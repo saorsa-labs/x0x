@@ -3704,13 +3704,6 @@ impl KvStoreSync {
         Ok(())
     }
 
-    /// Publish a local delta to the gossip network.
-    ///
-    /// For an encrypted store (#341 Phase B) the delta is NEVER serialized
-    /// plaintext: it is sign-then-encrypt sealed into an
-    /// `EncryptedKvStoreRecordV1` envelope first. A missing context or
-    /// signing material is a hard error — the plaintext path is unreachable
-
     /// #976 test hook: the next publish_delta fails deterministically.
     #[cfg(test)]
     pub(crate) fn fail_next_publish_for_test(&self) {
@@ -3718,7 +3711,12 @@ impl KvStoreSync {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// by construction for encrypted stores.
+    /// Publish an incremental delta on the store's topic.
+    ///
+    /// #341 Phase B: encrypted, TreeKEM and group-signed stores are sealed
+    /// or signed here — plaintext publication is unreachable by
+    /// construction for encrypted stores. The #973 GSS publication gate
+    /// bounds concurrent publications.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
         #[cfg(test)]
         if self

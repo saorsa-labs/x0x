@@ -762,15 +762,37 @@ pub(in crate::server) async fn delete_kv_value(
         handle.clone()
     };
 
-    match handle.remove_with_delta(&key).await {
-        Ok(delta) => {
+    match handle.remove_with_outcome(&key).await {
+        Ok(x0x::KvRemoveOutcome {
+            delta,
+            published,
+            publish_error,
+        }) => {
             // #341 Phase B: see put_kv_value — no plaintext DM fallback for
-            // encrypted stores.
+            // encrypted stores. #976: the fallback runs on the unpublished
+            // path too, and direct_attempted is reported (attempts, not
+            // confirmations).
+            let mut direct_attempted = 0usize;
             if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
+                direct_attempted = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            if published {
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            } else {
+                // #976 ruling: the remove happened — 202, saved locally,
+                // not yet published. No replay.
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "published": false,
+                        "reason": publish_error,
+                        "direct_attempted": direct_attempted,
+                    })),
+                )
+            }
         }
         Err(e) if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) => {
             // AppendOnly store: keys can never be deleted, even by the owner.

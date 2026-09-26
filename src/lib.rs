@@ -18823,7 +18823,7 @@ impl KvStoreHandle {
     /// Returns an error if the key does not exist, or
     /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
     /// to write under the store's access policy.
-    pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+    pub async fn remove_with_outcome(&self, key: &str) -> error::Result<KvRemoveOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18871,10 +18871,27 @@ impl KvStoreHandle {
         // #976 symmetry: a failed remove-publish is queued for
         // re-publish (reported via diagnostics; the remove IS applied and
         // persisted — a CRDT remove cannot be unwound either).
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
-            tracing::warn!("failed to publish kv remove delta: {e}");
-        }
-        Ok(delta)
+        // #976 r3: honest DELETE outcome — applied + persisted, publish
+        // reported, NO replay (a replayed remove could wipe a newer
+        // value remotely; see the r2 review B2).
+        let (published, publish_error) =
+            match self.sync.publish_delta(self.peer_id, delta.clone()).await {
+                Ok(()) => (true, None),
+                Err(e) => {
+                    tracing::warn!("failed to publish kv remove delta: {e}");
+                    (false, Some(format!("{e}")))
+                }
+            };
+        Ok(KvRemoveOutcome {
+            delta,
+            published,
+            publish_error,
+        })
+    }
+
+    /// As remove_with_outcome without the publish report.
+    pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.remove_with_outcome(key).await?.delta)
     }
 
     /// Apply a verified remote delta received through a non-pubsub channel.
@@ -18971,6 +18988,19 @@ pub struct KvPutOutcome {
     /// re-publish and the direct-peer side channel still ran.
     pub published: bool,
     /// The publish failure cause when `published` is false.
+    pub publish_error: Option<String>,
+}
+
+/// Result of a local KV remove (#976 ruling symmetry): the delta and
+/// whether it reached the wire. The remove IS applied and persisted;
+/// an unpublished remove is reported, never replayed.
+#[derive(Debug, Clone)]
+pub struct KvRemoveOutcome {
+    /// The CRDT remove delta.
+    pub delta: kv::KvStoreDelta,
+    /// False when the gossip publish failed. No queue, no replay.
+    pub published: bool,
+    /// The publish failure cause when published is false.
     pub publish_error: Option<String>,
 }
 
@@ -22362,10 +22392,10 @@ mod tests {
         creator.shutdown().await;
     }
 
-    /// #976 ruling: the local write is KEPT and the put is NOT an
-    /// error — it reports published=false + the cause, the value stays
-    /// readable, the delta is QUEUED for re-publish, and a retry with the
-    /// wire working succeeds AND drains the queue (the retry re-announces).
+    /// #976 r3: the local write is KEPT and the put is NOT an error —
+    /// published=false + the cause, the value stays readable, NO queue
+    /// exists anywhere (removed: plaintext leak + delete replay), and a
+    /// later put with the wire working succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn kv_put_reports_publish_failure_and_keeps_the_local_write() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -22391,8 +22421,6 @@ mod tests {
             .put_with_delta("warm".to_string(), b"up".to_vec(), "text/plain".to_string())
             .await
             .expect("warm-up put publishes normally");
-        // Force the next publish to fail — the deterministic stand-in for
-        // a gossip publish timeout/refusal.
         store.sync_fail_next_publish_for_test().await;
         let outcome = store
             .put_with_outcome("k976".to_string(), b"v".to_vec(), "text/plain".to_string())
@@ -22401,14 +22429,12 @@ mod tests {
         assert!(!outcome.published, "published=false is reported");
         let cause = outcome.publish_error.expect("the cause is carried");
         assert!(cause.contains("forced failure"), "{cause}");
-        // The local write is KEPT: applied and readable.
         let kept = store
             .get("k976")
             .await
             .expect("read")
             .expect("kept locally");
         assert_eq!(kept.value, b"v");
-        // The delta is QUEUED: a retry with the wire working drains it.
         store
             .put_with_delta(
                 "after".to_string(),
@@ -22417,15 +22443,12 @@ mod tests {
             )
             .await
             .expect("a later put with the wire working succeeds");
-        let pending = store.pending_republish_len_for_test().await;
-        assert_eq!(pending, 0, "the retry re-published the queued delta");
         agent.shutdown().await;
     }
 
-    /// #976 (F3): an identical AppendOnly re-put of an entry whose
-    /// publish failed RE-ANNOUNCES it (the no-op path drains the queue
-    /// and reports published accordingly) instead of returning a silent
-    /// success that leaves the value stranded off the wire.
+    /// #976 r3 (F3): an identical AppendOnly re-put RE-ANNOUNCES the
+    /// entry through the normal publish path (sealed, gated) and reports
+    /// its own publish outcome — no queue anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn appendonly_retry_republishes_an_unpublished_entry() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -22457,15 +22480,16 @@ mod tests {
             .await
             .expect("write kept");
         assert!(!first.published);
-        assert_eq!(store.pending_republish_len_for_test().await, 1, "queued");
-        // The identical retry: a no-op for the STORE, but it must drain the
-        // queue and report published=true (the re-announce happened).
+        // The identical retry: a store no-op that RE-ANNOUNCES via the
+        // normal path and reports its own outcome (published=true here).
         let retry = store
             .put_with_outcome("k".to_string(), b"v".to_vec(), "text/plain".to_string())
             .await
             .expect("retry succeeds");
-        assert!(retry.published, "the retry re-announced the queued delta");
-        assert_eq!(store.pending_republish_len_for_test().await, 0, "drained");
+        assert!(
+            retry.published,
+            "the retry re-announced through the normal path"
+        );
         agent.shutdown().await;
     }
 
