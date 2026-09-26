@@ -17,6 +17,12 @@ pub(in crate::server) use seat_cert_fetch::{
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
 
+mod requester_offer;
+pub(in crate::server) use requester_offer::{
+    insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
+    RequesterOfferObligation,
+};
+
 use super::super::state::AppState;
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
@@ -345,10 +351,65 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 
 /// A predecessor relay can only count a recipient application ACK. Raw QUIC's
 /// receive-pipeline ACK is produced before the typed route admits the item.
-pub(in crate::server) fn predecessor_relay_delivery_config() -> x0x::dm::DmSendConfig {
+/// #942 r3 (B4): the strict-v2 delivery config, following the durable
+/// bootstrap-outbox pattern exactly — the logical request id is the first
+/// 16 bytes of the obligation's envelope digest, so a retry after a lost
+/// ACK or a restart is a REPLAY of one logical request (the recipient's
+/// dedupe re-ACKs instead of re-dispatching), and the outbox — not the
+/// send layer — owns retry scheduling (max_retries = 0).
+pub(in crate::server) fn predecessor_relay_delivery_config(
+    envelope_digest: &[u8; 32],
+) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_gossip = true;
+    // The predecessor route is registered DURABLE: send Ok means the
+    // AUTHORITY's handler resolved its completion (Inserted/Duplicate),
+    // never a bare enqueue. A full typed channel withholds the ACK — that
+    // is the failure the retry schedule absorbs.
+    config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&envelope_digest[..16]);
+    config.logical_request_id = Some(request_id);
     config
+}
+
+/// #942 r3 (B4): the legacy (v1) fallback for authorities without a
+/// current v2 durable-ACK advert — pre-ADR-0030 builds and daemons with
+/// history disabled. The payload is unchanged (the predecessor prefix is
+/// the v1 listener's prefix too); the receipt is transport-level, so the
+/// obligation is discharged on delivery exactly as it was before the
+/// durable route existed. Without this arm such an authority would NEVER
+/// receive the offer (compatibility regression fixed).
+pub(in crate::server) fn predecessor_relay_legacy_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_durable_app_ack = false;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    config
+}
+
+/// #942 r3 (B4): which wire an authority can receive on, mirroring the
+/// bootstrap outbox's probe — a capability binding under v2 means legacy;
+/// a contact card that self-reports v1 means legacy; unknown defaults to
+/// the strict v2 attempt (which fails fast and retries on schedule).
+pub(in crate::server) async fn predecessor_relay_wire_version(
+    state: &AppState,
+    recipient: &crate::identity::AgentId,
+) -> bool {
+    if let Some(binding) = state.agent.capability_store().lookup_binding(recipient) {
+        return binding.capabilities.max_protocol_version >= 2;
+    }
+    let card_reports_v1 = state
+        .contacts
+        .read()
+        .await
+        .get(recipient)
+        .and_then(|contact| contact.dm_capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.max_protocol_version < 2);
+    !card_reports_v1
 }
 
 /// Request body for POST /groups.
@@ -14778,6 +14839,12 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         digest: [u8; 32],
         envelope_bytes: Vec<u8>,
         targets: Vec<String>,
+        /// #942 r4: the source obligation's due time (oldest-due-first
+        /// ordering for the bounded pass).
+        next_retry_at_ms: u64,
+        /// #942 r5 (B8): whether this is a retry — first attempts sort
+        /// ahead of the retry backlog.
+        is_retry: bool,
     }
     let mut due: Vec<DueObligation> = Vec::new();
 
@@ -14802,6 +14869,8 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                     digest: obligation.digest,
                     envelope_bytes: obligation.envelope_bytes.clone(),
                     targets: obligation.relay_targets.clone(),
+                    next_retry_at_ms: obligation.next_retry_at_ms,
+                    is_retry: obligation.retry_count > 0,
                 });
             }
         }
@@ -14901,8 +14970,28 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
 
     let mut relay_results: Vec<RelayResult> = Vec::new();
 
+    // #942 r4 (bounded pass): oldest-due-first, and a per-pass SEND
+    // budget so one pass cannot spend minutes on hundreds of
+    // slow-timeout strict sends while a brand-new obligation waits
+    // (head-of-line). Unserved obligations stay due and are picked up by
+    // the next 500 ms tick — the budget bounds work per tick, not the
+    // total.
+    let mut due_sorted = due;
+    // #942 r5 (B8): FIRST ATTEMPTS ahead of retries — a brand-new
+    // obligation is never starved behind a backlog of overdue retries;
+    // oldest-due within each class.
+    due_sorted.sort_by_key(|o| (o.is_retry, o.next_retry_at_ms));
+    const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
+    let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
+
     // Relay to each target and observe results per obligation (audit 6).
-    for due_obl in &due {
+    for due_obl in &due_sorted {
+        if pass_budget == 0 {
+            break;
+        }
+        // #942 r5 (B7): the budget is charged PER OBLIGATION here — a
+        // started obligation always fans out fully (see the inner loop).
+        pass_budget = pass_budget.saturating_sub(1);
         let group_id = &due_obl.group_id;
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
@@ -14910,6 +14999,12 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let mut successful_targets: Vec<String> = Vec::new();
         let mut success_count: usize = 0;
 
+        let obligation_digest = *digest;
+        // #942 r5 (B7): the budget is charged PER OBLIGATION (at the top
+        // of this loop), never per target — a started obligation always
+        // fans out fully, so witnesses past the budget cannot be starved
+        // by earlier failing targets and the obligation is never pruned
+        // unattempted. The fan-out itself is bounded by the group size.
         for target_hex in targets {
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
                 // Unparseable target — skip (not added to success set).
@@ -14921,14 +15016,31 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
             dm_payload.extend_from_slice(envelope_bytes);
             // B6: await the send result. Do NOT count record_causal_relayed
             // yet — count only after durable persistence (persist-before-count).
-            let send_result = state
-                .agent
-                .send_direct_with_config(
-                    &target_id,
-                    dm_payload,
-                    predecessor_relay_delivery_config(),
-                )
-                .await;
+            // #942 r4 (B6): dual-wire, the #903/bootstrap pattern — a
+            // witness with a current v2 durable advert gets the strict
+            // config; one without (pre-ADR-0030 build, history disabled)
+            // gets the LEGACY v1 gossip config so it still receives the
+            // relay (the receipt is transport-level; the payload is
+            // unchanged and the witness re-verifies the envelope).
+            let send_result = if predecessor_relay_wire_version(state, &target_id).await {
+                state
+                    .agent
+                    .send_direct_with_config(
+                        &target_id,
+                        dm_payload,
+                        predecessor_relay_delivery_config(&obligation_digest),
+                    )
+                    .await
+            } else {
+                state
+                    .agent
+                    .send_direct_with_config(
+                        &target_id,
+                        dm_payload,
+                        predecessor_relay_legacy_delivery_config(),
+                    )
+                    .await
+            };
             if send_result.is_ok() {
                 success_count += 1;
                 successful_targets.push(target_hex.clone());
@@ -23924,7 +24036,7 @@ pub(in crate::server) async fn create_join_request(
     use base64::Engine as _;
     let requester_kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         request_id: request.request_id.clone(),
         requester_agent_id: request.requester_agent_id.clone(),
         message: request.message.clone(),
@@ -23941,28 +24053,63 @@ pub(in crate::server) async fn create_join_request(
         publish_named_group_metadata_event_with_envelope(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
     if let Some(envelope) = envelope_bytes {
-        if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
-            let mut dm_payload =
-                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
-            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            dm_payload.extend_from_slice(&envelope);
-            let agent = Arc::clone(&state.agent);
-            let creator = creator_hex.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent
-                    .send_direct_with_config(
-                        &creator_id,
-                        dm_payload,
-                        predecessor_relay_delivery_config(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        creator = %LogHexId::agent(&creator),
-                        "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+        if parse_agent_id_hex(&creator_hex).is_ok() {
+            // #908: the offer to the authority is a DURABLE obligation,
+            // not a one-shot spawned DM. Persisted here (before the 201
+            // returns), retried by the background worker on the bounded
+            // ADR 0028 schedule over the gossip-only config (#913), and
+            // cleared on the authority's DURABLE application ACK (the
+            // handler's Inserted/Duplicate disposition — never a bare
+            // enqueue) or when the join resolves. A failed send is a
+            // retry, never a silent loss, and a restart resumes it.
+            let now_ms = now_millis_u64();
+            let obligation = RequesterOfferObligation {
+                group_id: event_group_id.to_string(),
+                request_id: request.request_id.clone(),
+                requester_agent_id: request.requester_agent_id.clone(),
+                authority_agent_id: creator_hex.clone(),
+                envelope_bytes: envelope.to_vec(),
+                digest: blake3::hash(&envelope).into(),
+                byte_size: envelope.len(),
+                first_seen_ms: now_ms,
+                next_retry_at_ms: now_ms,
+                retry_count: 0,
+            };
+            if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
+                // Fail-visible fallback: the pre-#908 one-shot shape, so
+                // a persist failure never leaves the authority with LESS
+                // than it had before.
+                tracing::warn!(
+                    creator = %LogHexId::agent(&creator_hex),
+                    %error,
+                    "#908: failed to persist the requester offer obligation; falling back to a one-shot send"
+                );
+                if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
+                    let mut dm_payload = Vec::with_capacity(
+                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len(),
                     );
+                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                    dm_payload.extend_from_slice(&envelope);
+                    let agent = Arc::clone(&state.agent);
+                    let creator = creator_hex.clone();
+                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
+                    tokio::spawn(async move {
+                        if let Err(e) = agent
+                            .send_direct_with_config(
+                                &creator_id,
+                                dm_payload,
+                                predecessor_relay_delivery_config(&fallback_digest),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                creator = %LogHexId::agent(&creator),
+                                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+                            );
+                        }
+                    });
                 }
-            });
+            }
         }
     }
 
@@ -30599,7 +30746,17 @@ pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
     };
-    write_relay_outbox_sidecar(state, &json).await
+    let outcome = write_relay_outbox_sidecar(state, &json).await;
+    #[cfg(test)]
+    if let Err(ref e) = outcome {
+        eprintln!(
+            "#942R3 PROBE write failed at {}: {e}",
+            state.predecessor_relay_outbox_path.display()
+        );
+    }
+    #[cfg(test)]
+    eprintln!("#942R3 PROBE write outcome: {outcome:?}");
+    outcome
 }
 
 /// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
@@ -35851,6 +36008,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
+    mod requester_offer;
     mod wp_c;
 
     fn fake_group_state_commit(
@@ -36548,6 +36706,9 @@ pub(in crate::server) mod tests {
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+            requester_offer_outbox: RwLock::new(HashMap::new()),
+            requester_offer_outbox_path: data_dir.join("requester_offer_outbox.json"),
+            requester_offer_outbox_persistence_lock: Mutex::new(()),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
             cert_fetch_requested: StdMutex::new(HashMap::new()),
             cert_fetch_answered: StdMutex::new(HashMap::new()),
@@ -48709,10 +48870,18 @@ pub(in crate::server) mod tests {
 
     #[test]
     fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
-        let config = predecessor_relay_delivery_config();
+        let digest = [7u8; 32];
+        let config = predecessor_relay_delivery_config(&digest);
         assert!(config.require_gossip);
         assert!(config.require_gossip_ack);
+        assert!(config.require_durable_app_ack);
         assert!(!config.prefer_raw_quic_if_connected);
+        // #942 r3 (B4): the outbox owns scheduling and the logical request
+        // id is the envelope digest's first half — a retry is a replay.
+        assert_eq!(config.max_retries, 0);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&digest[..16]);
+        assert_eq!(config.logical_request_id, Some(expected));
     }
 
     #[test]
@@ -49650,6 +49819,35 @@ pub(in crate::server) mod tests {
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
                 .with_network_config(isolated_loopback_config(plane))
+                .build()
+                .await?,
+        );
+        agent.join_network().await.context("join network")?;
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
+    /// #942 B2: a networked test state whose agent carries a DURABLE
+    /// HISTORY handle — required for v2 durable-ACK DMs (the strict
+    /// send mode the requester offer outbox uses). Same shape as
+    /// `networked_test_state` plus `with_history`.
+    async fn networked_test_state_with_history(
+        plane: &str,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(isolated_loopback_config(plane))
+                .with_history(x0x::history::HistoryConfig {
+                    db_path: Some(data_dir.join("history.db")),
+                    ..x0x::history::HistoryConfig::daemon_default()
+                })
                 .build()
                 .await?,
         );

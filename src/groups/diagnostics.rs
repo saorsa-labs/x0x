@@ -134,6 +134,15 @@ pub struct GroupCounters {
     pub causal_conflicted: u64,
     /// Entries rejected due to count or byte caps.
     pub causal_capacity_rejected: u64,
+    /// #908: requester predecessor-offer obligations DELIVERED to the
+    /// authority (application ACK) by the durable offer outbox.
+    pub requester_offer_delivered: u64,
+    /// #908: offer obligations dropped because the join RESOLVED first
+    /// (approved, denied, expired, cancelled, or the group withdrew).
+    pub requester_offer_resolved_drop: u64,
+    /// #908: offer obligations dropped after the bounded retry schedule
+    /// ran out (ADR 0028 offsets).
+    pub requester_offer_retry_exhausted: u64,
     /// #482: TreeKEM membership events queued awaiting state-chain
     /// catch-up/replay (the wedge class where a verified event — e.g. a
     /// second device's self-leave — could previously sit queued forever
@@ -456,6 +465,15 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.causal_capacity_rejected = dst
         .causal_capacity_rejected
         .saturating_add(src.causal_capacity_rejected);
+    dst.requester_offer_delivered = dst
+        .requester_offer_delivered
+        .saturating_add(src.requester_offer_delivered);
+    dst.requester_offer_resolved_drop = dst
+        .requester_offer_resolved_drop
+        .saturating_add(src.requester_offer_resolved_drop);
+    dst.requester_offer_retry_exhausted = dst
+        .requester_offer_retry_exhausted
+        .saturating_add(src.requester_offer_retry_exhausted);
     dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (None, Some(b)) => Some(b),
@@ -952,6 +970,28 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// #908: a requester predecessor-offer obligation was DELIVERED to
+    /// the authority (application ACK).
+    pub fn record_requester_offer_delivered(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_delivered = c.requester_offer_delivered.saturating_add(1);
+        });
+    }
+
+    /// #908: an offer obligation was dropped because the join resolved.
+    pub fn record_requester_offer_resolved_drop(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_resolved_drop = c.requester_offer_resolved_drop.saturating_add(1);
+        });
+    }
+
+    /// #908: an offer obligation's bounded retry schedule ran out.
+    pub fn record_requester_offer_retry_exhausted(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_retry_exhausted = c.requester_offer_retry_exhausted.saturating_add(1);
+        });
+    }
+
     /// Build a snapshot for `GET /diagnostics/groups`. Joins the live
     /// per-group counters with the caller-supplied `members_v2` and
     /// subscription views (the daemon already holds those locks higher up
@@ -1411,7 +1451,10 @@ mod tests {
             task_deltas_quarantine_buffered: base + 47,
             task_deltas_quarantine_dropped: base + 48,
             task_deltas_quarantine_applied: base + 49,
-            task_deltas_seal_rejected: base + 50,
+            requester_offer_delivered: base + 50,
+            requester_offer_resolved_drop: base + 51,
+            requester_offer_retry_exhausted: base + 52,
+            task_deltas_seal_rejected: base + 53,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);

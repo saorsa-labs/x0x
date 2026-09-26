@@ -25,6 +25,7 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
+use super::routes::named_groups::RequesterOfferObligation;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
@@ -1057,6 +1058,18 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
     /// so an older snapshot cannot rename over a newer completed receipt.
     pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
+    /// #908: the REQUESTER's durable predecessor-offer obligations, keyed
+    /// by group id (obligation identity is `(group, request_id)`). The
+    /// requester persists the exact signed envelope it offered to the
+    /// authority and retries on a bounded schedule until the authority
+    /// ACKs or the join resolves. See
+    /// `routes::named_groups::requester_offer`.
+    pub(super) requester_offer_outbox: RwLock<HashMap<String, Vec<RequesterOfferObligation>>>,
+    /// #908: disk location for the requester offer outbox sidecar.
+    pub(super) requester_offer_outbox_path: PathBuf,
+    /// #908: serializes snapshot-and-write of the requester offer outbox
+    /// sidecar (the relay outbox's discipline).
+    pub(super) requester_offer_outbox_persistence_lock: Mutex<()>,
     /// Serializes bootstrap outbox mutation and durable replacement. The retry
     /// worker never holds this while awaiting network delivery.
     pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,
