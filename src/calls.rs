@@ -822,7 +822,7 @@ impl crate::Agent {
             connect_policy,
             owner_trust,
             machine,
-            None, // RED(#980): gate change reverted on ci-mirror only
+            Some(caller),
         )
         .await
         .map_err(|e| CallRefusal::from_gate_error(&e))?;
