@@ -323,7 +323,10 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
     // brand-new obligation behind one 500 ms-tick pass. Unserved
     // obligations stay due for the next tick.
     let mut to_send = std::mem::take(&mut to_send);
-    to_send.sort_by_key(|o| o.next_retry_at_ms);
+    // #942 r5 (B8): FIRST ATTEMPTS ahead of retries — a brand-new offer
+    // is attempted in the FIRST pass even behind a full backlog of
+    // overdue retries; oldest-due within each class.
+    to_send.sort_by_key(|o| (o.retry_count > 0, o.next_retry_at_ms));
     const REQUESTER_OFFER_PASS_BUDGET: usize = 16;
     let mut pass_budget: usize = REQUESTER_OFFER_PASS_BUDGET;
     // (group_id, delivered) per send attempt.

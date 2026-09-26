@@ -340,6 +340,16 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     // (1) The strict send hits a FULL channel: no completion, no v2 ACK.
+    // #942 r5 (B9): the assertion is observable ON B — the inbox's
+    // typed-route DROP counter must increment (the request ARRIVED and
+    // was dropped by the full channel), which a gate refusal or a broken
+    // wire would NOT do.
+    let drops_before = b
+        .agent
+        .direct_messaging
+        .diagnostics_snapshot()
+        .stats
+        .incoming_typed_route_dropped;
     // Arm (2) below is the NEGATIVE CONTROL: with the channel drained,
     // the SAME obligation, wire and gate deliver and B applies — so a
     // keep here can only be the full channel withholding the ACK, never
@@ -359,6 +369,17 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
             .retry_count,
         1,
         "the failed attempt was counted"
+    );
+
+    let drops_after_full_channel = b
+        .agent
+        .direct_messaging
+        .diagnostics_snapshot()
+        .stats
+        .incoming_typed_route_dropped;
+    assert!(
+        drops_after_full_channel > drops_before,
+        "the full channel DROPPED the arrived request on B's side (observable)"
     );
 
     // (2) DRAIN: the real consumer takes over and the retry delivers.
@@ -506,7 +527,10 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
         sender: a.agent.agent_id(),
         machine_id: crate::identity::MachineId([0u8; 32]),
         payload: {
-            // a second, fresh request so no dedupe short-circuits
+            // A second, FRESH envelope: its own digest and logical id, so
+            // nothing from the first arm's completed logical request can
+            // re-ACK it (r5 B9 — this arm pins the requester-side keep on
+            // its OWN identity).
             let fresh = sign_v2_envelope_b2(
                 a.agent.identity().agent_keypair(),
                 &topic,
@@ -539,25 +563,55 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
         err_outcome.is_err(),
         "a non-durable admission must resolve Err: {err_outcome:?}"
     );
-    // And the requester side keeps its obligation for the same reason: a
+    // And the requester side keeps ITS obligation built from the SAME
+    // fresh bytes (r5 B9: its own digest and logical id — a replay of the
+    // first arm's completed request can no longer re-ACK it): the
     // withheld ACK fails the strict send.
-    let obligation_b = obligation_for(&group_id, "req-r3b", &a_hex, &b_hex, {
-        let mut p = Vec::new();
-        p.extend_from_slice(&envelope);
-        p
-    });
+    let fresh_bytes = {
+        let fresh = sign_v2_envelope_b2(
+            a.agent.identity().agent_keypair(),
+            &topic,
+            &NamedGroupMetadataEvent::JoinRequestCreated {
+                group_id: group_id.clone(),
+                request_id: "req-r3b".to_string(),
+                requester_agent_id: a_hex.clone(),
+                message: None,
+                ts: 0,
+                requester_kem_public_key_b64: None,
+                treekem_key_package_b64: None,
+                commit: None,
+            },
+        );
+        fresh
+    };
+    let obligation_b = obligation_for(&group_id, "req-r3b", &a_hex, &b_hex, fresh_bytes.clone());
     pending_join_request(&a, &group_id, "req-r3b", &a_hex).await;
     insert_requester_offer_obligation(&a, obligation_b)
         .await
         .expect("second obligation persisted");
-    // NOTE (follow-up finding, reported to Claude): the requester-side
-    // keep-on-withheld-ACK for THIS shape is not asserted because the
-    // inbox's dedupe cache re-ACKs a retried logical request whose FIRST
-    // delivery was withheld — attempt 1 fails correctly (withheld), but
-    // attempt 2 hits the cached Accepted and discharges. That cache
-    // semantics is a dm_inbox-level issue out of this PR's scope; the
-    // B3 pin here is the HANDLER-level contract: a non-durable admission
-    // resolves Err (asserted above), which is what withholds the ACK.
+    let mut kept_r3b = false;
+    for _ in 0..2 {
+        a.requester_offer_outbox
+            .write()
+            .await
+            .values_mut()
+            .for_each(|list| {
+                list.iter_mut().for_each(|o| {
+                    o.next_retry_at_ms = now_millis_u64();
+                })
+            });
+        requester_offer_step(&a).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        kept_r3b =
+            crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&a)
+                .await
+                .iter()
+                .any(|o| o.request_id == "req-r3b");
+    }
+    assert!(
+        kept_r3b,
+        "a non-durable authority write keeps the requester's fresh obligation (B3)"
+    );
 
     consumer.abort();
     std::fs::set_permissions(&outbox_parent, std::fs::Permissions::from_mode(0o755))
@@ -684,7 +738,7 @@ async fn witness_already_holding_replays_as_duplicate() -> Result<()> {
         &NamedGroupMetadataEvent::JoinRequestCreated {
             group_id: group_id.clone(),
             request_id: "req-wit".to_string(),
-            requester_agent_id: requester_hex,
+            requester_agent_id: requester_hex.clone(),
             message: None,
             ts: 0,
             requester_kem_public_key_b64: None,
@@ -717,6 +771,26 @@ async fn witness_already_holding_replays_as_duplicate() -> Result<()> {
         Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted),
         "the first witness delivery applies durably"
     );
+    // PUBSUB-FIRST arm (the production-common order): a WITNESS that
+    // already applied the request through the pubsub mesh (never via the
+    // relay) must ALSO ACK the relayed copy as an idempotent Duplicate —
+    // model it by seeding the applied request with THIS envelope's digest
+    // before the relayed copy arrives.
+    {
+        let mut seeded =
+            x0x::groups::JoinRequest::new(String::new(), requester_hex.clone(), None, 0);
+        seeded.request_id = "req-wit-pubsub-first".to_string();
+        seeded.predecessor_envelope_digest = Some(blake3::hash(&envelope).into());
+        seeded.predecessor_first_seen_ms = Some(0);
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        // Swap the applied request's identity for the seeded one so the
+        // digest match drives the already-held path without a second apply.
+        info.join_requests.insert("req-wit".to_string(), seeded);
+    }
+    // (falls through to the relay-again arm below, now exercising the
+    // pubsub-first shape: the request exists with THIS digest.)
+
     // Second delivery: the request is already held — the apply rejects,
     // and the relay must see an IDEMPOTENT Duplicate (r3 returned Err
     // here, which retried the relay ten times and pruned it).
@@ -784,6 +858,207 @@ async fn relay_wire_probe_selects_legacy_for_v1_witnesses() -> Result<()> {
     assert!(
         predecessor_relay_wire_version(&state, &stranger.agent_id()).await,
         "unknown defaults to the strict attempt"
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r5 (B7): the relay budget is charged PER OBLIGATION, never per
+/// target — a started obligation fans out to ALL its targets. With 16
+/// unreachable witnesses ahead of 4 reachable (self-loop) ones, the
+/// reachable witnesses are served in the FIRST pass (removed from
+/// relay_targets), not starved until the obligation is pruned.
+/// Rule 9: reverting to per-target charging (16 leading dead targets
+/// burn the budget) leaves the reachable targets unattempted and FAILS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_budget_charges_per_obligation_not_per_target() -> Result<()> {
+    let plane = format!("req-offer-relay-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = "ab".repeat(16);
+    {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "relay-budget".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // 16 unreachable witnesses, then 4 reachable (the local agent).
+    let mut targets: Vec<String> = (0..16).map(|i| format!("{:064x}", 0x3000 + i)).collect();
+    targets.push(local_hex.clone());
+    // A real signed envelope (the route validator demands one).
+    let requester_kp = x0x::identity::AgentKeypair::generate()?;
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let (topic, commit) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        let commit = x0x::groups::GroupStateCommit::sign(
+            info.stable_group_id().to_string(),
+            info.state_revision + 1,
+            Some(info.state_hash.clone()),
+            x0x::groups::state_commit::compute_roster_root(&info.members_v2),
+            x0x::groups::state_commit::compute_policy_hash(&info.policy),
+            x0x::groups::state_commit::compute_public_meta_hash(&info.public_meta()),
+            info.security_binding.clone(),
+            false,
+            info.state_revision + 1,
+            &requester_kp,
+        )
+        .expect("sign commit");
+        (info.metadata_topic.clone(), commit)
+    };
+    let envelope = sign_v2_envelope_b2(
+        &requester_kp,
+        &topic,
+        &NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: group_id.clone(),
+            request_id: "req-relay-budget".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: 0,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(commit),
+        },
+    );
+    let digest: [u8; 32] = blake3::hash(&envelope).into();
+    let obligation = crate::server::routes::named_groups::PredecessorRelayObligation {
+        envelope_bytes: envelope,
+        digest,
+        byte_size: 0,
+        first_seen_ms: now_millis_u64(),
+        next_retry_at_ms: now_millis_u64(),
+        retry_count: 0,
+        group_id: group_id.clone(),
+        request_id: "req-relay-budget".to_string(),
+        requester_agent_id: requester_hex,
+        relay_targets: targets,
+        completed_at_ms: None,
+    };
+    state
+        .predecessor_relay_outbox
+        .write()
+        .await
+        .insert(group_id.clone(), vec![obligation]);
+    // Production bootstraps the sidecar dir; the harness must too.
+    std::fs::create_dir_all(
+        state
+            .predecessor_relay_outbox_path
+            .parent()
+            .expect("outbox parent"),
+    )
+    .expect("treekem dir exists");
+
+    causal_relay_step(&state).await;
+    let remaining = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        outbox
+            .get(&group_id)
+            .and_then(|l| l.first())
+            .map(|o| o.relay_targets.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        !remaining.contains(&local_hex),
+        "the reachable witness (past 16 unreachable ones) was served in the FIRST pass"
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r5 (B8): a brand-new offer is attempted in the FIRST pass even
+/// behind a full daemon-cap backlog (16 groups × 64 overdue retries) of
+/// slow-failing sends. Rule 9: removing the first-attempt priority
+/// (oldest-due-only ordering) leaves the fresh offer unattempted and
+/// FAILS this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_offer_is_attempted_in_the_first_pass() -> Result<()> {
+    let plane = format!("req-offer-fresh-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let dead_authority = "ff".repeat(32);
+    // 16 groups × 64 overdue RETRIES = the 1024-obligation daemon cap.
+    for g in 0..16u32 {
+        let group_id = format!("{:032x}", 0x9000 + g);
+        {
+            let info = x0x::groups::GroupInfo::with_policy(
+                "fresh".to_string(),
+                String::new(),
+                state.agent.agent_id(),
+                group_id.clone(),
+                x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+        }
+        for i in 0..64u32 {
+            let req_id = format!("req-{g}-{i}");
+            pending_join_request(&state, &group_id, &req_id, &local_hex).await;
+            let mut obligation = obligation_for(
+                &group_id,
+                &req_id,
+                &local_hex,
+                &dead_authority,
+                vec![0xA6; 96],
+            );
+            // Already retried once and overdue: the backlog.
+            obligation.retry_count = 1;
+            obligation.next_retry_at_ms = now_millis_u64().saturating_sub(60_000);
+            insert_requester_offer_obligation(&state, obligation)
+                .await
+                .expect("backlog obligation persisted");
+        }
+    }
+    // THE FRESH OFFER: a brand-new join, due now.
+    let fresh_group = format!("{:032x}", 0x9100);
+    {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "fresh".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            fresh_group.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(fresh_group.clone(), info);
+    }
+    pending_join_request(&state, &fresh_group, "req-fresh", &local_hex).await;
+    insert_requester_offer_obligation(
+        &state,
+        obligation_for(
+            &fresh_group,
+            "req-fresh",
+            &local_hex,
+            &dead_authority,
+            vec![0xB7; 96],
+        ),
+    )
+    .await
+    .expect("fresh obligation persisted");
+
+    requester_offer_step(&state).await;
+    let fresh =
+        crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&state)
+            .await
+            .into_iter()
+            .find(|o| o.request_id == "req-fresh")
+            .expect("fresh obligation kept (dead authority)");
+    assert_eq!(
+        fresh.retry_count, 1,
+        "the FRESH offer was attempted in the FIRST pass, ahead of the overdue backlog"
     );
     state.agent.shutdown().await;
     Ok(())
