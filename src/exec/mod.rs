@@ -11,7 +11,11 @@ pub mod diagnostics;
 pub mod protocol;
 pub mod service;
 
-pub use acl::{default_exec_acl_path, load_exec_policy, ExecAcl, ExecPolicy, LoadMode};
+pub use acl::{
+    compose_exec_policy, default_exec_acl_path, exec_reload_compatible, load_exec_policy,
+    validate_exec_entry_spec, AclReloadStatus, ExecAcl, ExecAclCommandSpec, ExecAclEntrySpec,
+    ExecPolicy, LoadMode,
+};
 pub use diagnostics::{ExecDiagnostics, ExecDiagnosticsSnapshot};
 pub use protocol::{
     decode_frame_payload, encode_frame_payload, DenialReason, ExecFrame, ExecRequestId,

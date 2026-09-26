@@ -34,7 +34,7 @@ use ant_quic::derive_peer_id_from_public_key;
 use serde::{Deserialize, Serialize};
 
 use crate::error::IdentityError;
-use crate::identity::{AgentCertificate, AgentId, MachineId};
+use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 
 /// Domain-separation prefix for the bytes a revocation signs over.
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
@@ -45,6 +45,48 @@ const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
 /// Magic marker prefixing the ADR-0043 ad-hoc binding-record file
 /// (`revocations-v2.bin`).
 const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
+
+/// Magic marker prefixing the ADR-0070 share-grant revocation file
+/// (`revocations-v3.bin`). A distinct magic (and file) keeps the v1/v2
+/// stores loadable by older daemons after a downgrade.
+const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
+
+/// How long past the revoked grant's own expiry a share-grant revocation is
+/// kept before it may be garbage-collected. A grant is dead at `expiry`
+/// (evaluation never honours it after that); the slack covers clock skew
+/// between the owner and the enforcing daemons.
+pub const SHARE_GRANT_REVOCATION_GC_SLACK_SECS: u64 = 3_600;
+
+/// An ADR-0070 §2 share-grant revocation: the grant id plus the owner that
+/// signed the grant. Carrying the owner makes authority verifiable from the
+/// record alone (the issuer key must hash to `owner`), and scopes the
+/// revocation so a stranger's record for the same id revokes nothing.
+///
+/// `grant_expiry` is the revoked grant's own `expiry`, signed into the
+/// record, so every node garbage-collects the revocation at the same point
+/// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`) — once the grant
+/// itself can no longer be honoured. `u64::MAX` (an unknown grant) never
+/// expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShareGrantRevocation {
+    /// The revoked grant's random id.
+    pub grant_id: [u8; 32],
+    /// The grant's owner (grantor). Only this user's key may revoke it.
+    pub owner: UserId,
+    /// The revoked grant's `expiry` (unix seconds): the GC horizon.
+    pub grant_expiry: u64,
+}
+
+impl ShareGrantRevocation {
+    /// Whether this revocation may be garbage-collected at `now_unix`.
+    #[must_use]
+    pub fn gc_eligible_at(&self, now_unix: u64) -> bool {
+        now_unix
+            >= self
+                .grant_expiry
+                .saturating_add(SHARE_GRANT_REVOCATION_GC_SLACK_SECS)
+    }
+}
 
 /// An `(agent, machine, move_epoch)` pairing retired by an ADR-0043 move
 /// (or an ad-hoc owner revocation of the same pairing). Revokes the PAIR —
@@ -73,6 +115,11 @@ pub enum RevokedSubject {
     /// structurally impossible — the issuer key hashes to one 32-byte id,
     /// the subject carries two ids plus an epoch).
     AgentMachineBinding(AgentMachineBinding),
+    /// An ADR-0070 share grant. Owner-key issued only. Carried ONLY on
+    /// `x0x.revocation.v3` and `revocations-v3.bin`: older daemons decode
+    /// the v1/v2 batches as a whole `Vec<RevocationRecord>`, so this variant
+    /// must never appear there (see [`RevocationSet::all_records`]).
+    ShareGrant(ShareGrantRevocation),
 }
 
 impl From<AgentMachineBinding> for RevokedSubject {
@@ -88,6 +135,7 @@ impl RevokedSubject {
             RevokedSubject::Agent(_) => 0x01,
             RevokedSubject::Machine(_) => 0x02,
             RevokedSubject::AgentMachineBinding(_) => 0x03,
+            RevokedSubject::ShareGrant(_) => 0x04,
         }
     }
 
@@ -98,10 +146,10 @@ impl RevokedSubject {
         match self {
             RevokedSubject::Agent(id) => id.as_bytes(),
             RevokedSubject::Machine(id) => id.as_bytes(),
-            RevokedSubject::AgentMachineBinding(_) => {
+            RevokedSubject::AgentMachineBinding(_) | RevokedSubject::ShareGrant(_) => {
                 // Unreachable in canonical construction: canonical_message
-                // dispatches bindings to binding_subject_bytes. The empty slice
-                // keeps callers that only match Agent/Machine total.
+                // dispatches bindings and grants to binding_subject_bytes. The
+                // empty slice keeps callers that only match Agent/Machine total.
                 static EMPTY: [u8; 32] = [0u8; 32];
                 &EMPTY
             }
@@ -117,6 +165,15 @@ impl RevokedSubject {
                 out.extend_from_slice(binding.agent.as_bytes());
                 out.extend_from_slice(binding.machine.as_bytes());
                 out.extend_from_slice(&binding.move_epoch.to_le_bytes());
+                Some(out)
+            }
+            // Fixed-width `grant_id ‖ owner ‖ grant_expiry_le` — no
+            // boundary ambiguity; the GC horizon is signed.
+            RevokedSubject::ShareGrant(grant) => {
+                let mut out = Vec::with_capacity(32 + 32 + 8);
+                out.extend_from_slice(&grant.grant_id);
+                out.extend_from_slice(grant.owner.as_bytes());
+                out.extend_from_slice(&grant.grant_expiry.to_le_bytes());
                 Some(out)
             }
             _ => None,
@@ -246,6 +303,19 @@ impl RevocationRecord {
         // 2. Self-revocation: the issuer key hashes to the subject id.
         //    Binding subjects never take this path (no single subject id).
         let issuer_id = derive_peer_id_from_public_key(&issuer_pubkey).0;
+
+        // ADR-0070 §2: a share grant is revoked by its owner's key only —
+        // the issuer key must hash to the grant's owner UserId. No
+        // certificate is involved and no other path applies.
+        if let RevokedSubject::ShareGrant(grant) = &self.subject {
+            if &issuer_id == grant.owner.as_bytes() {
+                return Ok(());
+            }
+            return Err(IdentityError::Revocation(
+                "share-grant revocation issuer is not the grant owner".to_string(),
+            ));
+        }
+
         if !matches!(self.subject, RevokedSubject::AgentMachineBinding(_))
             && &issuer_id == self.subject.id_bytes()
         {
@@ -261,7 +331,7 @@ impl RevocationRecord {
         let subject_agent = match &self.subject {
             RevokedSubject::Agent(agent) => Some(*agent),
             RevokedSubject::AgentMachineBinding(binding) => Some(binding.agent),
-            RevokedSubject::Machine(_) => None,
+            RevokedSubject::Machine(_) | RevokedSubject::ShareGrant(_) => None,
         };
         if let Some(subject_agent) = subject_agent {
             if let Some(cert) = subject_cert {
@@ -295,8 +365,9 @@ impl RevocationRecord {
             &self.subject,
             MlDsaPublicKey::from_bytes(&self.issuer_public_key),
         ) {
-            // Bindings have no single subject id — never self-revocable.
-            (RevokedSubject::AgentMachineBinding(_), _) => false,
+            // Bindings and grants have no single subject id — never
+            // self-revocable.
+            (RevokedSubject::AgentMachineBinding(_) | RevokedSubject::ShareGrant(_), _) => false,
             (_, Ok(pk)) => &derive_peer_id_from_public_key(&pk).0 == self.subject.id_bytes(),
             (_, Err(_)) => false,
         }
@@ -311,17 +382,20 @@ impl RevocationRecord {
     pub fn subject_hex(&self) -> String {
         match &self.subject {
             RevokedSubject::AgentMachineBinding(binding) => hex::encode(binding.agent.as_bytes()),
+            RevokedSubject::ShareGrant(grant) => hex::encode(grant.grant_id),
             _ => hex::encode(self.subject.id_bytes()),
         }
     }
 
-    /// Human-readable subject kind: `"agent"`, `"machine"`, or `"binding"`.
+    /// Human-readable subject kind: `"agent"`, `"machine"`, `"binding"`, or
+    /// `"share_grant"`.
     #[must_use]
     pub fn subject_kind(&self) -> &'static str {
         match &self.subject {
             RevokedSubject::Agent(_) => "agent",
             RevokedSubject::Machine(_) => "machine",
             RevokedSubject::AgentMachineBinding(_) => "binding",
+            RevokedSubject::ShareGrant(_) => "share_grant",
         }
     }
 
@@ -392,6 +466,11 @@ pub struct RevocationSet {
     /// independent; never TTL-swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
+    /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
+    /// by the latest signed `grant_expiry`. Not swept by the 90-day TTL (a
+    /// grant can outlive it); collected once the grant itself is dead
+    /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
+    revoked_share_grants: HashMap<([u8; 32], UserId), u64>,
     /// Monotonic change counter — incremented on every insert or expiry.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
@@ -425,6 +504,14 @@ impl RevocationSet {
     pub fn is_binding_revoked(&self, agent: &AgentId, machine: &MachineId) -> bool {
         let key = (*agent, *machine);
         self.binding_epochs.contains_key(&key) || self.bundle_retired_epochs.contains_key(&key)
+    }
+
+    /// Whether the share grant `grant_id` signed by `owner` is revoked
+    /// (ADR-0070 §2). A revocation by any other owner for the same id does
+    /// not match.
+    #[must_use]
+    pub fn is_share_grant_revoked(&self, grant_id: &[u8; 32], owner: &UserId) -> bool {
+        self.revoked_share_grants.contains_key(&(*grant_id, *owner))
     }
 
     /// Highest epoch of any tombstone for the agent across both carriers,
@@ -549,12 +636,13 @@ impl RevocationSet {
             .iter()
             // ADR-0043 §7.3: binding tombstones are PERMANENT — a retired
             // binding must never resurrect, so the TTL sweep skips them.
-            .filter(|(_, persisted)| {
-                persisted.record.revoked_at < cutoff
-                    && !matches!(
-                        persisted.record.subject,
-                        RevokedSubject::AgentMachineBinding(_)
-                    )
+            // ADR-0070: a share-grant revocation ignores the TTL (a grant
+            // may outlive it) and is collected only once the revoked grant
+            // is dead: its signed expiry plus the skew slack.
+            .filter(|(_, persisted)| match &persisted.record.subject {
+                RevokedSubject::AgentMachineBinding(_) => false,
+                RevokedSubject::ShareGrant(grant) => grant.gc_eligible_at(now_unix),
+                _ => persisted.record.revoked_at < cutoff,
             })
             .map(|(hash, _)| *hash)
             .collect();
@@ -575,6 +663,21 @@ impl RevocationSet {
                     RevokedSubject::AgentMachineBinding(binding) => {
                         self.binding_epochs
                             .remove(&(binding.agent, binding.machine));
+                    }
+                    // Drop the key only when the LATEST expiry recorded for
+                    // it is past the horizon — a longer-lived record for the
+                    // same grant keeps it revoked.
+                    RevokedSubject::ShareGrant(grant) => {
+                        let key = (grant.grant_id, grant.owner);
+                        if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
+                            let horizon = ShareGrantRevocation {
+                                grant_expiry: latest,
+                                ..*grant
+                            };
+                            if horizon.gc_eligible_at(now_unix) {
+                                self.revoked_share_grants.remove(&key);
+                            }
+                        }
                     }
                 }
             }
@@ -602,6 +705,13 @@ impl RevocationSet {
                 let entry = self.binding_epochs.entry(key).or_insert(0);
                 *entry = (*entry).max(binding.move_epoch);
             }
+            RevokedSubject::ShareGrant(grant) => {
+                let entry = self
+                    .revoked_share_grants
+                    .entry((grant.grant_id, grant.owner))
+                    .or_insert(0);
+                *entry = (*entry).max(grant.grant_expiry);
+            }
         }
         self.records_by_hash.insert(hash, persisted);
         self.change_generation = self.change_generation.saturating_add(1);
@@ -612,14 +722,27 @@ impl RevocationSet {
     /// order unspecified), for rebroadcast/anti-entropy.
     ///
     /// ADR-0043 §7.4: the v1 batch is one whole `Vec<RevocationRecord>`
-    /// that legacy peers deserialize in full — an unknown `0x03` variant
-    /// would poison every co-resident record for old peers, so the v1
-    /// publication filters to legacy subjects and stays byte-identical.
+    /// that legacy peers deserialize in full — an unknown variant would
+    /// poison every co-resident record for old peers, so the v1
+    /// publication carries legacy subjects only and stays byte-identical.
+    /// ADR-0070: this is an ALLOWLIST (`Agent`/`Machine`), so a subject
+    /// variant added later can never leak onto v1.
     #[must_use]
     pub fn all_records(&self) -> Vec<RevocationRecord> {
         self.records_by_hash
             .values()
-            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
+            .filter(|p| is_v1_subject(&p.record.subject))
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// All held share-grant records for the `x0x.revocation.v3` carrier and
+    /// the `revocations-v3.bin` store (ADR-0070 §2).
+    #[must_use]
+    pub fn share_grant_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
+            .filter(|p| matches!(p.record.subject, RevokedSubject::ShareGrant(_)))
             .map(|p| p.record.clone())
             .collect()
     }
@@ -644,10 +767,11 @@ impl RevocationSet {
     ///
     /// Returns [`IdentityError::Serialization`] on encode failure.
     pub fn to_bytes(&self) -> Result<Vec<u8>, IdentityError> {
+        // Allowlist, like `all_records`: a downgraded daemon reads this file.
         let records: Vec<&PersistedRevocation> = self
             .records_by_hash
             .values()
-            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
+            .filter(|p| is_v1_subject(&p.record.subject))
             .collect();
         let body = bincode::serialize(&records)
             .map_err(|e| IdentityError::Serialization(e.to_string()))?;
@@ -713,6 +837,84 @@ impl RevocationSet {
         Ok(set)
     }
 
+    /// Encode the ADR-0070 share-grant revocations for `revocations-v3.bin`:
+    /// `X0R3` magic + bincode of the persisted entries. Only
+    /// [`RevokedSubject::ShareGrant`] records are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Serialization`] on encode failure.
+    pub fn to_bytes_v3(&self) -> Result<Vec<u8>, IdentityError> {
+        let records: Vec<&PersistedRevocation> = self
+            .records_by_hash
+            .values()
+            .filter(|p| matches!(p.record.subject, RevokedSubject::ShareGrant(_)))
+            .collect();
+        let body = bincode::serialize(&records)
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        let mut out = Vec::with_capacity(REVOCATIONS_FILE_MAGIC_V3.len() + body.len());
+        out.extend_from_slice(REVOCATIONS_FILE_MAGIC_V3);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a `revocations-v3.bin` written by
+    /// [`to_bytes_v3`](Self::to_bytes_v3), re-verifying every record on
+    /// load. Records that are not share-grant revocations, or that no
+    /// longer verify, are dropped (fail closed). Merge the result with
+    /// [`merge_v3`](Self::merge_v3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Serialization`] if the magic is missing or
+    /// the body is malformed. Empty input yields an empty set.
+    pub fn from_bytes_v3(bytes: &[u8]) -> Result<Self, IdentityError> {
+        if bytes.is_empty() {
+            return Ok(Self::new());
+        }
+        if bytes.len() < REVOCATIONS_FILE_MAGIC_V3.len()
+            || &bytes[..REVOCATIONS_FILE_MAGIC_V3.len()] != REVOCATIONS_FILE_MAGIC_V3
+        {
+            return Err(IdentityError::Serialization(
+                "revocation v3 file missing X0R3 magic".to_string(),
+            ));
+        }
+        let persisted: Vec<PersistedRevocation> =
+            bincode::deserialize(&bytes[REVOCATIONS_FILE_MAGIC_V3.len()..])
+                .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        let mut set = Self::new();
+        for entry in persisted {
+            if !matches!(entry.record.subject, RevokedSubject::ShareGrant(_)) {
+                continue;
+            }
+            let _ = set.verify_and_insert(entry.record, None);
+        }
+        Ok(set)
+    }
+
+    /// Merge a decoded v3 set into this one (grow-only union).
+    pub fn merge_v3(&mut self, other: Self) {
+        let mut changed = false;
+        for (key, expiry) in other.revoked_share_grants {
+            let entry = self.revoked_share_grants.entry(key).or_insert(0);
+            if *entry < expiry {
+                *entry = expiry;
+                changed = true;
+            }
+        }
+        for (hash, persisted) in other.records_by_hash {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.records_by_hash.entry(hash)
+            {
+                slot.insert(persisted);
+                changed = true;
+            }
+        }
+        if changed {
+            self.change_generation = self.change_generation.saturating_add(1);
+        }
+    }
+
     /// Merge a decoded v2 set into this one (grow-only union).
     pub fn merge_v2(&mut self, other: Self) {
         for ((agent, machine), epoch) in other.binding_epochs {
@@ -764,6 +966,15 @@ impl RevocationSet {
         }
         Ok(set)
     }
+}
+
+/// Whether a subject may ride the v1 wire and `revocations.bin`: the
+/// legacy `Agent`/`Machine` subjects only (an allowlist, ADR-0070).
+fn is_v1_subject(subject: &RevokedSubject) -> bool {
+    matches!(
+        subject,
+        RevokedSubject::Agent(_) | RevokedSubject::Machine(_)
+    )
 }
 
 #[cfg(test)]
@@ -1312,5 +1523,340 @@ mod tests {
         // decoded set is empty; the shape pin above is the contract).
         let decoded = RevocationSet::from_bytes_v2(&frozen).expect("decode v2 file");
         assert!(decoded.is_empty());
+    }
+
+    /// ADR-0070 slice 3: share-grant revocations and the old-decoder
+    /// guarantees of the v1/v2 carriers.
+    mod share_grant_v3 {
+        use super::super::*;
+        use crate::identity::UserKeypair;
+
+        /// Byte-for-byte replica of the subject enum an ADR-0043 daemon
+        /// (pre-slice-3) decodes. Variant ORDER is the bincode tag.
+        #[derive(Debug, Serialize, Deserialize)]
+        enum OldRevokedSubject {
+            Agent(AgentId),
+            Machine(MachineId),
+            AgentMachineBinding(AgentMachineBinding),
+        }
+
+        /// Replica of the pre-ADR-0043 (v1-only) subject enum.
+        #[derive(Debug, Serialize, Deserialize)]
+        enum V1OnlyRevokedSubject {
+            Agent(AgentId),
+            Machine(MachineId),
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct OldRecord<S> {
+            subject: S,
+            issuer_public_key: Vec<u8>,
+            revoked_at: u64,
+            reason: Option<String>,
+            signature: Vec<u8>,
+        }
+
+        fn fake(subject: RevokedSubject, tag: u8) -> RevocationRecord {
+            RevocationRecord {
+                subject,
+                issuer_public_key: vec![tag; 4],
+                revoked_at: 1_700_000_000 + u64::from(tag),
+                reason: Some("r".to_string()),
+                signature: vec![tag; 4],
+            }
+        }
+
+        fn share_grant_fake() -> RevocationRecord {
+            fake(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x5A; 32],
+                    owner: UserId([0x5B; 32]),
+                    grant_expiry: 1_900_000_000,
+                }),
+                0x5C,
+            )
+        }
+
+        fn insert(set: &mut RevocationSet, record: RevocationRecord) {
+            assert!(set.insert_verified(PersistedRevocation {
+                record,
+                subject_cert: None,
+            }));
+        }
+
+        /// WHY: only the grant's owner may revoke it. A stranger can sign a
+        /// record naming someone else's grant id, but it must not verify;
+        /// and a stranger's record naming *itself* as owner revokes only a
+        /// grant that stranger signed — never the victim's grant with the
+        /// same id.
+        #[test]
+        fn share_grant_revocation_authority_is_the_owner_key_only() {
+            let owner = UserKeypair::generate().unwrap();
+            let stranger = UserKeypair::generate().unwrap();
+            let grant_id = [0x11; 32];
+            let subject = RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            });
+
+            let by_owner = RevocationRecord::sign(
+                subject.clone(),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            assert!(by_owner.verify_authority(None).is_ok());
+            assert!(!by_owner.is_self_revocation());
+            assert_eq!(by_owner.subject_kind(), "share_grant");
+            assert_eq!(by_owner.subject_hex(), hex::encode(grant_id));
+
+            let forged = RevocationRecord::sign(
+                subject,
+                stranger.public_key(),
+                stranger.secret_key(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            assert!(forged.verify_authority(None).is_err());
+
+            let own_claim = RevocationRecord::sign(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id,
+                    owner: stranger.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                stranger.public_key(),
+                stranger.secret_key(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(own_claim, None).unwrap());
+            assert!(
+                !set.is_share_grant_revoked(&grant_id, &owner.user_id()),
+                "a stranger's revocation must not revoke the owner's grant"
+            );
+            assert!(set.verify_and_insert(by_owner, None).unwrap());
+            assert!(set.is_share_grant_revoked(&grant_id, &owner.user_id()));
+        }
+
+        /// WHY (golden): old daemons decode the whole v1 batch and drop it on
+        /// an unknown variant, and the heartbeat republishes the full set.
+        /// Holding a share-grant revocation must leave the v1 batch AND the
+        /// v1 file byte-identical, and the batch must still be exactly what
+        /// a pre-ADR-0043 encoder produced for the same records.
+        #[test]
+        fn v1_batch_and_file_bytes_unchanged_while_share_grant_held() {
+            let agent = fake(RevokedSubject::Agent(AgentId([0xA1; 32])), 0xA1);
+            let mut set = RevocationSet::new();
+            insert(&mut set, agent.clone());
+            let batch_before = bincode::serialize(&set.all_records()).unwrap();
+            let file_before = set.to_bytes().unwrap();
+
+            insert(&mut set, share_grant_fake());
+            assert_eq!(
+                bincode::serialize(&set.all_records()).unwrap(),
+                batch_before
+            );
+            assert_eq!(set.to_bytes().unwrap(), file_before);
+
+            let legacy = vec![OldRecord {
+                subject: V1OnlyRevokedSubject::Agent(AgentId([0xA1; 32])),
+                issuer_public_key: agent.issuer_public_key.clone(),
+                revoked_at: agent.revoked_at,
+                reason: agent.reason.clone(),
+                signature: agent.signature.clone(),
+            }];
+            assert_eq!(
+                bincode::serialize(&legacy).unwrap(),
+                batch_before,
+                "the v1 batch must match the legacy encoder byte for byte"
+            );
+        }
+
+        /// WHY: ADR-0043's v2 carrier and file must also stay byte-identical
+        /// when a share-grant revocation is held.
+        #[test]
+        fn v2_batch_and_file_bytes_unchanged_while_share_grant_held() {
+            let binding = fake(
+                RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                    agent: AgentId([0xB1; 32]),
+                    machine: MachineId([0xB2; 32]),
+                    move_epoch: 4,
+                }),
+                0xB3,
+            );
+            let mut set = RevocationSet::new();
+            insert(&mut set, binding);
+            let batch_before = bincode::serialize(&set.binding_records()).unwrap();
+            let file_before = set.to_bytes_v2().unwrap();
+
+            insert(&mut set, share_grant_fake());
+            assert_eq!(
+                bincode::serialize(&set.binding_records()).unwrap(),
+                batch_before
+            );
+            assert_eq!(set.to_bytes_v2().unwrap(), file_before);
+        }
+
+        /// WHY (old-decoder safety): a share-grant record never appears on
+        /// v1 or v2, so the batches an old daemon receives still decode with
+        /// its enum; and the v3 batch is exactly what such a decoder would
+        /// reject — the reason it rides its own topic.
+        #[test]
+        fn v3_records_never_reach_old_decoders() {
+            let mut set = RevocationSet::new();
+            insert(&mut set, fake(RevokedSubject::Agent(AgentId([1; 32])), 1));
+            insert(
+                &mut set,
+                fake(RevokedSubject::Machine(MachineId([2; 32])), 2),
+            );
+            insert(
+                &mut set,
+                fake(
+                    RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                        agent: AgentId([3; 32]),
+                        machine: MachineId([4; 32]),
+                        move_epoch: 1,
+                    }),
+                    3,
+                ),
+            );
+            insert(&mut set, share_grant_fake());
+
+            let v1 = set.all_records();
+            let v2 = set.binding_records();
+            let v3 = set.share_grant_records();
+            assert_eq!(v1.len(), 2);
+            assert_eq!(v2.len(), 1);
+            assert_eq!(v3.len(), 1);
+            for record in v1.iter().chain(v2.iter()) {
+                assert!(!matches!(record.subject, RevokedSubject::ShareGrant(_)));
+            }
+            assert!(v3
+                .iter()
+                .all(|r| matches!(r.subject, RevokedSubject::ShareGrant(_))));
+
+            let v1_bytes = bincode::serialize(&v1).unwrap();
+            assert!(
+                bincode::deserialize::<Vec<OldRecord<V1OnlyRevokedSubject>>>(&v1_bytes).is_ok()
+            );
+            assert!(bincode::deserialize::<Vec<OldRecord<OldRevokedSubject>>>(&v1_bytes).is_ok());
+            let v2_bytes = bincode::serialize(&v2).unwrap();
+            assert!(bincode::deserialize::<Vec<OldRecord<OldRevokedSubject>>>(&v2_bytes).is_ok());
+            let v3_bytes = bincode::serialize(&v3).unwrap();
+            assert!(
+                bincode::deserialize::<Vec<OldRecord<OldRevokedSubject>>>(&v3_bytes).is_err(),
+                "an old decoder rejects the whole batch on the new variant"
+            );
+            // The v1 file (read by a downgraded daemon) never carries it
+            // either: its body still decodes with the legacy subject enum.
+            let file = set.to_bytes().unwrap();
+            assert!(bincode::deserialize::<
+                Vec<(OldRecord<V1OnlyRevokedSubject>, Option<AgentCertificate>)>,
+            >(&file[4..])
+            .is_ok());
+        }
+
+        /// WHY: a revoked grant must stay revoked across restart (v3 file)
+        /// and past the 90-day TTL while the grant could still be honoured —
+        /// a grant may be valid for longer than the TTL, and an early
+        /// collection would resurrect it. Once the grant itself is dead
+        /// (expiry + slack) the record is collected, so the set stays
+        /// bounded; every node computes that point from the SIGNED expiry.
+        #[test]
+        fn share_grant_revocation_is_kept_until_grant_expiry_then_collected() {
+            let owner = UserKeypair::generate().unwrap();
+            let grant_id = [0x22; 32];
+            let grant_expiry = 1_000_000_000u64 + 200 * 24 * 3600;
+            let record = RevocationRecord::sign(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id,
+                    owner: owner.user_id(),
+                    grant_expiry,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                Some("ended".to_string()),
+            )
+            .unwrap();
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(record, None).unwrap());
+
+            let bytes = set.to_bytes_v3().unwrap();
+            assert_eq!(&bytes[..4], b"X0R3");
+            let mut restored = RevocationSet::new();
+            restored.merge_v3(RevocationSet::from_bytes_v3(&bytes).unwrap());
+            assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+
+            // Far past the 90-day TTL, but before expiry + slack: kept.
+            let ttl = 90 * 24 * 3600;
+            let just_before = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS - 1;
+            assert_eq!(restored.expire_records_older_than(ttl, just_before), 0);
+            assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert_eq!(restored.share_grant_records().len(), 1);
+
+            // At expiry + slack: collected (record and index).
+            let horizon = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
+            assert_eq!(restored.expire_records_older_than(ttl, horizon), 1);
+            assert!(!restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert!(restored.share_grant_records().is_empty());
+
+            // A revocation of an unknown grant (u64::MAX) is never collected.
+            let unknown = ShareGrantRevocation {
+                grant_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            };
+            assert!(!unknown.gc_eligible_at(u64::MAX - 1));
+
+            // A v1/v2 file is not a v3 file.
+            assert!(RevocationSet::from_bytes_v3(&set.to_bytes().unwrap()).is_err());
+        }
+
+        /// WHY: two signed records for one grant with different horizons —
+        /// collecting the shorter one must not un-revoke the grant while the
+        /// longer one is still held.
+        #[test]
+        fn shorter_revocation_gc_does_not_unrevoke_a_longer_one() {
+            let short = fake(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x44; 32],
+                    owner: UserId([0x45; 32]),
+                    grant_expiry: 1_000,
+                }),
+                0x46,
+            );
+            let long = fake(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x44; 32],
+                    owner: UserId([0x45; 32]),
+                    grant_expiry: 1_000_000,
+                }),
+                0x47,
+            );
+            let mut set = RevocationSet::new();
+            insert(&mut set, short);
+            insert(&mut set, long);
+            let now = 1_000 + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
+            assert_eq!(set.expire_records_older_than(u64::MAX, now), 1);
+            assert!(set.is_share_grant_revoked(&[0x44; 32], &UserId([0x45; 32])));
+        }
+
+        /// WHY: the v3 file is untrusted input. A tampered file carrying a
+        /// non-grant record, or a forged grant record, must load as nothing.
+        #[test]
+        fn v3_file_drops_foreign_and_forged_records() {
+            let mut set = RevocationSet::new();
+            insert(&mut set, share_grant_fake()); // fake signature
+            let tampered = set.to_bytes_v3().unwrap();
+            assert!(RevocationSet::from_bytes_v3(&tampered).unwrap().is_empty());
+        }
     }
 }

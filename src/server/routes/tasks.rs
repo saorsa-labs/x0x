@@ -171,9 +171,9 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// under disputed membership even when the CRDT data itself is recoverable
 /// (the ADR's own answer to the warn-only argument it rejected).
 ///
-/// The refusal goes through the single slice-1 helper, so it carries the §5
-/// body — machine `reason`, the human sentence, and the manual-clear remedy
-/// — and bumps `fork_quarantine_refusals` exactly once (§3e).
+/// The refusal goes through the shared marker gate and bumps
+/// `fork_quarantine_refusals` once. Sessions without an active local seat
+/// receive only a membership error; durable operators retain the §5 body.
 ///
 /// WHY it runs BEFORE [`ensure_task_list_access`] rather than after: #153's
 /// guard resolves the group with a single-spelling `named_groups.get(id)`, so
@@ -181,22 +181,28 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// request naming the stable id. Ordering the quarantine check after it would
 /// make the alias case fail closed for the wrong, undiagnosable reason — the
 /// exact "right outcome, wrong reason" defect slice 3 found on row 18 — and
-/// R5's condition for removing the warn-only window was that the user always
-/// learns WHY. Containment is a property of the group's contested state, not
-/// of who is asking, and these are daemon-local control-plane endpoints
-/// authenticated by the daemon's own token, so there is no third party to
-/// leak the marker to. Slice 3 set the same precedent on
+/// R5's condition for removing the warn-only window was that an authorized
+/// operator learns WHY. A session without a local seat must not inspect the
+/// marker, even though quarantine containment remains unconditional. Slice 3
+/// set the same precedence on
 /// `delegate_group_authority`, where the quarantine refusal precedes the
 /// ban/role checks.
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
+    actor: &crate::server::rider_auth::ActorContext,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let (group_id, marker) = task_list_fork_quarantine(state, id).await?;
-    Some(
-        crate::server::routes::named_groups::reject_fork_quarantined_marker(
-            state, &group_id, &marker,
-        ),
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() {
+        return None;
+    }
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)?;
+    crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+        state,
+        &scoped.group_id,
+        info,
+        actor,
     )
 }
 
@@ -288,6 +294,13 @@ pub(in crate::server) async fn group_task_list_binding(
     id: &str,
 ) -> x0x::TaskListBinding {
     let mut binding = x0x::TaskListBinding::default();
+    if legacy_space_board_prefix(id).is_some() {
+        // #895 (omp finding 1): a legacy plaintext board answers state
+        // requests only from members of its group, and not at all once
+        // this node has migrated it.
+        binding.state_serve_gate = Some(legacy_board_serve_gate(state, id));
+        return binding;
+    }
     let Some(scoped) = parse_group_scoped_task_list_id(id) else {
         return binding;
     };
@@ -295,11 +308,181 @@ pub(in crate::server) async fn group_task_list_binding(
         return binding;
     }
     binding.authorized_agents = active_group_members(state, &scoped.group_id).await;
+    // #895: installed for EVERY group-scoped id, including one whose group
+    // this node cannot resolve yet — the protector resolves live and fails
+    // closed (no publish, no merge) until the group is known.
+    binding.delta_protector = Some(std::sync::Arc::new(GroupTaskDeltaProtector {
+        state: Arc::downgrade(state),
+        group_id: scoped.group_id.clone(),
+        topic: id.to_string(),
+    }));
     binding.ingest_gate = Some(std::sync::Arc::new(TaskQuarantineIngestGate {
         state: Arc::downgrade(state),
         group_id: scoped.group_id,
     }));
     binding
+}
+
+/// #895: seals a group-scoped task list's wire payloads with its group's
+/// CURRENT key, using exactly the mechanism the group's KV stores use:
+///
+/// - `MlsEncrypted` on the GSS plane: [`x0x::crdt::sealed::seal_gss_task_payload`]
+///   (current shared-secret epoch; AAD binds group, record id and epoch).
+/// - `MlsEncrypted` on the TreeKEM plane: the live TreeKEM store protector
+///   ([`super::stores::treekem_task_list_protector`]).
+/// - `SignedPublic`: plaintext, as before (the group's content is public).
+/// - Unresolvable group: fail closed — nothing is sealed, opened or admitted.
+///
+/// Resolved on EVERY call, through the one both-spellings resolver, so a GSS
+/// rotation or TreeKEM commit (e.g. on member removal) applies to the very
+/// next delta.
+struct GroupTaskDeltaProtector {
+    state: std::sync::Weak<AppState>,
+    /// The group as spelled in the list id.
+    group_id: String,
+    /// The list id, which is also its gossip topic.
+    topic: String,
+}
+
+/// The group a task list is bound to, as this node holds it right now.
+enum TaskListPlane {
+    Public,
+    Gss(Box<x0x::groups::GroupInfo>),
+    TreeKem(x0x::kv::SharedTreeKemKvProtector, String),
+}
+
+impl GroupTaskDeltaProtector {
+    async fn plane(&self) -> x0x::crdt::Result<(Arc<AppState>, TaskListPlane)> {
+        let unavailable =
+            |why: &str| x0x::crdt::CrdtError::Gossip(format!("group task list sealing: {why}"));
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| unavailable("daemon is shutting down"))?;
+        let (group_key, info) = {
+            let groups = state.named_groups.read().await;
+            let (key, info) = crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                .ok_or_else(|| unavailable("group is not known on this node"))?;
+            (key.to_string(), info.clone())
+        };
+        if info.withdrawn {
+            return Err(unavailable("group is withdrawn"));
+        }
+        let plane = match info.policy.confidentiality {
+            x0x::groups::GroupConfidentiality::SignedPublic => TaskListPlane::Public,
+            x0x::groups::GroupConfidentiality::MlsEncrypted => match info.secure_plane {
+                x0x::mls::SecureGroupPlane::Gss => TaskListPlane::Gss(Box::new(info)),
+                x0x::mls::SecureGroupPlane::TreeKem => {
+                    let stable = info.stable_group_id().to_string();
+                    let protector =
+                        super::stores::treekem_task_list_protector(&state, &group_key, &info)
+                            .ok_or_else(|| unavailable("TreeKEM group is not eligible"))?;
+                    TaskListPlane::TreeKem(protector, stable)
+                }
+            },
+        };
+        Ok((state, plane))
+    }
+}
+
+impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
+    fn seal<'a>(
+        &'a self,
+        kind: x0x::kv::KvMutationKind,
+        payload: &'a [u8],
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, Option<x0x::crdt::sealed::SealedTaskRecordBody>>
+    {
+        Box::pin(async move {
+            let (state, plane) = self.plane().await?;
+            let signing =
+                x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+                    .map_err(|e| {
+                        x0x::crdt::CrdtError::Gossip(format!("task author signing: {e}"))
+                    })?;
+            match plane {
+                TaskListPlane::Public => Ok(None),
+                TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
+                    &info,
+                    &signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some),
+                TaskListPlane::TreeKem(protector, stable) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    protector
+                        .seal_record(&signing, kind, &record_id, payload, false)
+                        .await
+                        .map(|record| {
+                            Some(x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record))
+                        })
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task seal: {e}"))
+                        })
+                }
+            }
+        })
+    }
+
+    fn open<'a>(
+        &'a self,
+        body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::sealed::OpenedTaskPayload> {
+        Box::pin(async move {
+            let (_, plane) = self.plane().await?;
+            match (plane, body) {
+                (
+                    TaskListPlane::Gss(info),
+                    x0x::crdt::sealed::SealedTaskRecordBody::Gss(record),
+                ) => x0x::crdt::sealed::open_gss_task_record(&info, &self.topic, record),
+                (
+                    TaskListPlane::TreeKem(protector, stable),
+                    x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record),
+                ) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    let opened = protector
+                        .open_record(&record_id, record)
+                        .await
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task open: {e}"))
+                        })?;
+                    // `open_record` already required a current WRITER for a
+                    // non-read-only record; a read-only one is never content.
+                    x0x::crdt::sealed::accept_opened(
+                        opened.mutation.kind,
+                        !opened.reader_only,
+                        opened.mutation.author_id,
+                        opened.mutation.payload,
+                    )
+                }
+                _ => Err(x0x::crdt::CrdtError::Gossip(
+                    "sealed task record does not match the group's current plane".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn admits_plaintext(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { matches!(self.plane().await, Ok((_, TaskListPlane::Public))) })
+    }
+
+    fn on_rejected(&self, reason: x0x::crdt::TaskSealRejection) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_delta_seal_rejected(&self.group_id);
+            tracing::debug!(group_id = %self.group_id, ?reason, "[tasks] task delta refused (#895)");
+        }
+    }
+
+    fn local_agent(&self) -> Option<x0x::identity::AgentId> {
+        self.state.upgrade().map(|state| state.agent.agent_id())
+    }
 }
 
 /// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.
@@ -663,6 +846,9 @@ pub(in crate::server) async fn list_task_lists(
 /// POST /task-lists
 pub(in crate::server) async fn create_task_list(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: binding a NEW task list to a contested roster is
@@ -671,7 +857,7 @@ pub(in crate::server) async fn create_task_list(
     // writes a durable subscription registration and starts a sync listener
     // that publishes deltas on the group's topic. Refusing here means none
     // of that happens: no handle, no manifest row, no listener.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic, &actor).await {
         return refused;
     }
     // #153: creating a group-scoped task list requires membership of that group.
@@ -679,6 +865,14 @@ pub(in crate::server) async fn create_task_list(
         return denied;
     }
     let id = req.topic.clone();
+    // #895: a legacy board this node migrated stays retired — an old GUI tab
+    // must not bring its plaintext sync back.
+    if legacy_space_board_retired(&state, &id).await {
+        return api_error(
+            StatusCode::GONE,
+            "this space board moved to the group's encrypted list (#895)",
+        );
+    }
     // Reserve the entire handle+manifest transaction for this (kind,id) so
     // a concurrent create/rehydrate for the same id cannot interleave handle
     // insertion with failure rollback, or spawn a duplicate listener.
@@ -771,6 +965,190 @@ pub(in crate::server) async fn create_task_list(
     }
 }
 
+/// #895: the list segment of a GUI space Board's group-scoped id,
+/// `x0x.group.<gid>.symphony.board`.
+const SPACE_BOARD_LIST: &str = "board";
+
+/// #895: for a space Board id, the legacy PLAINTEXT board id the GUI used
+/// before the Board moved to the group-scoped (sealed) list:
+/// `x0x-board-<first 16 chars of the group id>`. `None` for any other list.
+pub(in crate::server) fn legacy_space_board_id(id: &str) -> Option<String> {
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() || scoped.list_id != SPACE_BOARD_LIST {
+        return None;
+    }
+    let prefix = scoped.group_id.get(..16).unwrap_or(&scoped.group_id);
+    Some(format!("x0x-board-{prefix}"))
+}
+
+/// #895: the durable "this node has migrated this board" marker, keyed by
+/// the LEGACY board id so both the migration and the legacy list's
+/// retirement (serve gate, rehydration, re-creation) can find it.
+fn space_board_migration_marker(state: &AppState, legacy_id: &str) -> std::path::PathBuf {
+    state.task_list_state_dir.join(format!(
+        "board-migration-{}.done",
+        blake3::hash(legacy_id.as_bytes()).to_hex()
+    ))
+}
+
+/// #895: the group-id prefix of a legacy plaintext space board id
+/// (`x0x-board-<first 16 chars of the group id>`), or `None`.
+fn legacy_space_board_prefix(id: &str) -> Option<&str> {
+    id.strip_prefix("x0x-board-")
+        .filter(|prefix| !prefix.is_empty())
+}
+
+/// #895: whether this node has migrated — and so retired — the legacy
+/// plaintext board `id`. `false` for any other list.
+pub(in crate::server) async fn legacy_space_board_retired(state: &AppState, id: &str) -> bool {
+    legacy_space_board_prefix(id).is_some()
+        && tokio::fs::try_exists(space_board_migration_marker(state, id))
+            .await
+            .unwrap_or(false)
+}
+
+/// #895: whether `sender` is an ACTIVE member of the group a legacy board id
+/// abbreviates (a group whose map key or stable id starts with the prefix).
+/// An unsigned request, an unknown group or a non-member answers `false`.
+pub(in crate::server) fn legacy_board_requester_is_member(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    legacy_id: &str,
+    sender: Option<&x0x::identity::AgentId>,
+) -> bool {
+    let (Some(prefix), Some(sender)) = (legacy_space_board_prefix(legacy_id), sender) else {
+        return false;
+    };
+    let sender_hex = hex::encode(sender.as_bytes());
+    groups.iter().any(|(key, info)| {
+        (key.starts_with(prefix) || info.stable_group_id().starts_with(prefix))
+            && info.has_active_member(&sender_hex)
+    })
+}
+
+/// #895: the state-serve gate for a legacy plaintext board. It answers a
+/// `StateRequest` only from an active member of the board's group, and
+/// never once this node has migrated (retired) the board — so a non-member
+/// that derives the topic cannot make a holder broadcast the list.
+fn legacy_board_serve_gate(state: &Arc<AppState>, legacy_id: &str) -> x0x::crdt::StateServeGate {
+    let weak = Arc::downgrade(state);
+    let legacy_id = legacy_id.to_string();
+    Arc::new(move |sender: Option<x0x::identity::AgentId>| {
+        let weak = weak.clone();
+        let legacy_id = legacy_id.clone();
+        Box::pin(async move {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            if legacy_space_board_retired(&state, &legacy_id).await {
+                return false;
+            }
+            let groups = state.named_groups.read().await;
+            legacy_board_requester_is_member(&groups, &legacy_id, sender.as_ref())
+        })
+    })
+}
+
+/// #895 (David, 2026-09-25): whether `agent` may write under the group's
+/// write policy — the same rule the group's encrypted stores and the task
+/// protector apply (active member; `AdminOnly` ⇒ admin or above;
+/// `ModeratedPublic` ⇒ nobody).
+fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId) -> bool {
+    let Some(member) = info.members_v2.get(&hex::encode(agent.as_bytes())) else {
+        return false;
+    };
+    if !member.is_active() {
+        return false;
+    }
+    match info.policy.write_access {
+        x0x::groups::GroupWriteAccess::MembersOnly => true,
+        x0x::groups::GroupWriteAccess::AdminOnly => {
+            member.role.at_least(x0x::groups::GroupRole::Admin)
+        }
+        x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+    }
+}
+
+/// #895: copy the legacy plaintext space Board into its group-scoped
+/// (sealed) list exactly once, then RETIRE the legacy list on this node.
+/// Returns `true` when the board needs no migration on this node (not a
+/// board, already migrated, or migrated now).
+///
+/// - Only a member with write permission migrates; anyone else gets `false`
+///   and the caller reports `board_migration_pending`.
+/// - Idempotent: the durable marker short-circuits re-runs, and the copy
+///   keeps each task's id, so a crash before the marker, or two members
+///   migrating concurrently, converge instead of duplicating.
+/// - A node that does not hold the legacy list has nothing to copy and
+///   records the marker.
+/// - Retirement (omp review finding 1): once the marker is durable, the
+///   legacy sync is cancelled (no more state serves, publishes or listening;
+///   its subscriptions drop with its loops) and its handle deregistered. The
+///   marker also keeps it from being rehydrated at boot or re-created via
+///   REST. Its local snapshot and manifest row stay on disk.
+pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, id: &str) -> bool {
+    let Some(legacy) = legacy_space_board_id(id) else {
+        return true;
+    };
+    let marker = space_board_migration_marker(state, &legacy);
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        retire_legacy_space_board(state, &legacy).await;
+        return true;
+    }
+    let Some(scoped) = parse_group_scoped_task_list_id(id) else {
+        return true;
+    };
+    let may_write = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+            .is_some_and(|(_, info)| may_write_group(info, &state.agent.agent_id()))
+    };
+    if !may_write {
+        return false;
+    }
+    let (target, source) = {
+        let lists = state.task_lists.read().await;
+        (lists.get(id).cloned(), lists.get(&legacy).cloned())
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    if let Some(source) = source {
+        match target.import_tasks_from(&source).await {
+            Ok(copied) => tracing::info!(
+                board = %id,
+                legacy = %legacy,
+                copied,
+                "[tasks] migrated the legacy plaintext space board (#895)"
+            ),
+            Err(e) => {
+                tracing::warn!(board = %id, "space board migration failed (#895): {e}");
+                return false;
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&marker, b"").await {
+        tracing::warn!(board = %id, "space board migration marker write failed: {e}");
+        return false;
+    }
+    retire_legacy_space_board(state, &legacy).await;
+    true
+}
+
+/// #895: stop the legacy plaintext board's sync on this node and deregister
+/// its live handle. The snapshot and manifest row are kept (local data is
+/// not deleted in this slice). Idempotent.
+async fn retire_legacy_space_board(state: &AppState, legacy: &str) {
+    // Read first: this runs on every board poll once migrated.
+    if !state.task_lists.read().await.contains_key(legacy) {
+        return;
+    }
+    let retired = state.task_lists.write().await.remove(legacy);
+    if let Some(handle) = retired {
+        handle.cancel_sync_and_drain().await;
+        tracing::info!(legacy = %legacy, "[tasks] retired the legacy plaintext space board (#895)");
+    }
+}
+
 /// GET /task-lists/:id/tasks
 pub(in crate::server) async fn list_tasks(
     State(state): State<Arc<AppState>>,
@@ -783,6 +1161,9 @@ pub(in crate::server) async fn list_tasks(
     // ADR-0066 §3c row 20 (read half): resolved before the task-list lock is
     // taken, so the roster read never nests inside it.
     let quarantine = task_list_fork_quarantine(&state, &id).await;
+    // #895: a space Board's first access copies the legacy plaintext board in
+    // once (a mutation, so never while the roster is contested).
+    let board_migrated = quarantine.is_some() || migrate_space_board_once(&state, &id).await;
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
         return not_found("task list not found");
@@ -805,12 +1186,24 @@ pub(in crate::server) async fn list_tasks(
                     completed_at: t.completed_at,
                 })
                 .collect();
+            let entries_empty = entries.is_empty();
             let mut body = serde_json::json!({
                 "ok": true,
                 "version": fence.revision,
                 "fence_token": fence.to_wire(),
                 "tasks": entries,
             });
+            // #895: a reader (or a writer that could not migrate yet) sees an
+            // explicit pending state instead of an unexplained empty board.
+            // Absent for every other list.
+            if !board_migrated && entries_empty {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "board_migration_pending".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
             // ADR-0066 §3c row 20 (read half): reads are NEVER refused —
             // containment must not blind the operator who is reading the
             // list to work out what the contested roster has been doing —
@@ -839,6 +1232,9 @@ pub(in crate::server) async fn list_tasks(
 pub(in crate::server) async fn add_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<AddTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: refuse BEFORE the handle is resolved, so nothing
@@ -846,7 +1242,7 @@ pub(in crate::server) async fn add_task(
     // snapshot or publish a delta. The ordering is observable: on a
     // quarantined group this returns 409 even for a list this daemon does
     // not hold, where the ungated path returns 404.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -879,6 +1275,9 @@ pub(in crate::server) async fn add_task(
 pub(in crate::server) async fn update_task(
     State(state): State<Arc<AppState>>,
     Path((id, tid)): Path<(String, String)>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: claim/complete is a mutation, refused before any
@@ -891,7 +1290,7 @@ pub(in crate::server) async fn update_task(
     // first, a quarantined group produces exactly ONE refusal and one
     // `fork_quarantine_refusals` increment, and row 17's check stays wired
     // for the case where a future change narrows row 20's scope.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -961,19 +1360,24 @@ pub(in crate::server) async fn update_task(
         // delegation-cited branch — gating group task mutations generally
         // is row 20 (§3c, slice 5) and is not this slice's business.
         //
-        // §5 says row 17 refuses with the full body, so the refusal goes
-        // through the shared helper rather than the local `forbidden`
-        // mapping: the caller gets the 409, the `fork_quarantined` reason
-        // and the remedy, not a bare 403.
-        let quarantine =
-            crate::server::delegations::fork_quarantine_marker(&state, &scoped.group_id).await;
-        if let Some(marker) = &quarantine {
-            return crate::server::routes::named_groups::reject_fork_quarantined_marker(
-                &state,
-                &scoped.group_id,
-                marker,
-            );
+        // Row 17 uses the shared helper. The marker and local seat are read
+        // together, so a nonmember session cannot inspect contested details.
+        let groups = state.named_groups.read().await;
+        if let Some((_, info)) =
+            crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+        {
+            if let Some(refused) =
+                crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+                    &state,
+                    &scoped.group_id,
+                    info,
+                    &actor,
+                )
+            {
+                return refused;
+            }
         }
+        drop(groups);
         let committed =
             crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;
         let sd = committed
@@ -994,17 +1398,14 @@ pub(in crate::server) async fn update_task(
             &committed,
             // Proven `None` by the refusal above; passed rather than
             // hard-coded so the predicate's gate stays wired here.
-            quarantine.as_ref(),
+            None,
         ) {
             return forbidden(format!("delegation does not authorize this action: {why}"));
         }
         let active = crate::server::delegations::active_members_of(&state, &scoped.group_id).await;
-        if let Err(why) = crate::server::delegations::chain_members_active(
-            sd,
-            &committed,
-            &active,
-            quarantine.as_ref(),
-        ) {
+        if let Err(why) =
+            crate::server::delegations::chain_members_active(sd, &committed, &active, None)
+        {
             return forbidden(format!("delegation chain no longer active: {why}"));
         }
         authorized_via = Some(hex::encode(sd.delegation.from_agent.as_bytes()));
