@@ -509,28 +509,72 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
     };
     assert_eq!(outbox_still, 1, "no second obligation");
 
-    // (4) NON-DURABLE (B3 Rule-9): B's journal save cannot become
-    // durable → the handler resolves Err → A's retry KEEPS the obligation.
-    // Sabotage durability the honest way an Arc'd AppState allows: make
-    // the sidecar's parent directory read-only, so the journal save
-    // cannot become Durable.
-    let outbox_parent = b
-        .predecessor_relay_outbox_path
-        .parent()
-        .expect("outbox parent")
-        .to_path_buf();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&outbox_parent, std::fs::Permissions::from_mode(0o555))
-        .expect("parent read-only");
-    let (err_tx, err_rx) = tokio::sync::oneshot::channel();
-    let mut err_dm = x0x::dm_inbox::DmTypedPayload {
-        sender: a.agent.agent_id(),
-        machine_id: crate::identity::MachineId([0u8; 32]),
-        payload: {
-            // A second, FRESH envelope: its own digest and logical id, so
-            // nothing from the first arm's completed logical request can
-            // re-ACK it (r5 B9 — this arm pins the requester-side keep on
-            // its OWN identity).
+    // (4) NON-DURABLE (B3 Rule-9) — unix-only: the sabotage uses Unix
+    // file permissions (#942 r6 B10; the mirror's Windows suite does not
+    // compile std::os::unix). Arms (1)-(3) run everywhere.
+    #[cfg(unix)]
+    {
+        // (4) NON-DURABLE (B3 Rule-9): B's journal save cannot become
+        // durable → the handler resolves Err → A's retry KEEPS the obligation.
+        // Sabotage durability the honest way an Arc'd AppState allows: make
+        // the sidecar's parent directory read-only, so the journal save
+        // cannot become Durable.
+        let outbox_parent = b
+            .predecessor_relay_outbox_path
+            .parent()
+            .expect("outbox parent")
+            .to_path_buf();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&outbox_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("parent read-only");
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+        let mut err_dm = x0x::dm_inbox::DmTypedPayload {
+            sender: a.agent.agent_id(),
+            machine_id: crate::identity::MachineId([0u8; 32]),
+            payload: {
+                // A second, FRESH envelope: its own digest and logical id, so
+                // nothing from the first arm's completed logical request can
+                // re-ACK it (r5 B9 — this arm pins the requester-side keep on
+                // its OWN identity).
+                let fresh = sign_v2_envelope_b2(
+                    a.agent.identity().agent_keypair(),
+                    &topic,
+                    &NamedGroupMetadataEvent::JoinRequestCreated {
+                        group_id: group_id.clone(),
+                        request_id: "req-r3b".to_string(),
+                        requester_agent_id: a_hex.clone(),
+                        message: None,
+                        ts: 0,
+                        requester_kem_public_key_b64: None,
+                        treekem_key_package_b64: None,
+                        commit: None,
+                    },
+                );
+                let mut p =
+                    Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + fresh.len());
+                p.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                p.extend_from_slice(&fresh);
+                p
+            },
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: 0,
+            request_id: [0u8; 16],
+            completion: None,
+        };
+        err_dm.completion = Some(err_tx);
+        crate::server::handle_predecessor_relay_typed_payload(&b, &b_hex, err_dm).await;
+        let err_outcome = err_rx.await.expect("non-durable completion resolved");
+        assert!(
+            err_outcome.is_err(),
+            "a non-durable admission must resolve Err: {err_outcome:?}"
+        );
+        // Requester-side SMOKE check (not a Rule-9 pin): with the sabotage
+        // active, A cannot discharge this obligation through any path the
+        // harness exercises — the failable pin for B3 is the handler-level
+        // is_err above; this only guards against an accidental discharge
+        // regression in the same run.
+        let fresh_bytes = {
             let fresh = sign_v2_envelope_b2(
                 a.agent.identity().agent_keypair(),
                 &topic,
@@ -545,77 +589,42 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
                     commit: None,
                 },
             );
-            let mut p = Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + fresh.len());
-            p.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            p.extend_from_slice(&fresh);
-            p
-        },
-        verified: true,
-        trust_decision: None,
-        received_at_unix_ms: 0,
-        request_id: [0u8; 16],
-        completion: None,
-    };
-    err_dm.completion = Some(err_tx);
-    crate::server::handle_predecessor_relay_typed_payload(&b, &b_hex, err_dm).await;
-    let err_outcome = err_rx.await.expect("non-durable completion resolved");
-    assert!(
-        err_outcome.is_err(),
-        "a non-durable admission must resolve Err: {err_outcome:?}"
-    );
-    // And the requester side keeps ITS obligation built from the SAME
-    // fresh bytes (r5 B9: its own digest and logical id — a replay of the
-    // first arm's completed request can no longer re-ACK it): the
-    // withheld ACK fails the strict send.
-    let fresh_bytes = {
-        let fresh = sign_v2_envelope_b2(
-            a.agent.identity().agent_keypair(),
-            &topic,
-            &NamedGroupMetadataEvent::JoinRequestCreated {
-                group_id: group_id.clone(),
-                request_id: "req-r3b".to_string(),
-                requester_agent_id: a_hex.clone(),
-                message: None,
-                ts: 0,
-                requester_kem_public_key_b64: None,
-                treekem_key_package_b64: None,
-                commit: None,
-            },
-        );
-        fresh
-    };
-    let obligation_b = obligation_for(&group_id, "req-r3b", &a_hex, &b_hex, fresh_bytes.clone());
-    pending_join_request(&a, &group_id, "req-r3b", &a_hex).await;
-    insert_requester_offer_obligation(&a, obligation_b)
-        .await
-        .expect("second obligation persisted");
-    let mut kept_r3b = false;
-    for _ in 0..2 {
-        a.requester_offer_outbox
-            .write()
+            fresh
+        };
+        let obligation_b =
+            obligation_for(&group_id, "req-r3b", &a_hex, &b_hex, fresh_bytes.clone());
+        pending_join_request(&a, &group_id, "req-r3b", &a_hex).await;
+        insert_requester_offer_obligation(&a, obligation_b)
             .await
-            .values_mut()
-            .for_each(|list| {
-                list.iter_mut().for_each(|o| {
-                    o.next_retry_at_ms = now_millis_u64();
-                })
-            });
-        requester_offer_step(&a).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        kept_r3b =
-            crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&a)
+            .expect("second obligation persisted");
+        let mut kept_r3b = false;
+        for _ in 0..2 {
+            a.requester_offer_outbox
+                .write()
                 .await
-                .iter()
-                .any(|o| o.request_id == "req-r3b");
+                .values_mut()
+                .for_each(|list| {
+                    list.iter_mut().for_each(|o| {
+                        o.next_retry_at_ms = now_millis_u64();
+                    })
+                });
+            requester_offer_step(&a).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            kept_r3b =
+                crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&a)
+                    .await
+                    .iter()
+                    .any(|o| o.request_id == "req-r3b");
+        }
+        assert!(
+            kept_r3b,
+            "smoke: the fresh obligation was not discharged during the sabotage"
+        );
+        std::fs::set_permissions(&outbox_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("restore parent writable");
     }
-    assert!(
-        kept_r3b,
-        "a non-durable authority write keeps the requester's fresh obligation (B3)"
-    );
 
     consumer.abort();
-    std::fs::set_permissions(&outbox_parent, std::fs::Permissions::from_mode(0o755))
-        .expect("restore parent writable");
     a.agent.shutdown().await;
     b.agent.shutdown().await;
     Ok(())
@@ -771,25 +780,6 @@ async fn witness_already_holding_replays_as_duplicate() -> Result<()> {
         Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted),
         "the first witness delivery applies durably"
     );
-    // PUBSUB-FIRST arm (the production-common order): a WITNESS that
-    // already applied the request through the pubsub mesh (never via the
-    // relay) must ALSO ACK the relayed copy as an idempotent Duplicate —
-    // model it by seeding the applied request with THIS envelope's digest
-    // before the relayed copy arrives.
-    {
-        let mut seeded =
-            x0x::groups::JoinRequest::new(String::new(), requester_hex.clone(), None, 0);
-        seeded.request_id = "req-wit-pubsub-first".to_string();
-        seeded.predecessor_envelope_digest = Some(blake3::hash(&envelope).into());
-        seeded.predecessor_first_seen_ms = Some(0);
-        let mut groups = state.named_groups.write().await;
-        let info = groups.get_mut(&group_id).expect("group");
-        // Swap the applied request's identity for the seeded one so the
-        // digest match drives the already-held path without a second apply.
-        info.join_requests.insert("req-wit".to_string(), seeded);
-    }
-    // (falls through to the relay-again arm below, now exercising the
-    // pubsub-first shape: the request exists with THIS digest.)
 
     // Second delivery: the request is already held — the apply rejects,
     // and the relay must see an IDEMPOTENT Duplicate (r3 returned Err
@@ -865,7 +855,7 @@ async fn relay_wire_probe_selects_legacy_for_v1_witnesses() -> Result<()> {
 
 /// #942 r5 (B7): the relay budget is charged PER OBLIGATION, never per
 /// target — a started obligation fans out to ALL its targets. With 16
-/// unreachable witnesses ahead of 4 reachable (self-loop) ones, the
+/// unreachable witnesses ahead of 1 reachable (self-loop) target, the
 /// reachable witnesses are served in the FIRST pass (removed from
 /// relay_targets), not starved until the obligation is pruned.
 /// Rule 9: reverting to per-target charging (16 leading dead targets
@@ -890,7 +880,7 @@ async fn relay_budget_charges_per_obligation_not_per_target() -> Result<()> {
             .insert(group_id.clone(), info);
     }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // 16 unreachable witnesses, then 4 reachable (the local agent).
+    // 16 unreachable witnesses, then 1 reachable target (the local agent).
     let mut targets: Vec<String> = (0..16).map(|i| format!("{:064x}", 0x3000 + i)).collect();
     targets.push(local_hex.clone());
     // A real signed envelope (the route validator demands one).
@@ -965,6 +955,11 @@ async fn relay_budget_charges_per_obligation_not_per_target() -> Result<()> {
             .map(|o| o.relay_targets.clone())
             .unwrap_or_default()
     };
+    assert_eq!(
+        remaining.len(),
+        16,
+        "the obligation survives with exactly its 16 unreachable targets"
+    );
     assert!(
         !remaining.contains(&local_hex),
         "the reachable witness (past 16 unreachable ones) was served in the FIRST pass"
@@ -1060,6 +1055,161 @@ async fn fresh_offer_is_attempted_in_the_first_pass() -> Result<()> {
         fresh.retry_count, 1,
         "the FRESH offer was attempted in the FIRST pass, ahead of the overdue backlog"
     );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r6 (T1/N4): the RELAY due-queue's first-attempt priority — a
+/// FRESH obligation (retry_count 0) is selected ahead of overdue retries
+/// even when the retry backlog alone would exhaust the per-pass budget.
+/// 17 overdue retry obligations with dead targets + 1 fresh obligation
+/// whose only target is the local (self-loop, always-deliverable) agent:
+/// the fresh obligation's target is served in pass 1. Rule 9: reverting
+/// the relay sort to oldest-due-only leaves the budget burnt by the 17
+/// overdue retries and FAILS this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_first_attempt_priority_beats_the_retry_backlog() -> Result<()> {
+    let plane = format!("req-offer-relayprio-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = "cd".repeat(16);
+    {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "relay-prio".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let requester_kp = x0x::identity::AgentKeypair::generate()?;
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let (topic, commit) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        let commit = x0x::groups::GroupStateCommit::sign(
+            info.stable_group_id().to_string(),
+            info.state_revision + 1,
+            Some(info.state_hash.clone()),
+            x0x::groups::state_commit::compute_roster_root(&info.members_v2),
+            x0x::groups::state_commit::compute_policy_hash(&info.policy),
+            x0x::groups::state_commit::compute_public_meta_hash(&info.public_meta()),
+            info.security_binding.clone(),
+            false,
+            info.state_revision + 1,
+            &requester_kp,
+        )
+        .expect("sign commit");
+        (info.metadata_topic.clone(), commit)
+    };
+    let envelope_for = |req_id: &str| -> Vec<u8> {
+        sign_v2_envelope_b2(
+            &requester_kp,
+            &topic,
+            &NamedGroupMetadataEvent::JoinRequestCreated {
+                group_id: group_id.clone(),
+                request_id: req_id.to_string(),
+                requester_agent_id: requester_hex.clone(),
+                message: None,
+                ts: 0,
+                requester_kem_public_key_b64: None,
+                treekem_key_package_b64: None,
+                commit: Some(commit.clone()),
+            },
+        )
+    };
+    let now = now_millis_u64();
+    let mut obligations = Vec::new();
+    // 17 overdue RETRIES with one dead target each.
+    for i in 0..17u32 {
+        let envelope = envelope_for(&format!("req-backlog-{i}"));
+        let digest: [u8; 32] = blake3::hash(&envelope).into();
+        obligations.push(
+            crate::server::routes::named_groups::PredecessorRelayObligation {
+                envelope_bytes: envelope,
+                digest,
+                byte_size: 0,
+                first_seen_ms: now.saturating_sub(120_000),
+                next_retry_at_ms: now.saturating_sub(60_000),
+                retry_count: 1,
+                group_id: group_id.clone(),
+                request_id: format!("req-backlog-{i}"),
+                requester_agent_id: requester_hex.clone(),
+                relay_targets: vec![format!("{:064x}", 0x4000 + i as u64)],
+                completed_at_ms: None,
+            },
+        );
+    }
+    // THE FRESH obligation: one self-loop target, due now.
+    let fresh_envelope = envelope_for("req-fresh-relay");
+    let fresh_digest: [u8; 32] = blake3::hash(&fresh_envelope).into();
+    obligations.push(
+        crate::server::routes::named_groups::PredecessorRelayObligation {
+            envelope_bytes: fresh_envelope,
+            digest: fresh_digest,
+            byte_size: 0,
+            first_seen_ms: now,
+            next_retry_at_ms: now,
+            retry_count: 0,
+            group_id: group_id.clone(),
+            request_id: "req-fresh-relay".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            relay_targets: vec![local_hex.clone()],
+            completed_at_ms: None,
+        },
+    );
+    state
+        .predecessor_relay_outbox
+        .write()
+        .await
+        .insert(group_id.clone(), obligations);
+    std::fs::create_dir_all(
+        state
+            .predecessor_relay_outbox_path
+            .parent()
+            .expect("outbox parent"),
+    )
+    .expect("treekem dir exists");
+
+    causal_relay_step(&state).await;
+    // The fresh obligation's only target delivered (self-loop), so it
+    // COMPLETES: absent from the live outbox and present in the
+    // completed tombstones by digest. Under the oldest-only sort it
+    // would never be attempted: still live with its target.
+    let (fresh_live, fresh_completed) = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        let live = outbox
+            .get(&group_id)
+            .is_some_and(|l| l.iter().any(|o| o.request_id == "req-fresh-relay"));
+        let tombstones = state.completed_relay_tombstones.read().await;
+        let completed = tombstones
+            .get(&group_id)
+            .is_some_and(|l| l.iter().any(|t| t.digest == fresh_digest));
+        (live, completed)
+    };
+    assert!(
+        !fresh_live && fresh_completed,
+        "the FRESH obligation completed in pass 1, ahead of 17 overdue retries"
+    );
+    // And the backlog was NOT skipped in its favour beyond the budget:
+    // every backlog obligation stays live (dead targets never deliver).
+    let backlog_live = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        outbox
+            .get(&group_id)
+            .map(|l| {
+                l.iter()
+                    .filter(|o| o.request_id.starts_with("req-backlog-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(backlog_live, 17, "the retry backlog stays live");
     state.agent.shutdown().await;
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! holds the verbatim handler bodies and request/response DTOs for one
 //! registry category; the router wiring stays in the parent module.
 
+pub(super) mod calls;
 mod connect;
 mod contacts;
 mod direct;
