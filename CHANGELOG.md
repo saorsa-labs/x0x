@@ -15,10 +15,14 @@ All notable changes to this project will be documented in this file.
   expiry or 7 days after queueing. Bounds: 128 entries per grantee, 1024 in
   total; past a bound the entry is refused and reported, and an over-bound
   file loads fail-closed rather than truncated. `POST /grants` delivery rows
-  gain `queued`; `GET /grants` reports `outbox_error`. `DELETE /grants/:id`
-  is serialized with in-flight redeliveries and now answers `503` unless
-  both `revocations-v3.bin` (now written durably) and the outbox removal
-  are durable (retry is idempotent). No wire change: retries re-send the #924
+  gain `queued`; `GET /grants` reports `outbox_error`. Every share-grant
+  revocation source (local `DELETE /grants/:id`, the `x0x.revocation.v3`
+  carrier, and share-grant records on the v1/v2 carriers) is serialized
+  with in-flight redeliveries. `DELETE /grants/:id` now answers `503` unless
+  both `revocations-v3.bin` and the outbox removal are durable (retry is
+  idempotent). `revocations-v3.bin` is now written durably and
+  monotonically: every writer re-reads and unions the file under one lock,
+  so an older snapshot can no longer erase a newer revocation. No wire change: retries re-send the #924
   typed DM with the same logical request id, so the receiving side is
   unchanged.
 

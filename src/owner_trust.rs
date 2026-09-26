@@ -110,6 +110,35 @@ impl OwnerTrust {
         *slot = Some(outbox);
     }
 
+    /// ADR-0070 §2 / #926: the barrier every path must hold while it makes
+    /// a share-grant revocation effective, so a redelivery pass can never
+    /// send a grant after its revocation took effect (see
+    /// [`crate::share_grant::outbox`]). `None` — no barrier needed — when no
+    /// outbox is installed or none of `records` is a share-grant revocation
+    /// not already in `revocation_set` (the pre-check keeps periodic
+    /// re-publishes of known records from waiting on an in-flight pass).
+    pub async fn share_grant_revocation_barrier<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a crate::revocation::RevocationRecord>,
+        revocation_set: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    ) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let outbox = self.share_grant_outbox()?;
+        let needs_barrier = {
+            let set = revocation_set.read().await;
+            records.into_iter().any(|record| {
+                matches!(
+                    record.subject,
+                    crate::revocation::RevokedSubject::ShareGrant(_)
+                ) && !set.contains_hash(&record.record_hash())
+            })
+        };
+        if needs_barrier {
+            Some(outbox.revocation_barrier().await)
+        } else {
+            None
+        }
+    }
+
     /// The installed grant redelivery outbox, if any.
     #[must_use]
     pub fn share_grant_outbox(
