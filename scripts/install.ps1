@@ -15,14 +15,14 @@
 #   5. Optionally starts x0xd (-Start)
 #
 # Signature verification needs gpg.exe (Gpg4win, or the copy bundled with Git
-# for Windows). Without it the installer stops unless -SkipSignature is given;
-# the SHA-256 checksum is always verified.
+# for Windows). As in install.sh, the SHA-256 checksum is always verified; if
+# gpg is absent the installer prints a loud warning and continues on the
+# checksum alone.
 
 param(
     [string]$Version = "latest",
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "x0x\bin"),
     [switch]$Start,
-    [switch]$SkipSignature,
     # Accepted for compatibility; the installer never prompts.
     [switch]$Yes
 )
@@ -132,12 +132,16 @@ try {
         Get-Download "$BaseUrl/SAORSA_PUBLIC_KEY.asc" (Join-Path $Tmp "SAORSA_PUBLIC_KEY.asc")
         Test-ReleaseSignature $gpg $zip "$zip.asc" (Join-Path $Tmp "SAORSA_PUBLIC_KEY.asc") $Tmp
         Write-Host "  GPG signature verified ($TrustedFingerprint)" -ForegroundColor Green
-    } elseif ($SkipSignature) {
-        Write-Warning "gpg not found and -SkipSignature given: installing with checksum verification only."
     } else {
-        throw ("gpg.exe not found, so the release signature cannot be verified. " +
-            "Install Gpg4win (https://gpg4win.org) or Git for Windows, or re-run with -SkipSignature " +
-            "to accept checksum-only verification.")
+        # Same policy and wording as install.sh: warn loudly, continue on checksum.
+        Write-Host ""
+        Write-Host "################################################################" -ForegroundColor Yellow
+        Write-Host "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" -ForegroundColor Yellow
+        Write-Host "# Only the SHA-256 checksum was checked, and that checksum was #" -ForegroundColor Yellow
+        Write-Host "# downloaded from the same place as the archive. Install gpg   #" -ForegroundColor Yellow
+        Write-Host "# and re-run to verify this release was signed by Saorsa Labs. #" -ForegroundColor Yellow
+        Write-Host "################################################################" -ForegroundColor Yellow
+        Write-Host ""
     }
 
     # ── Extract ─────────────────────────────────────────────────────────────
