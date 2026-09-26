@@ -123,6 +123,63 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
     /// The listener skips a sealed record as our own echo only when the
     /// envelope sender is this agent (the outer peer tag is unauthenticated).
     fn local_agent(&self) -> Option<AgentId>;
+
+    /// #975: called after [`seal`](Self::seal) and immediately before the
+    /// sealed `body` is published. Answers whether `body` is still sealed
+    /// under the group's CURRENT epoch and, if so, returns a permit that
+    /// keeps the epoch from moving until it is dropped. The sync loop holds
+    /// the permit through the publish call, so a member removal that commits
+    /// between seal and publish can never let a pre-removal record out: the
+    /// loop sees [`TaskPublication::Stale`] and re-seals instead.
+    ///
+    /// Deliberately has no default: an unconditional confirmation is
+    /// fail-open for any protector that resolves a live group key, so every
+    /// implementor must decide. Only a protector whose key can never change
+    /// (a fixed snapshot) may confirm with [`TaskPublicationPermit::none`].
+    fn confirm_publication<'a>(
+        &'a self,
+        body: &'a SealedTaskRecordBody,
+    ) -> TaskSealFuture<'a, TaskPublication>;
+}
+
+/// Holds whatever keeps a group's epoch fixed while a sealed task record is
+/// published (#975). Dropping it releases the epoch.
+pub struct TaskPublicationPermit {
+    held: Option<Box<dyn Send>>,
+}
+
+impl TaskPublicationPermit {
+    /// A permit that holds nothing.
+    #[must_use]
+    pub fn none() -> Self {
+        Self { held: None }
+    }
+
+    /// A permit that keeps `guard` alive until the permit is dropped.
+    #[must_use]
+    pub fn holding(guard: impl Send + 'static) -> Self {
+        Self {
+            held: Some(Box::new(guard)),
+        }
+    }
+}
+
+impl std::fmt::Debug for TaskPublicationPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskPublicationPermit")
+            .field("holds", &self.held.is_some())
+            .finish()
+    }
+}
+
+/// Outcome of [`TaskDeltaProtector::confirm_publication`] (#975).
+#[derive(Debug)]
+pub enum TaskPublication {
+    /// Still sealed under the current epoch: publish while holding the permit.
+    Current(TaskPublicationPermit),
+    /// The epoch moved after the seal: the record must not be published and
+    /// the payload is sealed again.
+    Stale,
 }
 
 /// Deterministic id a group task list seals under, shared by every member.

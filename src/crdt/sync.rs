@@ -16,7 +16,7 @@
 use crate::crdt::persistence::TaskListStorage;
 use crate::crdt::sealed::{
     decode_sealed_task_record, encode_sealed_task_record, SealedTaskRecordBody, TaskDeltaProtector,
-    TaskSealRejection,
+    TaskPublication, TaskSealRejection,
 };
 use crate::crdt::{Result, TaskList, TaskListDelta, TaskListId};
 use crate::gossip::wire::{decode_delta, encode_delta};
@@ -190,22 +190,79 @@ impl Drop for BootstrapGuard {
     }
 }
 
-/// #895: the main-topic bytes for `plain` (an encoded `(PeerId, delta)`).
-/// Without a protector, or for a signed-public group, that is `plain` itself;
-/// otherwise a sealed record. Never falls back to plaintext on a seal error.
-async fn seal_for_wire(
+/// #975: how many times a payload is re-sealed when the group's epoch moves
+/// between seal and publish before the publish is refused.
+const TASK_SEAL_ATTEMPTS: usize = 3;
+
+/// #975: bound on confirming a sealed record's epoch plus the publish call it
+/// guards. The protector's permit can hold the group's roster commits off, so
+/// a stalled pub/sub call must not hold it indefinitely (cancelling the
+/// publish future drops it before the permit).
+const TASK_SEALED_PUBLISH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn publish_err(e: impl std::fmt::Display) -> crate::crdt::CrdtError {
+    crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
+}
+
+/// #895/#975: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
+///
+/// Without a protector, or for a signed-public group, `plain` is published
+/// as is. Otherwise it is sealed, the protector confirms the seal is still
+/// under the group's CURRENT epoch, and the sealed record is published while
+/// the protector's permit holds that epoch fixed. A member removal that
+/// commits after the seal makes the confirmation `Stale` and the payload is
+/// sealed again, so a record under a pre-removal epoch is never published
+/// after the removal. Never falls back to plaintext on a seal error.
+async fn seal_and_publish(
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
+    pubsub: &PubSubManager,
+    topic: &str,
     local_peer_id: PeerId,
     kind: KvMutationKind,
     plain: Vec<u8>,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let Some(protector) = protector else {
-        return Ok(plain);
+        return pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(plain))
+            .await
+            .map_err(publish_err);
     };
-    match protector.seal(kind, &plain).await? {
-        None => Ok(plain),
-        Some(body) => encode_sealed_task_record(local_peer_id, body),
+    for _ in 0..TASK_SEAL_ATTEMPTS {
+        // The seal runs with no permit held: the protector's seal may take
+        // the same group locks the permit does (not re-entrant).
+        let Some(body) = protector.seal(kind, &plain).await? else {
+            return pubsub
+                .publish(topic.to_string(), bytes::Bytes::from(plain))
+                .await
+                .map_err(publish_err);
+        };
+        let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
+            match protector.confirm_publication(&body).await? {
+                TaskPublication::Stale => Ok(false),
+                TaskPublication::Current(permit) => {
+                    let wire = encode_sealed_task_record(local_peer_id, body.clone())?;
+                    let published = pubsub
+                        .publish(topic.to_string(), bytes::Bytes::from(wire))
+                        .await
+                        .map_err(publish_err);
+                    drop(permit);
+                    published.map(|()| true)
+                }
+            }
+        })
+        .await
+        .map_err(|_| publish_err("sealed publish exceeded its deadline"))?;
+        if guarded? {
+            return Ok(());
+        }
+        tracing::debug!(
+            topic,
+            "group epoch moved after sealing a task delta; re-sealing (#975)"
+        );
     }
+    Err(crate::crdt::CrdtError::Gossip(format!(
+        "group epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; task delta not published"
+    )))
 }
 
 /// #895: whether a plaintext delta may be merged on a protected list — only
@@ -1906,26 +1963,20 @@ impl TaskListSync {
                                 continue;
                             };
                             // #895: the cold-start serve carries the whole
-                            // list, so it is sealed exactly like a delta.
-                            let serialized = match seal_for_wire(
+                            // list, so it is sealed exactly like a delta —
+                            // and, #975, published only under the epoch it
+                            // was sealed with.
+                            if let Err(e) = seal_and_publish(
                                 responder_protector.as_ref(),
+                                &responder_pubsub,
+                                &responder_topic,
                                 local_peer_id,
                                 KvMutationKind::FullState,
                                 plain,
                             )
                             .await
                             {
-                                Ok(sealed) => sealed,
-                                Err(e) => {
-                                    tracing::warn!("TaskList state-response seal failed: {e}");
-                                    continue;
-                                }
-                            };
-                            if let Err(e) = responder_pubsub
-                                .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
-                                .await
-                            {
-                                tracing::warn!("TaskList state-response publish failed: {e}");
+                                tracing::warn!("TaskList state-response seal/publish failed: {e}");
                                 continue;
                             }
                             last_full_response = Some(tokio::time::Instant::now());
@@ -2228,20 +2279,17 @@ impl TaskListSync {
         })?;
         // #895: sealed under the group key when a protector is installed; a
         // seal failure publishes nothing rather than falling back to plaintext.
-        let serialized = seal_for_wire(
+        // #975: a sealed record is published only under the epoch it was
+        // sealed with (re-sealed if a roster commit moved it).
+        seal_and_publish(
             self.protector.get(),
+            &self.pubsub,
+            &self.topic,
             local_peer_id,
             KvMutationKind::Delta,
             plain,
         )
-        .await?;
-
-        self.pubsub
-            .publish(self.topic.clone(), bytes::Bytes::from(serialized))
-            .await
-            .map_err(|e| crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}")))?;
-
-        Ok(())
+        .await
     }
 
     /// Arm on-disk snapshot persistence for this list.
@@ -2740,6 +2788,18 @@ mod tests {
         fn local_agent(&self) -> Option<AgentId> {
             Some(self.signing.agent_id)
         }
+
+        /// A fixed `GroupInfo` snapshot: its epoch can never move.
+        fn confirm_publication<'a>(
+            &'a self,
+            _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, TaskPublication> {
+            Box::pin(async {
+                Ok(TaskPublication::Current(
+                    crate::crdt::sealed::TaskPublicationPermit::none(),
+                ))
+            })
+        }
     }
 
     /// An MlsEncrypted GSS group whose creator (and only active member) is
@@ -3068,7 +3128,7 @@ mod tests {
     /// wire, and the state-sync responder serves nothing (no broadcast, no
     /// marker).
     ///
-    /// Mutation check: `Err(_) => Ok(plain)` in `seal_for_wire` makes
+    /// Mutation check: an `Err(_)` plaintext fallback in `seal_and_publish` makes
     /// `publish_delta` return `Ok` (the `is_err()` assertion fails) and puts
     /// the plaintext pair on the topic (the "nothing published" assertion
     /// fails); the responder would broadcast the full list and its markers.

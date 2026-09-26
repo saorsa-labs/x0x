@@ -51,7 +51,7 @@ pub use provenance::{
     canonical_op_bytes, purge_unattested_elements, sign_attestation, verify_attestation,
     OpAttestation, OpKind, CLAIM_DOMAIN, COMPLETE_DOMAIN,
 };
-pub use sealed::{TaskDeltaProtector, TaskSealRejection};
+pub use sealed::{TaskDeltaProtector, TaskPublication, TaskPublicationPermit, TaskSealRejection};
 pub use sync::{
     AuthorizedRoster, StateServeGate, TaskIngestGate, TaskIngestGateSlot, TaskListSync,
     TASK_QUARANTINE_BUFFER_MAX_BYTES, TASK_QUARANTINE_BUFFER_MAX_DELTAS,
