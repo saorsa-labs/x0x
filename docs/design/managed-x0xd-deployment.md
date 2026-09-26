@@ -190,7 +190,7 @@ Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
 6. After approval and testnet soak, perform controlled fleet restarts with
    preflight/postflight receipts. Retain `--name testnet`.
 7. Identify the exact Obsidian target and governing sync rule, then perform
-   the `tests/CLAUDE.md` sync as post-merge housekeeping.
+   the `tests/AGENTS.md` sync as post-merge housekeeping.
 
 ---
 

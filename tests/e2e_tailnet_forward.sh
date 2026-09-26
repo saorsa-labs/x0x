@@ -20,7 +20,7 @@
 #     other (so the T1 identity gate clears).
 #   * B's connect ACL ($CONNECT_ACL on B) lists an allow entry for A's
 #     (agent_id, machine_id) → 127.0.0.1:$ECHO_PORT.
-#   * SSH access to both (tests/CLAUDE.md SSH notes: ControlMaster=no,
+#   * SSH access to both (tests/AGENTS.md SSH notes: ControlMaster=no,
 #     BatchMode=yes). API tokens at /root/.local/share/x0x/api-token.
 #   * `socat` on B for the echo service (or set ECHO_CMD).
 #
