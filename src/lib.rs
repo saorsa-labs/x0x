@@ -3896,7 +3896,12 @@ where
             .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
     }
     let mut lock_path = path.as_os_str().to_owned();
-    lock_path.push(".lock");
+    // RED PROOF (ci-redproof only): a per-call lock file never contends.
+    static RED_LOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    lock_path.push(format!(
+        ".{}.lock",
+        RED_LOCK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _lock = file_lock::lock_exclusive_with_retry(
         std::path::Path::new(&lock_path),
         std::time::Duration::from_millis(20),
