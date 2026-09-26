@@ -68,6 +68,14 @@ pub const SHARE_GRANT_FETCH_DM_PREFIX: &[u8] = b"x0x-sharegrant-fetch-v1\0";
 /// Response wire: `SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX ‖ grant_dm_payload`
 /// (the SAME signed wire form a direct delivery carries, so one verifier
 /// serves both paths).
+/// #967 r3 (B3): the grantee-side ATTACHMENT frame of ADR-0070 par 2 —
+/// prefix + bincode(Vec<grant_id>) (at most 32 ids), sent alongside a DM
+/// open so a daemon that missed a delivery can request the grants.
+pub const SHARE_GRANT_HINT_DM_PREFIX: &[u8] = b"x0x-sharegrant-hint-v1\0";
+/// Cap on ids one hint frame carries (and the receiver decodes).
+pub const SHARE_GRANT_HINT_MAX_IDS: usize = 32;
+/// How often the grantee re-attaches hints for one recipient.
+pub const SHARE_GRANT_HINT_INTERVAL_MS: u64 = 30_000;
 pub const SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX: &[u8] = b"x0x-sharegrant-fetch-response-v1\0";
 /// How long a fetch this node sent stays "in flight" (the only responses
 /// accepted for that id) and how long a re-fetch is suppressed.
@@ -501,6 +509,8 @@ pub struct ShareGrantStore {
     /// #967 B2: last time this peer's fetch was served (the per-peer
     /// rate limit). Swept + capped like the in-flight map.
     fetch_peer_served: std::sync::Mutex<std::collections::HashMap<AgentId, std::time::Instant>>,
+    /// #967 r3: last time hints were attached for one recipient.
+    hint_sent: std::sync::Mutex<std::collections::HashMap<AgentId, std::time::Instant>>,
 }
 
 impl ShareGrantStore {
@@ -516,6 +526,7 @@ impl ShareGrantStore {
             load_error: None,
             fetch_in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
             fetch_peer_served: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hint_sent: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -659,6 +670,29 @@ impl ShareGrantStore {
             }
         }
         map.insert(*grant_id, now);
+        true
+    }
+
+    /// #967 r3: rate-limit hint attachment per recipient. Returns true
+    /// when a hint may be sent now (one per peer per 30 s window).
+    pub fn note_hint_sent(&self, peer: &AgentId) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self
+            .hint_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, at| {
+            (now.duration_since(*at).as_millis() as u64) < SHARE_GRANT_HINT_INTERVAL_MS
+        });
+        if map.contains_key(peer) {
+            return false;
+        }
+        if map.len() >= GRANT_FETCH_MAX_ENTRIES {
+            if let Some(oldest) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(*peer, now);
         true
     }
 
@@ -1063,7 +1097,7 @@ pub struct GrantFetchOutcome {
 /// leaks nothing, and a stranger gets nothing. A grant this daemon does
 /// not hold resolves Err (transient: the fetch may precede the owner's
 /// delivery here), which withholds the v2 ACK so the sender retries.
-/// #967 B1: how the fetch handlers ask "is this grant revoked". The
+/// How the fetch handlers ask "is this grant revoked" (#967 B1). The
 /// daemon wiring passes a closure over its revocation set; tests pass a
 /// predicate over known-revoked ids.
 pub type GrantRevoked<'a> = &'a (dyn Fn(&ShareGrant) -> bool + Send + Sync);
@@ -1117,7 +1151,28 @@ pub async fn handle_share_grant_fetch(
                             }
                         }
                         Some(grant) => {
-                            if !grant.agents.contains(&sender) {
+                            if store.classify(&grant) != Some(GrantRole::Issued) {
+                                // #967 r3 (B1, design b): ONLY an owner install
+                                // (this daemon's owner == the grant's signer)
+                                // may serve a fetch. A GRANTEE-held (Received)
+                                // grant is never served: a hostile or stale
+                                // grantee must not be able to push grants —
+                                // least of all ones the requester's missed
+                                // revocations for. Owner installs are the
+                                // revocation source, so fetching from them
+                                // bounds the offline-through-revocation window
+                                // to the owner's own v3 propagation.
+                                tracing::warn!(
+                                    grant_id = %hex::encode(grant_id),
+                                    "#967: fetch served only by owner installs; this holder is not one; refused"
+                                );
+                                GrantFetchOutcome {
+                                    result: Err(
+                                        "fetches are served only by owner installs".to_string()
+                                    ),
+                                    reply: None,
+                                }
+                            } else if !grant.agents.contains(&sender) {
                                 tracing::warn!(
                                     sender = %hex::encode(sender.as_bytes()),
                                     grant_id = %hex::encode(grant_id),
@@ -1208,65 +1263,174 @@ fn parse_fetch_request(payload: &[u8]) -> Result<[u8; 32], String> {
 /// path (verify, classify, durable persist — exactly what a direct
 /// delivery runs) succeeds. The path is idempotent, and the in-flight
 /// window closes on success.
+/// The decoded, window-checked half of a fetch response (#967 r3): no
+/// revocation decision, no store mutation — so the DAEMON can evaluate
+/// revocation under a scoped guard and DROP it before the accept await.
+pub struct PreparedGrantFetch {
+    pub grant: ShareGrant,
+    pub completion: Option<tokio::sync::oneshot::Sender<DmTypedPayloadCompletionResult>>,
+    /// The store carried the in-flight window for this id.
+    pub window_open: bool,
+}
+
+impl PreparedGrantFetch {
+    /// Convenience for callers WITHOUT a daemon revocation set (tests):
+    /// run the revocation check and the accept in one call.
+    pub async fn finish_with(
+        self,
+        store: Option<&ShareGrantStore>,
+        revoked: Option<GrantRevoked<'_>>,
+        now_unix: u64,
+    ) -> DmTypedPayloadCompletionResult {
+        finish_share_grant_fetch_response(store, self, revoked, now_unix).await
+    }
+}
+
+/// Decode and window-check one fetch response. Errors are terminal
+/// outcomes (resolved to the completion when present).
+pub async fn prepare_share_grant_fetch_response(
+    store: Option<&ShareGrantStore>,
+    typed: DmTypedPayload,
+) -> Result<PreparedGrantFetch, DmTypedPayloadCompletionResult> {
+    let DmTypedPayload {
+        payload,
+        completion,
+        ..
+    } = typed;
+    let err =
+        |reason: String,
+         completion: Option<tokio::sync::oneshot::Sender<DmTypedPayloadCompletionResult>>| {
+            if let Some(tx) = completion {
+                let _ = tx.send(Err(reason.clone()));
+            }
+            Err(Err(reason))
+        };
+    let Some(store) = store else {
+        return err(
+            "share grants are not enabled on this daemon".to_string(),
+            completion,
+        );
+    };
+    let Some(grant_payload) = payload.strip_prefix(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX) else {
+        return err(
+            "share-grant fetch response missing its prefix".to_string(),
+            completion,
+        );
+    };
+    if grant_payload.len() > GRANT_FETCH_REPLY_MAX_BYTES {
+        // B2 nit: the size bound runs BEFORE the decode.
+        return err(
+            format!(
+                "grant fetch response {} bytes exceeds the {}-byte bound",
+                grant_payload.len(),
+                GRANT_FETCH_REPLY_MAX_BYTES
+            ),
+            completion,
+        );
+    }
+    let grant = match ShareGrant::from_dm_payload(grant_payload) {
+        Ok(grant) => grant,
+        Err(e) => return err(e.to_string(), completion),
+    };
+    if !store.is_fetch_in_flight(&grant.grant_id) {
+        tracing::warn!(
+            grant_id = %hex::encode(grant.grant_id),
+            "#926: grant fetch response for an id we did not request; dropped"
+        );
+        return err(
+            "no share-grant fetch in flight for this id".to_string(),
+            completion,
+        );
+    }
+    Ok(PreparedGrantFetch {
+        grant,
+        completion,
+        window_open: true,
+    })
+}
+
+/// The revocation + accept half. The caller has already dropped any
+/// revocation-set guard: `revoked` here must not hold one across this
+/// await (the store's write lock and disk persist run inside).
+pub async fn finish_share_grant_fetch_response(
+    store: Option<&ShareGrantStore>,
+    prepared: PreparedGrantFetch,
+    revoked: Option<GrantRevoked<'_>>,
+    now_unix: u64,
+) -> DmTypedPayloadCompletionResult {
+    let PreparedGrantFetch {
+        grant,
+        completion,
+        window_open,
+    } = prepared;
+    if !window_open {
+        let reason = "no share-grant fetch in flight for this id".to_string();
+        if let Some(tx) = completion {
+            let _ = tx.send(Err(reason.clone()));
+        }
+        return Err(reason);
+    }
+    if revoked.is_some_and(|is_revoked| is_revoked(&grant)) {
+        tracing::warn!(
+            grant_id = %hex::encode(grant.grant_id),
+            "#967: fetched grant is revoked here; not stored"
+        );
+        let reason = "grant is revoked".to_string();
+        if let Some(tx) = completion {
+            let _ = tx.send(Err(reason.clone()));
+        }
+        return Err(reason);
+    }
+    let grant_id = grant.grant_id;
+    let outcome = match store {
+        None => Err("share grants are not enabled on this daemon".to_string()),
+        Some(store) => store
+            .accept(grant, now_unix)
+            .await
+            .map_err(|e| e.to_string()),
+    };
+    if outcome.is_ok() {
+        if let Some(store) = store {
+            store.clear_fetch(&grant_id);
+        }
+    }
+    if let Some(tx) = completion {
+        let _ = tx.send(outcome.clone());
+    }
+    outcome
+}
+
+/// Composed form (prepare + finish in one call) for callers that do not
+/// need to interleave a scoped revocation guard (tests, tooling).
 pub async fn handle_share_grant_fetch_response(
     store: Option<&ShareGrantStore>,
     revoked: Option<GrantRevoked<'_>>,
     now_unix: u64,
     typed: DmTypedPayload,
 ) -> DmTypedPayloadCompletionResult {
-    let DmTypedPayload {
-        payload,
-        completion,
-        ..
-    } = typed;
-    let result = match store {
-        None => Err("share grants are not enabled on this daemon".to_string()),
-        Some(store) => match payload.strip_prefix(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX) {
-            None => Err("share-grant fetch response missing its prefix".to_string()),
-            Some(grant_payload) => match ShareGrant::from_dm_payload(grant_payload) {
-                Err(e) => Err(e.to_string()),
-                Ok(grant) => {
-                    if grant_payload.len() > GRANT_FETCH_REPLY_MAX_BYTES {
-                        Err(format!(
-                            "grant fetch response {} bytes exceeds the {}-byte bound",
-                            grant_payload.len(),
-                            GRANT_FETCH_REPLY_MAX_BYTES
-                        ))
-                    } else if revoked.is_some_and(|is_revoked| is_revoked(&grant)) {
-                        // B1: the requester refuses a REVOKED grant too —
-                        // it may have been revoked while our fetch was in
-                        // flight.
-                        tracing::warn!(
-                            grant_id = %hex::encode(grant.grant_id),
-                            "#967: fetched grant is revoked here; not stored"
-                        );
-                        Err("grant is revoked".to_string())
-                    } else if !store.is_fetch_in_flight(&grant.grant_id) {
-                        tracing::warn!(
-                            grant_id = %hex::encode(grant.grant_id),
-                            "#926: grant fetch response for an id we did not request; dropped"
-                        );
-                        Err("no share-grant fetch in flight for this id".to_string())
-                    } else {
-                        let grant_id = grant.grant_id;
-                        let outcome = store
-                            .accept(grant, now_unix)
-                            .await
-                            .map_err(|e| e.to_string());
-                        if outcome.is_ok() {
-                            // The window served its purpose.
-                            store.clear_fetch(&grant_id);
-                        }
-                        outcome
-                    }
-                }
-            },
-        },
-    };
-    if let Some(tx) = completion {
-        let _ = tx.send(result.clone());
+    match prepare_share_grant_fetch_response(store, typed).await {
+        Err(result) => result,
+        Ok(prepared) => finish_share_grant_fetch_response(store, prepared, revoked, now_unix).await,
     }
-    result
+}
+
+/// Encode a hint frame: prefix + bincode(Vec<grant_id>).
+pub fn share_grant_hint_payload(ids: &[[u8; 32]]) -> Vec<u8> {
+    let capped: Vec<[u8; 32]> = ids.iter().copied().take(SHARE_GRANT_HINT_MAX_IDS).collect();
+    let body = bincode::serialize(&capped).unwrap_or_default();
+    let mut p = Vec::with_capacity(SHARE_GRANT_HINT_DM_PREFIX.len() + body.len());
+    p.extend_from_slice(SHARE_GRANT_HINT_DM_PREFIX);
+    p.extend_from_slice(&body);
+    p
+}
+
+/// Decode a hint frame body (prefix already stripped by the route).
+pub fn decode_share_grant_hint(body: &[u8]) -> Vec<[u8; 32]> {
+    bincode::deserialize::<Vec<[u8; 32]>>(body)
+        .unwrap_or_default()
+        .into_iter()
+        .take(SHARE_GRANT_HINT_MAX_IDS)
+        .collect()
 }
 
 /// Send-layer retries for one grant delivery. Every retry reuses the same
@@ -1574,7 +1738,7 @@ impl crate::Agent {
     /// stream to a shared agent, so a daemon that missed delivery can
     /// request them (ADR-0070 §2). Callers attach these to their open
     /// frames; the shared daemon feeds each id to
-    /// [`Agent::request_share_grant_fetch`].
+    /// request_share_grant_fetch (see the Agent impl above).
     pub fn held_grant_ids_for(&self, shared_agent: &AgentId) -> Vec<[u8; 32]> {
         let Some(store) = self.share_grant_store() else {
             return Vec::new();
@@ -1586,6 +1750,51 @@ impl crate::Agent {
             .filter(|g| g.agents.contains(shared_agent) && g.is_active_at(now))
             .map(|g| g.grant_id)
             .collect()
+    }
+
+    /// #967 r3 (B3): the DM-open attachment. After a successful DM to
+    /// `to`, send (spawned, off the hot path) the grant ids this grantee
+    /// holds for that shared agent, rate-limited per recipient — the
+    /// ADR-0070 par-2 "attaches the grant grant_id when opening a DM"
+    /// carrier. A shared daemon that missed a delivery receives the hint
+    /// and requests the grants (see on_share_grant_hints).
+    pub async fn maybe_send_grant_hints(&self, to: &AgentId) {
+        let ids = self.held_grant_ids_for(to);
+        if ids.is_empty() {
+            return;
+        }
+        let Some(store) = self.share_grant_store() else {
+            return;
+        };
+        if !store.note_hint_sent(to) {
+            return; // rate-limited per recipient
+        }
+        let payload = share_grant_hint_payload(&ids);
+        // Inline await: this is the DM-open tail (already async), bounded
+        // by the per-recipient rate limit above.
+        // send_direct_with_config (NOT send_direct): the hint must not
+        // re-trigger the attachment hook (recursion).
+        if let Err(e) = self
+            .send_direct_with_config(to, payload, crate::dm::DmSendConfig::default())
+            .await
+        {
+            tracing::debug!(error = %e, "#967: grant hint frame not delivered");
+        }
+    }
+
+    /// #967 r3 (B3): the shared-daemon side of the attachment: for every
+    /// id this daemon does NOT hold, request the grant from the hint's
+    /// sender (ADR par 2: the requester asks the attacher; only OWNER
+    /// installs ever answer — see the responder's Issued-role gate).
+    /// Returns the number of fetch requests started.
+    pub async fn on_share_grant_hints(&self, from: &AgentId, ids: &[[u8; 32]]) -> usize {
+        let mut started = 0usize;
+        for id in ids.iter().take(SHARE_GRANT_HINT_MAX_IDS) {
+            if self.request_share_grant_fetch(*id, from).await.is_ok() {
+                started += 1;
+            }
+        }
+        started
     }
 }
 

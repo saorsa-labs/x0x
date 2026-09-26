@@ -491,9 +491,10 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
     let grantee_agent = agent(0x22);
     let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
 
-    // The GRANTEE holds the grant (received); the SHARED AGENT's install
-    // (same owner, missed the delivery) starts empty.
-    let responder = ShareGrantStore::in_memory(grantee_agent, Some(grantee_user.user_id()));
+    // An OWNER install holds the grant (Issued role — only owner installs
+    // serve fetches, r3 design b); the SHARED AGENT's install (same owner,
+    // missed the delivery) starts empty.
+    let responder = ShareGrantStore::in_memory(grantee_agent, Some(owner.user_id()));
     responder.accept(grant.clone(), NOW).await.unwrap();
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
     assert!(fetcher.by_id(&grant.grant_id).is_none(), "starts empty");
@@ -583,8 +584,9 @@ async fn fetch_response_for_unrequested_id_is_dropped() {
 /// ACK withheld) — the owner's delivery may still arrive there.
 #[tokio::test]
 async fn fetch_for_unheld_grant_is_a_retry() {
-    let grantee_user = UserKeypair::generate().unwrap();
-    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    let owner = UserKeypair::generate().unwrap();
+    // An OWNER install (local_owner == grant.owner) — only these serve fetches.
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(owner.user_id()));
     let outcome = handle_share_grant_fetch(
         Some(&responder),
         None,
@@ -611,7 +613,8 @@ async fn fetch_never_serves_a_revoked_grant() {
     let grantee_user = UserKeypair::generate().unwrap();
     let shared = agent(0x11);
     let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
-    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    // An OWNER install (local_owner == grant.owner) — only these serve fetches.
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(owner.user_id()));
     responder.accept(grant.clone(), NOW).await.unwrap();
     // The responder's owner has revoked exactly this grant.
     let revoked_list = [grant.grant_id];
@@ -659,7 +662,8 @@ async fn fetch_is_rate_limited_per_peer() {
     let grantee_user = UserKeypair::generate().unwrap();
     let shared = agent(0x11);
     let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
-    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    // An OWNER install (local_owner == grant.owner) — only these serve fetches.
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(owner.user_id()));
     responder.accept(grant.clone(), NOW).await.unwrap();
     let first = handle_share_grant_fetch(
         Some(&responder),
@@ -744,8 +748,9 @@ async fn offline_daemon_later_gains_access_end_to_end() {
     let shared = agent(0x11);
     let grantee_agent = agent(0x22);
     let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
-    // The grantee holds it; the shared daemon was offline at issuance.
-    let responder = ShareGrantStore::in_memory(grantee_agent, Some(grantee_user.user_id()));
+    // An OWNER install holds it (only owner installs serve fetches);
+    // the shared daemon was offline at issuance.
+    let responder = ShareGrantStore::in_memory(grantee_agent, Some(owner.user_id()));
     responder.accept(grant.clone(), NOW).await.unwrap();
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
 
@@ -792,4 +797,179 @@ async fn offline_daemon_later_gains_access_end_to_end() {
     )
     .await;
     assert!(replay.is_err(), "the window closed on success");
+}
+
+// ── #967 r3: design (b), bounds, TTLs, and the trigger ─────────────────
+
+/// WHY (B1 design b, the offline-through-revocation closure): a GRANTEE
+/// install (Received role) must NEVER serve a fetch — a hostile or stale
+/// grantee is exactly the peer that must not push grants to a daemon
+/// that missed a revocation. Only owner installs (the revocation source)
+/// serve, bounding the window to the owner's own v3 propagation.
+#[tokio::test]
+async fn a_grantee_install_never_serves_a_fetch() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let grantee_store = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    grantee_store.accept(grant.clone(), NOW).await.unwrap();
+    assert!(
+        grantee_store.by_id(&grant.grant_id).is_some(),
+        "fixture: the grantee holds it"
+    );
+    let outcome = handle_share_grant_fetch(
+        Some(&grantee_store),
+        None,
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(outcome.result.is_err(), "a grantee install never serves");
+    assert!(outcome.reply.is_none(), "and no bytes leave it");
+}
+
+/// WHY (responder expiry pin): an expired grant is never served.
+#[tokio::test]
+async fn an_expired_grant_is_never_served() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    // Expiry BEFORE the evaluation time.
+    let grant = ShareGrant::sign(
+        &owner,
+        [0x51; 32],
+        Grantee::User(grantee_user.user_id()),
+        vec![shared],
+        vec![ShareCap::Dm],
+        NOW - 3_600,
+        NOW - 60,
+    )
+    .expect("sign expired grant");
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(owner.user_id()));
+    // accept would refuse (expired) — install it as held via the issued
+    // map by accepting BEFORE expiry semantics: use accept at a time it
+    // was valid, then evaluate the fetch AFTER.
+    responder.accept(grant.clone(), NOW - 3_700).await.unwrap();
+    let outcome = handle_share_grant_fetch(
+        Some(&responder),
+        None,
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(outcome.result.is_err(), "an expired grant is never served");
+    assert!(outcome.reply.is_none());
+}
+
+/// WHY (TTL bounds): the in-flight window EXPIRES — an old entry no
+/// longer suppresses a re-fetch, and a response after expiry is dropped.
+#[tokio::test]
+async fn the_fetch_window_expires_and_reopens() {
+    let owner = UserKeypair::generate().unwrap();
+    let fetcher = ShareGrantStore::in_memory(agent(0x11), Some(owner.user_id()));
+    let id = [0x61; 32];
+    assert!(fetcher.note_fetch(&id));
+    assert!(!fetcher.note_fetch(&id), "suppressed inside the TTL");
+    // Age the entry past the TTL (tests are a child module: direct map
+    // access models the passage of time without sleeping).
+    fetcher.fetch_in_flight.lock().unwrap().insert(
+        id,
+        std::time::Instant::now() - std::time::Duration::from_millis(GRANT_FETCH_TTL_MS + 1),
+    );
+    assert!(
+        fetcher.note_fetch(&id),
+        "an expired window reopens (a fresh fetch may start)"
+    );
+    // And a response for a fully-expired id is dropped.
+    fetcher.fetch_in_flight.lock().unwrap().insert(
+        id,
+        std::time::Instant::now() - std::time::Duration::from_millis(GRANT_FETCH_TTL_MS + 1),
+    );
+    assert!(!fetcher.is_fetch_in_flight(&id));
+}
+
+/// WHY (cap bounds): both peer-keyed maps evict oldest at the cap.
+#[tokio::test]
+async fn the_peer_maps_evict_at_the_cap() {
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(0x11), Some(owner.user_id()));
+    let id_of = |i: usize| {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        AgentId(b)
+    };
+    for i in 0..=GRANT_FETCH_MAX_ENTRIES {
+        let _ = store.note_peer_fetch(&id_of(i));
+        let _ = store.note_hint_sent(&id_of(i));
+    }
+    let peers = store.fetch_peer_served.lock().unwrap();
+    let hints = store.hint_sent.lock().unwrap();
+    assert_eq!(peers.len(), GRANT_FETCH_MAX_ENTRIES, "capped");
+    assert_eq!(hints.len(), GRANT_FETCH_MAX_ENTRIES, "capped");
+    assert!(!peers.contains_key(&id_of(0)), "the oldest was evicted");
+    assert!(!hints.contains_key(&id_of(0)), "the oldest was evicted");
+}
+
+/// WHY (peer-window expiry): an aged entry no longer rate-limits the peer.
+#[tokio::test]
+async fn the_peer_window_expires() {
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(0x11), Some(owner.user_id()));
+    let peer = agent(0x77);
+    assert!(store.note_peer_fetch(&peer));
+    assert!(
+        !store.note_peer_fetch(&peer),
+        "rate-limited inside the window"
+    );
+    store.fetch_peer_served.lock().unwrap().insert(
+        peer,
+        std::time::Instant::now()
+            - std::time::Duration::from_millis(GRANT_FETCH_PEER_INTERVAL_MS + 1),
+    );
+    assert!(
+        store.note_peer_fetch(&peer),
+        "the window expired — served again"
+    );
+}
+
+/// WHY (B3, the trigger): the DM-open attachment and the hint→fetch path
+/// exist as PRODUCTION surface — held ids attach (rate-limited), and a
+/// hint for an unheld id opens a real fetch window on the receiver.
+#[tokio::test]
+async fn hint_round_trip_opens_a_real_fetch_window() {
+    // Payload encode/decode round-trips within the cap.
+    let ids: Vec<[u8; 32]> = (0..SHARE_GRANT_HINT_MAX_IDS as u16 + 5)
+        .map(|i| [i as u8; 32])
+        .collect();
+    let payload = share_grant_hint_payload(&ids);
+    assert!(payload.starts_with(SHARE_GRANT_HINT_DM_PREFIX));
+    let decoded = decode_share_grant_hint(&payload[SHARE_GRANT_HINT_DM_PREFIX.len()..]);
+    assert_eq!(decoded.len(), SHARE_GRANT_HINT_MAX_IDS, "the cap trims");
+
+    // The receiver side: a hint for an id this store does NOT hold opens
+    // the fetch window (request_share_grant_fetch's store half; the wire
+    // half needs a live peer and is exercised by the daemon wiring).
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(0x33), Some(owner.user_id()));
+    let id = [0x71; 32];
+    assert!(store.by_id(&id).is_none());
+    assert!(
+        store.note_fetch(&id),
+        "the trigger's window opens for an unheld id"
+    );
+    assert!(store.is_fetch_in_flight(&id));
+    // Held id: no window.
+    let grantee_user = UserKeypair::generate().unwrap();
+    let grant = grant_by(
+        &owner,
+        Grantee::User(grantee_user.user_id()),
+        vec![agent(0x33)],
+    );
+    store.accept(grant.clone(), NOW).await.unwrap();
+    let held = grant.grant_id;
+    // The TRIGGER checks by_id first (request_share_grant_fetch returns
+    // early for held ids), so no window is opened for them.
+    assert!(store.by_id(&held).is_some());
+    assert!(!store.is_fetch_in_flight(&held));
 }

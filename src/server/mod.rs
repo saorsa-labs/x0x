@@ -849,6 +849,8 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
     let (share_grant_fetch_response_tx, mut share_grant_fetch_response_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
+    let (share_grant_hint_tx, mut share_grant_hint_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1535,6 +1537,7 @@ pub async fn serve_with_options(
         dm_inbox_share_grant_route_tx,
         share_grant_fetch_tx,
         share_grant_fetch_response_tx,
+        share_grant_hint_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2166,18 +2169,55 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_fetch_response_rx.recv().await {
                 let store = fetch_agent.share_grant_store();
-                // #967 B1: the requester side refuses a revoked grant too.
-                let revocation = fetch_agent.revocation_set.read().await;
-                let is_revoked = |grant: &x0x::share_grant::ShareGrant| {
-                    revocation.is_share_grant_revoked(&grant.grant_id, &grant.owner)
+                // #967 r3 (lock fix): decode + window-check FIRST, then
+                // evaluate revocation under a SCOPED guard that is DROPPED
+                // before the accept await (the store's write lock and its
+                // disk persist run inside — no revocation writer may queue
+                // behind disk I/O).
+                match x0x::share_grant::prepare_share_grant_fetch_response(store.as_deref(), typed)
+                    .await
+                {
+                    Err(_) => continue,
+                    Ok(prepared) => {
+                        let grant_id = prepared.grant.grant_id;
+                        let owner = prepared.grant.owner;
+                        let revoked_now = {
+                            let revocation = fetch_agent.revocation_set.read().await;
+                            revocation.is_share_grant_revoked(&grant_id, &owner)
+                        };
+                        let is_revoked = |_g: &x0x::share_grant::ShareGrant| revoked_now;
+                        let _ = x0x::share_grant::finish_share_grant_fetch_response(
+                            store.as_deref(),
+                            prepared,
+                            Some(&is_revoked),
+                            x0x::share_grant::unix_now_secs(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
+    // #967 r3 (B3): the shared-daemon side of the attachment — every
+    // unheld id in a hint frame triggers a fetch request to the sender.
+    {
+        let hint_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = share_grant_hint_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(body) = typed
+                    .payload
+                    .strip_prefix(x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX)
+                else {
+                    continue;
                 };
-                let _ = x0x::share_grant::handle_share_grant_fetch_response(
-                    store.as_deref(),
-                    Some(&is_revoked),
-                    x0x::share_grant::unix_now_secs(),
-                    typed,
-                )
-                .await;
+                let ids = x0x::share_grant::decode_share_grant_hint(body);
+                let started = hint_agent.on_share_grant_hints(&typed.sender, &ids).await;
+                if started > 0 {
+                    tracing::info!(started, "#967: grant hints triggered fetch requests");
+                }
             }
         }));
     }
@@ -2809,6 +2849,15 @@ pub(crate) fn valid_kv_store_delta_typed_dm(payload: &[u8]) -> bool {
         .is_some_and(|bytes| serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok())
 }
 
+/// #967 r3: a hint frame is prefix + bincode(Vec<[u8; 32]>) within the cap.
+fn valid_share_grant_hint_typed_dm(payload: &[u8]) -> bool {
+    let Some(body) = payload.strip_prefix(x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX) else {
+        return false;
+    };
+    x0x::share_grant::decode_share_grant_hint(body).len()
+        <= x0x::share_grant::SHARE_GRANT_HINT_MAX_IDS
+}
+
 pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
     let Some(bytes) = payload.strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX) else {
         return false;
@@ -2832,6 +2881,7 @@ async fn start_dm_inbox_when_gossip_ready(
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_fetch_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_fetch_response_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    share_grant_hint_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -2881,6 +2931,13 @@ async fn start_dm_inbox_when_gossip_ready(
         let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
             x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX,
             share_grant_fetch_response_route_tx.clone(),
+        );
+        // #967 r3 (B3): the grantee-side attachment frame — a plain route
+        // (the hint needs no durable ACK; the fetches it triggers do).
+        let dm_inbox_config = dm_inbox_config.with_validated_typed_payload_route(
+            x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX,
+            share_grant_hint_route_tx.clone(),
+            valid_share_grant_hint_typed_dm,
         );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)

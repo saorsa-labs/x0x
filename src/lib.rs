@@ -6351,8 +6351,17 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        self.send_direct_with_config(to, payload, dm::DmSendConfig::default())
-            .await
+        let receipt = self
+            .send_direct_with_config(to, payload, dm::DmSendConfig::default())
+            .await?;
+        // #967 r3 (B3): the ADR-0070 par-2 DM-open attachment — after a
+        // successful DM to another agent, attach this grantee's held
+        // grant ids for that agent (rate-limited per recipient; a no-op
+        // without a grant store or without held grants).
+        if *to != self.identity.agent_id() {
+            self.maybe_send_grant_hints(to).await;
+        }
+        Ok(receipt)
     }
 
     async fn dm_peer_rtt_ms(&self, agent_id: &identity::AgentId) -> Option<u32> {
