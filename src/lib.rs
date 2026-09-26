@@ -18245,6 +18245,28 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.put_with_outcome(key, value, content_type).await?.delta)
+    }
+
+    /// Put a key-value pair and return the published delta together with
+    /// the writer's own keys that the put evicted.
+    ///
+    /// Under [`kv::AccessPolicy::SelfKeyed`], ADR-0047 lowest-N admission can
+    /// evict the writer's lexicographically highest live keys when a put
+    /// takes it over the quota. That rule is unchanged. This method only
+    /// reports the eviction so the writer sees it (issue #849). A put whose
+    /// own key would fall outside the admitted set is refused before
+    /// anything changes, as with [`put_with_delta`](Self::put_with_delta).
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18262,18 +18284,21 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
             })?;
-            store
+            let evicted_keys = store
                 .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
@@ -18294,7 +18319,10 @@ impl KvStoreHandle {
             // must not advance for a non-mutation), publish nothing, and
             // persist nothing. Retries stay observationally silent.
             if store.current_version() == version_before {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -18334,7 +18362,7 @@ impl KvStoreHandle {
                 // (content_root binds the store name).
                 delta.name_update = Some(store.name_register().clone());
             }
-            delta
+            (delta, evicted_keys)
         };
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
@@ -18353,7 +18381,10 @@ impl KvStoreHandle {
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
-        Ok(delta)
+        Ok(KvPutOutcome {
+            delta,
+            evicted_keys,
+        })
     }
 
     /// Get a value by key.
@@ -18528,6 +18559,16 @@ impl KvStoreHandle {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
     }
+}
+
+/// Result of a local KV put: the published delta plus any keys it evicted.
+#[derive(Debug, Clone)]
+pub struct KvPutOutcome {
+    /// The CRDT delta that was published for this put.
+    pub delta: kv::KvStoreDelta,
+    /// The writer's own keys that this put evicted under the `SelfKeyed`
+    /// lowest-N quota (ADR-0047), sorted. Empty when nothing was evicted.
+    pub evicted_keys: Vec<String>,
 }
 
 /// Read-only snapshot of a KvStore entry.
