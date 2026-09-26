@@ -1198,7 +1198,6 @@ struct ForwardEntry {
 /// `ForwardHeader`, and bridge on `connected`.
 pub struct ForwardService {
     agent: Arc<crate::Agent>,
-    policy: Arc<ConnectPolicy>,
     connect_diag: Arc<ConnectDiagnostics>,
     fwd_diag: Arc<ForwardDiagnostics>,
     /// Registered forwards (spec + cancellation) so `shutdown` / `remove` can
@@ -1306,6 +1305,10 @@ fn try_peer_slot(
 impl ForwardService {
     /// Construct a forwarder over a loaded connect policy + its diagnostics.
     ///
+    /// `policy` is installed on the agent ([`crate::Agent::set_connect_policy`]),
+    /// which is the single hot-swappable holder (ADR-0070 §3): inbound
+    /// streams are gated against the agent's policy current at accept.
+    ///
     /// Registers the forwarder as the single acceptor for the `ForwardV1` and
     /// `ForwardV2` stream protocols ([`crate::Agent::register_stream_acceptor`])
     /// — inbound forward streams are routed to this service by the accept
@@ -1333,9 +1336,11 @@ impl ForwardService {
         let discovery_cache = agent.identity_discovery_cache();
         let contact_store = agent.contact_store();
         let move_state = agent.move_state();
+        // The agent owns the effective (hot-swappable) connect policy; the
+        // forwarder reads it per stream rather than pinning a copy.
+        agent.set_connect_policy(policy);
         Ok(Self {
             agent,
-            policy,
             connect_diag,
             fwd_diag: Arc::new(ForwardDiagnostics::default()),
             forwards: std::sync::Mutex::new(Vec::new()),
@@ -1440,7 +1445,10 @@ impl ForwardService {
             this.fwd_diag.enter_stream();
             let _leave = StreamLeaveGuard(Arc::clone(&this.fwd_diag));
             let inbound_ctx = InboundCtx {
-                policy: Arc::clone(&this.policy),
+                // ADR-0070 §3: the agent holds the one hot-swappable connect
+                // policy; each stream is gated against the snapshot current at
+                // accept, so a reload never alters an in-flight stream.
+                policy: this.agent.connect_policy(),
                 connect_diag: Arc::clone(&this.connect_diag),
                 revocation_set: Arc::clone(&this.revocation_set),
                 move_state: Arc::clone(&this.move_state),

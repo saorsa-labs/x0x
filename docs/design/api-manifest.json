@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 190,
+  "endpoint_count": 197,
   "endpoints": [
     {
       "category": "status",
@@ -3237,6 +3237,76 @@
       "description": "Active forward-stream count + connect-ACL counters",
       "method": "GET",
       "path": "/streams",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect list",
+      "description": "List connect ACL entries (TOML floor + API-managed) and reload status",
+      "method": "GET",
+      "path": "/acl/connect",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect add",
+      "description": "Add an API-managed connect ACL entry (TOML entry schema as JSON)",
+      "method": "POST",
+      "path": "/acl/connect",
+      "request": {
+        "kind": "passthrough"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect rm",
+      "description": "Remove an API-managed connect ACL entry (floor entries: 409)",
+      "method": "DELETE",
+      "path": "/acl/connect/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec list",
+      "description": "List exec ACL entries (TOML floor + API-managed) and reload status",
+      "method": "GET",
+      "path": "/acl/exec",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec add",
+      "description": "Add an API-managed exec ACL entry (TOML entry schema as JSON)",
+      "method": "POST",
+      "path": "/acl/exec",
+      "request": {
+        "kind": "passthrough"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec rm",
+      "description": "Remove an API-managed exec ACL entry (floor entries: 409)",
+      "method": "DELETE",
+      "path": "/acl/exec/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl reload",
+      "description": "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
+      "method": "POST",
+      "path": "/acl/reload",
       "request": {
         "kind": "none"
       }

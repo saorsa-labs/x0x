@@ -1,6 +1,6 @@
 //! Diagnostics counters for Tier-1 exec.
 
-use super::acl::AclSummary;
+use super::acl::{AclReloadStatus, AclSummary};
 use super::protocol::{DenialReason, ExecRequestId, WarningKind};
 use crate::identity::AgentId;
 use serde::Serialize;
@@ -24,7 +24,8 @@ pub struct ExecDiagnostics {
     cap_breaches: Mutex<HashMap<&'static str, u64>>,
     cap_warnings: Mutex<HashMap<WarningKind, u64>>,
     recent_warnings: Mutex<VecDeque<ExecWarningEvent>>,
-    acl_summary: AclSummary,
+    acl_summary: Mutex<AclSummary>,
+    acl_reload: Mutex<AclReloadStatus>,
 }
 
 impl ExecDiagnostics {
@@ -43,8 +44,25 @@ impl ExecDiagnostics {
             cap_breaches: Mutex::new(HashMap::new()),
             cap_warnings: Mutex::new(HashMap::new()),
             recent_warnings: Mutex::new(VecDeque::new()),
-            acl_summary,
+            acl_summary: Mutex::new(acl_summary),
+            acl_reload: Mutex::new(AclReloadStatus::default()),
         }
+    }
+
+    /// Replace the policy summary after an ADR-0070 hot reload or API edit.
+    pub fn set_acl_summary(&self, summary: AclSummary) {
+        *self
+            .acl_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = summary;
+    }
+
+    /// Replace the ADR-0070 reload bookkeeping.
+    pub fn set_acl_reload_status(&self, status: AclReloadStatus) {
+        *self
+            .acl_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
     }
 
     pub fn record_request_received(&self) {
@@ -165,7 +183,16 @@ impl ExecDiagnostics {
                 cap_warnings,
             },
             recent_warnings,
-            acl_summary: self.acl_summary.clone(),
+            acl_summary: self
+                .acl_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            acl_reload: self
+                .acl_reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 }
@@ -180,6 +207,8 @@ pub struct ExecDiagnosticsSnapshot {
     pub totals: ExecTotalsSnapshot,
     pub recent_warnings: Vec<ExecWarningEvent>,
     pub acl_summary: AclSummary,
+    /// ADR-0070 §3 hot-reload status (last error, counters).
+    pub acl_reload: AclReloadStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
