@@ -57,6 +57,14 @@ pub enum IdentityError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// A local KV mutation was applied and persisted, but announcing it to
+    /// the mesh FAILED (the gossip publish timed out or was refused). The
+    /// local write is durable and anti-entropy re-publishes the converged
+    /// state later; the caller is told so it can observe or retry.
+    /// #976: this must NOT be reported as plain success.
+    #[error("kv write applied and persisted locally, but the delta publish failed: {0}")]
+    KvPublishFailed(String),
+
     /// Agent certificate verification failed.
     /// This indicates the certificate signature is invalid, the keys don't match,
     /// or the certificate data has been tampered with.

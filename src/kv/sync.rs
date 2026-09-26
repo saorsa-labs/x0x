@@ -914,6 +914,9 @@ pub struct KvStoreSync {
     /// racing the executor.
     #[cfg(test)]
     loop_exits: Arc<LoopExitTracker>,
+    /// #976 test hook: force the NEXT publish_delta to fail deterministically.
+    #[cfg(test)]
+    fail_next_publish: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -1100,6 +1103,8 @@ impl KvStoreSync {
             receive_merged_test: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             loop_exits: Arc::new(LoopExitTracker::default()),
+            #[cfg(test)]
+            fail_next_publish: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -3706,7 +3711,23 @@ impl KvStoreSync {
     /// `EncryptedKvStoreRecordV1` envelope first. A missing context or
     /// signing material is a hard error — the plaintext path is unreachable
     /// by construction for encrypted stores.
+    /// #976 test hook: the next publish_delta fails deterministically.
+    #[cfg(test)]
+    pub(crate) fn fail_next_publish_for_test(&self) {
+        self.fail_next_publish
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_publish
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(KvError::Gossip(
+                "publish delta failed: forced failure (test hook)".to_string(),
+            ));
+        }
         // Policy check at the PUBLIC boundary (the start() guard only covers
         // the background loops): a sync constructed for an encrypted store
         // but never configured (or not yet started) must hard-error here —

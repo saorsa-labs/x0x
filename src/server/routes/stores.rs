@@ -666,7 +666,12 @@ pub(in crate::server) async fn put_kv_value(
             )
         }
         Err(e) => {
-            let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
+            let status = if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
+                // #976: the value is durable locally; the mesh announcement
+                // failed. 503 (retry later), with the durability facts in
+                // the body so no caller mistakes it for a lost write.
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
                 // AppendOnly store: the key already exists and existing keys
                 // are immutable, even to the owner.
                 StatusCode::CONFLICT
@@ -682,7 +687,18 @@ pub(in crate::server) async fn put_kv_value(
             };
             (
                 status,
-                Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+                Json(
+                    if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("{e}"),
+                            "local_write": "durable",
+                            "replicated": false,
+                        })
+                    } else {
+                        serde_json::json!({ "ok": false, "error": format!("{e}") })
+                    },
+                ),
             )
         }
     }

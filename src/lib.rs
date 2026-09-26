@@ -18174,6 +18174,12 @@ impl KvStoreHandle {
             })
     }
 
+    /// #976 test hook (see kv_put_reports_publish_failure_and_keeps_the_local_write).
+    #[cfg(test)]
+    pub(crate) async fn sync_fail_next_publish_for_test(&self) {
+        self.sync.fail_next_publish_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) async fn with_persist_gate_held_for_test<F: std::future::Future>(
         &self,
@@ -18687,8 +18693,17 @@ impl KvStoreHandle {
                  delta not published; store is durability-degraded"
             )))
         })?;
+        // #976: the publish outcome is part of the contract. The local
+        // write is applied AND persisted (the CRDT mutation cannot be
+        // safely unwound, and anti-entropy re-publishes the converged
+        // state later) — but "success" that silently dropped the wire
+        // announcement is a lie the caller cannot detect. Report the
+        // failure with the durability facts.
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
+            return Err(error::IdentityError::KvPublishFailed(format!(
+                "{e}; the value IS applied and persisted locally and will                  replicate when the store's anti-entropy re-publishes"
+            )));
         }
         Ok(KvPutOutcome {
             delta,
@@ -22266,6 +22281,67 @@ mod tests {
         joiner2.shutdown().await;
         store.cancel_sync();
         creator.shutdown().await;
+    }
+
+    /// #976: a KV put whose delta publish fails (timeout or refusal) is
+    /// NOT success. The caller sees KvPublishFailed, the local write is
+    /// KEPT (applied + persisted — the CRDT mutation cannot be unwound and
+    /// anti-entropy re-publishes), and a later put with the wire working
+    /// succeeds again. Fail-before: the pre-fix code swallowed the publish
+    /// error and returned Ok.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_put_reports_publish_failure_and_keeps_the_local_write() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "p976",
+                "p976-topic",
+                kv::AccessPolicy::Signed,
+                &dir.path().join("kv"),
+            )
+            .await
+            .expect("create store");
+        store
+            .put_with_delta("warm".to_string(), b"up".to_vec(), "text/plain".to_string())
+            .await
+            .expect("warm-up put publishes normally");
+        // Force the next publish to fail — the deterministic stand-in for
+        // a gossip publish timeout/refusal.
+        store.sync_fail_next_publish_for_test().await;
+        let result = store
+            .put_with_delta("k976".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await;
+        let err = result.expect_err("a failed publish is NOT success");
+        assert!(
+            matches!(err, error::IdentityError::KvPublishFailed(_)),
+            "typed publish failure, got: {err}"
+        );
+        // The local write is KEPT: applied and readable.
+        let kept = store
+            .get("k976")
+            .await
+            .expect("read")
+            .expect("kept locally");
+        assert_eq!(kept.value, b"v");
+        // And the store is healthy again once the wire works.
+        store
+            .put_with_delta(
+                "after".to_string(),
+                b"ok".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("a later put with the wire working succeeds");
+        agent.shutdown().await;
     }
 
     /// Durability blockers (round-3 review): (1) the direct-delivery path
