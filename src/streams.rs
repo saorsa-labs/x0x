@@ -321,22 +321,62 @@ pub(crate) fn stream_gate(
 ///   the ACL, else [`NetworkError::PeerNotInConnectAcl`]. The every-agent
 ///   rule mirrors `forward::decide_inbound` (#192): the QUIC transport
 ///   authenticates the machine, not the individual agent, so a single
-///   unlisted agent on the machine fails the whole stream closed.
+///   unlisted agent on the machine fails the whole stream closed. An agent
+///   in `owner_trusted` (ADR-0070 §1, established by [`crate::owner_trust`])
+///   is also listed when the ACL has a `principal = "owner"` entry; owner
+///   trust without such an entry lists nothing.
 ///
 /// Pure function so the Disabled/Enabled × listed/unlisted × multi-agent
 /// matrix is fast unit-testable without a network. Target membership is NOT
 /// checked here — raw byte-streams carry no target; per-target enforcement
 /// stays with the T4 forwarder's `evaluate_connect_gate` call.
+///
+/// The accept loop calls [`stream_acl_gate_with_grants`]; this form (no
+/// grant holders) is kept for the slice-1 matrix tests.
+#[cfg(test)]
 pub(crate) fn stream_acl_gate(
     policy: &crate::connect::ConnectPolicy,
     agents: &[crate::identity::AgentId],
+    owner_trusted: &[crate::identity::AgentId],
+    machine_id: &MachineId,
+) -> NetworkResult<()> {
+    stream_acl_gate_with_grants(policy, agents, owner_trusted, &[], &[], machine_id)
+}
+
+/// [`stream_acl_gate`] with the ADR-0070 §2 grant selector.
+///
+/// * `grant_connect` — agents holding a current `Connect` ShareGrant for
+///   this daemon's agent. With an `Enabled` policy such an agent is also
+///   listed when the ACL has a `principal = "grant"` entry (per-port target
+///   checks stay with the forwarder).
+/// * `grant_only` — agents whose identity gate passed ONLY because of that
+///   grant (their contact/owner decision alone was not `Accept`). A grant
+///   never opens anything without an explicit rule, so under a `Disabled`
+///   policy — where the identity gate would be the sole boundary — such an
+///   agent is refused.
+pub(crate) fn stream_acl_gate_with_grants(
+    policy: &crate::connect::ConnectPolicy,
+    agents: &[crate::identity::AgentId],
+    owner_trusted: &[crate::identity::AgentId],
+    grant_connect: &[crate::identity::AgentId],
+    grant_only: &[crate::identity::AgentId],
     machine_id: &MachineId,
 ) -> NetworkResult<()> {
     let crate::connect::ConnectPolicy::Enabled(acl) = policy else {
+        if let Some(agent_id) = agents.iter().find(|a| grant_only.contains(a)) {
+            return Err(NetworkError::PeerNotInConnectAcl {
+                agent_id: agent_id.0,
+            });
+        }
         return Ok(());
     };
     for agent_id in agents {
-        if acl.entry_for(agent_id, machine_id).is_none() {
+        if !acl.has_entry_for_principals(
+            agent_id,
+            machine_id,
+            owner_trusted.contains(agent_id),
+            grant_connect.contains(agent_id),
+        ) {
             return Err(NetworkError::PeerNotInConnectAcl {
                 agent_id: agent_id.0,
             });
@@ -667,6 +707,8 @@ mod tests {
             loaded_from: std::path::Path::new("/test").to_path_buf(),
             loaded_at_unix_ms: 0,
             allow,
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
@@ -686,24 +728,24 @@ mod tests {
 
         // Disabled ⇒ no constraint, even for a peer listing nobody.
         let disabled = crate::connect::ConnectPolicy::default();
-        assert!(stream_acl_gate(&disabled, &[unlisted], &machine).is_ok());
+        assert!(stream_acl_gate(&disabled, &[unlisted], &[], &machine).is_ok());
 
         let policy = enabled_policy_listing(&[(listed, machine), (also_listed, machine)]);
 
         // All agents listed ⇒ pass.
-        assert!(stream_acl_gate(&policy, &[listed], &machine).is_ok());
-        assert!(stream_acl_gate(&policy, &[listed, also_listed], &machine).is_ok());
+        assert!(stream_acl_gate(&policy, &[listed], &[], &machine).is_ok());
+        assert!(stream_acl_gate(&policy, &[listed, also_listed], &[], &machine).is_ok());
 
         // Single unlisted agent ⇒ PeerNotInConnectAcl naming that agent.
         assert!(matches!(
-            stream_acl_gate(&policy, &[unlisted], &machine),
+            stream_acl_gate(&policy, &[unlisted], &[], &machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == unlisted.0
         ));
 
         // Multi-agent fail-closed: one unlisted agent on the machine denies
         // the whole stream, even though another agent is listed.
         assert!(matches!(
-            stream_acl_gate(&policy, &[listed, unlisted], &machine),
+            stream_acl_gate(&policy, &[listed, unlisted], &[], &machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == unlisted.0
         ));
 
@@ -711,8 +753,57 @@ mod tests {
         // not listed at all.
         let other_machine = MachineId([8u8; 32]);
         assert!(matches!(
-            stream_acl_gate(&policy, &[listed], &other_machine),
+            stream_acl_gate(&policy, &[listed], &[], &other_machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == listed.0
+        ));
+    }
+
+    // ADR-0070 §1 + PR #896 decision 1: owner trust does not open the
+    // connect ACL by itself. An owner-trusted agent passes only when the ACL
+    // carries a `principal = "owner"` entry, and a non-owner agent never
+    // matches that entry.
+    #[test]
+    fn stream_acl_gate_owner_principal_requires_explicit_entry() {
+        use crate::error::NetworkError;
+        use crate::identity::AgentId;
+
+        let machine = MachineId([7u8; 32]);
+        let owner_agent = AgentId([1u8; 32]);
+        let stranger = AgentId([3u8; 32]);
+
+        // Owner-trusted, but the ACL has no owner entry ⇒ denied.
+        let no_owner_entry = enabled_policy_listing(&[]);
+        assert!(matches!(
+            stream_acl_gate(&no_owner_entry, &[owner_agent], &[owner_agent], &machine),
+            Err(NetworkError::PeerNotInConnectAcl { .. })
+        ));
+
+        let mut with_owner_entry = enabled_policy_listing(&[]);
+        if let crate::connect::ConnectPolicy::Enabled(acl) = &mut with_owner_entry {
+            acl.owner_allow.push(crate::connect::ConnectOwnerEntry {
+                description: None,
+                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+            });
+        }
+        // Owner entry + owner-trusted agent ⇒ pass.
+        assert!(
+            stream_acl_gate(&with_owner_entry, &[owner_agent], &[owner_agent], &machine).is_ok()
+        );
+        // Owner entry, but the agent is not owner-trusted ⇒ denied.
+        assert!(matches!(
+            stream_acl_gate(&with_owner_entry, &[stranger], &[owner_agent], &machine),
+            Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == stranger.0
+        ));
+        // Multi-agent fail-closed still holds: one non-owner agent on the
+        // machine denies the stream even though the other is owner-trusted.
+        assert!(matches!(
+            stream_acl_gate(
+                &with_owner_entry,
+                &[owner_agent, stranger],
+                &[owner_agent],
+                &machine
+            ),
+            Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == stranger.0
         ));
     }
 

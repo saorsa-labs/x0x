@@ -297,7 +297,12 @@ enum Commands {
         sub: Option<WsSub>,
     },
     /// Open the x0x GUI in your browser.
-    Gui,
+    Gui {
+        /// Open a specific view (#893), e.g. `dm/<agent_id>`,
+        /// `groups/<group_id>`, `groups/<group_id>/board` or `people`.
+        #[arg(long)]
+        view: Option<String>,
+    },
     /// Print all API routes. [dev]
     #[command(hide = true)]
     Routes {
@@ -368,6 +373,95 @@ enum Commands {
     },
     /// Active byte-stream + connect-ACL diagnostics.
     Streams,
+    /// Print a compact recipe that teaches another agent to install x0x
+    /// and DM you (#894).
+    Onboard {
+        /// Emit the recipe as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Omit your agent card (the recipe then looks you up by agent id).
+        #[arg(long, conflicts_with_all = ["inline_card", "card_file"])]
+        no_card: bool,
+        /// Embed the (~20 KB) signed card link in the recipe instead of
+        /// writing it to a file.
+        #[arg(long, conflicts_with = "card_file")]
+        inline_card: bool,
+        /// Where to write the signed card link (default: ./x0x-invite-card.txt).
+        #[arg(long, value_name = "PATH")]
+        card_file: Option<PathBuf>,
+    },
+    /// Manage connect/exec ACL entries over the TOML floor (ADR-0070;
+    /// durable API token only).
+    Acl {
+        #[command(subcommand)]
+        sub: AclSub,
+    },
+    /// Share a subset of your agents with another user or agent
+    /// (ADR-0070 ShareGrant; durable API token only).
+    Grant {
+        #[command(subcommand)]
+        sub: GrantSub,
+    },
+}
+
+/// `x0x grant` sub-actions.
+#[derive(Subcommand)]
+enum GrantSub {
+    /// Sign a grant with the owner key and deliver it: the `POST /grants`
+    /// body as JSON (literal, `@path`, or `-` for stdin).
+    Issue {
+        /// Grant JSON, e.g. '{"grantee_user":"<hex>","agents":["<hex>"],
+        /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
+        #[arg(value_name = "GRANT_JSON")]
+        grant: String,
+    },
+    /// List grants this install's owner issued, with status.
+    List,
+    /// Revoke a grant (owner key; gossiped on x0x.revocation.v3).
+    Revoke {
+        /// Grant id (64 hex chars) from `list`.
+        id: String,
+    },
+    /// List grants that name this install as grantee.
+    Received,
+}
+
+/// `x0x acl` sub-actions.
+#[derive(Subcommand)]
+enum AclSub {
+    /// Connect (port-forward) ACL entries.
+    Connect {
+        #[command(subcommand)]
+        sub: AclPlaneSub,
+    },
+    /// Remote exec ACL entries.
+    Exec {
+        #[command(subcommand)]
+        sub: AclPlaneSub,
+    },
+    /// Re-read both ACL TOML floors and API overlays; a rejected file keeps
+    /// the last good ACL.
+    Reload,
+}
+
+/// `x0x acl connect|exec` sub-actions.
+#[derive(Subcommand)]
+enum AclPlaneSub {
+    /// List floor (`origin: file`) and API (`origin: api`) entries with ids.
+    List,
+    /// Add an API-managed entry: the TOML allow-entry schema as JSON
+    /// (literal, `@path`, or `-` for stdin).
+    Add {
+        /// Entry JSON, e.g. '{"principal":"owner","targets":["127.0.0.1:22"]}'.
+        #[arg(value_name = "ENTRY_JSON")]
+        entry: String,
+    },
+    /// Remove an API-managed entry by id (floor entries cannot be removed).
+    #[command(alias = "rm")]
+    Remove {
+        /// Entry id from `list` (e.g. `api-0123456789abcdef`).
+        id: String,
+    },
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -757,6 +851,8 @@ enum DiagnosticsSub {
     },
     /// Print per-group ingest counters and drop-reason buckets.
     Groups,
+    /// Print per-open-store state-sync activity and rejection counters.
+    StateSync,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
     /// Print connect-ACL policy summary and stream allow/deny counters.
@@ -850,6 +946,8 @@ enum HistorySub {
 enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
+    /// Swap a live session token (passed via `X0X_API_TOKEN`) for a fresh one.
+    Refresh,
 }
 
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
@@ -2010,11 +2108,12 @@ async fn run(
 
     // Commands that need a running daemon.
     match command {
-        Commands::Gui => {
+        Commands::Gui { view } => {
             // Ensure daemon is running and open GUI in browser.
             // #127 / WS1.6: exchange the durable API token for a short-lived
             // session token *before* constructing the URL, so the durable
             // secret never appears in the browser's address bar / history.
+            let fragment = gui_view_fragment(view.as_deref())?;
             client.ensure_running().await?;
             let session = client.post_empty("/auth/session").await?;
             // Review round 2 (verdict item 5): no durable-token fallback —
@@ -2025,7 +2124,7 @@ async fn run(
                     "daemon did not return a session token for the GUI URL (response: {session})"
                 );
             };
-            let url = format!("{}/gui?token={token}", client.base_url());
+            let url = format!("{}/gui?token={token}{fragment}", client.base_url());
             eprintln!("x0x GUI: {}/gui", client.base_url());
 
             let opened = {
@@ -2276,6 +2375,7 @@ async fn run(
                 commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await
             }
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
+            DiagnosticsSub::StateSync => commands::network::diagnostics_state_sync(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
@@ -2323,6 +2423,7 @@ async fn run(
         },
         Commands::Auth { sub } => match sub {
             AuthSub::Session => commands::auth::session(&client).await,
+            AuthSub::Refresh => commands::auth::refresh(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,
@@ -2974,6 +3075,38 @@ async fn run(
             }
         },
         Commands::Streams => commands::forward::streams(&client).await,
+        Commands::Acl { sub } => match sub {
+            AclSub::Reload => commands::acl::reload(&client).await,
+            AclSub::Connect { sub } => {
+                run_acl_plane(&client, commands::acl::AclPlane::Connect, sub).await
+            }
+            AclSub::Exec { sub } => {
+                run_acl_plane(&client, commands::acl::AclPlane::Exec, sub).await
+            }
+        },
+        Commands::Grant { sub } => match sub {
+            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::List => commands::grant::list(&client).await,
+            GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
+            GrantSub::Received => commands::grant::received(&client).await,
+        },
+        Commands::Onboard {
+            json,
+            no_card,
+            inline_card,
+            card_file,
+        } => {
+            let card = if no_card {
+                commands::onboard::CardDelivery::Lookup
+            } else if inline_card {
+                commands::onboard::CardDelivery::Inline
+            } else {
+                commands::onboard::CardDelivery::File(
+                    card_file.unwrap_or_else(|| PathBuf::from("x0x-invite-card.txt")),
+                )
+            };
+            commands::onboard::run(&client, json, card).await
+        }
         Commands::Routes { .. }
         | Commands::Tree
         | Commands::Uninstall
@@ -2989,6 +3122,43 @@ async fn run(
 }
 
 // ── Tree view ──────────────────────────────────────────────────────────────
+
+/// Dispatch `x0x acl connect|exec <action>`.
+async fn run_acl_plane(
+    client: &DaemonClient,
+    plane: commands::acl::AclPlane,
+    sub: AclPlaneSub,
+) -> anyhow::Result<()> {
+    match sub {
+        AclPlaneSub::List => commands::acl::list(client, plane).await,
+        AclPlaneSub::Add { entry } => commands::acl::add(client, plane, &entry).await,
+        AclPlaneSub::Remove { id } => commands::acl::remove(client, plane, &id).await,
+    }
+}
+
+/// Build the `#/<route>` URL fragment for `x0x gui --view` (#893).
+///
+/// Only route-safe characters are accepted so the value can neither break out
+/// of the URL nor the platform opener's argument (e.g. `&` under Windows
+/// `cmd /C start`). The GUI itself decides whether the route names a view.
+fn gui_view_fragment(view: Option<&str>) -> anyhow::Result<String> {
+    let Some(view) = view else {
+        return Ok(String::new());
+    };
+    let route = view.trim().trim_start_matches('#').trim_start_matches('/');
+    if route.is_empty() {
+        return Ok(String::new());
+    }
+    if !route
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'))
+    {
+        anyhow::bail!(
+            "invalid --view route {view:?}: use letters, digits, '/', '-' or '_' (e.g. dm/<agent_id>)"
+        );
+    }
+    Ok(format!("#/{route}"))
+}
 
 fn print_command_tree() -> anyhow::Result<()> {
     let tree = "\
@@ -3006,6 +3176,7 @@ x0x (v{VERSION})
 |   |   +-- user-id        Show user ID
 |   |   +-- card           Generate shareable identity card
 |   |   +-- import         Import an agent card to contacts
+|   +-- onboard            Recipe teaching another agent to install + DM you
 |   +-- user-id create     Create user identity keypair
 |   +-- user-id inspect    Validate a user identity file (daemonless)
 |   +-- profile           Show stored self-profile names
@@ -3377,6 +3548,27 @@ mod tests {
             Commands::Presence { sub: None } => Ok(()),
             _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
         }
+    }
+
+    // #893: `--view` becomes the GUI hash route; anything that could escape
+    // the URL or the opener's argv (`&`, quotes, spaces, `?`) must be refused
+    // before a session token is minted.
+    #[test]
+    fn gui_view_becomes_hash_route_and_rejects_unsafe_input() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "gui", "--view", "dm/abc123"])?;
+        let Commands::Gui { view } = cli.command else {
+            anyhow::bail!("expected gui command");
+        };
+        assert_eq!(gui_view_fragment(view.as_deref())?, "#/dm/abc123");
+        assert_eq!(gui_view_fragment(Some("#/people"))?, "#/people");
+        assert_eq!(gui_view_fragment(None)?, "");
+        for bad in ["dm/a&calc", "dm/a b", "dm/a?x=1", "dm/'x'", "groups/a#b"] {
+            assert!(
+                gui_view_fragment(Some(bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        Ok(())
     }
 
     #[test]

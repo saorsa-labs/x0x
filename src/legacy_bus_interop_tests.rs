@@ -598,6 +598,16 @@ async fn paired_controlled_load_bus_eager_attempts_default_vs_optout() {
     run(Case::Measurement).await;
 }
 
+/// SG-internal reserved key-cache control topic, blake3 hex8
+/// `87f4025bf2b9a4ad`. Literal from the saorsa-gossip pin 997abc75
+/// (Cargo.lock git rev) `crates/pubsub/src/key_cache.rs` `CONTROL_DOMAIN`
+/// (`pub(crate)`, so a symbol import is impossible; literal-by-design like
+/// the rest of the universe list). A universe member only because pinned SG
+/// spawns `spawn_key_cache_control_flusher` for every PubSub instance
+/// (pubsub lib.rs:6831): session-scoped control egress on authenticated
+/// sessions, never an x0x application topic.
+const SG_KEY_CACHE_CONTROL_TOPIC: &str = "saorsa-gossip/key-cache-control/v1";
+
 // Literal source-reviewed lifetime universe, not observed subscriptions. The
 // full Agent fixture starts only identity/machine/user listeners, revocation,
 // move listeners, capability services, blob service and the actual DM inboxes.
@@ -613,6 +623,7 @@ fn topic_universe(agents: &[Agent]) -> serde_json::Value {
         crate::REVOCATION_TOPIC,
         crate::MACHINE_ANNOUNCE_V3_TOPIC,
         crate::REVOCATION_V2_TOPIC,
+        crate::REVOCATION_V3_TOPIC,
         crate::MOVE_ACTIVATION_TOPIC,
         crate::announce_blob::ANNOUNCE_BLOB_TOPIC,
         crate::dm_capability::DM_CAPABILITY_TOPIC,
@@ -620,6 +631,10 @@ fn topic_universe(agents: &[Agent]) -> serde_json::Value {
         crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC,
         crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC,
         DM_BUS_TOPIC,
+        // Upstream-internal session-scoped control plane; see the const doc
+        // above. Its rows must carry zero data-plane bytes (premise in
+        // validate_measurement).
+        SG_KEY_CACHE_CONTROL_TOPIC,
     ];
     let mut universe = std::collections::BTreeMap::new();
     for name in fixed {
@@ -1529,6 +1544,16 @@ fn validate_topology_capture(
 // These cuts include background/local/relayed activity. Only load_returns
 // attributes counts to controlled calls. publish_total deltas do not validate
 // vector length or controlled origin; no cut is an acceptance predicate.
+//
+// Producer semantics pinned by `reviewed_pubsub_producer` below: the meter
+// records exactly the four application kinds (eager/ihave/iwant/
+// anti_entropy) per topic, with `bytes` being the measured wire bytes for
+// each claimed peer — the git 997abc75 producer uses the final Full/Ref/legacy
+// frame length per peer instead of one shared legacy serialized length, so
+// `msgs` stays one attempt per peer and `bytes` reflects mixed fan-out.
+// Its separate key-cache snapshot also counts ordinary legacy and v3 Full
+// outbound submissions by final frame length; hop-local control remains on
+// a reserved topic outside these four application fields.
 fn generator_topic_projection(
     rows: &std::collections::BTreeMap<String, saorsa_gossip_pubsub::OutboundTopicMeterSnapshot>,
     zero_fanout: &std::collections::BTreeMap<String, u64>,
@@ -1875,6 +1900,12 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
     if !projected.contains(bus.as_str()) {
         return Err("bus missing from universe".into());
     }
+    // SG key-cache control topic: universe member (see
+    // SG_KEY_CACHE_CONTROL_TOPIC). Kept in one place with the row premise
+    // below so the two cannot drift apart.
+    let control = saorsa_gossip_types::TopicId::from_entity(SG_KEY_CACHE_CONTROL_TOPIC.as_bytes())
+        .to_string();
+
     // #613: the generator's machine ID keys the per-peer receive-pump rows.
     let generator_machine_hex = raw["identities"][0]["machine"]
         .as_str()
@@ -1917,6 +1948,27 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                     let y = new[kind][field].as_u64().ok_or("invalid new counter")?;
                     if y < x {
                         return Err("counter decrease".into());
+                    }
+                }
+            }
+        }
+        // Control-plane purity premise: the SG key-cache control topic is
+        // session-scoped protected control egress. When its row is present,
+        // it must carry zero data-plane msgs AND bytes in every one of the
+        // four kinds — non-zero eager/ihave/iwant/anti_entropy there is a
+        // control-plane leak (data-plane traffic riding the reserved topic)
+        // and fails the measurement outright, not merely inconclusives it.
+        // Deliberately not O5_BUS_ORACLE_KINDS: the reserved-topic premise
+        // must not silently change if an arm's oracle kinds ever diverge.
+        for rows in [&a, &b] {
+            if let Some(row) = rows.get(control.as_str()) {
+                for kind in ["eager", "ihave", "iwant", "anti_entropy"] {
+                    for field in ["msgs", "bytes"] {
+                        if row[kind][field].as_u64().ok_or("invalid control counter")? != 0 {
+                            return Err(format!(
+                                "FAIL: {arm}: control plane carried {kind} {field}"
+                            ));
+                        }
                     }
                 }
             }
@@ -2033,6 +2085,93 @@ fn prepare_measurement() -> MeasurementPreparation {
     }
 }
 
+fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
+    // crates.io 0.5.86 retains the reviewed git producer's outbound meter,
+    // wire_bytes_for_peer and key-cache accounting semantics. Group-roster
+    // eager selection can change attempt counts without changing the meter.
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.86";
+    const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const REGISTRY_PUBSUB_SHA: &str =
+        "6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82";
+    const GIT_PUBSUB_VERSION: &str = "0.5.85";
+    // SG 997abc75 supplies the reviewed meter accounting. Its descendant
+    // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
+    // fatal-send pin, and a typed view of the unchanged outbound meters.
+    // Both historical git pins keep the same 0.5.85 meter definitions.
+    // No checksum: git lock entries carry none.
+    const GIT_PUBSUB_SOURCE_ACCOUNTING: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867";
+    const GIT_PUBSUB_SOURCE_CURRENT: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc";
+    let version = package.get("version").and_then(toml::Value::as_str);
+    let source = package.get("source").and_then(toml::Value::as_str);
+    let registry = version == Some(REGISTRY_PUBSUB_VERSION)
+        && source == Some(REGISTRY_PUBSUB_SOURCE)
+        && package.get("checksum").and_then(toml::Value::as_str) == Some(REGISTRY_PUBSUB_SHA);
+    let git = version == Some(GIT_PUBSUB_VERSION)
+        && (source == Some(GIT_PUBSUB_SOURCE_ACCOUNTING)
+            || source == Some(GIT_PUBSUB_SOURCE_CURRENT))
+        && package.get("checksum").is_none();
+    registry || git
+}
+
+#[test]
+fn controlled_load_producer_allowlist_is_exact() {
+    let registry: toml::Value = toml::from_str(
+        "version = '0.5.86'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82'",
+    )
+    .expect("registry fixture");
+    let git_accounting: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867'",
+    )
+    .expect("accounting git fixture");
+    let git: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc'",
+    )
+    .expect("current git fixture");
+    assert!(reviewed_pubsub_producer(&registry));
+    assert!(reviewed_pubsub_producer(&git_accounting));
+    assert!(reviewed_pubsub_producer(&git));
+    let stale_current: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0'",
+    )
+    .expect("stale current git fixture");
+    assert!(!reviewed_pubsub_producer(&stale_current));
+    // The superseded 0.5.85 registry package is no longer the reviewed
+    // producer: moving the premise must not leave the old graph accepted.
+    let stale_registry: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22'",
+    )
+    .expect("stale registry fixture");
+    assert!(!reviewed_pubsub_producer(&stale_registry));
+    let mut wrong_registry = registry.clone();
+    wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
+    assert!(!reviewed_pubsub_producer(&wrong_registry));
+    // Exactly one component wrong versus the accepted git source: the
+    // revision query parameter.
+    let mut wrong_revision = git.clone();
+    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#9258cee9b5f30455675279d02730df1345e6aedc".into());
+    assert!(!reviewed_pubsub_producer(&wrong_revision));
+    let mut wrong_hash = git.clone();
+    wrong_hash["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#0000000000000000000000000000000000000000".into());
+    assert!(!reviewed_pubsub_producer(&wrong_hash));
+    // Exactly one component wrong versus the accepted git source: the URL
+    // (a lookalike repository must not satisfy the premise).
+    let mut wrong_url = git.clone();
+    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc".into());
+    assert!(!reviewed_pubsub_producer(&wrong_url));
+    let mut spurious_checksum = git.clone();
+    spurious_checksum
+        .as_table_mut()
+        .expect("table fixture")
+        .insert("checksum".into(), toml::Value::String("0".repeat(64)));
+    assert!(!reviewed_pubsub_producer(&spurious_checksum));
+    let mut missing_source = git;
+    missing_source
+        .as_table_mut()
+        .expect("table fixture")
+        .remove("source");
+    assert!(!reviewed_pubsub_producer(&missing_source));
+}
+
 async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde_json::Value {
     use serde_json::json;
     let clock = std::time::Instant::now();
@@ -2052,11 +2191,8 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
         .iter()
         .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
         .collect::<Vec<_>>();
-    if pinned.len() != 1
-        || pinned[0]["version"].as_str() != Some("0.5.84")
-        || pinned[0]["checksum"].as_str()
-            != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")
-    {
+    let reviewed_producer = pinned.len() == 1 && reviewed_pubsub_producer(pinned[0]);
+    if !reviewed_producer {
         raw["outcome"] = json!("INCONCLUSIVE");
         raw["reason"] = json!("published meter producer pin unavailable");
         emit_measurement(&raw);
@@ -3599,6 +3735,124 @@ fn validate_topology_accepts_stripped_observations() {
             assert!(
                 !e.contains("topology keys mismatch"),
                 "stripped observations must not trigger topology-key check; got: {e}"
+            );
+        }
+    }
+}
+
+fn reserved_measurement_row(topic: &str) -> serde_json::Value {
+    serde_json::json!({"topic_id_hex8":topic,"name":"unknown-hex","names":[],
+        "outbound":{"eager":{"msgs":0,"bytes":0},"ihave":{"msgs":0,"bytes":0},
+            "iwant":{"msgs":0,"bytes":0},"anti_entropy":{"msgs":0,"bytes":0}}})
+}
+
+// JSON-only measurement evidence: synthetic_diamond_evidence topology plus
+// the production fixed-topic declaration (without Agent-specific topics). D5
+// moves bus eager bytes; O5 is a clean opt-out; both arms carry the reserved
+// SG key-cache control row with zero data-plane counters — the exact live
+// shape at the SG 997abc75 pin (its control flusher runs per PubSub
+// instance for every authenticated session).
+fn synthetic_measurement_evidence() -> serde_json::Value {
+    use serde_json::json;
+    let hex8 = |name: &str| saorsa_gossip_types::TopicId::from_entity(name.as_bytes()).to_string();
+    let bus = hex8(DM_BUS_TOPIC);
+    let control = hex8(SG_KEY_CACHE_CONTROL_TOPIC);
+    let mut raw = synthetic_diamond_evidence();
+    raw["universe"] = topic_universe(&[]);
+    let sample = |begin: u64, rows: serde_json::Value, bus_subscribed: bool| {
+        json!({"begin_ns":begin,"end_ns":begin+1,
+            "egress":{
+                "subscribed_topics": if bus_subscribed {
+                    json!([{"name":DM_BUS_TOPIC,"topic_id_hex8":bus}])
+                } else { json!([]) },
+                "outbound_by_topic_named": rows,
+                "egress_budget":{"byte_policy":"observe_only","repair":{"tracking_overflow":0}}},
+            "participation":{"mode":"leaf","relay_bytes":7}})
+    };
+    let bus_row = serde_json::json!({"topic_id_hex8":bus,"name":DM_BUS_TOPIC,
+        "names":[DM_BUS_TOPIC],
+        "outbound":{"eager":{"msgs":1,"bytes":4096},"ihave":{"msgs":0,"bytes":0},
+            "iwant":{"msgs":0,"bytes":0},"anti_entropy":{"msgs":0,"bytes":0}}});
+    raw["samples"]["D5"] = json!({
+        "t0": sample(2_000_000_000, json!([reserved_measurement_row(&control)]), true),
+        "t1": sample(12_000_000_000, json!([bus_row, reserved_measurement_row(&control)]), true),
+    });
+    raw["samples"]["O5"] = json!({
+        "t0": sample(2_000_000_000, json!([reserved_measurement_row(&control)]), false),
+        "t1": sample(12_000_000_000, json!([reserved_measurement_row(&control)]), false),
+    });
+    raw
+}
+
+// Declared zero reserved control row (both arms, both cuts) is accepted:
+// admission of the reserved topic changes no verdict while its rows stay
+// pure control-plane.
+#[test]
+fn validate_measurement_accepts_declared_zero_reserved_control_row() {
+    let evidence = synthetic_measurement_evidence();
+    validate_measurement(&evidence)
+        .expect("declared zero reserved control row must not change the verdict");
+}
+
+// The same evidence minus the universe declaration must stay rejected: the
+// admission is a deliberate source-reviewed act, never an observed-row fact.
+#[test]
+fn validate_measurement_rejects_reserved_row_without_universe_declaration() {
+    let mut evidence = synthetic_measurement_evidence();
+    evidence["universe"]
+        .as_array_mut()
+        .expect("universe")
+        .retain(|row| row["name"].as_str() != Some(SG_KEY_CACHE_CONTROL_TOPIC));
+    let err = validate_measurement(&evidence)
+        .expect_err("undeclared reserved row must be rejected fail-closed");
+    assert!(
+        err.contains("D5: observed topic outside admitted universe"),
+        "expected universe rejection; got: {err}"
+    );
+}
+
+// Arbitrary unknown topics stay rejected — the admission is a single named
+// literal, never a blanket unknown-hex or zero-row exemption.
+#[test]
+fn validate_measurement_rejects_arbitrary_rogue_topic_row() {
+    let mut evidence = synthetic_measurement_evidence();
+    let rogue = saorsa_gossip_types::TopicId::from_entity(b"x0x-rogue-topic").to_string();
+    let mut row = reserved_measurement_row(&rogue);
+    row["name"] = serde_json::json!("rogue");
+    evidence["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"]
+        .as_array_mut()
+        .expect("rows")
+        .push(row);
+    let err = validate_measurement(&evidence).expect_err("rogue topic must stay rejected");
+    assert!(
+        err.contains("observed topic outside admitted universe"),
+        "expected universe rejection; got: {err}"
+    );
+}
+
+// Non-zero data-plane counters on the reserved topic fail the measurement.
+// Each of the four kinds x each field is violated alone (only msgs OR only
+// bytes set to 1), so a guard missing any single check is observable.
+#[test]
+fn validate_measurement_rejects_data_plane_traffic_on_reserved_control_topic() {
+    let control = saorsa_gossip_types::TopicId::from_entity(SG_KEY_CACHE_CONTROL_TOPIC.as_bytes())
+        .to_string();
+    for kind in ["eager", "ihave", "iwant", "anti_entropy"] {
+        for field in ["msgs", "bytes"] {
+            let mut evidence = synthetic_measurement_evidence();
+            for row in evidence["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"]
+                .as_array_mut()
+                .expect("rows")
+            {
+                if row["topic_id_hex8"].as_str() == Some(control.as_str()) {
+                    row["outbound"][kind][field] = serde_json::json!(1);
+                }
+            }
+            let err = validate_measurement(&evidence)
+                .expect_err("data-plane traffic on the reserved topic must fail");
+            assert!(
+                err.contains(&format!("FAIL: O5: control plane carried {kind} {field}")),
+                "expected reserved-topic purity failure for {kind} {field}; got: {err}"
             );
         }
     }

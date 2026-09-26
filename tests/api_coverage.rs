@@ -48,6 +48,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
+    covered!(
+        Post,
+        "/auth/session/refresh",
+        daemon_api_auth_session_refresh
+    ),
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     covered!(Post, "/agent/move", move_routes_wired),
     covered!(Post, "/agent/move/export", move_routes_wired),
@@ -153,6 +158,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/diagnostics/history",
         rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/diagnostics/state-sync",
+        state_sync_route_exposes_bounded_open_store_snapshot
     ),
     covered!(
         Get,
@@ -568,9 +578,26 @@ const COVERED: &[CoveredEndpoint] = &[
         daemon_api_forwards_remove_disabled
     ),
     covered!(Get, "/streams", daemon_api_streams),
+    // ── ACL management (ADR-0070 §3) ────────────────────────────────────
+    covered!(Get, "/acl/connect", acl_routes_wired),
+    covered!(Post, "/acl/connect", acl_routes_wired),
+    covered!(Delete, "/acl/connect/:id", acl_routes_wired),
+    covered!(Get, "/acl/exec", acl_routes_wired),
+    covered!(Post, "/acl/exec", acl_routes_wired),
+    covered!(Delete, "/acl/exec/:id", acl_routes_wired),
+    covered!(Post, "/acl/reload", acl_routes_wired),
+    // ── Share grants (ADR-0070 §2) ──────────────────────────────────────
+    covered!(Get, "/grants", grant_routes_wired),
+    covered!(Post, "/grants", grant_routes_wired),
+    covered!(Delete, "/grants/:id", grant_routes_wired),
+    covered!(Get, "/grants/received", grant_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/server/routes/network.rs",
+        include_str!("../src/server/routes/network.rs"),
+    ),
     (
         "tests/daemon_api_integration.rs",
         include_str!("daemon_api_integration.rs"),
@@ -615,6 +642,14 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/sync.rs",
         include_str!("../src/server/routes/sync.rs"),
+    ),
+    (
+        "src/server/routes/acl.rs",
+        include_str!("../src/server/routes/acl.rs"),
+    ),
+    (
+        "src/server/routes/grants.rs",
+        include_str!("../src/server/routes/grants.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1080,6 +1115,8 @@ fn categories_are_valid() {
         "upgrade",
         "websocket",
         "history",
+        "acl",
+        "grants",
     ];
 
     for ep in ENDPOINTS {

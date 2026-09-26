@@ -5,12 +5,14 @@
 //! holds the verbatim handler bodies and request/response DTOs for one
 //! registry category; the router wiring stays in the parent module.
 
+mod acl;
 mod connect;
 mod contacts;
 mod direct;
 mod discovery;
 mod exec;
 mod files;
+mod grants;
 mod groups;
 pub(in crate::server) mod history;
 pub mod home;
@@ -31,6 +33,10 @@ pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
 
+pub(super) use acl::{
+    acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add, acl_exec_list,
+    acl_exec_remove, acl_reload,
+};
 pub(super) use connect::{
     connect_diagnostics_handler, forward_add, forward_list, forward_remove, streams_diagnostics,
 };
@@ -50,6 +56,7 @@ pub(super) use files::{
     file_accept_handler, file_reject_handler, file_send_handler, file_transfer_status_handler,
     file_transfers_handler, handle_file_message, FileChunkAckSlot,
 };
+pub(super) use grants::{grants_issue, grants_list, grants_received, grants_revoke};
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
@@ -79,10 +86,10 @@ pub(super) use named_groups::{
     create_group_invite, create_join_request, create_named_group, delete_discovery_subscription,
     discover_groups, discover_groups_nearby, ensure_named_group_listeners, get_group_card,
     get_group_join_status, get_group_public_messages, get_group_state, get_group_state_commits,
-    get_named_group, get_named_group_members, group_membership_lock, handle_join_result_message,
-    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    import_group_card, ingest_public_message, join_group_via_invite, leave_group,
-    list_discovery_subscriptions, list_join_requests, list_named_groups,
+    get_named_group, get_named_group_members, group_membership_lock, handle_control_blob_message,
+    handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
+    handle_welcome_blob_message, import_group_card, ingest_public_message, join_group_via_invite,
+    leave_group, list_discovery_subscriptions, list_join_requests, list_named_groups,
     load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, migrate_unsplit_home_suite_store_if_needed,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, now_millis_u64,
@@ -96,22 +103,23 @@ pub(super) use named_groups::{
     spawn_global_discovery_listener, spawn_global_public_message_listener,
     spawn_listed_to_contacts_listener, store_named_group_info, unban_group_member,
     update_group_policy, update_member_role, update_named_group, withdraw_group_state,
-    AtomicWriteOutcome, ExpectedJoinResultInviter, JoinRefusalSignLimiter, JoinResultMessage,
-    LastJoinOutcome, ListenerRegistration, NamedGroupMetadataEvent, PendingCausalApproval,
-    PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingListenerAdmission,
-    PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation,
-    PublicGroupBootstrap, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    AtomicWriteOutcome, ControlBlobMessage, ControlBlobState, ExpectedJoinResultInviter,
+    JoinRefusalSignLimiter, JoinResultMessage, LastJoinOutcome, ListenerRegistration,
+    NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval, PendingJoinAttempt,
+    PendingJoinRefusal, PendingJoinResult, PendingListenerAdmission, PendingTreeKemMetadataEvent,
+    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, PublicGroupBootstrap,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, TreeKemMemberKeyPackageCache,
+    WelcomeBlobMessage, WelcomeFetchWaiter, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
-    probe_peer_handler, relay_diagnostics, transport_diagnostics,
+    probe_peer_handler, relay_diagnostics, state_sync_diagnostics, transport_diagnostics,
 };
 pub(super) use owner::{
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
