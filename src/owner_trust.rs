@@ -58,6 +58,9 @@ pub struct OwnerTrust {
     /// ADR-0070 §2 share-grant store (slice 3). Shared slot like `devices`:
     /// until the daemon installs it, no pair holds any grant.
     grants: Arc<std::sync::RwLock<Option<Arc<crate::share_grant::ShareGrantStore>>>>,
+    /// #926 owner-side grant redelivery outbox. Shared slot like `grants`.
+    grant_outbox:
+        Arc<std::sync::RwLock<Option<Arc<crate::share_grant::outbox::GrantRedeliveryOutbox>>>>,
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -91,7 +94,31 @@ impl OwnerTrust {
             devices: Arc::new(std::sync::RwLock::new(None)),
             bindings,
             grants: Arc::new(std::sync::RwLock::new(None)),
+            grant_outbox: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the #926 grant redelivery outbox. Every clone sees it.
+    pub fn install_share_grant_outbox(
+        &self,
+        outbox: Arc<crate::share_grant::outbox::GrantRedeliveryOutbox>,
+    ) {
+        let mut slot = self
+            .grant_outbox
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(outbox);
+    }
+
+    /// The installed grant redelivery outbox, if any.
+    #[must_use]
+    pub fn share_grant_outbox(
+        &self,
+    ) -> Option<Arc<crate::share_grant::outbox::GrantRedeliveryOutbox>> {
+        self.grant_outbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Install the ADR-0070 share-grant store. Every clone sees it.

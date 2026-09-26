@@ -1022,6 +1022,22 @@ pub async fn serve_with_options(
         )
         .await,
     ));
+    // #926: the owner-side grant redelivery outbox (deliveries whose durable
+    // DM attempts failed). An unreadable file queues nothing and refuses
+    // writes, like the store; the grants themselves are unaffected.
+    agent.install_share_grant_outbox(Arc::new(
+        x0x::share_grant::outbox::GrantRedeliveryOutbox::load(
+            config
+                .data_dir
+                .join(x0x::share_grant::outbox::SHARE_GRANT_OUTBOX_FILE),
+            agent.identity().user_keypair().map(|kp| kp.user_id()),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+        .await,
+    ));
 
     // ADR-0070 §3: from here on ACL edits and reloads swap the policies the
     // agent (connect accept + forwarder) and the exec service consult.
@@ -2138,6 +2154,45 @@ pub async fn serve_with_options(
                 let _ = x0x::share_grant::handle_share_grant_dm(store.as_deref(), typed).await;
             }
         }));
+    }
+
+    // #926: grant redelivery worker. Each pass drops revoked/expired entries
+    // and sends at most a bounded batch of due ones on the #924 durable DM
+    // route; a newly queued or nudged entry wakes it early.
+    if let Some(grant_outbox) = agent.share_grant_outbox() {
+        let grant_agent = Arc::clone(&agent);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = grant_outbox.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                let _ = grant_agent.share_grant_outbox_step().await;
+            }
+        }));
+        // Retry promptly when a recipient's machine connects again.
+        if let Some(network) = agent.network() {
+            let mut events = network.subscribe();
+            let nudge_agent = Arc::clone(&agent);
+            let mut shutdown_rx = state.shutdown_notify.subscribe();
+            bg_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => break,
+                        event = events.recv() => match event {
+                            Ok(x0x::network::NetworkEvent::PeerConnected { peer_id, .. }) => {
+                                let machine = x0x::identity::MachineId(peer_id);
+                                nudge_agent.nudge_share_grant_outbox_for_machine(&machine).await;
+                            }
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                    }
+                }
+            }));
+        }
     }
 
     // ADR 0030 §5: durable bootstrap retry worker. The outbox was loaded and

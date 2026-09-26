@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant redelivery outbox (#926, ADR-0070 §2).** A grant delivery
+  whose durable-DM attempts all fail is now queued in
+  `<data_dir>/share-grant-outbox.bin` (durable, 0600) and retried on bounded
+  backoff (5 s doubling to 5 min), and at once when the recipient's machine
+  connects again, until the recipient ACKs. An entry is dropped on ACK, on
+  revocation (checked before every send) or at its deadline: the grant's
+  expiry or 7 days after queueing. Bounds: 32 entries per recipient, 1024 in
+  total; past a bound the entry is refused and reported. `POST /grants`
+  delivery rows gain `queued`. No wire change: retries re-send the #924
+  typed DM with the same logical request id, so the receiving side is
+  unchanged.
+
 - **`[gossip] byte_policy` — opt-in Leaf egress shedding (#504 slice 2).**
   `"observe_only"` (default) | `"shed_normal"`. The byte thresholds and the
   authority to act on them are now two separate settings: a non-zero

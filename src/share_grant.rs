@@ -21,7 +21,9 @@
 //! only once the grant is persisted. A malformed, forged, expired or
 //! unrelated grant completes with `Err`: the ACK is withheld, nothing is
 //! stored, and the bytes never reach generic DM consumers (the typed route
-//! owns the prefix).
+//! owns the prefix). A recipient that does not ACK is queued in the durable
+//! owner-side redelivery outbox ([`outbox`], #926) and retried until it ACKs,
+//! the grant is revoked, or the entry expires.
 //!
 //! # Storage
 //!
@@ -949,9 +951,102 @@ pub struct GrantDelivery {
     pub agent: String,
     /// `true` once the recipient's durable v2 ACK arrived.
     pub delivered: bool,
-    /// Why delivery failed, if it did.
+    /// `true` when delivery failed and the grant was durably queued in the
+    /// owner-side redelivery outbox (#926), which keeps retrying it.
+    pub queued: bool,
+    /// Why delivery failed, if it did (and why it was not queued, if it
+    /// was not).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The exact typed-DM payload and logical request id a grant is delivered
+/// with. The request id is derived from the payload, so the first delivery
+/// and every outbox retry (#926) are the SAME logical request: a receiver
+/// that already stored the grant answers `Duplicate`.
+///
+/// # Errors
+/// The grant cannot be encoded ([`ShareGrant::to_dm_payload`]).
+pub fn grant_delivery_request(grant: &ShareGrant) -> Result<(Vec<u8>, [u8; 16]), ShareGrantError> {
+    let payload = grant.to_dm_payload()?;
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&blake3::hash(&payload).as_bytes()[..16]);
+    Ok((payload, request_id))
+}
+
+/// Deliver `grant` to each recipient concurrently through `send` (which
+/// must return `Ok` only on the recipient's durable v2 ACK) and durably
+/// queue every failed recipient in `outbox` for redelivery (#926).
+pub async fn deliver_grant_via<F, Fut>(
+    grant: &ShareGrant,
+    recipients: &[AgentId],
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    now_unix: u64,
+    send: F,
+) -> Vec<GrantDelivery>
+where
+    F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let (payload, request_id) = match grant_delivery_request(grant) {
+        Ok(request) => request,
+        Err(e) => {
+            return recipients
+                .iter()
+                .map(|a| GrantDelivery {
+                    agent: hex::encode(a.as_bytes()),
+                    delivered: false,
+                    queued: false,
+                    error: Some(e.to_string()),
+                })
+                .collect();
+        }
+    };
+    let sends = recipients.iter().map(|recipient| {
+        let fut = send(*recipient, payload.clone(), request_id);
+        async move { (*recipient, fut.await) }
+    });
+    let mut out = Vec::with_capacity(recipients.len());
+    for (recipient, result) in futures::future::join_all(sends).await {
+        let mut delivery = GrantDelivery {
+            agent: hex::encode(recipient.as_bytes()),
+            delivered: result.is_ok(),
+            queued: false,
+            error: result.err(),
+        };
+        if !delivery.delivered {
+            delivery.queued =
+                queue_failed_delivery(grant, recipient, outbox, now_unix, &mut delivery.error)
+                    .await;
+        }
+        out.push(delivery);
+    }
+    out
+}
+
+/// Queue one failed delivery; returns whether it is now queued. A refusal
+/// is appended to `error` so the owner sees why it will not be retried.
+async fn queue_failed_delivery(
+    grant: &ShareGrant,
+    recipient: AgentId,
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    now_unix: u64,
+    error: &mut Option<String>,
+) -> bool {
+    let Some(outbox) = outbox else {
+        return false;
+    };
+    match outbox.enqueue(grant, recipient, now_unix).await {
+        Ok(_) => true,
+        Err(e) => {
+            let reason = format!("not queued for redelivery: {e}");
+            *error = Some(match error.take() {
+                Some(prev) => format!("{prev}; {reason}"),
+                None => reason,
+            });
+            false
+        }
+    }
 }
 
 impl crate::Agent {
@@ -1090,62 +1185,111 @@ impl crate::Agent {
     /// A recipient counts as delivered only on its durable v2 ACK, which its
     /// handler releases once the grant is stored.
     ///
-    /// # Why delivery is reliable without a grant fetch
+    /// # Missed deliveries: the owner-side outbox (#926)
     ///
-    /// ADR-0070 §2 also sketches a grantee-attached `grant_id` so a daemon
-    /// that missed delivery can request the grant. That fetch is NOT
-    /// implemented (follow-up). Delivery is still reliable, because it can
-    /// never silently lose a grant:
-    /// - the route is DURABLE: the receiver withholds the v2 ACK until the
-    ///   grant is verified and written to its store, so `delivered = true`
-    ///   means "stored", never "sent";
-    /// - without that ACK the sender retries ([`GRANT_DELIVERY_RETRIES`])
-    ///   under the same logical request id, which the receiver answers
-    ///   idempotently (`Duplicate`), and finally reports the recipient as
-    ///   not delivered in the `POST /grants` response;
-    /// - a shared agent's daemon that never received the grant grants
-    ///   nothing — the failure is closed, and visible to the owner.
+    /// Without that ACK the sender retries ([`GRANT_DELIVERY_RETRIES`])
+    /// under the same logical request id, which the receiver answers
+    /// idempotently (`Duplicate`). A recipient that is still unreachable is
+    /// durably queued in the redelivery outbox ([`outbox`]) and retried on
+    /// bounded backoff — and promptly when its machine connects again —
+    /// until it ACKs, the grant is revoked, or the entry's deadline passes.
+    /// ADR-0070 §2's grantee-attached fetch is not implemented: the outbox
+    /// closes the same gap with no wire change and no new request type.
+    /// Until delivery succeeds, a shared agent's daemon that has not
+    /// received the grant grants nothing (fail closed).
     pub async fn deliver_share_grant(
         &self,
         grant: &ShareGrant,
         recipients: &[AgentId],
     ) -> Vec<GrantDelivery> {
-        let payload = match grant.to_dm_payload() {
-            Ok(payload) => payload,
-            Err(e) => {
-                return recipients
-                    .iter()
-                    .map(|a| GrantDelivery {
-                        agent: hex::encode(a.as_bytes()),
-                        delivered: false,
-                        error: Some(e.to_string()),
-                    })
-                    .collect();
-            }
+        let outbox = self.share_grant_outbox();
+        deliver_grant_via(
+            grant,
+            recipients,
+            outbox.as_deref(),
+            unix_now_secs(),
+            |recipient, payload, request_id| {
+                self.send_share_grant_dm(recipient, payload, request_id, GRANT_DELIVERY_RETRIES)
+            },
+        )
+        .await
+    }
+
+    /// One durable typed-DM grant send; `Ok` only on the durable v2 ACK.
+    async fn send_share_grant_dm(
+        &self,
+        recipient: AgentId,
+        payload: Vec<u8>,
+        request_id: [u8; 16],
+        max_retries: u8,
+    ) -> Result<(), String> {
+        let config = crate::dm::DmSendConfig {
+            require_durable_app_ack: true,
+            prefer_raw_quic_if_connected: false,
+            logical_request_id: Some(request_id),
+            max_retries,
+            ..crate::dm::DmSendConfig::default()
         };
-        let mut request_id = [0u8; 16];
-        request_id.copy_from_slice(&blake3::hash(&payload).as_bytes()[..16]);
-        let sends = recipients.iter().map(|recipient| {
-            let payload = payload.clone();
-            async move {
-                let config = crate::dm::DmSendConfig {
-                    require_durable_app_ack: true,
-                    prefer_raw_quic_if_connected: false,
-                    logical_request_id: Some(request_id),
-                    max_retries: GRANT_DELIVERY_RETRIES,
-                    ..crate::dm::DmSendConfig::default()
-                };
-                let result = self
-                    .send_direct_with_config(recipient, payload, config)
-                    .await;
-                GrantDelivery {
-                    agent: hex::encode(recipient.as_bytes()),
-                    delivered: result.is_ok(),
-                    error: result.err().map(|e| e.to_string()),
-                }
-            }
-        });
-        futures::future::join_all(sends).await
+        self.send_direct_with_config(&recipient, payload, config)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Install the owner-side grant redelivery outbox (#926; the daemon does
+    /// this once at startup).
+    pub fn install_share_grant_outbox(&self, outbox: Arc<outbox::GrantRedeliveryOutbox>) {
+        self.owner_trust().install_share_grant_outbox(outbox);
+    }
+
+    /// The installed grant redelivery outbox, if any.
+    #[must_use]
+    pub fn share_grant_outbox(&self) -> Option<Arc<outbox::GrantRedeliveryOutbox>> {
+        self.owner_trust().share_grant_outbox()
+    }
+
+    /// One redelivery-outbox pass (see
+    /// [`outbox::GrantRedeliveryOutbox::step`]). `None` when no outbox is
+    /// installed.
+    pub async fn share_grant_outbox_step(&self) -> Option<outbox::OutboxStepReport> {
+        let outbox = self.share_grant_outbox()?;
+        Some(
+            outbox
+                .step(
+                    unix_now_secs(),
+                    &self.revocation_set,
+                    |recipient, payload, request_id| {
+                        self.send_share_grant_dm(
+                            recipient,
+                            payload,
+                            request_id,
+                            outbox::OUTBOX_SEND_RETRIES,
+                        )
+                    },
+                )
+                .await,
+        )
+    }
+
+    /// `machine` connected: make every queued grant delivery to an agent
+    /// known to run on it due now. Cheap when the outbox is empty.
+    pub async fn nudge_share_grant_outbox_for_machine(&self, machine: &MachineId) -> bool {
+        let Some(outbox) = self.share_grant_outbox() else {
+            return false;
+        };
+        if outbox.is_empty() {
+            return false;
+        }
+        let agents: Vec<AgentId> = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .values()
+            .filter(|entry| entry.machine_id == *machine)
+            .map(|entry| entry.agent_id)
+            .filter(|agent| outbox.has_recipient(agent))
+            .collect();
+        !agents.is_empty() && outbox.nudge(&agents, unix_now_secs())
     }
 
     /// Revoke an issued grant (owner key only): sign a
@@ -1196,6 +1340,14 @@ impl crate::Agent {
             .await
             .verify_and_insert(record.clone(), None)
             .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
+        // #926: a revoked grant must never be redelivered. The outbox worker
+        // also re-checks the revocation set before every send, so failing to
+        // rewrite the outbox file here cannot lead to a delivery.
+        if let Some(outbox) = self.share_grant_outbox() {
+            if let Err(e) = outbox.remove_grant(&grant_id).await {
+                tracing::warn!("revoked grant's queued deliveries not rewritten: {e}");
+            }
+        }
         crate::persist_share_grant_revocations(&self.revocation_set, self.identity_dir.as_deref())
             .await;
         if let Some(rt) = &self.gossip_runtime {
@@ -1213,6 +1365,8 @@ impl crate::Agent {
         Ok(record)
     }
 }
+
+pub mod outbox;
 
 #[cfg(test)]
 mod tests;
