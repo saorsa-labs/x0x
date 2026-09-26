@@ -206,45 +206,61 @@ if ($Start) {
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
     $portFile = Join-Path $dataDir "api.port"
     Write-Host ""
-    Write-Host "Starting: $(Join-Path $InstallDir 'x0xd.exe')"
-    $proc = Start-Process -FilePath (Join-Path $InstallDir "x0xd.exe") -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $dataDir "x0xd.log") `
-        -RedirectStandardError (Join-Path $dataDir "x0xd.err.log")
 
-    $tries = 0
-    while (-not (Test-Path -LiteralPath $portFile) -and $tries -lt 30) {
-        Start-Sleep -Seconds 1
-        $tries++
-    }
-    if (-not (Test-Path -LiteralPath $portFile)) {
-        throw "Timeout waiting for x0xd. Check: $(Join-Path $dataDir 'x0xd.err.log')"
-    }
-    $api = (Get-Content -LiteralPath $portFile -Raw).Trim()
+    # Never report another daemon as the one we started: if any x0xd is
+    # already running (e.g. from another install dir), say so and do not start.
+    $running = @(Get-Process -Name x0xd -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        $pids = ($running | ForEach-Object { $_.Id }) -join ", "
+        Write-Warning ("x0xd is already running (PID $pids), so -Start did not start another. " +
+            "To run the version just installed: x0x stop, then x0xd.")
+    } else {
+        # No x0xd is running, so any api.port left behind is stale.
+        Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
+        Write-Host "Starting: $(Join-Path $InstallDir 'x0xd.exe')"
+        $proc = Start-Process -FilePath (Join-Path $InstallDir "x0xd.exe") -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput (Join-Path $dataDir "x0xd.log") `
+            -RedirectStandardError (Join-Path $dataDir "x0xd.err.log")
+        $exitedMsg = "x0xd (PID $($proc.Id)) exited during startup. Check: $(Join-Path $dataDir 'x0xd.err.log')"
 
-    $health = $null
-    for ($i = 0; $i -lt 15 -and -not $health; $i++) {
-        try { $health = Invoke-RestMethod -Uri "http://$api/health" -UseBasicParsing } catch { Start-Sleep -Seconds 1 }
-    }
-    if (-not $health) {
-        throw "Timeout waiting for a healthy x0xd. Check: $(Join-Path $dataDir 'x0xd.err.log')"
-    }
+        $tries = 0
+        while (-not (Test-Path -LiteralPath $portFile) -and -not $proc.HasExited -and $tries -lt 30) {
+            Start-Sleep -Seconds 1
+            $tries++
+        }
+        if ($proc.HasExited) { throw $exitedMsg }
+        if (-not (Test-Path -LiteralPath $portFile)) {
+            throw "Timeout waiting for x0xd. Check: $(Join-Path $dataDir 'x0xd.err.log')"
+        }
+        $api = (Get-Content -LiteralPath $portFile -Raw).Trim()
 
-    $agentId = ""
-    $tokenFile = Join-Path $dataDir "api-token"
-    if (Test-Path -LiteralPath $tokenFile) {
-        $token = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
-        try {
-            $agent = Invoke-RestMethod -Uri "http://$api/agent" -UseBasicParsing -Headers @{ Authorization = "Bearer $token" }
-            $agentId = $agent.agent_id
-        } catch { }
-    }
+        $health = $null
+        for ($i = 0; $i -lt 15 -and -not $health -and -not $proc.HasExited; $i++) {
+            try { $health = Invoke-RestMethod -Uri "http://$api/health" -UseBasicParsing } catch { Start-Sleep -Seconds 1 }
+        }
+        # Health must come from a daemon while our child is still alive.
+        if ($proc.HasExited) { throw $exitedMsg }
+        if (-not $health) {
+            throw "Timeout waiting for a healthy x0xd. Check: $(Join-Path $dataDir 'x0xd.err.log')"
+        }
 
-    Write-Host ""
-    Write-Host "x0x is running" -ForegroundColor Green
-    Write-Host "  API:    http://$api"
-    Write-Host "  Agent:  $agentId"
-    Write-Host "  Log:    $(Join-Path $dataDir 'x0xd.log')"
-    Write-Host "  PID:    $($proc.Id)"
+        $agentId = ""
+        $tokenFile = Join-Path $dataDir "api-token"
+        if (Test-Path -LiteralPath $tokenFile) {
+            $token = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+            try {
+                $agent = Invoke-RestMethod -Uri "http://$api/agent" -UseBasicParsing -Headers @{ Authorization = "Bearer $token" }
+                $agentId = $agent.agent_id
+            } catch { }
+        }
+
+        Write-Host ""
+        Write-Host "x0x is running" -ForegroundColor Green
+        Write-Host "  API:    http://$api"
+        Write-Host "  Agent:  $agentId"
+        Write-Host "  Log:    $(Join-Path $dataDir 'x0xd.log')"
+        Write-Host "  PID:    $($proc.Id)"
+    }
 }
 
 # ── Next steps ──────────────────────────────────────────────────────────────
