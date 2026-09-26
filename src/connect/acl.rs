@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::exec::acl::{parse_agent_id, parse_machine_id, LoadMode};
+use crate::exec::acl::{parse_principal, AclPrincipal, LoadMode};
 use crate::identity::{AgentId, MachineId};
 use crate::server::InstanceName;
 
@@ -138,8 +138,13 @@ impl ConnectPolicy {
                 enabled: true,
                 loaded_from: acl.loaded_from.display().to_string(),
                 loaded_at_unix_ms: acl.loaded_at_unix_ms,
-                allow_entry_count: acl.allow.len(),
-                target_entry_count: acl.allow.iter().map(|e| e.targets.len()).sum(),
+                allow_entry_count: acl.allow.len() + acl.owner_allow.len(),
+                target_entry_count: acl.allow.iter().map(|e| e.targets.len()).sum::<usize>()
+                    + acl
+                        .owner_allow
+                        .iter()
+                        .map(|e| e.targets.len())
+                        .sum::<usize>(),
                 disabled_reason: None,
             },
         }
@@ -168,6 +173,11 @@ pub struct ConnectAcl {
     /// Allowed (agent, machine, target) triples. v1 has **no caps struct** —
     /// per-flow stream limits are T4 forwarder config, not ACL policy.
     pub allow: Vec<ConnectAllowEntry>,
+    /// `principal = "owner"` entries (ADR-0070 §1): targets allowed to any
+    /// owner-trusted `(agent, machine)` pair. Kept apart from [`Self::allow`]
+    /// so the exact-pair lookups ([`Self::entry_for`], [`Self::is_allowed`])
+    /// keep their meaning; only the `*_for_principal` lookups consult it.
+    pub owner_allow: Vec<ConnectOwnerEntry>,
 }
 
 impl ConnectAcl {
@@ -196,6 +206,56 @@ impl ConnectAcl {
         self.entry_for(agent_id, machine_id)
             .is_some_and(|e| e.targets.iter().any(|t| t == target))
     }
+
+    /// Whether the ACL has any `principal = "owner"` entry.
+    #[must_use]
+    pub fn has_owner_entries(&self) -> bool {
+        !self.owner_allow.is_empty()
+    }
+
+    /// Whether any entry names this requester: an exact `(agent, machine)`
+    /// pair, or — only when `owner_trusted` — a `principal = "owner"` entry.
+    ///
+    /// `owner_trusted` must come from [`crate::owner_trust`]; passing `false`
+    /// reduces this to the exact-pair check.
+    #[must_use]
+    pub fn has_entry_for_principal(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+    ) -> bool {
+        self.entry_for(agent_id, machine_id).is_some()
+            || (owner_trusted && self.has_owner_entries())
+    }
+
+    /// Exact-target membership test across both selectors: the exact pair's
+    /// targets, plus — only when `owner_trusted` — every `principal =
+    /// "owner"` entry's targets. Target matching stays exact `SocketAddr`
+    /// equality for both.
+    #[must_use]
+    pub fn is_allowed_for_principal(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        target: &SocketAddr,
+    ) -> bool {
+        self.is_allowed(agent_id, machine_id, target)
+            || (owner_trusted
+                && self
+                    .owner_allow
+                    .iter()
+                    .any(|e| e.targets.iter().any(|t| t == target)))
+    }
+}
+
+/// One `principal = "owner"` entry (ADR-0070 §1): loopback targets allowed
+/// to any owner-trusted pair. Targets are explicit, exactly as for pairs.
+#[derive(Debug, Clone)]
+pub struct ConnectOwnerEntry {
+    pub description: Option<String>,
+    pub targets: Vec<SocketAddr>,
 }
 
 /// One allowed requester pair + their permitted loopback targets.
@@ -311,17 +371,17 @@ pub fn parse_connect_policy(
     }
 
     let mut allow = Vec::with_capacity(connect.allow.len());
+    let mut owner_allow = Vec::new();
     for (idx, entry) in connect.allow.into_iter().enumerate() {
-        let agent_id =
-            parse_agent_id(&entry.agent_id).map_err(|reason| ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].agent_id: {reason}"),
-            })?;
-        let machine_id =
-            parse_machine_id(&entry.machine_id).map_err(|reason| ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].machine_id: {reason}"),
-            })?;
+        let principal = parse_principal(
+            entry.principal.as_deref(),
+            entry.agent_id.as_deref(),
+            entry.machine_id.as_deref(),
+        )
+        .map_err(|reason| ConnectAclError::Invalid {
+            path: path.display().to_string(),
+            reason: format!("allow[{idx}]: {reason}"),
+        })?;
         if entry.targets.is_empty() {
             return Err(ConnectAclError::Invalid {
                 path: path.display().to_string(),
@@ -339,18 +399,28 @@ pub fn parse_connect_policy(
             })?;
             targets.push(addr);
         }
-        allow.push(ConnectAllowEntry {
-            description: entry.description,
-            agent_id,
-            machine_id,
-            targets,
-        });
+        match principal {
+            AclPrincipal::Pair {
+                agent_id,
+                machine_id,
+            } => allow.push(ConnectAllowEntry {
+                description: entry.description,
+                agent_id,
+                machine_id,
+                targets,
+            }),
+            AclPrincipal::Owner => owner_allow.push(ConnectOwnerEntry {
+                description: entry.description,
+                targets,
+            }),
+        }
     }
 
     Ok(ConnectPolicy::Enabled(ConnectAcl {
         loaded_from: path.to_path_buf(),
         loaded_at_unix_ms,
         allow,
+        owner_allow,
     }))
 }
 
@@ -459,8 +529,10 @@ struct ConnectSectionToml {
 #[serde(deny_unknown_fields)]
 struct ConnectAllowEntryToml {
     description: Option<String>,
-    agent_id: String,
-    machine_id: String,
+    /// `"owner"` (ADR-0070 §1) instead of `agent_id` + `machine_id`.
+    principal: Option<String>,
+    agent_id: Option<String>,
+    machine_id: Option<String>,
     targets: Vec<String>,
 }
 

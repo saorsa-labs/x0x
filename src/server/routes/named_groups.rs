@@ -42779,11 +42779,17 @@ pub(in crate::server) mod tests {
             },
         )
         .await;
-        assert_eq!(
-            state.control_blobs.staged_len(),
-            1,
-            "the reference is staged"
-        );
+        // #878 r3 flake fix (#910): do NOT assert the intermediate
+        // `staged_len() == 1` here. The stage() above made the slot
+        // staged SYNCHRONOUSLY, and the whole self-looped pipeline
+        // (Reference → fetch → chunks → digest-verify → Release →
+        // release_staged) runs on spawned tasks that can complete BEFORE
+        // this assert executes — the assert then observed 0 and failed
+        // ("left 0 right 1") on an unrelated PR. Assert only the TERMINAL
+        // state, which cannot race: `release_staged` is the only remover
+        // of a staged entry inside this window (the TTL prune is lazy and
+        // `PENDING_JOIN_RESULT_TTL` is minutes away), so staged_len
+        // reaching 0 IS the Release round trip.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while state.control_blobs.staged_len() > 0 {
             assert!(
@@ -42792,6 +42798,14 @@ pub(in crate::server) mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // The Release path freed the slot EXACTLY once (not a TTL prune,
+        // not a re-stage): the counter increments only inside
+        // `release_staged`'s successful-remove arm.
+        assert_eq!(
+            state.control_blobs.released_notice_count(),
+            1,
+            "#878 r3: the staged slot was freed by exactly one Release notice"
+        );
         state.agent.shutdown().await;
         Ok(())
     }
