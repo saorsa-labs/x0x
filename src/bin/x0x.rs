@@ -424,7 +424,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum GrantSub {
     /// Sign a grant with the owner key and deliver it: the `POST /grants`
-    /// body as JSON (literal, `@path`, or `-` for stdin).
+    /// body as JSON (literal, `@path` or a bare path, or `-` for stdin).
     Issue {
         /// Grant JSON, e.g. '{"grantee_user":"<hex>","agents":["<hex>"],
         /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.

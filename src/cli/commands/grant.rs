@@ -4,7 +4,7 @@ use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
 
 /// `x0x grant issue GRANT_JSON` — GRANT_JSON is the `POST /grants` body
-/// (literal, `@path`, or `-` for stdin), e.g.
+/// (literal, `@path` or a bare path, or `-` for stdin), e.g.
 /// `{"grantee_user":"<hex>","agents":["<hex>"],"caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}`.
 pub async fn issue(client: &DaemonClient, grant_json: &str) -> Result<()> {
     let body = read_json_arg(grant_json)?;
@@ -42,10 +42,12 @@ fn read_json_arg(spec: &str) -> Result<serde_json::Value> {
             .read_to_string(&mut buf)
             .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
         buf
-    } else if let Some(path) = spec.strip_prefix('@') {
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?
-    } else {
+    } else if spec.trim_start().starts_with(['{', '[']) {
         spec.to_string()
+    } else {
+        // `@path` or a bare path: every other `*_JSON` CLI argument is a file.
+        let path = spec.strip_prefix('@').unwrap_or(spec);
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?
     };
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("grant JSON parse: {e}"))
 }
@@ -60,6 +62,22 @@ mod tests {
             .expect("literal parses");
         assert_eq!(v["caps"][0], "dm");
         assert!(read_json_arg("{not json").is_err());
+    }
+
+    #[test]
+    fn grant_json_bare_path_is_read_like_other_json_file_args() {
+        // Scripts pass a file path, as for every other `*_JSON` argument;
+        // treating it as literal JSON made `grant issue grant.json` fail.
+        let p = std::env::temp_dir().join(format!("x0x-grant-{}.json", std::process::id()));
+        std::fs::write(&p, r#"{"caps":["dm"]}"#).expect("write");
+        let s = p.display().to_string();
+        assert_eq!(read_json_arg(&s).expect("bare path")["caps"][0], "dm");
+        assert_eq!(
+            read_json_arg(&format!("@{s}")).expect("@path")["caps"][0],
+            "dm"
+        );
+        let _ = std::fs::remove_file(&p);
+        assert!(read_json_arg("/nonexistent/x0x-grant.json").is_err());
     }
 
     #[test]
