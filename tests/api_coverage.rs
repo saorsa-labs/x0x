@@ -48,6 +48,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
+    covered!(
+        Post,
+        "/auth/session/refresh",
+        daemon_api_auth_session_refresh
+    ),
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     covered!(Post, "/agent/move", move_routes_wired),
     covered!(Post, "/agent/move/export", move_routes_wired),
@@ -153,6 +158,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/diagnostics/history",
         rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/diagnostics/state-sync",
+        state_sync_route_exposes_bounded_open_store_snapshot
     ),
     covered!(
         Get,
@@ -287,6 +297,29 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/exec/run", daemon_api_exec_run_bad_agent_id),
     covered!(Post, "/exec/cancel", daemon_api_exec_cancel_bad_request_id),
     covered!(Get, "/exec/sessions", daemon_api_exec_sessions),
+    // ── Calls (ADR-0073 slice 1) ────────────────────────────────────────
+    covered!(
+        Post,
+        "/calls",
+        daemon_api_calls_create_unverified_callee_refused
+    ),
+    covered!(Get, "/calls", daemon_api_calls_list),
+    covered!(Get, "/calls/:id", daemon_api_calls_unknown_id_is_404),
+    covered!(
+        Post,
+        "/calls/:id/accept",
+        daemon_api_calls_unknown_id_is_404
+    ),
+    covered!(
+        Post,
+        "/calls/:id/reject",
+        daemon_api_calls_unknown_id_is_404
+    ),
+    covered!(
+        Post,
+        "/calls/:id/hangup",
+        daemon_api_calls_unknown_id_is_404
+    ),
     // ── MLS groups ──────────────────────────────────────────────────────
     covered!(Post, "/mls/groups", daemon_api_create_group),
     covered!(Get, "/mls/groups", daemon_api_list_groups),
@@ -571,6 +604,10 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/server/routes/network.rs",
+        include_str!("../src/server/routes/network.rs"),
+    ),
     (
         "tests/daemon_api_integration.rs",
         include_str!("daemon_api_integration.rs"),
@@ -1076,6 +1113,7 @@ fn categories_are_valid() {
         "stores",
         "files",
         "exec",
+        "calls",
         "connect",
         "upgrade",
         "websocket",

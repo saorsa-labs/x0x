@@ -887,6 +887,16 @@
   },
   {
     "method": "GET",
+    "path": "/diagnostics/state-sync",
+    "cli_name": "diagnostics state-sync",
+    "description": "Local state-sync counters for currently open KV stores",
+    "category": "network",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
     "path": "/history",
     "cli_name": "history list",
     "description": "List durable history for one scope (dm:/group:/topic:), keyset-paginated",

@@ -46,6 +46,25 @@ targets = [
 
 Each `[[connect.allow]]` entry grants the `(agent_id, machine_id)` pair access to the listed loopback targets. Matching is **exact**: `127.0.0.1:22` does not grant `[::1]:22`.
 
+### `principal = "owner"` (ADR-0070 §1)
+
+An entry may name the owner principal instead of an exact pair:
+
+```toml
+[[connect.allow]]
+description = "any of my own machines"
+principal = "owner"
+targets = ["127.0.0.1:22"]
+```
+
+It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted. An install with no owner key never matches an owner entry.
+
+- Owner trust **does not open connect by itself.** With no `principal = "owner"` entry, an owner-trusted peer is denied exactly as before. The shipped defaults contain no owner entry.
+- Targets stay explicit and exact, as for pair entries.
+- An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
+- Owner entries apply to the inbound stream gate and to attested `ForwardV2` forwards. The legacy `ForwardV1` path (`require_attestation = false`) matches exact pairs only.
+- The ACL is still loaded once at startup; there is no REST/CLI editing or reload yet (ADR-0070 slice 2).
+
 ## Target validation rules
 
 Every target is validated at **load time** — a bad target is a hard error that blocks daemon startup and fails `--check`. The rules:
