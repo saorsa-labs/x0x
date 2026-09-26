@@ -284,9 +284,13 @@ async fn call_list(
     state: &Arc<AppState>,
     group_id: &str,
 ) -> Result<(StatusCode, serde_json::Value)> {
-    let resp = list_group_delegations(State(Arc::clone(state)), Path(group_id.to_string()))
-        .await
-        .into_response();
+    let resp = list_group_delegations(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.to_string()),
+    )
+    .await
+    .into_response();
     response_json(resp).await
 }
 

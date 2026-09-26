@@ -323,6 +323,7 @@ fn is_allowed_exact_triple_semantics() {
             machine_id: machine,
             targets: vec![t22],
         }],
+        owner_allow: Vec::new(),
     };
     assert!(acl.is_allowed(&agent, &machine, &t22));
     // wrong port
@@ -506,4 +507,87 @@ async fn load_policy_missing_plane_specific_default_is_disabled() {
     } else {
         panic!("expected Disabled for a missing plane-specific default");
     }
+}
+
+// ===========================================================================
+// ADR-0070 §1 — `principal = "owner"` selector
+// ===========================================================================
+
+const OWNER_ENTRY_TOML: &str = "[connect]\nenabled = true\n\
+     [[connect.allow]]\nprincipal = \"owner\"\ntargets = [\"127.0.0.1:22\"]\n";
+
+#[test]
+fn owner_principal_entry_parses_with_explicit_targets() {
+    let policy = parse_connect_policy(Path::new("/tmp/x"), 0, OWNER_ENTRY_TOML).unwrap();
+    let ConnectPolicy::Enabled(acl) = &policy else {
+        panic!("expected Enabled");
+    };
+    assert!(acl.allow.is_empty(), "owner entry is not an exact pair");
+    assert_eq!(acl.owner_allow.len(), 1);
+    let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
+    assert_eq!(acl.owner_allow[0].targets, vec![t22]);
+    assert_eq!(policy.summary().allow_entry_count, 1);
+}
+
+#[test]
+fn owner_principal_matches_owner_trusted_pairs_only_and_exact_targets() {
+    // WHY: the owner selector must never widen access to a non-owner pair
+    // (owner_trusted = false) or to an unlisted port.
+    let policy = parse_connect_policy(Path::new("/tmp/x"), 0, OWNER_ENTRY_TOML).unwrap();
+    let ConnectPolicy::Enabled(acl) = &policy else {
+        panic!("expected Enabled");
+    };
+    let agent = parse_agent_id(&"aa".repeat(32)).unwrap();
+    let machine = parse_machine_id(&"bb".repeat(32)).unwrap();
+    let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
+    let t80: SocketAddr = "127.0.0.1:80".parse().unwrap();
+    assert!(acl.is_allowed_for_principal(&agent, &machine, true, &t22));
+    assert!(!acl.is_allowed_for_principal(&agent, &machine, false, &t22));
+    assert!(!acl.is_allowed_for_principal(&agent, &machine, true, &t80));
+    // The exact-pair API never sees owner entries.
+    assert!(acl.entry_for(&agent, &machine).is_none());
+    assert!(!acl.is_allowed(&agent, &machine, &t22));
+}
+
+#[test]
+fn owner_principal_with_pair_ids_is_rejected() {
+    // Mixing selectors is ambiguous; fail loudly rather than guess.
+    let text = format!(
+        "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\n\
+         agent_id = \"{}\"\ntargets = [\"127.0.0.1:22\"]\n",
+        "aa".repeat(32)
+    );
+    let err = parse_connect_policy(Path::new("/tmp/x"), 0, &text).unwrap_err();
+    assert!(matches!(err, ConnectAclError::Invalid { .. }), "{err}");
+}
+
+#[test]
+fn unknown_principal_is_rejected() {
+    // "grant" is reserved for ADR-0070 slice 3 and must not load today.
+    for principal in ["grant", "Owner", "anyone"] {
+        let text = format!(
+            "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"{principal}\"\n\
+             targets = [\"127.0.0.1:22\"]\n"
+        );
+        let err = parse_connect_policy(Path::new("/tmp/x"), 0, &text).unwrap_err();
+        assert!(
+            matches!(err, ConnectAclError::Invalid { .. }),
+            "{principal}: {err}"
+        );
+    }
+}
+
+#[test]
+fn entry_without_principal_or_ids_is_rejected() {
+    let text = "[connect]\nenabled = true\n[[connect.allow]]\ntargets = [\"127.0.0.1:22\"]\n";
+    let err = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap_err();
+    assert!(matches!(err, ConnectAclError::Invalid { .. }), "{err}");
+}
+
+#[test]
+fn owner_principal_targets_stay_loopback_only() {
+    let text = "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\n\
+                targets = [\"10.0.0.1:22\"]\n";
+    let err = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap_err();
+    assert!(matches!(err, ConnectAclError::Invalid { .. }), "{err}");
 }
