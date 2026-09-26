@@ -414,7 +414,8 @@ impl GrantRedeliveryOutbox {
         if revocations
             .read()
             .await
-            .is_share_grant_revoked(&[0u8; 32], &grant.owner) // RED PROOF: enqueue revocation check removed
+            .is_share_grant_revoked(&[0u8; 32], &grant.owner)
+        // RED PROOF: enqueue revocation check removed
         {
             return Err(OutboxError::Revoked);
         }
