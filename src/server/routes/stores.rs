@@ -640,16 +640,23 @@ pub(in crate::server) async fn put_kv_value(
         Ok(x0x::KvPutOutcome {
             delta,
             evicted_keys,
+            published,
+            publish_error,
         }) => {
             // #341 Phase B: encrypted stores replicate ONLY via the sealed
             // gossip path — never ship the plaintext local delta over the
-            // DM direct-delivery side channel.
+            // DM direct-delivery side channel. #976 ruling: the fallback
+            // runs on the UNPUBLISHED path too — congested gossip is
+            // exactly what it exists for.
+            let mut direct_delivered = 0usize;
             if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
+                direct_delivered = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
             // #849: a SelfKeyed put can evict the writer's lex-highest keys
-            // under ADR-0047 lowest-N admission. Tell the writer which ones.
+            // under ADR-0047 lowest-N admission. Tell the writer which ones
+            // (on the unpublished path too — the eviction IS durable).
             if !evicted_keys.is_empty() {
                 let _ = state.broadcast_tx.send(SseEvent {
                     event_type: "kv:evicted".to_string(),
@@ -660,18 +667,28 @@ pub(in crate::server) async fn put_kv_value(
                     }),
                 });
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
-            )
+            if published {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
+                )
+            } else {
+                // #976 ruling: the write happened — report it as saved
+                // locally but not yet published (202, never 503).
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "published": false,
+                        "reason": publish_error,
+                        "direct_delivered": direct_delivered,
+                        "evicted_keys": evicted_keys,
+                    })),
+                )
+            }
         }
         Err(e) => {
-            let status = if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
-                // #976: the value is durable locally; the mesh announcement
-                // failed. 503 (retry later), with the durability facts in
-                // the body so no caller mistakes it for a lost write.
-                StatusCode::SERVICE_UNAVAILABLE
-            } else if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
+            let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
                 // AppendOnly store: the key already exists and existing keys
                 // are immutable, even to the owner.
                 StatusCode::CONFLICT
@@ -687,18 +704,7 @@ pub(in crate::server) async fn put_kv_value(
             };
             (
                 status,
-                Json(
-                    if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
-                        serde_json::json!({
-                            "ok": false,
-                            "error": format!("{e}"),
-                            "local_write": "durable",
-                            "replicated": false,
-                        })
-                    } else {
-                        serde_json::json!({ "ok": false, "error": format!("{e}") })
-                    },
-                ),
+                Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
             )
         }
     }

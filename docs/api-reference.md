@@ -1872,6 +1872,31 @@ value is a **400**. CLI: `x0x store create <name> <topic> --policy append_only`.
 }
 ```
 
+### Store put publish outcome (#976)
+
+A PUT whose local write succeeded but whose gossip publish failed (timeout
+or refusal — congested pubsub is the usual cause) returns **202 Accepted**,
+never an error: the value IS applied and persisted locally.
+
+```json
+{
+  "ok": true,
+  "published": false,
+  "reason": "<the publish failure cause>",
+  "direct_delivered": 2,
+  "evicted_keys": []
+}
+```
+
+- `published: false` — the mesh announcement failed; the delta is queued
+  and re-published by the store's retry tick and by the next PUT (a client
+  retry of the same PUT re-announces it, including on `append_only`
+  stores where the identical re-put is otherwise a no-op).
+- `direct_delivered` — how many directly-connected peers received the
+  delta over the DM side channel despite the publish failure.
+- `evicted_keys` — as on 200; eviction notices (`kv:evicted` SSE) fire on
+  this path too.
+
 ### Store write authorization
 
 Stores default to the `Signed` policy: only the creating agent (the owner)
