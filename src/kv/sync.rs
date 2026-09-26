@@ -917,6 +917,11 @@ pub struct KvStoreSync {
     /// #976 test hook: force the NEXT publish_delta to fail deterministically.
     #[cfg(test)]
     fail_next_publish: std::sync::atomic::AtomicBool,
+    /// #976: deltas whose gossip publish failed, queued for re-publish.
+    /// Anti-entropy only serves EMPTY replicas, so an unpublished delta
+    /// needs its own retry: the next publish (any write) and the retry
+    /// tick re-announce queued deltas; successes are dropped. Bounded.
+    pending_republish: std::sync::Arc<tokio::sync::Mutex<Vec<KvStoreDelta>>>,
 }
 
 #[cfg(test)]
@@ -1105,6 +1110,7 @@ impl KvStoreSync {
             loop_exits: Arc::new(LoopExitTracker::default()),
             #[cfg(test)]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
+            pending_republish: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -2670,6 +2676,56 @@ impl KvStoreSync {
         let listener_loop = TrackedLoopFuture::wrap(listener_loop_exits, listener_loop);
         spawn(Box::pin(listener_loop));
 
+        // #976: the re-publish retry tick. Anti-entropy only serves EMPTY
+        // replicas (state requests), so a delta whose gossip publish
+        // failed needs its own retry: every 30 s the queued deltas are
+        // re-announced and successes dropped. New publishes retry the
+        // queue too (see publish_delta), so a client PUT retry re-announces
+        // immediately.
+        {
+            let queue = Arc::clone(&self.pending_republish);
+            let pubsub = Arc::clone(&self.pubsub);
+            let topic = self.topic.clone();
+            let local_peer_id = self.local_peer_id;
+            let tick_cancel = self.cancel.clone();
+            let tick_loop = async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = tick_cancel.cancelled() => return,
+                        _ = interval.tick() => {},
+                    }
+                    let queued: Vec<KvStoreDelta> = std::mem::take(&mut *queue.lock().await);
+                    for delta in queued {
+                        // Re-publish through the raw encode+publish pair the
+                        // sync owns (a full publish_delta here would recurse
+                        // into the retry); failures re-queue.
+                        let wire = match encode_delta(local_peer_id, &delta) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::debug!("kv republish encode failed: {e}");
+                                continue;
+                            }
+                        };
+                        if let Err(e) = pubsub
+                            .publish(topic.clone(), bytes::Bytes::from(wire))
+                            .await
+                        {
+                            tracing::debug!("kv republish retry failed (re-queued): {e}");
+                            let mut q = queue.lock().await;
+                            if q.len() >= 256 {
+                                q.remove(0);
+                            }
+                            q.push(delta);
+                        }
+                    }
+                }
+            };
+            spawn(Box::pin(tick_loop));
+        }
+
         // Responder + ownership listener on the state-sync side topic.
         //
         // StateRequest: holders with non-empty state answer by republishing
@@ -3710,7 +3766,51 @@ impl KvStoreSync {
     /// plaintext: it is sign-then-encrypt sealed into an
     /// `EncryptedKvStoreRecordV1` envelope first. A missing context or
     /// signing material is a hard error — the plaintext path is unreachable
-    /// by construction for encrypted stores.
+    /// #976: how many deltas await re-publish (diagnostics + tests).
+    pub(crate) async fn pending_republish_len(&self) -> usize {
+        self.pending_republish.lock().await.len()
+    }
+
+    /// #976: queue a delta whose publish failed for re-publish.
+    pub async fn queue_republish(&self, delta: KvStoreDelta) {
+        let mut queue = self.pending_republish.lock().await;
+        // Bound: the newest delta for a key subsumes older ones at merge
+        // time, but keep the queue small regardless.
+        if queue.len() >= 256 {
+            queue.remove(0);
+        }
+        queue.push(delta);
+    }
+
+    /// #976: re-publish queued deltas; drop each success. Called by the
+    /// retry tick and at the head of every new publish, so a retry of the
+    /// PUT (or any later write) re-announces an unpublished entry.
+    pub async fn retry_pending_republish(&self, local_peer_id: PeerId) {
+        // Inline encode+publish (NOT publish_delta): publish_delta calls
+        // this at its head, so calling it back would recurse.
+        let queued: Vec<KvStoreDelta> = {
+            let mut queue = self.pending_republish.lock().await;
+            std::mem::take(&mut *queue)
+        };
+        for delta in queued {
+            let wire = match encode_delta(local_peer_id, &delta) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::debug!("kv republish encode failed: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = self
+                .pubsub
+                .publish(self.topic.clone(), bytes::Bytes::from(wire))
+                .await
+            {
+                tracing::debug!("kv republish retry failed (re-queued): {e}");
+                self.queue_republish(delta).await;
+            }
+        }
+    }
+
     /// #976 test hook: the next publish_delta fails deterministically.
     #[cfg(test)]
     pub(crate) fn fail_next_publish_for_test(&self) {
@@ -3718,7 +3818,12 @@ impl KvStoreSync {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// by construction for encrypted stores.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
+        // #976: a new publish is also a retry opportunity for queued
+        // deltas (an AppendOnly identical re-put is a no-op that never
+        // reaches here, so the retry tick covers that path).
+        self.retry_pending_republish(local_peer_id).await;
         #[cfg(test)]
         if self
             .fail_next_publish
