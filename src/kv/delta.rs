@@ -10,6 +10,14 @@ use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Exact wire shape of the typed KV delta direct-message fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KvStoreDirectDelta {
+    pub(crate) store_id: String,
+    pub(crate) peer_id: PeerId,
+    pub(crate) delta: KvStoreDelta,
+}
+
 /// Unique tag for OR-Set elements: (PeerId, sequence_number).
 pub type UniqueTag = (PeerId, u64);
 

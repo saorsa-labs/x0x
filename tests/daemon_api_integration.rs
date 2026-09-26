@@ -2602,6 +2602,51 @@ async fn daemon_api_auth_session_exchange() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_auth_session_refresh() {
+    // #893: a live session token is swapped for a fresh one; the durable
+    // token is refused and the replaced session stops working.
+    let d = daemon().await;
+    let refused = ca(&d)
+        .post(d.url("/auth/session/refresh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "durable token must be refused");
+
+    let r: Value = ca(&d)
+        .post(d.url("/auth/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let old = r["session_token"].as_str().unwrap().to_string();
+    let plain = reqwest::Client::new();
+    let r: Value = plain
+        .post(d.url("/auth/session/refresh"))
+        .bearer_auth(&old)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fresh = r["session_token"].as_str().unwrap();
+    assert_ne!(fresh, old);
+    assert_eq!(r["expires_in"], 600);
+
+    let replaced = plain
+        .post(d.url("/auth/session/refresh"))
+        .bearer_auth(&old)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 401, "replaced session must stop working");
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)
@@ -2941,4 +2986,85 @@ async fn daemon_api_streams() {
     assert_eq!(r["active_streams"], 0);
     assert_eq!(r["connect_failed"], 0);
     assert!(r["connect"].is_object(), "connect-ACL snapshot present");
+}
+
+// ── Calls (ADR-0073 slice 1) ────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_calls_list() {
+    // A fresh daemon has no calls and zeroed gate counters.
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/calls"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["calls"], serde_json::json!([]));
+    assert_eq!(r["stats"]["invites_received"], 0);
+    assert_eq!(r["stats"]["invites_refused"], 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_calls_create_unverified_callee_refused() {
+    // WHY: the outbound gate must refuse a callee we have no verified,
+    // trusted binding for — no invite leaves the daemon and no call is
+    // recorded. A malformed agent id is a 400.
+    let d = daemon().await;
+    let bad = ca(&d)
+        .post(d.url("/calls"))
+        .json(&serde_json::json!({"agent_id": "bad"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    let r = ca(&d)
+        .post(d.url("/calls"))
+        .json(&serde_json::json!({"agent_id": "ab".repeat(32), "video": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["reason"], "not_verified");
+
+    let list: Value = ca(&d)
+        .get(d.url("/calls"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["calls"], serde_json::json!([]));
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_calls_unknown_id_is_404() {
+    let d = daemon().await;
+    let id = "cd".repeat(16);
+    let r = ca(&d)
+        .get(d.url(&format!("/calls/{id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    for action in ["accept", "reject", "hangup"] {
+        let r = ca(&d)
+            .post(d.url(&format!("/calls/{id}/{action}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{action}");
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], false, "{action}");
+    }
 }
