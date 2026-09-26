@@ -1115,6 +1115,7 @@ fn categories_are_valid() {
         "upgrade",
         "websocket",
         "history",
+        "acl",
     ];
 
     for ep in ENDPOINTS {
