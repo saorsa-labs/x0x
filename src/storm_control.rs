@@ -303,7 +303,11 @@ pub(crate) fn register_announce_validators<T>(
     // generic guard: inner-payload replay dedupe + per-author rate limit.
     // The measured storm migrated here the moment the announce topics were
     // guarded (revocation.v1 hit 405 KB/s of identical stale sets).
-    for topic in [crate::REVOCATION_TOPIC, "x0x.discovery.groups"] {
+    for topic in [
+        crate::REVOCATION_TOPIC,
+        crate::REVOCATION_V3_TOPIC,
+        "x0x.discovery.groups",
+    ] {
         let guard = std::sync::Arc::new(std::sync::Mutex::new(BroadcastGuard::default()));
         let validator: saorsa_gossip_pubsub::TopicValidator = {
             let guard = std::sync::Arc::clone(&guard);

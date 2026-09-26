@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class RunnerDeploymentTests(unittest.TestCase):
-    def test_test_network_deploy_installs_and_starts_testnet_runner(self) -> None:
+    def run_deploy_with_fake_ssh(self, network: str) -> str:
         tests_dir = Path(__file__).parent
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -50,7 +50,7 @@ printf 'COMMAND:%s\\nPAYLOAD-BEGIN\\n%s\\nPAYLOAD-END\\n' "$cmd" "$payload" >> "
 case "$cmd" in
   true) ;;
   *"systemctl is-active"*) echo active ;;
-  *"cat /root/.local/share/x0x-testnet/api-token"*) echo fixture-token ;;
+  *"api-token"*) echo fixture-token ;;
   *"/health"*) printf '{"ok":true,"version":"9.8.7"}\\n' ;;
   *"/network/status"*) printf '{"connected_peers":5}\\n' ;;
 esac
@@ -63,11 +63,12 @@ esac
                 PATH=f"{bin_dir}:{os.environ['PATH']}",
                 SKIP_BUILD="1",
                 CONFIGURE_LOG_CAPS="0",
+                DEPLOY_RUNNER="1",
                 X0X_DEPLOY_SSH_CMD=str(fake_ssh),
                 X0X_FAKE_REMOTE_LOG=str(remote_log),
             )
             completed = subprocess.run(
-                ["bash", "tests/e2e_deploy.sh", "--network", "test"],
+                ["bash", "tests/e2e_deploy.sh", "--network", network],
                 cwd=root,
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -76,17 +77,36 @@ esac
                 check=False,
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
-            remote = remote_log.read_text()
-            self.assertIn(
-                "ExecStart=/usr/local/bin/x0x-test-runner-testnet.py", remote
-            )
-            self.assertIn(
-                "/tmp/x0x-result-framing.py.codex / testnet", remote
-            )
-            self.assertIn(
-                "systemctl restart x0x-test-runner-testnet.service", remote
-            )
-            self.assertNotIn("x0x-test-runner-test.py", remote)
+            return remote_log.read_text()
+
+    @staticmethod
+    def rendered_unit(remote: str, unit_name: str) -> str:
+        marker = f"COMMAND:cat > /tmp/{unit_name}.codex\nPAYLOAD-BEGIN\n"
+        return remote.split(marker, 1)[1].split("\nPAYLOAD-END\n", 1)[0]
+
+    def test_test_network_deploy_installs_and_starts_testnet_runner(self) -> None:
+        remote = self.run_deploy_with_fake_ssh("test")
+        unit = self.rendered_unit(remote, "x0x-test-runner-testnet.service")
+        self.assertIn("After=x0xd-testnet.service", unit)
+        self.assertIn("Wants=x0xd-testnet.service", unit)
+        self.assertNotIn("After=x0xd.service", unit)
+        self.assertNotIn("Wants=x0xd.service", unit)
+        self.assertIn("EnvironmentFile=/etc/x0x-test-runner-testnet.env", unit)
+        self.assertIn("ExecStart=/usr/local/bin/x0x-test-runner-testnet.py", unit)
+        self.assertIn("/tmp/x0x-result-framing.py.codex / testnet", remote)
+        self.assertIn("systemctl restart x0x-test-runner-testnet.service", remote)
+        self.assertNotIn("x0x-test-runner-test.py", remote)
+
+    def test_prod_deploy_keeps_prod_runner_dependencies(self) -> None:
+        remote = self.run_deploy_with_fake_ssh("prod")
+        unit = self.rendered_unit(remote, "x0x-test-runner.service")
+        self.assertIn("After=x0xd.service", unit)
+        self.assertIn("Wants=x0xd.service", unit)
+        self.assertNotIn("After=x0xd-testnet.service", unit)
+        self.assertNotIn("Wants=x0xd-testnet.service", unit)
+        self.assertIn("EnvironmentFile=/etc/x0x-test-runner.env", unit)
+        self.assertIn("ExecStart=/usr/local/bin/x0x-test-runner-prod.py", unit)
+        self.assertIn("systemctl restart x0x-test-runner.service", remote)
 
     def test_installed_runner_finds_shared_framing_helper(self) -> None:
         tests_dir = Path(__file__).parent
