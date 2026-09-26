@@ -3917,7 +3917,8 @@ where
     let live = revocation::RevocationSet::from_bytes_v3(live_v3)
         .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
     merged.merge_v3(live);
-    if now_unix != 0 {
+    // RED PROOF (ci-redproof only): no GC horizon on merge.
+    if now_unix == u64::MAX {
         merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
     }
     let bytes = merged
