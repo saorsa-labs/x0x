@@ -264,6 +264,54 @@ pub(super) async fn create_session(
         .into_response()
 }
 
+/// `POST /auth/session/refresh` — swap a still-valid browser session token
+/// for a fresh one (#893, sliding refresh with a hard cap).
+///
+/// Accepts **only** a live session bearer. The durable token is refused
+/// (it keeps using `POST /auth/session`), and rider tokens never reach this
+/// handler (ADR-0039 deny-by-default route set). The new token is an
+/// ordinary session token, with the same authority as the one it replaces,
+/// and it inherits the ORIGINAL mint time. Once
+/// [`SESSION_MAX_LIFETIME`] has passed since that mint, refresh is refused
+/// and the user re-opens the GUI with `x0x gui`. The presented token is
+/// revoked in the same critical section (no overlap window).
+pub(super) async fn refresh_session(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Response {
+    let Some(bearer) = extract_bearer(req.headers()) else {
+        return session_refresh_refused(StatusCode::UNAUTHORIZED, "session bearer token required");
+    };
+    if ct_eq(&bearer, &state.api_token) {
+        return session_refresh_refused(
+            StatusCode::FORBIDDEN,
+            "session refresh requires a session token; mint one with POST /auth/session",
+        );
+    }
+    match state.sessions.refresh(&bearer, Instant::now()) {
+        Ok(token) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "session_token": token,
+                "expires_in": SESSION_TOKEN_TTL_SECS,
+            })),
+        )
+            .into_response(),
+        Err(SessionRefreshError::Unknown) => session_refresh_refused(
+            StatusCode::UNAUTHORIZED,
+            "session token is invalid or expired; reopen with `x0x gui`",
+        ),
+        Err(SessionRefreshError::LifetimeCapReached) => session_refresh_refused(
+            StatusCode::UNAUTHORIZED,
+            "session reached its maximum lifetime; reopen with `x0x gui`",
+        ),
+    }
+}
+
+fn session_refresh_refused(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
 // ── Policy predicates ────────────────────────────────────────────────────
 
 fn is_auth_exempt_path(path: &str) -> bool {
@@ -299,6 +347,16 @@ fn accepts_query_token(path: &str) -> bool {
 /// exec-prefix egress check is likewise payload-conditional and lives
 /// in the handlers.
 pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
+    // ADR-0070 §3: every ACL management surface — reads included — is
+    // owner/durable-token only; session bearers and riders are refused.
+    if is_acl_admin_path(path) {
+        return true;
+    }
+    // ADR-0070 §2: share grants decide who reaches the owner's agents;
+    // every method is owner/durable-token only.
+    if is_grants_path(path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -316,6 +374,30 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
         Method::DELETE => is_sync_device_path(path),
         _ => false,
     }
+}
+
+/// `true` for the ADR-0070 §3 ACL routes: `/acl/reload`, `/acl/connect`,
+/// `/acl/exec`, and `/acl/{connect,exec}/<nonempty-id>`.
+fn is_acl_admin_path(path: &str) -> bool {
+    if path == "/acl/reload" {
+        return true;
+    }
+    ["/acl/connect", "/acl/exec"].iter().any(|base| {
+        path == *base
+            || path
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
+}
+
+/// `true` for the ADR-0070 §2 grant routes: `/grants` and
+/// `/grants/<nonempty-segment>` (including `/grants/received`).
+fn is_grants_path(path: &str) -> bool {
+    path == "/grants"
+        || path
+            .strip_prefix("/grants/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/delegate`.
@@ -415,6 +497,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
 pub(super) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 /// Same value in seconds, surfaced in the `expires_in` JSON field.
 const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
+/// Hard cap on a refreshed session chain (#893): refresh is refused once
+/// this long has passed since the ORIGINAL `POST /auth/session` mint. A
+/// chain can therefore live at most this plus one [`SESSION_TOKEN_TTL`].
+pub(super) const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// A single issued browser session token, stored as a SHA-256 digest.
 ///
@@ -423,6 +509,18 @@ const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
 struct AuthSession {
     token_hash: [u8; 32],
     expires_at: Instant,
+    /// Mint time of the first token in this refresh chain; refreshed tokens
+    /// inherit it so [`SESSION_MAX_LIFETIME`] cannot be extended (#893).
+    minted_at: Instant,
+}
+
+/// Why [`SessionStore::refresh`] refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SessionRefreshError {
+    /// Not a live session token (unknown, expired, or already refreshed).
+    Unknown,
+    /// The chain is older than [`SESSION_MAX_LIFETIME`].
+    LifetimeCapReached,
 }
 
 /// In-memory store of short-lived browser session tokens (#127 / WS1.6).
@@ -448,14 +546,7 @@ impl SessionStore {
     /// to hand to the client. `now` is injected so expiry can be unit-tested
     /// without sleeping.
     pub(super) fn issue(&self, now: Instant) -> String {
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let token = hex::encode(bytes);
-        let session = AuthSession {
-            token_hash: Sha256::digest(token.as_bytes()).into(),
-            expires_at: now + self.ttl,
-        };
+        let (token, session) = self.new_session(now, now);
         if let Ok(mut guard) = self.sessions.lock() {
             guard.push(session);
             // Bound the store: lazy-prune expired entries on every issue so a
@@ -463,6 +554,63 @@ impl SessionStore {
             guard.retain(|s| s.expires_at > now);
         }
         token
+    }
+
+    /// Generate a raw token plus its stored entry, expiring `ttl` from `now`
+    /// and carrying the chain's original `minted_at`.
+    fn new_session(&self, now: Instant, minted_at: Instant) -> (String, AuthSession) {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        let session = AuthSession {
+            token_hash: Sha256::digest(token.as_bytes()).into(),
+            expires_at: now + self.ttl,
+            minted_at,
+        };
+        (token, session)
+    }
+
+    /// Replace a live session token with a fresh one (#893).
+    ///
+    /// The new entry keeps the original `minted_at`; the presented token is
+    /// removed in the same critical section, so it stops working at once.
+    /// Refused once `now - minted_at` exceeds [`SESSION_MAX_LIFETIME`].
+    pub(super) fn refresh(&self, token: &str, now: Instant) -> Result<String, SessionRefreshError> {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let mut guard = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionRefreshError::Unknown)?;
+        guard.retain(|s| s.expires_at > now);
+        let index = guard
+            .iter()
+            .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+            .ok_or(SessionRefreshError::Unknown)?;
+        let minted_at = guard
+            .get(index)
+            .map(|s| s.minted_at)
+            .ok_or(SessionRefreshError::Unknown)?;
+        if now.saturating_duration_since(minted_at) > SESSION_MAX_LIFETIME {
+            return Err(SessionRefreshError::LifetimeCapReached);
+        }
+        guard.swap_remove(index);
+        let (fresh, session) = self.new_session(now, minted_at);
+        guard.push(session);
+        Ok(fresh)
+    }
+
+    /// Original mint time of a live token's refresh chain (tests only).
+    #[cfg(test)]
+    fn minted_at(&self, token: &str, now: Instant) -> Option<Instant> {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let guard = self.sessions.lock().ok()?;
+        guard
+            .iter()
+            .find(|s| s.expires_at > now && bool::from(candidate.ct_eq(&s.token_hash)))
+            .map(|s| s.minted_at)
     }
 
     /// Validate a candidate token: constant-time compare against every active
@@ -968,6 +1116,121 @@ mod tests {
         assert!(store.is_valid(&fresh, far_future));
     }
 
+    // -- #893 sliding refresh with a hard cap.
+
+    #[test]
+    fn session_refresh_rotates_token_and_keeps_original_mint_time() {
+        // The cap is only meaningful if a refreshed token inherits the FIRST
+        // mint time; if refresh reset it, an open tab could live forever.
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let first = store.issue(t0);
+        let t1 = t0 + Duration::from_secs(8 * 60);
+        let second = store.refresh(&first, t1).expect("live session refreshes");
+        assert_ne!(first, second, "refresh must mint a new token");
+        assert_eq!(store.minted_at(&second, t1), Some(t0));
+        assert!(
+            !store.is_valid(&first, t1),
+            "the replaced token must stop working immediately (no overlap)"
+        );
+        assert!(store.is_valid(&second, t1));
+        // The new token gets a full TTL from the refresh, not from t0.
+        assert!(store.is_valid(&second, t1 + SESSION_TOKEN_TTL - Duration::from_nanos(1)));
+        // A replaced token can never be refreshed again.
+        assert_eq!(store.refresh(&first, t1), Err(SessionRefreshError::Unknown));
+    }
+
+    #[test]
+    fn session_refresh_is_refused_past_the_hard_cap() {
+        // Refresh every 8 min (as the GUI does) on a simulated clock. The
+        // chain must be refused at original mint + 12 h even though the
+        // LAST refresh was only minutes earlier and the token is still live:
+        // the cap counts from the ORIGINAL issue time, not the last refresh.
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let step = Duration::from_secs(8 * 60);
+        let mut token = store.issue(t0);
+        let mut now = t0;
+        let mut refreshes = 0u32;
+        while now + step <= t0 + SESSION_MAX_LIFETIME {
+            now += step;
+            token = store.refresh(&token, now).expect("within the cap");
+            refreshes += 1;
+            assert_eq!(store.minted_at(&token, now), Some(t0));
+        }
+        let last_refresh = now;
+        assert!(refreshes > 80, "the chain must span many refreshes");
+        // Exactly at original + 12 h a refresh is still allowed.
+        let at_cap = t0 + SESSION_MAX_LIFETIME;
+        assert!(at_cap - last_refresh < SESSION_TOKEN_TTL);
+        token = store.refresh(&token, at_cap).expect("at the cap boundary");
+        // One second past original + 12 h: refused, although only seconds
+        // have passed since the last refresh and the token is still valid.
+        let attempt = at_cap + Duration::from_secs(1);
+        assert!(attempt - at_cap < SESSION_MAX_LIFETIME);
+        assert!(
+            store.is_valid(&token, attempt),
+            "refusal must be the cap, not expiry"
+        );
+        assert_eq!(
+            store.refresh(&token, attempt),
+            Err(SessionRefreshError::LifetimeCapReached)
+        );
+    }
+
+    #[test]
+    fn session_refresh_refuses_unknown_expired_and_durable_tokens() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        // The durable token is not in the session store, so the store can
+        // never turn it into a session (the handler also refuses it first).
+        assert_eq!(
+            store.refresh(TEST_API_TOKEN, t0),
+            Err(SessionRefreshError::Unknown)
+        );
+        // An expired session cannot be revived by refresh.
+        let after = t0 + SESSION_TOKEN_TTL + Duration::from_nanos(1);
+        assert_eq!(
+            store.refresh(&token, after),
+            Err(SessionRefreshError::Unknown)
+        );
+    }
+
+    #[test]
+    fn refreshed_session_has_the_same_authority_as_the_original() {
+        // A refreshed token is an ordinary session bearer: accepted on
+        // protected routes and browser query-token routes, still classified
+        // non-durable on owner-act routes (the middleware 403s it there).
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let first = store.issue(t0);
+        let refreshed = store.refresh(&first, t0).expect("refresh");
+        for (path, header, query) in [
+            ("/agent", Some(refreshed.as_str()), None),
+            ("/ws/direct", None, Some(refreshed.as_str())),
+        ] {
+            assert!(
+                authorize(
+                    path,
+                    &Method::GET,
+                    header,
+                    query,
+                    TEST_API_TOKEN,
+                    &store,
+                    t0
+                )
+                .is_ok(),
+                "{path}: refreshed session must authorize like the original"
+            );
+        }
+        assert!(
+            !ct_eq(&refreshed, TEST_API_TOKEN),
+            "a refreshed session must never be the durable token"
+        );
+        assert!(requires_durable_owner(&Method::POST, "/agent/sign"));
+    }
+
     #[test]
     fn ct_eq_is_constant_time_and_correct() {
         // Correctness: equal strings compare equal, different do not.
@@ -1010,5 +1273,52 @@ mod tests {
         );
         assert!(extract_query_token(Some("no_token_here")).is_none());
         assert!(extract_query_token(None).is_none());
+    }
+
+    #[test]
+    fn acl_routes_require_durable_owner_for_every_method() {
+        // ADR-0070 §3: ACL management — including listing, which reveals
+        // who may connect/exec — is durable-owner only. A session bearer
+        // must not read or edit it, whatever the method.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in [
+                "/acl/connect",
+                "/acl/exec",
+                "/acl/reload",
+                "/acl/connect/api-0011223344556677",
+                "/acl/exec/file-0011223344556677",
+            ] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must be durable-owner"
+                );
+            }
+        }
+        for path in [
+            "/acl",
+            "/acl/connect/",
+            "/acl/connect/a/b",
+            "/aclx/connect",
+            "/acl/connectx",
+        ] {
+            assert!(!is_acl_admin_path(path), "{path} must not be classified");
+        }
+    }
+
+    #[test]
+    fn grant_routes_require_durable_owner_for_every_method() {
+        // ADR-0070 §2: listing grants reveals who may reach the owner's
+        // agents; issuing/revoking changes it. Durable-owner only.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in ["/grants", "/grants/received", "/grants/00ff"] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must be durable-owner"
+                );
+            }
+        }
+        for path in ["/grant", "/grants/", "/grants/a/b", "/grantsx"] {
+            assert!(!is_grants_path(path), "{path} must not be classified");
+        }
     }
 }

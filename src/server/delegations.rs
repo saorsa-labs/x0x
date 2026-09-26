@@ -1094,6 +1094,9 @@ fn rand_delegation_id() -> [u8; 16] {
 /// CURRENT roster: revoked members' authority auto-expires (ADR-0040).
 pub(in crate::server) async fn list_group_delegations(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -1109,14 +1112,29 @@ pub(in crate::server) async fn list_group_delegations(
             return not_found("group is withdrawn");
         }
         let is_member = info.has_active_member(&local_hex);
+        // Sessions need an active local seat before delegation authority is exposed.
+        match &actor {
+            crate::server::rider_auth::ActorContext::Owner { durable: false } if !is_member => {
+                return crate::server::api_error_with_reason(
+                    StatusCode::FORBIDDEN,
+                    "active local group membership required",
+                    "group_membership_required",
+                )
+                .into_response();
+            }
+            crate::server::rider_auth::ActorContext::Owner { .. } => {}
+            _ => return forbidden("rider tokens cannot read group delegations"),
+        }
+        let quarantine = info.fork_quarantine.clone();
         let read_open = info.policy.read_access == x0x::groups::GroupReadAccess::Public;
+        // Durable owners retain the existing group read policy.
         if !is_member && !read_open {
             return forbidden("members-only read policy");
         }
         (
             info.stable_group_id().to_string(),
             info.members_v2.clone(),
-            info.fork_quarantine.clone(),
+            quarantine,
         )
     };
     let (stable_id, members, quarantine) = snapshot;

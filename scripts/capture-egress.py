@@ -47,6 +47,7 @@ x0x.machine.announce.v3
 x0x.user.announce.v2
 x0x.revocation.v1
 x0x.revocation.v2
+x0x.revocation.v3
 x0x.move.activation.v1
 x0x/dm/v1/bus
 x0x/caps/v1

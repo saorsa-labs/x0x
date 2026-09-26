@@ -4,6 +4,7 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 use super::super::crdt_subscriptions;
+use super::super::sse::SseEvent;
 use super::super::state::AppState;
 use super::super::{
     api_error, api_error_with_reason, bad_request, direct_message_send_config, forbidden,
@@ -68,13 +69,7 @@ struct LoadedLegacyStore {
 }
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::server) struct KvStoreDirectDelta {
-    store_id: String,
-    peer_id: saorsa_gossip_types::PeerId,
-    delta: x0x::kv::KvStoreDelta,
-}
+pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
@@ -638,8 +633,14 @@ pub(in crate::server) async fn put_kv_value(
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    match handle.put_with_delta(key, value, content_type).await {
-        Ok(delta) => {
+    match handle
+        .put_with_outcome(key.clone(), value, content_type)
+        .await
+    {
+        Ok(x0x::KvPutOutcome {
+            delta,
+            evicted_keys,
+        }) => {
             // #341 Phase B: encrypted stores replicate ONLY via the sealed
             // gossip path — never ship the plaintext local delta over the
             // DM direct-delivery side channel.
@@ -647,10 +648,30 @@ pub(in crate::server) async fn put_kv_value(
                 let recipients = kv_store_delta_direct_recipients(&state).await;
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            // #849: a SelfKeyed put can evict the writer's lex-highest keys
+            // under ADR-0047 lowest-N admission. Tell the writer which ones.
+            if !evicted_keys.is_empty() {
+                let _ = state.broadcast_tx.send(SseEvent {
+                    event_type: "kv:evicted".to_string(),
+                    data: serde_json::json!({
+                        "store_id": id,
+                        "key": key,
+                        "evicted_keys": evicted_keys,
+                    }),
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
+            )
         }
         Err(e) => {
-            let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
+            let status = if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
+                // #976: the value is durable locally; the mesh announcement
+                // failed. 503 (retry later), with the durability facts in
+                // the body so no caller mistakes it for a lost write.
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
                 // AppendOnly store: the key already exists and existing keys
                 // are immutable, even to the owner.
                 StatusCode::CONFLICT
@@ -666,7 +687,18 @@ pub(in crate::server) async fn put_kv_value(
             };
             (
                 status,
-                Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+                Json(
+                    if matches!(e, x0x::error::IdentityError::KvPublishFailed(_)) {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("{e}"),
+                            "local_write": "durable",
+                            "replicated": false,
+                        })
+                    } else {
+                        serde_json::json!({ "ok": false, "error": format!("{e}") })
+                    },
+                ),
             )
         }
     }
@@ -780,6 +812,27 @@ struct TreeKemGroupStoreProtector {
     stable_group_id: String,
     authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
     invalid: std::sync::atomic::AtomicBool,
+}
+
+/// #895: the live TreeKEM protector for a group-scoped task list — the same
+/// adapter this group's encrypted KV stores seal with, so a task list rides
+/// the same ratchet, roster/policy binding and durability rules. `None` when
+/// the group is not an eligible TreeKEM group.
+pub(in crate::server) fn treekem_task_list_protector(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<x0x::kv::SharedTreeKemKvProtector> {
+    let authorization = Arc::new(x0x::groups::TreeKemKvAuthorizationContext::from_group(
+        info,
+    )?);
+    Some(Arc::new(TreeKemGroupStoreProtector {
+        state: Arc::clone(state),
+        group_key: group_key.to_string(),
+        stable_group_id: info.stable_group_id().to_string(),
+        authorization,
+        invalid: std::sync::atomic::AtomicBool::new(false),
+    }))
 }
 
 impl TreeKemGroupStoreProtector {
@@ -1070,6 +1123,19 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
         retained_image: Option<Vec<u8>>,
     ) -> x0x::kv::Result<()> {
+        self.merge_main_record_with_outcome(opened, sender_peer, local_peer, store, retained_image)
+            .await
+            .map(|_| ())
+    }
+
+    async fn merge_main_record_with_outcome(
+        &self,
+        opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
+        sender_peer: saorsa_gossip_types::PeerId,
+        local_peer: saorsa_gossip_types::PeerId,
+        store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> x0x::kv::Result<Option<bool>> {
         if opened.reader_only || opened.mutation.kind == x0x::kv::KvMutationKind::Control {
             return Err(x0x::kv::KvError::Unauthorized(
                 "read-side TreeKEM record cannot mutate a store".to_string(),
@@ -1092,7 +1158,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 let delta: x0x::kv::KvStoreDelta =
                     bincode::deserialize(&opened.mutation.payload)
                         .map_err(|e| x0x::kv::KvError::Gossip(format!("bad TreeKEM delta: {e}")))?;
-                target.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                target
+                    .merge_delta_with_outcome(&delta, sender_peer, Some(&opened.mutation.author_id))
+                    .map(|outcome| Some(matches!(outcome, x0x::kv::store::MergeOutcome::Applied)))
             }
             x0x::kv::KvMutationKind::RetainedState => {
                 let image: x0x::kv::KvStore =
@@ -1102,7 +1170,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                         )
                     })?)
                     .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
-                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                let previous_version = target.current_version();
+                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)?;
+                Ok(Some(target.current_version() != previous_version))
             }
             x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
                 "TreeKEM control record on main topic".to_string(),
@@ -1539,6 +1609,7 @@ async fn open_bound_gss_store(
             Arc::clone(&secure) as Arc<dyn KvSecureContext>,
             refresh,
             snapshot_lease,
+            Arc::clone(&state.gss_publication_gate),
         )
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -2910,6 +2981,11 @@ mod tests {
         let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
             .expect("payload should encode");
         assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+        assert!(crate::server::valid_kv_store_delta_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: KvStoreDirectDelta =
             serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
@@ -3062,6 +3138,25 @@ mod tests {
         let groups = std::collections::HashMap::from([(gid.clone(), base)]);
         assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([3; 32])).is_err());
         assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());
+    }
+
+    /// #794: an invite-joined GSS member's stub starts KEYLESS — the real
+    /// secret arrives via `SecureShareDelivered` after committed admission.
+    /// Until then, opening/creating the group store must fail closed with
+    /// the explicit 409, never silently open with a wrong local secret.
+    #[test]
+    fn gss794_keyless_stub_store_open_fails_closed() {
+        let gid = "79".repeat(16);
+        let mut info = binding_fixture(&gid);
+        info.shared_secret = None;
+        let groups = std::collections::HashMap::from([(gid.clone(), info)]);
+        let err = resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([2; 32]))
+            .expect_err("keyless stub must refuse store resolution");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "keyless stub is a 409, not a silent wrong-secret open"
+        );
     }
 
     #[test]
@@ -4707,6 +4802,78 @@ mod tests {
             .insert(group_key.to_string(), info);
     }
 
+    #[tokio::test]
+    async fn durable_gss_rekey_waits_for_inflight_publication() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "96".repeat(16);
+        let owner = state.agent.agent_id();
+        let removed = AgentId([7; 32]);
+        seed_group(&state, &group_key, owner).await;
+        let previous = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_key).expect("group");
+            info.add_member(
+                hex::encode(removed.as_bytes()),
+                crate::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+            info.clone()
+        };
+        let old_epoch = previous.secret_epoch;
+        let mut next = previous;
+        next.roster_revision += 1;
+        next.remove_member(
+            &hex::encode(removed.as_bytes()),
+            Some(hex::encode(owner.as_bytes())),
+        );
+        let _ = next.rotate_shared_secret();
+        assert_eq!(next.secret_epoch, old_epoch + 1);
+
+        // An encrypted publisher holds this read permit from refresh through
+        // enqueue. The production persistence transaction must wait before
+        // installing its new roster and retain its writer permit through save.
+        let publication = state.gss_publication_gate.read().await;
+        let committing = Arc::clone(&state);
+        let commit_key = group_key.clone();
+        let commit = tokio::spawn(async move {
+            crate::server::routes::named_groups::persist_named_group_info(
+                &committing,
+                &commit_key,
+                next,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.gss_publication_gate.try_read().is_err() {
+                    break;
+                }
+                assert!(
+                    !commit.is_finished(),
+                    "roster committed without waiting for G"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("roster writer did not queue behind publication");
+        assert_eq!(
+            state.named_groups.read().await[&group_key].secret_epoch,
+            old_epoch,
+            "candidate became visible before the publication permit released"
+        );
+        drop(publication);
+        assert!(matches!(
+            commit.await.expect("commit task").expect("persist rekey"),
+            crate::server::routes::named_groups::AtomicWriteOutcome::Durable
+        ));
+        assert_eq!(
+            state.named_groups.read().await[&group_key].secret_epoch,
+            old_epoch + 1
+        );
+    }
+
     async fn seed_treekem_group(state: &AppState, group_key: &str) {
         let group_id = hex::decode(group_key).expect("hex group id");
         let creator = state.agent.agent_id();
@@ -4963,6 +5130,223 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// #895 (TreeKEM mirror of the GSS tests in `crdt/sealed.rs`): a
+    /// group-scoped task list on a TreeKEM group, through the PRODUCTION
+    /// binding (`group_task_list_binding`), seals with the live ratchet so the
+    /// wire bytes carry no task text, a current member opens it, and a member
+    /// whose ratchet is at a different epoch cannot.
+    #[tokio::test]
+    async fn treekem_group_task_list_seals_opens_and_rejects_wrong_epoch() {
+        const TITLE: &str = "TREEKEM-TASK-TITLE-895";
+        let (writer_state, _writer_dir) = encrypted_store_test_state().await;
+        let (reader_state, _reader_dir) = encrypted_store_test_state().await;
+        let owner = AgentId([78; 32]);
+        let writer = writer_state.agent.agent_id();
+        let reader = reader_state.agent.agent_id();
+        let group_key = "46".repeat(16);
+        let group_id = hex::decode(&group_key).expect("group id");
+        let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            writer_state.agent.as_ref(),
+            &group_id,
+        );
+        let reader_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            reader_state.agent.as_ref(),
+            &group_id,
+        );
+        let mut owner_group = x0x::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[78; 32])
+            .expect("owner group");
+        let writer_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(reader, &reader_seed).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances for reader");
+        let reader_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        assert_eq!(writer_group.epoch(), reader_group.epoch());
+
+        let mut info = GroupInfo::new("tasks".to_string(), String::new(), owner, group_key.clone());
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        for member in [writer, reader] {
+            info.add_member(
+                hex::encode(member.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+        }
+        info.secret_epoch = writer_group.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", writer_group.epoch()));
+        info.recompute_state_hash();
+        for (state, live) in [(&writer_state, writer_group), (&reader_state, reader_group)] {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::new(tokio::sync::Mutex::new(live)));
+        }
+
+        let topic = format!("x0x.group.{group_key}.symphony.board");
+        let sealer = crate::server::routes::group_task_list_binding(&writer_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let opener = crate::server::routes::group_task_list_binding(&reader_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let payload = format!("plaintext-delta:{TITLE}").into_bytes();
+
+        let body = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal")
+            .expect("an MlsEncrypted group is sealed, never plaintext");
+        assert!(matches!(
+            body,
+            x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(_)
+        ));
+        let wire = x0x::crdt::sealed::encode_sealed_task_record(
+            saorsa_gossip_types::PeerId::new([1; 32]),
+            body.clone(),
+        )
+        .expect("wire");
+        assert!(!wire.windows(TITLE.len()).any(|w| w == TITLE.as_bytes()));
+        assert!(!opener.admits_plaintext().await);
+        let opened = opener.open(&body).await.expect("member opens");
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.author, writer);
+
+        // Wrong epoch: the writer's ratchet advances (a third member is
+        // added and only the writer processes the commit), the reader's does
+        // not — a record sealed at the new epoch must not open at the old one.
+        let third = AgentId([79; 32]);
+        let third_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(third, &[79; 32]).expect("third kp");
+        let third_add = owner_group
+            .add_member(third, third_prepared.key_package_bytes())
+            .expect("add third");
+        writer_state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("writer ratchet")
+            .lock()
+            .await
+            .process_commit(&third_add.commit)
+            .expect("writer advances");
+        let next_epoch = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal at the new epoch")
+            .expect("sealed");
+        assert!(
+            opener.open(&next_epoch).await.is_err(),
+            "a record from another epoch must fail closed"
+        );
+    }
+
+    /// omp review finding 1 (#895) WHY: the legacy plaintext space board must
+    /// not keep serving its content. Before migration it answers state
+    /// requests only from members of its group; after migration this node has
+    /// retired it — its sync is gone and even a member's request is refused —
+    /// while the copied tasks live on in the sealed board.
+    #[tokio::test]
+    async fn legacy_space_board_is_member_gated_then_retired_by_migration() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let member = state.agent.agent_id();
+        let outsider = AgentId([5; 32]);
+        let group_key = "47".repeat(16);
+        seed_group(&state, &group_key, member).await;
+        let legacy = format!("x0x-board-{}", &group_key[..16]);
+        let board = format!("x0x.group.{group_key}.symphony.board");
+
+        let gate = crate::server::routes::group_task_list_binding(&state, &legacy)
+            .await
+            .state_serve_gate
+            .expect("a legacy board gets a serve gate");
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served before migration"
+        );
+        assert!(!gate(None).await, "unsigned request served");
+        assert!(gate(Some(member)).await, "control: a member is served");
+
+        let legacy_binding = crate::server::routes::group_task_list_binding(&state, &legacy).await;
+        let legacy_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &legacy,
+                &state.task_list_state_dir,
+                legacy_binding,
+            )
+            .await
+            .expect("legacy board");
+        legacy_handle
+            .add_task("legacy task".to_string(), "d".to_string())
+            .await
+            .expect("legacy task");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(legacy.clone(), legacy_handle);
+        let board_binding = crate::server::routes::group_task_list_binding(&state, &board).await;
+        let board_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &board,
+                &state.task_list_state_dir,
+                board_binding,
+            )
+            .await
+            .expect("sealed board");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(board.clone(), board_handle.clone());
+
+        assert!(crate::server::routes::tasks::migrate_space_board_once(&state, &board).await);
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
+        assert!(
+            !state.task_lists.read().await.contains_key(&legacy),
+            "the legacy sync must be retired on this node"
+        );
+        assert!(crate::server::routes::legacy_space_board_retired(&state, &legacy).await);
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served after migration"
+        );
+        assert!(!gate(Some(member)).await, "a retired board serves nobody");
+        assert!(
+            crate::server::routes::tasks::migrate_space_board_once(&state, &board).await,
+            "re-run is a no-op"
+        );
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
     }
 
     #[tokio::test]
@@ -5647,5 +6031,97 @@ mod tests {
         .into_response();
         assert_eq!(keys_response.status(), StatusCode::FORBIDDEN);
         assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    /// WHY (#849): REST clients learn about a SelfKeyed quota eviction
+    /// only through the PUT response and the `/events` stream. ADR-0047
+    /// admission is unchanged: the 65th lex-low key evicts the writer's
+    /// lex-highest key, and a new lex-highest key is refused.
+    #[tokio::test]
+    async fn put_kv_value_reports_self_keyed_evictions() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let topic = "issue-849-directory".to_string();
+        let handle = state
+            .agent
+            .create_kv_store_persistent(
+                "directory",
+                &topic,
+                x0x::kv::AccessPolicy::SelfKeyed,
+                &state.kv_store_state_dir,
+            )
+            .await
+            .expect("create self_keyed store");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(topic.clone(), handle.clone());
+        let me = hex::encode(state.agent.agent_id().as_bytes());
+        let mut events = state.broadcast_tx.subscribe();
+
+        let put = |suffix: String| {
+            let state = Arc::clone(&state);
+            let topic = topic.clone();
+            let key = format!("{me}/{suffix}");
+            async move {
+                let response = put_kv_value(
+                    State(state),
+                    Path((topic, key)),
+                    Json(PutValueRequest {
+                        value: BASE64.encode(b"v"),
+                        content_type: None,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                (status, body)
+            }
+        };
+
+        // Under quota: the field is present and empty.
+        for i in 1..=64 {
+            let (status, body) = put(format!("{i:03}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["evicted_keys"], serde_json::json!([]), "{body}");
+        }
+
+        // The 65th, lex-lowest key evicts exactly the writer's lex-highest key.
+        let (status, body) = put("000".to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let evicted = format!("{me}/064");
+        assert_eq!(body["evicted_keys"], serde_json::json!([evicted]), "{body}");
+        let mut evictions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.event_type == "kv:evicted" {
+                evictions.push(event);
+            }
+        }
+        assert_eq!(evictions.len(), 1, "exactly one eviction event");
+        let event = &evictions[0];
+        assert_eq!(event.data["store_id"], topic);
+        assert_eq!(event.data["evicted_keys"], serde_json::json!([evicted]));
+        assert_eq!(handle.keys().await.expect("keys").len(), 64);
+
+        // A new lex-highest key is refused as not admitted and evicts nothing.
+        let (status, body) = put("999".to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("NOT admitted")),
+            "{body}"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event.event_type, "kv:evicted",
+                "a refused put emits no eviction"
+            );
+        }
+        assert_eq!(handle.keys().await.expect("keys").len(), 64);
     }
 }
