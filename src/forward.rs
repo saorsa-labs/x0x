@@ -1043,8 +1043,13 @@ impl Drop for StreamLeaveGuard {
 /// buffered data, so returning right after is safe.
 async fn send_denial(stream: &mut PeerStream, reason: ConnectDenialReason) {
     let send = stream.send_mut();
-    // RED-PROOF MUTATION (ci-mirror only): finish() removed.
-    let _ = send.write_all(&encode_response_denied(reason)).await;
+    if send
+        .write_all(&encode_response_denied(reason))
+        .await
+        .is_ok()
+    {
+        let _ = send.finish();
+    }
 }
 
 /// Bridge a local TCP connection and the peer stream's two halves until both
@@ -1058,15 +1063,21 @@ async fn send_denial(stream: &mut PeerStream, reason: ConnectDenialReason) {
 /// QUIC send stream resets it and the truncation surfaces as an error rather
 /// than a well-formed but short stream.
 async fn bridge(tcp: TcpStream, mut send: HighLevelSendStream, mut recv: HighLevelRecvStream) {
+    use tokio::io::AsyncWriteExt;
     // Split the TCP socket into owned read/write halves so the two copy tasks
     // can run concurrently without overlapping mutable borrows.
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let to_stream = async {
-        // RED-PROOF MUTATION (ci-mirror only): shutdown removed.
-        let _ = tokio::io::copy(&mut tcp_read, &mut send).await;
+        if tokio::io::copy(&mut tcp_read, &mut send).await.is_ok() {
+            // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
+            // connection retransmits buffered data even after drop.
+            let _ = send.shutdown().await;
+        }
     };
     let from_stream = async {
-        let _ = tokio::io::copy(&mut recv, &mut tcp_write).await;
+        if tokio::io::copy(&mut recv, &mut tcp_write).await.is_ok() {
+            let _ = tcp_write.shutdown().await;
+        }
     };
     tokio::join!(to_stream, from_stream);
 }
