@@ -12,6 +12,9 @@
 #   BINARY           — absolute path to the local binary
 #   LOCAL_SIZE       — byte count of $BINARY (stat -f %z / -c %s)
 #   MAX_UPLOAD_ATTEMPTS — maximum upload attempts per node (default 3)
+#   X0X_NETWORK      — selected fleet; staged reuse requires "test"
+#   X0X_DEPLOY_STAGED_RUN_ID / X0X_DEPLOY_STAGED_SHA256 — optional pair that
+#                        selects a previously verified testnet artifact stage
 #
 # Additional globals consumed by x0x_scan_and_repush_stragglers:
 #   NODE_NAMES          — indexed array of node names
@@ -27,6 +30,62 @@
 # do not define them get plain output.
 # =============================================================================
 
+# x0x_reuse_staged_binary IP
+#
+# Reuses only the fixed stage layout created by the artifact staging helper.
+# The caller supplies the reviewed run ID and daemon SHA-256 together.  No
+# upload fallback is permitted if the local or remote identity check fails.
+x0x_reuse_staged_binary() {
+    local _ip="$1" _run_id="${X0X_DEPLOY_STAGED_RUN_ID:-}"
+    local _expected="${X0X_DEPLOY_STAGED_SHA256:-}" _local_sha _command
+    uploaded=false
+
+    if [ "${X0X_NETWORK:-}" != "test" ] \
+        || ! [[ "$_run_id" =~ ^[a-z0-9][a-z0-9-]{7,63}$ ]] \
+        || ! [[ "$_expected" =~ ^[0-9a-f]{64}$ ]] \
+        || [ ! -f "$BINARY" ] || [ -L "$BINARY" ]; then
+        printf '    %sstaged binary reuse refused: invalid network, identity, or local binary%s\n' \
+            "${RED:-}" "${NC:-}" >&2
+        return 1
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        _local_sha=$(shasum -a 256 "$BINARY" | cut -d ' ' -f1)
+    else
+        _local_sha=$(sha256sum "$BINARY" | cut -d ' ' -f1)
+    fi
+    if [ "$_local_sha" != "$_expected" ]; then
+        printf '    %sstaged binary reuse refused: local SHA-256 differs from reviewed artifact%s\n' \
+            "${RED:-}" "${NC:-}" >&2
+        return 1
+    fi
+
+    # Values interpolated below have first passed strict run-ID and SHA-256
+    # validation.  The stage layout and destination are intentionally fixed.
+    _command="set -eu
+stage=/tmp/x0x-artifact-stage-${_run_id}
+marker=\$stage/.x0x-stage-owner
+artifact=\$stage/artifact
+source=\$artifact/x0xd
+test -d \"\$stage\" && test ! -L \"\$stage\"
+test -d \"\$artifact\" && test ! -L \"\$artifact\"
+test -f \"\$marker\" && test ! -L \"\$marker\"
+test -f \"\$source\" && test ! -L \"\$source\"
+printf %s '${_run_id}' | cmp -s - \"\$marker\"
+test \"\$(sha256sum \"\$source\" | cut -d ' ' -f1)\" = '${_expected}'
+install -m 755 -- \"\$source\" /tmp/x0xd.codex
+test \"\$(sha256sum /tmp/x0xd.codex | cut -d ' ' -f1)\" = '${_expected}'"
+
+    printf '    Reusing verified staged testnet binary... '
+    # shellcheck disable=SC2086  # intentional word-split on $SSH
+    if timeout 900 $SSH root@"$_ip" "$_command" 2>/dev/null; then
+        printf '%sdone%s\n' "${GREEN:-}" "${NC:-}"
+        uploaded=true
+        return 0
+    fi
+    printf '%sfailed identity check or copy%s\n' "${RED:-}" "${NC:-}" >&2
+    return 1
+}
+
 # x0x_upload_binary IP
 #
 # Streams $BINARY to /tmp/x0xd.codex on the remote and verifies the received
@@ -38,6 +97,11 @@
 x0x_upload_binary() {
     local _ip="$1"
     uploaded=false
+    if [ -n "${X0X_DEPLOY_STAGED_RUN_ID:-}" ] \
+        || [ -n "${X0X_DEPLOY_STAGED_SHA256:-}" ]; then
+        x0x_reuse_staged_binary "$_ip"
+        return $?
+    fi
     local _attempt _remote
     for _attempt in $(seq 1 "$MAX_UPLOAD_ATTEMPTS"); do
         printf '    Uploading binary (attempt %s/%s)... ' "$_attempt" "$MAX_UPLOAD_ATTEMPTS"

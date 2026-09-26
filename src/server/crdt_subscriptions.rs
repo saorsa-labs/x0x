@@ -671,6 +671,12 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             if state.task_lists.read().await.contains_key(&entry.id) {
                 return RehydrateOutcome::AlreadyPresent; // re-created via REST since startup
             }
+            // #895: a legacy plaintext space board this node migrated stays
+            // retired across restarts — its sync is never started again. The
+            // manifest row and snapshot are kept (local data is not deleted).
+            if super::routes::legacy_space_board_retired(&state, &entry.id).await {
+                return RehydrateOutcome::Skipped;
+            }
             // #557: restore content from the per-list snapshot before any
             // network write is accepted; a corrupt snapshot fails closed
             // (Skipped — entry stays for the next restart) rather than
