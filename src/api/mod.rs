@@ -685,6 +685,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "network",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/state-sync",
+        cli_name: "diagnostics state-sync",
+        description: "Local state-sync counters for currently open KV stores",
+        category: "network",
+        request: RequestSpec::None,
+    },
     // ── History (ADR-0023 durable local history) ────────────────────────
     EndpointDef {
         method: Method::Get,

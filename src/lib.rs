@@ -17871,6 +17871,11 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Cumulative local state-sync counters for this open store.
+    pub fn state_sync_snapshot(&self) -> kv::sync::StateSyncSnapshot {
+        self.sync.state_sync_snapshot()
+    }
+
     pub(crate) async fn retained_content_digest_hex(&self) -> String {
         hex::encode(self.sync.read().await.served_digest())
     }

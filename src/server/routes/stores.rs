@@ -1086,6 +1086,19 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
         retained_image: Option<Vec<u8>>,
     ) -> x0x::kv::Result<()> {
+        self.merge_main_record_with_outcome(opened, sender_peer, local_peer, store, retained_image)
+            .await
+            .map(|_| ())
+    }
+
+    async fn merge_main_record_with_outcome(
+        &self,
+        opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
+        sender_peer: saorsa_gossip_types::PeerId,
+        local_peer: saorsa_gossip_types::PeerId,
+        store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> x0x::kv::Result<Option<bool>> {
         if opened.reader_only || opened.mutation.kind == x0x::kv::KvMutationKind::Control {
             return Err(x0x::kv::KvError::Unauthorized(
                 "read-side TreeKEM record cannot mutate a store".to_string(),
@@ -1108,7 +1121,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 let delta: x0x::kv::KvStoreDelta =
                     bincode::deserialize(&opened.mutation.payload)
                         .map_err(|e| x0x::kv::KvError::Gossip(format!("bad TreeKEM delta: {e}")))?;
-                target.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                target
+                    .merge_delta_with_outcome(&delta, sender_peer, Some(&opened.mutation.author_id))
+                    .map(|outcome| Some(matches!(outcome, x0x::kv::store::MergeOutcome::Applied)))
             }
             x0x::kv::KvMutationKind::RetainedState => {
                 let image: x0x::kv::KvStore =
@@ -1118,7 +1133,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                         )
                     })?)
                     .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
-                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                let previous_version = target.current_version();
+                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)?;
+                Ok(Some(target.current_version() != previous_version))
             }
             x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
                 "TreeKEM control record on main topic".to_string(),

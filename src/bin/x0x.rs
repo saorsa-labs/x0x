@@ -779,6 +779,8 @@ enum DiagnosticsSub {
     },
     /// Print per-group ingest counters and drop-reason buckets.
     Groups,
+    /// Print per-open-store state-sync activity and rejection counters.
+    StateSync,
     /// Print remote exec counters, warnings, and ACL summary.
     Exec,
     /// Print connect-ACL policy summary and stream allow/deny counters.
@@ -2301,6 +2303,7 @@ async fn run(
                 commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await
             }
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
+            DiagnosticsSub::StateSync => commands::network::diagnostics_state_sync(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,

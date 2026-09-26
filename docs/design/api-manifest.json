@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 183,
+  "endpoint_count": 184,
   "endpoints": [
     {
       "category": "status",
@@ -919,6 +919,16 @@
       "description": "Durable-history writer/reaper counters (ADR-0023)",
       "method": "GET",
       "path": "/diagnostics/history",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics state-sync",
+      "description": "Local state-sync counters for currently open KV stores",
+      "method": "GET",
+      "path": "/diagnostics/state-sync",
       "request": {
         "kind": "none"
       }

@@ -161,6 +161,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Get,
+        "/diagnostics/state-sync",
+        state_sync_route_exposes_bounded_open_store_snapshot
+    ),
+    covered!(
+        Get,
         "/history",
         rest_history_list_search_stats_purge_roundtrip
     ),
@@ -576,6 +581,10 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/server/routes/network.rs",
+        include_str!("../src/server/routes/network.rs"),
+    ),
     (
         "tests/daemon_api_integration.rs",
         include_str!("daemon_api_integration.rs"),
