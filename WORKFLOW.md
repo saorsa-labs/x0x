@@ -81,7 +81,6 @@ hooks:
     test -d ant-quic/.git
     test -d saorsa-gossip/.git
     test -f x0x/AGENTS.md
-    test -f x0x/CLAUDE.md
     test -f x0x/justfile
     test -f x0x/issues/issues.jsonl
 
@@ -156,9 +155,8 @@ Description:
 Before editing code:
 
 1. Read `x0x/AGENTS.md`.
-2. Read `x0x/CLAUDE.md`.
-3. Read any docs or modules directly relevant to the issue.
-4. Check `x0x/issues/schema.md` so issue state updates stay machine-readable.
+2. Read any docs or modules directly relevant to the issue.
+3. Check `x0x/issues/schema.md` so issue state updates stay machine-readable.
 
 ## Project rules
 

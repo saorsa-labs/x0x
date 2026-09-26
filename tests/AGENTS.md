@@ -1,7 +1,7 @@
 # tests/ — Test Suite Reference
 
-Auto-loaded only when Claude is working on files in `tests/`. Root `CLAUDE.md`
-covers project-wide rules and architecture.
+Loaded when working on files in `tests/`. The root `AGENTS.md` covers
+architecture and how to run tests in isolation.
 
 ## Ordinary shared Wiki/Web testnet acceptance
 

@@ -408,7 +408,7 @@ pub(in crate::server) async fn direct_send(
                 if let Some(network) = state.agent.network() {
                     // Resolve AgentId → MachineId via discovery cache, then
                     // reinterpret the 32 bytes as an ant_quic PeerId (they
-                    // are the same hash by construction — see CLAUDE.md).
+                    // are the same hash by construction — see AGENTS.md).
                     let discovered = state.agent.discovered_agent(agent_id).await.ok().flatten();
                     if let Some(rec) = discovered {
                         let peer_id = ant_quic::PeerId(rec.machine_id.0);

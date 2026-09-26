@@ -7,7 +7,7 @@ This document describes the production test architecture for x0x — Rust
 unit/integration tests, end-to-end shell harnesses, GUI parity checks, and
 the cross-surface parity proofs against Communitas (Dioxus + Apple). For
 the maintained quick reference (integration-test inventory, e2e run
-recipes, VPS ports), see [`tests/CLAUDE.md`](tests/CLAUDE.md).
+recipes, VPS ports), see [`tests/AGENTS.md`](tests/AGENTS.md).
 
 The capability source of truth is the manifest-driven parity test suite:
 the `ENDPOINTS` registry in `src/api/mod.rs` (projected to
@@ -70,7 +70,7 @@ can be replayed and audited after the fact.
 **Scope:** 81 integration files in `tests/` (plus 37 shell harnesses and
 inline `#[cfg(test)]` modules).
 
-Highlights (curated inventory in [`tests/CLAUDE.md`](tests/CLAUDE.md)):
+Highlights (curated inventory in [`tests/AGENTS.md`](tests/AGENTS.md)):
 
 | File | Coverage |
 |------|----------|
@@ -994,4 +994,4 @@ Mesh-harness specific:
 - GitHub: https://github.com/saorsa-labs/x0x
 - Email: david@saorsalabs.com
 - Parity signoff: [`docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`](docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md)
-- Architecture: [`CLAUDE.md`](CLAUDE.md)
+- Architecture: [`AGENTS.md`](AGENTS.md)
