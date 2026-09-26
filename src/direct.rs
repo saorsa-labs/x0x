@@ -768,6 +768,36 @@ impl DirectMessaging {
         tracing::info!("Agent connected: {:?}", agent_id);
     }
 
+    /// Mark a raw-Direct sender connected — but only when the listener
+    /// VERIFIED the sender's `AgentId→MachineId` binding (#898).
+    ///
+    /// The raw Direct payload's first 32 bytes are a sender-claimed
+    /// `AgentId`. When that claim does not match the verified binding
+    /// (`verified == false`), recording it would let any connected machine
+    /// overwrite another agent's connected-machine entry, which
+    /// `connect_to_agent` later copies into the discovery cache. An
+    /// unverified claim therefore never marks connected or rebinds; the
+    /// message content itself is still delivered, annotated unverified.
+    /// Returns whether the sender was marked.
+    pub async fn mark_raw_direct_sender_connected(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        verified: bool,
+    ) -> bool {
+        if !verified {
+            tracing::debug!(
+                target: "x0x::direct",
+                sender_prefix = %crate::network::hex_prefix(&agent_id.0, 4),
+                machine_prefix = %crate::network::hex_prefix(&machine_id.0, 4),
+                "unverified raw Direct sender claim: binding left unchanged (#898)"
+            );
+            return false;
+        }
+        self.mark_connected(agent_id, machine_id).await;
+        true
+    }
+
     /// Mark an agent as disconnected.
     pub async fn mark_disconnected(&self, agent_id: &AgentId) {
         let mut connected = self.connected_agents.write().await;
@@ -1748,6 +1778,45 @@ mod tests {
 
         dm.mark_disconnected(&agent_id).await;
         assert!(!dm.is_connected(&agent_id).await);
+    }
+
+    /// #898 regression: a raw Direct payload from machine M2 that claims
+    /// agent A (verified binding on M1) must not rebind A to M2 — neither
+    /// the connected map nor the machine→agent map — while a verified
+    /// sender is still recorded.
+    #[tokio::test]
+    async fn unverified_raw_direct_claim_never_rebinds_the_agent() {
+        let dm = DirectMessaging::new();
+        let agent_a = AgentId([0xA1; 32]);
+        let m1 = MachineId([0x01; 32]);
+        let m2 = MachineId([0x02; 32]);
+
+        assert!(dm.mark_raw_direct_sender_connected(agent_a, m1, true).await);
+        assert_eq!(dm.get_machine_id(&agent_a).await, Some(m1));
+
+        // Spoof: M2 prefixes A's id; the listener computed verified=false.
+        assert!(
+            !dm.mark_raw_direct_sender_connected(agent_a, m2, false)
+                .await
+        );
+        assert_eq!(
+            dm.get_machine_id(&agent_a).await,
+            Some(m1),
+            "an unverified claim must not move A's connected machine"
+        );
+        assert_eq!(dm.lookup_agent(&m2).await, None, "M2 must not map to A");
+
+        // A never-seen agent claimed unverified is not registered at all.
+        let agent_b = AgentId([0xB1; 32]);
+        assert!(
+            !dm.mark_raw_direct_sender_connected(agent_b, m2, false)
+                .await
+        );
+        assert!(!dm.is_connected(&agent_b).await);
+
+        // A verified move still updates the binding.
+        assert!(dm.mark_raw_direct_sender_connected(agent_a, m2, true).await);
+        assert_eq!(dm.get_machine_id(&agent_a).await, Some(m2));
     }
 
     #[tokio::test]

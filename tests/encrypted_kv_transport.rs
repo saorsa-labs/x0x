@@ -6,14 +6,17 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bincode::Options;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::StatusCode;
 use saorsa_gossip_types::PeerId;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use x0x::kv::encrypted::EncryptedKvStoreRecordV1;
+use x0x::groups::{GroupInfo, GssKvSecureContext};
+use x0x::kv::encrypted::{open_mutation, seal_mutation, AuthorSigning, EncryptedKvStoreRecordV1};
+use x0x::kv::{KvEntry, KvMutationKind, KvSecureContext, KvStoreDelta, KvStoreId};
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -33,6 +36,25 @@ struct CapturedFrame {
     topic: String,
     sender: String,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct PhaseEpochProof<'a> {
+    previous: &'a GssKvSecureContext,
+    current: &'a GssKvSecureContext,
+    post_key: &'a str,
+    restart_key: Option<&'a str>,
+    expected_kind: Option<KvMutationKind>,
+    required_current_key: Option<&'a str>,
+}
+
+async fn persisted_group(d: &AgentInstance, group_id: &str) -> GroupInfo {
+    let bytes = tokio::fs::read(d.data_dir().join("named_groups.json"))
+        .await
+        .expect("durable named groups");
+    let mut groups: HashMap<String, GroupInfo> =
+        serde_json::from_slice(&bytes).expect("named groups JSON");
+    groups.remove(group_id).expect("durable group entry")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,7 +473,6 @@ fn validate_frame(
     sender: &str,
     group_id: &[u8],
     store_id: &[u8; 32],
-    minimum_epoch: u64,
     forbidden: &[&[u8]],
 ) -> Result<EncryptedKvStoreRecordV1, String> {
     if frame.topic != topic {
@@ -477,24 +498,119 @@ fn validate_frame(
     if &record.store_id != store_id {
         return Err("wrong store binding".to_string());
     }
-    if record.epoch < minimum_epoch {
-        return Err("old epoch".to_string());
-    }
     if record.ciphertext.len() <= 16 {
         return Err("missing authenticated ciphertext".to_string());
     }
     Ok(record)
 }
 
+fn mutation_contains_key(kind: KvMutationKind, payload: &[u8], key: &str) -> Result<bool, String> {
+    match kind {
+        KvMutationKind::Delta | KvMutationKind::FullState => {
+            let delta: KvStoreDelta = bincode::deserialize(payload)
+                .map_err(|error| format!("invalid decrypted KV delta: {error}"))?;
+            Ok(delta.added.contains_key(key)
+                || delta.updated.contains_key(key)
+                || delta.removed.contains_key(key))
+        }
+        KvMutationKind::RetainedState | KvMutationKind::Control => Ok(payload
+            .windows(key.len())
+            .any(|window| window == key.as_bytes())),
+    }
+}
+
+fn check_phase_epoch(
+    record: &EncryptedKvStoreRecordV1,
+    phase: &str,
+    store_id: &[u8; 32],
+    minimum_epoch: u64,
+    proof: Option<&PhaseEpochProof<'_>>,
+) -> bool {
+    if record.epoch < minimum_epoch {
+        if let Some(proof) = proof {
+            assert_eq!(
+                record.epoch,
+                proof.previous.current_epoch(),
+                "unexpected earlier epoch: phase={phase}, frame_epoch={}, minimum_epoch={minimum_epoch}",
+                record.epoch
+            );
+            let mutation = open_mutation(proof.previous, &KvStoreId::new(*store_id), record)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "prior-epoch frame failed authenticated open: phase={phase}, frame_epoch={}: {error}",
+                        record.epoch
+                    )
+                });
+            let contains_post_key =
+                mutation_contains_key(mutation.kind, &mutation.payload, proof.post_key)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                        "prior-epoch frame payload invalid: phase={phase}, frame_epoch={}: {error}",
+                        record.epoch
+                    )
+                    });
+            let contains_restart_key = proof.restart_key.is_some_and(|key| {
+                mutation_contains_key(mutation.kind, &mutation.payload, key).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "prior-epoch frame payload invalid: phase={phase}, frame_epoch={}: {error}",
+                            record.epoch
+                        )
+                    },
+                )
+            });
+            assert!(
+                !contains_post_key && !contains_restart_key,
+                "post-removal key published under prior epoch: phase={phase}, frame_epoch={}, minimum_epoch={minimum_epoch}",
+                record.epoch
+            );
+        }
+        return false;
+    }
+    if let Some(proof) = proof {
+        if record.epoch != proof.current.current_epoch() {
+            return false;
+        }
+        let mutation = open_mutation(proof.current, &KvStoreId::new(*store_id), record)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "current-epoch frame failed authenticated open: phase={phase}, frame_epoch={}: {error}",
+                    record.epoch
+                )
+            });
+        if proof
+            .expected_kind
+            .is_some_and(|kind| mutation.kind != kind)
+        {
+            return false;
+        }
+        if let Some(key) = proof.required_current_key {
+            return mutation_contains_key(mutation.kind, &mutation.payload, key).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "current-epoch payload invalid: phase={phase}, frame_epoch={}: {error}",
+                        record.epoch
+                    )
+                },
+            );
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn next_phase_frame(
     rx: &mut mpsc::Receiver<Result<CapturedFrame, String>>,
+    phase: &str,
     topic: &str,
     sender: &str,
     group_id: &[u8],
     store_id: &[u8; 32],
     minimum_epoch: u64,
     forbidden: &[&[u8]],
+    proof: Option<&PhaseEpochProof<'_>>,
 ) -> EncryptedKvStoreRecordV1 {
+    let mut last_frame_epoch = None;
     tokio::time::timeout(PHASE_TIMEOUT, async {
         loop {
             let frame = rx
@@ -505,20 +621,37 @@ async fn next_phase_frame(
             if frame.topic != topic || frame.sender != sender {
                 continue;
             }
-            return validate_frame(
+            let frame_epoch = decode_envelope(&frame.payload).ok().map(|record| record.epoch);
+            last_frame_epoch = frame_epoch;
+            let record = validate_frame(
                 &frame,
                 topic,
                 sender,
                 group_id,
                 store_id,
-                minimum_epoch,
                 forbidden,
             )
-            .unwrap_or_else(|error| panic!("relevant transport frame rejected: {error}"));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "relevant transport frame rejected: phase={phase}, sender={}, topic={}, frame_epoch={frame_epoch:?}, minimum_epoch={minimum_epoch}: {error}",
+                    frame.sender,
+                    frame.topic
+                )
+            });
+            // A retry from an earlier epoch is checked against the saved
+            // secret and unique post-write key before it can be skipped.
+            if !check_phase_epoch(&record, phase, store_id, minimum_epoch, proof) {
+                continue;
+            }
+            return record;
         }
     })
     .await
-    .expect("timed out waiting for exact encrypted transport frame")
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for encrypted transport frame: phase={phase}, sender={sender}, topic={topic}, last_frame_epoch={last_frame_epoch:?}, minimum_epoch={minimum_epoch}"
+        )
+    })
 }
 
 fn drain_phase(rx: &mut mpsc::Receiver<Result<CapturedFrame, String>>) {
@@ -530,17 +663,19 @@ fn drain_phase(rx: &mut mpsc::Receiver<Result<CapturedFrame, String>>) {
 #[allow(clippy::too_many_arguments)]
 async fn validate_phase_tail(
     rx: &mut mpsc::Receiver<Result<CapturedFrame, String>>,
+    phase: &str,
     topic: &str,
     sender: &str,
     group_id: &[u8],
     store_id: &[u8; 32],
     minimum_epoch: u64,
     forbidden: &[&[u8]],
+    proof: Option<&PhaseEpochProof<'_>>,
 ) {
     // The phase already has a required exact frame and a positive remote-state
     // barrier. This short quiet window is only to inspect delayed duplicates:
     // every additional frame from the same sender on the same transport topic
-    // must satisfy the identical sealed-envelope oracle.
+    // must be a bound sealed envelope. Earlier epochs may be delayed retries.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -549,16 +684,27 @@ async fn validate_phase_tail(
         }
         match tokio::time::timeout(remaining.min(Duration::from_millis(200)), rx.recv()).await {
             Ok(Some(Ok(frame))) if frame.topic == topic && frame.sender == sender => {
-                validate_frame(
+                let frame_epoch = decode_envelope(&frame.payload)
+                    .ok()
+                    .map(|record| record.epoch);
+                let record = validate_frame(
                     &frame,
                     topic,
                     sender,
                     group_id,
                     store_id,
-                    minimum_epoch,
                     forbidden,
                 )
-                .unwrap_or_else(|error| panic!("delayed relevant frame rejected: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "delayed relevant frame rejected: phase={phase}, sender={}, topic={}, frame_epoch={frame_epoch:?}, minimum_epoch={minimum_epoch}: {error}",
+                        frame.sender,
+                        frame.topic
+                    )
+                });
+                if !check_phase_epoch(&record, phase, store_id, minimum_epoch, proof) {
+                    continue;
+                }
             }
             Ok(Some(Ok(_))) | Err(_) => {}
             Ok(Some(Err(error))) => panic!("SSE parser: {error}"),
@@ -682,25 +828,32 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     put(&trio.alice, &topic, &pre_key, &pre_value).await;
     let pre = next_phase_frame(
         &mut captures,
+        "pre_write",
         &topic,
         &alice_id,
         &group_bytes,
         &store_id,
         initial_epoch,
         &[pre_key.as_bytes(), &pre_value, pre_value_b64.as_bytes()],
+        None,
     )
     .await;
     assert!(wait_until(|| reads(&trio.bob, &topic, &pre_key, &pre_value)).await);
     validate_phase_tail(
         &mut captures,
+        "pre_write_tail",
         &topic,
         &alice_id,
         &group_bytes,
         &store_id,
         initial_epoch,
         &[pre_key.as_bytes(), &pre_value, pre_value_b64.as_bytes()],
+        None,
     )
     .await;
+
+    let previous_group = persisted_group(&trio.alice, &owner_group).await;
+    assert_eq!(previous_group.secret_epoch, pre.epoch);
 
     let removed = authed_client(&trio.alice)
         .delete(
@@ -730,27 +883,58 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     let post_key = format!("post-{}", rand::random::<u64>());
     let post_value = format!("post-value-{}", rand::random::<u64>()).into_bytes();
     let post_value_b64 = BASE64.encode(&post_value);
+    let current_group = persisted_group(&trio.alice, &owner_group).await;
+    assert_eq!(current_group.secret_epoch, post_epoch);
+    let previous_context =
+        GssKvSecureContext::from_group(&previous_group).expect("saved pre-removal secret");
+    let current_context =
+        GssKvSecureContext::from_group(&current_group).expect("saved post-removal secret");
+    let strict_post_proof = PhaseEpochProof {
+        previous: &previous_context,
+        current: &current_context,
+        post_key: &post_key,
+        restart_key: None,
+        expected_kind: Some(KvMutationKind::Delta),
+        required_current_key: Some(&post_key),
+    };
+    let replay_proof = PhaseEpochProof {
+        expected_kind: None,
+        required_current_key: None,
+        ..strict_post_proof
+    };
+    let control_proof = PhaseEpochProof {
+        expected_kind: Some(KvMutationKind::Control),
+        ..replay_proof
+    };
+    let retained_proof = PhaseEpochProof {
+        expected_kind: Some(KvMutationKind::RetainedState),
+        ..replay_proof
+    };
     put(&trio.alice, &topic, &post_key, &post_value).await;
     let post = next_phase_frame(
         &mut captures,
+        "post_removal_write",
         &topic,
         &alice_id,
         &group_bytes,
         &store_id,
         post_epoch,
         &[post_key.as_bytes(), &post_value, post_value_b64.as_bytes()],
+        Some(&strict_post_proof),
     )
     .await;
     assert_eq!(post.epoch, post_epoch);
     assert!(wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value)).await);
     validate_phase_tail(
         &mut captures,
+        "post_removal_write_tail",
         &topic,
         &alice_id,
         &group_bytes,
         &store_id,
         post_epoch,
         &[post_key.as_bytes(), &post_value, post_value_b64.as_bytes()],
+        Some(&replay_proof),
     )
     .await;
 
@@ -763,6 +947,7 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     // and A's sealed retained response on distinct transport topics.
     let control = next_phase_frame(
         &mut captures,
+        "restart_control",
         &side_topic,
         &bob_id,
         &group_bytes,
@@ -774,11 +959,13 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
             post_key.as_bytes(),
             &post_value,
         ],
+        Some(&control_proof),
     )
     .await;
     assert!(control.epoch >= post_epoch);
     let retained = next_phase_frame(
         &mut captures,
+        "restart_retained",
         &topic,
         &alice_id,
         &group_bytes,
@@ -790,12 +977,14 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
             post_key.as_bytes(),
             &post_value,
         ],
+        Some(&retained_proof),
     )
     .await;
     assert!(retained.epoch >= post_epoch);
     assert!(wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value)).await);
     validate_phase_tail(
         &mut captures,
+        "restart_retained_tail",
         &topic,
         &alice_id,
         &group_bytes,
@@ -807,16 +996,24 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
             post_key.as_bytes(),
             &post_value,
         ],
+        Some(&replay_proof),
     )
     .await;
 
     let restart_key = format!("restart-{}", rand::random::<u64>());
     let restart_value = format!("restart-value-{}", rand::random::<u64>()).into_bytes();
     let restart_value_b64 = BASE64.encode(&restart_value);
+    let restart_write_proof = PhaseEpochProof {
+        restart_key: Some(&restart_key),
+        expected_kind: Some(KvMutationKind::Delta),
+        required_current_key: Some(&restart_key),
+        ..replay_proof
+    };
     drain_phase(&mut captures);
     put(&trio.bob, &topic, &restart_key, &restart_value).await;
     let restarted = next_phase_frame(
         &mut captures,
+        "restart_write",
         &topic,
         &bob_id,
         &group_bytes,
@@ -827,12 +1024,14 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
             &restart_value,
             restart_value_b64.as_bytes(),
         ],
+        Some(&restart_write_proof),
     )
     .await;
     assert!(restarted.epoch >= post_epoch);
     assert!(wait_until(|| reads(&trio.alice, &topic, &restart_key, &restart_value)).await);
     validate_phase_tail(
         &mut captures,
+        "restart_write_tail",
         &topic,
         &bob_id,
         &group_bytes,
@@ -843,6 +1042,7 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
             &restart_value,
             restart_value_b64.as_bytes(),
         ],
+        Some(&restart_write_proof),
     )
     .await;
 
@@ -857,7 +1057,7 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
 }
 
 #[test]
-fn frame_oracle_rejects_plaintext_tampering_unrelated_and_old_epoch() {
+fn frame_oracle_rejects_plaintext_tampering_and_unrelated_binding() {
     let topic = "x0x/group/g/kv/proof";
     let sender = "11".repeat(32);
     let group = b"stable-group".to_vec();
@@ -878,7 +1078,7 @@ fn frame_oracle_rejects_plaintext_tampering_unrelated_and_old_epoch() {
         sender: sender.clone(),
         payload,
     };
-    assert!(validate_frame(&valid, topic, &sender, &group, &store, 9, &[b"secret"]).is_ok());
+    assert!(validate_frame(&valid, topic, &sender, &group, &store, &[b"secret"]).is_ok());
 
     let plaintext = CapturedFrame {
         payload: b"secret".to_vec(),
@@ -888,11 +1088,135 @@ fn frame_oracle_rejects_plaintext_tampering_unrelated_and_old_epoch() {
             payload: valid.payload.clone(),
         }
     };
-    assert!(validate_frame(&plaintext, topic, &sender, &group, &store, 9, &[b"secret"]).is_err());
-    assert!(validate_frame(&valid, "other", &sender, &group, &store, 9, &[]).is_err());
-    assert!(validate_frame(&valid, topic, &sender, b"tampered-group", &store, 9, &[]).is_err());
-    assert!(validate_frame(&valid, topic, &sender, &group, &[8; 32], 9, &[]).is_err());
-    assert!(validate_frame(&valid, topic, &sender, &group, &store, 10, &[]).is_err());
+    assert!(validate_frame(&plaintext, topic, &sender, &group, &store, &[b"secret"]).is_err());
+    assert!(validate_frame(&valid, "other", &sender, &group, &store, &[]).is_err());
+    assert!(validate_frame(&valid, topic, &sender, b"tampered-group", &store, &[]).is_err());
+    assert!(validate_frame(&valid, topic, &sender, &group, &[8; 32], &[]).is_err());
+    assert_eq!(
+        validate_frame(&valid, topic, &sender, &group, &store, &[])
+            .expect("bound sealed old frame")
+            .epoch,
+        9
+    );
+}
+
+#[tokio::test]
+async fn phase_frame_skips_only_harmless_authenticated_prior_epoch_retry() {
+    let topic = "x0x/group/g/kv/proof";
+    let sender = "11".repeat(32);
+    let keypair = x0x::identity::AgentKeypair::generate().expect("author keypair");
+    let signing = AuthorSigning::from_keypair(&keypair).expect("author signing");
+    let mut previous = GroupInfo::new(
+        "proof".to_string(),
+        String::new(),
+        keypair.agent_id(),
+        "ab".repeat(16),
+    );
+    previous.migrate_from_v1();
+    let _ = previous.rotate_shared_secret();
+    let mut current = previous.clone();
+    let _ = current.rotate_shared_secret();
+    let previous_context = GssKvSecureContext::from_group(&previous).expect("previous secret");
+    let current_context = GssKvSecureContext::from_group(&current).expect("current secret");
+    let group = previous.stable_group_id().as_bytes().to_vec();
+    let store = [7; 32];
+    let post_key = "unique-post-key";
+    let proof = PhaseEpochProof {
+        previous: &previous_context,
+        current: &current_context,
+        post_key,
+        restart_key: None,
+        expected_kind: Some(KvMutationKind::Delta),
+        required_current_key: Some(post_key),
+    };
+    let frame = |context: &GssKvSecureContext, key: &str| {
+        let mut delta = KvStoreDelta::new(1);
+        delta.updated.insert(
+            key.to_string(),
+            KvEntry::new(key.to_string(), b"value".to_vec(), "text/plain".to_string()),
+        );
+        let record = seal_mutation(
+            context,
+            &signing,
+            KvMutationKind::Delta,
+            &KvStoreId::new(store),
+            &bincode::serialize(&delta).expect("delta bytes"),
+        )
+        .expect("authenticated sealed delta");
+        CapturedFrame {
+            topic: topic.to_string(),
+            sender: sender.clone(),
+            payload: bincode::options()
+                .with_fixint_encoding()
+                .serialize(&(PeerId::new([1; 32]), record))
+                .expect("fixture envelope"),
+        }
+    };
+    let (tx, mut rx) = mpsc::channel(2);
+    tx.try_send(Ok(frame(&previous_context, "old-key")))
+        .expect("queued harmless retry");
+    tx.try_send(Ok(frame(&current_context, post_key)))
+        .expect("queued current post-write delta");
+    let record = next_phase_frame(
+        &mut rx,
+        "post_removal_write",
+        topic,
+        &sender,
+        &group,
+        &store,
+        current.secret_epoch,
+        &[b"secret"],
+        Some(&proof),
+    )
+    .await;
+    assert_eq!(record.epoch, current.secret_epoch);
+
+    let (tx, mut rx) = mpsc::channel(2);
+    tx.try_send(Ok(frame(&previous_context, post_key)))
+        .expect("queued stale-secret post-write delta");
+    tx.try_send(Ok(frame(&current_context, post_key)))
+        .expect("queued current post-write delta");
+    let result = std::panic::AssertUnwindSafe(next_phase_frame(
+        &mut rx,
+        "post_removal_write",
+        topic,
+        &sender,
+        &group,
+        &store,
+        current.secret_epoch,
+        &[b"secret"],
+        Some(&proof),
+    ))
+    .catch_unwind()
+    .await;
+    assert!(result.is_err(), "old-epoch post-write Delta must fail");
+
+    let restart_key = "unique-restart-key";
+    let restart_proof = PhaseEpochProof {
+        restart_key: Some(restart_key),
+        expected_kind: Some(KvMutationKind::Delta),
+        required_current_key: Some(restart_key),
+        ..proof
+    };
+    let (tx, mut rx) = mpsc::channel(2);
+    tx.try_send(Ok(frame(&previous_context, restart_key)))
+        .expect("queued stale-secret restart delta");
+    tx.try_send(Ok(frame(&current_context, restart_key)))
+        .expect("queued current restart delta");
+    let result = std::panic::AssertUnwindSafe(next_phase_frame(
+        &mut rx,
+        "restart_write",
+        topic,
+        &sender,
+        &group,
+        &store,
+        current.secret_epoch,
+        &[b"secret"],
+        Some(&restart_proof),
+    ))
+    .catch_unwind()
+    .await;
+    assert!(result.is_err(), "old-epoch restart Delta must fail");
 }
 
 #[test]
