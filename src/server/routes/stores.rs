@@ -640,16 +640,23 @@ pub(in crate::server) async fn put_kv_value(
         Ok(x0x::KvPutOutcome {
             delta,
             evicted_keys,
+            published,
+            publish_error,
         }) => {
             // #341 Phase B: encrypted stores replicate ONLY via the sealed
             // gossip path — never ship the plaintext local delta over the
-            // DM direct-delivery side channel.
+            // DM direct-delivery side channel. #976 ruling: the fallback
+            // runs on the UNPUBLISHED path too — congested gossip is
+            // exactly what it exists for.
+            let mut direct_attempted = 0usize;
             if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
+                direct_attempted = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
             // #849: a SelfKeyed put can evict the writer's lex-highest keys
-            // under ADR-0047 lowest-N admission. Tell the writer which ones.
+            // under ADR-0047 lowest-N admission. Tell the writer which ones
+            // (on the unpublished path too — the eviction IS durable).
             if !evicted_keys.is_empty() {
                 let _ = state.broadcast_tx.send(SseEvent {
                     event_type: "kv:evicted".to_string(),
@@ -660,10 +667,25 @@ pub(in crate::server) async fn put_kv_value(
                     }),
                 });
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
-            )
+            if published {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
+                )
+            } else {
+                // #976 ruling: the write happened — report it as saved
+                // locally but not yet published (202, never 503).
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "published": false,
+                        "reason": publish_error,
+                        "direct_attempted": direct_attempted,
+                        "evicted_keys": evicted_keys,
+                    })),
+                )
+            }
         }
         Err(e) => {
             let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
@@ -740,15 +762,37 @@ pub(in crate::server) async fn delete_kv_value(
         handle.clone()
     };
 
-    match handle.remove_with_delta(&key).await {
-        Ok(delta) => {
+    match handle.remove_with_outcome(&key).await {
+        Ok(x0x::KvRemoveOutcome {
+            delta,
+            published,
+            publish_error,
+        }) => {
             // #341 Phase B: see put_kv_value — no plaintext DM fallback for
-            // encrypted stores.
+            // encrypted stores. #976: the fallback runs on the unpublished
+            // path too, and direct_attempted is reported (attempts, not
+            // confirmations).
+            let mut direct_attempted = 0usize;
             if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
+                direct_attempted = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            if published {
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            } else {
+                // #976 ruling: the remove happened — 202, saved locally,
+                // not yet published. No replay.
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "published": false,
+                        "reason": publish_error,
+                        "direct_attempted": direct_attempted,
+                    })),
+                )
+            }
         }
         Err(e) if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) => {
             // AppendOnly store: keys can never be deleted, even by the owner.
@@ -6107,5 +6151,132 @@ mod tests {
             );
         }
         assert_eq!(handle.keys().await.expect("keys").len(), 64);
+    }
+
+    /// #976 r4 (T1a): a PUT whose publish fails is 202 with
+    /// published:false and the cause — never 503 — and the value is
+    /// readable locally afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_kv_value_reports_202_with_published_false_on_publish_failure() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let topic = "issue-976-put-202".to_string();
+        let handle = state
+            .agent
+            .create_kv_store_persistent(
+                "put202",
+                &topic,
+                x0x::kv::AccessPolicy::Signed,
+                &state.kv_store_state_dir,
+            )
+            .await
+            .expect("create store");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(topic.clone(), handle.clone());
+        let me = hex::encode(state.agent.agent_id().as_bytes());
+        let key = format!("{me}/k");
+        // Warm-up put publishes normally (200).
+        let warm = put_kv_value(
+            State(Arc::clone(&state)),
+            Path((topic.clone(), key.clone())),
+            Json(PutValueRequest {
+                value: BASE64.encode(b"warm"),
+                content_type: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(warm.status(), StatusCode::OK);
+        // Force the NEXT publish to fail; the put still succeeds locally.
+        handle.sync_fail_next_publish_for_test().await;
+        let key = format!("{me}/k2");
+        let response = put_kv_value(
+            State(Arc::clone(&state)),
+            Path((topic, key.clone())),
+            Json(PutValueRequest {
+                value: BASE64.encode(b"v"),
+                content_type: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["ok"], serde_json::json!(true), "{body}");
+        assert_eq!(body["published"], serde_json::json!(false), "{body}");
+        assert!(
+            body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "the cause is carried: {body}"
+        );
+        let kept = handle.get(&key).await.expect("read").expect("kept");
+        assert_eq!(kept.value, b"v");
+    }
+
+    /// #976 r4 (T1b): on the unpublished path the REST handler ATTEMPTS
+    /// the DM side-channel fallback — direct_attempted counts the
+    /// gossip-inbox-capable contacts (the sends are fire-and-forget).
+    /// Encrypted stores never ship the plaintext delta over it, so an
+    /// ENCRYPTED store reports direct_attempted == 0; a PLAINTEXT store
+    /// with one capable contact reports 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_kv_value_attempts_direct_fallback_on_publish_failure() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let topic = "issue-976-direct".to_string();
+        let handle = state
+            .agent
+            .create_kv_store_persistent(
+                "direct",
+                &topic,
+                x0x::kv::AccessPolicy::Signed,
+                &state.kv_store_state_dir,
+            )
+            .await
+            .expect("create store");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(topic.clone(), handle.clone());
+        let me = state.agent.agent_id();
+        let key = format!("{}/k", hex::encode(me.as_bytes()));
+        // Seed one gossip-inbox-capable contact (not us, not blocked).
+        let other = x0x::identity::AgentKeypair::generate().expect("kp");
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: other.agent_id(),
+            trust_level: x0x::contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready(vec![0xAAu8; 32])),
+        });
+        handle.sync_fail_next_publish_for_test().await;
+        let response = put_kv_value(
+            State(Arc::clone(&state)),
+            Path((topic.clone(), key)),
+            Json(PutValueRequest {
+                value: BASE64.encode(b"v"),
+                content_type: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // This store is NOT encrypted and one capable contact exists: the
+        // fallback ran for exactly that recipient.
+        assert_eq!(body["direct_attempted"], serde_json::json!(1), "{body}");
+        assert_eq!(body["published"], serde_json::json!(false), "{body}");
     }
 }
