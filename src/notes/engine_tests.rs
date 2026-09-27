@@ -377,12 +377,18 @@ fn op_ids(records: &[EngineRecord]) -> Vec<(u64, i32)> {
 /// session's id (in the doc's version vector) on even iterations, and an id
 /// that was drawn and persisted but never used for an op (only in the
 /// retired set) on odd ones. The redraw must reject both.
+///
+/// Each restart reopens from ONE update carrying the whole history (every
+/// op, every peer), so the reopen cost stays linear: re-importing the
+/// growing record list one record at a time is quadratic and timed out
+/// in CI, where the loro dependency builds without optimisation.
 #[test]
 fn peer_ids_are_unique_across_crash_restarts() {
     let rt = runtime();
     let dir = tempfile::tempdir().expect("tempdir");
     rt.block_on(async {
         let mut records: Vec<EngineRecord> = Vec::new();
+        let history = loro::LoroDoc::new();
         let mut seq = 0u64;
         let mut all_sessions: BTreeSet<u64> = BTreeSet::new();
         let mut previous_session: Option<u64> = None;
@@ -400,8 +406,16 @@ fn peer_ids_are_unique_across_crash_restarts() {
             let engine =
                 NotesEngine::with_peer_source(Box::new(peers.clone()), Some(dir.path().into()));
             let before = engine.counters().peer_id_redraws;
+            let snapshot = history
+                .export(loro::ExportMode::all_updates())
+                .expect("history export");
             let actor = engine
-                .get_or_open("store/note", "note", || records.clone())
+                .get_or_open("store/note", "note", || {
+                    vec![EngineRecord {
+                        id: "history".into(),
+                        update: Arc::new(snapshot),
+                    }]
+                })
                 .await
                 .expect("reopen");
             let session = actor.session_peer().await.expect("peer").expect("session");
@@ -423,13 +437,21 @@ fn peer_ids_are_unique_across_crash_restarts() {
                 // Leave a session that never writes: next odd restart must
                 // still refuse its id (it lives only in the retired set).
                 let text = format!("{}{}", actor.view().await.expect("v").text, token(i));
-                records.extend(save(&actor, &text, "a", &mut seq).await);
+                let saved = save(&actor, &text, "a", &mut seq).await;
+                for r in &saved {
+                    history.import(&r.update).expect("history import");
+                }
+                records.extend(saved);
                 let rotated = actor.rotate_session().await.expect("rotate");
                 assert!(all_sessions.insert(rotated));
                 unused_session = Some(rotated);
             } else {
                 let text = format!("{}{}", actor.view().await.expect("v").text, token(i));
-                records.extend(save(&actor, &text, "a", &mut seq).await);
+                let saved = save(&actor, &text, "a", &mut seq).await;
+                for r in &saved {
+                    history.import(&r.update).expect("history import");
+                }
+                records.extend(saved);
             }
             previous_session = Some(session);
             // "Kill": no clean shutdown, everything is just dropped.

@@ -549,6 +549,28 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         "GET /groups/:id/stores/:app/legacy-imports/:source_id",
         RouteClass::Covered(&[7]),
     ),
+    // ADR 0081 notes (#965): every notes route opens the group's `notes`
+    // store through `create_group_kv_store` (row 7's resolution, which
+    // refuses a fork-quarantined group) and then reads/writes it through the
+    // same KV handle and authorization as `/stores/:id/:key` (rows 8–11).
+    // In addition the notes layer builds no roster history for a
+    // quarantined group, so it holds every record and signs nothing.
+    (
+        "GET /groups/:id/notes",
+        RouteClass::Covered(&[7, 8, 10, 11]),
+    ),
+    (
+        "POST /groups/:id/notes",
+        RouteClass::Covered(&[7, 8, 9, 10]),
+    ),
+    (
+        "GET /groups/:id/notes/:note",
+        RouteClass::Covered(&[7, 8, 10, 11]),
+    ),
+    (
+        "PUT /groups/:id/notes/:note",
+        RouteClass::Covered(&[7, 8, 9, 10]),
+    ),
     ("GET /stores", RouteClass::Covered(&[8])),
     ("POST /stores", RouteClass::Covered(&[7, 9])),
     ("POST /stores/:id/join", RouteClass::Covered(&[7, 10, 11])),
