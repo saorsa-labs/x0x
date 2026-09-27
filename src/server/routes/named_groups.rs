@@ -38472,6 +38472,46 @@ pub(in crate::server) mod tests {
                 });
                 info.state_hash = "871r4-forked".to_string();
             }
+            // SURVIVAL fixtures: live key material (a TreeKEM group)
+            // and a LIVE pending join — all of which
+            // a teardown regression would destroy even while keeping
+            // the truthful-sounding 503 message.
+            wedged.treekem_groups.write().await.insert(
+                group.clone(),
+                Arc::new(Mutex::new(
+                    x0x::mls::TreeKemMlsGroup::create(
+                        hex::decode(&group).expect("group bytes"),
+                        wedged.agent.agent_id(),
+                        &[0xf3; 32],
+                    )
+                    .expect("fixture treekem group"),
+                )),
+            );
+            wedged
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(group.clone());
+            {
+                let mut attempts = wedged
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                attempts.insert(
+                    join_result_key(&group, &hex::encode(wedged.agent.agent_id().as_bytes())),
+                    PendingJoinAttempt {
+                        attempt_id: "871r4b-survive".to_string(),
+                        local_group_key: group.clone(),
+                        invite_fingerprint: "871r4b-fp".to_string(),
+                        invite_group_id: group.clone(),
+                        inviter_public_key_b64: String::new(),
+                        stored_resend: None,
+                        polls: Vec::new(),
+                        tasks: Vec::new(),
+                        listener_token: None,
+                    },
+                );
+            }
             // Force the NEXT persist_named_groups_mutation save to
             // NotReplaced — the exact R4b arm (compare_and_restore
             // brings the forked GroupInfo BACK).
@@ -38497,6 +38537,33 @@ pub(in crate::server) mod tests {
             assert!(
                 armed_anchored_gap_sequence(info).is_some(),
                 "the gate is still armed — a retry is safe"
+            );
+            // SURVIVAL: the key material and the pending join are
+            // INTACT — the not-durable leave tore NOTHING down. A
+            // teardown regression that keeps the 503 message fails
+            // here.
+            assert!(
+                wedged.treekem_groups.read().await.contains_key(&group),
+                "the TreeKEM key material survives the not-durable leave"
+            );
+            assert!(
+                wedged
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&group),
+                "the pending-join stub survives the not-durable leave"
+            );
+            assert!(
+                wedged
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&join_result_key(
+                        &group,
+                        &hex::encode(wedged.agent.agent_id().as_bytes()),
+                    )),
+                "the pending-join attempt survives the not-durable leave"
             );
         }
         /// Direct-handler call helper for the #871 escape route.
