@@ -1804,6 +1804,17 @@ impl KvStore {
                 return Err(KvError::ImmutableKey(key.to_string()));
             }
         }
+        // ADR 0081 §5: a local put never replaces a note update record with
+        // a value that loses to it (write-once record keys).
+        if self.notes_record_guarded(key) {
+            if let Some(existing) = self.entries.get(key) {
+                if existing.value != value
+                    && !self.notes_record_incoming_wins(key, &existing.value, value)
+                {
+                    return Err(KvError::ImmutableKey(key.to_string()));
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -1894,7 +1905,7 @@ impl KvStore {
         if !self.entries.contains_key(key) {
             return Err(KvError::KeyNotFound(key.to_string()));
         }
-        if matches!(self.policy, AccessPolicy::AppendOnly) {
+        if matches!(self.policy, AccessPolicy::AppendOnly) || self.notes_record_guarded(key) {
             return Err(KvError::ImmutableKey(key.to_string()));
         }
 
@@ -2346,11 +2357,7 @@ impl KvStore {
                 .add(key.clone(), *tag)
                 .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
 
-            if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge(entry);
-            } else {
-                self.entries.insert(key.clone(), entry.clone());
-            }
+            self.merge_entry_guarded(key, entry);
         }
 
         // Apply removed keys — never for AppendOnly stores: keys are immutable
@@ -2367,6 +2374,15 @@ impl KvStore {
             }
         } else {
             for key in delta.removed.keys() {
+                // ADR 0081 §5: note update records are write-once and are
+                // never removed (compaction is a later, separate design).
+                if self.notes_record_guarded(key) {
+                    tracing::warn!(
+                        "skipped removal of write-once notes record {key:?} for store {}",
+                        self.id
+                    );
+                    continue;
+                }
                 let _ = self.keys.remove(&key.to_string());
                 self.entries.remove(key.as_str());
             }
@@ -2377,8 +2393,8 @@ impl KvStore {
             if self.append_only_rejects_entry(key, entry) {
                 continue; // skip this entry; the rest of the delta still applies
             }
-            if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge(entry);
+            if self.entries.contains_key(key) {
+                self.merge_entry_guarded(key, entry);
             } else {
                 self.keys
                     .add(key.clone(), (peer_id, 0))
@@ -2433,6 +2449,96 @@ impl KvStore {
         true
     }
 
+    /// ADR 0081 §5 (#965): whether `key` is a write-once note update-record
+    /// key of a group `notes` store. Such keys are never overwritten with a
+    /// value that loses to the current one (see
+    /// [`Self::notes_record_incoming_wins`]) and never removed, whoever
+    /// publishes or serves the delta: the KV writer of a delta is its
+    /// PUBLISHER (the serving member after a full-state or retained serve),
+    /// so ownership is bound to the record's own author signature instead.
+    pub(crate) fn notes_record_guarded(&self, key: &str) -> bool {
+        self.notes_record_guard_store() && crate::notes::record::parse_record_key(key).is_some()
+    }
+
+    /// Whether this store is a group `notes` store (ADR 0081).
+    fn notes_record_guard_store(&self) -> bool {
+        matches!(
+            self.policy,
+            AccessPolicy::Encrypted { .. }
+                | AccessPolicy::GroupSigned { .. }
+                | AccessPolicy::TreeKemEncrypted { .. }
+        ) && self.name.get() == crate::notes::NOTES_STORE_NAME
+    }
+
+    fn notes_record_verifies(&self, key: &str, value: &[u8]) -> bool {
+        crate::notes::record::record_value_verifies(self.id.as_bytes(), key, value, |seq0| {
+            self.entries.get(seq0).map(|e| e.value.clone())
+        })
+    }
+
+    /// Deterministic winner for two different values under one guarded
+    /// record key: a value whose author signature verifies beats one that
+    /// does not (a forgery can never verify: it would need the key author's
+    /// secret key); otherwise the lower BLAKE3 of the value wins. Every
+    /// replica applies the same order, so they converge, and a verified
+    /// record is never replaced by a forged one — the pre-#965 LWW merge
+    /// let a later forged value delete the author's save everywhere.
+    fn notes_record_incoming_wins(&self, key: &str, existing: &[u8], incoming: &[u8]) -> bool {
+        let existing_ok = self.notes_record_verifies(key, existing);
+        let incoming_ok = self.notes_record_verifies(key, incoming);
+        match (existing_ok, incoming_ok) {
+            (true, false) => false,
+            (false, true) => true,
+            _ => blake3::hash(incoming).as_bytes() < blake3::hash(existing).as_bytes(),
+        }
+    }
+
+    /// Resolve an incoming entry against an existing one under a guarded
+    /// record key. `None` = not guarded or same value (use the normal
+    /// merge); `Some(true)` = replace wholesale; `Some(false)` = keep.
+    fn notes_record_resolution(
+        &self,
+        key: &str,
+        existing: &KvEntry,
+        incoming: &KvEntry,
+    ) -> Option<bool> {
+        if !self.notes_record_guarded(key) || existing.value == incoming.value {
+            return None;
+        }
+        let wins = self.notes_record_incoming_wins(key, &existing.value, &incoming.value);
+        if !wins {
+            tracing::warn!(
+                "notes record key {key:?} for store {}: kept the existing record over a \
+                 conflicting value that loses (write-once, ADR 0081 §5)",
+                self.id
+            );
+        }
+        Some(wins)
+    }
+
+    /// Merge one incoming entry into `entries`, honouring the notes record
+    /// guard.
+    fn merge_entry_guarded(&mut self, key: &str, entry: &KvEntry) {
+        let resolution = self
+            .entries
+            .get(key)
+            .map(|existing| self.notes_record_resolution(key, existing, entry));
+        match resolution {
+            None => {
+                self.entries.insert(key.to_string(), entry.clone());
+            }
+            Some(None) => {
+                if let Some(existing) = self.entries.get_mut(key) {
+                    existing.merge(entry);
+                }
+            }
+            Some(Some(true)) => {
+                self.entries.insert(key.to_string(), entry.clone());
+            }
+            Some(Some(false)) => {}
+        }
+    }
+
     /// Try to adopt an owner-signed checkpoint as an authoritative full
     /// snapshot.
     ///
@@ -2456,6 +2562,13 @@ impl KvStore {
         peer_id: PeerId,
         cp: &OwnerCheckpoint,
     ) -> bool {
+        // ADR 0081 §5: a group `notes` store never adopts a full-replacement
+        // checkpoint — adoption would drop any note update record the
+        // checkpoint omits. Its entries merge additively through the
+        // write-once record guard instead.
+        if self.notes_record_guard_store() {
+            return false;
+        }
         // 0. Encrypted policy WITHOUT an attached secure context is
         //    fail-closed (#341 Phase A, I1): this path runs in merge_delta
         //    BEFORE the sender-auth check, so without this gate a genuine
@@ -2924,11 +3037,7 @@ impl KvStore {
             .merge_state(&other.keys)
             .map_err(|e| KvError::Merge(format!("OR-Set image merge failed: {e}")))?;
         for (key, entry) in &other.entries {
-            if let Some(local) = trial.entries.get_mut(key) {
-                local.merge(entry);
-            } else {
-                trial.entries.insert(key.clone(), entry.clone());
-            }
+            trial.merge_entry_guarded(key, entry);
         }
         // Remote images contribute retained content only. Identity, policy,
         // checkpoint authority, allowlists, and local sequence state remain
@@ -2946,6 +3055,25 @@ impl KvStore {
         }
         if let Some(floor) = retained_sequence_floor {
             trial.restore_seq_counter(floor);
+        }
+        // ADR 0081 §5: a retained image must not remove a note update
+        // record either. A guarded record that was active here and that the
+        // image's OR-Set tombstoned is re-added under a fresh local tag
+        // (add wins), so every replica that holds it keeps serving it.
+        let tombstoned: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|key| trial.notes_record_guarded(key) && !trial.keys.contains(*key))
+            .cloned()
+            .collect();
+        for key in tombstoned {
+            let seq = trial.reserve_sequences(1)?;
+            trial
+                .keys
+                .add(key, (local_peer, seq))
+                .map_err(|e| KvError::Merge(format!("OR-Set re-add failed: {e}")))?;
+            trial.version = self.version.saturating_add(1);
         }
         *self = trial;
         Ok(())

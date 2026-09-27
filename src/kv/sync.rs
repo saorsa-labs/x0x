@@ -7421,6 +7421,196 @@ mod tests {
         sync.stop().await.expect("stop");
     }
 
+    /// Replicas of one group store named `name`, B's forged value for A's
+    /// note record key, and A's genuine value (ADR 0081 §5, #965).
+    struct RecordOverwriteFixture {
+        replicas: Vec<KvStore>,
+        key: String,
+        genuine: KvEntry,
+        forged: KvEntry,
+        a: AgentId,
+        b: AgentId,
+    }
+
+    fn record_overwrite_fixture(name: &str) -> RecordOverwriteFixture {
+        let a_kp = AgentKeypair::generate().expect("a");
+        let b_kp = AgentKeypair::generate().expect("b");
+        let (a, b) = (a_kp.agent_id(), b_kp.agent_id());
+        let (_, contexts, group_id) = encrypted_group(&[a, b]);
+        let id = store_id(96);
+        let doc = loro::LoroDoc::new();
+        doc.get_text(crate::notes::engine::TEXT_CONTAINER)
+            .insert(0, "A's minutes")
+            .expect("insert");
+        doc.commit();
+        let update = doc.export(loro::ExportMode::all_updates()).expect("export");
+        let note_id = "cd".repeat(16);
+        let a_signing = AuthorSigning::from_keypair(&a_kp).expect("a signing");
+        let b_signing = AuthorSigning::from_keypair(&b_kp).expect("b signing");
+        let (key, genuine_record) = crate::notes::record::sign_record(
+            &a_signing,
+            id.as_bytes(),
+            &note_id,
+            0,
+            1,
+            update.clone(),
+        )
+        .expect("sign");
+        // B's forgery under A's key: B's own signature, A's author field.
+        let (_, mut forged_record) =
+            crate::notes::record::sign_record(&b_signing, id.as_bytes(), &note_id, 0, 2, update)
+                .expect("sign");
+        forged_record.author = a.0;
+        let genuine = KvEntry::new(
+            key.clone(),
+            crate::notes::record::encode_record(&genuine_record).expect("encode"),
+            crate::notes::record::RECORD_CONTENT_TYPE.to_string(),
+        );
+        let mut forged = KvEntry::new(
+            key.clone(),
+            crate::notes::record::encode_record(&forged_record).expect("encode"),
+            crate::notes::record::RECORD_CONTENT_TYPE.to_string(),
+        );
+        // LWW would pick the forgery everywhere: it is strictly newer.
+        forged.updated_at = genuine.updated_at + 60_000;
+        let replicas = (0..4)
+            .map(|i| {
+                KvStore::new_encrypted(
+                    id,
+                    name.to_string(),
+                    a,
+                    group_id.clone(),
+                    contexts[i % 2].clone() as SharedKvSecureContext,
+                )
+                .expect("replica")
+            })
+            .collect();
+        RecordOverwriteFixture {
+            replicas,
+            key,
+            genuine,
+            forged,
+            a,
+            b,
+        }
+    }
+
+    fn delta_with(key: &str, entry: &KvEntry, tag: (PeerId, u64)) -> KvStoreDelta {
+        let mut delta = KvStoreDelta::new(1);
+        delta.added.insert(key.to_string(), (entry.clone(), tag));
+        delta
+    }
+
+    /// Run the attack; return the value each replica ends with under A's
+    /// key (`None` = key gone).
+    fn run_record_overwrite_attack(fx: &mut RecordOverwriteFixture) -> Vec<Option<Vec<u8>>> {
+        let genuine = delta_with(&fx.key, &fx.genuine, (peer(1), 1));
+        let forged = delta_with(&fx.key, &fx.forged, (peer(2), 1));
+        let mut removal = KvStoreDelta::new(2);
+        removal
+            .removed
+            .insert(fx.key.clone(), std::collections::HashSet::new());
+        let (a, b) = (fx.a, fx.b);
+        // Replica 0 = A: its own save, then B's overwrite and B's delete.
+        fx.replicas[0]
+            .merge_delta(&genuine, peer(1), Some(&a))
+            .expect("a");
+        fx.replicas[0]
+            .merge_delta(&forged, peer(2), Some(&b))
+            .expect("forged");
+        fx.replicas[0]
+            .merge_delta(&removal, peer(2), Some(&b))
+            .expect("removal");
+        // Replica 1: the forgery arrives FIRST, the genuine save later.
+        fx.replicas[1]
+            .merge_delta(&forged, peer(2), Some(&b))
+            .expect("forged");
+        fx.replicas[1]
+            .merge_delta(&genuine, peer(1), Some(&a))
+            .expect("a");
+        // Replica 2 (fresh) is served B's image first, then replica 0's.
+        let mut b_image = fx.replicas[3].clone();
+        b_image
+            .merge_delta(&forged, peer(2), Some(&b))
+            .expect("b's store");
+        fx.replicas[2]
+            .merge_group_retained_image(&b_image, b, peer(3))
+            .expect("serve b");
+        let served = fx.replicas[0].clone();
+        fx.replicas[2]
+            .merge_group_retained_image(&served, a, peer(3))
+            .expect("serve a");
+        // Replica 3 = B's own replica: it held the forgery, then is served
+        // replica 1's image.
+        let served = fx.replicas[1].clone();
+        fx.replicas[3]
+            .merge_group_retained_image(&b_image, b, peer(4))
+            .expect("own");
+        fx.replicas[3]
+            .merge_group_retained_image(&served, a, peer(4))
+            .expect("serve");
+        // Finally replica 0 is served B's image (an overwrite via serve).
+        fx.replicas[0]
+            .merge_group_retained_image(&b_image, b, peer(1))
+            .expect("serve b to a");
+        fx.replicas
+            .iter()
+            .map(|r| r.get(&fx.key).map(|e| e.value.clone()))
+            .collect()
+    }
+
+    /// ADR 0081 §5 / #965 (WHY): the KV writer of a delta is its publisher,
+    /// and a state serve re-publishes everyone's entries, so a member could
+    /// overwrite (or delete) another author's note update record under LWW;
+    /// the receiver rule then rejects the forged value, but the author's
+    /// save would be gone for good. With the write-once record guard, A's
+    /// genuine record survives B's overwrite, B's delete, B's serve, and
+    /// every delivery order, on every replica.
+    #[test]
+    fn notes_record_key_survives_another_members_overwrite() {
+        let mut fx = record_overwrite_fixture(crate::notes::NOTES_STORE_NAME);
+        let genuine = fx.genuine.value.clone();
+        let outcome = run_record_overwrite_attack(&mut fx);
+        for (i, value) in outcome.iter().enumerate() {
+            assert_eq!(
+                value.as_deref(),
+                Some(genuine.as_slice()),
+                "replica {i} lost A's record"
+            );
+        }
+        // Local writes obey the guard too.
+        assert!(matches!(
+            fx.replicas[0].put(
+                fx.key.clone(),
+                fx.forged.value.clone(),
+                crate::notes::record::RECORD_CONTENT_TYPE.to_string(),
+                peer(2),
+            ),
+            Err(KvError::ImmutableKey(_))
+        ));
+        assert!(matches!(
+            fx.replicas[0].remove(&fx.key),
+            Err(KvError::ImmutableKey(_))
+        ));
+    }
+
+    /// Control for the test above: the same attack on a group store that is
+    /// not a `notes` store (plain LWW, no record guard) loses A's record on
+    /// at least one replica, so the test can fail.
+    #[test]
+    fn record_overwrite_attack_control_loses_the_record_without_the_guard() {
+        let mut fx = record_overwrite_fixture("wiki");
+        let genuine = fx.genuine.value.clone();
+        let outcome = run_record_overwrite_attack(&mut fx);
+        assert!(
+            outcome
+                .iter()
+                .any(|value| value.as_deref() != Some(genuine.as_slice())),
+            "control: without the guard LWW must lose A's record somewhere: {:?}",
+            outcome.iter().map(Option::is_some).collect::<Vec<_>>()
+        );
+    }
+
     /// ADR 0081 wire test (WHY): notes ride the #914 sealed envelope with no
     /// outer field, so the exact bytes handed to `pubsub.publish` for a note
     /// record — as a delta AND inside a state serve — must carry no note

@@ -332,3 +332,33 @@ pub fn verify_record(
         .map_err(|e| RecordRejection::BadSignature(format!("signature: {e:?}")))?;
     Ok(AgentId(parsed.author))
 }
+
+/// Whether `value` is a record under `key` whose author signature verifies
+/// (ADR 0081 §5). For `seq > 0` the author's key comes from the seq-0
+/// record found by `lookup` (any seq-0 value will do: `verify_record`
+/// still requires the key to derive to the author). Runs the decode and
+/// verification inside `catch_unwind`; any failure is `false`.
+///
+/// The KV layer uses this to keep record keys write-once: a value that
+/// verifies is never replaced by one that does not.
+pub fn record_value_verifies(
+    store_id: &[u8; 32],
+    key: &str,
+    value: &[u8],
+    lookup: impl Fn(&str) -> Option<Vec<u8>>,
+) -> bool {
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parsed = parse_record_key(key)?;
+        let record = decode_record(value).ok()?;
+        let known = if record.seq == 0 {
+            None
+        } else {
+            let seq0 = record_key(parsed.note_id, &parsed.author, 0);
+            lookup(&seq0)
+                .and_then(|bytes| decode_record(&bytes).ok())
+                .and_then(|r| r.author_pubkey)
+        };
+        verify_record(store_id, key, &record, known.as_deref()).ok()
+    }));
+    matches!(checked, Ok(Some(_)))
+}
