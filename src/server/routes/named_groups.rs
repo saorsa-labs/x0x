@@ -36860,6 +36860,12 @@ pub(in crate::server) mod tests {
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,
             ),
+            forwards: Arc::new(
+                x0x::forward::store::ForwardStore::load(
+                    x0x::forward::store::ForwardStore::path_in(data_dir),
+                )
+                .await,
+            ),
             named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(test)]
             named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),

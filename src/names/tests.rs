@@ -131,10 +131,12 @@ fn grammar_rejects_bad_inputs() {
     }
 }
 
-/// WHY: hex stays valid everywhere; a forward refuses a `machine:` name
-/// until slice 2 checks the stream reaches the pinned MachineId.
+/// WHY: hex stays valid everywhere, and (slice 2) a forward accepts a
+/// machine name: it opens to the agent that machine's daemon announces and
+/// pins the machine, so the forwarder can refuse a stream that reaches any
+/// other machine. A machine with no single announced agent is refused.
 #[test]
-fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
+fn peer_ref_accepts_hex_and_forward_targets_pin_machines() {
     let hex_id = "ab".repeat(32);
     assert_eq!(
         PeerRef::parse(&hex_id).unwrap(),
@@ -144,18 +146,13 @@ fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
         PeerRef::parse(&"AB".repeat(32)).unwrap(),
         PeerRef::Hex(AgentId([0xab; 32]))
     );
-    assert!(matches!(
-        PeerRef::parse_forward_peer("agent:studio.me").unwrap(),
-        PeerRef::Name(_)
-    ));
-    assert!(matches!(
-        PeerRef::parse_forward_peer("studio.me").unwrap(),
-        PeerRef::Name(_)
-    ));
-    let err = PeerRef::parse_forward_peer("machine:studio.me").unwrap_err();
-    assert_eq!(err.code(), "machine_target_unsupported", "{err}");
-    // A bare label that resolves to a machine is refused the same way.
-    let resolved = Resolved {
+    for raw in ["agent:studio.me", "studio.me", "machine:studio.me"] {
+        assert!(
+            matches!(PeerRef::parse(raw).unwrap(), PeerRef::Name(_)),
+            "{raw}"
+        );
+    }
+    let machine = Resolved {
         name: "machine:studio.me".into(),
         kind: NameKind::Machine,
         owner: UserId([1; 32]),
@@ -163,8 +160,27 @@ fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
         machine_id: Some(MachineId([3; 32])),
         newly_pinned: false,
     };
-    let err = require_agent_target(&resolved, &name("studio.me")).unwrap_err();
-    assert_eq!(err.code(), "machine_target_unsupported");
+    assert_eq!(
+        forward_target(&machine, &name("studio.me")).unwrap(),
+        (AgentId([2; 32]), Some(MachineId([3; 32]))),
+        "a machine target pins its machine"
+    );
+    let agent = Resolved {
+        kind: NameKind::Agent,
+        machine_id: None,
+        name: "agent:studio.me".into(),
+        ..machine.clone()
+    };
+    assert_eq!(
+        forward_target(&agent, &name("studio.me")).unwrap(),
+        (AgentId([2; 32]), None)
+    );
+    let no_agent = Resolved {
+        agent_id: None,
+        ..machine
+    };
+    let err = forward_target(&no_agent, &name("machine:studio.me")).unwrap_err();
+    assert_eq!(err.code(), "unknown_name", "{err}");
 }
 
 #[test]

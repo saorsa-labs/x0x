@@ -1772,7 +1772,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward add",
         description: "Add a local port forward to a peer's loopback service",
         category: "connect",
-        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port"), RequestField::body_as("ephemeral", false, "--ephemeral")]),
     },
     EndpointDef {
         method: Method::Get,

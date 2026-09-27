@@ -2658,25 +2658,54 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service |
-| GET | `/forwards` | `x0x forward list` | List registered forwards |
-| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed counter + connect-ACL snapshot |
+| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`) |
+| GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record |
+| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed and machine-mismatch counters + connect-ACL snapshot |
 
 ### `POST /forwards` request body
 
 ```json
 {
   "local_addr": "127.0.0.1:8022",
-  "peer_agent": "<peer agent id hex>",
+  "peer_agent": "<peer agent id hex, or a name>",
   "target_host": "127.0.0.1",
-  "target_port": 22
+  "target_port": 22,
+  "ephemeral": false
 }
 ```
 
 `local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
-`peer_agent` also accepts an agent name (`studio.me`, `agent:studio.bob`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. The response then carries the canonical `name`. A `machine:` name, or a bare label that resolves to a machine, is refused with `400` `machine_target_unsupported`. This lasts until forwards check that the stream reaches the pinned `MachineId` (ADR-0074 slice 2). Name errors use the codes listed under Names.
+`peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
+
+**Machine binding (ADR-0074 §1).** A forward with a pinned machine (every machine-name forward and every persistent forward) checks, on every stream, that the stream reached that `MachineId` before any forward-header byte is sent. On a mismatch (the agent moved, or discovery changed) the stream is reset with zero header bytes, the local TCP connection closes, and `GET /streams` `machine_mismatch` counts it.
+
+**Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards.
+
+At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Forwards that are down are retried every 10 s, so a peer that is discovered after startup comes back without user action; startup never waits for them. An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept but nothing is restored. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
+
+`GET /forwards` returns:
+
+```json
+{
+  "forwards": [
+    {
+      "local_addr": "127.0.0.1:8022",
+      "peer_agent": "<hex>",
+      "target_host": "::1",
+      "target_port": 22,
+      "name": "machine:box.me",
+      "kind": "machine",
+      "pinned_machine_id": "<hex>",
+      "persistent": true,
+      "enabled": true,
+      "error": null
+    }
+  ],
+  "store_error": null
+}
+```
 
 ## Names (ADR-0074)
 
@@ -2725,8 +2754,7 @@ Refusals are `{"ok": false, "error", "code"}`:
 |---|---|---|
 | `invalid_name` | 400 | Outside the grammar |
 | `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
-| `machine_target_unsupported` | 400 | A machine name where only agents are accepted (`POST /forwards`) |
-| `unknown_name` | 404 | Unbound owner label, or nothing carries the name |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
 | `ambiguous_kind` | 409 | A bare label names both an agent and a machine. Retry with `agent:` or `machine:` |

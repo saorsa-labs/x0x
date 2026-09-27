@@ -51,9 +51,7 @@ fn parse_id32(field: &str, raw: &str) -> Result<[u8; 32], NameError> {
 /// HTTP status for a refused name.
 pub(in crate::server) fn name_error_status(err: &NameError) -> StatusCode {
     match err {
-        NameError::Invalid(_) | NameError::Reserved(_) | NameError::MachineTargetUnsupported(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        NameError::Invalid(_) | NameError::Reserved(_) => StatusCode::BAD_REQUEST,
         NameError::UnknownName(_) => StatusCode::NOT_FOUND,
         NameError::UnverifiedOwner(_) => StatusCode::UNPROCESSABLE_ENTITY,
         NameError::AmbiguousName { .. }

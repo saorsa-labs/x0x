@@ -21,14 +21,38 @@ use std::sync::Arc;
 pub(in crate::server) struct ForwardAddRequest {
     /// Local bind, e.g. `127.0.0.1:8022`.
     local_addr: String,
-    /// Peer agent: hex agent id, or an ADR-0074 agent name
-    /// (`[agent:]<label>.<owner>`). `machine:` names are refused until the
-    /// pinned-MachineId stream check (slice 2) lands.
+    /// Peer: hex agent id, or an ADR-0074 name (`[agent:|machine:]<label>.<owner>`).
+    /// A machine name pins the `MachineId` every stream must reach.
     peer_agent: String,
     /// Loopback target host on the peer (numeric IP).
     target_host: String,
     /// Loopback target port.
     target_port: u16,
+    /// ADR-0074 §2 (Q3): forwards persist in `forwards.json` by default;
+    /// `true` keeps this one in memory only.
+    #[serde(default)]
+    ephemeral: bool,
+}
+
+fn forward_error(status: StatusCode, code: &str, error: String) -> axum::response::Response {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": error, "code": code })),
+    )
+        .into_response()
+}
+
+fn store_error_response(e: &x0x::forward::store::ForwardStoreError) -> axum::response::Response {
+    use x0x::forward::store::ForwardStoreError;
+    let (status, code) = match e {
+        ForwardStoreError::Unusable(_) | ForwardStoreError::Write(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "forward_store")
+        }
+        ForwardStoreError::Full => (StatusCode::CONFLICT, "forward_store_full"),
+        ForwardStoreError::Unpinned(_) => (StatusCode::CONFLICT, "machine_unknown"),
+        ForwardStoreError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_forward"),
+    };
+    forward_error(status, code, e.to_string())
 }
 
 pub(in crate::server) async fn forward_add(
@@ -36,11 +60,9 @@ pub(in crate::server) async fn forward_add(
     Json(req): Json<ForwardAddRequest>,
 ) -> impl IntoResponse {
     use x0x::forward::ForwardSpec;
-    use x0x::identity::AgentId;
-    use x0x::names::PeerRef;
-    // Syntax first, before any state is consulted: a malformed peer or a
-    // `machine:` name (fail closed until slice 2) is refused outright.
-    let peer = match PeerRef::parse_forward_peer(&req.peer_agent) {
+    use x0x::names::{NameKind, PeerRef};
+    // Syntax first, before any state is consulted.
+    let peer = match PeerRef::parse(&req.peer_agent) {
         Ok(peer) => peer,
         Err(e) => return super::names::name_error(&e),
     };
@@ -64,72 +86,115 @@ pub(in crate::server) async fn forward_add(
         )
         .into_response();
     }
-    // ADR-0074 §1: a name resolves locally (pinned at first use) to an
-    // agent id. Resolution adds no trust: the stream below still passes the
-    // identity gate and the peer's connect ACL.
-    let (peer_agent_bytes, name) = match peer {
-        PeerRef::Hex(id) => (id, None),
+    // ADR-0074 §1: a name resolves locally (pinned at first use). An agent
+    // name gives the agent; a machine name gives the agent its daemon
+    // announces AND the MachineId every stream must reach. Resolution adds
+    // no trust: the stream still passes the identity gate and the peer's
+    // connect ACL.
+    let (peer_agent, name, kind, machine_pin) = match peer {
+        PeerRef::Hex(id) => (id, None, NameKind::Agent, None),
         PeerRef::Name(name) => {
             let resolved = match super::names::resolve(&state, &name).await {
                 Ok(resolved) => resolved,
                 Err(e) => return super::names::name_error(&e),
             };
-            match x0x::names::require_agent_target(&resolved, &name) {
-                Ok(agent) => (agent, Some(resolved.name)),
+            match x0x::names::forward_target(&resolved, &name) {
+                Ok((agent, machine)) => (agent, Some(resolved.name), resolved.kind, machine),
                 Err(e) => return super::names::name_error(&e),
             }
         }
     };
+    // ADR-0074 §1/§2: a persisted forward is pinned to a machine. For an
+    // agent target that is the machine the agent is bound to now (the one
+    // its streams would open to); an ephemeral agent forward stays
+    // unpinned, as before.
+    let pinned_machine = match machine_pin {
+        Some(machine) => Some(machine),
+        None if !req.ephemeral => state
+            .agent
+            .cached_agent(&peer_agent)
+            .await
+            .map(|d| d.machine_id),
+        None => None,
+    };
     let spec = ForwardSpec {
         local_addr,
-        peer_agent: peer_agent_bytes,
+        peer_agent,
         target_host: req.target_host,
         target_port: req.target_port,
+        name: name.clone(),
+        kind,
+        pinned_machine,
+        persistent: !req.ephemeral,
     };
-    let peer_agent: AgentId = spec.peer_agent;
-    match forwarder.add_forward(spec).await {
-        Ok(bound) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "local_addr": bound.to_string(),
-                "peer_agent": hex::encode(peer_agent.as_bytes()),
-                "name": name,
-            })),
-        )
-            .into_response(),
-        Err(e) => api_error(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    // Refuse a persistent forward the store cannot take BEFORE binding.
+    if let Err(e) = state.forwards.check(&spec) {
+        return store_error_response(&e);
     }
+    let bound = match forwarder.add_forward(spec.clone()).await {
+        Ok(bound) => bound,
+        Err(e) => return api_error(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let mut registered = spec;
+    registered.local_addr = bound;
+    if let Err(e) = state.forwards.remember(&registered).await {
+        // Not durable: do not leave a forward running that the caller was
+        // told failed.
+        forwarder.remove_forward(bound);
+        return store_error_response(&e);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "local_addr": bound.to_string(),
+            "peer_agent": hex::encode(peer_agent.as_bytes()),
+            "name": name,
+            "kind": kind.as_str(),
+            "pinned_machine_id": pinned_machine.map(|m| hex::encode(m.as_bytes())),
+            "persistent": registered.persistent,
+        })),
+    )
+        .into_response()
 }
 
-/// GET /forwards — list registered forwards.
+fn forward_json(status: &x0x::forward::ForwardStatus) -> serde_json::Value {
+    let s = &status.spec;
+    serde_json::json!({
+        "local_addr": s.local_addr.to_string(),
+        "peer_agent": s.peer_agent_hex(),
+        "target_host": s.target_host,
+        "target_port": s.target_port,
+        "name": s.name,
+        "kind": s.kind.as_str(),
+        "pinned_machine_id": s.pinned_machine.map(|m| hex::encode(m.as_bytes())),
+        "persistent": s.persistent,
+        "enabled": status.error.is_none(),
+        "error": status.error,
+    })
+}
+
+/// GET /forwards — list registered forwards, including restored forwards
+/// that are down (`enabled: false` with an `error`).
 pub(in crate::server) async fn forward_list(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let forwards: Vec<serde_json::Value> = state
         .forward_service
         .as_ref()
-        .map(|f| {
-            f.list_forwards()
-                .into_iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "local_addr": s.local_addr.to_string(),
-                        "peer_agent": s.peer_agent_hex(),
-                        "target_host": s.target_host,
-                        "target_port": s.target_port,
-                    })
-                })
-                .collect()
-        })
+        .map(|f| f.list_forwards().iter().map(forward_json).collect())
         .unwrap_or_default();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "forwards": forwards })),
+        Json(serde_json::json!({
+            "forwards": forwards,
+            "store_error": state.forwards.load_error(),
+        })),
     )
 }
 
-/// DELETE /forwards/:local_addr — tear down a forward by its local bind addr.
+/// DELETE /forwards/:local_addr — tear down a forward by its local bind
+/// addr and delete its persisted record.
 pub(in crate::server) async fn forward_remove(
     State(state): State<Arc<AppState>>,
     Path(local_addr): Path<String>,
@@ -146,7 +211,29 @@ pub(in crate::server) async fn forward_remove(
             Json(serde_json::json!({ "ok": false, "removed": false })),
         );
     };
-    let removed = forwarder.remove_forward(addr);
+    // Forget the durable record first, so a deleted forward never comes
+    // back at the next start. A store failure leaves the running forward
+    // in place and reports it.
+    let persistent = forwarder.forward_at(addr).is_none_or(|s| s.persistent);
+    let forgotten = if persistent {
+        match state.forwards.forget(addr).await {
+            Ok(forgotten) => forgotten,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "removed": false,
+                        "error": e.to_string(),
+                        "code": "forward_store",
+                    })),
+                );
+            }
+        }
+    } else {
+        false
+    };
+    let removed = forwarder.remove_forward(addr) || forgotten;
     let status = if removed {
         StatusCode::OK
     } else {
@@ -158,25 +245,106 @@ pub(in crate::server) async fn forward_remove(
     )
 }
 
+/// How often restored forwards that are down are re-resolved and re-bound.
+pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
+
+/// Bring one persisted forward up, or register it as down with the reason
+/// (ADR-0074 §2). Its name is re-resolved through the name store, where the
+/// pin applies; it only comes up on exactly its pinned ids.
+async fn restore_one(
+    state: &AppState,
+    forwarder: &x0x::forward::ForwardService,
+    record: &x0x::forward::store::ForwardRecord,
+) -> bool {
+    let resolution = match &record.name {
+        None => None,
+        Some(raw) => Some(match x0x::names::NameRef::parse(raw) {
+            Ok(name) => super::names::resolve(state, &name).await,
+            Err(e) => Err(e),
+        }),
+    };
+    let spec = match x0x::forward::store::restore_decision(record, resolution) {
+        Ok(spec) => spec,
+        Err(reason) => {
+            tracing::warn!(
+                target: "x0x::forward",
+                forward = %record.id,
+                %reason,
+                "persisted forward stays down"
+            );
+            forwarder.add_disabled(record.to_spec(), reason);
+            return false;
+        }
+    };
+    match forwarder.add_forward(spec.clone()).await {
+        Ok(_) => true,
+        Err(e) => {
+            let reason = format!("bind_failed: {e}");
+            tracing::warn!(
+                target: "x0x::forward",
+                forward = %record.id,
+                %reason,
+                "persisted forward stays down"
+            );
+            forwarder.add_disabled(spec, reason);
+            false
+        }
+    }
+}
+
+/// Restore every persisted forward that is not already listening. Returns
+/// how many are still down. Never fails: a corrupt store restores nothing
+/// (and is reported by `GET /forwards`), a bad record stays down.
+pub(in crate::server) async fn restore_forwards(state: &AppState) -> usize {
+    let Some(forwarder) = state.forward_service.as_ref() else {
+        return 0;
+    };
+    let records = match state.forwards.records().await {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(target: "x0x::forward", "persisted forwards not restored: {e}");
+            return 0;
+        }
+    };
+    let listening: std::collections::BTreeSet<SocketAddr> = forwarder
+        .list_forwards()
+        .iter()
+        .filter(|f| f.error.is_none())
+        .map(|f| f.spec.local_addr)
+        .collect();
+    let mut down = 0;
+    for record in records {
+        if listening.contains(&record.local_addr) {
+            continue;
+        }
+        if !restore_one(state, forwarder, &record).await {
+            down += 1;
+        }
+    }
+    down
+}
+
 /// GET /streams — active forward-stream count + connect-ACL counters.
 pub(in crate::server) async fn streams_diagnostics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let (active, connect_failed) = state
+    let (active, connect_failed, machine_mismatch) = state
         .forward_service
         .as_ref()
         .map(|f| {
             (
                 f.diagnostics().active_streams(),
                 f.diagnostics().connect_failed(),
+                f.diagnostics().machine_mismatch(),
             )
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0));
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "active_streams": active,
             "connect_failed": connect_failed,
+            "machine_mismatch": machine_mismatch,
             "connect": state.connect_diagnostics.snapshot(),
         })),
     )

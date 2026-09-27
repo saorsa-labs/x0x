@@ -117,9 +117,6 @@ pub enum NameError {
         /// The id it resolves to now (hex).
         current: String,
     },
-    /// A machine name was given where only agent targets are accepted.
-    #[error("machine names are not accepted here: {0}")]
-    MachineTargetUnsupported(String),
     /// The store could not be read or written (fail closed).
     #[error("name store: {0}")]
     Store(String),
@@ -137,7 +134,6 @@ impl NameError {
             Self::AmbiguousName { .. } => "ambiguous_name",
             Self::AmbiguousKind(_) => "ambiguous_kind",
             Self::PinMismatch { .. } => "pin_mismatch",
-            Self::MachineTargetUnsupported(_) => "machine_target_unsupported",
             Self::Store(_) => "name_store",
         }
     }
@@ -302,40 +298,26 @@ impl PeerRef {
         }
         NameRef::parse(raw).map(Self::Name)
     }
-
-    /// Parse a forward peer: hex or an agent name. A `machine:` name is
-    /// refused until forwards check that the stream reaches the pinned
-    /// `MachineId` (ADR-0074 §1 machine binding, slice 2).
-    ///
-    /// # Errors
-    /// Any parse error, or [`NameError::MachineTargetUnsupported`].
-    pub fn parse_forward_peer(raw: &str) -> Result<Self, NameError> {
-        let peer = Self::parse(raw)?;
-        if let Self::Name(name) = &peer {
-            if name.kind == Some(NameKind::Machine) {
-                return Err(machine_forward_refusal(name));
-            }
-        }
-        Ok(peer)
-    }
 }
 
-fn machine_forward_refusal(name: &NameRef) -> NameError {
-    NameError::MachineTargetUnsupported(format!(
-        "{name}: forwards to machine names need the pinned-MachineId stream check \
-         (ADR-0074 slice 2); use an agent name or hex agent id"
-    ))
-}
-
-/// Refuse a resolution that landed on a machine where only agents are
-/// accepted (forwards, until slice 2); otherwise return the agent.
+/// Where a forward to a resolved name goes: the agent its streams open to,
+/// and — for a machine name — the `MachineId` every stream must reach
+/// (ADR-0074 §1 machine binding; the forwarder checks `PeerStream::peer()`
+/// against it before any forward-header byte is sent).
 ///
 /// # Errors
-/// [`NameError::MachineTargetUnsupported`] for a machine target.
-pub fn require_agent_target(resolved: &Resolved, name: &NameRef) -> Result<AgentId, NameError> {
-    match (resolved.kind, resolved.agent_id) {
-        (NameKind::Agent, Some(agent)) => Ok(agent),
-        _ => Err(machine_forward_refusal(name)),
+/// [`NameError::UnknownName`] when a machine name has no single agent that
+/// its daemon announces (nothing to open a stream to).
+pub fn forward_target(
+    resolved: &Resolved,
+    name: &NameRef,
+) -> Result<(AgentId, Option<MachineId>), NameError> {
+    match (resolved.kind, resolved.agent_id, resolved.machine_id) {
+        (NameKind::Agent, Some(agent), _) => Ok((agent, None)),
+        (NameKind::Machine, Some(agent), Some(machine)) => Ok((agent, Some(machine))),
+        _ => Err(NameError::UnknownName(format!(
+            "{name}: no single agent is announced on that machine"
+        ))),
     }
 }
 

@@ -1,7 +1,7 @@
 //! Route tests for ADR-0074 §1 names: every `/names` route is wired and
 //! answers its contract, resolution pins and survives a daemon restart, a
-//! signed card binds an owner petname once, and `POST /forwards` refuses a
-//! `machine:` name (fail closed until slice 2).
+//! signed card binds an owner petname once, and `POST /forwards` accepts a
+//! `machine:` name (slice 2: the forwarder checks the pinned machine).
 
 use super::*;
 use axum::body::to_bytes;
@@ -227,11 +227,15 @@ async fn resolve_pins_own_agent_and_the_pin_survives_restart() -> anyhow::Result
     Ok(())
 }
 
-/// WHY: fail closed until slice 2 — `forward add` must refuse a `machine:`
-/// name (400, before any other check), while hex still reaches the normal
-/// path (409 here: connect is disabled in the test daemon).
+/// WHY (slice 2 lifts slice 1's interim refusal): `forward add` now
+/// accepts a `machine:` name — allowed ONLY because the forwarder checks
+/// that every stream reaches the pinned MachineId (see
+/// `forward::tests::machine_name_forward_to_the_wrong_machine_is_refused_at_the_peer_check`).
+/// It passes the syntax check and reaches the forwarder (409 here: connect
+/// is disabled in the test daemon) instead of the old 400. Malformed peers
+/// are still refused first.
 #[tokio::test]
-async fn forward_add_refuses_machine_names() -> anyhow::Result<()> {
+async fn forward_add_accepts_machine_names() -> anyhow::Result<()> {
     let (state, _dir) =
         crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
     let app = names_router(Arc::clone(&state));
@@ -243,23 +247,21 @@ async fn forward_add_refuses_machine_names() -> anyhow::Result<()> {
             "target_port": 22,
         })
     };
-    let (status, json) = send(&app, "POST", "/forwards", body("machine:studio.me")).await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-    assert_eq!(json["code"], "machine_target_unsupported", "{json}");
+    for peer in [
+        "machine:studio.me".to_string(),
+        "agent:studio.me".to_string(),
+        "ab".repeat(32),
+    ] {
+        let (status, json) = send(&app, "POST", "/forwards", body(&peer)).await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{peer} reaches the forwarder: {json}"
+        );
+    }
     let (status, json) = send(&app, "POST", "/forwards", body("Not A Name")).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-    let (status, json) = send(&app, "POST", "/forwards", body(&"ab".repeat(32))).await?;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "hex reaches the forwarder: {json}"
-    );
-    let (status, json) = send(&app, "POST", "/forwards", body("agent:studio.me")).await?;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "agent names are accepted: {json}"
-    );
+    assert_eq!(json["code"], "invalid_name", "{json}");
     Ok(())
 }
 

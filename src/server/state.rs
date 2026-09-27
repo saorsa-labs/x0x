@@ -1221,6 +1221,10 @@ pub(super) struct AppState {
     /// (`<data_dir>/names.json`). An unreadable file refuses every name
     /// operation (fail closed); hex ids keep working.
     pub(super) names: Arc<x0x::names::NameStore>,
+    /// ADR-0074 §2 persistent forwards (`<data_dir>/forwards.json`),
+    /// restored at start. An unreadable file restores nothing and refuses
+    /// persistent adds (fail closed); `--ephemeral` forwards still work.
+    pub(super) forwards: Arc<x0x::forward::store::ForwardStore>,
     /// Per-instance fault-injection cell for `save_named_groups_checked_unlocked`.
     /// Each test that calls `set_save_fault` arms and RAII-clears this; because it
     /// lives on the `AppState` rather than in a process-global static, parallel

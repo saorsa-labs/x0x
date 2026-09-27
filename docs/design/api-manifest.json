@@ -3206,6 +3206,12 @@
             "in": "body",
             "name": "target_port",
             "required": true
+          },
+          {
+            "cli": "--ephemeral",
+            "in": "body",
+            "name": "ephemeral",
+            "required": false
           }
         ],
         "kind": "fields"

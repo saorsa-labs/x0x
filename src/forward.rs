@@ -26,6 +26,14 @@
 //!   back to the opener and a `record_denied` counter; zero bytes reach the
 //!   target.
 //!
+//! ## Machine binding and persistence (ADR-0074 §1, §2)
+//!
+//! A forward may pin the `MachineId` its streams must reach (every
+//! machine-name forward and every persisted forward). The outbound side
+//! checks `PeerStream::peer()` against the pin before writing any header
+//! byte; a mismatch resets the stream and counts `machine_mismatch`, and
+//! never falls back to V1. Persisted forwards live in [`crate::forward::store`].
+//!
 //! ## Loopback-only (Phase 1)
 //!
 //! Targets are numeric loopback IPs only (`127.0.0.0/8`, `::1`). A hostname
@@ -55,6 +63,8 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, AgentKeypair, MachineId};
 use crate::streams::{PeerStream, StreamProtocol};
 use crate::trust::TrustDecision;
+
+pub mod store;
 
 // Import the ant-quic stream halves under stable names for the bridge helper,
 // plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
@@ -729,6 +739,9 @@ pub struct ForwardDiagnostics {
     /// Streams reset because the forward header did not arrive within
     /// `HEADER_READ_TIMEOUT` (FIX 2).
     header_timeout: AtomicU64,
+    /// Outbound streams reset before any header byte because they reached a
+    /// different machine than the forward's pinned `MachineId` (ADR-0074 §1).
+    machine_mismatch: AtomicU64,
 }
 
 impl ForwardDiagnostics {
@@ -755,6 +768,16 @@ impl ForwardDiagnostics {
     /// Record a header-read timeout (FIX 2).
     pub fn record_header_timeout(&self) {
         self.header_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record an outbound stream refused at the machine-binding check
+    /// (ADR-0074 §1).
+    pub fn record_machine_mismatch(&self) {
+        self.machine_mismatch.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Outbound streams refused because they reached an unpinned machine.
+    #[must_use]
+    pub fn machine_mismatch(&self) -> u64 {
+        self.machine_mismatch.load(Ordering::Relaxed)
     }
     /// Current connect-failure count.
     #[must_use]
@@ -1095,18 +1118,6 @@ async fn read_header<R: tokio::io::AsyncRead + Unpin>(
     bincode::deserialize(&body).map_err(|e| ForwardError::Decode(e.to_string()))
 }
 
-/// Write a length-prefixed `ForwardHeader` to an async writer.
-async fn write_header<W: tokio::io::AsyncWrite + Unpin>(
-    w: &mut W,
-    header: &ForwardHeader,
-) -> Result<(), NetworkError> {
-    use tokio::io::AsyncWriteExt;
-    let frame = header.encode();
-    w.write_all(&frame)
-        .await
-        .map_err(|e| NetworkError::StreamError(format!("write forward header: {e}")))
-}
-
 /// Read a length-prefixed `ForwardV2Header` from an async reader.
 async fn read_header_v2<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
@@ -1127,7 +1138,9 @@ async fn read_header_v2<R: tokio::io::AsyncRead + Unpin>(
     bincode::deserialize(&body).map_err(|e| ForwardError::Decode(e.to_string()))
 }
 
-/// Write a length-prefixed `ForwardV2Header` to an async writer.
+/// Write a length-prefixed `ForwardV2Header` to an async writer (tests;
+/// production writes go through [`send_header_to_pinned`]).
+#[cfg(test)]
 async fn write_header_v2<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     header: &ForwardV2Header,
@@ -1177,7 +1190,7 @@ impl ForwardConfig {
 // ===========================================================================
 
 /// A registered local forward (`forward add`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardSpec {
     /// Local loopback address the daemon binds (`127.0.0.1:PORT`).
     pub local_addr: SocketAddr,
@@ -1187,6 +1200,19 @@ pub struct ForwardSpec {
     pub target_host: String,
     /// Loopback target port.
     pub target_port: u16,
+    /// The canonical ADR-0074 name the forward was added by
+    /// (`agent:studio.me`, `machine:box.bob`), or `None` for a hex peer.
+    pub name: Option<String>,
+    /// Whether the target is an agent or a machine (ADR-0074 §2 `kind`).
+    pub kind: crate::names::NameKind,
+    /// ADR-0074 §1 machine binding: when set, every stream this forward
+    /// opens must reach this `MachineId` (`PeerStream::peer()`), checked
+    /// before any forward-header byte is sent; a mismatch resets the
+    /// stream and counts `machine_mismatch`.
+    pub pinned_machine: Option<MachineId>,
+    /// Persisted in `forwards.json` (ADR-0074 §2); `false` for
+    /// `--ephemeral` forwards.
+    pub persistent: bool,
 }
 
 impl ForwardSpec {
@@ -1197,10 +1223,30 @@ impl ForwardSpec {
     }
 }
 
-/// A registered forward + its cancellation token (internal).
+/// One registered forward as `GET /forwards` reports it: its spec, and the
+/// reason it is down when it is not listening (a restored forward whose
+/// name no longer resolves to its pinned ids, or whose port is busy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardStatus {
+    /// The forward.
+    pub spec: ForwardSpec,
+    /// `None` while listening; otherwise why the forward is down.
+    pub error: Option<String>,
+}
+
+/// Whether a registered forward is listening (internal).
+enum EntryState {
+    /// Listening; cancelling the token stops the listener.
+    Active(CancellationToken),
+    /// Registered but down, with the reason (ADR-0074 §2: a restored
+    /// forward that could not be re-resolved or re-bound).
+    Disabled(String),
+}
+
+/// A registered forward + its state (internal).
 struct ForwardEntry {
     spec: ForwardSpec,
-    cancel: CancellationToken,
+    state: EntryState,
 }
 
 /// Owns the inbound forward consumers + the outbound local listeners.
@@ -1499,9 +1545,14 @@ impl ForwardService {
         let mut registered_spec = spec.clone();
         registered_spec.local_addr = bound;
         if let Ok(mut forwards) = self.forwards.lock() {
+            // A disabled entry for this address (a restored forward now
+            // coming up) is replaced by the listening one.
+            forwards.retain(|e| {
+                !(e.spec.local_addr == bound && matches!(e.state, EntryState::Disabled(_)))
+            });
             forwards.push(ForwardEntry {
                 spec: registered_spec,
-                cancel: cancel.clone(),
+                state: EntryState::Active(cancel.clone()),
             });
         }
 
@@ -1510,8 +1561,12 @@ impl ForwardService {
         let outbound_permits = Arc::clone(&self.outbound_permits);
         let per_peer = Arc::clone(&self.per_peer);
         let peer_agent = spec.peer_agent;
-        let target_host = spec.target_host;
-        let target_port = spec.target_port;
+        let target = OutboundTarget {
+            peer_agent,
+            pinned_machine: spec.pinned_machine,
+            target_host: spec.target_host,
+            target_port: spec.target_port,
+        };
         let require_attestation = self.require_attestation;
         tokio::spawn(async move {
             tracing::info!(
@@ -1553,33 +1608,65 @@ impl ForwardService {
                 };
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
-                let target_host = target_host.clone();
+                let target = target.clone();
                 tokio::spawn(async move {
                     let _admission = admission;
                     fwd_diag.enter_stream();
                     let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                    drive_outbound(
-                        agent,
-                        peer_agent,
-                        target_host,
-                        target_port,
-                        tcp,
-                        require_attestation,
-                    )
-                    .await;
+                    drive_outbound(agent, &target, tcp, require_attestation, &fwd_diag).await;
                 });
             }
         });
         Ok(bound)
     }
 
+    /// Register `spec` as a forward that is down for `reason` (ADR-0074 §2:
+    /// a restored forward whose name did not re-resolve to its pinned ids,
+    /// or whose port could not be bound). It is listed with its reason and
+    /// never listens; a later successful [`Self::add_forward`] for the same
+    /// address replaces it. An active forward on that address is left alone.
+    pub fn add_disabled(&self, spec: ForwardSpec, reason: String) {
+        if let Ok(mut forwards) = self.forwards.lock() {
+            if forwards.iter().any(|e| {
+                e.spec.local_addr == spec.local_addr && matches!(e.state, EntryState::Active(_))
+            }) {
+                return;
+            }
+            forwards.retain(|e| e.spec.local_addr != spec.local_addr);
+            forwards.push(ForwardEntry {
+                spec,
+                state: EntryState::Disabled(reason),
+            });
+        }
+    }
+
     /// Snapshot of registered forwards (for `GET /forwards` / `x0x forward list`).
     #[must_use]
-    pub fn list_forwards(&self) -> Vec<ForwardSpec> {
+    pub fn list_forwards(&self) -> Vec<ForwardStatus> {
         self.forwards
             .lock()
-            .map(|f| f.iter().map(|e| e.spec.clone()).collect())
+            .map(|f| {
+                f.iter()
+                    .map(|e| ForwardStatus {
+                        spec: e.spec.clone(),
+                        error: match &e.state {
+                            EntryState::Active(_) => None,
+                            EntryState::Disabled(reason) => Some(reason.clone()),
+                        },
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// The registered forward bound to `local_addr`, if any.
+    #[must_use]
+    pub fn forward_at(&self, local_addr: SocketAddr) -> Option<ForwardSpec> {
+        self.forwards.lock().ok().and_then(|f| {
+            f.iter()
+                .find(|e| e.spec.local_addr == local_addr)
+                .map(|e| e.spec.clone())
+        })
     }
 
     /// Remove a forward by its bound local address. Cancels the listener.
@@ -1591,7 +1678,9 @@ impl ForwardService {
                 .iter()
                 .position(|e| e.spec.local_addr == local_addr)
             {
-                forwards[pos].cancel.cancel();
+                if let EntryState::Active(cancel) = &forwards[pos].state {
+                    cancel.cancel();
+                }
                 forwards.remove(pos);
                 removed = true;
             }
@@ -1604,10 +1693,85 @@ impl ForwardService {
         self.inbound_token.cancel();
         if let Ok(forwards) = self.forwards.lock() {
             for entry in forwards.iter() {
-                entry.cancel.cancel();
+                if let EntryState::Active(cancel) = &entry.state {
+                    cancel.cancel();
+                }
             }
         }
     }
+}
+
+/// Where one outbound forward stream goes (internal).
+#[derive(Clone)]
+struct OutboundTarget {
+    peer_agent: AgentId,
+    /// ADR-0074 §1: the machine every stream must reach, if pinned.
+    pinned_machine: Option<MachineId>,
+    target_host: String,
+    target_port: u16,
+}
+
+/// Result of [`send_header_to_pinned`].
+#[derive(Debug)]
+enum HeaderSend {
+    /// The stream reaches the pinned machine (or nothing is pinned) and the
+    /// whole header frame was written.
+    Sent,
+    /// The stream reaches a different machine than the pinned one. Nothing
+    /// was written.
+    MachineMismatch {
+        pinned: MachineId,
+        actual: MachineId,
+    },
+    /// The write itself failed.
+    Failed,
+}
+
+/// ADR-0074 §1 machine binding: write the forward-header `frame` only when
+/// the stream's transport-authenticated peer (`PeerStream::peer()`) is the
+/// pinned machine. On a mismatch not one byte of the header is written, so
+/// the peer never learns the target.
+async fn send_header_to_pinned<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    peer: MachineId,
+    pinned: Option<MachineId>,
+    frame: &[u8],
+) -> HeaderSend {
+    use tokio::io::AsyncWriteExt;
+    if let Some(pinned) = pinned {
+        if pinned != peer {
+            return HeaderSend::MachineMismatch {
+                pinned,
+                actual: peer,
+            };
+        }
+    }
+    match w.write_all(frame).await {
+        Ok(()) => HeaderSend::Sent,
+        Err(e) => {
+            tracing::debug!(target: "x0x::forward", error = %e, "write forward header failed");
+            HeaderSend::Failed
+        }
+    }
+}
+
+/// Reset a stream refused at the machine-binding check and count it.
+fn refuse_machine_mismatch(
+    mut stream: PeerStream,
+    pinned: MachineId,
+    actual: MachineId,
+    fwd_diag: &ForwardDiagnostics,
+) {
+    fwd_diag.record_machine_mismatch();
+    // Reset (not finish): the peer sees an aborted stream with zero header
+    // bytes. A reset on an already-closed stream is harmless.
+    let _ = stream.send_mut().reset(ant_quic::VarInt::from_u32(0));
+    tracing::warn!(
+        target: "x0x::forward",
+        pinned = %hex::encode(pinned.as_bytes()),
+        actual = %hex::encode(actual.as_bytes()),
+        "outbound forward refused: stream reached a different machine than pinned (machine_mismatch)"
+    );
 }
 
 /// Outbound driver: open the peer stream, write the header, read the peer's
@@ -1619,17 +1783,18 @@ impl ForwardService {
 /// falls back to `ForwardV1` so mixed-fleet upgrades degrade gracefully.
 async fn drive_outbound(
     agent: Arc<crate::Agent>,
-    peer_agent: AgentId,
-    target_host: String,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
     require_attestation: bool,
+    fwd_diag: &ForwardDiagnostics,
 ) {
+    let peer_agent = target.peer_agent;
     // Try ForwardV2 (attestation). On peer rejection (old software), fall
     // back to ForwardV1 — but ONLY when require_attestation is false. When
     // true (the default) there is no fallback: a peer that cannot handle V2
-    // simply cannot forward (#204 must-fix 1).
-    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp).await {
+    // simply cannot forward (#204 must-fix 1). A machine-binding refusal is
+    // `Done`, never a fallback.
+    match try_outbound_v2(&agent, target, tcp, fwd_diag).await {
         OutboundOutcome::Done => (),
         OutboundOutcome::PeerRejectedV2(tcp) => {
             if require_attestation {
@@ -1644,7 +1809,7 @@ async fn drive_outbound(
                     peer = %hex::encode(peer_agent.as_bytes()),
                     "outbound forward: peer does not support ForwardV2 — falling back to V1"
                 );
-                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+                drive_outbound_v1(&agent, target, tcp, fwd_diag).await;
             }
         }
     }
@@ -1664,11 +1829,13 @@ enum OutboundOutcome {
 /// byte (the write to the opened stream fails immediately).
 async fn try_outbound_v2(
     agent: &Arc<crate::Agent>,
-    peer_agent: &AgentId,
-    target_host: &str,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
+    fwd_diag: &ForwardDiagnostics,
 ) -> OutboundOutcome {
+    let peer_agent = &target.peer_agent;
+    let target_host = target.target_host.as_str();
+    let target_port = target.target_port;
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
         .await
@@ -1721,10 +1888,24 @@ async fn try_outbound_v2(
         );
         return OutboundOutcome::PeerRejectedV2(tcp);
     }
-    // Write the V2 header. If this fails the peer likely reset the stream
-    // after reading the unknown V2 protocol byte (old software) — fall back.
-    if write_header_v2(stream.send_mut(), &header).await.is_err() {
-        return OutboundOutcome::PeerRejectedV2(tcp);
+    // Write the V2 header — only to the pinned machine (ADR-0074 §1). If
+    // the write fails the peer likely reset the stream after reading the
+    // unknown V2 protocol byte (old software) — fall back.
+    let peer = stream.peer();
+    match send_header_to_pinned(
+        stream.send_mut(),
+        peer,
+        target.pinned_machine,
+        &header.encode(),
+    )
+    .await
+    {
+        HeaderSend::Sent => {}
+        HeaderSend::MachineMismatch { pinned, actual } => {
+            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
+            return OutboundOutcome::Done;
+        }
+        HeaderSend::Failed => return OutboundOutcome::PeerRejectedV2(tcp),
     }
     // Read the peer's connect-response byte.
     let mut resp = [0u8; 1];
@@ -1739,11 +1920,11 @@ async fn try_outbound_v2(
 /// peers and as a last-resort fallback.
 async fn drive_outbound_v1(
     agent: &Arc<crate::Agent>,
-    peer_agent: &AgentId,
-    target_host: &str,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
+    fwd_diag: &ForwardDiagnostics,
 ) {
+    let peer_agent = &target.peer_agent;
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV1)
         .await
@@ -1760,11 +1941,24 @@ async fn drive_outbound_v1(
         }
     };
     let header = ForwardHeader {
-        target_host: target_host.to_string(),
-        target_port,
+        target_host: target.target_host.clone(),
+        target_port: target.target_port,
     };
-    if write_header(stream.send_mut(), &header).await.is_err() {
-        return;
+    let peer = stream.peer();
+    match send_header_to_pinned(
+        stream.send_mut(),
+        peer,
+        target.pinned_machine,
+        &header.encode(),
+    )
+    .await
+    {
+        HeaderSend::Sent => {}
+        HeaderSend::MachineMismatch { pinned, actual } => {
+            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
+            return;
+        }
+        HeaderSend::Failed => return,
     }
     let mut resp = [0u8; 1];
     if stream.recv_mut().read_exact(&mut resp).await.is_err() {
@@ -2842,6 +3036,138 @@ mod tests {
             .starts_with(FORWARD_V2_ATTESTATION_DOMAIN));
     }
 
+    // ── ADR-0074 §1 machine binding (slice 2) ─────────────────────────────
+
+    /// Everything the peer side of `w` received once the writer is gone.
+    async fn received(mut peer_side: tokio::io::DuplexStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        peer_side
+            .read_to_end(&mut got)
+            .await
+            .expect("read peer side");
+        got
+    }
+
+    fn signed_frame() -> Vec<u8> {
+        let opener = AgentKeypair::generate().expect("keypair");
+        let mut header = ForwardV2Header::new(
+            "::1".to_string(),
+            22,
+            opener.agent_id(),
+            opener.public_key().as_bytes().to_vec(),
+            MachineId([0x11; 32]),
+        );
+        header.sign(&opener).expect("sign");
+        header.encode()
+    }
+
+    /// WHY (ADR-0074 §1): a pinned forward whose stream reaches another
+    /// machine must be refused BEFORE the forward header goes out — the
+    /// header names the target service and carries the opener's signed
+    /// attestation, so a wrong machine must learn neither. Zero bytes on
+    /// the stream, for both header versions.
+    #[tokio::test]
+    async fn peer_mismatch_sends_no_header_bytes() {
+        let pinned = MachineId([0x11; 32]);
+        let actual = MachineId([0x22; 32]);
+        let v1 = ForwardHeader {
+            target_host: "127.0.0.1".to_string(),
+            target_port: 22,
+        }
+        .encode();
+        for frame in [signed_frame(), v1] {
+            let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+            let outcome =
+                send_header_to_pinned(&mut opener_side, actual, Some(pinned), &frame).await;
+            assert!(
+                matches!(
+                    outcome,
+                    HeaderSend::MachineMismatch { pinned: p, actual: a } if p == pinned && a == actual
+                ),
+                "mismatch must be refused, got {outcome:?}"
+            );
+            drop(opener_side);
+            assert!(
+                received(peer_side).await.is_empty(),
+                "no header byte may reach an unpinned machine"
+            );
+        }
+    }
+
+    /// WHY: the check must not break the forwards it protects — the right
+    /// machine, or an unpinned (ephemeral agent) forward, gets the exact
+    /// header frame.
+    #[tokio::test]
+    async fn pinned_or_unpinned_peer_receives_the_exact_header() {
+        let pinned = MachineId([0x11; 32]);
+        let frame = signed_frame();
+        for pin in [Some(pinned), None] {
+            let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+            let outcome = send_header_to_pinned(&mut opener_side, pinned, pin, &frame).await;
+            assert!(matches!(outcome, HeaderSend::Sent), "{outcome:?}");
+            drop(opener_side);
+            assert_eq!(received(peer_side).await, frame);
+        }
+    }
+
+    fn resolved_machine(agent: AgentId, machine: MachineId) -> crate::names::Resolved {
+        crate::names::Resolved {
+            name: "machine:box.me".to_string(),
+            kind: crate::names::NameKind::Machine,
+            owner: crate::identity::UserId([0x33; 32]),
+            agent_id: Some(agent),
+            machine_id: Some(machine),
+            newly_pinned: false,
+        }
+    }
+
+    /// WHY (replaces slice 1's interim refusal of `machine:` forwards):
+    /// machine names are allowed ONLY because the peer check exists. A
+    /// machine-name forward pins its machine, and a stream to the agent
+    /// that then lands on a different machine (the agent moved, or
+    /// discovery changed) is refused at the peer check with zero bytes.
+    #[tokio::test]
+    async fn machine_name_forward_to_the_wrong_machine_is_refused_at_the_peer_check() {
+        let box_machine = MachineId([0x11; 32]);
+        let elsewhere = MachineId([0x22; 32]);
+        let resolved = resolved_machine(AgentId([0x44; 32]), box_machine);
+        let name = crate::names::NameRef::parse("machine:box.me").expect("name");
+        let (agent, pinned) = crate::names::forward_target(&resolved, &name).expect("target");
+        assert_eq!(agent, AgentId([0x44; 32]));
+        assert_eq!(pinned, Some(box_machine), "a machine name must pin");
+        let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+        let outcome =
+            send_header_to_pinned(&mut opener_side, elsewhere, pinned, &signed_frame()).await;
+        assert!(
+            matches!(outcome, HeaderSend::MachineMismatch { .. }),
+            "{outcome:?}"
+        );
+        drop(opener_side);
+        assert!(received(peer_side).await.is_empty());
+        // Counted, so operators can see the refusals.
+        let diag = ForwardDiagnostics::default();
+        diag.record_machine_mismatch();
+        assert_eq!(diag.machine_mismatch(), 1);
+    }
+
+    /// WHY: the lifted restriction must actually admit the right case — a
+    /// machine-name forward whose stream reaches the pinned machine sends
+    /// its header and proceeds.
+    #[tokio::test]
+    async fn correct_machine_name_forward_is_accepted() {
+        let box_machine = MachineId([0x11; 32]);
+        let resolved = resolved_machine(AgentId([0x44; 32]), box_machine);
+        let name = crate::names::NameRef::parse("machine:box.me").expect("name");
+        let (_, pinned) = crate::names::forward_target(&resolved, &name).expect("target");
+        let frame = signed_frame();
+        let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+        let outcome = send_header_to_pinned(&mut opener_side, box_machine, pinned, &frame).await;
+        assert!(matches!(outcome, HeaderSend::Sent), "{outcome:?}");
+        drop(opener_side);
+        assert_eq!(received(peer_side).await, frame);
+    }
+
     #[test]
     fn forward_config_defaults_to_require_attestation() {
         // Must-fix 1: default config must deny V1.
@@ -2873,6 +3199,10 @@ mod tests {
             peer_agent,
             target_host: "127.0.0.1".to_string(),
             target_port: 9,
+            name: None,
+            kind: crate::names::NameKind::Agent,
+            pinned_machine: None,
+            persistent: false,
         };
 
         let first = service.add_forward(spec(peer)).await.expect("first bind");
@@ -2881,8 +3211,8 @@ mod tests {
         assert!(first.port() != 0 && second.port() != 0);
         let listed = service.list_forwards();
         assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|entry| entry.local_addr == first));
-        assert!(listed.iter().any(|entry| entry.local_addr == second));
+        assert!(listed.iter().any(|entry| entry.spec.local_addr == first));
+        assert!(listed.iter().any(|entry| entry.spec.local_addr == second));
 
         assert!(service.remove_forward(first));
         assert!(!service.remove_forward(first));

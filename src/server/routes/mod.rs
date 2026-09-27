@@ -7,7 +7,7 @@
 
 mod acl;
 pub(super) mod calls;
-mod connect;
+pub(super) mod connect;
 mod contacts;
 mod direct;
 mod discovery;
