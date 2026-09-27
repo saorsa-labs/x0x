@@ -224,17 +224,6 @@ opt-level = 3
 [profile.test.package.x0x]
 opt-level = 3
 
-# #965: the notes tests drive loro through thousands of imports/exports;
-# unoptimised loro made the ADR-0081 peer-id restart test time out in CI.
-[profile.test.package.loro-internal]
-opt-level = 3
-
-[profile.test.package.loro]
-opt-level = 3
-
-[profile.test.package.generic-btree]
-opt-level = 3
-
 [profile.release-profiling]
 inherits = "release"
 debug = "line-tables-only"
