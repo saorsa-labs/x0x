@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import subprocess
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -322,6 +324,64 @@ class KvHarnessTests(unittest.TestCase):
         self.assertEqual("accepted", receipt["outcome"])
         self.assertEqual(receipt["expected_value_sha256"], receipt["observed_value_sha256"])
         self.assertNotIn("sensitive-value", json.dumps(evidence.polls))
+
+    def test_failure_rows_keep_poll_timeout_text_but_never_other_error_text(self):
+        # R19 legacy failed as a bare class name; the fix keeps poll()'s own
+        # message. Any other exception text may carry a token and must not
+        # enter a report, even when it is an AssertionError.
+        secret = "Bearer token-secret-value"
+        timeout = self.kv.PollTimeout("valid barrier converges", 120, 120.4, 404, None)
+        row = self.kv.with_poll_timeout({"label": "harness", "passed": False}, timeout)
+        self.assertEqual("valid barrier converges did not converge in 120s; elapsed_seconds=120.4; "
+                         "last_status=404; last_error=None", row["poll_timeout"])
+        for error in (RuntimeError(secret), AssertionError(secret), ValueError(secret)):
+            row = self.kv.with_poll_timeout({"label": "harness", "passed": False}, error)
+            self.assertNotIn("poll_timeout", row)
+            self.assertNotIn(secret, json.dumps(row))
+
+    def test_poll_raises_poll_timeout_with_structured_fields(self):
+        clock = [0.0]
+        with mock.patch.object(self.kv.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.kv.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                self.assertRaises(self.kv.PollTimeout) as raised:
+            self.kv.poll("roster on owner", 3, lambda: (404, {}), lambda _r: False)
+        error = raised.exception
+        self.assertEqual(("roster on owner", 3, 404, None),
+                         (error.label, error.timeout, error.last_status, error.last_error))
+        self.assertIn("roster on owner did not converge in 3s",
+                      self.kv.with_poll_timeout({}, error)["poll_timeout"])
+
+    def test_spoofed_or_tampered_timeout_text_never_enters_a_row(self):
+        # Codex #1021 P1: any AssertionError carrying poll()'s phrase used to be
+        # copied verbatim. Only PollTimeout counts, and its text is rebuilt from
+        # validated fields; str(error) is never read.
+        secret = "token-secret-value"
+        spoofed = AssertionError(f"server says Bearer {secret} did not converge in 120s; last_status=404")
+        self.assertEqual({}, self.kv.with_poll_timeout({}, spoofed))
+        tampered = self.kv.PollTimeout("valid barrier", 120, 1.0, 404, None)
+        tampered.args = (f"Bearer {secret} did not converge in 120s",)
+        unsafe_label = self.kv.PollTimeout(f'x"; token="{secret}', 120, 1.0, "404 Bearer " + secret,
+                                           f"Bearer {secret}")
+        for error in (tampered, unsafe_label):
+            row = self.kv.with_poll_timeout({}, error)
+            self.assertIn("did not converge", row["poll_timeout"])
+            self.assertNotIn(secret, json.dumps(row))
+        self.assertTrue(self.kv.with_poll_timeout({}, unsafe_label)["poll_timeout"].startswith("unsafe_label "))
+
+    def test_safe_error_outcome_keeps_only_allow_listed_class_and_int_status(self):
+        # Codex #1021 P1: a lowercase token or hex string passed the old
+        # character-set filter on "reason"/"code". No body field is kept now.
+        secret = "token_secret_value"
+        body = json.dumps({"ok": False, "error": f"Bearer {secret}", "reason": secret,
+                           "code": "deadbeef" * 8}).encode()
+        error = urllib.error.HTTPError("http://127.0.0.1/x", 403, f"Bearer {secret}", {}, io.BytesIO(body))
+        self.addCleanup(error.close)
+        self.assertEqual({"error_class": "HTTPError", "http_status": 403}, self.kv.safe_error_outcome(error))
+
+        class TokenSecretValueError(Exception):
+            pass
+        self.assertEqual({"error_class": "Other"}, self.kv.safe_error_outcome(TokenSecretValueError(secret)))
+        self.assertEqual({"error_class": "RuntimeError"}, self.kv.safe_error_outcome(RuntimeError(secret)))
 
     def test_unsafe_server_fields_and_tokens_never_enter_receipt(self):
         evidence = self.kv.Evidence()
