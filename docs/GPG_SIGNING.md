@@ -113,7 +113,7 @@ Always review the code before installing, even if the signature is valid.
 - **Algorithm**: RSA 4096-bit
 - **Email**: david@saorsalabs.com
 - **Keyserver**: keys.openpgp.org
-- **Fingerprint**: [To be added when key is generated]
+- **Fingerprint**: `CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29` (primary key of `SAORSA_PUBLIC_KEY.asc`)
 
 ### Key Rotation
 

@@ -152,6 +152,7 @@ fn allow_only(opener: &x0x::Agent, target: std::net::SocketAddr) -> Arc<ConnectP
             targets: vec![target],
         }],
         owner_allow: Vec::new(),
+        grant_allow: Vec::new(),
     }))
 }
 
