@@ -370,7 +370,7 @@ pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolu
 /// `OwnerCertified(owner)` Home-shaped AND our own agent is an active
 /// member. Anything else (injected metadata, a foreign owner's Home, a
 /// group we were removed from) is not trusted.
-pub(in crate::server) async fn find_home(
+pub(crate) async fn find_home(
     state: &AppState,
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
@@ -798,7 +798,7 @@ enum ProvisionStep {
     AwaitOwnerSync,
 }
 
-pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
+pub(crate) async fn provision_home(state: &Arc<AppState>) {
     let _ = provision_home_steps(state, false).await;
 }
 
@@ -866,7 +866,11 @@ async fn home_creator_rank(state: &AppState) -> u32 {
 /// - a committed record makes a canonical Home known (it will then yield);
 /// - a session with an owner device completes and this device is the
 ///   designated creator (rank 0): that session either delivered the pointer
-///   or showed that the device it reached advertises none;
+///   or showed that the device it reached advertises none — #863 makes
+///   "advertises none" TRUSTWORTHY: every session (both directions)
+///   materializes the local Home pointer into the Tier-1 store BEFORE the
+///   version-vector exchange, so a peer holding an unpublished Home can no
+///   longer answer with an empty HomePointer vector;
 /// - or `(rank + 1) × wait` has passed since the wait began.
 ///
 /// A completed session that brought no pointer releases ONLY the rank-0
@@ -3852,6 +3856,113 @@ pub(in crate::server::routes) mod tests {
         assert_eq!(home_shaped_group_count(follower).await, 0);
         let (status, body) =
             response_json(get_home(State(Arc::clone(follower))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#863): provisioning does NOT publish the Home pointer — only a
+    /// sync pass (or, post-fix, a session) does. That gap is the hole: a
+    /// peer holding an unpublished Home answers a session's version-vector
+    /// exchange with an EMPTY HomePointer kind. `materialize_local_home_
+    /// pointer` (what every session path now runs first) closes it. With
+    /// the helper disabled (the fail-before) the canonical pointer stays
+    /// None and both assertions below fail.
+    #[tokio::test]
+    async fn materialize_local_home_pointer_publishes_an_unpublished_local_home(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8C; 32]).await?;
+        // The server startup attaches the daemon view to the sync
+        // service; owned_state skips startup, so mirror it here.
+        sync_of(&state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        provision_home(&state).await;
+        let sync = sync_of(&state)?;
+        assert!(
+            sync.canonical_home().await.is_none(),
+            "the #863 gap: a freshly provisioned Home is unpublished"
+        );
+        sync.materialize_local_home_pointer().await;
+        let canonical = sync.canonical_home().await.expect("published");
+        let (gid, _) = find_home(&state, &owner_of(&state)).await.expect("Home");
+        assert_eq!(canonical.group_id, gid);
+        // The version vector now ADVERTISES the HomePointer kind — an
+        // empty vector from this peer is henceforth genuine proof it
+        // holds no Home.
+        let vector = sync.store().version_vector().await;
+        assert!(vector.iter().any(|kv| {
+            kv.kind == crate::owner_sync::SyncKind::HomePointer && !kv.entries.is_empty()
+        }));
+        Ok(())
+    }
+
+    /// WHY (#863, the reported duplicate): the rank-0 wait may treat an
+    /// empty session as "no Home exists" only because every session now
+    /// PUBLISHES the peer's local Home pointer before the exchange. Model:
+    /// the follower holds a Home whose pointer is unpublished; its
+    /// session-side publication runs; the session delivers exactly what
+    /// the follower ADVERTISES; the leader's wait yields on the POINTER —
+    /// it reports "elsewhere" and creates nothing. With the publication
+    /// disabled (the fail-before) nothing is advertised, the empty session
+    /// releases rank 0, and the leader creates a duplicate Home.
+    #[tokio::test]
+    async fn rank_zero_adopts_an_unpublished_peer_home_instead_of_duplicating() -> anyhow::Result<()>
+    {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = owned_state(dir_a.path(), [0x8D; 32]).await?;
+        let b = owned_state(dir_b.path(), [0x8D; 32]).await?;
+        for state in [&a, &b] {
+            // Mirror the server-startup view attachment (see above).
+            sync_of(state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(state))));
+        }
+        let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
+        anyhow::ensure!(ma != mb, "distinct machines");
+        enroll_machine(&a, mb.0).await?;
+        enroll_machine(&b, ma.0).await?;
+        let (leader, follower) = if ma.0 < mb.0 { (&a, &b) } else { (&b, &a) };
+        let (leader_machine, follower_machine) =
+            (leader.agent.machine_id(), follower.agent.machine_id());
+
+        // The follower already holds a Home whose pointer is unpublished
+        // (created since its last reconcile pass — the #863 gap).
+        provision_home(follower).await;
+        assert_eq!(home_shaped_group_count(follower).await, 1);
+        assert!(
+            sync_of(follower)?.canonical_home().await.is_none(),
+            "the follower's Home is real but unpublished"
+        );
+
+        // The leader (rank 0 — the only lower machine id) defers.
+        let task = provision_home_at_startup(leader, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader must defer"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A session happens: both sides run the session-side publication
+        // the production session paths run; the merge delivers exactly
+        // what the follower ADVERTISES; both sides record the session.
+        sync_of(follower)?.materialize_local_home_pointer().await;
+        sync_of(leader)?.materialize_local_home_pointer().await;
+        if let Some(canonical) = sync_of(follower)?.canonical_home().await {
+            commit_canonical_home(leader, &canonical.group_id).await?;
+        }
+        sync_of(leader)?
+            .store()
+            .set_session_status(&follower_machine, true)
+            .await;
+        sync_of(follower)?
+            .store()
+            .set_session_status(&leader_machine, true)
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(
+            home_shaped_group_count(leader).await,
+            0,
+            "#863: the leader ADOPTED the follower's Home — no duplicate"
+        );
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(leader))).await.into_response()).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["state"], "elsewhere", "{body}");
         Ok(())

@@ -7,8 +7,20 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
+};
+pub(in crate::server) use seat_cert_fetch::{
+    cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
+    handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
+    CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
+};
+
+mod requester_offer;
+pub(in crate::server) use requester_offer::{
+    insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
+    RequesterOfferObligation,
 };
 
 use super::super::state::AppState;
@@ -335,6 +347,93 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
     config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
     config.require_gossip_ack = true;
     config
+}
+
+/// A predecessor relay can only count a recipient application ACK. Raw QUIC's
+/// receive-pipeline ACK is produced before the typed route admits the item.
+/// #942 r3 (B4): the strict-v2 delivery config, following the durable
+/// bootstrap-outbox pattern exactly — the logical request id is the first
+/// 16 bytes of the obligation's envelope digest, so a retry after a lost
+/// ACK or a restart is a REPLAY of one logical request (the recipient's
+/// dedupe re-ACKs instead of re-dispatching), and the outbox — not the
+/// send layer — owns retry scheduling (max_retries = 0).
+pub(in crate::server) fn predecessor_relay_delivery_config(
+    envelope_digest: &[u8; 32],
+    target: &crate::identity::AgentId,
+) -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    // The predecessor route is registered DURABLE: send Ok means the
+    // AUTHORITY's handler resolved its completion (Inserted/Duplicate),
+    // never a bare enqueue. A full typed channel withholds the ACK — that
+    // is the failure the retry schedule absorbs.
+    config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    config.logical_request_id = Some(relay_request_id(envelope_digest, target));
+    config
+}
+
+/// #979 r2 (B1): the PER-TARGET logical request id —
+/// blake3("x0x relay request id v1", digest || target)[..16]. One
+/// obligation fanned out to N witnesses now registers N DISTINCT
+/// in-flight ACK waiters (the registry is keyed by request id alone, and
+/// a shared id made concurrent sends cancel each other: 0 successes, the
+/// obligation pruned unretried). The id stays stable per
+/// (obligation, target) across restarts, so a retry is still a replay
+/// for that recipient; the recipient's durable dedup is keyed by the
+/// ENVELOPE digest (Inserted/Duplicate), not by this id, so distinct
+/// per-target ids never double-apply.
+pub(in crate::server) fn relay_request_id(
+    envelope_digest: &[u8; 32],
+    target: &crate::identity::AgentId,
+) -> [u8; 16] {
+    let mut material = Vec::with_capacity(32 + 32);
+    material.extend_from_slice(envelope_digest);
+    material.extend_from_slice(target.as_bytes());
+    let mut hasher = blake3::Hasher::new_derive_key("x0x relay request id v1");
+    hasher.update(&material);
+    let derived: [u8; 32] = *hasher.finalize().as_bytes();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&derived[..16]);
+    id
+}
+
+/// #942 r3 (B4): the legacy (v1) fallback for authorities without a
+/// current v2 durable-ACK advert — pre-ADR-0030 builds and daemons with
+/// history disabled. The payload is unchanged (the predecessor prefix is
+/// the v1 listener's prefix too); the receipt is transport-level, so the
+/// obligation is discharged on delivery exactly as it was before the
+/// durable route existed. Without this arm such an authority would NEVER
+/// receive the offer (compatibility regression fixed).
+pub(in crate::server) fn predecessor_relay_legacy_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_durable_app_ack = false;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    config
+}
+
+/// #942 r3 (B4): which wire an authority can receive on, mirroring the
+/// bootstrap outbox's probe — a capability binding under v2 means legacy;
+/// a contact card that self-reports v1 means legacy; unknown defaults to
+/// the strict v2 attempt (which fails fast and retries on schedule).
+pub(in crate::server) async fn predecessor_relay_wire_version(
+    state: &AppState,
+    recipient: &crate::identity::AgentId,
+) -> bool {
+    if let Some(binding) = state.agent.capability_store().lookup_binding(recipient) {
+        return binding.capabilities.max_protocol_version >= 2;
+    }
+    let card_reports_v1 = state
+        .contacts
+        .read()
+        .await
+        .get(recipient)
+        .and_then(|contact| contact.dm_capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.max_protocol_version < 2);
+    !card_reports_v1
 }
 
 /// Request body for POST /groups.
@@ -948,6 +1047,23 @@ pub(in crate::server) struct PendingTreeKemMetadataEvent {
     queued_at: Instant,
 }
 
+/// #876: a signed `MemberRoleUpdated` that arrived before its target
+/// member was seated locally. Parked instead of dropped; replayed after
+/// the group's next accepted `MemberAdded`. Bounded per group
+/// (`PARKED_ROLE_UPDATE_CAP`).
+#[derive(Debug, Clone)]
+pub(in crate::server) struct ParkedRoleUpdate {
+    pub(in crate::server) event: NamedGroupMetadataEvent,
+    pub(in crate::server) sender: AgentId,
+    pub(in crate::server) parked_at: Instant,
+}
+
+/// #876: per-group bound on parked role updates (drop-oldest with a warn).
+/// Accepted abuse (review note): an admin can park 32 junk updates to
+/// evict a real one — bounded, logged, and requires admin authority the
+/// same admin could spend on direct role churn anyway.
+pub(in crate::server) const PARKED_ROLE_UPDATE_CAP: usize = 32;
+
 /// ADR 0028: a `JoinRequestApproved` that arrived before its matching
 /// `JoinRequestCreated` predecessor. The approval is durably queued without
 /// mutating group state until the predecessor arrives and the ordinary
@@ -1178,6 +1294,17 @@ pub(in crate::server) enum JoinResultMessage {
         /// result (owner installs only) — the joiner's CAS anchor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_attestation: Option<Box<HeadAttestation>>,
+        /// R19 (#802 R18 Home blocker): base64 bincode `AgentCertificate`s
+        /// for the authority's byte-bearing roster seats (owner devices
+        /// included), so the joiner holds them even after their device
+        /// goes offline. Not covered by any signature: each entry is
+        /// installed only when it hashes to a committed seat digest and
+        /// verifies under the group owner (see
+        /// `seat_cert_fetch::hydrate_from_roster_certificate_sidecar`).
+        /// Empty and omitted for legacy authorities; legacy joiners ignore
+        /// the key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roster_certificates_b64: Vec<String>,
     },
     /// #477 W1: the authority's typed, attempt-bound refusal. Served ONLY
     /// to fetches that carried `accepts_refusal: true` AND a matching
@@ -1189,15 +1316,24 @@ pub(in crate::server) enum JoinResultMessage {
 /// outcomes: the five `consume_issued_invite` failures (src/groups/mod.rs
 /// `consume_issued_invite`) plus the addressed-recipient pre-consumption
 /// refusal (an immutable fact about the invite itself). OwnerCertified-gate
-/// failures are deliberately ABSENT: certificate evidence is mutable
-/// discovery state and the authority-side attempt tombstone that would make
-/// them safely terminal is deferred (#481) — they stay retryable.
+/// failures stay retryable — certificate evidence is mutable discovery
+/// state and the authority-side attempt tombstone that would make them
+/// safely terminal is deferred (#481) — with ONE exception:
+/// [`JoinRefusalReason::CertificateEvidenceUnavailable`], staged only after
+/// a digest-only seat has blocked the same join attempt continuously for
+/// `CERT_EVIDENCE_DEADLINE_MS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // the shared Invite prefix IS the taxonomy
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
+    /// #946: an existing member's committed certificate digest never
+    /// hydrated to bytes, so the seal refused. RETRYABLE FIRST — the joiner
+    /// keeps retrying while a group-scoped fetch may still obtain it; this
+    /// typed refusal is staged only after CERT_EVIDENCE_DEADLINE_MS of
+    /// continuous refusals for the same join attempt.
+    CertificateEvidenceUnavailable,
     InviteRoleExceedsCap,
     InviteEventBeforeCreation,
     InviteExpired,
@@ -1221,6 +1357,7 @@ impl JoinRefusalReason {
     #[must_use]
     fn as_str(self) -> &'static str {
         match self {
+            Self::CertificateEvidenceUnavailable => "certificate_evidence_unavailable",
             Self::InviteSecretUnknown => "invite_secret_unknown",
             Self::InviteSecretConsumed => "invite_secret_consumed",
             Self::InviteRoleExceedsCap => "invite_role_exceeds_cap",
@@ -3994,6 +4131,7 @@ async fn install_fork_evidence(
     evidence: x0x::groups::ForkEvidence,
     quarantine: Option<x0x::groups::ForkQuarantine>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
 ) -> bool {
     let install_key = group_key.to_string();
     let marker_was_carried = quarantine.is_some();
@@ -4055,8 +4193,16 @@ async fn install_fork_evidence(
         true
     };
     let outcome = if persistence_lock_already_held {
-        persist_named_groups_mutation_unlocked(state, install).await
+        if let Some(guard) = held_gss_guard {
+            persist_named_groups_mutation_with_gss_guard(state, guard, install).await
+        } else {
+            persist_named_groups_mutation_unlocked(state, install).await
+        }
     } else {
+        debug_assert!(
+            held_gss_guard.is_none(),
+            "GSS writer requires held roster persistence"
+        );
         persist_named_groups_mutation(state, install).await
     };
     match outcome {
@@ -4143,6 +4289,7 @@ async fn apply_stateful_event_with_evidence(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
@@ -4156,6 +4303,7 @@ async fn apply_stateful_event_with_evidence(
                 commit,
                 owner_mandate,
                 persistence_lock_already_held,
+                held_gss_guard,
                 &e,
             )
             .await;
@@ -4177,6 +4325,7 @@ async fn apply_terminal_stateful_event_with_evidence(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
@@ -4190,6 +4339,7 @@ async fn apply_terminal_stateful_event_with_evidence(
                 commit,
                 owner_mandate,
                 persistence_lock_already_held,
+                held_gss_guard,
                 &e,
             )
             .await;
@@ -4265,6 +4415,7 @@ fn fork_evidence_path_open(current: &x0x::groups::GroupInfo) -> bool {
 /// drift from the ordinary hook's rules. `owner_mandate` is `Some`
 /// only on the `MemberAdded` arm (the one event kind that can carry an
 /// owner anchor).
+#[allow(clippy::too_many_arguments)]
 async fn record_fork_evidence_on_apply_error(
     state: &Arc<AppState>,
     group_key: &str,
@@ -4272,6 +4423,7 @@ async fn record_fork_evidence_on_apply_error(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
     if fork_evidence_path_open(current) {
@@ -4292,6 +4444,7 @@ async fn record_fork_evidence_on_apply_error(
                     evidence.clone(),
                     quarantine,
                     persistence_lock_already_held,
+                    held_gss_guard,
                 )
                 .await;
                 // ADR-0064 slice 4: the classification counters fire on
@@ -4495,6 +4648,7 @@ async fn classify_refused_joiner_fork_chain(
         evidence,
         quarantine,
         persistence_lock_already_held,
+        None,
     )
     .await;
     if durable {
@@ -5091,6 +5245,54 @@ pub(in crate::server) async fn store_named_group_info(
     true
 }
 
+/// Snapshot the committed roster without retaining a group lock across the
+/// direct-connection and gossip awaits.
+pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
+    let _refresh_guard = state.group_roster_gossip_lock.lock().await;
+    let rosters = {
+        // The map write can precede an awaited disk save and be rolled back.
+        // Serialize this snapshot with that transaction so SG never sees an
+        // uncommitted admission or removal. Drop both guards before the
+        // direct-connection and gossip awaits below.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        let groups = state.named_groups.read().await;
+        let mut entries: Vec<_> = groups.iter().collect();
+        // Aliases may retain an older view. The exact stable-id key wins;
+        // otherwise take the highest revision deterministically. A winning
+        // withdrawn record clears its preference rather than reviving an
+        // active alias.
+        entries.sort_by_key(|(key, group)| {
+            (
+                group.stable_group_id(),
+                key.as_str() == group.stable_group_id(),
+                group.state_revision,
+                key.as_str(),
+            )
+        });
+        let mut by_group = std::collections::BTreeMap::new();
+        for (_, group) in entries {
+            let roster = (!group.withdrawn).then(|| {
+                let agents = group
+                    .active_members()
+                    .filter_map(|member| {
+                        let bytes = hex::decode(&member.agent_id).ok()?;
+                        let bytes: [u8; 32] = bytes.try_into().ok()?;
+                        Some(AgentId(bytes))
+                    })
+                    .collect();
+                (
+                    group.stable_group_id().to_string(),
+                    group.metadata_topic.clone(),
+                    agents,
+                )
+            });
+            by_group.insert(group.stable_group_id().to_string(), roster);
+        }
+        by_group.into_values().flatten().collect()
+    };
+    state.agent.replace_group_rosters_for_gossip(rosters).await;
+}
+
 /// Apply one shared-roster mutation as a persistence transaction.
 ///
 /// The global roster persistence lock is acquired before the shared map is
@@ -5106,8 +5308,17 @@ pub(in crate::server) async fn persist_named_groups_mutation<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
-    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    persist_named_groups_mutation_unlocked(state, mutate).await
+    let outcome = {
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        persist_named_groups_mutation_unlocked(state, mutate).await
+    };
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        refresh_group_rosters_for_gossip(state).await;
+    }
+    outcome
 }
 
 /// #457 r10 item 10.1 — the SAME semantics as the locked variant (the
@@ -5144,6 +5355,24 @@ where
 /// rollback.
 pub(in crate::server) async fn persist_named_groups_mutation_unlocked<F>(
     state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    // The caller already holds roster persistence P. Every live map change,
+    // durable save and rollback stays behind G so no encrypted KV publisher
+    // can refresh a candidate epoch or enqueue an old sealed record midway.
+    let gss_publication_guard = state.gss_publication_gate.write().await;
+    persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
+}
+
+/// The roster mutation core for a caller that already owns the GSS writer.
+/// A borrowed guard is the capability: causal replay can enter here while
+/// retaining its P→G transaction without reacquiring the non-reentrant G.
+async fn persist_named_groups_mutation_with_gss_guard<F>(
+    state: &AppState,
+    _gss_publication_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
     mutate: F,
 ) -> std::io::Result<AtomicWriteOutcome>
 where
@@ -5697,6 +5926,21 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let outcome = persist_named_group_info_inner(state, group_id, info).await;
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        refresh_group_rosters_for_gossip(state).await;
+    }
+    outcome
+}
+
+async fn persist_named_group_info_inner(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> std::io::Result<AtomicWriteOutcome> {
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -5706,6 +5950,7 @@ pub(in crate::server) async fn persist_named_group_info(
     // a correctness bug), rolls the visible map back, restores the
     // pending-stub marker, and fails the operation.
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let _gss_publication_guard = state.gss_publication_gate.write().await;
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -8703,7 +8948,7 @@ struct ValidatedCausalEnvelope {
 /// Returns the decoded event, the authenticated signer, and the signed
 /// topic string. Used by both the shared exact-envelope validator and
 /// the outbox loader.
-fn decode_and_verify_v2(
+pub(in crate::server) fn decode_and_verify_v2(
     envelope_bytes: &[u8],
 ) -> Result<(NamedGroupMetadataEvent, AgentId, String), &'static str> {
     let msg = x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(envelope_bytes))
@@ -9354,6 +9599,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     }
 
     let mut still_pending = VecDeque::new();
+    // #878 r4 (finding 1): a JoinRequestApproved landing seats the
+    // requester — the drain must fire for parked role updates, but only
+    // AFTER this function's guards drop (the drain re-enters the apply
+    // path, which takes the membership lock).
+    let mut member_landed = false;
     for pending in entries {
         // ADR 0028: skip conflicted entries (reject-both, Kimi blocker 5).
         if pending.conflicted {
@@ -9433,6 +9683,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             still_pending.push_back(pending);
             continue;
         }
+        // Replay installs a live candidate directly, bypassing the ordinary
+        // persist wrapper. Keep encrypted KV publishes out through its checked
+        // save or rollback.
+        let replay_gss_guard = state.gss_publication_gate.write().await;
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -9465,6 +9719,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             None,
             true, // lock_already_held
             true, // roster_lock_already_held
+            Some(&replay_gss_guard),
         ))
         .await;
 
@@ -9507,6 +9762,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         } else {
             (false, false)
         };
+        drop(replay_gss_guard);
         if applied.accepted && group_persisted {
             // #759 item 1: the candidate is DURABLE, so a marker clear it
             // carried is real — promote it to the caller's notification set.
@@ -9533,6 +9789,9 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                 "ADR 0028 B5: queued approval drained and applied (group state durable)"
             );
             state.groups_diagnostics.record_causal_applied(group_id);
+            if applied_member_add(&pending.event) {
+                member_landed = true;
+            }
             continue;
         }
         if applied.accepted && visible_not_durable {
@@ -9598,6 +9857,15 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             let mut queue_lock = state.causal_approval_queue.write().await;
             queue_lock.insert(group_id.to_string(), queue_snapshot);
         }
+    }
+
+    // #878 r4 (finding 1): a queued JoinRequestApproved seated a member —
+    // drain this group's parked role updates now that every guard of this
+    // replay (membership, persistence, per-iteration roster) has dropped.
+    if member_landed {
+        drop(_replay_membership_guard);
+        drop(_persistence_guard);
+        Box::pin(replay_parked_role_updates(state, group_id)).await;
     }
 }
 
@@ -10218,6 +10486,29 @@ async fn apply_named_group_metadata_event_with_binding(
     // dropped, because the task-ingest drain takes `TaskList` write then
     // `named_groups` read.
     let mut cleared_quarantine = std::collections::BTreeSet::new();
+    // #876: a role update parked for a member who is landing NOW must be
+    // replayed after this apply — capture the trigger before `event` moves.
+    // #876 r2 (review item 1): the replay key is the group's LOCAL MAP
+    // KEY — the same key the park site resolved — never the raw event
+    // group id: a group whose local key differs from its stable id would
+    // otherwise never replay.
+    let member_landing_group = if applied_member_add(&event) {
+        local_group_key_for_parking(state, named_group_metadata_event_group_id(&event)).await
+    } else {
+        None
+    };
+    // #946 C3: a member who leaves or is removed/banned loses any
+    // certificate-unobtainable refusal window, so a later rejoin starts
+    // retryable. Captured before `event` moves.
+    let departing_member = match &event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id, agent_id, ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            group_id, agent_id, ..
+        } => Some((group_id.clone(), agent_id.clone())),
+        _ => None,
+    };
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10231,13 +10522,226 @@ async fn apply_named_group_metadata_event_with_binding(
         bound_join_attempt,
         false,
         false,
+        None,
     ))
     .await;
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    if applied.accepted {
+        if let Some((gid, member)) = departing_member.as_ref() {
+            clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
+        }
+        if let Some(gid) = member_landing_group {
+            replay_parked_role_updates(state, &gid).await;
+        }
+    }
+    refresh_group_rosters_for_gossip(state).await;
     applied
+}
+
+/// #876: is this apply the one that seats a member (the replay trigger for
+/// parked role updates)?
+fn applied_member_add(event: &NamedGroupMetadataEvent) -> bool {
+    // #876 r2 (review item 2): a member can also be seated through an
+    // accepted MemberJoined (self-joins) — both release parked updates.
+    // #878 r4 (finding 1): JoinRequestApproved seats the requester too
+    // (its mutate add_member's the requester) — the third landing path.
+    matches!(
+        event,
+        NamedGroupMetadataEvent::MemberAdded { .. }
+            | NamedGroupMetadataEvent::MemberJoined { .. }
+            | NamedGroupMetadataEvent::JoinRequestApproved { .. }
+    )
+}
+
+/// #876 r2 (review item 1): resolve an event's group id to the LOCAL
+/// named-groups map key (exact match, else the stable-id match) — the
+/// key both the park site and the replay trigger must use, so a group
+/// whose local key differs from its stable id still replays.
+async fn local_group_key_for_parking(state: &AppState, event_group_id: &str) -> Option<String> {
+    let groups = state.named_groups.read().await;
+    if let Some((key, _)) = groups.get_key_value(event_group_id) {
+        return Some(key.clone());
+    }
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == event_group_id)
+        .map(|(key, _)| key.clone())
+}
+
+/// #876 (issue item 3): park a signed role update whose target member is
+/// not yet in the local roster, instead of dropping it. Bounded per group
+/// (drop-oldest with a warn); suppressed in replay contexts (`allow_queue`
+/// false) so a re-park cannot grow the lot.
+fn park_role_update_for_late_member(
+    state: &AppState,
+    group_key: &str,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    member_hex: &str,
+    allow_queue: bool,
+) {
+    tracing::warn!(
+        group_id = %LogHexId::group(group_key),
+        member = %LogHexId::agent(member_hex),
+        "role update targets a member not yet in the local roster; parking it until their MemberAdded applies (#876)"
+    );
+    if !allow_queue {
+        return;
+    }
+    let mut lot = state
+        .parked_role_updates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    // #876 r2 (review item 2): TTL — a member that never lands must not
+    // hold the slot forever.
+    list.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    while list.len() >= PARKED_ROLE_UPDATE_CAP {
+        let evicted = list.remove(0);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "parked role update cap reached; dropping the oldest ({})",
+            named_group_metadata_event_kind(&evicted.event)
+        );
+    }
+    list.push(ParkedRoleUpdate {
+        event,
+        sender,
+        parked_at: Instant::now(),
+    });
+}
+
+/// #876 r3 (review finding 1): after a member lands, drain the group's
+/// parked role updates. An entry whose target member is STILL absent is
+/// re-inserted with its ORIGINAL `parked_at` — a member who never lands
+/// must expire on the TTL, never have it reset by every other member's
+/// landing. An entry whose member HAS landed is re-applied through the
+/// ordinary apply; if that apply refuses for other reasons (a stale
+/// chain, a withdrawn group), the update is dropped with a warn — the
+/// member is seated, so this is an ordinary apply refusal, not a
+/// parking case.
+async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
+    let mut parked = {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.remove(group_key).unwrap_or_default()
+    };
+    // #876 r2 (review item 2): expired entries die with the drain.
+    parked.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    if parked.is_empty() {
+        return;
+    }
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        count = parked.len(),
+        oldest_parked_secs = parked
+            .first()
+            .map(|entry| entry.parked_at.elapsed().as_secs())
+            .unwrap_or_default(),
+        "member landed; replaying parked role updates (#876)"
+    );
+    let mut still_late = Vec::new();
+    for entry in parked {
+        let member_seated = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_key).is_some_and(|info| {
+                role_update_target(&entry.event)
+                    .is_some_and(|member| info.members_v2.contains_key(member))
+            })
+        };
+        if !member_seated {
+            still_late.push(entry);
+            continue;
+        }
+        let outcome = Box::pin(apply_named_group_metadata_event(
+            state,
+            entry.event,
+            entry.sender,
+            true,
+            None,
+        ))
+        .await;
+        if !outcome.accepted {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                "a drained role update was refused with its member seated; dropping it (#876 r3)"
+            );
+        }
+    }
+    if still_late.is_empty() {
+        return;
+    }
+    let mut lot = state
+        .parked_role_updates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    for entry in still_late {
+        // Re-inserted entries keep their ORIGINAL parked_at (TTL
+        // continuity — the finding-1 fix) and arrival order.
+        list.push(entry);
+    }
+    list.sort_by_key(|entry| entry.parked_at);
+    while list.len() > PARKED_ROLE_UPDATE_CAP {
+        let evicted = list.remove(0);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "parked role update cap reached; dropping the oldest ({})",
+            named_group_metadata_event_kind(&evicted.event)
+        );
+    }
+}
+
+/// #878 r5: drop the per-pair guard entry once its staging task ends —
+/// the map must not grow with the (group, recipient) universe. Removed
+/// only when the stored semaphore is the SAME instance and fully
+/// released (no other task holds a permit on it).
+fn release_join_result_staging_guard(state: &AppState, key: &(String, AgentId)) {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The semaphore always has exactly 1 permit: available == 1 means
+    // no staging task holds it.
+    if guards
+        .get(key)
+        .is_some_and(|semaphore| semaphore.available_permits() == 1)
+    {
+        guards.remove(key);
+    }
+}
+
+/// #878 r4 (review finding 2): acquire the single in-flight permit for
+/// an oversized join-result staging task for this (group, recipient).
+/// `None` while one is already running (the duplicate is dropped).
+fn acquire_join_result_staging_permit(
+    state: &AppState,
+    group_id: &str,
+    recipient: &AgentId,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let semaphore = guards
+        .entry((group_id.to_string(), *recipient))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    semaphore.try_acquire_owned().ok()
+}
+
+/// #876 r3: the `agent_id` a `MemberRoleUpdated` targets, if the event
+/// is one.
+fn role_update_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::MemberRoleUpdated { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -10251,6 +10755,16 @@ async fn apply_named_group_metadata_event_inner(
     // ADR 0028: replay is called after _serialized returns (guard dropped).
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
+    // #876 r3 (review finding 2): this wrapper is the path a MemberAdded
+    // lands through when the TreeKEM pending replay applies it
+    // (`replay_pending_treekem_events` calls here with allow_queue =
+    // false) — the lagging-join shape #876 exists for. Capture the same
+    // #876 landing trigger the direct-apply wrapper uses.
+    let member_landing_group = if applied_member_add(&event) {
+        Some(named_group_metadata_event_group_id(&event).to_string())
+    } else {
+        None
+    };
     let mut replay_group_id: Option<String> = None;
     // #759 item 1: as in `apply_named_group_metadata_event` above — the
     // notification is consumed only after the (guard-free) replay call.
@@ -10268,6 +10782,7 @@ async fn apply_named_group_metadata_event_inner(
         None,
         false,
         false,
+        None,
     ))
     .await;
     if allow_queue {
@@ -10276,6 +10791,15 @@ async fn apply_named_group_metadata_event_inner(
         }
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    if applied.accepted {
+        if let Some(event_gid) = member_landing_group {
+            // Resolve to the local map key AFTER the apply (the group may
+            // have been installed by this very apply).
+            if let Some(gid) = local_group_key_for_parking(state, &event_gid).await {
+                replay_parked_role_updates(state, &gid).await;
+            }
+        }
+    }
     applied
 }
 
@@ -10320,6 +10844,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     bound_join_attempt: Option<&str>,
     lock_already_held: bool,
     roster_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
 ) -> ApplyMetadataResult {
     let observed_predecessor_at_ms =
         envelope_bytes.map(|_| predecessor_first_seen_ms.unwrap_or_else(now_millis_u64));
@@ -10670,6 +11195,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11402,6 +11928,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 action_kind,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11462,6 +11989,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     Ok(AtomicWriteOutcome::Durable)
                 ) {
                     return ApplyMetadataResult::REJECTED;
+                }
+                // #876 r3 (review finding 3): the group is gone — its
+                // parked role updates die with it.
+                for alias in &cache_aliases {
+                    state
+                        .parked_role_updates
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(alias);
                 }
                 *replay_group_id = Some(resolved_group_key.clone());
                 save_mls_groups(state).await;
@@ -11542,6 +12078,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11607,6 +12144,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.policy_revision = revision.max(next.policy_revision);
@@ -11654,6 +12192,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+                // #876 (issue item 3): the member's own MemberAdded has
+                // not reached this roster yet (its join blob can lag
+                // behind the control-blob staging budget). Never drop the
+                // signed role update silently — park it and replay once
+                // the member lands. The apply result stays REJECTED so
+                // ordering semantics are unchanged.
+                park_role_update_for_late_member(
+                    state,
+                    &resolved_group_key,
+                    event_for_log.clone(),
+                    sender,
+                    &agent_id,
+                    allow_queue,
+                );
                 return ApplyMetadataResult::REJECTED;
             };
             if target.is_removed() || target.is_banned() {
@@ -11675,6 +12227,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11733,6 +12286,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11863,6 +12417,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11934,6 +12489,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
                     let req = x0x::groups::JoinRequest {
@@ -12106,6 +12662,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     let now_ms = commit.committed_at;
@@ -12308,6 +12865,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     let requester_hex = next
@@ -12365,6 +12923,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
                     if let Some(req) = next.join_requests.get_mut(&request_id) {
@@ -12438,6 +12997,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -13151,6 +13711,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 member = %LogHexId::agent(&member_agent_id),
                                 "MemberJoined: failed to seal authoritative add: {e}"
                             );
+                            // #908/R17: a pending-certificate refusal whose
+                            // members are ALL still digest-only. The seal
+                            // published a group-scoped fetch; the refusal
+                            // stays retryable, and the typed refusal is
+                            // staged only after CERT_EVIDENCE_DEADLINE_MS of
+                            // continuous refusals for this join attempt.
+                            stage_refusal_if_certificates_unobtainable(
+                                state,
+                                &resolved_group_key,
+                                &member_agent_id,
+                                &event_for_log,
+                                &e,
+                            )
+                            .await;
                             return ApplyMetadataResult::REJECTED;
                         }
                     };
@@ -13224,6 +13798,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
+                        // #908/R17: same deadline-gated refusal staging as
+                        // the TreeKEM arm above.
+                        stage_refusal_if_certificates_unobtainable(
+                            state,
+                            &resolved_group_key,
+                            &member_agent_id,
+                            &event_for_log,
+                            &e,
+                        )
+                        .await;
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
@@ -13487,6 +14071,31 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                 maybe_msg = sub.recv() => {
                     let Some(msg) = maybe_msg else { break; };
                     let Some(sender) = msg.sender else { continue; };
+                    // #946 r2: group-scoped certificate fetch traffic rides
+                    // this topic BEFORE any metadata event (it is not an
+                    // event); route it to the real handler branches and
+                    // continue the listener loop.
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
+                        handle_group_cert_fetch_request(
+                            &state_for_task,
+                            rest,
+                            Some(&sender),
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
+                        handle_group_cert_fetch_response(
+                            &state_for_task,
+                            rest,
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
+                        continue;
+                    }
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
                     let apply_result = apply_named_group_metadata_event(
                         &state_for_task,
@@ -14727,7 +15336,7 @@ pub(in crate::server) const GROUP_PUBLIC_MESSAGE_DM_PREFIX: &[u8] = b"X0X-GROUP-
 /// NOT decoded JSON. The receiver decodes the V2 envelope to verify the
 /// requester's ML-DSA-65 signature independently of the carrier's identity.
 pub(in crate::server) const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] =
-    b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+    x0x::dm_inbox::GROUP_PREDECESSOR_RELAY_DM_PREFIX;
 
 /// ADR 0028: finite relay retry step. Advances the retry schedule for all
 /// outbox obligations whose `next_retry_at_ms` has elapsed. Relays to each
@@ -14745,6 +15354,12 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         digest: [u8; 32],
         envelope_bytes: Vec<u8>,
         targets: Vec<String>,
+        /// #942 r4: the source obligation's due time (oldest-due-first
+        /// ordering for the bounded pass).
+        next_retry_at_ms: u64,
+        /// #942 r5 (B8): whether this is a retry — first attempts sort
+        /// ahead of the retry backlog.
+        is_retry: bool,
     }
     let mut due: Vec<DueObligation> = Vec::new();
 
@@ -14769,6 +15384,8 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                     digest: obligation.digest,
                     envelope_bytes: obligation.envelope_bytes.clone(),
                     targets: obligation.relay_targets.clone(),
+                    next_retry_at_ms: obligation.next_retry_at_ms,
+                    is_retry: obligation.retry_count > 0,
                 });
             }
         }
@@ -14868,8 +15485,32 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
 
     let mut relay_results: Vec<RelayResult> = Vec::new();
 
+    // #942 r4 (bounded pass): oldest-due-first, and a per-pass SEND
+    // budget so one pass cannot spend minutes on hundreds of
+    // slow-timeout strict sends while a brand-new obligation waits
+    // (head-of-line). Unserved obligations stay due and are picked up by
+    // the next 500 ms tick — the budget bounds work per tick, not the
+    // total.
+    let mut due_sorted = due;
+    // #942 r5 (B8): FIRST ATTEMPTS ahead of retries — a brand-new
+    // obligation is never starved behind a backlog of overdue retries;
+    // oldest-due within each class.
+    due_sorted.sort_by_key(|o| (o.is_retry, o.next_retry_at_ms));
+    const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
+    // #979: per-obligation concurrent fan-out width. One obligation's
+    // targets send in parallel (bounded), so a slow witness never
+    // serialises the pass; the per-OBLIGATION pass budget is unchanged.
+    const RELAY_TARGET_FANOUT: usize = 8;
+    let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
+
     // Relay to each target and observe results per obligation (audit 6).
-    for due_obl in &due {
+    for due_obl in &due_sorted {
+        if pass_budget == 0 {
+            break;
+        }
+        // #942 r5 (B7): the budget is charged PER OBLIGATION here — a
+        // started obligation always fans out fully (see the inner loop).
+        pass_budget = pass_budget.saturating_sub(1);
         let group_id = &due_obl.group_id;
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
@@ -14877,28 +15518,67 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let mut successful_targets: Vec<String> = Vec::new();
         let mut success_count: usize = 0;
 
-        for target_hex in targets {
-            let Ok(target_id) = parse_agent_id_hex(target_hex) else {
-                // Unparseable target — skip (not added to success set).
-                continue;
-            };
-            let mut dm_payload =
-                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len());
-            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            dm_payload.extend_from_slice(envelope_bytes);
-            // B6: await the send result. Do NOT count record_causal_relayed
-            // yet — count only after durable persistence (persist-before-count).
-            let send_result = state
-                .agent
-                .send_direct_with_config(
-                    &target_id,
-                    dm_payload,
-                    named_group_direct_delivery_config(),
-                )
-                .await;
-            if send_result.is_ok() {
+        let obligation_digest = *digest;
+        // #942 r5 (B7): the budget is charged PER OBLIGATION (at the top
+        // of this loop), never per target — a started obligation always
+        // fans out fully, so witnesses past the budget cannot be starved
+        // by earlier failing targets and the obligation is never pruned
+        // unattempted. The fan-out width is bounded by RELAY_TARGET_FANOUT
+        // (and the daemon-wide target cap of 4096).
+        use futures::StreamExt;
+        // #979: fan ONE obligation's targets out CONCURRENTLY with bounded
+        // concurrency — one slow (ACK-withholding) witness no longer
+        // serialises the whole pass behind its 8 s timeout. Budget
+        // semantics unchanged: the pass still charges per OBLIGATION (a
+        // started obligation always fans out fully).
+        let outcomes: Vec<(String, bool)> = futures::stream::iter(targets.iter().cloned())
+            .map(|target_hex: String| {
+                let state = &state;
+                let envelope_bytes = &envelope_bytes;
+                async move {
+                    let Ok(target_id) = parse_agent_id_hex(&target_hex) else {
+                        // Unparseable target — skip (not added to the
+                        // success set).
+                        return (target_hex, false);
+                    };
+                    let mut dm_payload = Vec::with_capacity(
+                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len(),
+                    );
+                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                    dm_payload.extend_from_slice(envelope_bytes);
+                    // #942 r4 (B6): dual-wire, the #903/bootstrap pattern
+                    // — a witness with a current v2 durable advert gets
+                    // the strict config; one without gets the LEGACY v1
+                    // gossip config so it still receives the relay.
+                    let send_result = if predecessor_relay_wire_version(state, &target_id).await {
+                        state
+                            .agent
+                            .send_direct_with_config(
+                                &target_id,
+                                dm_payload,
+                                predecessor_relay_delivery_config(&obligation_digest, &target_id),
+                            )
+                            .await
+                    } else {
+                        state
+                            .agent
+                            .send_direct_with_config(
+                                &target_id,
+                                dm_payload,
+                                predecessor_relay_legacy_delivery_config(),
+                            )
+                            .await
+                    };
+                    (target_hex, send_result.is_ok())
+                }
+            })
+            .buffer_unordered(RELAY_TARGET_FANOUT)
+            .collect()
+            .await;
+        for (target_hex, ok) in outcomes {
+            if ok {
                 success_count += 1;
-                successful_targets.push(target_hex.clone());
+                successful_targets.push(target_hex);
             }
             // Failed targets are simply not added to the success set —
             // they remain in the obligation's relay_targets after
@@ -18647,6 +19327,7 @@ pub(in crate::server) async fn add_named_group_member(
                 "named-group state and bootstrap obligation are not directory-durable",
             );
         }
+        refresh_group_rosters_for_gossip(&state).await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -19012,6 +19693,9 @@ pub(in crate::server) async fn remove_named_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a removed member's refusal window ends (clearing early only
+    // keeps a later rejoin retryable longer).
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let agent_id = match parse_agent_id_hex(&agent_id_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -19170,6 +19854,7 @@ pub(in crate::server) async fn remove_named_group_member(
                 "named-group state is not directory-durable",
             );
         }
+        refresh_group_rosters_for_gossip(&state).await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -19874,6 +20559,16 @@ async fn wipe_local_group_crypto_material(
         }
     }
     state.control_blobs.prune_groups(&aliases);
+    // #876 r2 (review item 2): parked role updates die with the group.
+    {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in &aliases {
+            lot.remove(alias);
+        }
+    }
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
@@ -20155,6 +20850,7 @@ async fn leave_treekem_group(
                     "named-group state is not directory-durable",
                 );
             }
+            refresh_group_rosters_for_gossip(&state).await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
@@ -20230,6 +20926,15 @@ async fn leave_treekem_group(
     }
     // #341 Phase B: left/removed group — retire its encrypted stores.
     super::retire_group_kv_stores(&state, &id).await;
+    // #876 r3 (review finding 3): the group is gone — its parked role
+    // updates die with it.
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
     let _ = prune_treekem_cache_groups(&state, &cache_aliases, "treekem_leave").await;
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
@@ -21354,6 +22059,9 @@ pub(in crate::server) async fn leave_group(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: leaving the group ends every refusal window this node
+    // tracked for it.
+    clear_cert_evidence_stamps_for(&state, &id, None).await;
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
@@ -21512,6 +22220,15 @@ pub(in crate::server) async fn leave_group(
     }
     // #341 Phase B: left/removed group — retire its encrypted stores.
     super::retire_group_kv_stores(&state, &id).await;
+    // #878 r4 (review finding 3): the non-TreeKEM leave deletes the
+    // group — its parked role updates die with it.
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
@@ -21887,6 +22604,37 @@ async fn owner_cert_seal_evidence(
     owner_cert_evidence_for_with_digests(state, &with_digests).await
 }
 
+/// #908/R17 Home blocker: how many digest-only seats one seal may fetch
+/// for (the common wedge is one seat; the bound keeps a pathological
+/// roster from stalling the seal on many sequential fetch deadlines).
+const SEAL_TIME_CERT_FETCH_CAP_SEATS: usize = 8;
+
+/// #908/R17: seal-time warranted certificate fetch. For each still
+/// digest-only seat (up to [`SEAL_TIME_CERT_FETCH_CAP_SEATS`]), publish a
+/// group-scoped request for its committed digest on the group's metadata
+/// topic and return without waiting. An active roster member holding the
+/// verified owner-issued pair answers (see `seat_cert_fetch`); the
+/// response handler hydrates the seat durably, and the NEXT seal retry
+/// finds the bytes.
+fn warranted_fetch_for_pending_seats(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    members: &[String],
+) {
+    // NEVER wait on the network under the caller's membership lock.
+    let stable_group_id = info.stable_group_id().to_string();
+    let metadata_topic = info.metadata_topic.clone();
+    for member_hex in members.iter().take(SEAL_TIME_CERT_FETCH_CAP_SEATS) {
+        let Some(seat) = info.members_v2.get(member_hex) else {
+            continue;
+        };
+        let Some(digest_hex) = seat.certificate_digest.as_ref() else {
+            continue;
+        };
+        publish_group_cert_fetch(state, &metadata_topic, &stable_group_id, digest_hex);
+    }
+}
+
 /// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
 /// path NEVER evicts. If any active member currently fails OwnerCertified
 /// re-verification it refuses with a typed error directing the caller to
@@ -21933,6 +22681,21 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 "#483: seal-time hydrate installed certificates onto digest-only seats"
             );
         }
+        // #908/R17 Home blocker: seats the local caches could not hydrate
+        // get a group-scoped fetch request published on the group's
+        // metadata topic. It does not wait: THIS seal falls through to the
+        // pending refusal below, an active member holding the verified
+        // pair answers, the response hydrates the seat durably, and the
+        // next seal retry succeeds. This is what lets an admin seal while
+        // the certificate's owner is offline.
+        let still_pending: Vec<String> = info
+            .active_members()
+            .filter(|m| m.certificate.is_none() && m.certificate_digest.is_some())
+            .map(|m| m.agent_id.clone())
+            .collect();
+        if !still_pending.is_empty() {
+            warranted_fetch_for_pending_seats(state, info, &still_pending);
+        }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
     let verdict = info.owner_cert_verdict(&evidence);
@@ -21947,15 +22710,28 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 },
             );
         }
+        // #908/R17: the refusal lists BOTH classes — in-grace AND
+        // digest-pending — so the operator sees exactly who is pending
+        // (the R17 log's empty `[]` was this line reporting only
+        // in_grace).
+        let mut pending = verdict.in_grace();
+        pending.extend(verdict.digest_pending());
         return Err(
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
                 group_id,
-                members: verdict.in_grace(),
+                members: pending,
             },
         );
     }
-    info.seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
-        .map(|(commit, _evicted)| commit)
+    let sealed = info
+        .seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
+        .map(|(commit, _evicted)| commit);
+    // C3: an all-clean OwnerCertified seal ends any certificate-unobtainable
+    // refusal window for this group.
+    if sealed.is_ok() && info.policy.admission.owner_certified_user_id().is_some() {
+        clear_cert_evidence_stamps(state, info.stable_group_id(), None);
+    }
+    sealed
 }
 
 /// ADR-0064 (Decision §1/§1a; slice-3 closes the seat-path advisory):
@@ -23241,6 +24017,8 @@ pub(in crate::server) async fn ban_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a banned member's refusal window ends.
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -23793,7 +24571,7 @@ pub(in crate::server) async fn create_join_request(
     use base64::Engine as _;
     let requester_kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         request_id: request.request_id.clone(),
         requester_agent_id: request.requester_agent_id.clone(),
         message: request.message.clone(),
@@ -23810,28 +24588,63 @@ pub(in crate::server) async fn create_join_request(
         publish_named_group_metadata_event_with_envelope(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
     if let Some(envelope) = envelope_bytes {
-        if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
-            let mut dm_payload =
-                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
-            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            dm_payload.extend_from_slice(&envelope);
-            let agent = Arc::clone(&state.agent);
-            let creator = creator_hex.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent
-                    .send_direct_with_config(
-                        &creator_id,
-                        dm_payload,
-                        named_group_direct_delivery_config(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        creator = %LogHexId::agent(&creator),
-                        "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+        if parse_agent_id_hex(&creator_hex).is_ok() {
+            // #908: the offer to the authority is a DURABLE obligation,
+            // not a one-shot spawned DM. Persisted here (before the 201
+            // returns), retried by the background worker on the bounded
+            // ADR 0028 schedule over the gossip-only config (#913), and
+            // cleared on the authority's DURABLE application ACK (the
+            // handler's Inserted/Duplicate disposition — never a bare
+            // enqueue) or when the join resolves. A failed send is a
+            // retry, never a silent loss, and a restart resumes it.
+            let now_ms = now_millis_u64();
+            let obligation = RequesterOfferObligation {
+                group_id: event_group_id.to_string(),
+                request_id: request.request_id.clone(),
+                requester_agent_id: request.requester_agent_id.clone(),
+                authority_agent_id: creator_hex.clone(),
+                envelope_bytes: envelope.to_vec(),
+                digest: blake3::hash(&envelope).into(),
+                byte_size: envelope.len(),
+                first_seen_ms: now_ms,
+                next_retry_at_ms: now_ms,
+                retry_count: 0,
+            };
+            if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
+                // Fail-visible fallback: the pre-#908 one-shot shape, so
+                // a persist failure never leaves the authority with LESS
+                // than it had before.
+                tracing::warn!(
+                    creator = %LogHexId::agent(&creator_hex),
+                    %error,
+                    "#908: failed to persist the requester offer obligation; falling back to a one-shot send"
+                );
+                if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
+                    let mut dm_payload = Vec::with_capacity(
+                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len(),
                     );
+                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                    dm_payload.extend_from_slice(&envelope);
+                    let agent = Arc::clone(&state.agent);
+                    let creator = creator_hex.clone();
+                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
+                    tokio::spawn(async move {
+                        if let Err(e) = agent
+                            .send_direct_with_config(
+                                &creator_id,
+                                dm_payload,
+                                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                creator = %LogHexId::agent(&creator),
+                                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+                            );
+                        }
+                    });
                 }
-            });
+            }
         }
     }
 
@@ -23937,6 +24750,9 @@ pub(in crate::server) async fn approve_join_request(
             "named-group state is awaiting directory-durability confirmation",
         );
     }
+    // Approval mutates the live roster before its outbox and roster writes.
+    // Hold G until every durable or compensating outcome has finished.
+    let approval_gss_guard = state.gss_publication_gate.write().await;
     let proof_read_now_ms = now_millis_u64();
 
     // R3: Check the live outbox first, then completed tombstones. Return the
@@ -24407,6 +25223,7 @@ pub(in crate::server) async fn approve_join_request(
             *state.pending_b8_compensation.lock().await = None;
         }
     }
+    drop(approval_gss_guard);
     drop(roster_persistence_guard);
     drop(relay_persistence_guard);
 
@@ -30464,7 +31281,17 @@ pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
     };
-    write_relay_outbox_sidecar(state, &json).await
+    let outcome = write_relay_outbox_sidecar(state, &json).await;
+    #[cfg(test)]
+    if let Err(ref e) = outcome {
+        eprintln!(
+            "#942R3 PROBE write failed at {}: {e}",
+            state.predecessor_relay_outbox_path.display()
+        );
+    }
+    #[cfg(test)]
+    eprintln!("#942R3 PROBE write outcome: {outcome:?}");
+    outcome
 }
 
 /// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
@@ -31831,6 +32658,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                         evidence,
                                         quarantine,
                                         false,
+                                        None,
                                     )
                                     .await;
                                     if durable {
@@ -33084,6 +33912,70 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
     }
 }
 
+/// #908/R17 Home blocker: stage the typed join refusal for a seal refusal
+/// whose pending members are ALL still digest-only (committed digest, no
+/// bytes) — but only once such refusals have continued for
+/// CERT_EVIDENCE_DEADLINE_MS for the same join attempt. The seal publishes
+/// a group-scoped fetch each time, so until then the refusal stays
+/// retryable. In-grace members (evidence in flight) never stage a refusal.
+async fn stage_refusal_if_certificates_unobtainable(
+    state: &AppState,
+    group_key: &str,
+    member_agent_id: &str,
+    event: &NamedGroupMetadataEvent,
+    error: &x0x::groups::state_commit::ApplyError,
+) {
+    let pending = match error {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => members,
+        _ => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // A refusal is bound to a join attempt; without one there is nothing
+    // to stage and no window to track.
+    let Some(attempt_id) = member_joined_event_attempt_id(event) else {
+        return;
+    };
+    let (all_digest_only, stable_group_id) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
+            return;
+        };
+        let all_digest_only = pending.iter().all(|hex| {
+            info.members_v2
+                .get(hex)
+                .is_some_and(|seat| seat.certificate.is_none() && seat.certificate_digest.is_some())
+        });
+        (all_digest_only, info.stable_group_id().to_string())
+    };
+    if !all_digest_only {
+        return;
+    }
+    // The refusal is RETRYABLE first — the joiner keeps retrying while a
+    // fetch may still obtain the certificate (a member caching it comes
+    // online, the owner returns). Stage the typed terminal refusal only
+    // after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
+    if !cert_evidence_deadline_elapsed(state, &stable_group_id, member_agent_id, &attempt_id) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            member = %LogHexId::agent(member_agent_id),
+            "#946: certificate-unobtainable refusal is retryable (deadline not reached); no typed refusal yet"
+        );
+        return;
+    }
+    state
+        .groups_diagnostics
+        .record_invite_refusal(group_key, "certificate_evidence_unavailable");
+    stage_join_refusal(
+        state,
+        group_key,
+        member_agent_id,
+        event,
+        JoinRefusalReason::CertificateEvidenceUnavailable,
+    )
+    .await;
+}
 /// #477 A1 — stage a typed, attempt-bound refusal on the AUTHORITY. The
 /// receipt body is stored unsigned; the ML-DSA signature materializes
 /// lazily on first capable serve (rate-limited). Bounded + TTL-swept.
@@ -33925,6 +34817,46 @@ async fn group_membership_lock_for_known_group(
     )))
 }
 
+/// R19 (#802 R18 Home blocker): serialize a served JoinResult with the
+/// authority's roster certificate sidecar
+/// ([`seat_cert_fetch::roster_certificate_sidecar`]) attached. The sidecar
+/// is trimmed from the end until the payload fits the budget of the
+/// transport the BARE result would use: an inline result stays within the
+/// direct-message limit, and an oversized one stays within the
+/// control-blob limit. Attaching certificates therefore never moves a
+/// result onto a transport the joiner may not support.
+pub(in crate::server) async fn join_result_payload_with_roster_certificates(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    mut response: JoinResultMessage,
+) -> serde_json::Result<Vec<u8>> {
+    let bare = serde_json::to_vec(&response)?;
+    let mut sidecar =
+        seat_cert_fetch::roster_certificate_sidecar(state, group_id, member_agent_id).await;
+    let budget = if bare.len() <= x0x::dm::MAX_PAYLOAD_BYTES {
+        x0x::dm::MAX_PAYLOAD_BYTES
+    } else {
+        TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES
+    };
+    while !sidecar.is_empty() {
+        let JoinResultMessage::Result {
+            roster_certificates_b64,
+            ..
+        } = &mut response
+        else {
+            return Ok(bare);
+        };
+        *roster_certificates_b64 = sidecar.clone();
+        let payload = serde_json::to_vec(&response)?;
+        if payload.len() <= budget {
+            return Ok(payload);
+        }
+        sidecar.pop();
+    }
+    Ok(bare)
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -34104,8 +35036,16 @@ async fn handle_join_result_message_bound(
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
+                roster_certificates_b64: Vec::new(),
             };
-            let payload = match serde_json::to_vec(&response) {
+            let payload = match join_result_payload_with_roster_certificates(
+                state,
+                &group_id,
+                &member_agent_id,
+                response,
+            )
+            .await
+            {
                 Ok(payload) => payload,
                 Err(e) => {
                     tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result event: {e}");
@@ -34132,19 +35072,52 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 }
-                if let Err(e) = control_blob::send_reference(
-                    &state.control_blobs,
-                    &state.agent,
-                    sender,
-                    control_blob::ControlBlobKind::JoinResult,
-                    &group_id,
-                    attempt_id.as_deref(),
-                    payload,
-                )
-                .await
-                {
-                    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result reference: {e}");
-                }
+                // #876 r2 (review item 3) + #878 r4 (finding 2): the
+                // bounded staging retry must NOT run inside the single
+                // join-result listener loop, and repeated requests from
+                // the same (group, recipient) must not stack overlapping
+                // staging tasks. One 1-permit semaphore per pair: a
+                // duplicate while a staging runs is DROPPED (the
+                // reference it would stage is byte-identical; the
+                // recipient's retry fetches the live one).
+                let Some(permit) = acquire_join_result_staging_permit(state, &group_id, sender)
+                else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "join-result staging already in flight for this recipient; dropping the duplicate (#878 r4)"
+                    );
+                    return;
+                };
+                let control_blobs = state.control_blobs.clone();
+                let agent = Arc::clone(&state.agent);
+                let group_id_for_task = group_id.clone();
+                let attempt = attempt_id.clone();
+                let member_for_log = member_agent_id.clone();
+                let recipient = *sender;
+                let guard_key = (group_id.clone(), *sender);
+                let guard_state = Arc::clone(state);
+                tokio::spawn(async move {
+                    let _staging_permit = permit;
+                    let outcome = control_blob::send_reference(
+                        &control_blobs,
+                        &agent,
+                        &recipient,
+                        control_blob::ControlBlobKind::JoinResult,
+                        &group_id_for_task,
+                        attempt.as_deref(),
+                        payload,
+                    )
+                    .await;
+                    // #878 r5 (review): drop OUR permit BEFORE pruning,
+                    // so the released semaphore is observably idle — the
+                    // prune condition (available == 1) actually holds.
+                    drop(_staging_permit);
+                    release_join_result_staging_guard(&guard_state, &guard_key);
+                    if let Err(e) = outcome {
+                        tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
+                    }
+                });
                 return;
             }
             if let Err(e) = state
@@ -34177,6 +35150,7 @@ async fn handle_join_result_message_bound(
             event,
             chain,
             head_attestation,
+            roster_certificates_b64,
         } => {
             let event = *event;
             tracing::debug!(
@@ -34311,6 +35285,18 @@ async fn handle_join_result_message_bound(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&expected_key);
+            // R19: hydrate digest-only seats from the authority's
+            // certificate sidecar. This runs whether or not THIS apply
+            // was accepted: the gossip copy of the same MemberAdded may
+            // already have seated us, leaving this result a no-op apply.
+            // Every entry is verified against the committed seat digest
+            // and the group owner before it is installed.
+            seat_cert_fetch::hydrate_from_roster_certificate_sidecar(
+                state,
+                &group_id,
+                &roster_certificates_b64,
+            )
+            .await;
             if applied {
                 // #477 (r6 item 2 → r7): the seat finalize ran INSIDE the
                 // MemberAdded apply while its membership guard was held
@@ -35555,6 +36541,9 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    mod r17_cert_hydrate;
+    mod r19_cert_carry;
+    mod requester_offer;
     mod wp_c;
 
     fn fake_group_state_commit(
@@ -36214,6 +37203,14 @@ pub(in crate::server) mod tests {
             reason: "test".to_string(),
             loaded_at_unix_ms: 0,
         };
+        let acl_admin = Arc::new(
+            crate::server::acl_admin::AclAdmin::load(
+                data_dir,
+                x0x::connect::ConnectPolicy::default(),
+                exec_policy.clone(),
+            )
+            .await,
+        );
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
@@ -36236,13 +37233,21 @@ pub(in crate::server) mod tests {
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
+            gss_publication_gate: Arc::new(RwLock::new(())),
+            group_roster_gossip_lock: Mutex::new(()),
             named_groups_path,
             home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+            requester_offer_outbox: RwLock::new(HashMap::new()),
+            requester_offer_outbox_path: data_dir.join("requester_offer_outbox.json"),
+            requester_offer_outbox_persistence_lock: Mutex::new(()),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+            cert_fetch_requested: StdMutex::new(HashMap::new()),
+            cert_fetch_answered: StdMutex::new(HashMap::new()),
+            cert_unresolvable_since: StdMutex::new(HashMap::new()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -36288,6 +37293,8 @@ pub(in crate::server) mod tests {
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
+            parked_role_updates: StdMutex::new(HashMap::new()),
+            join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
             public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
@@ -36312,6 +37319,7 @@ pub(in crate::server) mod tests {
             start_time: Instant::now(),
             health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
+            calls: crate::server::routes::calls::new_registry(),
             file_transfers: RwLock::new(HashMap::new()),
             receive_hashers: RwLock::new(HashMap::new()),
             pending_file_chunks: RwLock::new(HashMap::new()),
@@ -36334,6 +37342,7 @@ pub(in crate::server) mod tests {
             cert_journal_lock: tokio::sync::Mutex::new(()),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+            acl_admin,
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
@@ -37660,6 +38669,7 @@ pub(in crate::server) mod tests {
                     event: Box::new(event),
                     chain: Vec::new(),
                     head_attestation: attestation.map(Box::new),
+                    roster_certificates_b64: Vec::new(),
                 },
             )
             .await;
@@ -41679,6 +42689,1182 @@ pub(in crate::server) mod tests {
             x0x::groups::GroupRole::Member
         );
         assert_eq!(stored.shared_secret, Some(vec![9; 32]));
+        Ok(())
+    }
+
+    /// #876 (issue item 3): a role update that arrives before its target
+    /// member's `MemberAdded` must be PARKED (warn) — never silently
+    /// dropped — and replayed to acceptance once the member lands. This is
+    /// the R15 shape: the member's join blob lagged behind the control-blob
+    /// staging budget, so sfo saw the role update first. On the pre-fix
+    /// head the update is silently rejected and the lot stays empty (the
+    /// fail-before).
+    #[tokio::test]
+    async fn role_update_for_late_member_parks_then_replays_on_member_add() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "role-update-late-member-876";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // #876 r2 (review item 1): the group's LOCAL MAP KEY differs
+        // from its stable id (genesis-pinned), so the parked update is
+        // keyed under the map key while the events carry the stable id —
+        // the mismatch shape the replay must survive.
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "876-stable-role-late".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let foreign = "33".repeat(32);
+
+        // The owner's chain: MemberAdded seats `foreign`, RoleUpdated
+        // promotes them — both sealed exactly as production seals them.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            foreign.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let revision_add = seated.roster_revision;
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        // Advance the scratch to the post-add state the authority holds
+        // (the role update must chain from the MemberAdded's hash).
+        seated.prev_state_hash = Some(parent.state_hash.clone());
+        seated.state_hash = commit_add.state_hash.clone();
+        seated.state_revision = commit_add.revision;
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_add,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+
+        let mut adminified = seated.clone();
+        adminified.roster_revision = adminified.roster_revision.saturating_add(1);
+        adminified.set_member_role(&foreign, x0x::groups::GroupRole::Admin);
+        let revision_role = adminified.roster_revision;
+        let commit_role = sign_metadata_terminality_commit(&seated, &adminified, &state, 3_000);
+        let role_update = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_role,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit_role),
+        };
+
+        // 1) The role update arrives FIRST: the member is not in the local
+        //    roster, so the apply refuses — but parks instead of dropping.
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_update.clone(),
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted, "the member has not landed yet");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                lot.get(group_id).map(Vec::len),
+                Some(1),
+                "#876: the role update is PARKED, not dropped"
+            );
+        }
+
+        // 2) The MemberAdded lands: accepted, and the parked role update
+        //    replays through the ordinary apply to acceptance.
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "the member lands: {applied_add:?}");
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            assert!(stored.has_active_member(&foreign));
+            assert_eq!(
+                stored.members_v2[&foreign].role,
+                x0x::groups::GroupRole::Admin,
+                "#876: the parked role update replayed to acceptance"
+            );
+        }
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#876: the parking lot drained after the replay"
+            );
+        }
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 1): a parked update whose member never
+    /// lands keeps its ORIGINAL `parked_at` across other members'
+    /// landings (the TTL is not reset by the drain), and finally EXPIRES
+    /// on the TTL. On the r2 drain (re-park with `Instant::now()`) the
+    /// timestamp assert fails (the fail-before); without the expiry
+    /// retain the second phase fails.
+    #[tokio::test]
+    async fn parked_update_keeps_its_ttl_across_other_members_landing() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-ttl-continuity-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // Distinct stable id from the map key (the r1.1 shape).
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-parked-ttl".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        let never_lands = "44".repeat(32);
+        let lands_first = "55".repeat(32);
+        let lands_second = "66".repeat(32);
+
+        // Park: a role update for `never_lands` (no commit validation is
+        // needed to reach the parking site — the member check precedes
+        // the stateful apply).
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: never_lands,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        let parked_at_original = {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lot.get(group_id).expect("parked")[0].parked_at
+        };
+
+        // A DIFFERENT member lands: the drain runs, `never_lands` is
+        // still absent — the entry must be re-inserted with its ORIGINAL
+        // parked_at (TTL continuity).
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            lands_first.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: lands_first,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "first member lands: {applied_add:?}");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let list = lot
+                .get(group_id)
+                .expect("still parked for the absent member");
+            assert_eq!(list.len(), 1);
+            assert_eq!(
+                list[0].parked_at, parked_at_original,
+                "#878 r3: the drain must NOT reset the TTL of an update whose member never lands"
+            );
+        }
+
+        // Expire it, then land another member: the drain now DROPS it.
+        {
+            let mut lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lot.get_mut(group_id).expect("parked")[0].parked_at =
+                Instant::now() - PENDING_JOIN_RESULT_TTL - std::time::Duration::from_secs(1);
+        }
+        let seated_now = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group")
+            .clone();
+        let mut seated2 = seated_now.clone();
+        seated2.roster_revision = seated2.roster_revision.saturating_add(1);
+        seated2.add_member(
+            lands_second.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add2 = sign_metadata_terminality_commit(&seated_now, &seated2, &state, 3_000);
+        let member_added2 = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated2.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: lands_second,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add2),
+        };
+        let applied_add2 = apply_named_group_metadata_event(
+            &state,
+            member_added2,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            applied_add2.accepted,
+            "second member lands: {applied_add2:?}"
+        );
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#878 r3: the expired entry is dropped, never re-parked forever"
+            );
+        }
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4b): teardown — a self-leave that deletes
+    /// the local group clears its parked updates. Reverting the clear
+    /// leaves the lot populated (the fail-before).
+    #[tokio::test]
+    async fn self_leave_deletion_clears_the_parked_lot() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-self-leave-878";
+        let (mut info, admin_hex, member_hex) = metadata_terminality_test_group(&state, group_id);
+        // The OTHER member is an admin, so the local agent's self-leave
+        // passes the last-admin invariant (the apply's mutate removes
+        // ONLY the leaver).
+        info.set_member_role(&member_hex, x0x::groups::GroupRole::Admin);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        // Park a role update for a member who never lands.
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: "77".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The local agent self-leaves: the local group is deleted and its
+        // parked updates die with it.
+        let mut scratch = parent.clone();
+        scratch.remove_member(&admin_hex, Some(admin_hex.clone()));
+        let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 2_000);
+        let leave_event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: admin_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        };
+        let leave = apply_named_group_metadata_event(
+            &state,
+            leave_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(leave.accepted, "self-leave path: {leave:?}");
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the parked lot dies with the group"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4b): a `MemberJoined` landing ALSO drains
+    /// the parked lot (`applied_member_add` matches both seating paths).
+    /// Reverting the MemberJoined arm leaves the lot populated (the
+    /// fail-before).
+    #[tokio::test]
+    async fn member_joined_landing_also_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-member-joined-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-member-joined".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let invite_secret = "member-joined-878-secret".to_string();
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // The joiner: a real member-signed MemberJoined (GSS plane, real
+        // keypair, matching invite secret).
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner_kp.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let ts_ms = now_millis_u64();
+        let canonical = canonical_member_joined_bytes(
+            parent.stable_group_id(),
+            Some(parent.stable_group_id()),
+            &joiner_hex,
+            &BASE64.encode(joiner_kp.public_key().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            &admin_hex,
+            &invite_secret,
+            ts_ms,
+            None,
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            joiner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign join fixture: {e:?}"))?;
+        let member_joined = NamedGroupMetadataEvent::MemberJoined {
+            group_id: parent.stable_group_id().to_string(),
+            stable_group_id: Some(parent.stable_group_id().to_string()),
+            member_agent_id: joiner_hex.clone(),
+            member_public_key_b64: BASE64.encode(joiner_kp.public_key().as_bytes()),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: admin_hex.clone(),
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+            certificate_b64: None,
+        };
+
+        // Park a role update for the joiner BEFORE they land.
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_some_and(|list| !list.is_empty()),
+            "parked before the join"
+        );
+
+        // The joiner lands through an accepted MemberJoined.
+        let join =
+            apply_named_group_metadata_event(&state, member_joined, joiner_id, true, None).await;
+        assert!(join.accepted, "the join lands: {join:?}");
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the MemberJoined landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 2): the TreeKEM pending-replay path lands
+    /// its MemberAdded through `apply_named_group_metadata_event_inner`
+    /// (`replay_pending_treekem_events`, allow_queue = false) — the
+    /// landing hook must fire THERE too, or the lagging joiner's parked
+    /// role updates never drain. Removing the inner-path hook leaves the
+    /// lot populated (the fail-before).
+    #[tokio::test]
+    async fn inner_replay_path_landing_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-inner-replay-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-inner-replay".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let invite_secret = "inner-replay-878-secret".to_string();
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // Park a role update for the joiner first.
+        let joiner_hex = "88".repeat(32);
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The member lands through the INNER path (the TreeKEM
+        // pending-replay entry) with allow_queue = false.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+        let applied_inner = apply_named_group_metadata_event_inner(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            applied_inner.accepted,
+            "the inner path lands: {applied_inner:?}"
+        );
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the INNER-path landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 1): a `JoinRequestApproved` landing ALSO
+    /// seats a member — the causal-approval replay path (and the direct
+    /// apply) must drain the parked lot. Removing the
+    /// JoinRequestApproved arm from `applied_member_add` (or the
+    /// replay's post-guard drain) leaves the lot populated (the
+    /// fail-before).
+    #[tokio::test]
+    async fn join_request_approved_landing_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-join-approval-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-join-approval".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        // The pending join request the approval resolves.
+        info.join_requests.insert(
+            "req-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                "99".repeat(32),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // Park a role update for the requester BEFORE approval.
+        let requester = "99".repeat(32);
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: requester.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The approval seats the requester.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            requester.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-878".to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(commit_add),
+        };
+        let applied_approval =
+            apply_named_group_metadata_event(&state, approval, state.agent.agent_id(), true, None)
+                .await;
+        assert!(
+            applied_approval.accepted,
+            "the approval lands: {applied_approval:?}"
+        );
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r4: the JoinRequestApproved landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review follow-up): the CAUSAL-QUEUE replay drain. A
+    /// lagging peer receives the approval BEFORE the join request it
+    /// resolves: the approval is queued, the JoinRequestCreated then
+    /// lands (the production replay trigger), the replay applies the
+    /// approval through _serialized directly, seats the requester, and
+    /// — only with the post-guard drain (:9498-9506 region) — the
+    /// parked role update APPLIES. Asserts the ROLE CHANGE LANDED, not
+    /// only that the lot drained. Deleting the replay drain leaves the
+    /// requester at Member (the fail-before).
+    #[tokio::test]
+    async fn causal_queue_approval_landing_applies_the_parked_role_update() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-causal-queue-878";
+        // NOTE: map key == stable id here (no genesis pinning) — the
+        // causal-queue admission binds the decoded event's group_id to
+        // the resolved map key; the distinct-key park coverage lives in
+        // the other r3/r4 tests.
+        let (info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let admin_id = state.agent.agent_id();
+
+        // The requester's REAL keypair: the JoinRequestCreated is
+        // member-signed by them (NonMemberRequest commit).
+        let requester_kp = crate::identity::AgentKeypair::generate()?;
+        let requester_id = requester_kp.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+
+        // Precompute the sender's consecutive chain exactly as the
+        // producing peer sealed it:
+        //   state0 (no record) --Created--> state1 --Approved--> state2.
+        let mut state1 = parent.clone();
+        state1.roster_revision = state1.roster_revision.saturating_add(1);
+        state1.join_requests.insert(
+            "req-causal-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                requester_hex.clone(),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        let created_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            parent.state_revision.saturating_add(1),
+            Some(parent.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state1.members_v2),
+            x0x::groups::compute_policy_hash(&state1.policy),
+            x0x::groups::compute_public_meta_hash(&state1.public_meta()),
+            state1.security_binding.clone(),
+            false,
+            1_000,
+            &requester_kp,
+        )?;
+        // state1 as the apply leaves it.
+        state1.prev_state_hash = Some(parent.state_hash.clone());
+        state1.state_hash = created_commit.state_hash.clone();
+        state1.state_revision = created_commit.revision;
+
+        let mut state2 = state1.clone();
+        state2.roster_revision = state2.roster_revision.saturating_add(1);
+        state2.add_member(
+            requester_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let approval_revision = state2.roster_revision;
+        let approval_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            state1.state_revision.saturating_add(1),
+            Some(state1.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state2.members_v2),
+            x0x::groups::compute_policy_hash(&state2.policy),
+            x0x::groups::compute_public_meta_hash(&state2.public_meta()),
+            state2.security_binding.clone(),
+            false,
+            2_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // The post-join state the role update chains from (the admin
+        // seals it AFTER the join — realistic late-arrival ordering).
+        state2.prev_state_hash = Some(state1.state_hash.clone());
+        state2.state_hash = approval_commit.state_hash.clone();
+        state2.state_revision = state1.state_revision.saturating_add(1);
+        let mut state3 = state2.clone();
+        state3.roster_revision = state3.roster_revision.saturating_add(1);
+        state3.set_member_role(&requester_hex, x0x::groups::GroupRole::Admin);
+        let role_commit = x0x::groups::GroupStateCommit::sign(
+            state2.stable_group_id().to_string(),
+            state2.state_revision.saturating_add(1),
+            Some(state2.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state3.members_v2),
+            x0x::groups::compute_policy_hash(&state3.policy),
+            x0x::groups::compute_public_meta_hash(&state3.public_meta()),
+            state3.security_binding.clone(),
+            false,
+            3_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // 1) Park the role update for the requester (they have not
+        //    landed).
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: state3.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: requester_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(role_commit),
+        };
+        let applied =
+            apply_named_group_metadata_event(&state, role_event, admin_id, true, None).await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // 2) The approval arrives BEFORE its predecessor — queued.
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            revision: approval_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(approval_commit),
+        };
+        // The REAL V2 envelope signed by the approval actor over the
+        // group's metadata topic (what validate_causal_envelope checks).
+        let metadata_topic = parent.metadata_topic.clone();
+        let admin_kp = state.agent.identity().agent_keypair();
+        let envelope = {
+            use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
+            let payload = serde_json::to_vec(&approval)?;
+            let agent_id = state.agent.agent_id();
+            let pub_bytes = admin_kp.public_key().as_bytes();
+            let mut signing = Vec::with_capacity(10 + 32 + metadata_topic.len() + payload.len());
+            signing.extend_from_slice(b"x0x-msg-v2");
+            signing.extend_from_slice(agent_id.as_bytes());
+            signing.extend_from_slice(metadata_topic.as_bytes());
+            signing.extend_from_slice(&payload);
+            let sig = sign_with_ml_dsa(admin_kp.secret_key(), &signing)
+                .map_err(|e| anyhow::anyhow!("sign envelope: {e:?}"))?;
+            let sig_bytes = sig.as_bytes();
+            let topic_bytes = metadata_topic.as_bytes();
+            let mut buf = Vec::with_capacity(
+                1 + 32
+                    + 2
+                    + pub_bytes.len()
+                    + 2
+                    + sig_bytes.len()
+                    + 2
+                    + topic_bytes.len()
+                    + payload.len(),
+            );
+            buf.push(0x02u8);
+            buf.extend_from_slice(agent_id.as_bytes());
+            buf.extend_from_slice(&(pub_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(pub_bytes);
+            buf.extend_from_slice(&(sig_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(sig_bytes);
+            buf.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(topic_bytes);
+            buf.extend_from_slice(&payload);
+            buf
+        };
+        let approval_apply =
+            apply_named_group_metadata_event(&state, approval, admin_id, true, Some(&envelope))
+                .await;
+        assert!(
+            !approval_apply.accepted,
+            "no record yet — queued, not applied"
+        );
+        assert!(
+            state
+                .causal_approval_queue
+                .read()
+                .await
+                .get(group_id)
+                .is_some_and(|q| !q.is_empty()),
+            "the approval was admitted to the causal queue"
+        );
+
+        // 3) The predecessor lands: the requester's member-signed
+        //    JoinRequestCreated. Its acceptance triggers the causal
+        //    replay (the production trigger), which applies the queued
+        //    approval and — with the post-guard drain — the parked role
+        //    update.
+        let created = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: now_millis_u64(),
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(created_commit),
+        };
+        let created_apply =
+            apply_named_group_metadata_event(&state, created, requester_id, true, None).await;
+        assert!(
+            created_apply.accepted,
+            "the predecessor lands: {created_apply:?}"
+        );
+
+        // 4) THE assertion: the role change LANDED through the whole
+        //    chain (created → replay → approval → drain → role update).
+        {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group retained");
+            let seat = info
+                .members_v2
+                .get(&requester_hex)
+                .expect("the requester was seated by the replayed approval");
+            assert!(
+                seat.is_active(),
+                "the replayed approval seated the requester as an active member"
+            );
+            assert_eq!(
+                seat.role,
+                x0x::groups::GroupRole::Admin,
+                "#878 r4: the PARKED role update applied after the causal-queue landing"
+            );
+        }
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "the parked lot drained"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 2): a second concurrent oversized
+    /// join-result staging for the same (group, recipient) does NOT start
+    /// a second task — the 1-permit guard drops the duplicate. Removing
+    /// the guard lets the second acquire succeed (the fail-before: the
+    /// assert on None fails).
+    #[tokio::test]
+    async fn concurrent_join_result_staging_is_bounded_per_recipient() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "staging-bound-878".to_string();
+        let recipient = crate::identity::AgentId([0x5A; 32]);
+        let first = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(first.is_some(), "the first staging acquires the permit");
+        let second = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            second.is_none(),
+            "#878 r4: the duplicate staging is dropped while the first runs"
+        );
+        drop(first);
+        let third = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            third.is_some(),
+            "the permit is released when the staging task ends"
+        );
+        // A DIFFERENT recipient is unaffected.
+        let other = crate::identity::AgentId([0x5B; 32]);
+        assert!(acquire_join_result_staging_permit(&state, &group_id, &other).is_some());
+        // #878 r5: the guard entry is PRUNED once released (no map growth
+        // with the (group, recipient) universe).
+        drop(third);
+        release_join_result_staging_guard(&state, &(group_id.clone(), recipient));
+        assert!(
+            !state
+                .join_result_staging_guards
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&(group_id.clone(), recipient)),
+            "the per-pair guard entry is pruned after release"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4a): the RECIPIENT sends the Release. A
+    /// real pull on a single networked state looped to itself (gossip
+    /// delivers own publishes to own subscriptions): the production
+    /// dispatch answers Fetch with Chunk; the pull reassembles,
+    /// digest-verifies and EMITS its Release notice; the same dispatch
+    /// handles it and frees the staged slot. Deleting the release notice
+    /// in `fetch_and_apply` leaves the slot staged forever (the
+    /// fail-before).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completed_pull_sends_its_release_over_the_wire() -> Result<()> {
+        let plane = format!("ctrl-release-{}", rand::random::<u32>());
+        let (state, _dir) = networked_test_state(&plane).await?;
+        let group_id = insert_local_public_group(&state, &"b1".repeat(16)).await;
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        // A Trusted contact card for OURSELVES with our own KEM (the
+        // gossip-DM capability shape the advert service normally
+        // converges).
+        state
+            .agent
+            .contacts()
+            .write()
+            .await
+            .add(crate::contacts::Contact {
+                agent_id: local,
+                trust_level: crate::contacts::TrustLevel::Trusted,
+                label: None,
+                added_at: 0,
+                last_seen: None,
+                identity_type: crate::contacts::IdentityType::Known,
+                machines: Vec::new(),
+                dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready(
+                    state.agent_kem_keypair.public_bytes.clone(),
+                )),
+            });
+        // Production dispatch (test states skip server listener startup).
+        {
+            let dispatch_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut rx = dispatch_state.agent.subscribe_direct();
+                while let Some(msg) = rx.recv().await {
+                    if let Ok(message) = serde_json::from_slice::<ControlBlobMessage>(&msg.payload)
+                    {
+                        handle_control_blob_message(
+                            &dispatch_state,
+                            &msg.sender,
+                            msg.verified,
+                            message,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        // The payload is deliberately NOT valid event JSON: the pull still
+        // completes and digest-verifies (which is what triggers the
+        // Release); only the post-release apply refuses it.
+        let bytes = vec![0xA6u8; x0x::dm::MAX_PAYLOAD_BYTES + 512];
+        let reference = crate::server::routes::named_groups::control_blob::test_reference(
+            &bytes, &group_id, &local_hex, &local_hex,
+        );
+        state
+            .control_blobs
+            .stage(reference.clone(), bytes)
+            .map_err(|e| anyhow::anyhow!("stage: {e}"))?;
+        // The recipient sees its own Reference through the production
+        // handler (the transport delivery is the gossip self-loop).
+        handle_control_blob_message(
+            &state,
+            &local,
+            true,
+            ControlBlobMessage::Reference {
+                reference: reference.clone(),
+            },
+        )
+        .await;
+        // #878 r3 flake fix (#910): do NOT assert the intermediate
+        // `staged_len() == 1` here. The stage() above made the slot
+        // staged SYNCHRONOUSLY, and the whole self-looped pipeline
+        // (Reference → fetch → chunks → digest-verify → Release →
+        // release_staged) runs on spawned tasks that can complete BEFORE
+        // this assert executes — the assert then observed 0 and failed
+        // ("left 0 right 1") on an unrelated PR. Assert only the TERMINAL
+        // state, which cannot race: `release_staged` is the only remover
+        // of a staged entry inside this window (the TTL prune is lazy and
+        // `PENDING_JOIN_RESULT_TTL` is minutes away), so staged_len
+        // reaching 0 IS the Release round trip.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.control_blobs.staged_len() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "#878 r3: the completed pull never sent its Release"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // The Release path freed the slot EXACTLY once (not a TTL prune,
+        // not a re-stage): the counter increments only inside
+        // `release_staged`'s successful-remove arm.
+        assert_eq!(
+            state.control_blobs.released_notice_count(),
+            1,
+            "#878 r3: the staged slot was freed by exactly one Release notice"
+        );
+        state.agent.shutdown().await;
         Ok(())
     }
 
@@ -46523,6 +48709,7 @@ pub(in crate::server) mod tests {
             }),
             chain: Vec::new(),
             head_attestation: None,
+            roster_certificates_b64: Vec::new(),
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");
@@ -47216,6 +49403,81 @@ pub(in crate::server) mod tests {
         );
     }
 
+    /// #979 r2 (B1, the wire-level pin): two CONCURRENT witnesses of one
+    /// obligation register two DISTINCT in-flight waiters — the exact
+    /// registration the fan-out performs — and BOTH stay live. Under the
+    /// r1 shared id the second registration closed the first (the
+    /// registry-hazard test in dm.rs pins that mechanism; this test pins
+    /// that the relay configs can no longer trigger it).
+    #[test]
+    fn concurrent_relay_targets_register_distinct_waiters() {
+        let digest = [7u8; 32];
+        let a = crate::identity::AgentId([0x11; 32]);
+        let b = crate::identity::AgentId([0x22; 32]);
+        let cfg_a = predecessor_relay_delivery_config(&digest, &a);
+        let cfg_b = predecessor_relay_delivery_config(&digest, &b);
+        let id_a = cfg_a.logical_request_id.expect("a id");
+        let id_b = cfg_b.logical_request_id.expect("b id");
+        assert_ne!(id_a, id_b, "concurrent witnesses must not share an ACK key");
+        // And the registry agrees: both waiters stay live.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let registry = crate::dm::InFlightAcks::new();
+            let (rx1, _) = registry.register_for_protocol_with_provenance(
+                id_a,
+                2,
+                a,
+                Some(crate::identity::MachineId([1; 32])),
+            );
+            let (_rx2, _) = registry.register_for_protocol_with_provenance(
+                id_b,
+                2,
+                b,
+                Some(crate::identity::MachineId([2; 32])),
+            );
+            let first_live = tokio::time::timeout(std::time::Duration::from_millis(10), rx1)
+                .await
+                .is_err();
+            assert!(
+                first_live,
+                "the first witness's waiter survives the second registration"
+            );
+        });
+    }
+
+    #[test]
+    fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
+        let digest = [7u8; 32];
+        let target = crate::identity::AgentId([0x11; 32]);
+        let config = predecessor_relay_delivery_config(&digest, &target);
+        assert!(config.require_gossip);
+        assert!(config.require_gossip_ack);
+        assert!(config.require_durable_app_ack);
+        assert!(!config.prefer_raw_quic_if_connected);
+        // #942 r3 (B4): the outbox owns scheduling; #979 r2 (B1): the
+        // logical request id is PER-TARGET (stable per (digest, target)
+        // across restarts, so a retry is still a replay for that
+        // recipient) — concurrent fan-out no longer makes witnesses
+        // cancel each other's in-flight waiters.
+        assert_eq!(config.max_retries, 0);
+        let expected = relay_request_id(&digest, &target);
+        assert_eq!(config.logical_request_id, Some(expected));
+        // B1: DISTINCT targets of one digest get DISTINCT request ids,
+        // and the same target is stable (replay semantics).
+        let other = crate::identity::AgentId([0xAB; 32]);
+        assert_ne!(
+            relay_request_id(&digest, &target),
+            relay_request_id(&digest, &other)
+        );
+        assert_eq!(
+            relay_request_id(&digest, &target),
+            relay_request_id(&digest, &target)
+        );
+    }
+
     #[test]
     fn public_group_messages_prefer_receive_acked_raw_quic_with_gossip_fallback() {
         let config = group_public_message_direct_delivery_config();
@@ -47708,6 +49970,11 @@ pub(in crate::server) mod tests {
         let payload =
             encode_group_public_message_direct_payload(&msg).expect("payload should encode");
         assert!(payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX));
+        assert!(crate::server::valid_group_public_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: x0x::groups::GroupPublicMessage =
             serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
@@ -48146,6 +50413,35 @@ pub(in crate::server) mod tests {
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
                 .with_network_config(isolated_loopback_config(plane))
+                .build()
+                .await?,
+        );
+        agent.join_network().await.context("join network")?;
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
+    /// #942 B2: a networked test state whose agent carries a DURABLE
+    /// HISTORY handle — required for v2 durable-ACK DMs (the strict
+    /// send mode the requester offer outbox uses). Same shape as
+    /// `networked_test_state` plus `with_history`.
+    async fn networked_test_state_with_history(
+        plane: &str,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(isolated_loopback_config(plane))
+                .with_history(x0x::history::HistoryConfig {
+                    db_path: Some(data_dir.join("history.db")),
+                    ..x0x::history::HistoryConfig::daemon_default()
+                })
                 .build()
                 .await?,
         );
@@ -56515,8 +58811,8 @@ mod hs451_downgrade_safety {
 mod cas_rollback_470 {
     use super::tests::secure_endpoint_test_state;
     use super::{
-        persist_named_groups_mutation, save_named_groups, set_save_fault, AtomicWriteOutcome,
-        SaveFault,
+        persist_named_groups_mutation, refresh_group_rosters_for_gossip, save_named_groups,
+        set_save_fault, AtomicWriteOutcome, SaveFault,
     };
     use crate as x0x;
     use crate::server::AppState;
@@ -56526,6 +58822,35 @@ mod cas_rollback_470 {
     const X_ID: &str = "aa4178787878787878787878787878787878";
     const Y_ID: &str = "bb4278787878787878787878787878787878";
     const Y_MEMBER: &str = "227878787878787878787878787878787878";
+
+    #[tokio::test]
+    async fn gossip_roster_snapshot_waits_for_persist_or_rollback() {
+        let (state, _dir) = secure_endpoint_test_state().await.expect("test state");
+        let persistence_guard = state.named_groups_persistence_lock.lock().await;
+        state.named_groups.write().await.insert(
+            X_ID.to_string(),
+            plain_group(0x58, X_ID, "uncommitted-candidate"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let refresh_state = Arc::clone(&state);
+        let mut refresh = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            refresh_group_rosters_for_gossip(&refresh_state).await;
+        });
+        started_rx.await.expect("refresh started");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut refresh)
+                .await
+                .is_err(),
+            "refresh must wait while a candidate may still roll back"
+        );
+        state.named_groups.write().await.remove(X_ID);
+        drop(persistence_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh completed after rollback")
+            .expect("refresh task");
+    }
 
     fn plain_group(seed: u8, id: &str, name: &str) -> x0x::groups::GroupInfo {
         let mut info = x0x::groups::GroupInfo::new(

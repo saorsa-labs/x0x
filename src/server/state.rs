@@ -25,12 +25,14 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
+use super::routes::named_groups::RequesterOfferObligation;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
-    ListenerRegistration, NamedGroupMetadataEvent, PendingCausalApproval, PendingJoinAttempt,
-    PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
-    PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
+    ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
+    PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
+    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
+    WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -157,6 +159,8 @@ pub(super) const fn effective_self_update_enabled(
 pub struct ServerHandle {
     pub(super) local_addr: SocketAddr,
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// ADR-0070 §3 ACL manager, for [`ServerHandle::acl_reload_trigger`].
+    pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -181,6 +185,13 @@ impl ServerHandle {
     /// handle to observe run-to-completion.
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    /// Handle that re-reads the connect/exec ACL floors and API overlays
+    /// (ADR-0070 §3) — what `x0xd` runs on `SIGHUP`.
+    #[must_use]
+    pub fn acl_reload_trigger(&self) -> super::AclReloadTrigger {
+        super::AclReloadTrigger(Arc::clone(&self.acl_admin))
     }
 
     /// Await the server's run-to-completion, returning its supervisor result.
@@ -853,6 +864,11 @@ pub(super) struct AppState {
     /// long-lived sync listeners. Keyed by `"{kind}:{id}"`.
     pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
+    /// Orders every GSS encrypted KV seal/publish with authoritative roster
+    /// transactions. Writers hold it through durability or rollback.
+    pub(super) gss_publication_gate: Arc<RwLock<()>>,
+    /// Orders roster snapshots sent to gossip after committed mutations.
+    pub(super) group_roster_gossip_lock: Mutex<()>,
     pub(super) named_groups_path: PathBuf,
     /// Issue #451: disk location of the Home-Suite sidecar
     /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for
@@ -938,6 +954,19 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// #878 r4 (review finding 2): one in-flight oversized join-result
+    /// staging task per (group, recipient) — a 1-permit semaphore each;
+    /// duplicates are dropped while a staging is running (the recipient
+    /// can re-request; the reference it fetches is byte-identical).
+    pub(super) join_result_staging_guards: StdMutex<
+        HashMap<(String, crate::identity::AgentId), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
+    /// #876: signed `MemberRoleUpdated` events that arrived before their
+    /// target member was seated locally (the member's `MemberAdded` blob
+    /// was still in flight behind the control-blob staging budget). Parked,
+    /// never dropped; replayed after the group's next accepted
+    /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -1029,9 +1058,34 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
     /// so an older snapshot cannot rename over a newer completed receipt.
     pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
+    /// #908: the REQUESTER's durable predecessor-offer obligations, keyed
+    /// by group id (obligation identity is `(group, request_id)`). The
+    /// requester persists the exact signed envelope it offered to the
+    /// authority and retries on a bounded schedule until the authority
+    /// ACKs or the join resolves. See
+    /// `routes::named_groups::requester_offer`.
+    pub(super) requester_offer_outbox: RwLock<HashMap<String, Vec<RequesterOfferObligation>>>,
+    /// #908: disk location for the requester offer outbox sidecar.
+    pub(super) requester_offer_outbox_path: PathBuf,
+    /// #908: serializes snapshot-and-write of the requester offer outbox
+    /// sidecar (the relay outbox's discipline).
+    pub(super) requester_offer_outbox_persistence_lock: Mutex<()>,
     /// Serializes bootstrap outbox mutation and durable replacement. The retry
     /// worker never holds this while awaiting network delivery.
     pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,
+    /// #946 r2: requester-side per-digest suppression for group-scoped
+    /// certificate fetches (in-flight dedup + 60 s negative cache).
+    pub(super) cert_fetch_requested:
+        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// #946: responder-side suppression deadline per (stable group id,
+    /// digest) — the answer rate limit and the miss negative cache.
+    pub(super) cert_fetch_answered: StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// #946: the current certificate-unobtainable refusal window per
+    /// (stable group id, joining member) — the typed refusal is staged only
+    /// after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
+    pub(super) cert_unresolvable_since: StdMutex<
+        std::collections::HashMap<String, crate::server::routes::named_groups::CertEvidenceStamp>,
+    >,
     /// ADR 0028 B5: write-ahead journal for the cross-file B8 operation
     /// (outbox refresh + roster save). Set before the outbox refresh save;
     /// cleared after both saves succeed. On restart, a pending entry triggers
@@ -1098,6 +1152,8 @@ pub(super) struct AppState {
     /// [`super::routes::status::HealthSnapshot`].
     pub(super) health_snapshot: Arc<super::routes::status::HealthSnapshot>,
     pub(super) broadcast_tx: broadcast::Sender<SseEvent>,
+    /// ADR-0073 call lifecycle registry (slice 1: signalling only).
+    pub(super) calls: tokio::sync::Mutex<x0x::calls::CallRegistry>,
     /// Active file transfers.
     pub(super) file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
     /// Incremental SHA-256 hashers for receiving transfers.
@@ -1144,6 +1200,9 @@ pub(super) struct AppState {
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
     pub(super) groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
+    /// ADR-0070 §3: API-managed connect/exec ACL entries over the TOML
+    /// floor, and hot reload (`/acl/*`).
+    pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read

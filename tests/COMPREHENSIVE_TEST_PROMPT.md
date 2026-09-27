@@ -26,8 +26,8 @@ Certify that **100% of x0x functionality** works correctly across **all 5 interf
 | saorsa-3 | 147.182.234.192 | SFO, US | `ssh root@147.182.234.192` |
 | saorsa-6 | 65.21.157.229 | Helsinki, FI | `ssh root@65.21.157.229` |
 | saorsa-7 | 116.203.101.172 | Nuremberg, DE | `ssh root@116.203.101.172` |
-| saorsa-8 | 149.28.156.231 | Singapore, SG | `ssh root@149.28.156.231` |
-| saorsa-9 | 45.77.176.184 | Tokyo, JP | `ssh root@45.77.176.184` |
+| saorsa-8 | 152.42.210.67 | Singapore, SG | `ssh root@152.42.210.67` |
+| saorsa-9 | 170.64.176.102 | Sydney, AU | `ssh root@170.64.176.102` |
 
 VPS API: port 12600 (localhost only, SSH tunnel required). Token: `/root/.local/share/x0x/api-token`
 

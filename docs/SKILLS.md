@@ -231,5 +231,5 @@ POST /files/send                          # Send file to agent
 POST /files/accept/:id                    # Accept transfer
 GET  /files/transfers                     # List transfers
 GET  /upgrade                             # Check for updates
-GET  /gui                                 # Embedded GUI (no auth required)
+GET  /gui                                 # Embedded GUI (bearer or ?token=<session_token>; only /health, /constitution* are auth-exempt)
 ```

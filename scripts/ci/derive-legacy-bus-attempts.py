@@ -27,12 +27,12 @@ KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
 CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-# crates.io 0.5.85 (SG tag v0.5.85): outbound meters, wire_bytes_for_peer and
-# key_cache CONTROL_DOMAIN byte-identical to git 9258cee9; differs only on
-# inbound key-cache Response admission and priority-skewed Ref resolution.
-REGISTRY_PUBSUB_VERSION = "0.5.85"
+# crates.io 0.5.86: outbound meters, wire_bytes_for_peer and key_cache
+# CONTROL_DOMAIN retain the reviewed git producer's accounting semantics.
+# Group-roster eager selection can change the observed attempt counts.
+REGISTRY_PUBSUB_VERSION = "0.5.86"
 REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-REGISTRY_PUBSUB_SHA = "2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22"
+REGISTRY_PUBSUB_SHA = "6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
 # SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
@@ -88,8 +88,8 @@ def validate_source_premise(cargo_bytes, rust_bytes):
     manifest = tomllib.loads(cargo_bytes.decode())
     pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
     patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
-    # Registry and git share 0.5.85, so the patch alone selects the graph:
-    # none means the crates.io package, otherwise an exact reviewed git rev.
+    # Registry 0.5.86 is the current package; the historical git producers
+    # remain at 0.5.85 and require an exact reviewed patch revision.
     if patch is None:
         require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
     else:

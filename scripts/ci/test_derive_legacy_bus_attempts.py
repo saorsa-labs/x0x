@@ -88,20 +88,21 @@ class DerivationControls(unittest.TestCase):
         workspace = Path(__file__).resolve().parents[2]
         cargo = (workspace / "Cargo.toml").read_bytes()
         rust = (workspace / "src/legacy_bus_interop_tests.rs").read_bytes()
-        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.85"\n'
+        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.86"\n'
+        git_pin_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.85"\n'
 
         def git_cargo(rev):
-            return (registry_cargo + b'[patch.crates-io]\nsaorsa-gossip-pubsub = { git = "'
+            return (git_pin_cargo + b'[patch.crates-io]\nsaorsa-gossip-pubsub = { git = "'
                     + module.GIT_PUBSUB_URL.encode() + b'", rev = "' + rev.encode() + b'" }\n')
 
         module.validate_source_premise(registry_cargo, rust)
         module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_CURRENT), rust)
         module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_ACCOUNTING), rust)
         for cargo_input, rust_input, code in (
-            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.85"',
+            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.86"',
                            b'saorsa-gossip-pubsub = "=0.5.84"'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
             (git_cargo("0" * 40), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
-            (registry_cargo.replace(b'=0.5.85', b'0.5.85'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (registry_cargo.replace(b'=0.5.86', b'0.5.86'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
             (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
                                  b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
             (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
@@ -133,10 +134,10 @@ class DerivationControls(unittest.TestCase):
             GIT_LOCK + GIT_LOCK,
             LOCK.replace(module.REGISTRY_PUBSUB_SOURCE.encode(), b'registry+https://example.invalid'),
             LOCK.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64),
-            # The superseded 0.5.84 registry package is no longer reviewed.
-            LOCK.replace(b'0.5.85', b'0.5.84').replace(
+            # The prior 0.5.85 registry package is no longer reviewed.
+            LOCK.replace(b'0.5.86', b'0.5.85').replace(
                 module.REGISTRY_PUBSUB_SHA.encode(),
-                b"ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"),
+                b"2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22"),
         )
         for lock in invalid:
             record = fixture()

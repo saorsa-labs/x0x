@@ -1,6 +1,7 @@
 # ADR 0060: The Owner's Home Is Elected, Not Per-Install
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (vision-alignment review; status change applied by Claude at his instruction)
 - **Date:** 2026-09-05
 - **Decision owners:** David Irvine (direction), Claude (drafting)
 - **Reviewers:** — (Codex review of PR #507 at `4629117`; Jarvis Senior Engineer ADR conformance pending)

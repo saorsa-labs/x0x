@@ -1,11 +1,11 @@
 # ADR 0065: Duplicate Homes Are Inventoried, Not Retired
 
-- **Status:** Proposed
+- **Status:** Superseded
 - **Date:** 2026-09-06
 - **Decision owners:** David Irvine (direction), Claude (drafting)
 - **Reviewers:** — (independent review pending; number 0065 centrally allocated to #449)
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** ADR-0060 (folded in 2026-09-25 by David Irvine; the inventory this ADR describes ships under 0060's election, `src/server/routes/home.rs`; status change applied by Claude at his instruction)
 - **Amends:** none. Addresses — without closing — the retirement gap
   [ADR 0060](./0060-one-home-per-owner.md) explicitly deferred.
 - **Related:** issue #449 (P4); #506/PR #509 (merged); ADR 0023 (durable local

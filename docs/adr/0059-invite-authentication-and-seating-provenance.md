@@ -1,6 +1,7 @@
 # ADR 0059: Invite Authentication and Seating Provenance
 
-- **Status:** Proposed (acceptance follows in a docs PR after v0.41.0 ships)
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (vision-alignment review; status change applied by Claude at his instruction)
 - **Date:** 2026-09-02
 - **Decision owners:** David Irvine (direction), omp (drafting)
 - **Reviewers:** hs-FU-A independent review (Fable r1, Codex r1/r2)
