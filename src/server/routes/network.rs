@@ -575,6 +575,7 @@ pub(in crate::server) async fn gossip_diagnostics(
         Some(snap) => {
             let pubsub_stages =
                 augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            let participation_snapshot = state.agent.gossip_participation();
             let egress = state.agent.gossip_egress_diagnostics().unwrap_or_default();
             let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
             (
@@ -583,10 +584,37 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "ok": true,
                 "uptime_secs": state.start_time.elapsed().as_secs(),
                 "stats": snap,
-                "participation": state.agent.gossip_participation(),
+                // #945: one participation snapshot feeds both the
+                // top-level field and leaf_egress — no torn reads under load.
+                "participation": participation_snapshot,
+                // #945 visibility (ADR 0078 precondition): the numbers that
+                // say whether a default Leaf is over its egress budget,
+                // first-class instead of nested. Purely additive; the deep
+                // forms stay (`participation`, `egress_budget`).
+                "leaf_egress": {
+                    "byte_policy": egress["egress_budget"]["byte_policy"].clone(),
+                    "applies_to_leaf": egress["egress_budget"]["applies_to_leaf"].clone(),
+                    "soft_exceeded": egress["egress_budget"]["egress_budget_soft_exceeded"]
+                        .clone(),
+                    "hard_exceeded": egress["egress_budget"]["egress_budget_hard_exceeded"]
+                        .clone(),
+                    "subscribed_outbound_bytes_per_sec_60s": egress["egress_budget"]
+                        ["subscribed_outbound_bytes_per_sec_60s"]
+                        .clone(),
+                    "epidemic_forward_bytes": participation_snapshot
+                        .as_ref()
+                        .map(|p| p.epidemic_forward_bytes),
+                    "epidemic_forward_msgs": participation_snapshot
+                        .as_ref()
+                        .map(|p| p.epidemic_forward_msgs),
+                    "leaf_egress_snapshot": egress["egress_budget"]["leaf_egress"].clone(),
+                },
                 "subscribed_topics": egress["subscribed_topics"],
                 "outbound_by_topic_named": egress["outbound_by_topic_named"],
                 "egress_budget": egress["egress_budget"],
+                // SG76 key-cache runtime witness (see PubSubManager::
+                // egress_diagnostics); additive, diagnostics-only.
+                "key_cache": egress["key_cache"],
                 "outer_signature_policy": state.agent.gossip_outer_signature_policy(),
                 "legacy_grants_enabled": false,
                 "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
@@ -615,11 +643,115 @@ pub(in crate::server) async fn gossip_diagnostics(
     }
 }
 
+/// GET /diagnostics/state-sync — cumulative local activity for open stores.
+pub(in crate::server) async fn state_sync_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let snapshots: std::collections::BTreeMap<_, _> = stores
+        .iter()
+        .map(|(topic, handle)| (topic.clone(), handle.state_sync_snapshot()))
+        .collect();
+    Json(serde_json::json!({
+        "ok": true,
+        "scope": "local_open_stores",
+        "reset": "store_close_or_process_restart",
+        "stores": snapshots,
+    }))
+}
+
 #[cfg(test)]
 mod participation_diagnostics_tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn state_sync_route_exposes_bounded_open_store_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let handle = agent
+            .create_kv_store("Diagnostics", "diagnostics/state-sync-test")
+            .await
+            .unwrap();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert("diagnostics/state-sync-test".to_string(), handle);
+        let app = Router::new()
+            .route("/diagnostics/state-sync", get(state_sync_diagnostics))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/state-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["scope"], "local_open_stores");
+        assert_eq!(json["reset"], "store_close_or_process_restart");
+        let counters = &json["stores"]["diagnostics/state-sync-test"];
+        let keys = counters
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "incoming_record_merges",
+                "rejected_authorization_version",
+                "rejected_cooldown",
+                "rejected_no_retained",
+                "rejected_other",
+                "rejected_unauthorized_control",
+                "rejected_unauthorized_request",
+                "rejected_verify",
+                "request_seal_failed",
+                "requests_answered",
+                "requests_received",
+                "requests_sent",
+                "retained_pages_served",
+            ]
+        );
+        assert!(counters
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value.is_u64()));
+    }
 
     /// The C0 soak needs the subscription-aware relay meter, not the older
     /// origin-based counter that also includes subscribed-topic forwarding.
@@ -676,6 +808,39 @@ mod participation_diagnostics_tests {
             assert_eq!(body["egress_budget"]["leaf_max_eager_degree"], 2);
             assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
             assert_eq!(body["egress_budget"]["applies_to_leaf"], !relay);
+            // SG76 key-cache witness: the additive object must be present at
+            // the real route with the producer snapshot's counter types
+            // (cumulative u64s; usize high-water fields serialize as u64).
+            // Presence/type only — values are runtime evidence, asserted on
+            // isolated Linux runs, not here.
+            let key_cache = &body["key_cache"];
+            assert!(key_cache.is_object(), "key_cache object present");
+            for field in [
+                "full_out_frames",
+                "full_out_bytes",
+                "ref_out_frames",
+                "ref_out_bytes",
+                "full_in_frames",
+                "full_in_bytes",
+                "ref_in_frames",
+                "ref_in_bytes",
+                "cache_hits",
+                "cache_misses",
+                "cache_evictions",
+                "requests",
+                "responses",
+                "pending_frames_high_water",
+                "pending_bytes_high_water",
+                "pending_timeouts",
+                "pending_peer_limit_drops",
+                "pending_global_limit_drops",
+                "malformed_controls",
+                "hash_mismatches",
+                "replay_success",
+                "replay_failure",
+            ] {
+                assert!(key_cache[field].is_u64(), "key_cache.{field} is u64");
+            }
             // #288 soak: cumulative counters are integrals, so the same
             // response must carry the daemon clock, the inner-envelope verify
             // cost (verify/s replaces co-tenant %CPU, #656) and the sub-second
@@ -729,6 +894,102 @@ mod participation_diagnostics_tests {
             );
             agent.shutdown().await;
         }
+    }
+
+    /// #945 (ADR 0078 precondition): the first-class `leaf_egress` block —
+    /// the four numbers an operator needs to see whether a default Leaf is
+    /// over its budget — is present at the real route, typed as counters,
+    /// and consistent with the deep forms (`participation`,
+    /// `egress_budget`) it summarizes. Visibility only; no behaviour.
+    #[tokio::test]
+    async fn gossip_route_exposes_first_class_leaf_egress_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/diagnostics/gossip", get(gossip_diagnostics))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/gossip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let leaf = &body["leaf_egress"];
+        assert!(leaf.is_object(), "leaf_egress block present");
+        // Default config: observe_only (the #504 default this visibility
+        // ships alongside ADR 0078's proposal to change it).
+        assert_eq!(leaf["byte_policy"], "observe_only");
+        assert_eq!(leaf["applies_to_leaf"], true, "default node is a Leaf");
+        for counter in [
+            "soft_exceeded",
+            "hard_exceeded",
+            "epidemic_forward_bytes",
+            "epidemic_forward_msgs",
+        ] {
+            assert!(
+                leaf[counter].is_u64(),
+                "leaf_egress.{counter} must be a u64 counter"
+            );
+            assert_eq!(leaf[counter].as_u64(), Some(0), "{counter} at startup");
+        }
+        assert!(
+            leaf["subscribed_outbound_bytes_per_sec_60s"].is_number(),
+            "the 60s rate is carried"
+        );
+        // Consistency with the deep forms it summarizes.
+        assert_eq!(
+            leaf["epidemic_forward_bytes"],
+            body["participation"]["epidemic_forward_bytes"]
+        );
+        assert_eq!(
+            leaf["epidemic_forward_msgs"],
+            body["participation"]["epidemic_forward_msgs"]
+        );
+        assert_eq!(
+            leaf["soft_exceeded"],
+            body["egress_budget"]["egress_budget_soft_exceeded"]
+        );
+        assert_eq!(
+            leaf["hard_exceeded"],
+            body["egress_budget"]["egress_budget_hard_exceeded"]
+        );
+        // The saorsa-gossip snapshot rides along unmodified.
+        assert_eq!(
+            leaf["leaf_egress_snapshot"],
+            body["egress_budget"]["leaf_egress"]
+        );
+        agent.shutdown().await;
     }
 
     #[tokio::test]
@@ -964,6 +1225,13 @@ pub(in crate::server) async fn groups_diagnostics(
             "ok": true,
             "groups": snap.groups,
             "treekem_recovery_cache": treekem_recovery_cache,
+            // ADR 0081: notes engine counters.
+            "notes": serde_json::json!({
+                "engine": state.notes.counters(),
+                "open_notes": state.notes.open_notes().await,
+                "note_cap_bytes": x0x::notes::NOTE_CAP_BYTES,
+                "store_budget_bytes": x0x::notes::STORE_BUDGET_BYTES,
+            }),
         })),
     )
 }

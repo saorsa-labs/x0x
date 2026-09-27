@@ -283,6 +283,14 @@ leaf_egress_burst_bytes = 4194304
 byte_policy = "observe_only"
 ```
 
+> **Superseded by #807 (PR #808):** the Leaf eager set is no longer a
+> truncated list. Every writer passes the full connected plane to sg
+> `set_topic_peers_with_preferred_eager`; sg keeps every connected peer eager
+> or lazy and caps only EAGER at `leaf_max_eager_degree`. Truncation left
+> peers beyond D in neither role, so a directly connected DM/join recipient
+> could be black-holed. The Full/bootstrap preference below survives as the
+> single preferred-eager slot.
+
 Prefer Full/bootstrap peers at the front of the truncated list. The helper
 already exists for ACK topics:
 `select_one_full_bootstrap_eager_peer` (`src/gossip/pubsub.rs:1351`). Reuse
@@ -658,7 +666,11 @@ Do not wire HyParView `active_view_size` as an egress fix.
    ACK), and `apply_preferred_eager_peer` (ACK preference). This includes
    the initializer call as well as all three direct `set_topic_peers`
    call sites. No full-plane overwrite may bypass policy.
-4. **Deterministic ordering:** deduplicate plane ids, sort by full 32-byte
+4. *(Superseded by #807 / PR #808: selection is no longer sort-and-truncate.
+   Every connected peer stays eager-or-lazy, eager is capped at D by sg
+   score, and only the Full/bootstrap preference is chosen by x0x. The
+   original requirement is kept below for history.)*
+   **Deterministic ordering:** deduplicate plane ids, sort by full 32-byte
    PeerId, select slot 0 via `select_one_full_bootstrap_eager_peer` with
    stable tie-breaking, then append the remaining sorted ids excluding it
    and truncate to D. Sort any candidate inputs whose order affects the

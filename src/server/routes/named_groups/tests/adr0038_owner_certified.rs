@@ -561,7 +561,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     };
 
     // 1. Miss: no cache entry at all → typed failure, denied.
-    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         denied,
         Err(x0x::groups::owner_cert::OwnerCertFailure::NoCertificate),
@@ -572,7 +572,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     //    promotion) and the SAME check now returns the cert for binding.
     let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &joiner)?;
     announce_cert_for(state.as_ref(), cert.clone()).await;
-    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         admitted,
         Ok(Some(cert)),
@@ -1079,8 +1079,13 @@ async fn reseal_refuses_while_restore_quarantined() -> Result<()> {
     }
     let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
     let req: ResealRequest = serde_json::from_value(serde_json::json!({ "recipient": owner_hex }))?;
-    let (status, json) =
-        secure_group_reseal(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let (status, json) = secure_group_reseal(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,
