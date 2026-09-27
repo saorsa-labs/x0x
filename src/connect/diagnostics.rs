@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::connect::acl::ConnectAclSummary;
 use crate::connect::gate::ConnectDenialReason;
+use crate::exec::acl::AclReloadStatus;
 
 /// Atomic allow/deny counters + per-reason denial breakdown.
 #[derive(Debug)]
@@ -22,7 +23,8 @@ pub struct ConnectDiagnostics {
     streams_allowed: std::sync::atomic::AtomicU64,
     streams_denied: std::sync::atomic::AtomicU64,
     denial_breakdown: Mutex<HashMap<ConnectDenialReason, u64>>,
-    acl_summary: ConnectAclSummary,
+    acl_summary: Mutex<ConnectAclSummary>,
+    acl_reload: Mutex<AclReloadStatus>,
 }
 
 impl ConnectDiagnostics {
@@ -33,8 +35,25 @@ impl ConnectDiagnostics {
             streams_allowed: std::sync::atomic::AtomicU64::new(0),
             streams_denied: std::sync::atomic::AtomicU64::new(0),
             denial_breakdown: Mutex::new(HashMap::new()),
-            acl_summary: summary,
+            acl_summary: Mutex::new(summary),
+            acl_reload: Mutex::new(AclReloadStatus::default()),
         }
+    }
+
+    /// Replace the policy summary after an ADR-0070 hot reload or API edit.
+    pub fn set_acl_summary(&self, summary: ConnectAclSummary) {
+        *self
+            .acl_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = summary;
+    }
+
+    /// Replace the ADR-0070 reload bookkeeping.
+    pub fn set_acl_reload_status(&self, status: AclReloadStatus) {
+        *self
+            .acl_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
     }
 
     /// Record an allowed connect stream.
@@ -70,7 +89,16 @@ impl ConnectDiagnostics {
             streams_allowed: allowed,
             streams_denied: denied,
             denial_breakdown: breakdown,
-            acl_summary: self.acl_summary.clone(),
+            acl_summary: self
+                .acl_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            acl_reload: self
+                .acl_reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 }
@@ -82,6 +110,8 @@ pub struct ConnectDiagnosticsSnapshot {
     pub streams_denied: u64,
     pub denial_breakdown: HashMap<ConnectDenialReason, u64>,
     pub acl_summary: ConnectAclSummary,
+    /// ADR-0070 §3 hot-reload status (last error, counters).
+    pub acl_reload: AclReloadStatus,
 }
 
 #[cfg(test)]

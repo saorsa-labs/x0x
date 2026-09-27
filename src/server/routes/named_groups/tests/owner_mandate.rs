@@ -178,6 +178,7 @@ fn member_added_event(
 ) -> NamedGroupMetadataEvent {
     use base64::Engine as _;
     NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_id.to_string(),
         revision,
         actor: actor_hex.to_string(),
@@ -2229,6 +2230,7 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
             certificate_b64,
             ..
         } => NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id,
             revision,
             actor,
