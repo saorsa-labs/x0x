@@ -1286,6 +1286,16 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/escape/leave",
+        cli_name: "groups escape leave",
+        description: "#871 wedge escape: leave a genuinely-forked group locally (audit kept) to rejoin via a fresh owner-authorized invite",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("reason", true, "--reason"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/join",
         cli_name: "group join",
         description: "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",

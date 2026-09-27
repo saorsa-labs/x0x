@@ -209,6 +209,8 @@ pub struct GroupCounters {
     /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
     /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
+    /// #871 leave-and-rejoin escapes (the wedge escape route).
+    pub escape_leave_total: u64,
     /// ADR-0064 slice 4 (#472 decision 3): fork evidence classified as
     /// `signer_only` — the signer was an active admin at the conflicting
     /// commit's claimed parent (or the joiner's served chain validated
@@ -456,6 +458,9 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.fork_quarantine_manual_clears = dst
         .fork_quarantine_manual_clears
         .saturating_add(src.fork_quarantine_manual_clears);
+    dst.escape_leave_total = dst
+        .escape_leave_total
+        .saturating_add(src.escape_leave_total);
     dst.membership_events_queued_revision_gap = dst
         .membership_events_queued_revision_gap
         .saturating_add(src.membership_events_queued_revision_gap);
@@ -511,6 +516,13 @@ impl GroupsDiagnostics {
 
     /// ADR-0064 slice 2: an owner mandate was minted by this install at
     /// the pre-mutation point of an invite-derived seat.
+    /// #871: one leave-and-rejoin escape.
+    pub fn record_escape_leave(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.escape_leave_total = c.escape_leave_total.saturating_add(1);
+        });
+    }
+
     pub fn record_owner_mandate_minted(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_minted = c.owner_mandate_minted.saturating_add(1);
@@ -1444,6 +1456,7 @@ mod tests {
             owner_mandate_missing: base + 40,
             mandate_capability_refusing_transitions: base + 41,
             fork_quarantine_manual_clears: base + 42,
+            escape_leave_total: base + 43,
             fork_evidence_signer_only: base + 43,
             fork_evidence_unauthorized_signer: base + 44,
             fork_quarantine_owner_anchored_clears: base + 45,
@@ -1463,6 +1476,10 @@ mod tests {
         merge_counters(&mut merged, &src);
         // Every merged counter must equal the exact per-field sum — a
         // dropped merge line leaves dst's value; a doubled line over-sums.
+        assert_eq!(
+            merged.escape_leave_total,
+            dst.escape_leave_total + src.escape_leave_total
+        );
         assert_eq!(
             merged.messages_received,
             dst.messages_received + src.messages_received

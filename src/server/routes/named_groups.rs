@@ -21558,6 +21558,204 @@ async fn withdraw_named_group_terminal(
 }
 
 /// DELETE /groups/:id — leave a group.
+/// #871 (redesign: leave-and-rejoin): POST /groups/:id/escape/leave —
+/// the wedge escape for a genuinely-forked node. The #846 anchored-gap
+/// gate is fail-safe (the node refuses rather than corrupts), but a
+/// forked head can never converge; the ONLY secure escape is to LEAVE
+/// locally (audit kept) and rejoin through the existing, reviewed
+/// invite -> join path with FRESH owner authorization. This route is
+/// deliberately NOT the general leave: it requires an ARMED
+/// `owner_attested_stale_base_gap` record, publishes nothing on the
+/// forked chain (peers would reject a forked-head event anyway), and
+/// its response names the rejoin step.
+///
+/// Audit invariant (Root requirement): the leave NEVER deletes audit
+/// records — the armed record is snapshotted into the durable
+/// `escape_leave_audit.json` (atomic tmp+rename) with
+/// `retired_by = "leave-and-rejoin"` BEFORE the local GroupInfo (which
+/// carries the in-memory copy) is removed.
+///
+/// Rejoin authorization is fresh BY CONSTRUCTION: the teardown wipes
+/// every local credential (invite state, seats, TreeKEM keys), so the
+/// only join path is a NEWLY minted addressed invite — an owner/admin
+/// act. No retained attestation, no state transfer (the parked #916
+/// design's attack surface does not exist here).
+pub(in crate::server) async fn escape_leave_group(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Path(id): Path<String>,
+    Json(req): Json<EscapeLeaveRequest>,
+) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "escape/leave requires the durable owner token (operator action)",
+        );
+    }
+    let reason: String = req.reason.chars().take(256).collect();
+    if reason.trim().is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "reason_required: the escape is an audited operator decision — \
+             state why (capped at 256 chars)",
+        );
+    }
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let now_ms = now_millis_u64();
+
+    // Snapshot + gate under one read: the armed record must be LIVE.
+    let (stable_group_id, armed) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        (
+            info.stable_group_id().to_string(),
+            info.invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.anchored_gap_refusal.clone())
+                .filter(|_| armed_anchored_gap_sequence(info).is_some()),
+        )
+    };
+    let Some(record) = armed else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "escape_requires_armed_gap_gate: this route is ONLY the \
+             #871 wedge escape (an armed owner-attested stale-base gap \
+             record below its terminal); use DELETE /groups/:id for an \
+             ordinary leave",
+        );
+    };
+
+    // (1) DURABLE AUDIT FIRST — the record survives the teardown.
+    if let Err(error) = persist_escape_leave_audit(
+        &state,
+        &EscapeLeaveAuditEntry {
+            group_id: stable_group_id.clone(),
+            map_key: id.clone(),
+            left_by: local_agent_hex.clone(),
+            left_at_ms: now_ms,
+            reason: reason.clone(),
+            retired_record: record.clone(),
+        },
+    )
+    .await
+    {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("escape-leave audit entry did not persist: {error}"),
+        );
+    }
+
+    // (2) LOCAL teardown — the non-publishing subset of the ordinary
+    //     leave: no MemberRemoved is signed or published (a forked
+    //     head's event is unanchorable by construction); peers learn
+    //     through their own membership flows.
+    let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
+    let _ = prune_treekem_cache_groups(&state, &cache_aliases, "escape_leave").await;
+    if !matches!(
+        persist_named_groups_mutation(&state, |groups| {
+            groups.remove(&id);
+            true
+        })
+        .await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    super::retire_group_kv_stores(&state, &id).await;
+    clear_cert_evidence_stamps_for(&state, &id, None).await;
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
+    state.group_card_cache.write().await.remove(&id);
+    state.mls_groups.write().await.remove(&id);
+    state.treekem_groups.write().await.remove(&id);
+    remove_treekem_persistence_for_group_id(&state, &id, "escape_leave").await;
+    save_mls_groups(&state).await;
+    stop_named_group_metadata_listener(&state, &id).await;
+    refresh_group_rosters_for_gossip(&state).await;
+    state
+        .groups_diagnostics
+        .record_escape_leave(&stable_group_id);
+    tracing::warn!(
+        group_id = %LogHexId::group(&stable_group_id),
+        terminal_revision = record.terminal_revision,
+        terminal_state_hash = %record.terminal_state_hash,
+        reason = %reason,
+        "#871 leave-and-rejoin escape: local group state removed (audit \
+         kept); re-seat with a FRESH addressed invite from an owner/admin"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "left": stable_group_id,
+            "escaped": "leave-and-rejoin",
+            "audit": "escape_leave_audit.json (retired_by=leave-and-rejoin)",
+            "rejoin": "mint a FRESH addressed invite on an owner/admin device \
+             and join via POST /groups/join — stale local credentials were \
+             wiped by this leave; nothing auto-rejoins",
+        })),
+    )
+}
+
+/// Request body for POST /groups/:id/escape/leave (#871).
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct EscapeLeaveRequest {
+    /// The capped operator reason (audit trail).
+    pub reason: String,
+}
+
+/// One durable #871 escape-leave audit entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct EscapeLeaveAuditEntry {
+    pub group_id: String,
+    pub map_key: String,
+    pub left_by: String,
+    pub left_at_ms: u64,
+    pub reason: String,
+    pub retired_record: x0x::groups::AnchoredGapRefusal,
+}
+
+/// Append (durably, atomically) to `<data_dir>/escape_leave_audit.json`.
+async fn persist_escape_leave_audit(
+    state: &Arc<AppState>,
+    entry: &EscapeLeaveAuditEntry,
+) -> std::result::Result<(), String> {
+    let path = state
+        .predecessor_relay_outbox_path
+        .parent()
+        .map(|dir| dir.join("escape_leave_audit.json"))
+        .ok_or_else(|| "no data dir".to_string())?;
+    let _persistence = state.named_groups_persistence_lock.lock().await;
+    let mut entries: Vec<EscapeLeaveAuditEntry> = tokio::fs::read(&path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    entries.push(entry.clone());
+    let bytes = serde_json::to_vec_pretty(&entries).map_err(|e| format!("serialize audit: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .map_err(|e| format!("write audit tmp: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("rename audit: {e}"))?;
+    Ok(())
+}
+
 pub(in crate::server) async fn leave_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -37439,6 +37637,177 @@ pub(in crate::server) mod tests {
                 .insert(group.to_string(), info);
         }
 
+        /// #871 (redesign): fork → LEAVE (escape route) → REJOIN through
+        /// the reviewed invite/join path → converged. The leave keeps
+        /// AUDIT (durable escape_leave_audit.json) while removing the
+        /// forked GroupInfo; nothing auto-rejoins — the rejoin uses a
+        /// FRESH invite minted by the authority (fresh owner
+        /// authorization by construction). RED (Rule 9): when the leave
+        /// keeps the forked GroupInfo, the state-removal and
+        /// rejoin-converged assertions fail.
+        #[tokio::test]
+        async fn escape_leave_then_fresh_invite_rejoin_converges() {
+            let (authority, _a) = fresh_state().await;
+            let (wedged, _wdir) = fresh_state().await;
+            let group = "ee".repeat(16);
+            seed_authority_group(&authority, &group, "escape-1", None, false, false).await;
+            // The WEDGED node holds the same stable group with a FORKED
+            // head and an ARMED owner-attested stale-base gap record
+            // (revision below the terminal, content diverged).
+            seed_authority_group(&wedged, &group, "dead-cred", None, true, false).await;
+            {
+                let mut groups = wedged.named_groups.write().await;
+                let info = groups.get_mut(&group).expect("wedged group");
+                let head_revision = info.state_revision;
+                let head_hash = info.state_hash.clone();
+                let lineage = info.invite_lineage.get_or_insert_with(Default::default);
+                lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+                    reason: "owner_attested_stale_base_gap".to_string(),
+                    head_revision,
+                    head_state_hash: head_hash.clone(),
+                    terminal_revision: head_revision + 1,
+                    terminal_state_hash: "871-terminal".to_string(),
+                    committed_by: hex::encode(wedged.agent.agent_id().as_bytes()),
+                    occurrences: 1,
+                    first_observed_at_ms: 0,
+                    last_observed_at_ms: 0,
+                    attested_chain_hashes: vec!["871-terminal".to_string()],
+                    by_reason: Default::default(),
+                });
+                // The fork: same revision, diverged content — no attested
+                // page can ever link, exactly the #871 wedge.
+                info.state_hash = "871-forked-head".to_string();
+            }
+            // Session actors are refused; the escape is operator-only.
+            let session = escape_call(
+                &wedged,
+                &group,
+                "",
+                crate::server::rider_auth::ActorContext::Owner { durable: false },
+            )
+            .await;
+            assert_eq!(session.0, StatusCode::FORBIDDEN, "{}", session.1);
+            // A reason is required (audit trail).
+            let no_reason = escape_call(
+                &wedged,
+                &group,
+                "   ",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(no_reason.0, StatusCode::CONFLICT, "{}", no_reason.1);
+            // Without an armed gate the route refuses (not a general leave).
+            let unarmed_group = "ef".repeat(16);
+            seed_authority_group(&wedged, &unarmed_group, "plain", None, false, false).await;
+            let unarmed = escape_call(
+                &wedged,
+                &unarmed_group,
+                "ops runbook",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(unarmed.0, StatusCode::CONFLICT, "{}", unarmed.1);
+            assert!(unarmed.1.contains("escape_requires_armed_gap_gate"));
+
+            // THE LEAVE.
+            let left = escape_call(
+                &wedged,
+                &group,
+                "forked head confirmed; leaving for rejoin",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(left.0, StatusCode::OK, "{}", left.1);
+            assert!(
+                wedged.named_groups.read().await.get(&group).is_none(),
+                "the forked GroupInfo is GONE (the whole point of the escape)"
+            );
+            // AUDIT SURVIVES the teardown — the record is never deleted.
+            let audit_path = wedged
+                .predecessor_relay_outbox_path
+                .parent()
+                .expect("audit dir")
+                .join("escape_leave_audit.json");
+            let audit: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&audit_path).expect("audit file"))
+                    .expect("audit json");
+            assert_eq!(audit[0]["group_id"], group);
+            assert_eq!(
+                audit[0]["retired_record"]["terminal_state_hash"],
+                "871-terminal"
+            );
+            assert_eq!(
+                counter_for(&wedged, &group, |c| c.escape_leave_total),
+                1,
+                "the escape is attributable in /diagnostics/groups"
+            );
+
+            // THE REJOIN — a FRESH invite from the authority (fresh owner
+            // authorization; the wiped node holds nothing else) through
+            // the reviewed join path.
+            let (_inviter, link) = mint_real_invite(&authority, &group).await;
+            let response = join_group_via_invite(
+                State(Arc::clone(&wedged)),
+                Json(JoinGroupRequest {
+                    invite: link,
+                    display_name: None,
+                    mode: None,
+                    expected_owner_user_id: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            // CONVERGED, in the reviewed path's own terms: the fresh
+            // invite was ACCEPTED and the rejoined node now sits in the
+            // normal pending-authority-commit state (stub + fresh
+            // inviter pin) — the authority-commit leg is the two-daemon
+            // fixture's coverage (d4/Home), not reproducible in-proc.
+            // What MUST hold here: the group is back on the reviewed
+            // path with NO forked state and NO stale credential.
+            let has_stub = {
+                let stubs = wedged
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                stubs.iter().any(|stub| stub.as_str() == group)
+            };
+            assert!(
+                has_stub,
+                "the rejoin is on the reviewed pending path (stub present)"
+            );
+            let groups = wedged.named_groups.read().await;
+            if let Some(info) = groups.get(&group) {
+                assert_ne!(
+                    info.state_hash, "871-forked-head",
+                    "no forked state survived the leave-and-rejoin"
+                );
+            }
+        }
+
+        /// Direct-handler call helper for the #871 escape route.
+        async fn escape_call(
+            state: &Arc<AppState>,
+            group: &str,
+            reason: &str,
+            actor: crate::server::rider_auth::ActorContext,
+        ) -> (StatusCode, String) {
+            let response = escape_leave_group(
+                State(Arc::clone(state)),
+                axum::extract::Extension(actor),
+                Path(group.to_string()),
+                Json(EscapeLeaveRequest {
+                    reason: reason.to_string(),
+                }),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
         /// T1 — the SIX definitive refusal reasons, each via a REAL event
         /// through the REAL apply path, each asserting the staged reason
         /// AND the diagnostics counter (not map length).

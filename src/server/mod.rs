@@ -2322,6 +2322,10 @@ pub async fn serve_with_options(
         .route("/groups/:id/join-status", get(get_group_join_status))
         .route("/groups/:id", get(get_named_group))
         .route("/groups/:id/quarantine/clear", post(clear_group_quarantine))
+        .route(
+            "/groups/:id/escape/leave",
+            post(routes::named_groups::escape_leave_group),
+        )
         .route("/groups/:id", patch(update_named_group))
         .route("/groups/:id/policy", patch(update_group_policy))
         .route("/groups/:id/members", get(get_named_group_members))

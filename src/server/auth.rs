@@ -370,12 +370,28 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/seat"
                     | "/upgrade/apply"
             ) || is_two_segment_action(path, "delegate")
+                || is_three_segment_action(path, "escape", "leave")
         }
         Method::DELETE => is_sync_device_path(path),
         _ => false,
     }
 }
 
+/// `true` for exactly `/groups/<nonempty-id>/<a>/<b>` with the given
+/// trailing segments (#871: `escape`/`leave` — the wedge escape is an
+/// operator action, durable-token gated).
+fn is_three_segment_action(path: &str, a: &str, b: &str) -> bool {
+    match path.strip_prefix("/groups/") {
+        Some(rest) => {
+            let mut segs = rest.split('/');
+            segs.next().is_some_and(|id| !id.is_empty())
+                && segs.next() == Some(a)
+                && segs.next() == Some(b)
+                && segs.next().is_none()
+        }
+        None => false,
+    }
+}
 /// `true` for the ADR-0070 §3 ACL routes: `/acl/reload`, `/acl/connect`,
 /// `/acl/exec`, and `/acl/{connect,exec}/<nonempty-id>`.
 fn is_acl_admin_path(path: &str) -> bool {
