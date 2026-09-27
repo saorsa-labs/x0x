@@ -67,7 +67,10 @@ def require_loopback_namespace() -> None:
     """Fail closed unless the only interface is `lo` (isolated-runtime.py)."""
     if sys.platform != "linux":
         raise SmokeFailure("Linux only: run inside scripts/ci/isolated-runtime.py")
-    ifaces = sorted(p.name for p in Path("/sys/class/net").iterdir())
+    # /proc/self/net follows this process's network namespace; /sys/class/net
+    # shows the namespace sysfs was mounted in (the host's, under unshare).
+    lines = Path("/proc/self/net/dev").read_text().splitlines()[2:]
+    ifaces = sorted(line.split(":", 1)[0].strip() for line in lines)
     if ifaces != ["lo"]:
         raise SmokeFailure(
             f"refusing to start daemons outside a loopback-only namespace (interfaces: {ifaces})"
