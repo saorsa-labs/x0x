@@ -523,6 +523,8 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// ADR-0064 slice 2: an owner mandate was minted by this install at
+    /// the pre-mutation point of an invite-derived seat.
     pub fn record_owner_mandate_minted(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_minted = c.owner_mandate_minted.saturating_add(1);
@@ -1456,7 +1458,7 @@ mod tests {
             owner_mandate_missing: base + 40,
             mandate_capability_refusing_transitions: base + 41,
             fork_quarantine_manual_clears: base + 42,
-            escape_leave_total: base + 43,
+            escape_leave_total: base + 50,
             fork_evidence_signer_only: base + 43,
             fork_evidence_unauthorized_signer: base + 44,
             fork_quarantine_owner_anchored_clears: base + 45,

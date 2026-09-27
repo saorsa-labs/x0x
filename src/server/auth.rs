@@ -1245,6 +1245,19 @@ mod tests {
             "a refreshed session must never be the durable token"
         );
         assert!(requires_durable_owner(&Method::POST, "/agent/sign"));
+        // N6 (#871): the escape route sits in the durable-owner table.
+        assert!(requires_durable_owner(
+            &Method::POST,
+            "/groups/some-group-id/escape/leave"
+        ));
+        assert!(!requires_durable_owner(
+            &Method::POST,
+            "/groups/some-group-id/escape/leave/extra"
+        ));
+        assert!(!requires_durable_owner(
+            &Method::GET,
+            "/groups/some-group-id/escape/leave"
+        ));
     }
 
     #[test]

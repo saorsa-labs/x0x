@@ -1288,7 +1288,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/groups/:id/escape/leave",
         cli_name: "groups escape leave",
-        description: "#871 wedge escape: leave a genuinely-forked group locally (audit kept) to rejoin via a fresh owner-authorized invite",
+        description: "#871 wedge escape: leave a genuinely-forked group locally (audit kept); RUNBOOK — the owner/admin REMOVES the stale member first (key rotation), then mints a fresh invite",
         category: "named-groups",
         request: RequestSpec::Fields(&[
             RequestField::body_as("reason", true, "--reason"),

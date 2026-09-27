@@ -2676,4 +2676,10 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 `local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
+## Escape leave (#871)
+
+`POST /groups/:id/escape/leave` (durable owner token, body `{"reason": "..."}`) is the wedge escape for a genuinely-forked node whose #846 anchored-gap gate can never converge. It leaves LOCALLY: the armed record is snapshotted to the durable `escape_leave_audit.json` (never truncated), any live pending-join attempt is finalized (its resends and polls aborted — no stale-credential auto-rejoin), and the local group state, caches and key material are torn down. Nothing is published on the forked chain.
+
+**Runbook (required order):** 1. the wedged node's operator runs this route; 2. an owner/admin REMOVES the stale member (`MemberRemoved` rotates keys and evicts the wiped leaf — a fresh Welcome is only staged for a member the authority no longer seats); 3. a FRESH addressed invite is minted and the node joins via `POST /groups/join`. Typed refusals: `escape_requires_armed_gap_gate` (no armed record), `reason_required`, `escape_no_longer_armed` (the gate converged mid-flight — nothing was torn down).
+
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)
