@@ -181,6 +181,30 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
     ) -> crate::share_grant::GrantAccess {
+        self.grant_access_at(
+            contact_store,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            unix_now_secs(),
+        )
+        .await
+    }
+
+    /// [`Self::grant_access`] with the grant validity windows evaluated at
+    /// `now_unix` (ADR-0074 §4: the open-stream re-check runs every live
+    /// stream against one clock reading, so a grant's expiry is judged the
+    /// same way for all of them).
+    pub async fn grant_access_at(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        now_unix: u64,
+    ) -> crate::share_grant::GrantAccess {
         let Some(store) = self.share_grant_store() else {
             return crate::share_grant::GrantAccess::default();
         };
@@ -207,7 +231,7 @@ impl OwnerTrust {
             revocation_set,
             agent_id,
             machine_id,
-            unix_now_secs(),
+            now_unix,
         )
         .await;
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin

@@ -55,7 +55,8 @@ pub async fn remove(client: &DaemonClient, local_addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// `x0x streams` — active forward-stream count + connect-ACL counters.
+/// `x0x streams` — active and live forward streams, teardown and
+/// connect-ACL counters.
 pub async fn streams(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
     let resp = client.get("/streams").await?;

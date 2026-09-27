@@ -737,6 +737,9 @@ pub struct GrantAccess {
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
+    /// Ids of the grants that contributed `connect_ports` (ADR-0074 §4:
+    /// an open forward records the grant it was admitted under).
+    pub connect_grant_ids: BTreeSet<[u8; 32]>,
 }
 
 impl GrantAccess {
@@ -842,6 +845,13 @@ pub async fn evaluate_grant_access(
         };
         if grantee_matches {
             access.absorb(&grant.caps);
+            if grant
+                .caps
+                .iter()
+                .any(|cap| matches!(cap, ShareCap::Connect { .. }))
+            {
+                access.connect_grant_ids.insert(grant.grant_id);
+            }
         }
     }
     access

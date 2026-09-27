@@ -324,27 +324,22 @@ pub(in crate::server) async fn restore_forwards(state: &AppState) -> usize {
     down
 }
 
-/// GET /streams — active forward-stream count + connect-ACL counters.
+/// GET /streams — active forward-stream count, live streams with their
+/// authority (ADR-0074 §4), teardown and connect-ACL counters.
 pub(in crate::server) async fn streams_diagnostics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let (active, connect_failed, machine_mismatch) = state
-        .forward_service
-        .as_ref()
-        .map(|f| {
-            (
-                f.diagnostics().active_streams(),
-                f.diagnostics().connect_failed(),
-                f.diagnostics().machine_mismatch(),
-            )
-        })
-        .unwrap_or((0, 0, 0));
+    let forward = state.forward_service.as_ref();
+    let diag = forward.map(|f| f.diagnostics());
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "active_streams": active,
-            "connect_failed": connect_failed,
-            "machine_mismatch": machine_mismatch,
+            "active_streams": diag.map_or(0, |d| d.active_streams()),
+            "connect_failed": diag.map_or(0, |d| d.connect_failed()),
+            "machine_mismatch": diag.map_or(0, |d| d.machine_mismatch()),
+            "torn_down_reauth": diag.map_or(0, |d| d.torn_down_reauth()),
+            "torn_down_reasons": diag.map(|d| d.torn_down_reasons()).unwrap_or_default(),
+            "live": forward.map(|f| f.live_streams()).unwrap_or_default(),
             "connect": state.connect_diagnostics.snapshot(),
         })),
     )

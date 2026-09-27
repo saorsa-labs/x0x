@@ -224,6 +224,9 @@ pub struct ContactStore {
     revoked_keys: HashSet<[u8; 32]>,
     revocations: Vec<RevocationRecord>,
     storage_path: PathBuf,
+    /// ADR-0074 §4: woken on every persisted change so live tailnet streams
+    /// are re-checked promptly after a trust change. `None` wakes nothing.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Serializable format for the contacts file.
@@ -252,6 +255,7 @@ impl ContactStore {
             revoked_keys: HashSet::new(),
             revocations: Vec::new(),
             storage_path,
+            change_notify: None,
         };
         // Best-effort load from disk
         let _ = store.load();
@@ -548,8 +552,21 @@ impl ContactStore {
         let _ = self.save();
     }
 
+    /// Wake `notify` on every future change to the store (ADR-0074 §4
+    /// open-stream re-check). Replaces any previously installed notifier.
+    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
+    }
+
     /// Persist contacts and revocations to disk.
+    ///
+    /// Every mutation ends here, so this is also where a change is
+    /// signalled — before the write, since the in-memory state has already
+    /// changed even if persisting it fails.
     fn save(&self) -> std::io::Result<()> {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
         let file = ContactsFile {
             contacts: self.contacts.values().cloned().collect(),
             revocations: self.revocations.clone(),

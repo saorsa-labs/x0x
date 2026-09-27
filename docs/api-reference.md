@@ -2661,7 +2661,7 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 | POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`) |
 | GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed and machine-mismatch counters + connect-ACL snapshot |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, live streams with their authority, connect-failed, machine-mismatch and teardown counters, connect-ACL snapshot |
 
 ### `POST /forwards` request body
 
@@ -2680,6 +2680,32 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 `peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
 
 **Machine binding (ADR-0074 §1).** A forward with a pinned machine (every machine-name forward and every persistent forward) checks, on every stream, that the stream reached that `MachineId` before any forward-header byte is sent. On a mismatch (the agent moved, or discovery changed) the stream is reset with zero header bytes, the local TCP connection closes, and `GET /streams` `machine_mismatch` counts it.
+
+**Open-stream teardown (ADR-0074 §4).** Every bridged forward stream, inbound and outbound, is recorded with the authority it was admitted under. The daemon re-runs the stream's admission gates on every live stream when a gate input changes (a revocation-set change, a contact trust change or `Blocked`, a connect-ACL reload) and on a 2 s sweep that also catches grant and certificate expiry and owner enrollment removal. A stream that a fresh admission would now refuse is torn down: both QUIC halves are reset (application error code `0x5244`), the local TCP socket is closed with an RST, and the teardown is counted. The bound is ≤5 s after the daemon applies the event and ≤35 s after a grant's `expiry`. A stream stays open while any rule still admits it, so an owner-trusted stream is not closed by a grant event. The exposing daemon is the security boundary; the opener also closes its side when its peer is revoked, blocked or moves machine.
+
+`GET /streams` returns:
+
+```json
+{
+  "active_streams": 1,
+  "connect_failed": 0,
+  "machine_mismatch": 0,
+  "torn_down_reauth": 2,
+  "torn_down_reasons": { "trust_rejected": 1, "target_not_allowed": 1 },
+  "live": [
+    {
+      "direction": "inbound",
+      "peer_agent": "<hex>",
+      "peer_machine": "<hex>",
+      "target": "127.0.0.1:22",
+      "authority": { "principal": "grant", "grant_ids": ["<hex>"] }
+    }
+  ],
+  "connect": { "streams_allowed": 3, "streams_denied": 0, "denial_breakdown": {}, "acl_summary": { "enabled": true } }
+}
+```
+
+`authority.principal` is `acl_entry` (an exact `(agent, machine)` entry), `owner_trust` (a `principal = "owner"` entry), `grant` (a `principal = "grant"` entry and the covering Connect grants) or, for outbound streams, `peer_trust`. `direction` is `inbound` or `outbound`; `peer_agent` is `null` for a legacy `ForwardV1` stream, which is authorized per machine. `torn_down_reasons` keys are `revoked`, `not_verified` (unknown agent or expired certificate), `trust_rejected`, `agent_machine_not_in_acl`, `target_not_allowed`, `connect_disabled`, `agent_not_on_machine`, `pairing_retired` and `machine_changed` (outbound: the peer now resolves to another machine).
 
 **Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards.
 

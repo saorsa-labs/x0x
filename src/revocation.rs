@@ -476,6 +476,9 @@ pub struct RevocationSet {
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
     change_generation: u64,
+    /// ADR-0074 §4: woken on every change so live tailnet streams are
+    /// re-checked promptly. `None` (the default) wakes nothing.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl RevocationSet {
@@ -483,6 +486,19 @@ impl RevocationSet {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wake `notify` on every future change to the set (ADR-0074 §4 open-
+    /// stream re-check). Replaces any previously installed notifier.
+    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
+    }
+
+    fn bump_generation(&mut self) {
+        self.change_generation = self.change_generation.saturating_add(1);
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
     }
 
     /// Whether an agent id is revoked.
@@ -554,7 +570,7 @@ impl RevocationSet {
             }
         }
         if changed {
-            self.change_generation = self.change_generation.saturating_add(1);
+            self.bump_generation();
         }
         changed
     }
@@ -682,7 +698,7 @@ impl RevocationSet {
                 }
             }
         }
-        self.change_generation = self.change_generation.saturating_add(1);
+        self.bump_generation();
         expired.len()
     }
 
@@ -714,7 +730,7 @@ impl RevocationSet {
             }
         }
         self.records_by_hash.insert(hash, persisted);
-        self.change_generation = self.change_generation.saturating_add(1);
+        self.bump_generation();
         true
     }
 
@@ -911,7 +927,7 @@ impl RevocationSet {
             }
         }
         if changed {
-            self.change_generation = self.change_generation.saturating_add(1);
+            self.bump_generation();
         }
     }
 

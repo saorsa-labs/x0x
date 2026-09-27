@@ -282,7 +282,7 @@ admin-equivalent for old groups but are not assignable.
 | POST | `/forwards` | `x0x forward add` | Add a local port forward to a peer's loopback service |
 | GET | `/forwards` | `x0x forward list` | List registered port forwards |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm` | Remove a port forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-ACL counters |
+| GET | `/streams` | `x0x streams` | Active and live forward streams (with authority) + teardown and connect-ACL counters |
 
 ## WebSocket and GUI
 
