@@ -239,6 +239,10 @@ async fn half_close_propagates_and_response_tail_arrives() {
             peer_agent: bob.agent_id(),
             target_host: "127.0.0.1".to_string(),
             target_port: server_addr.port(),
+            name: None,
+            kind: x0x::names::NameKind::Agent,
+            pinned_machine: None,
+            persistent: false,
         })
         .await
         .expect("add forward");
