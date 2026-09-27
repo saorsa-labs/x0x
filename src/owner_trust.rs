@@ -16,8 +16,15 @@
 //! 4. neither the agent, the machine, nor the ADR-0043 binding is in the
 //!    local ADR-0018 revocation set;
 //! 5. the machine holds a current `OwnerEnrollment` signed by the local owner
-//!    ([`OwnerSyncStore::is_enrolled`], which re-verifies the signature and
-//!    expiry on every call).
+//!    (the same check as [`OwnerSyncStore::is_enrolled`]; expiry is checked
+//!    on every call).
+//!
+//! ML-DSA results (the certificate chain in 3, the enrollment signature in
+//! 5, and a `Grantee::User` grant chain) are memoized per exact certificate
+//! or enrollment bytes, so the ADR-0074 §4 open-stream re-check does not
+//! re-verify unchanged evidence on every pass. The memo is cleared whenever
+//! the revocation set or the owner-trust state (device set, installed
+//! stores) changes; revocation and expiry are never memoized.
 //!
 //! Every failure — no owner, no device set, no cached certificate, a bad or
 //! foreign or expired certificate, a revocation, a missing or expired
@@ -61,6 +68,83 @@ pub struct OwnerTrust {
     /// #926 owner-side grant redelivery outbox. Shared slot like `grants`.
     grant_outbox:
         Arc<std::sync::RwLock<Option<Arc<crate::share_grant::outbox::GrantRedeliveryOutbox>>>>,
+    /// Memoized ML-DSA results (module docs). Shared by every clone.
+    verified: Arc<std::sync::Mutex<VerifyMemo>>,
+    /// Bumped when a store is installed; part of the memo epoch.
+    installs: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Upper bound on memoized results; the memo is cleared when reached.
+const VERIFY_MEMO_MAX: usize = 4096;
+
+/// A memo key: two identities and a fingerprint of the verified bytes.
+type MemoKey = ([u8; 32], [u8; 32], [u8; 32]);
+
+/// Memoized verification results, valid for one epoch.
+#[derive(Default)]
+struct VerifyMemo {
+    /// `(revocation-set generation, owner-trust state)` the results were
+    /// computed under. Any change clears the memo.
+    epoch: Option<(u64, u64)>,
+    /// `(owner, agent, certificate fingerprint)` -> chain verified.
+    certs: HashMap<MemoKey, bool>,
+    /// `(machine, owner, enrollment fingerprint)` -> signature verified.
+    enrollments: HashMap<MemoKey, bool>,
+}
+
+impl VerifyMemo {
+    fn at_epoch(&mut self, epoch: (u64, u64)) -> &mut Self {
+        if self.epoch != Some(epoch) || self.certs.len() + self.enrollments.len() >= VERIFY_MEMO_MAX
+        {
+            self.certs.clear();
+            self.enrollments.clear();
+            self.epoch = Some(epoch);
+        }
+        self
+    }
+}
+
+/// Encode an optional expiry unambiguously for a fingerprint.
+fn expiry_bytes(expiry: Option<u64>) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    if let Some(t) = expiry {
+        out[0] = 1;
+        out[1..].copy_from_slice(&t.to_le_bytes());
+    }
+    out
+}
+
+/// SHA-256 over every signed field of a certificate, including its expiry.
+fn cert_fingerprint(cert: &AgentCertificate) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"x0x.verify-memo.cert.v1");
+    for part in [
+        cert.user_public_key_bytes(),
+        cert.agent_public_key(),
+        cert.signature_bytes(),
+    ] {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    h.update(cert.issued_at().to_le_bytes());
+    h.update(expiry_bytes(cert.not_after()));
+    h.finalize().into()
+}
+
+/// SHA-256 over every signed field of an enrollment, including its expiry.
+fn enrollment_fingerprint(e: &crate::owner_sync::OwnerEnrollment) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"x0x.verify-memo.enrollment.v1");
+    h.update(e.machine_id);
+    h.update(e.enrolled_at_ms.to_le_bytes());
+    h.update(expiry_bytes(e.expires_at_ms));
+    for part in [e.owner_public_key.as_slice(), e.signature.as_slice()] {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    h.finalize().into()
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -95,7 +179,85 @@ impl OwnerTrust {
             bindings,
             grants: Arc::new(std::sync::RwLock::new(None)),
             grant_outbox: Arc::new(std::sync::RwLock::new(None)),
+            verified: Arc::default(),
+            installs: Arc::default(),
         }
+    }
+
+    /// The memo epoch: the revocation-set generation and the owner-trust
+    /// state (store installs plus the owner device store's generation).
+    pub(crate) async fn verify_epoch(&self, revocation_set: &RwLock<RevocationSet>) -> (u64, u64) {
+        let revocations = revocation_set.read().await.generation();
+        let devices = self.device_store().map_or(0, |d| d.generation());
+        let installs = self.installs.load(std::sync::atomic::Ordering::Acquire);
+        (revocations, (installs << 32) ^ devices)
+    }
+
+    fn memo(&self) -> std::sync::MutexGuard<'_, VerifyMemo> {
+        self.verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`certificate_chains_to_owner`] with the signature and chain result
+    /// memoized for `epoch` (module docs). Revocation and expiry are checked
+    /// on every call.
+    pub(crate) fn chains_to_owner_memo(
+        &self,
+        epoch: (u64, u64),
+        owner: &UserId,
+        agent_id: &AgentId,
+        cert: &AgentCertificate,
+        revoked: bool,
+        now_unix: u64,
+    ) -> bool {
+        if revoked {
+            return false;
+        }
+        // Cheap pre-check first, exactly as the unmemoized form: a foreign
+        // certificate costs no verification.
+        match cert.user_id() {
+            Ok(cert_user) if cert_user == *owner => {}
+            _ => return false,
+        }
+        let key = (owner.0, agent_id.0, cert_fingerprint(cert));
+        let known = self.memo().at_epoch(epoch).certs.get(&key).copied();
+        let chained = known.unwrap_or_else(|| {
+            // `now = 0`: the time-independent part only (signature, chain,
+            // agent binding); expiry is checked below on every call.
+            let chained = certificate_chains_to_owner(owner, agent_id, cert, false, 0);
+            self.memo().at_epoch(epoch).certs.insert(key, chained);
+            chained
+        });
+        chained && !cert.is_expired(now_unix)
+    }
+
+    /// Whether `machine_id` holds an enrollment by `owner` that verifies
+    /// (memoized for `epoch`) and is current at `now_ms`.
+    async fn enrolled_memo(
+        &self,
+        epoch: (u64, u64),
+        devices: &OwnerSyncStore,
+        machine_id: &MachineId,
+        owner: &UserId,
+        now_ms: u64,
+    ) -> bool {
+        let Some(enrollment) = devices.enrollment(machine_id).await else {
+            return false;
+        };
+        if !enrollment.is_current_at(now_ms) {
+            return false;
+        }
+        let key = (machine_id.0, owner.0, enrollment_fingerprint(&enrollment));
+        let known = self.memo().at_epoch(epoch).enrollments.get(&key).copied();
+        known.unwrap_or_else(|| {
+            let verified = enrollment.verify_owner(owner).is_ok();
+            self.memo()
+                .at_epoch(epoch)
+                .enrollments
+                .insert(key, verified);
+            verified
+        })
     }
 
     /// Install the #926 grant redelivery outbox. Every clone sees it.
@@ -157,6 +319,8 @@ impl OwnerTrust {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(store);
+        self.installs
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The installed share-grant store, if any.
@@ -224,7 +388,7 @@ impl OwnerTrust {
         if rejected(base) {
             return crate::share_grant::GrantAccess::default();
         }
-        let access = crate::share_grant::evaluate_grant_access(
+        let access = crate::share_grant::evaluate_grant_access_memo(
             &store,
             &self.bindings,
             discovery_cache,
@@ -232,6 +396,7 @@ impl OwnerTrust {
             agent_id,
             machine_id,
             now_unix,
+            Some(self),
         )
         .await;
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
@@ -263,6 +428,8 @@ impl OwnerTrust {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(store);
+        self.installs
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     fn device_store(&self) -> Option<Arc<OwnerSyncStore>> {
@@ -313,10 +480,13 @@ impl OwnerTrust {
                 || revoked.is_machine_revoked(machine_id)
                 || revoked.is_binding_revoked(agent_id, machine_id)
         };
-        if !certificate_chains_to_owner(&owner, agent_id, &cert, revoked, unix_now_secs()) {
+        let epoch = self.verify_epoch(revocation_set).await;
+        if !self.chains_to_owner_memo(epoch, &owner, agent_id, &cert, revoked, unix_now_secs()) {
             return false;
         }
-        devices.is_enrolled(machine_id, &owner).await
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        self.enrolled_memo(epoch, &devices, machine_id, &owner, now_ms)
+            .await
     }
 
     /// Evaluate trust for a pair with the owner-trust input applied, in the
@@ -418,6 +588,8 @@ impl crate::Agent {
     /// sync service has loaded its store; without it nothing is
     /// owner-trusted.
     pub fn install_owner_device_store(&self, store: Arc<OwnerSyncStore>) {
+        // ADR-0074 §4: an enrollment removal re-checks live streams.
+        store.set_device_change_notify(Arc::clone(&self.stream_reauth));
         self.owner_trust.install_device_store(store);
     }
 

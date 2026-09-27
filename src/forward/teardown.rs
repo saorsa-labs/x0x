@@ -13,18 +13,23 @@
 //!
 //! ## When a pass runs
 //!
-//! - **On an event**: the agent's re-check signal is woken by every
-//!   revocation-set change, every contact-store change and every connect-ACL
-//!   reload ([`crate::Agent::set_connect_policy`]). The pass starts at most
-//!   [`REAUTH_MIN_SPACING`] later.
-//! - **On a sweep**: every [`REAUTH_SWEEP_INTERVAL`]. This backstop bounds
-//!   the triggers that raise no event (grant and certificate expiry, an
-//!   owner enrollment removal, a discovery-cache change) and any change made
-//!   through a path that does not signal.
+//! **On an event** (bound ≤5 s; the pass starts at most
+//! [`REAUTH_MIN_SPACING`] after the signal). The agent's re-check signal is
+//! woken by every change to a gate input:
 //!
-//! The ADR bounds are ≤5 s after the exposing daemon applies an event and
-//! ≤35 s after a grant's expiry. Both are met by the sweep alone (2 s plus a
-//! pass), so a missed event can delay a teardown but never past the bound.
+//! | Trigger | Where the event is raised |
+//! |---|---|
+//! | revocation (agent, machine, binding, grant; ADR-0018/0070 v3) | `RevocationSet` on every change |
+//! | ADR-0043 move (retired binding, placement record) | `RevocationSet` (tombstones), `MoveState::cache_placement` |
+//! | contact trust change, `Blocked`, machine pin | `ContactStore` on every persisted change, and on dropping a [`crate::contacts::ContactMut`] |
+//! | connect-ACL reload | [`crate::Agent::set_connect_policy`] |
+//! | owner enrollment added or removed | `OwnerSyncStore::enroll` / `unenroll` |
+//! | peer machine binding or certificate changed | the announcement ingest (`upsert_discovered_agent`) and the announce-blob certificate patch |
+//!
+//! **On a sweep** every [`REAUTH_SWEEP_INTERVAL`] (30 s), for the
+//! triggers that are only the passage of time: grant expiry (bound ≤35 s),
+//! certificate expiry, enrollment expiry and discovery-cache TTL eviction.
+//! Nothing else depends on the sweep.
 //!
 //! ## What a teardown does
 //!
@@ -50,10 +55,11 @@ use crate::error::NetworkError;
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
 
-/// Backstop sweep period. Keeps every §4 bound even for a trigger that
-/// raises no event: 2 s plus one pass is well inside 5 s, and far inside
-/// the 35 s grant-expiry bound.
-pub const REAUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+/// Expiry sweep period (ADR-0074 §4: "30 s sweep plus slack"). One period
+/// plus [`REAUTH_MIN_SPACING`] and a pass stays inside the 35 s grant-expiry
+/// bound. Only time-driven triggers rely on it; every other trigger is an
+/// event.
+pub const REAUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Minimum gap between two passes, so a burst of events (a revocation
 /// flood, many contact writes) costs one pass per gap rather than one per
@@ -517,22 +523,35 @@ pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
     torn_down
 }
 
-/// Run re-check passes on every `kick` and every [`REAUTH_SWEEP_INTERVAL`]
-/// until `stop` fires.
+/// Run re-check passes on every `kick` and, when `sweep` is set, every
+/// `sweep` period, until `stop` fires. Production passes
+/// `Some(REAUTH_SWEEP_INTERVAL)`; `None` (tests) leaves only the events.
 pub(crate) fn spawn_reauth_loop(
     live: Arc<LiveStreams>,
     ctx: ReauthCtx,
     kick: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
+    sweep: Option<Duration>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sweep = tokio::time::interval(REAUTH_SWEEP_INTERVAL);
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sweep = sweep.map(|period| {
+            let mut sweep = tokio::time::interval(period);
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            sweep
+        });
         loop {
+            let tick = async {
+                match sweep.as_mut() {
+                    Some(sweep) => {
+                        sweep.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 () = stop.cancelled() => break,
                 () = kick.notified() => {}
-                _ = sweep.tick() => {}
+                () = tick => {}
             }
             reauth_pass(&live, &ctx).await;
             tokio::select! {

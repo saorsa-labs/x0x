@@ -1314,6 +1314,9 @@ pub struct MoveState {
     /// Current owner-verified placement record per agent
     /// (`placement-blobs.bin`); mint records enter here too.
     placements: HashMap<AgentId, PlacementRecord>,
+    /// ADR-0074 §4: woken when the placement cache changes (the ADR-0043
+    /// P gate reads it), so live tailnet streams are re-checked promptly.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl MoveState {
@@ -1321,6 +1324,11 @@ impl MoveState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wake `notify` whenever a placement record is cached (ADR-0074 §4).
+    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
     }
 
     /// The participant log of one agent (empty slice when absent).
@@ -1518,6 +1526,9 @@ impl MoveState {
             }
             _ => {
                 self.placements.insert(record.agent_id, record);
+                if let Some(notify) = &self.change_notify {
+                    notify.notify_one();
+                }
                 Ok(true)
             }
         }

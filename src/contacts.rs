@@ -229,6 +229,35 @@ pub struct ContactStore {
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
+/// Mutable handle to one contact ([`ContactStore::get_mut`]). Signals the
+/// store's change notifier when dropped.
+#[derive(Debug)]
+pub struct ContactMut<'a> {
+    contact: &'a mut Contact,
+    notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl std::ops::Deref for ContactMut<'_> {
+    type Target = Contact;
+    fn deref(&self) -> &Contact {
+        self.contact
+    }
+}
+
+impl std::ops::DerefMut for ContactMut<'_> {
+    fn deref_mut(&mut self) -> &mut Contact {
+        self.contact
+    }
+}
+
+impl Drop for ContactMut<'_> {
+    fn drop(&mut self) {
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
+    }
+}
+
 /// Serializable format for the contacts file.
 #[derive(Serialize, Deserialize)]
 struct ContactsFile {
@@ -376,9 +405,18 @@ impl ContactStore {
         self.contacts.get(&agent_id.0)
     }
 
-    /// Get a mutable reference to a contact by agent ID.
-    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
-        self.contacts.get_mut(&agent_id.0)
+    /// Get a mutable handle to a contact by agent ID.
+    ///
+    /// The handle derefs to [`Contact`]. Dropping it signals a change
+    /// (ADR-0074 §4), so an edit made through it — a trust level, a machine
+    /// pin — re-checks live tailnet streams like every other mutation. It
+    /// does not persist: call a persisting method, or accept that the edit
+    /// is in memory only.
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
+        let notify = self.change_notify.clone();
+        self.contacts
+            .get_mut(&agent_id.0)
+            .map(|contact| ContactMut { contact, notify })
     }
 
     /// List all contacts.

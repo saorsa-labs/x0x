@@ -794,6 +794,32 @@ pub async fn evaluate_grant_access(
     requester_machine: &MachineId,
     now_unix: u64,
 ) -> GrantAccess {
+    evaluate_grant_access_memo(
+        store,
+        bindings,
+        discovery_cache,
+        revocation_set,
+        requester_agent,
+        requester_machine,
+        now_unix,
+        None,
+    )
+    .await
+}
+
+/// [`evaluate_grant_access`], with a `Grantee::User` certificate chain
+/// memoized in `memo` when given (ADR-0074 §4 re-check cost).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn evaluate_grant_access_memo(
+    store: &ShareGrantStore,
+    bindings: &AuthenticatedMachineBindings,
+    discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+    revocation_set: &RwLock<RevocationSet>,
+    requester_agent: &AgentId,
+    requester_machine: &MachineId,
+    now_unix: u64,
+    memo: Option<&OwnerTrust>,
+) -> GrantAccess {
     let mut access = GrantAccess::default();
     // A failed clock read maps to 0; never evaluate validity windows
     // against it (it could reactivate a long-expired grant). Fail closed.
@@ -830,17 +856,24 @@ pub async fn evaluate_grant_access(
     } else {
         None
     };
+    let epoch = match (memo, cert.is_some()) {
+        (Some(memo), true) => Some(memo.verify_epoch(revocation_set).await),
+        _ => None,
+    };
     for grant in &live {
         let grantee_matches = match grant.grantee {
             Grantee::Agent(agent) => agent == *requester_agent,
-            Grantee::User(user) => cert.as_ref().is_some_and(|cert| {
-                crate::owner_trust::certificate_chains_to_owner(
+            Grantee::User(user) => cert.as_ref().is_some_and(|cert| match (memo, epoch) {
+                (Some(memo), Some(epoch)) => {
+                    memo.chains_to_owner_memo(epoch, &user, requester_agent, cert, false, now_unix)
+                }
+                _ => crate::owner_trust::certificate_chains_to_owner(
                     &user,
                     requester_agent,
                     cert,
                     false,
                     now_unix,
-                )
+                ),
             }),
         };
         if grantee_matches {

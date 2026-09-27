@@ -1677,6 +1677,7 @@ impl ForwardService {
             ctx,
             self.agent.stream_reauth_signal(),
             self.inbound_token.clone(),
+            Some(teardown::REAUTH_SWEEP_INTERVAL),
         );
     }
 

@@ -510,6 +510,8 @@ impl OwnerEnrollment {
     /// [`SyncError::BadSignature`] / [`SyncError::OwnerMismatch`] — fail
     /// closed on any enrollment failure.
     pub fn verify_owner(&self, owner: &UserId) -> Result<(), SyncError> {
+        #[cfg(test)]
+        crate::identity::ml_dsa_verify_count::bump();
         let pubkey = MlDsaPublicKey::from_bytes(&self.owner_public_key)
             .map_err(|_| SyncError::BadSignature("invalid owner public key".into()))?;
         if derive_peer_id_from_public_key(&pubkey).0 != owner.0 {
@@ -841,6 +843,10 @@ pub struct OwnerSyncStore {
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
     canonical_home_gate: tokio::sync::RwLock<()>,
+    /// ADR-0074 §4: woken when the owner device set changes (an enrollment
+    /// added, replaced or removed), so live tailnet streams admitted by
+    /// owner trust are re-checked promptly.
+    device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
@@ -910,7 +916,27 @@ impl OwnerSyncStore {
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
+            device_change_notify: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Wake `notify` on every future change to the device set (ADR-0074 §4).
+    pub fn set_device_change_notify(&self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        *self
+            .device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    fn notify_device_change(&self) {
+        if let Some(notify) = self
+            .device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            notify.notify_one();
+        }
     }
 
     /// Read a persisted state file: `NotFound` → default (fresh install);
@@ -1132,6 +1158,7 @@ impl OwnerSyncStore {
                     // mutation (memory matches disk) and poison.
                     drop(devices);
                     self.poison(e.to_string());
+                    self.notify_device_change();
                     return Err(e);
                 }
                 // Pre-rename failure: roll back so memory matches the
@@ -1149,6 +1176,7 @@ impl OwnerSyncStore {
         }
         drop(devices);
         self.kick();
+        self.notify_device_change();
         Ok(())
     }
 
@@ -1166,6 +1194,7 @@ impl OwnerSyncStore {
                     // Disk already holds the removal: keep it and poison.
                     drop(devices);
                     self.poison(e.to_string());
+                    self.notify_device_change();
                     return Err(e);
                 }
                 devices.insert(previous.machine_id, previous);
@@ -1176,6 +1205,7 @@ impl OwnerSyncStore {
         }
         drop(devices);
         self.kick();
+        self.notify_device_change();
         Ok(true)
     }
 
@@ -1187,6 +1217,17 @@ impl OwnerSyncStore {
     /// On-change trigger: bump the generation the periodic task waits on.
     pub fn kick(&self) {
         self.generation_tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// The current generation (bumped on every stored change).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        *self.generation_tx.borrow()
+    }
+
+    /// The stored enrollment for `machine`, unverified (callers verify).
+    pub async fn enrollment(&self, machine: &MachineId) -> Option<OwnerEnrollment> {
+        self.devices.read().await.get(&machine.0).cloned()
     }
 
     /// Subscribe to generation changes.

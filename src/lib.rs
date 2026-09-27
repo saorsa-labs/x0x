@@ -2411,9 +2411,12 @@ async fn upsert_discovered_agent(
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     mut incoming: DiscoveredAgent,
-) {
+) -> bool {
     prioritize_discovery_addresses(&mut incoming.addresses);
     let mut cache = cache.write().await;
+    let agent_id = incoming.agent_id;
+    let before = cache.get(&agent_id).map(discovery_gate_inputs);
+    let mut evicted = false;
     match cache.get_mut(&incoming.agent_id) {
         Some(existing) => {
             if incoming.announced_at >= existing.announced_at {
@@ -2520,6 +2523,7 @@ async fn upsert_discovered_agent(
                     .map(|(id, _)| *id)
                 {
                     cache.remove(&stalest);
+                    evicted = true;
                 }
             }
             // E2d: a certificate arriving with a COLD entry lands too —
@@ -2532,6 +2536,37 @@ async fn upsert_discovered_agent(
             }
         }
     }
+    evicted || cache.get(&agent_id).map(discovery_gate_inputs) != before
+}
+
+/// Swap the effective connect policy in `holder` and signal `reauth`, so an
+/// ACL reload re-checks every open stream (ADR-0074 §4).
+pub(crate) fn install_connect_policy(
+    holder: &std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>,
+    reauth: &tokio::sync::Notify,
+    policy: std::sync::Arc<connect::ConnectPolicy>,
+) {
+    {
+        let mut guard = holder
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+    reauth.notify_one();
+}
+
+/// The discovery-entry fields the stream gates read (ADR-0074 §4): the
+/// machine binding and the certificate evidence. [`upsert_discovered_agent`]
+/// reports a change to them so live streams are re-checked.
+fn discovery_gate_inputs(
+    entry: &DiscoveredAgent,
+) -> (identity::MachineId, Option<u64>, Option<[u8; 32]>, bool) {
+    (
+        entry.machine_id,
+        entry.cert_not_after,
+        entry.cert_digest,
+        entry.agent_certificate.is_some(),
+    )
 }
 
 /// #447: merge an announce-blob pair into the discovery entry the moment a
@@ -2551,7 +2586,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
     agent_id: &identity::AgentId,
-) {
+) -> bool {
     let attempts = (announce_blob::BLOB_FETCH_TIMEOUT_SECS * 2).max(1);
     for _ in 0..attempts {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -2559,14 +2594,14 @@ async fn patch_discovery_entry_when_blob_lands(
             continue;
         };
         let Some(cert) = blob.agent_certificate.as_ref() else {
-            return; // anonymous pair fetched — nothing to attach
+            return false; // anonymous pair fetched — nothing to attach
         };
         if !cert.agent_id().is_ok_and(|id| id == *agent_id) || cert.user_id().ok() != blob.user_id {
             tracing::debug!(
                 agent = %hex::encode(agent_id.0),
                 "announce blob landed but binds a different agent; not patching discovery entry (#447)"
             );
-            return;
+            return false;
         }
         let mut cache = cache.write().await;
         if let Some(entry) = cache.get_mut(agent_id) {
@@ -2583,7 +2618,7 @@ async fn patch_discovery_entry_when_blob_lands(
                     current_digest = ?entry.cert_digest.map(hex::encode),
                     "announce blob landed for a superseded digest; not patching (#447 r2)"
                 );
-                return;
+                return false;
             }
             if entry.agent_certificate.is_none() {
                 entry.user_id = blob.user_id;
@@ -2596,10 +2631,12 @@ async fn patch_discovery_entry_when_blob_lands(
                 // E2d: the fetched certificate has now LANDED in the
                 // discovery cache — notify the hydration bridge.
                 publish_verified_certificate(cert_events, *agent_id, cert);
+                return true;
             }
         }
-        return;
+        return false;
     }
+    false
 }
 
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
@@ -8919,6 +8956,9 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         // E2d: the listener's upserts fire verified-certificate events.
         let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
+        // ADR-0074 §4: a peer's machine binding or certificate changing
+        // re-checks live streams.
+        let stream_reauth = std::sync::Arc::clone(&self.stream_reauth);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
@@ -9665,15 +9705,21 @@ impl Agent {
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
                                 let watch_digest = cert_digest;
                                 let watch_agent = converted.agent_id;
+                                let watch_reauth = std::sync::Arc::clone(&stream_reauth);
                                 tokio::spawn(async move {
-                                    patch_discovery_entry_when_blob_lands(
+                                    if patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
                                         &watch_blob_cache,
                                         &watch_cert_events,
                                         &watch_digest,
                                         &watch_agent,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        // ADR-0074 §4: certificate evidence
+                                        // changed; re-check live streams.
+                                        watch_reauth.notify_one();
+                                    }
                                 });
                             }
                         }
@@ -9917,7 +9963,9 @@ impl Agent {
                     cache_freshness_ttl_secs,
                 ) {
                     upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                    upsert_discovered_agent(&cache, &cert_events, discovered_agent).await;
+                    if upsert_discovered_agent(&cache, &cert_events, discovered_agent).await {
+                        stream_reauth.notify_one();
+                    }
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -12829,7 +12877,9 @@ impl Agent {
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
-                            upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
+                            if upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await {
+                                self.stream_reauth.notify_one();
+                            }
                             return Ok(Some(addrs));
                         }
                     }
@@ -14263,15 +14313,7 @@ impl Agent {
     /// The daemon calls this once at startup with the loaded policy; library
     /// embedders that want ACL-gated streams do the same.
     pub fn set_connect_policy(&self, policy: std::sync::Arc<connect::ConnectPolicy>) {
-        {
-            let mut guard = self
-                .connect_policy
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = policy;
-        }
-        // ADR-0074 §4: an ACL reload re-checks every open stream.
-        self.stream_reauth.notify_one();
+        install_connect_policy(&self.connect_policy, &self.stream_reauth, policy);
     }
 
     /// The shared holder of the connect policy, for gates that run outside
@@ -16258,7 +16300,11 @@ impl AgentBuilder {
             }
             (state, logs_corrupt)
         };
-        let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
+        let move_state = {
+            let mut move_state = move_state;
+            move_state.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+            std::sync::Arc::new(tokio::sync::RwLock::new(move_state))
+        };
         let move_state_load_failed =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
 

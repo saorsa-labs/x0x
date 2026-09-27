@@ -29,6 +29,27 @@ pub type PeerId = AntQuicPeerId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MachineId(pub [u8; PEER_ID_LENGTH]);
 
+/// Test-only count of certificate and enrollment ML-DSA verifications on
+/// the current thread (ADR-0074 §4 memo tests).
+#[cfg(test)]
+pub(crate) mod ml_dsa_verify_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Count one verification.
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Verifications so far on this thread.
+    pub(crate) fn get() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// Portable agent identity derived from ML-DSA-65 keypair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub [u8; PEER_ID_LENGTH]);
@@ -665,6 +686,8 @@ impl AgentCertificate {
     /// Reconstructs the signed message and verifies the ML-DSA-65 signature
     /// against the stored user public key.
     pub fn verify(&self) -> Result<(), crate::error::IdentityError> {
+        #[cfg(test)]
+        ml_dsa_verify_count::bump();
         let user_pubkey = MlDsaPublicKey::from_bytes(&self.user_public_key).map_err(|_| {
             crate::error::IdentityError::CertificateVerification(
                 "invalid user public key in certificate".to_string(),

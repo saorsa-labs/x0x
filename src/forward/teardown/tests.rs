@@ -3,7 +3,8 @@
 //! the streams whose authority is gone.
 //!
 //! Time is paused tokio time. The re-check clock is derived from it, so a
-//! grant's expiry is crossed deterministically. Streams are in-memory
+//! grant's expiry is crossed deterministically. Event tests run with the
+//! expiry sweep disabled, so only the event under test can close a stream. Streams are in-memory
 //! registrations (plus `tokio::io::duplex` for the bridge); nothing binds a
 //! socket.
 
@@ -76,6 +77,7 @@ struct World {
     move_state: Arc<RwLock<crate::key_move::MoveState>>,
     policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
     trust: OwnerTrust,
+    devices: Arc<OwnerSyncStore>,
     grants: Arc<ShareGrantStore>,
     kick: Arc<Notify>,
     diag: Arc<ForwardDiagnostics>,
@@ -120,22 +122,23 @@ impl World {
             cache.insert(kp.agent_id(), discovered(kp, machine, cert));
         }
 
-        // Every contact-store and revocation-set change wakes the loop, as
-        // the agent wires them.
+        // Every contact-store, revocation-set and device-set change wakes the
+        // loop, as the agent wires them.
         let kick = Arc::new(Notify::new());
         let mut contacts = ContactStore::new(dir.path().join("contacts.json"));
         contacts.set_change_notify(Arc::clone(&kick));
         let mut revocations = RevocationSet::new();
         revocations.set_change_notify(Arc::clone(&kick));
 
-        let devices = OwnerSyncStore::load(dir.path()).await.unwrap();
+        let devices = Arc::new(OwnerSyncStore::load(dir.path()).await.unwrap());
         devices
             .enroll(OwnerEnrollment::sign(mo, &owner_a, base_secs * 1000, None).unwrap())
             .await
             .unwrap();
+        devices.set_device_change_notify(Arc::clone(&kick));
         let grants = Arc::new(ShareGrantStore::in_memory(a1, Some(owner_a.user_id())));
         let trust = OwnerTrust::new(Some(owner_a.user_id()), bindings);
-        trust.install_device_store(Arc::new(devices));
+        trust.install_device_store(Arc::clone(&devices));
         trust.install_share_grant_store(Arc::clone(&grants));
 
         let diag = Arc::new(ForwardDiagnostics::default());
@@ -156,6 +159,7 @@ impl World {
             move_state: Arc::new(RwLock::new(crate::key_move::MoveState::default())),
             policy: Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default()))),
             trust,
+            devices,
             grants,
             kick,
             live: Arc::new(LiveStreams::new(Arc::clone(&diag))),
@@ -183,8 +187,8 @@ impl World {
         }
     }
 
-    /// Install `policy` WITHOUT waking the loop (an unsignalled change: only
-    /// the sweep can see it).
+    /// Install `policy` WITHOUT waking the loop (fixture setup, before the
+    /// loop runs).
     fn set_policy_silently(&self, policy: ConnectPolicy) {
         *self.policy.write().unwrap() = Arc::new(policy);
     }
@@ -279,13 +283,16 @@ impl World {
         (self.live.register(gate, authority.clone()), authority)
     }
 
-    fn spawn_loop(&self) -> CancellationToken {
+    /// Start the loop. `sweep: None` disables the expiry sweep, so only an
+    /// event can trigger a pass.
+    fn spawn_loop(&self, sweep: Option<Duration>) -> CancellationToken {
         let stop = CancellationToken::new();
         spawn_reauth_loop(
             Arc::clone(&self.live),
             self.ctx(),
             Arc::clone(&self.kick),
             stop.clone(),
+            sweep,
         );
         stop
     }
@@ -307,6 +314,7 @@ async fn closes_within(guard: &LiveStreamGuard, bound: Duration) -> Duration {
 /// WHY (ADR-0074 §4, Q5): revoking the ShareGrant a forward was admitted
 /// under must close that live forward within 5 s. Before slice 3 the grant
 /// was checked only at admission, so the stream outlived the revocation.
+/// The sweep is off: only the revocation event can close it.
 #[tokio::test(start_paused = true)]
 async fn revoked_grant_closes_its_forward_within_5s() {
     let w = World::new().await;
@@ -322,23 +330,19 @@ async fn revoked_grant_closes_its_forward_within_5s() {
         },
         "the stream records the grant it was admitted under"
     );
-    let _stop = w.spawn_loop();
-
-    // Nothing changed: sweeps keep it open.
+    let _stop = w.spawn_loop(None);
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
     w.revoke_grant(&grant).await;
-    let took = closes_within(&stream, EVENT_BOUND).await;
-    assert!(took < EVENT_BOUND, "closed after {took:?}");
+    closes_within(&stream, EVENT_BOUND).await;
     assert_eq!(w.diag.torn_down_reauth(), 1);
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
     assert_eq!(w.live.len(), 0, "a torn-down stream leaves the registry");
 }
 
 /// WHY: a contact downgrade to `Blocked` must close the peer's live forward
-/// within 5 s, and through the event path (the contact-store change wakes
-/// the loop) rather than waiting for a sweep.
+/// within 5 s, through the contact-store event (sweep off).
 #[tokio::test(start_paused = true)]
 async fn trust_downgrade_closes_within_5s() {
     let w = World::new().await;
@@ -349,37 +353,103 @@ async fn trust_downgrade_closes_within_5s() {
     w.set_policy_silently(w.acl(&[(w.b1, w.mb)], false, false));
     let (stream, authority) = w.admit(w.inbound(w.b1, w.mb)).await;
     assert_eq!(authority, StreamAuthority::AclEntry);
-    let _stop = w.spawn_loop();
-    // Half a sweep after the loop's first pass: the next sweep is 1.5 s away.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
     w.contacts
         .write()
         .await
         .set_trust(&w.b1, TrustLevel::Blocked);
-    let took = closes_within(&stream, EVENT_BOUND).await;
-    assert!(
-        took < Duration::from_secs(1),
-        "the event path, not the next sweep, closed it (took {took:?})"
-    );
+    closes_within(&stream, EVENT_BOUND).await;
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
 }
 
-/// WHY (Q5): a grant's expiry must close its forward within 35 s — and not
-/// before the expiry: the stream is authorized right up to it.
+/// WHY: an edit through `ContactStore::get_mut` bypasses the persisting
+/// methods; the handle's drop must still raise the event (sweep off).
 #[tokio::test(start_paused = true)]
-async fn grant_expiry_closes_within_35s_and_not_before() {
+async fn get_mut_edit_closes_within_5s() {
+    let w = World::new().await;
+    w.contacts
+        .write()
+        .await
+        .set_trust(&w.b1, TrustLevel::Trusted);
+    w.set_policy_silently(w.acl(&[(w.b1, w.mb)], false, false));
+    let (stream, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!stream.token().is_cancelled());
+
+    w.contacts.write().await.get_mut(&w.b1).unwrap().trust_level = TrustLevel::Blocked;
+    closes_within(&stream, EVENT_BOUND).await;
+}
+
+/// WHY: an ACL reload that drops a stream's entry must close it within 5 s,
+/// through the reload event `Agent::set_connect_policy` raises (sweep off).
+/// The still-listed stream stays up.
+#[tokio::test(start_paused = true)]
+async fn acl_reload_closes_a_stream_no_longer_listed() {
+    let w = World::new().await;
+    for agent in [w.b1, w.c1] {
+        w.contacts
+            .write()
+            .await
+            .set_trust(&agent, TrustLevel::Trusted);
+    }
+    w.set_policy_silently(w.acl(&[(w.b1, w.mb), (w.c1, w.mc)], false, false));
+    let (b_stream, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+    let (c_stream, _) = w.admit(w.inbound(w.c1, w.mc)).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    crate::install_connect_policy(
+        &w.policy,
+        &w.kick,
+        Arc::new(w.acl(&[(w.c1, w.mc)], false, false)),
+    );
+    closes_within(&b_stream, EVENT_BOUND).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        !c_stream.token().is_cancelled(),
+        "the still-listed stream closed"
+    );
+    assert_eq!(w.reasons().get("agent_machine_not_in_acl"), Some(&1));
+}
+
+/// WHY: removing the owner enrollment of a machine ends owner trust for its
+/// agents; their owner-admitted streams must close within 5 s through the
+/// device-set event (sweep off).
+#[tokio::test(start_paused = true)]
+async fn enrollment_removal_closes_owner_stream_within_5s() {
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], true, false));
+    let (stream, authority) = w.admit(w.inbound(w.o1, w.mo)).await;
+    assert_eq!(authority, StreamAuthority::OwnerTrust);
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!stream.token().is_cancelled());
+
+    assert!(w.devices.unenroll(&w.mo).await.unwrap());
+    closes_within(&stream, EVENT_BOUND).await;
+    assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
+}
+
+/// WHY (Q5): with only the 30 s expiry sweep, a grant's expiry closes its
+/// forward within 35 s, and not before the expiry. The expiry falls just
+/// after a sweep, the worst case for the bound.
+#[tokio::test(start_paused = true)]
+async fn grant_expiry_closes_within_35s_with_the_30s_sweep() {
     let w = World::new().await;
     w.set_policy_silently(w.acl(&[], false, true));
-    let expiry = w.base_secs + 100;
+    // Sweeps run at t = 0, 30, 60, 90, 120 s.
+    let expiry = w.base_secs + 91;
     w.grant(0x22, Grantee::User(w.user_b.user_id()), expiry)
         .await;
     let (stream, _) = w.admit(w.inbound(w.b1, w.mb)).await;
-    let _stop = w.spawn_loop();
+    let _stop = w.spawn_loop(Some(REAUTH_SWEEP_INTERVAL));
 
-    // One second before expiry, after ~50 sweeps: still open.
-    tokio::time::sleep(Duration::from_secs(99)).await;
+    // Past the t = 90 s sweep, one second before expiry: still open.
+    tokio::time::sleep(Duration::from_secs(90)).await;
     assert!(
         !stream.token().is_cancelled(),
         "closed before the grant expired"
@@ -420,7 +490,7 @@ async fn unaffected_streams_stay_open() {
     assert!(matches!(b_auth, StreamAuthority::Grant { .. }));
     assert_eq!(o_auth, StreamAuthority::OwnerTrust);
     assert_eq!(c_auth, StreamAuthority::AclEntry);
-    let _stop = w.spawn_loop();
+    let _stop = w.spawn_loop(None);
 
     w.revoke_grant(&grant_b).await;
     w.revoke_grant(&grant_o).await;
@@ -436,37 +506,8 @@ async fn unaffected_streams_stay_open() {
     assert_eq!(w.live.len(), 2);
 }
 
-/// WHY: an ACL change that drops a stream's entry must close it within
-/// 5 s. The policy is swapped here WITHOUT any event, so this also proves
-/// the sweep backstop alone keeps the bound.
-#[tokio::test(start_paused = true)]
-async fn acl_change_closes_a_stream_no_longer_listed() {
-    let w = World::new().await;
-    for agent in [w.b1, w.c1] {
-        w.contacts
-            .write()
-            .await
-            .set_trust(&agent, TrustLevel::Trusted);
-    }
-    w.set_policy_silently(w.acl(&[(w.b1, w.mb), (w.c1, w.mc)], false, false));
-    let (b_stream, _) = w.admit(w.inbound(w.b1, w.mb)).await;
-    let (c_stream, _) = w.admit(w.inbound(w.c1, w.mc)).await;
-    let _stop = w.spawn_loop();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    w.set_policy_silently(w.acl(&[(w.c1, w.mc)], false, false));
-    let took = closes_within(&b_stream, EVENT_BOUND).await;
-    assert!(took <= REAUTH_SWEEP_INTERVAL + REAUTH_MIN_SPACING);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    assert!(
-        !c_stream.token().is_cancelled(),
-        "the still-listed stream closed"
-    );
-    assert_eq!(w.reasons().get("agent_machine_not_in_acl"), Some(&1));
-}
-
 /// WHY (§4 "both ends enforce"): the opener also closes its side once its
-/// peer is blocked.
+/// peer is blocked (sweep off).
 #[tokio::test(start_paused = true)]
 async fn outbound_stream_closes_when_the_peer_is_blocked() {
     let w = World::new().await;
@@ -481,7 +522,7 @@ async fn outbound_stream_closes_when_the_peer_is_blocked() {
         })
         .await;
     assert_eq!(authority, StreamAuthority::PeerTrust);
-    let _stop = w.spawn_loop();
+    let _stop = w.spawn_loop(None);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(!stream.token().is_cancelled());
 
@@ -490,6 +531,49 @@ async fn outbound_stream_closes_when_the_peer_is_blocked() {
         .await
         .set_trust(&w.b1, TrustLevel::Blocked);
     closes_within(&stream, EVENT_BOUND).await;
+}
+
+/// WHY: a re-check pass must not redo ML-DSA work for evidence that has not
+/// changed — with many streams that cost is per stream per pass. The first
+/// pass verifies (owner certificate chain, enrollment, grantee chain); a
+/// repeat pass with nothing changed verifies nothing; a revocation-set
+/// change clears the memo, so the next pass verifies again.
+#[tokio::test]
+async fn repeat_pass_without_changes_performs_no_verification() {
+    use crate::identity::ml_dsa_verify_count;
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], true, true));
+    w.grant(0x55, Grantee::User(w.user_b.user_id()), w.base_secs + 3_600)
+        .await;
+    let unrelated = w
+        .grant(0x66, Grantee::Agent(w.c1), w.base_secs + 3_600)
+        .await;
+    let (_o, _) = w.admit(w.inbound(w.o1, w.mo)).await;
+    let (_b, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+
+    let before = ml_dsa_verify_count::get();
+    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    let first = ml_dsa_verify_count::get() - before;
+    // Admission above already filled the memo, so even this pass is free;
+    // clear it through a revocation-set change to measure a cold pass.
+    w.revoke_grant(&unrelated).await;
+    let before = ml_dsa_verify_count::get();
+    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    let cold = ml_dsa_verify_count::get() - before;
+    assert!(
+        cold >= 3,
+        "a cold pass verifies the owner chain, the enrollment and the grantee chain (got {cold})"
+    );
+
+    let before = ml_dsa_verify_count::get();
+    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        ml_dsa_verify_count::get() - before,
+        0,
+        "repeat pass re-verified"
+    );
+    assert_eq!(first, 0, "the pass after admission re-verified");
+    assert_eq!(w.live.len(), 2);
 }
 
 /// WHY: a torn-down bridge must stop moving bytes at once rather than run
