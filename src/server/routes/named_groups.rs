@@ -5133,7 +5133,13 @@ pub(in crate::server) async fn store_named_group_info(
 
 /// Snapshot the committed roster without retaining a group lock across the
 /// direct-connection and gossip awaits.
-pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
+pub(in crate::server) async fn refresh_group_rosters_for_gossip(
+    state: &AppState,
+    source: crate::groups::diagnostics::RosterRefreshSource,
+) {
+    state
+        .groups_diagnostics
+        .record_roster_refresh("__gossip__", source);
     let _refresh_guard = state.group_roster_gossip_lock.lock().await;
     let rosters = {
         // The map write can precede an awaited disk save and be rolled back.
@@ -5202,7 +5208,11 @@ where
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
-        refresh_group_rosters_for_gossip(state).await;
+        refresh_group_rosters_for_gossip(
+            state,
+            crate::groups::diagnostics::RosterRefreshSource::Persist,
+        )
+        .await;
     }
     outcome
 }
@@ -5817,7 +5827,11 @@ pub(in crate::server) async fn persist_named_group_info(
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
-        refresh_group_rosters_for_gossip(state).await;
+        refresh_group_rosters_for_gossip(
+            state,
+            crate::groups::diagnostics::RosterRefreshSource::Persist,
+        )
+        .await;
     }
     outcome
 }
@@ -10395,7 +10409,11 @@ async fn apply_named_group_metadata_event_with_binding(
             replay_parked_role_updates(state, &gid).await;
         }
     }
-    refresh_group_rosters_for_gossip(state).await;
+    refresh_group_rosters_for_gossip(
+        state,
+        crate::groups::diagnostics::RosterRefreshSource::Apply,
+    )
+    .await;
     applied
 }
 
@@ -18836,7 +18854,11 @@ pub(in crate::server) async fn add_named_group_member(
                 "named-group state and bootstrap obligation are not directory-durable",
             );
         }
-        refresh_group_rosters_for_gossip(&state).await;
+        refresh_group_rosters_for_gossip(
+            &state,
+            crate::groups::diagnostics::RosterRefreshSource::Mutation,
+        )
+        .await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -19363,7 +19385,11 @@ pub(in crate::server) async fn remove_named_group_member(
                 "named-group state is not directory-durable",
             );
         }
-        refresh_group_rosters_for_gossip(&state).await;
+        refresh_group_rosters_for_gossip(
+            &state,
+            crate::groups::diagnostics::RosterRefreshSource::Mutation,
+        )
+        .await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -20359,7 +20385,11 @@ async fn leave_treekem_group(
                     "named-group state is not directory-durable",
                 );
             }
-            refresh_group_rosters_for_gossip(&state).await;
+            refresh_group_rosters_for_gossip(
+                &state,
+                crate::groups::diagnostics::RosterRefreshSource::Mutation,
+            )
+            .await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
@@ -58344,7 +58374,11 @@ mod cas_rollback_470 {
         let refresh_state = Arc::clone(&state);
         let mut refresh = tokio::spawn(async move {
             let _ = started_tx.send(());
-            refresh_group_rosters_for_gossip(&refresh_state).await;
+            refresh_group_rosters_for_gossip(
+                &refresh_state,
+                crate::groups::diagnostics::RosterRefreshSource::Mutation,
+            )
+            .await;
         });
         started_rx.await.expect("refresh started");
         assert!(

@@ -781,6 +781,7 @@ pub struct PubSubManager {
     /// #504 slice 2: the policy saorsa-gossip accepted, which is what
     /// diagnostics report. Not the policy the operator requested.
     effective_byte_policy: LeafBytePolicy,
+    roster_preference_binding_misses: std::sync::atomic::AtomicU64,
     egress_meter: Mutex<EgressMeter>,
     eager_ceiling_initialized: tokio::sync::OnceCell<()>,
     /// Local topic subscription ref-counts (for stats and cleanup).
@@ -1212,11 +1213,24 @@ impl PubSubManager {
         };
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
         let local = self.transport.local_peer_id();
+        // #901 ask 4: ONE write-lock acquisition for the whole roster's
+        // LRU recency updates (was: per member), so a large roster no
+        // longer serializes on the bindings lock N times per refresh.
+        let roster_agents: Vec<AgentId> = agents.to_vec();
+        let bindings = crate::dm_inbox::authenticated_machine_bindings_resolve_many(
+            &identity.bindings,
+            &roster_agents,
+        )
+        .await;
         let mut ranked = Vec::new();
         let mut seen = HashSet::new();
         for agent in agents {
-            if let Some(machine) =
-                crate::dm_inbox::authenticated_machine_binding(&identity.bindings, &agent).await
+            let Some(machine) = bindings.get(&agent) else {
+                self.roster_preference_binding_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            };
+            let machine = *machine;
             {
                 // Raw Direct frames carry an untrusted AgentId prefix and can
                 // overwrite the reachability map. Only an independently
@@ -1367,6 +1381,7 @@ impl PubSubManager {
             transport,
             egress_config: GossipConfig::default(),
             effective_byte_policy: LeafBytePolicy::ObserveOnly,
+            roster_preference_binding_misses: std::sync::atomic::AtomicU64::new(0),
             egress_meter: Mutex::new(EgressMeter::default()),
             eager_ceiling_initialized: tokio::sync::OnceCell::new(),
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
@@ -1527,6 +1542,17 @@ impl PubSubManager {
         serde_json::json!({
             "subscribed_topics": topics,
             "outbound_by_topic_named": rows,
+            "roster_preference": {
+                "binding_misses": self
+                    .roster_preference_binding_misses
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "binding_evictions": self
+                    .group_identity
+                    .get()
+                    .and_then(|ctx| ctx.bindings.try_read().ok())
+                    .map(|cache| cache.evicted_total_pub())
+                    .unwrap_or(0),
+            },
             "egress_budget": {
                 "leaf_max_eager_degree": self.egress_config.leaf_max_eager_degree,
                 "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,

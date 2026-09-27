@@ -29,10 +29,28 @@ use std::sync::Mutex;
 /// attacker's packet rate.
 const CONFLICT_UNAUTHENTICATED_WINDOW_MS: u64 = 1_000;
 
+/// #901 ask 3: what triggered a `refresh_group_rosters_for_gossip`
+/// pass. Instrumentation only — the poll/dedup decision follows the
+/// evidence these counters produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterRefreshSource {
+    /// Daemon startup wiring.
+    Startup,
+    /// The 5 s safety-net poll.
+    Poll,
+    /// The persist wrappers (a durable named-group write landed).
+    Persist,
+    /// The metadata-event apply path.
+    Apply,
+    /// A membership mutation route (add/remove/ban/...).
+    Mutation,
+}
+
 /// Per-group counters captured by the public-message and metadata ingest
 /// pipelines. Plain `u64`s — atomic ordering is not required because the
 /// outer `Mutex` already serialises updates and snapshot reads.
 #[derive(Debug, Clone, Default, Serialize)]
+
 pub struct GroupCounters {
     /// Validated public messages accepted into the local cache.
     pub messages_received: u64,
@@ -209,6 +227,15 @@ pub struct GroupCounters {
     /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
     /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
+    /// #901 ask 3 (instrument first): roster-refresh invocations by
+    /// SOURCE, so one fixture run shows which sources ever change a
+    /// topic classification before any refresh is deduplicated or the
+    /// 5 s poll retired. Per-group rows merge into fleet aggregates.
+    pub roster_refresh_startup_total: u64,
+    pub roster_refresh_poll_total: u64,
+    pub roster_refresh_persist_total: u64,
+    pub roster_refresh_apply_total: u64,
+    pub roster_refresh_mutation_total: u64,
     /// ADR-0064 slice 4 (#472 decision 3): fork evidence classified as
     /// `signer_only` — the signer was an active admin at the conflicting
     /// commit's claimed parent (or the joiner's served chain validated
@@ -456,6 +483,21 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.fork_quarantine_manual_clears = dst
         .fork_quarantine_manual_clears
         .saturating_add(src.fork_quarantine_manual_clears);
+    dst.roster_refresh_startup_total = dst
+        .roster_refresh_startup_total
+        .saturating_add(src.roster_refresh_startup_total);
+    dst.roster_refresh_poll_total = dst
+        .roster_refresh_poll_total
+        .saturating_add(src.roster_refresh_poll_total);
+    dst.roster_refresh_persist_total = dst
+        .roster_refresh_persist_total
+        .saturating_add(src.roster_refresh_persist_total);
+    dst.roster_refresh_apply_total = dst
+        .roster_refresh_apply_total
+        .saturating_add(src.roster_refresh_apply_total);
+    dst.roster_refresh_mutation_total = dst
+        .roster_refresh_mutation_total
+        .saturating_add(src.roster_refresh_mutation_total);
     dst.membership_events_queued_revision_gap = dst
         .membership_events_queued_revision_gap
         .saturating_add(src.membership_events_queued_revision_gap);
@@ -511,6 +553,27 @@ impl GroupsDiagnostics {
 
     /// ADR-0064 slice 2: an owner mandate was minted by this install at
     /// the pre-mutation point of an invite-derived seat.
+    /// #901 ask 3: count one roster-refresh invocation by source
+    /// (visibility for the poll-audit decision; no behavior).
+    pub fn record_roster_refresh(&self, group_id: &str, source: RosterRefreshSource) {
+        self.with_counters(group_id, |c| match source {
+            RosterRefreshSource::Startup => {
+                c.roster_refresh_startup_total = c.roster_refresh_startup_total.saturating_add(1);
+            }
+            RosterRefreshSource::Poll => {
+                c.roster_refresh_poll_total = c.roster_refresh_poll_total.saturating_add(1);
+            }
+            RosterRefreshSource::Persist => {
+                c.roster_refresh_persist_total = c.roster_refresh_persist_total.saturating_add(1);
+            }
+            RosterRefreshSource::Apply => {
+                c.roster_refresh_apply_total = c.roster_refresh_apply_total.saturating_add(1);
+            }
+            RosterRefreshSource::Mutation => {
+                c.roster_refresh_mutation_total = c.roster_refresh_mutation_total.saturating_add(1);
+            }
+        });
+    }
     pub fn record_owner_mandate_minted(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_minted = c.owner_mandate_minted.saturating_add(1);
@@ -1444,6 +1507,11 @@ mod tests {
             owner_mandate_missing: base + 40,
             mandate_capability_refusing_transitions: base + 41,
             fork_quarantine_manual_clears: base + 42,
+            roster_refresh_startup_total: base + 43,
+            roster_refresh_poll_total: base + 44,
+            roster_refresh_persist_total: base + 45,
+            roster_refresh_apply_total: base + 46,
+            roster_refresh_mutation_total: base + 47,
             fork_evidence_signer_only: base + 43,
             fork_evidence_unauthorized_signer: base + 44,
             fork_quarantine_owner_anchored_clears: base + 45,
@@ -1463,6 +1531,14 @@ mod tests {
         merge_counters(&mut merged, &src);
         // Every merged counter must equal the exact per-field sum — a
         // dropped merge line leaves dst's value; a doubled line over-sums.
+        assert_eq!(
+            merged.roster_refresh_startup_total,
+            dst.roster_refresh_startup_total + src.roster_refresh_startup_total
+        );
+        assert_eq!(
+            merged.roster_refresh_mutation_total,
+            dst.roster_refresh_mutation_total + src.roster_refresh_mutation_total
+        );
         assert_eq!(
             merged.messages_received,
             dst.messages_received + src.messages_received

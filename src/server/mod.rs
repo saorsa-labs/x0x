@@ -1386,12 +1386,20 @@ pub async fn serve_with_options(
         port_file.display()
     );
 
-    routes::named_groups::refresh_group_rosters_for_gossip(&state).await;
+    routes::named_groups::refresh_group_rosters_for_gossip(
+        &state,
+        x0x::groups::diagnostics::RosterRefreshSource::Startup,
+    )
+    .await;
     let roster_refresh_state = Arc::clone(&state);
     bg_tasks.push(tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            routes::named_groups::refresh_group_rosters_for_gossip(&roster_refresh_state).await;
+            routes::named_groups::refresh_group_rosters_for_gossip(
+                &roster_refresh_state,
+                x0x::groups::diagnostics::RosterRefreshSource::Poll,
+            )
+            .await;
         }
     }));
 

@@ -122,6 +122,8 @@ pub struct AuthenticatedMachineBindingCache {
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
+    /// #901 ask 5: cumulative evictions (visibility only).
+    evicted_total: u64,
 }
 
 impl Default for AuthenticatedMachineBindingCache {
@@ -131,6 +133,7 @@ impl Default for AuthenticatedMachineBindingCache {
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
+            evicted_total: 0,
         }
     }
 }
@@ -143,7 +146,15 @@ impl AuthenticatedMachineBindingCache {
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
+            evicted_total: 0,
         }
+    }
+
+    /// #901 ask 5: cumulative LRU evictions — visibility for "an
+    /// otherwise authorized member lost eager preference until
+    /// reannouncement". Never authorization.
+    pub(crate) fn evicted_total_pub(&self) -> u64 {
+        self.evicted_total
     }
 
     fn next_tick(&mut self) -> (std::time::Instant, u64) {
@@ -171,6 +182,7 @@ impl AuthenticatedMachineBindingCache {
             if let Some(oldest_key) = oldest {
                 self.recency.remove(&oldest_key);
                 let evicted_agent = AgentId(oldest_key.2);
+                self.evicted_total = self.evicted_total.saturating_add(1);
                 if let Some(evicted_binding) = self.entries.remove(&evicted_agent) {
                     tracing::warn!(
                         agent = %hex::encode(evicted_agent.as_bytes()),
@@ -223,6 +235,22 @@ pub(crate) async fn record_authenticated_machine_binding(
         .write()
         .await
         .record(agent_id, machine_id, announced_at);
+}
+
+/// #901 ask 4: resolve a WHOLE roster's bindings under ONE write-lock
+/// acquisition (the lock is exclusive because resolve mutates LRU
+/// recency). Same semantics as N single resolves: hits get their
+/// recency refreshed inside this one critical section, misses are
+/// simply absent — never authorization.
+pub(crate) async fn authenticated_machine_bindings_resolve_many(
+    bindings: &AuthenticatedMachineBindings,
+    agents: &[AgentId],
+) -> std::collections::HashMap<AgentId, MachineId> {
+    let mut cache = bindings.write().await;
+    agents
+        .iter()
+        .filter_map(|agent| cache.resolve(agent).map(|machine| (*agent, machine)))
+        .collect()
 }
 
 pub(crate) async fn authenticated_machine_binding(
