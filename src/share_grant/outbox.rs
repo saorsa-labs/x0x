@@ -306,21 +306,9 @@ impl GrantRedeliveryOutbox {
         };
         let file = file.and_then(|file| outbox.validate_loaded(file, now_unix, &path));
         match file {
-            Ok((entries, expired)) => {
+            Ok((entries, _expired)) => {
+                // RED PROOF (#1004 a): the load-time rewrite is removed.
                 outbox.entries = std::sync::Mutex::new(entries);
-                // #1004: entries that expired while the daemon was down are
-                // gone from memory; rewrite the file so they are gone from
-                // disk too. Only a fully validated file reaches here, so a
-                // fail-closed file is never rewritten. A failed write leaves
-                // the outbox dirty and the first worker pass retries it.
-                if expired > 0 {
-                    let _write = outbox.write_lock.lock().await;
-                    if let Err(e) = outbox.persist().await {
-                        tracing::warn!(
-                            "share-grant outbox: pruning expired entries not persisted: {e}"
-                        );
-                    }
-                }
             }
             Err(e) => {
                 tracing::warn!("share-grant outbox unreadable, holding no deliveries: {e}");
