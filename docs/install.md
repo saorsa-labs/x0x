@@ -46,6 +46,35 @@ Install for a named instance:
 curl -sfL https://x0x.md | sh -s -- --name alice --start
 ```
 
+Install from a local directory instead of the latest GitHub release
+(air-gapped machines, CI). The directory holds `x0x-<platform>.tar.gz` and its
+`.sha256`; the checksum is still required. The GPG check runs only when
+`<archive>.asc` and `SAORSA_PUBLIC_KEY.asc` are also there, since a local build
+is unsigned:
+
+```bash
+X0X_INSTALL_FROM=/path/to/dist sh install.sh
+```
+
+Start the daemon without the embedded global bootstrap peers (only
+`bootstrap_peers` from its `config.toml` are dialed):
+
+```bash
+X0X_NO_HARD_CODED_BOOTSTRAP=1 sh install.sh
+```
+
+### Onboarding smoke test (#894)
+
+CI job `Onboarding smoke (Linux)` (`.github/workflows/integration.yml`) runs
+`tests/onboard_smoke.py`: an inviter daemon runs `x0x onboard`, and a fresh
+HOME follows only that recipe and card file, installing this build through
+both variables above, then exchanges a DM each way with the inviter. It runs
+inside the loopback-only Linux namespace (`scripts/ci/isolated-runtime.py`),
+which does not exist on macOS or Windows, so those platforms are checked by
+hand: on a second machine or user account, take `x0x onboard` output from an
+existing agent, follow it as written (Windows: `scripts/install.ps1`), then
+confirm `x0x health` and a DM each way.
+
 ## What the installer does
 
 The current installer:

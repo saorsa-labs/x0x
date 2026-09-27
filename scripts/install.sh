@@ -20,6 +20,16 @@
 # Requirements: curl or wget, tar, sh, sha256sum or shasum. gpg is strongly
 # recommended; without it only the checksum is verified (with a warning).
 # No root/sudo required (except --autostart on Linux uses systemd).
+#
+# Environment (optional; for air-gapped installs and CI, #894):
+#   X0X_INSTALL_FROM=<dir>          Install x0x-<platform>.tar.gz from this local
+#                                   directory instead of the latest GitHub release.
+#                                   <archive>.sha256 is still required. The GPG check
+#                                   runs when <archive>.asc and SAORSA_PUBLIC_KEY.asc
+#                                   are in the directory; locally built archives are
+#                                   unsigned, so it is otherwise skipped with a warning.
+#   X0X_NO_HARD_CODED_BOOTSTRAP=1   Start x0xd with --no-hard-coded-bootstrap (only
+#                                   bootstrap_peers from its config file are dialed).
 
 set -e
 
@@ -33,6 +43,17 @@ VERIFY_ONLY=false
 # Saorsa Labs release signing key (primary fingerprint of SAORSA_PUBLIC_KEY.asc).
 # Rotate only with a reviewed installer change.
 TRUSTED_FPR="CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
+LOCAL_SRC="${X0X_INSTALL_FROM-}"
+if [ -n "$LOCAL_SRC" ] && [ ! -d "$LOCAL_SRC" ]; then
+    echo "Error: X0X_INSTALL_FROM is not a directory: $LOCAL_SRC" >&2
+    exit 1
+fi
+XOXD_ARGS=""
+case "${X0X_NO_HARD_CODED_BOOTSTRAP-}" in
+    ""|0) ;;
+    1) XOXD_ARGS="--no-hard-coded-bootstrap" ;;
+    *) echo "Error: X0X_NO_HARD_CODED_BOOTSTRAP must be 0 or 1" >&2; exit 1 ;;
+esac
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -124,6 +145,9 @@ fi
 echo "x0x installer"
 echo "  Platform: $PLATFORM"
 echo "  Install:  $BIN"
+if [ -n "$LOCAL_SRC" ]; then
+    echo "  Source:   $LOCAL_SRC (X0X_INSTALL_FROM)"
+fi
 
 ARCHIVE="x0x-${PLATFORM}.tar.gz"
 TMP=$(mktemp -d)
@@ -141,6 +165,11 @@ else
 fi
 
 fetch() {
+    if [ -n "$LOCAL_SRC" ]; then
+        cp "$LOCAL_SRC/${1##*/}" "$2" 2>/dev/null \
+            || { echo "Error: not found: $LOCAL_SRC/${1##*/}" >&2; exit 1; }
+        return 0
+    fi
     if [ "$DOWNLOADER" = "curl" ]; then
         curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
     else
@@ -180,7 +209,15 @@ echo "  SHA-256 verified ($ACTUAL_SHA)"
 
 # GPG: required when gpg is present. Everything happens in a throwaway GnuPG
 # home under $TMP, so the user's own keyring is never read or written.
-if command -v gpg >/dev/null 2>&1; then
+# A local X0X_INSTALL_FROM build carries no release signature; it is checked
+# only when the signature and key sit next to the archive.
+if [ -n "$LOCAL_SRC" ] && { [ ! -f "$LOCAL_SRC/$ARCHIVE.asc" ] \
+        || [ ! -f "$LOCAL_SRC/SAORSA_PUBLIC_KEY.asc" ]; }; then
+    echo "" >&2
+    echo "WARNING: $LOCAL_SRC has no $ARCHIVE.asc + SAORSA_PUBLIC_KEY.asc;" >&2
+    echo "         the GPG signature was NOT verified (SHA-256 only)." >&2
+    echo "" >&2
+elif command -v gpg >/dev/null 2>&1; then
     fetch "$URL/$ARCHIVE.asc" "$TMP/$ARCHIVE.asc"
     fetch "$URL/SAORSA_PUBLIC_KEY.asc" "$TMP/SAORSA_PUBLIC_KEY.asc"
     GNUPG_TMP="$TMP/gnupg"
@@ -307,11 +344,14 @@ XOXD="$BIN/x0xd"
 
 mkdir -p "$INSTANCE_DIR"
 if [ -n "$NAME" ]; then
-    echo "Starting: $XOXD --name $NAME"
-    nohup "$XOXD" --name "$NAME" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+    echo "Starting: $XOXD --name $NAME $XOXD_ARGS"
+    # $XOXD_ARGS is empty or one fixed flag; unquoted so empty adds no argument.
+    # shellcheck disable=SC2086
+    nohup "$XOXD" --name "$NAME" $XOXD_ARGS >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
 else
-    echo "Starting: $XOXD"
-    nohup "$XOXD" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+    echo "Starting: $XOXD $XOXD_ARGS"
+    # shellcheck disable=SC2086
+    nohup "$XOXD" $XOXD_ARGS >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
 fi
 PID=$!
 

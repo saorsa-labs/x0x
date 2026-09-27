@@ -169,6 +169,47 @@ jobs:
             --no-fail-fast \
             --test-threads 1
 
+  # Onboarding (#894 R11): a fresh HOME follows only `x0x onboard` output
+  # (recipe + card file), installs this run's build via scripts/install.sh
+  # (X0X_INSTALL_FROM), starts x0xd and exchanges a DM each way with an
+  # inviter daemon. Both daemons stay inside the loopback-only namespace with
+  # the inviter as the only bootstrap. Linux only: the isolation boundary does
+  # not exist on macOS/Windows (manual steps: docs/install.md).
+  onboard-smoke:
+    name: Onboarding smoke (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 900
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release x0xd + x0x
+        run: cargo build --release --bin x0xd --bin x0x
+      - name: Follow the x0x onboard recipe in a fresh HOME
+        run: |
+          python3 scripts/ci/isolated-runtime.py python3 tests/onboard_smoke.py \
+            --bin-dir "$GITHUB_WORKSPACE/target/release" \
+            --repo "$GITHUB_WORKSPACE" \
+            --evidence-dir "$RUNNER_TEMP/onboard-smoke"
+      - name: Upload onboarding evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: onboard-smoke-evidence
+          path: ${{ runner.temp }}/onboard-smoke/
+          if-no-files-found: warn
+
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
   # See issue #197: core was cancelled at its budget when this suite rode
