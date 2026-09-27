@@ -248,4 +248,4 @@ These points do not contradict the ADR and should carry into Slice 2:
 
 ## Artefacts
 
-The spike crates and build directories lived in the session scratchpad and have been deleted. No measurement code is committed. The 60-line `repro` for the yrs out-of-order bug is the only piece worth keeping, perhaps as an upstream bug report or a future regression test. It will be added only if asked.
+The spike crates and build directories lived in the session scratchpad and have been deleted. No measurement code is committed. The 60-line `repro` for the yrs out-of-order bug is the only piece worth keeping, as a future regression test. By decision (David Irvine, 2026-09-27) the repro stays internal and is not posted upstream. It will be added to the repo only if asked. For the follow-up comparison of yrs, automerge, loro and diamond-types, see `adr-0075-crdt-comparison.md`.
