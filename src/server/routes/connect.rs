@@ -21,7 +21,9 @@ use std::sync::Arc;
 pub(in crate::server) struct ForwardAddRequest {
     /// Local bind, e.g. `127.0.0.1:8022`.
     local_addr: String,
-    /// Peer agent id (hex).
+    /// Peer agent: hex agent id, or an ADR-0074 agent name
+    /// (`[agent:]<label>.<owner>`). `machine:` names are refused until the
+    /// pinned-MachineId stream check (slice 2) lands.
     peer_agent: String,
     /// Loopback target host on the peer (numeric IP).
     target_host: String,
@@ -35,6 +37,13 @@ pub(in crate::server) async fn forward_add(
 ) -> impl IntoResponse {
     use x0x::forward::ForwardSpec;
     use x0x::identity::AgentId;
+    use x0x::names::PeerRef;
+    // Syntax first, before any state is consulted: a malformed peer or a
+    // `machine:` name (fail closed until slice 2) is refused outright.
+    let peer = match PeerRef::parse_forward_peer(&req.peer_agent) {
+        Ok(peer) => peer,
+        Err(e) => return super::names::name_error(&e),
+    };
     let Some(forwarder) = state.forward_service.as_ref() else {
         return api_error(
             StatusCode::CONFLICT,
@@ -55,10 +64,20 @@ pub(in crate::server) async fn forward_add(
         )
         .into_response();
     }
-    let peer_agent_bytes = match x0x::exec::acl::parse_agent_id(&req.peer_agent) {
-        Ok(id) => id,
-        Err(e) => {
-            return api_error(StatusCode::BAD_REQUEST, format!("peer_agent: {e}")).into_response()
+    // ADR-0074 §1: a name resolves locally (pinned at first use) to an
+    // agent id. Resolution adds no trust: the stream below still passes the
+    // identity gate and the peer's connect ACL.
+    let (peer_agent_bytes, name) = match peer {
+        PeerRef::Hex(id) => (id, None),
+        PeerRef::Name(name) => {
+            let resolved = match super::names::resolve(&state, &name).await {
+                Ok(resolved) => resolved,
+                Err(e) => return super::names::name_error(&e),
+            };
+            match x0x::names::require_agent_target(&resolved, &name) {
+                Ok(agent) => (agent, Some(resolved.name)),
+                Err(e) => return super::names::name_error(&e),
+            }
         }
     };
     let spec = ForwardSpec {
@@ -75,6 +94,7 @@ pub(in crate::server) async fn forward_add(
                 "ok": true,
                 "local_addr": bound.to_string(),
                 "peer_agent": hex::encode(peer_agent.as_bytes()),
+                "name": name,
             })),
         )
             .into_response(),

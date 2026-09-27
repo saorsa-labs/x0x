@@ -1089,12 +1089,17 @@ pub(in crate::server) async fn import_agent_card(
         }
     }
 
+    // ADR-0074 §1: a signed card's owner_name binds a local owner petname
+    // at first bind (never rebinds; a taken label is reported, not changed).
+    let owner_label = super::names::bind_owner_from_card(&state, &card, effective_trust).await;
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "agent_id": card.agent_id,
             "display_name": card.display_name,
+            "owner_label": owner_label,
             "trust_level": format!("{effective_trust:?}"),
             "trust_change_ignored": change_ignored,
             "groups": card.groups.len(),

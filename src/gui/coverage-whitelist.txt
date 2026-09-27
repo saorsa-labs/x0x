@@ -56,6 +56,15 @@ POST /grants
 DELETE /grants/*
 GET /grants/received
 
+# ── ADR-0074 §1 names — durable API token only (petnames are editable only
+# by the local owner, and a resolve pins), like /grants. ──
+GET /names
+POST /names/resolve
+POST /names/owners
+DELETE /names/owners/*
+POST /names/machines
+DELETE /names/pins/*
+
 # ── Identity card — the GUI calls it via the agentCardPath() helper
 # (share links need the query params), so the first argument is a
 # function call, not a path literal the crawler can statically match.

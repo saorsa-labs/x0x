@@ -418,6 +418,76 @@ enum Commands {
         #[command(subcommand)]
         sub: GrantSub,
     },
+    /// Names for agents and machines: `[agent:|machine:]<label>.<owner>`
+    /// (ADR-0074; local petnames pinned at first use; durable API token only).
+    Names {
+        #[command(subcommand)]
+        sub: NamesSub,
+    },
+}
+
+/// `x0x names` sub-actions.
+#[derive(Subcommand)]
+enum NamesSub {
+    /// List owner petnames and pinned names.
+    List,
+    /// Resolve a name locally (no network query); pins it at first use.
+    Resolve {
+        /// `[agent:|machine:]<label>.<owner>`, e.g. `studio.me`, or a hex agent id.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Owner petnames (label -> user id), frozen at first bind.
+    Owner {
+        #[command(subcommand)]
+        sub: NamesOwnerSub,
+    },
+    /// Label machines shared with you by a received grant.
+    Machine {
+        #[command(subcommand)]
+        sub: NamesMachineSub,
+    },
+    /// Drop a pin (e.g. `agent:studio.bob`) so the name re-pins at next use.
+    Unpin {
+        /// Canonical pinned name, with its `agent:` or `machine:` prefix.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+/// `x0x names owner` sub-actions.
+#[derive(Subcommand)]
+enum NamesOwnerSub {
+    /// Bind a petname to an owner's user id.
+    Add {
+        /// Petname (lowercase DNS label; not `me`, `agent` or `machine`).
+        #[arg(value_name = "LABEL")]
+        label: String,
+        /// The owner's user id (64 hex chars).
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+    },
+    /// Remove a petname and every pin under it.
+    #[command(alias = "remove")]
+    Rm {
+        /// Petname to remove.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
+}
+
+/// `x0x names machine` sub-actions.
+#[derive(Subcommand)]
+enum NamesMachineSub {
+    /// Label a shared machine: `machine:<label>.<owner>` -> machine id.
+    Label {
+        /// `machine:<label>.<owner>` (owner is a bound petname).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The machine id (64 hex chars).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
+    },
 }
 
 /// `x0x grant` sub-actions.
@@ -1003,7 +1073,8 @@ enum ForwardSub {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         #[arg(long)]
         local: String,
-        /// Peer agent id (hex).
+        /// Peer agent: hex agent id or an agent name (`[agent:]<label>.<owner>`,
+        /// ADR-0074). `machine:` names are refused until slice 2.
         #[arg(long)]
         peer: String,
         /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
@@ -3155,6 +3226,22 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+        },
+        Commands::Names { sub } => match sub {
+            NamesSub::List => commands::names::list(&client).await,
+            NamesSub::Resolve { name } => commands::names::resolve(&client, &name).await,
+            NamesSub::Owner { sub } => match sub {
+                NamesOwnerSub::Add { label, user_id } => {
+                    commands::names::owner_add(&client, &label, &user_id).await
+                }
+                NamesOwnerSub::Rm { label } => commands::names::owner_remove(&client, &label).await,
+            },
+            NamesSub::Machine { sub } => match sub {
+                NamesMachineSub::Label { name, machine_id } => {
+                    commands::names::machine_label(&client, &name, &machine_id).await
+                }
+            },
+            NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
         },
         Commands::Onboard {
             json,

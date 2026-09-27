@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 201,
+  "endpoint_count": 207,
   "endpoints": [
     {
       "category": "status",
@@ -3397,6 +3397,102 @@
       "description": "List share grants that name this install as grantee",
       "method": "GET",
       "path": "/grants/received",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names list",
+      "description": "List owner petnames and pinned names",
+      "method": "GET",
+      "path": "/names",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names resolve",
+      "description": "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+      "method": "POST",
+      "path": "/names/resolve",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names owner add",
+      "description": "Bind a local owner petname to a user id (frozen at first bind)",
+      "method": "POST",
+      "path": "/names/owners",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "label",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "user_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names owner rm",
+      "description": "Remove a local owner petname and every pin under it",
+      "method": "DELETE",
+      "path": "/names/owners/:label",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names machine label",
+      "description": "Label a machine shared with this install by an active received grant",
+      "method": "POST",
+      "path": "/names/machines",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "name",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "machine_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names unpin",
+      "description": "Drop a name pin so the name re-pins at next use",
+      "method": "DELETE",
+      "path": "/names/pins/:name",
       "request": {
         "kind": "none"
       }

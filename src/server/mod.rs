@@ -1173,6 +1173,9 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        names: Arc::new(
+            x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
+        ),
         #[cfg(test)]
         named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         #[cfg(test)]
@@ -2480,6 +2483,13 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
+        .route("/names", get(routes::names_list))
+        .route("/names/resolve", post(routes::names_resolve))
+        .route("/names/owners", post(routes::names_owner_bind))
+        .route("/names/owners/:label", delete(routes::names_owner_unbind))
+        .route("/names/machines", post(routes::names_machine_label))
+        .route("/names/pins/:name", delete(routes::names_unpin))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))

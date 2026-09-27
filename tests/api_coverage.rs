@@ -614,6 +614,13 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/grants", grant_routes_wired),
     covered!(Delete, "/grants/:id", grant_routes_wired),
     covered!(Get, "/grants/received", grant_routes_wired),
+    // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
+    covered!(Get, "/names", names_routes_wired),
+    covered!(Post, "/names/resolve", names_routes_wired),
+    covered!(Post, "/names/owners", names_routes_wired),
+    covered!(Delete, "/names/owners/:label", names_routes_wired),
+    covered!(Post, "/names/machines", names_routes_wired),
+    covered!(Delete, "/names/pins/:name", names_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
@@ -673,6 +680,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/grants.rs",
         include_str!("../src/server/routes/grants.rs"),
+    ),
+    (
+        "src/server/routes/names/tests.rs",
+        include_str!("../src/server/routes/names/tests.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1141,6 +1152,7 @@ fn categories_are_valid() {
         "history",
         "acl",
         "grants",
+        "names",
     ];
 
     for ep in ENDPOINTS {

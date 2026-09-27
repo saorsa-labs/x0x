@@ -1897,6 +1897,61 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "grants",
         request: RequestSpec::None,
     },
+    // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/names",
+        cli_name: "names list",
+        description: "List owner petnames and pinned names",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/resolve",
+        cli_name: "names resolve",
+        description: "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+        category: "names",
+        request: RequestSpec::Fields(&[RequestField::body("name", true)]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/owners",
+        cli_name: "names owner add",
+        description: "Bind a local owner petname to a user id (frozen at first bind)",
+        category: "names",
+        request: RequestSpec::Fields(&[
+            RequestField::body("label", true),
+            RequestField::body("user_id", true),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/owners/:label",
+        cli_name: "names owner rm",
+        description: "Remove a local owner petname and every pin under it",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/machines",
+        cli_name: "names machine label",
+        description: "Label a machine shared with this install by an active received grant",
+        category: "names",
+        request: RequestSpec::Fields(&[
+            RequestField::body("name", true),
+            RequestField::body("machine_id", true),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/pins/:name",
+        cli_name: "names unpin",
+        description: "Drop a name pin so the name re-pins at next use",
+        category: "names",
+        request: RequestSpec::None,
+    },
 ];
 
 /// Find an endpoint by its CLI name.

@@ -22,6 +22,7 @@ mod key_move;
 mod machines;
 mod messaging;
 pub(crate) mod named_groups;
+pub(in crate::server) mod names;
 mod network;
 mod owner;
 mod presence;
@@ -117,6 +118,10 @@ pub(super) use named_groups::{
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
     DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+};
+pub(super) use names::{
+    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
+    names_unpin,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,

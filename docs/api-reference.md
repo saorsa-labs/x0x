@@ -2676,4 +2676,61 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 `local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
+`peer_agent` also accepts an agent name (`studio.me`, `agent:studio.bob`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. The response then carries the canonical `name`. A `machine:` name, or a bare label that resolves to a machine, is refused with `400` `machine_target_unsupported`. This lasts until forwards check that the stream reaches the pinned `MachineId` (ADR-0074 slice 2). Name errors use the codes listed under Names.
+
+## Names (ADR-0074)
+
+These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
+
+- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
+  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`.
+  - `POST /names/owners`.
+
+  A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
+- **Agent label.** This is the announced self-name, mapped to a label the same way. It resolves only to an agent whose valid, unexpired, unrevoked `AgentCertificate` chains to the owner.
+- **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
+- **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
+- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. To re-pin on purpose, delete the pin.
+
+Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/names` | `x0x names list` | Owner petnames and pins |
+| POST | `/names/resolve` | `x0x names resolve <NAME>` | Resolve a name; pins it at first use |
+| POST | `/names/owners` | `x0x names owner add <LABEL> <USER_ID>` | Bind an owner petname |
+| DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
+| POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
+| DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+
+`POST /names/resolve` takes `{"name": "studio.me"}` and returns:
+
+```json
+{
+  "ok": true,
+  "name": "agent:studio.me",
+  "kind": "agent",
+  "owner_user_id": "<hex>",
+  "agent_id": "<hex>",
+  "machine_id": null,
+  "newly_pinned": true
+}
+```
+
+For a machine name, `machine_id` is the machine. `agent_id` is the one agent that a stream to that machine would open to, or `null` when no single agent qualifies. For a shared machine, only a granted agent can qualify.
+
+Refusals are `{"ok": false, "error", "code"}`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_name` | 400 | Outside the grammar |
+| `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
+| `machine_target_unsupported` | 400 | A machine name where only agents are accepted (`POST /forwards`) |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name |
+| `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
+| `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
+| `ambiguous_kind` | 409 | A bare label names both an agent and a machine. Retry with `agent:` or `machine:` |
+| `pin_mismatch` | 409 | The name is pinned to another key. The body carries `pinned` and `current` |
+| `name_store` | 503 | `names.json` is unreadable (fail closed) |
+
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)

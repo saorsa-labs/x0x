@@ -357,6 +357,11 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_grants_path(path) {
         return true;
     }
+    // ADR-0074 §1: owner petnames are editable only by the local owner, and
+    // resolving pins a name; every names route is durable-token only.
+    if is_names_path(path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -398,6 +403,21 @@ fn is_grants_path(path: &str) -> bool {
         || path
             .strip_prefix("/grants/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// `true` for the ADR-0074 §1 name routes: `/names`, `/names/resolve`,
+/// `/names/owners`, `/names/machines`, and `/names/{owners,pins}/<segment>`.
+fn is_names_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/names" | "/names/resolve" | "/names/owners" | "/names/machines"
+    ) {
+        return true;
+    }
+    ["/names/owners/", "/names/pins/"].iter().any(|base| {
+        path.strip_prefix(base)
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    })
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/delegate`.
@@ -1302,6 +1322,36 @@ mod tests {
             "/acl/connectx",
         ] {
             assert!(!is_acl_admin_path(path), "{path} must not be classified");
+        }
+    }
+
+    #[test]
+    fn name_routes_require_durable_owner_for_every_method() {
+        // ADR-0074 §1: petnames are editable only by the local owner and a
+        // resolve pins; a session or rider token must reach none of them.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in [
+                "/names",
+                "/names/resolve",
+                "/names/owners",
+                "/names/machines",
+                "/names/owners/bob",
+                "/names/pins/agent:studio.bob",
+            ] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must require the durable token"
+                );
+            }
+        }
+        for path in [
+            "/name",
+            "/names/",
+            "/namesx",
+            "/names/owners/",
+            "/names/pins/a/b",
+        ] {
+            assert!(!is_names_path(path), "{path} must not be classified");
         }
     }
 
