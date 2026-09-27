@@ -17,7 +17,7 @@ SUMMARY="$PROOF_DIR/summary.md"
 printf '[%s] slow-consumer proof → %s\n' "$(date -u +%H:%M:%S)" "$PROOF_DIR" | tee "$LOG"
 
 X0X_SLOW_CONSUMER_PROOF="$RESULT_JSON" \
-  cargo test --lib test_slow_subscriber_isolated_at_100k_messages -- --ignored --nocapture \
+  cargo test --profile signing-acceptance --lib test_slow_subscriber_isolated_at_100k_messages -- --ignored --nocapture \
   2>&1 | tee -a "$LOG"
 
 python3 - "$RESULT_JSON" <<'PY' > "$SUMMARY"
