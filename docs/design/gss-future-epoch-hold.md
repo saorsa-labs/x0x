@@ -38,6 +38,63 @@ The premise holds: a future-epoch sealed delta is dropped today.
 One part of the brief does not hold: an immediate state request at the moment
 of `no key for epoch` cannot help. See §5.
 
+## 1a. Premise check: is "no key for epoch" actually observed in R19?
+
+**Not yet shown.** §1 proves only that the code *would* drop a future-epoch
+record. It does not prove that R19's barrier reached the observer at all.
+
+A competing explanation fits the same symptom: open issue **#890**. On Full
+nodes, the eager fanout for a group-store topic ignores the group roster. So a
+write to a small group can reach the other member only through lazy IHAVE, and
+IHAVE is shed under load. The R19 testnet nodes run in Full mode.
+
+The two causes fail at different layers:
+
+| Cause | Where the barrier is lost | Does this hold fix it? |
+|-------|---------------------------|------------------------|
+| Future-epoch drop | Delivered, then rejected by `open_mutation` | Yes |
+| #890 fanout/IHAVE shed | Never delivered to the observer | No: nothing reaches the hold, and no catch-up fires because no future epoch was observed |
+
+They can also co-occur.
+
+**Evidence that would confirm the future-epoch drop**, all from the R19 run
+(legacy-a1, head `41d1759`) or a rerun of it:
+
+1. **Observer log.** A `WARN` from the observer's `x0x::kv` target for the
+   barrier store id, inside the 120 s poll window:
+   `rejected sealed record before author verification`, with
+   `reason = record epoch N is ahead of local group epoch M — waiting for group secret sync`.
+   Note that the literal string is **not** "no key for epoch". That text comes
+   from test fixtures and `GssKvSecureContext::open`, which a future epoch never
+   reaches.
+2. **Epochs at barrier time.** `GET /groups/:id` `secret_epoch` on the writer
+   and the observer, sampled at the barrier PUT. The drop needs writer = E+1
+   and observer = E. The same sample repeated during the poll shows whether,
+   and when, the observer reached E+1.
+3. **Counter delta.** The observer's `/diagnostics/state-sync`
+   `incoming_record_merges` for the destination topic across the barrier
+   window. If rejected records were logged but no merge happened, the record
+   was dropped rather than never delivered.
+
+**Evidence that would point at #890 instead:**
+
+1. The observer logs nothing at all for the barrier store topic in the window:
+   no merge and no rejection.
+2. The observer's `incoming_record_merges` for the topic does not move.
+3. The writer's eager peer set for the store topic excludes the observer, and
+   the gossip IHAVE/IWANT shed counters rise during the window (see the #890
+   diagnostics).
+4. The observer is already at E+1 at barrier time (evidence item 2 above). In
+   that case the hold's premise is false for R19.
+
+**After this branch.** The new counters answer the question directly: on the
+observer, `future_epoch_held + future_epoch_refused` is non-zero if and only
+if a future-epoch record arrived.
+
+**Decision point.** Root decides between #890 and this hold, or both, based on
+that evidence. The branch stays as implemented and is not proposed for merge
+until then.
+
 ## 2. What is held (a)
 
 A main-topic payload enters the hold only if **every** check below passes. All
@@ -249,8 +306,9 @@ Pure-container tests take an explicit `now: Instant`.
    context moves to the post-removal state without the new secret. Nothing
    releases, and TTL expiry clears the hold.
 5. `release_completes_while_publication_holds_g`: hold `G.write` (the rekey
-   commit shape) and a `G.read`, then run release under a bounded
-   `tokio::time::timeout` on paused time. It completes and merges.
+   commit shape), then separately a `G.read` with a queued `G.write` (the #973
+   shape). Run release, with a refresh hook reading a mock group map, under a
+   10 s `tokio::time::timeout`. It completes and merges in both phases.
 6. `catchup_state_request_fires_once_per_window`: two epoch advances inside one
    window produce one signal. After the window, the next advance produces
    another. The limiter takes an injected clock.
@@ -260,7 +318,7 @@ Pure-container tests take an explicit `now: Instant`.
    E+1. The barrier becomes readable, and a removed member's forged
    E+1-epoch envelope is released-rejected.
 
-Plus pre-check refusals: a stale epoch, beyond-lookahead, a non-roster sender,
+Plus `future_epoch_hold_refuses_records_failing_pre_decrypt_checks`: a stale epoch, beyond-lookahead, a non-roster sender,
 an unsigned payload and a foreign store are never held.
 
 ## 9. Open questions

@@ -25,6 +25,7 @@
 pub mod delta;
 pub mod encrypted;
 pub mod entry;
+pub(crate) mod epoch_hold;
 pub mod error;
 pub(crate) mod retained_paging;
 pub(crate) mod snapshot_fence;

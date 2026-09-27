@@ -13,6 +13,7 @@ use crate::kv::encrypted::{
     AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, PublicAuthorizationVersion,
     SharedKvSecureContext, SignedKvMutation,
 };
+use crate::kv::epoch_hold::{FutureEpochHold, MAX_EPOCH_LOOKAHEAD};
 use crate::kv::retained_paging::{
     decode_page, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
 };
@@ -43,6 +44,14 @@ struct StateSyncCounters {
     rejected_no_retained: AtomicU64,
     rejected_other: AtomicU64,
     incoming_record_merges: AtomicU64,
+    future_epoch_held: AtomicU64,
+    future_epoch_released: AtomicU64,
+    future_epoch_release_rejected: AtomicU64,
+    future_epoch_superseded: AtomicU64,
+    future_epoch_expired: AtomicU64,
+    future_epoch_evicted: AtomicU64,
+    future_epoch_refused: AtomicU64,
+    future_epoch_catchup_requests: AtomicU64,
 }
 
 /// Cumulative state-sync activity for one currently open local store.
@@ -61,6 +70,26 @@ pub struct StateSyncSnapshot {
     pub rejected_no_retained: u64,
     pub rejected_other: u64,
     pub incoming_record_merges: u64,
+    /// Sealed records admitted to the future-epoch hold.
+    pub future_epoch_held: u64,
+    /// Held records merged after the local epoch advanced.
+    pub future_epoch_released: u64,
+    /// Held records that failed full verification or merge on release.
+    pub future_epoch_release_rejected: u64,
+    /// Held records dropped because the local epoch moved past theirs.
+    pub future_epoch_superseded: u64,
+    /// Held records dropped by TTL.
+    pub future_epoch_expired: u64,
+    /// Held records evicted by the count/byte bounds.
+    pub future_epoch_evicted: u64,
+    /// Future-epoch records refused by the pre-decrypt hold checks.
+    pub future_epoch_refused: u64,
+    /// Catch-up state requests published after an epoch install.
+    pub future_epoch_catchup_requests: u64,
+    /// Records currently held (gauge).
+    pub future_epoch_held_records: u64,
+    /// Payload bytes currently held (gauge).
+    pub future_epoch_held_bytes: u64,
 }
 
 impl StateSyncCounters {
@@ -80,6 +109,16 @@ impl StateSyncCounters {
             rejected_no_retained: get(&self.rejected_no_retained),
             rejected_other: get(&self.rejected_other),
             incoming_record_merges: get(&self.incoming_record_merges),
+            future_epoch_held: get(&self.future_epoch_held),
+            future_epoch_released: get(&self.future_epoch_released),
+            future_epoch_release_rejected: get(&self.future_epoch_release_rejected),
+            future_epoch_superseded: get(&self.future_epoch_superseded),
+            future_epoch_expired: get(&self.future_epoch_expired),
+            future_epoch_evicted: get(&self.future_epoch_evicted),
+            future_epoch_refused: get(&self.future_epoch_refused),
+            future_epoch_catchup_requests: get(&self.future_epoch_catchup_requests),
+            future_epoch_held_records: 0,
+            future_epoch_held_bytes: 0,
         }
     }
 }
@@ -221,6 +260,36 @@ struct RetainedHistoryPublish<'a> {
     counters: Option<&'a StateSyncCounters>,
     #[cfg(test)]
     test_state: Option<&'a std::sync::Mutex<RetainedPublishTestState>>,
+}
+
+/// Borrowed handles for the GSS encrypted receive path and its
+/// future-epoch hold.
+struct EncryptedReceive<'a> {
+    ctx: &'a SharedKvSecureContext,
+    refresh: Option<&'a SecureRefreshFn>,
+    store: &'a Arc<RwLock<KvStore>>,
+    store_id: &'a KvStoreId,
+    local_peer: PeerId,
+    /// The local agent; release requires it to be a current reader.
+    local_agent: Option<AgentId>,
+    pages: &'a Arc<std::sync::Mutex<RetainedPagePool>>,
+    hold: &'a std::sync::Mutex<FutureEpochHold>,
+    counters: &'a StateSyncCounters,
+    catchup: &'a tokio::sync::Notify,
+}
+
+/// Handles for one catch-up state request (design §5).
+struct CatchupStateRequest<'a> {
+    ctx: &'a SharedKvSecureContext,
+    refresh: Option<&'a SecureRefreshFn>,
+    gate: Option<&'a GssPublicationGate>,
+    signing: &'a Arc<AuthorSigning>,
+    pubsub: &'a PubSubManager,
+    topic: &'a str,
+    store_id: &'a KvStoreId,
+    local_peer: PeerId,
+    counters: &'a StateSyncCounters,
+    cancel: &'a tokio_util::sync::CancellationToken,
 }
 
 /// Delays between state-request retries for a first-time joiner whose
@@ -892,6 +961,11 @@ pub struct KvStoreSync {
     /// sign-then-encrypt flow).
     author_signing: Option<std::sync::Arc<AuthorSigning>>,
     retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
+    /// GSS sealed records whose epoch is ahead of the local epoch, held for
+    /// release after the rekey installs (`docs/design/gss-future-epoch-hold.md`).
+    future_epoch_hold: Arc<std::sync::Mutex<FutureEpochHold>>,
+    /// Wakes the responder loop to publish one catch-up state request.
+    future_epoch_catchup: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
     #[cfg(test)]
@@ -1093,6 +1167,8 @@ impl KvStoreSync {
             gss_publication_gate: None,
             author_signing: None,
             retained_pages: Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+            future_epoch_hold: Arc::new(std::sync::Mutex::new(FutureEpochHold::default())),
+            future_epoch_catchup: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             retained_publish_test: Arc::new(std::sync::Mutex::new(
                 RetainedPublishTestState::default(),
@@ -1110,7 +1186,14 @@ impl KvStoreSync {
 
     /// Local counters reset when this open store is released or the process restarts.
     pub fn state_sync_snapshot(&self) -> StateSyncSnapshot {
-        self.state_sync_counters.snapshot()
+        let mut snapshot = self.state_sync_counters.snapshot();
+        let hold = self
+            .future_epoch_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.future_epoch_held_records = hold.len() as u64;
+        snapshot.future_epoch_held_bytes = hold.bytes() as u64;
+        snapshot
     }
 
     /// Attach the group security/authorization context and refresh hook.
@@ -1906,6 +1989,218 @@ impl KvStoreSync {
         }
     }
 
+    /// Receive one GSS main-topic payload: hold it when it is sealed under a
+    /// future epoch and passes the pre-decrypt checks, otherwise take the
+    /// unchanged verify-and-merge path. Returns whether a live record merged.
+    async fn receive_encrypted_record(
+        rx: &EncryptedReceive<'_>,
+        sender: Option<AgentId>,
+        payload: &[u8],
+        now: tokio::time::Instant,
+    ) -> bool {
+        if let Some(refresh) = rx.refresh {
+            refresh().await;
+        }
+        if let Ok((_, record)) = decode_delta::<EncryptedKvStoreRecordV1>(payload) {
+            let current = rx.ctx.current_epoch();
+            if record.epoch > current {
+                Self::offer_future_epoch_record(rx, sender, &record, payload, current, now);
+                return false;
+            }
+        }
+        Self::merge_encrypted_record(
+            rx.ctx,
+            None,
+            rx.store,
+            rx.store_id,
+            rx.local_peer,
+            payload,
+            rx.pages,
+        )
+        .await
+    }
+
+    /// Pre-decrypt admission to the future-epoch hold (design §2). Never
+    /// merges; a refused record is dropped exactly as before this hold.
+    fn offer_future_epoch_record(
+        rx: &EncryptedReceive<'_>,
+        sender: Option<AgentId>,
+        record: &EncryptedKvStoreRecordV1,
+        payload: &[u8],
+        current: u64,
+        now: tokio::time::Instant,
+    ) {
+        let refuse = |reason: &str| {
+            rx.counters
+                .future_epoch_refused
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(store_id = %rx.store_id, record_epoch = record.epoch,
+                local_epoch = current, reason, "dropped future-epoch sealed record");
+        };
+        // The pub/sub layer already dropped signed payloads that failed
+        // verification; an unsigned payload has no accountable sender.
+        let Some(sender) = sender else {
+            return refuse("unsigned pub/sub envelope");
+        };
+        if record.group_id != rx.ctx.group_id() || record.store_id != *rx.store_id.as_bytes() {
+            return refuse("envelope group/store binding mismatch");
+        }
+        // Only a writer in the local roster may use the hold; this also
+        // requires a live secret, so an invalidated context holds nothing.
+        if !rx.ctx.is_authorized_writer(&sender) {
+            return refuse("sender is not a current authorized writer");
+        }
+        if record.epoch > current.saturating_add(MAX_EPOCH_LOOKAHEAD) {
+            return refuse("epoch beyond hold lookahead");
+        }
+        let outcome = {
+            let mut hold = rx
+                .hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hold.note_future_epoch(record.epoch);
+            hold.insert(sender, record.epoch, payload, now)
+        };
+        rx.counters
+            .future_epoch_expired
+            .fetch_add(outcome.expired as u64, Ordering::Relaxed);
+        rx.counters
+            .future_epoch_evicted
+            .fetch_add(outcome.evicted as u64, Ordering::Relaxed);
+        if outcome.held {
+            rx.counters
+                .future_epoch_held
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(store_id = %rx.store_id, sender = %hex::encode(sender.as_bytes()),
+                record_epoch = record.epoch, local_epoch = current,
+                "holding sealed record until its epoch installs");
+        } else if outcome.oversize {
+            refuse("record exceeds hold byte bound");
+        }
+    }
+
+    /// Release held records whose epoch has installed (design §4). Runs the
+    /// unchanged `merge_encrypted_record` on each, so a held record gets
+    /// every check a live one does. Never takes the GSS publication gate.
+    /// Returns how many held records merged.
+    async fn release_future_epoch_hold(
+        rx: &EncryptedReceive<'_>,
+        refresh: bool,
+        now: tokio::time::Instant,
+    ) -> usize {
+        if refresh {
+            if let Some(refresh) = rx.refresh {
+                refresh().await;
+            }
+        }
+        let current = rx.ctx.current_epoch();
+        let reader = rx
+            .local_agent
+            .is_some_and(|agent| rx.ctx.is_authorized_reader(&agent));
+        let (expired, ready, catchup) = {
+            let mut hold = rx
+                .hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expired = hold.expire(now);
+            if reader {
+                let ready = hold.take_releasable(current);
+                let catchup = hold.take_catchup_due(current, now);
+                (expired, ready, catchup)
+            } else {
+                // A node outside the current membership never releases;
+                // its entries leave only by TTL.
+                (expired, Vec::new(), false)
+            }
+        };
+        rx.counters
+            .future_epoch_expired
+            .fetch_add(expired as u64, Ordering::Relaxed);
+        if catchup {
+            rx.catchup.notify_one();
+        }
+        let mut released = 0usize;
+        for entry in ready {
+            if entry.epoch < current {
+                rx.counters
+                    .future_epoch_superseded
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if Self::merge_encrypted_record(
+                rx.ctx,
+                None,
+                rx.store,
+                rx.store_id,
+                rx.local_peer,
+                &entry.payload,
+                rx.pages,
+            )
+            .await
+            {
+                released += 1;
+                rx.counters
+                    .future_epoch_released
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                rx.counters
+                    .future_epoch_release_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        released
+    }
+
+    /// Publish one sealed `StateRequest` at the (newly installed) local
+    /// epoch, under the GSS publication gate like the bootstrap requester.
+    async fn publish_catchup_state_request(req: CatchupStateRequest<'_>) {
+        let _publication_guard = match req.gate {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        let deadline = gss_deadline(_publication_guard.is_some());
+        let request = KvSyncMessage::StateRequest {
+            requester: req.local_peer,
+        };
+        let Some(serialized) = within_gss_deadline(
+            Self::seal_control_message(
+                req.ctx,
+                req.refresh,
+                req.signing,
+                req.store_id,
+                req.local_peer,
+                &request,
+            ),
+            deadline,
+        )
+        .await
+        .flatten() else {
+            req.counters
+                .request_seal_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let result = tokio::select! {
+            biased;
+            () = req.cancel.cancelled() => return,
+            result = publish_with_gss_deadline(
+                req.pubsub,
+                req.topic.to_string(),
+                bytes::Bytes::from(serialized),
+                deadline,
+            ) => result,
+        };
+        match result {
+            Ok(()) => {
+                req.counters.requests_sent.fetch_add(1, Ordering::Relaxed);
+                req.counters
+                    .future_epoch_catchup_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::debug!("KvStore catch-up state-request publish failed: {e}"),
+        }
+    }
+
     /// Seal a state-sync control message for an encrypted store. Returns
     /// ready-to-publish gossip bytes, or `None` (logged) on any failure.
     async fn seal_control_message(
@@ -2432,13 +2727,39 @@ impl KvStoreSync {
         let listener_served = Arc::clone(&served_evidence);
         let listener_counters = Arc::clone(&self.state_sync_counters);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
+        // GSS future-epoch hold (docs/design/gss-future-epoch-hold.md): only
+        // the GSS encrypted path holds; TreeKEM and group-signed never do.
+        let listener_uses_hold =
+            listener_is_encrypted && listener_secure.is_some() && listener_treekem.is_none();
+        let listener_hold = Arc::clone(&self.future_epoch_hold);
+        let listener_catchup = Arc::clone(&self.future_epoch_catchup);
+        let listener_local_agent = self
+            .author_signing
+            .as_ref()
+            .map(|signing| signing.agent_id)
+            .or(self.local_agent_id);
+        let mut listener_epoch_changes = if listener_uses_hold {
+            listener_secure
+                .as_ref()
+                .and_then(|ctx| ctx.encrypted_authorization_changes())
+        } else {
+            None
+        };
+        let mut listener_hold_tick = tokio::time::interval(crate::kv::epoch_hold::HOLD_TICK);
+        listener_hold_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
         // termination is recorded only after this future — and every
         // capture it holds, including the persist context — is destroyed
         // (see `TrackedLoopFuture`).
         let listener_loop = async move {
             loop {
-                let msg = tokio::select! {
+                let hold_busy = listener_uses_hold
+                    && !listener_hold
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_idle();
+                // `None` = hold maintenance (`Some(refresh)`), not a message.
+                let (msg, hold_refresh) = tokio::select! {
                     // Cancel-first (#757): an unbiased select picks at
                     // random when a queued message and the cancel are both
                     // ready, so a retired sync still merged and persisted.
@@ -2447,7 +2768,53 @@ impl KvStoreSync {
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
                     () = listener_cancel.cancelled() => return,
-                    msg = sub.recv() => msg,
+                    changed = async {
+                        match listener_epoch_changes.as_mut() {
+                            Some(changes) => changes.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if hold_busy => {
+                        if changed.is_err() {
+                            listener_epoch_changes = None;
+                        }
+                        (None, false)
+                    },
+                    _ = listener_hold_tick.tick(), if hold_busy => (None, true),
+                    msg = sub.recv() => (Some(msg), false),
+                };
+                let Some(msg) = msg else {
+                    // Hold maintenance: the rekey installs under G in the
+                    // daemon's group map; the refresh hook makes it visible.
+                    let _lifecycle = listener_lifecycle.lock().await;
+                    if listener_cancel.is_cancelled() {
+                        return;
+                    }
+                    if let Some(ctx) = listener_secure.as_ref() {
+                        let rx = EncryptedReceive {
+                            ctx,
+                            refresh: listener_refresh.as_ref(),
+                            store: &store,
+                            store_id: &listener_store_id,
+                            local_peer: listener_local_peer_id,
+                            local_agent: listener_local_agent,
+                            pages: &listener_pages,
+                            hold: &listener_hold,
+                            counters: &listener_counters,
+                            catchup: &listener_catchup,
+                        };
+                        let released = Self::release_future_epoch_hold(
+                            &rx,
+                            hold_refresh,
+                            tokio::time::Instant::now(),
+                        )
+                        .await;
+                        if released > 0 {
+                            if let Some(ctx) = loop_persist_ctx.as_ref() {
+                                let _ = persist_snapshot(&store, ctx).await;
+                            }
+                        }
+                    }
+                    continue;
                 };
                 let Some(msg) = msg else {
                     // The main-topic subscription is gone: this sync can no
@@ -2494,17 +2861,28 @@ impl KvStoreSync {
                         }
                     }
                 } else if let Some(ctx) = listener_secure.as_ref() {
+                    let mut released = 0usize;
                     let merged = if listener_is_encrypted {
-                        Self::merge_encrypted_record(
+                        let rx = EncryptedReceive {
                             ctx,
-                            listener_refresh.as_ref(),
-                            &store,
-                            &listener_store_id,
-                            listener_local_peer_id,
-                            &msg.payload,
-                            &listener_pages,
-                        )
-                        .await
+                            refresh: listener_refresh.as_ref(),
+                            store: &store,
+                            store_id: &listener_store_id,
+                            local_peer: listener_local_peer_id,
+                            local_agent: listener_local_agent,
+                            pages: &listener_pages,
+                            hold: &listener_hold,
+                            counters: &listener_counters,
+                            catchup: &listener_catchup,
+                        };
+                        let now = tokio::time::Instant::now();
+                        let merged =
+                            Self::receive_encrypted_record(&rx, msg.sender, &msg.payload, now)
+                                .await;
+                        // The receive just refreshed the context: release
+                        // anything its epoch now covers.
+                        released = Self::release_future_epoch_hold(&rx, false, now).await;
+                        merged
                     } else {
                         trace_group_signed_record(
                             "receive_before_verification",
@@ -2527,6 +2905,8 @@ impl KvStoreSync {
                         listener_counters
                             .incoming_record_merges
                             .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if merged || released > 0 {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
@@ -2707,6 +3087,10 @@ impl KvStoreSync {
         let responder_is_group_signed = store_is_group_signed;
         let responder_uses_retained = responder_is_encrypted || responder_is_group_signed;
         let responder_store_id = { *self.store.read().await.id() };
+        // Catch-up requests after a future-epoch install (GSS only).
+        let responder_uses_catchup =
+            responder_is_encrypted && responder_secure.is_some() && responder_treekem.is_none();
+        let responder_catchup = Arc::clone(&self.future_epoch_catchup);
         #[cfg(test)]
         let responder_loop_exits = Arc::clone(&self.loop_exits);
         // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
@@ -2725,6 +3109,32 @@ impl KvStoreSync {
                     biased;
                     // cancel_sync tears down every loop (round-4 review).
                     () = responder_cancel.cancelled() => return,
+                    () = async {
+                        if responder_uses_catchup {
+                            responder_catchup.notified().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        if let (Some(ctx), Some(signing)) =
+                            (responder_secure.as_ref(), responder_signing.as_ref())
+                        {
+                            Self::publish_catchup_state_request(CatchupStateRequest {
+                                ctx,
+                                refresh: responder_refresh.as_ref(),
+                                gate: responder_gss_publication_gate.as_ref(),
+                                signing,
+                                pubsub: responder_pubsub.as_ref(),
+                                topic: &sync_topic,
+                                store_id: &responder_store_id,
+                                local_peer: local_peer_id,
+                                counters: &responder_counters,
+                                cancel: &responder_cancel,
+                            })
+                            .await;
+                        }
+                        continue;
+                    },
                     msg = sync_sub.recv() => msg,
                 };
                 let Some(msg) = msg else {
@@ -11429,5 +11839,402 @@ mod tests {
                 4 + round
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // GSS future-epoch hold (docs/design/gss-future-epoch-hold.md)
+    // ------------------------------------------------------------------
+
+    struct HoldFixture {
+        store: Arc<RwLock<KvStore>>,
+        ctx: SharedKvSecureContext,
+        refresh: Option<SecureRefreshFn>,
+        id: KvStoreId,
+        local: AgentId,
+        pages: Arc<std::sync::Mutex<RetainedPagePool>>,
+        hold: std::sync::Mutex<FutureEpochHold>,
+        counters: StateSyncCounters,
+        catchup: tokio::sync::Notify,
+    }
+
+    impl HoldFixture {
+        fn new(
+            ctx: Arc<GssKvSecureContext>,
+            creator: AgentId,
+            local: AgentId,
+            group_id: Vec<u8>,
+            refresh: Option<SecureRefreshFn>,
+        ) -> Self {
+            let id = store_id(77);
+            let store = KvStore::new_encrypted(
+                id,
+                "Enc".to_string(),
+                creator,
+                group_id,
+                ctx.clone() as Arc<dyn KvSecureContext>,
+            )
+            .expect("encrypted store");
+            Self {
+                store: Arc::new(RwLock::new(store)),
+                ctx,
+                refresh,
+                id,
+                local,
+                pages: Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+                hold: std::sync::Mutex::new(FutureEpochHold::default()),
+                counters: StateSyncCounters::default(),
+                catchup: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn rx(&self) -> EncryptedReceive<'_> {
+            EncryptedReceive {
+                ctx: &self.ctx,
+                refresh: self.refresh.as_ref(),
+                store: &self.store,
+                store_id: &self.id,
+                local_peer: peer(9),
+                local_agent: Some(self.local),
+                pages: &self.pages,
+                hold: &self.hold,
+                counters: &self.counters,
+                catchup: &self.catchup,
+            }
+        }
+
+        fn held(&self) -> usize {
+            self.hold.lock().expect("hold lock").len()
+        }
+
+        async fn value(&self, key: &str) -> Option<Vec<u8>> {
+            self.store
+                .read()
+                .await
+                .get(key)
+                .map(|entry| entry.value.clone())
+        }
+
+        fn catchup_signalled(&self) -> bool {
+            use futures::FutureExt;
+            self.catchup.notified().now_or_never().is_some()
+        }
+    }
+
+    fn sealed_put(
+        ctx: &GssKvSecureContext,
+        signing: &AuthorSigning,
+        id: &KvStoreId,
+        key: &str,
+        seq: u64,
+    ) -> EncryptedKvStoreRecordV1 {
+        let delta = KvStoreDelta::for_put(
+            key.to_string(),
+            KvEntry::new(
+                key.to_string(),
+                key.as_bytes().to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), seq),
+            seq,
+        );
+        ctx.seal_authorized(
+            signing,
+            KvMutationKind::Delta,
+            id,
+            &bincode::serialize(&delta).expect("delta bytes"),
+        )
+        .expect("sealed put")
+    }
+
+    fn wire(record: &EncryptedKvStoreRecordV1) -> Vec<u8> {
+        encode_delta(peer(1), record).expect("wire")
+    }
+
+    /// Next epoch of `info`: rotated secret, and `removed` (if any) gone.
+    fn next_epoch(info: &GroupInfo, removed: Option<AgentId>) -> GroupInfo {
+        let mut next = info.clone();
+        let _ = next.rotate_shared_secret();
+        if let Some(removed) = removed {
+            next.remove_member(
+                &hex::encode(removed.as_bytes()),
+                Some(hex::encode(info.creator.as_bytes())),
+            );
+        }
+        next
+    }
+
+    #[tokio::test]
+    async fn future_epoch_delta_held_then_applied_after_rekey_install() {
+        let owner_kp = AgentKeypair::generate().expect("owner");
+        let observer_kp = AgentKeypair::generate().expect("observer");
+        let (owner, observer) = (owner_kp.agent_id(), observer_kp.agent_id());
+        let (info, contexts, group_id) = encrypted_group(&[owner, observer]);
+        let next = next_epoch(&info, None);
+        contexts[0].update_from_group(&next);
+        let fx = HoldFixture::new(contexts[1].clone(), owner, observer, group_id, None);
+        let signing = AuthorSigning::from_keypair(&owner_kp).expect("signing");
+        let payload = wire(&sealed_put(&contexts[0], &signing, &fx.id, "k", 1));
+        let now = tokio::time::Instant::now();
+
+        // Before the hold this record was dropped: no merge, nothing kept.
+        assert!(!KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &payload, now).await);
+        assert_eq!(
+            fx.held(),
+            1,
+            "future-epoch record must be held, not dropped"
+        );
+        assert_eq!(fx.value("k").await, None);
+        assert_eq!(
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), false, now).await,
+            0,
+            "nothing releases before the epoch installs"
+        );
+        assert!(!fx.catchup_signalled());
+
+        contexts[1].update_from_group(&next);
+        assert_eq!(
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), false, now).await,
+            1
+        );
+        assert_eq!(fx.value("k").await, Some(b"k".to_vec()));
+        assert_eq!(fx.held(), 0);
+        let snap = fx.counters.snapshot();
+        assert_eq!((snap.future_epoch_held, snap.future_epoch_released), (1, 1));
+        assert!(
+            fx.catchup_signalled(),
+            "install after a future epoch asks for state"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_epoch_hold_refuses_records_failing_pre_decrypt_checks() {
+        let owner_kp = AgentKeypair::generate().expect("owner");
+        let observer_kp = AgentKeypair::generate().expect("observer");
+        let outsider_kp = AgentKeypair::generate().expect("outsider");
+        let (owner, observer) = (owner_kp.agent_id(), observer_kp.agent_id());
+        let (info, contexts, group_id) = encrypted_group(&[owner, observer]);
+        let next = next_epoch(&info, None);
+        contexts[0].update_from_group(&next);
+        let fx = HoldFixture::new(contexts[1].clone(), owner, observer, group_id, None);
+        let signing = AuthorSigning::from_keypair(&owner_kp).expect("signing");
+        let now = tokio::time::Instant::now();
+        let good = sealed_put(&contexts[0], &signing, &fx.id, "k", 1);
+
+        let mut far = good.clone();
+        far.epoch = contexts[1].current_epoch() + MAX_EPOCH_LOOKAHEAD + 1;
+        let foreign = sealed_put(&contexts[0], &signing, &store_id(78), "k", 2);
+        let cases: [(Option<AgentId>, Vec<u8>); 4] = [
+            (None, wire(&good)),
+            (Some(outsider_kp.agent_id()), wire(&good)),
+            (Some(owner), wire(&far)),
+            (Some(owner), wire(&foreign)),
+        ];
+        for (sender, payload) in cases {
+            assert!(!KvStoreSync::receive_encrypted_record(&fx.rx(), sender, &payload, now).await);
+        }
+        assert_eq!(fx.held(), 0);
+        assert_eq!(fx.counters.snapshot().future_epoch_refused, 4);
+
+        // A stale (past-epoch) record is never held either.
+        let stale = sealed_put(&contexts[1], &signing, &fx.id, "old", 3);
+        contexts[1].update_from_group(&next);
+        assert!(
+            !KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &wire(&stale), now).await
+        );
+        assert_eq!(fx.held(), 0);
+        assert_eq!(fx.value("old").await, None);
+    }
+
+    #[tokio::test]
+    async fn removed_member_never_releases_held_records() {
+        let owner_kp = AgentKeypair::generate().expect("owner");
+        let removed_kp = AgentKeypair::generate().expect("removed");
+        let (owner, removed) = (owner_kp.agent_id(), removed_kp.agent_id());
+        let (info, contexts, group_id) = encrypted_group(&[owner, removed]);
+        let next = next_epoch(&info, Some(removed));
+        contexts[0].update_from_group(&next);
+        let fx = HoldFixture::new(contexts[1].clone(), owner, removed, group_id, None);
+        let signing = AuthorSigning::from_keypair(&owner_kp).expect("signing");
+        let start = tokio::time::Instant::now();
+        let payload = wire(&sealed_put(&contexts[0], &signing, &fx.id, "secret", 1));
+
+        // Received while the removal had not landed locally: held.
+        assert!(
+            !KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &payload, start).await
+        );
+        assert_eq!(fx.held(), 1);
+
+        // The removal lands: the new epoch number is visible, but there is
+        // no secret for it and no membership. Nothing is drained or opened.
+        let mut removed_view = next.clone();
+        removed_view.shared_secret = None;
+        contexts[1].update_from_group(&removed_view);
+        assert!(contexts[1].current_epoch() >= next.secret_epoch);
+        assert_eq!(
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), false, start).await,
+            0
+        );
+        assert_eq!(fx.held(), 1, "a non-member must not drain its hold");
+        let snap = fx.counters.snapshot();
+        assert_eq!(
+            (
+                snap.future_epoch_released,
+                snap.future_epoch_release_rejected
+            ),
+            (0, 0)
+        );
+        assert!(!fx.catchup_signalled(), "a non-member never asks for state");
+        assert_eq!(fx.value("secret").await, None);
+
+        // A further future-epoch record is refused outright.
+        let mut ahead = sealed_put(&contexts[0], &signing, &fx.id, "more", 2);
+        ahead.epoch = contexts[1].current_epoch() + 1;
+        assert!(
+            !KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &wire(&ahead), start)
+                .await
+        );
+        assert_eq!(fx.held(), 1);
+
+        // TTL is the only exit.
+        let later = start + crate::kv::epoch_hold::HOLD_TTL;
+        assert_eq!(
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), false, later).await,
+            0
+        );
+        assert_eq!(fx.held(), 0);
+        assert_eq!(fx.counters.snapshot().future_epoch_expired, 1);
+    }
+
+    #[tokio::test]
+    async fn release_completes_while_publication_holds_g() {
+        let owner_kp = AgentKeypair::generate().expect("owner");
+        let observer_kp = AgentKeypair::generate().expect("observer");
+        let (owner, observer) = (owner_kp.agent_id(), observer_kp.agent_id());
+        let (info, contexts, group_id) = encrypted_group(&[owner, observer]);
+        // The daemon's authoritative group map, read by the refresh hook.
+        let groups = Arc::new(RwLock::new(info.clone()));
+        let hook_groups = Arc::clone(&groups);
+        let refresh = GssKvSecureContext::refresh_hook(contexts[1].clone(), move || {
+            let groups = Arc::clone(&hook_groups);
+            async move { Some(groups.read().await.clone()) }
+        });
+        let fx = HoldFixture::new(
+            contexts[1].clone(),
+            owner,
+            observer,
+            group_id,
+            Some(refresh),
+        );
+        let signing = AuthorSigning::from_keypair(&owner_kp).expect("signing");
+        let gate: GssPublicationGate = Arc::new(RwLock::new(()));
+        let bound = Duration::from_secs(10);
+
+        // Phase 1: the rekey commit shape — G write held while the new
+        // epoch is installed into the group map.
+        let e1 = next_epoch(&info, None);
+        contexts[0].update_from_group(&e1);
+        let first = wire(&sealed_put(&contexts[0], &signing, &fx.id, "one", 1));
+        let now = tokio::time::Instant::now();
+        assert!(!KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &first, now).await);
+        assert_eq!(fx.held(), 1);
+        {
+            let _rekey = gate.write().await;
+            *groups.write().await = e1.clone();
+            let released = tokio::time::timeout(
+                bound,
+                KvStoreSync::release_future_epoch_hold(&fx.rx(), true, now),
+            )
+            .await
+            .expect("release must not wait on G write");
+            assert_eq!(released, 1);
+        }
+        assert_eq!(fx.value("one").await, Some(b"one".to_vec()));
+
+        // Phase 2: #973 shape — a publication holds G read and a rekey is
+        // queued on G write (which blocks new readers).
+        let e2 = next_epoch(&e1, None);
+        contexts[0].update_from_group(&e2);
+        let second = wire(&sealed_put(&contexts[0], &signing, &fx.id, "two", 2));
+        assert!(!KvStoreSync::receive_encrypted_record(&fx.rx(), Some(owner), &second, now).await);
+        assert_eq!(fx.held(), 1);
+        *groups.write().await = e2.clone();
+        let publication = Arc::clone(&gate).read_owned().await;
+        let queued_gate = Arc::clone(&gate);
+        let queued = tokio::spawn(async move {
+            let _rekey = queued_gate.write().await;
+        });
+        tokio::task::yield_now().await;
+        let released = tokio::time::timeout(
+            bound,
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), true, now),
+        )
+        .await
+        .expect("release must not wait on G read or a queued writer");
+        assert_eq!(released, 1);
+        assert_eq!(fx.value("two").await, Some(b"two".to_vec()));
+        drop(publication);
+        queued.await.expect("queued rekey completes");
+    }
+
+    #[tokio::test]
+    async fn r19_barrier_converges_after_observer_installs_next_epoch() {
+        // legacy-a1 shape: the owner removes a member (E -> E+1), a writer
+        // at E+1 puts a barrier, the observer is still at E.
+        let owner_kp = AgentKeypair::generate().expect("owner");
+        let writer_kp = AgentKeypair::generate().expect("writer");
+        let observer_kp = AgentKeypair::generate().expect("observer");
+        let removed_kp = AgentKeypair::generate().expect("removed");
+        let (owner, writer, observer, removed) = (
+            owner_kp.agent_id(),
+            writer_kp.agent_id(),
+            observer_kp.agent_id(),
+            removed_kp.agent_id(),
+        );
+        let (info, contexts, group_id) = encrypted_group(&[owner, writer, observer, removed]);
+        let next = next_epoch(&info, Some(removed));
+        contexts[0].update_from_group(&next);
+        contexts[1].update_from_group(&next);
+        let fx = HoldFixture::new(contexts[2].clone(), owner, observer, group_id, None);
+        let writer_signing = AuthorSigning::from_keypair(&writer_kp).expect("writer signing");
+        let removed_signing = AuthorSigning::from_keypair(&removed_kp).expect("removed signing");
+        let now = tokio::time::Instant::now();
+
+        let barrier = wire(&sealed_put(
+            &contexts[1],
+            &writer_signing,
+            &fx.id,
+            "barrier",
+            1,
+        ));
+        assert!(
+            !KvStoreSync::receive_encrypted_record(&fx.rx(), Some(writer), &barrier, now).await
+        );
+        // The removed member (still in the observer's E roster) forges an
+        // E+1 envelope around ciphertext it can only seal at E.
+        let mut forged = sealed_put(&contexts[3], &removed_signing, &fx.id, "forged", 2);
+        forged.epoch = next.secret_epoch;
+        assert!(
+            !KvStoreSync::receive_encrypted_record(&fx.rx(), Some(removed), &wire(&forged), now)
+                .await
+        );
+        assert_eq!(fx.held(), 2);
+        assert_eq!(fx.value("barrier").await, None, "R19: not readable at E");
+
+        // The observer installs E+1; the next live record, watch wake or
+        // tick releases.
+        contexts[2].update_from_group(&next);
+        assert_eq!(
+            KvStoreSync::release_future_epoch_hold(&fx.rx(), false, now).await,
+            1
+        );
+        assert_eq!(fx.value("barrier").await, Some(b"barrier".to_vec()));
+        assert_eq!(fx.value("forged").await, None);
+        let snap = fx.counters.snapshot();
+        assert_eq!(snap.future_epoch_released, 1);
+        assert_eq!(
+            snap.future_epoch_release_rejected, 1,
+            "forged record fails AEAD"
+        );
+        assert!(fx.catchup_signalled());
     }
 }

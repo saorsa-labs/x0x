@@ -731,6 +731,16 @@ mod participation_diagnostics_tests {
         assert_eq!(
             keys,
             [
+                "future_epoch_catchup_requests",
+                "future_epoch_evicted",
+                "future_epoch_expired",
+                "future_epoch_held",
+                "future_epoch_held_bytes",
+                "future_epoch_held_records",
+                "future_epoch_refused",
+                "future_epoch_release_rejected",
+                "future_epoch_released",
+                "future_epoch_superseded",
                 "incoming_record_merges",
                 "rejected_authorization_version",
                 "rejected_cooldown",
