@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import load_tokens
-from e2e_vps_kv import Api, Evidence, active_provider_ids, enc, poll
+from e2e_vps_kv import Api, Evidence, active_provider_ids, enc, poll, with_poll_timeout
 from e2e_vps_private_kv import Scenario, machine_id, settled_home
 
 ROOT_RE = re.compile(r"/var/tmp/x0x-home-e2e-[0-9a-f]{32}\Z")
@@ -541,7 +541,7 @@ def main() -> int:
     try:
         succeeded = run_fixture(args, Remote(), evidence, resources)
     except Exception as error:
-        evidence.assertions.append({"label": f"fixture {type(error).__name__}", "passed": False})
+        evidence.assertions.append(with_poll_timeout({"label": f"fixture {type(error).__name__}", "passed": False}, error))
     finally:
         custody = resources.get("custody")
         witnesses: list[dict[str, Any]] = []
