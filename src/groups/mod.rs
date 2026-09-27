@@ -108,6 +108,126 @@ pub struct InviteLineage {
     /// `(revision, state_hash, committed_by)`; first evidence wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_evidence: Option<ForkEvidence>,
+    /// Non-gating audit of served join chains refused without fork evidence:
+    /// either the owner attested the exact terminal (a stale-base gap), or
+    /// only a v1 parent attestation was available (an ambiguous terminal).
+    /// Visible through `GET /groups/:id` → `invite_lineage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored_gap_refusal: Option<AnchoredGapRefusal>,
+}
+
+/// The latest owner-attestation gap refusal plus a running count
+/// (see [`InviteLineage::anchored_gap_refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredGapRefusal {
+    /// Why the chain was exempted from fork evidence.
+    pub reason: String,
+    /// Revision of the attested head (the terminal's parent).
+    pub head_revision: u64,
+    /// State hash of the attested head.
+    pub head_state_hash: String,
+    /// Revision of the refused terminal commit.
+    pub terminal_revision: u64,
+    /// State hash of the refused terminal commit.
+    pub terminal_state_hash: String,
+    /// The admin that committed the terminal (hex agent id).
+    pub committed_by: String,
+    /// Total refusals recorded on this lineage, across reasons.
+    pub occurrences: u64,
+    /// Local time of the first recorded refusal (unix ms).
+    pub first_observed_at_ms: u64,
+    /// Local time of the latest recorded refusal (unix ms).
+    pub last_observed_at_ms: u64,
+    /// #846: the per-step state-hash sequence the owner attestation
+    /// covers — every intervening link of the validated chain in order,
+    /// ending with the terminal's own state hash. Each catch-up page must
+    /// match the NEXT expected hash in this sequence before anything is
+    /// adopted, so adoption stays inside what the owner attested while
+    /// multi-commit gaps still converge page by page. Empty on older
+    /// persisted records: the gate still ARMS on them and then refuses
+    /// EVERY page (fail-closed — an attestation whose steps were never
+    /// recorded admits nothing) until the record retires.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attested_chain_hashes: Vec<String>,
+    /// First authenticated evidence and count for each reason. A later
+    /// refusal cannot overwrite the first terminal or committer recorded
+    /// for another reason. Empty on older persisted records.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_reason: BTreeMap<String, GapRefusalReasonAudit>,
+    /// #871 r3: the OWNER-ISSUED wire attestation that armed this gate
+    /// (base64 of the serialized server HeadAttestation — bytes only,
+    /// the type is server-private). The r2 escape MINTED a local
+    /// self-verified authorization (tautological, and only an install
+    /// holding the owner key could escape); r3 re-verifies THESE bytes
+    /// against the admission owner's public key, so ANY member holding
+    /// an armed record can escape. Older records (pre-r3) have None
+    /// and fail the escape closed with reseat_attestation_unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_attestation_b64: Option<String>,
+    /// #871 r3: the admission owner's USER public key as resolved at ARM
+    /// time through the policy-rooted certificate chain (base64 ML-DSA).
+    /// Fallback when the forked roster no longer carries a usable owner
+    /// certificate member for trusted_owner_public_key — provenance is
+    /// the same resolution that authenticated the chain at arm time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_public_key_b64: Option<String>,
+    /// #871 r2: when this gate RETIRED (unix ms). A retired record is
+    /// KEPT for audit — [`AnchoredGapRefusal::retired_by`] names the
+    /// path — and the catch-up gate treats it as unarmed. `None` while
+    /// the gate is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at_ms: Option<u64>,
+    /// #871 r2: which path retired the gate — `"converged"` (the
+    /// attested terminal installed through gated catch-up) or
+    /// `"owner-key-reseat"` (the manual owner-key re-seat, whose
+    /// authorization is [`AnchoredGapRefusal::reseat`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_by: Option<String>,
+    /// #871 r2: the owner-key RE-SEAT authorization for this gate — the
+    /// admission owner's v2 terminal-bound signature over the RECORDED
+    /// terminal (never the node's current, possibly forked head),
+    /// installed by `POST /groups/:id/quarantine/clear`. Authorizing a
+    /// re-seat does NOT disarm the gate: the head re-anchors at the
+    /// attested head and the gate retires only once the attested
+    /// terminal installs through catch-up validated against the
+    /// attested sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reseat: Option<GapReseatAuthorization>,
+}
+
+/// #871 r2: the durable owner-key re-seat authorization recorded on an
+/// armed [`AnchoredGapRefusal`] (see [`AnchoredGapRefusal::reseat`]).
+///
+/// The signature is the ADMISSION OWNER's user-key signature over the
+/// same `x0x.join-terminal-attest.v2` canonical bytes the join path's
+/// terminal binding uses — `(group, head_revision, head_state_hash,
+/// authorizing member, terminal_state_hash, terminal_committed_by,
+/// epoch = None)` — minted over the RECORDED terminal. It proves the
+/// operator held the owner key and accepted exactly this terminal as
+/// the re-seat target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapReseatAuthorization {
+    /// Local time the operator authorized the re-seat (unix ms).
+    pub authorized_at_ms: u64,
+    /// The local agent whose request the operator authorized (hex).
+    pub authorized_by: String,
+    /// The capped operator reason (the audit trail).
+    pub reason: String,
+    /// The owner's v2 terminal-binding signature (base64 ML-DSA).
+    pub terminal_signature_b64: String,
+}
+
+/// Durable first-seen evidence for one non-gating gap-refusal reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapRefusalReasonAudit {
+    pub first_head_revision: u64,
+    pub first_head_state_hash: String,
+    pub first_terminal_revision: u64,
+    pub first_terminal_state_hash: String,
+    pub first_committed_by: String,
+    pub occurrences: u64,
+    pub first_observed_at_ms: u64,
+    pub last_observed_at_ms: u64,
 }
 
 /// One authenticated fork-evidence record (#468 A5).

@@ -91,10 +91,16 @@ async fn call_clear(
     body: serde_json::Value,
 ) -> Result<(StatusCode, serde_json::Value)> {
     let req: ClearQuarantineRequest = serde_json::from_value(body)?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(state)), Path(id.to_string()), Json(req))
-            .await
-            .into_response();
+    // #871 r2: the handler now takes the actor; direct calls model the
+    // durable owner the middleware guarantees for this route.
+    let response = clear_group_quarantine(
+        State(Arc::clone(state)),
+        Path(id.to_string()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     response_json(response).await
 }
 

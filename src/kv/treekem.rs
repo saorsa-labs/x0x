@@ -80,6 +80,22 @@ pub trait TreeKemKvProtector: Send + Sync {
         retained_image: Option<Vec<u8>>,
     ) -> Result<()>;
 
+    /// Report whether a verified main record actually changed the KV store.
+    /// Existing protectors retain their accepted-record behavior by default;
+    /// `None` means their applied outcome is unknown and is not counted.
+    async fn merge_main_record_with_outcome(
+        &self,
+        opened: OpenedTreeKemKvRecord,
+        sender_peer: PeerId,
+        local_peer: PeerId,
+        store: &Arc<tokio::sync::RwLock<super::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> Result<Option<bool>> {
+        self.merge_main_record(opened, sender_peer, local_peer, store, retained_image)
+            .await
+            .map(|()| None)
+    }
+
     /// Permanently fence this live protector after local group retirement.
     fn invalidate(&self);
 }

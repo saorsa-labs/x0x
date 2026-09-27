@@ -33,6 +33,7 @@ pub mod sync;
 pub mod treekem;
 
 pub use delta::KvStoreDelta;
+pub(crate) use delta::KvStoreDirectDelta;
 pub use encrypted::{
     encrypted_record_aad, group_store_identity, store_record_key, AuthorSigning,
     EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext, SharedKvSecureContext,

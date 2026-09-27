@@ -87,6 +87,7 @@ async fn sealed_group_with_lineage(
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -119,6 +120,7 @@ async fn apply_commit(
         &commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -1059,6 +1061,7 @@ async fn adr0064_explicit_seal_without_owner_user_key_does_not_clear() -> Result
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -1148,6 +1151,7 @@ async fn cert_sealed_group_with_lineage(
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -1266,6 +1270,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
         &removal_commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.add_member(
@@ -1305,6 +1310,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
         &removal_commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.remove_member(&a_hex, Some(authority_hex.clone()));
@@ -1450,6 +1456,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
             &seating_commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.add_member(
@@ -1486,6 +1493,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
             &commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.remove_member(&a_hex3, Some(authority_hex.clone()));
@@ -1713,6 +1721,7 @@ async fn adr0064_contested_branch_anchored_commit_cannot_clear() -> Result<()> {
         &contested_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "contested-3".to_string();
@@ -1839,6 +1848,7 @@ async fn adr0064_owner_anchored_successor_conflicting_commit_never_clears() -> R
         &anchored_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "owner-anchored-3".to_string();
@@ -2038,6 +2048,7 @@ async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Resu
         &anchored_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "owner-anchored-sibling-2".to_string();
@@ -2423,10 +2434,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
 
     // Path (a) is unreachable for this population, and says so.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
@@ -2447,10 +2462,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
         "force": true,
         "reason": "benign split confirmed by both operators",
     }))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "the override clears: {body}");
     assert_eq!(body["cleared_by"].as_str(), Some("force"));
@@ -2483,6 +2502,206 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
         StatusCode::CONFLICT,
         "after the clear the route no longer refuses on quarantine grounds: {}",
         json.0
+    );
+    Ok(())
+}
+
+/// WHY #871 r2: the armed #846 anchored-gap record has no TTL/queue
+/// disarm, so a forked-head node is wedged forever. The escape is an
+/// OWNER-KEY RE-SEAT, not a clear — and on an ordinary (ownerless)
+/// group neither exists: an armed record is owner-anchored, so a group
+/// without an owner axis can only be a hand-planted fixture. This test
+/// pins the r2 contract on such a group: the escape is REFUSED
+/// (`force` cannot disarm the gate), the record stays armed, and no
+/// counter fires. The positive re-seat path lives in
+/// `owner_mandate.rs::manual_clear_reseats_an_armed_anchored_gap_gate`
+/// (the fixture whose install actually holds the owner user key).
+#[tokio::test]
+async fn manual_clear_cannot_force_retire_an_armed_anchored_gap_record() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "871".repeat(16);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    // Arm the gate directly: the durable record with the #846 reason,
+    // revision below the terminal (the forked-head wedge).
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("sealed group")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+            reason: "owner_attested_stale_base_gap".to_string(),
+            head_revision: 0,
+            head_state_hash: base.state_hash.clone(),
+            terminal_revision: base.state_revision + 9,
+            terminal_state_hash: "871-terminal".to_string(),
+            committed_by: "aa".repeat(32),
+            occurrences: 1,
+            first_observed_at_ms: 0,
+            last_observed_at_ms: 0,
+            attested_chain_hashes: vec!["871-step".to_string()],
+            by_reason: Default::default(),
+            retired_at_ms: None,
+            retired_by: None,
+            head_attestation_b64: None,
+            owner_public_key_b64: None,
+            reseat: None,
+        });
+    }
+    assert!(
+        catchup_846_gate_armed(&live_record(&state, &group_id).await),
+        "fixture: the gate is armed"
+    );
+    // No owner axis ⇒ the re-seat has nothing to attest with: typed
+    // refusal, record untouched.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("force_required"),
+        "same authorisation contract as the quarantine clear: {body}"
+    );
+    // #871 r2: force is REFUSED for the armed gate — a keyless
+    // override would re-open the ungated catch-up path #846 closed.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({
+        "force": true,
+        "reason": "forked head confirmed; re-seat from the new invite",
+    }))?;
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "force cannot retire an armed anchored-gap gate: {body}"
+    );
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        catchup_846_gate_armed(&record),
+        "#871 r2: the refused clear leaves the gate ARMED"
+    );
+    assert_eq!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .and_then(|record| record.retired_at_ms),
+        None,
+        "nothing marked the record retired"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .anchored_gap_manual_clears,
+        0,
+        "a refused escape authorizes nothing — no counter"
+    );
+    Ok(())
+}
+
+/// WHY #871 r2 (B3): retirement KEEPS the record and disarms the gate.
+/// A retired record (marked by the catch-up path once the attested
+/// terminal installs) must read as UNARMED, and convergence at the
+/// terminal disarms without deleting the audit either.
+#[tokio::test]
+async fn retired_and_converged_anchored_gap_records_are_unarmed() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "871b".repeat(16);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    let mut armed = x0x::groups::AnchoredGapRefusal {
+        reason: "owner_attested_stale_base_gap".to_string(),
+        head_revision: 0,
+        head_state_hash: base.state_hash.clone(),
+        terminal_revision: base.state_revision + 9,
+        terminal_state_hash: "871b-terminal".to_string(),
+        committed_by: "aa".repeat(32),
+        occurrences: 1,
+        first_observed_at_ms: 0,
+        last_observed_at_ms: 0,
+        attested_chain_hashes: vec!["871b-step".to_string()],
+        by_reason: Default::default(),
+        retired_at_ms: None,
+        retired_by: None,
+        head_attestation_b64: None,
+        owner_public_key_b64: None,
+        reseat: None,
+    };
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("sealed group")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage.anchored_gap_refusal = Some(armed.clone());
+    }
+    assert!(
+        catchup_846_gate_armed(&live_record(&state, &group_id).await),
+        "a live record below the terminal arms the gate"
+    );
+    // Convergence (revision reached the terminal) disarms WITHOUT
+    // deleting: the record stays for audit.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("sealed group");
+        info.state_revision = armed.terminal_revision;
+    }
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        !catchup_846_gate_armed(&record),
+        "a converged head disarms the gate"
+    );
+    assert!(
+        record.invite_lineage.is_some_and(|lineage| {
+            lineage.anchored_gap_refusal.as_ref().is_some_and(|r| {
+                r.reason == "owner_attested_stale_base_gap" && r.retired_at_ms.is_none()
+            })
+        }),
+        "convergence alone leaves the record in place (the catch-up arm marks it retired)"
+    );
+    // A MARKED-retired record is unarmed even while the head is still
+    // below the terminal.
+    armed.retired_at_ms = Some(1);
+    armed.retired_by = Some("owner-key-reseat".to_string());
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("sealed group");
+        info.state_revision = base.state_revision;
+        let lineage = info.invite_lineage.as_mut().expect("lineage");
+        lineage.anchored_gap_refusal = Some(armed);
+    }
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        !catchup_846_gate_armed(&record),
+        "a retired record is UNARMED (B3: keep the audit, stop the gate)"
+    );
+    assert!(
+        record.invite_lineage.is_some_and(|lineage| lineage
+            .anchored_gap_refusal
+            .as_ref()
+            .is_some_and(|r| r.retired_by.as_deref() == Some("owner-key-reseat"))),
+        "the retired record keeps its audit trail (who retired it)"
     );
     Ok(())
 }
@@ -2713,6 +2932,7 @@ fn lineage_for(info: &x0x::groups::GroupInfo) -> x0x::groups::InviteLineage {
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     }
 }
 
@@ -3008,6 +3228,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_decrypt(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<SecureDecryptRequest>(
             serde_json::json!({ "ciphertext_b64": "aGVsbG8=" }),
         )?),
@@ -3018,6 +3239,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<ResealRequest>(
             serde_json::json!({ "recipient": "ab".repeat(32) }),
         )?),
@@ -4532,6 +4754,7 @@ async fn issue732_inherited_divergent_containment_survives_the_load_boundary() -
             evidence.clone(),
             Some(marker_x.clone()),
             false,
+            None,
         )
         .await,
         "first-complete-wins: an identical marker is already recorded, nothing installs"
@@ -4576,6 +4799,7 @@ async fn issue732_inherited_divergent_containment_survives_the_load_boundary() -
             evidence_y,
             Some(marker_y.clone()),
             false,
+            None,
         )
         .await,
         "the faulted install never reaches durability"
@@ -4708,6 +4932,7 @@ async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_id
             seated_at_revision: None,
             corroborated: false,
             fork_evidence: Some(evidence.clone()),
+            anchored_gap_refusal: None,
         });
         let mut disk = std::collections::HashMap::new();
         disk.insert(first_key.clone(), lineage_less);
@@ -4768,6 +4993,7 @@ async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_id
                 evidence.clone(),
                 Some(marker.clone()),
                 false,
+                None,
             )
             .await,
             "first-complete-wins: the identical conflict does not re-install"
@@ -4859,6 +5085,7 @@ async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -4876,6 +5103,7 @@ async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_
             evidence.clone(),
             Some(marker.clone()),
             false,
+            None,
         )
         .await,
         "atomic admission: a pre-existing marker refuses the install even with \

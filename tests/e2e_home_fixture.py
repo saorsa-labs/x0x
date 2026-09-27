@@ -21,9 +21,50 @@ from typing import Any, Callable
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import load_tokens
 from e2e_vps_kv import Api, Evidence, active_provider_ids, enc, poll
-from e2e_vps_private_kv import Scenario
+from e2e_vps_private_kv import Scenario, machine_id, settled_home
 
 ROOT_RE = re.compile(r"/var/tmp/x0x-home-e2e-[0-9a-f]{32}\Z")
+# Runtime witness emitted by control_blob.rs after exact-length/digest, binding
+# and shape checks, BEFORE the original handler: it proves real oversized
+# transport + reassembly, never that the handler applied the payload.
+DM_MAX_PAYLOAD_BYTES = 49_152
+WITNESS_STAGE = "reassembled_validated_for_handler"
+REQUIRED_WITNESS_KINDS = ("member_added", "join_result")
+WITNESS_RE = re.compile(r"x0x_control_blob_witness stage=([a-z_]+) kind=([a-z_]+) "
+                        r"byte_len=([0-9]{1,12}) digest=([0-9a-f]{64})\Z")
+WITNESS_LINES_PER_NODE = 64
+WITNESS_BYTES_PER_NODE = 16_384
+# head emits one line past WITNESS_LINES_PER_NODE so real overflow reaches the
+# Python bound in control_blob_witnesses and fails closed instead of being
+# silently truncated down to the bound.
+WITNESS_SCRIPT = r'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ -f "$root/logs/daemon.log" ] || exit 0
+{ grep -a -o -E 'x0x_control_blob_witness stage=[a-z_]+ kind=[a-z_]+ byte_len=[0-9]{1,12} digest=[0-9a-f]{64}' "$root/logs/daemon.log" || true; } | head -n ''' + str(WITNESS_LINES_PER_NODE + 1) + '\n'
+
+
+def parse_witness_line(line: str) -> dict[str, Any]:
+    match = WITNESS_RE.fullmatch(line)
+    if match is None:
+        raise RuntimeError("malformed control blob witness receipt")
+    stage, kind, byte_len, digest = match.groups()
+    return {"stage": stage, "kind": kind, "byte_len": int(byte_len), "digest": digest}
+
+
+def witness_assertions(witnesses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per required kind; passes only for the right stage above the DM limit."""
+    rows = []
+    for kind in REQUIRED_WITNESS_KINDS:
+        matching = [w for w in witnesses if w["kind"] == kind and w["stage"] == WITNESS_STAGE
+                    and w["byte_len"] > DM_MAX_PAYLOAD_BYTES]
+        best = max(matching, key=lambda w: w["byte_len"], default=None)
+        rows.append({"label": f"oversized {kind} reassembled and validated for handler",
+                     "passed": best is not None, "stage": WITNESS_STAGE,
+                     "threshold_bytes": DM_MAX_PAYLOAD_BYTES, "receipt_count": len(matching),
+                     "node": best and best["node"], "byte_len": best and best["byte_len"],
+                     "digest": best and best["digest"]})
+    return rows
 SSH = ("ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 
@@ -284,6 +325,22 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             raise RuntimeError("invalid synthetic custody hash receipt")
         return fields[0], fields[1]
 
+    def control_blob_witnesses(self) -> list[dict[str, Any]]:
+        """Strictly parsed, node-tagged witness receipts from every started node's log."""
+        witnesses: list[dict[str, Any]] = []
+        for label, node in self.started.items():
+            raw = self.remote.run(node.host, WITNESS_SCRIPT, [node.root, self.marker], capture=True)
+            if len(raw) > WITNESS_BYTES_PER_NODE:
+                raise RuntimeError(f"control blob witness bytes exceed the bound for {label}")
+            lines = raw.decode().splitlines()
+            if len(lines) > WITNESS_LINES_PER_NODE:
+                raise RuntimeError(f"control blob witness lines exceed the bound for {label}")
+            for line in lines:
+                witness = parse_witness_line(line)
+                witness["node"] = label
+                witnesses.append(witness)
+        return witnesses
+
     def restore(self) -> list[str]:
         errors = []
         for label, node in reversed(list(self.started.items())):
@@ -292,6 +349,21 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             except Exception as error:
                 errors.append(f"cleanup {label}: {type(error).__name__}")
         return errors
+
+
+def trust_peer(evidence: Evidence, client: Api, label: str, peer: str, agent_id: str) -> None:
+    """Owner sync streams need a plain `trusted` decision for the peer agent."""
+    status, body = client.request("POST", "/contacts/trust", {"agent_id": agent_id, "level": "trusted"})
+    evidence.check(f"{label} trusts {peer} for owner sync", status in (200, 201)
+                   and isinstance(body, dict) and body.get("ok") is not False, status=status)
+
+
+def enroll_peer(evidence: Evidence, client: Api, label: str, peer: str, machine: str | None) -> None:
+    """Enroll `peer` (or this machine, when `machine` is None) for owner sync."""
+    status, body = client.request("POST", "/sync/devices/enroll",
+                                  {"machine_id": machine} if machine is not None else {})
+    evidence.check(f"{label} enrolls {peer} for owner sync", status == 200
+                   and isinstance(body, dict) and body.get("ok") is True, status=status)
 
 
 def config_bytes(node: Node, plane: str, bootstrap: str | None) -> bytes:
@@ -344,7 +416,9 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         "config_sha256": {label: receipt[0] for label, receipt in receipts.items()},
     }
     owner_api = clients[owner]
-    home_status, home = owner_api.request("GET", "/home")
+    # #824: a fresh owner device defers provisioning (at most 90 s) while it
+    # waits for owner sync; poll through that documented transient state.
+    home_status, home = settled_home(owner_api, owner, args.poll_timeout)
     evidence.check("synthetic owner provisions verified local Home", home_status == 200
                    and home.get("state") == "local"
                    and (home.get("primary_agent") or {}).get("verified") is True,
@@ -358,12 +432,26 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     owner_key_sha = custody.key_fingerprint(nodes[owner])
     evidence.check("synthetic owner key fingerprint recorded", owner_key_sha is not None,
                    owner_key_sha256=owner_key_sha)
+    # #824: the real product setup for an additional owner device. Owner sync
+    # is bilateral, so the owner device enrolls itself and each new machine
+    # before that machine restarts with the key. The new device enrolls the
+    # owner while its own Home provisioning waits for owner sync.
+    home_gid = home.get("group_id")
+    owner_agent, owner_machine = owner_api.agent_id(), machine_id(owner_api)
+    enroll_peer(evidence, owner_api, owner, owner, None)
 
     def certify_same_owner_device(label: str) -> None:
-        card_status, card = clients[label].request("GET", "/agent/card")
-        public_key = card.get("agent_public_key")
+        card_status, response = clients[label].request("GET", "/agent/card")
+        card = response.get("card") if isinstance(response, dict) else None
+        public_key = card.get("agent_public_key") if isinstance(card, dict) else None
+        signature = card.get("signature") if isinstance(card, dict) else None
         evidence.check(f"{label} signed card exposes public key", card_status == 200
-                       and isinstance(public_key, str) and bool(public_key), status=card_status)
+                       and isinstance(response, dict) and response.get("ok") is True
+                       and isinstance(public_key, str) and re.fullmatch(r"[0-9a-f]{3904}", public_key) is not None
+                       and isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{6618}", signature) is not None,
+                       status=card_status)
+        device_agent, device_machine = clients[label].agent_id(), machine_id(clients[label])
+        trust_peer(evidence, clients[label], label, owner, owner_agent)
         custody.stop(label)
         issue_status, issued = owner_api.request("POST", "/owner/agents/issue",
                                                  {"agent_public_key": public_key, "mode": "acp",
@@ -371,6 +459,8 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         certificate = (issued.get("certificate") or {}).get("storage_b64")
         evidence.check(f"owner certifies {label}", issue_status == 200 and isinstance(certificate, str),
                        status=issue_status)
+        trust_peer(evidence, owner_api, owner, label, device_agent)
+        enroll_peer(evidence, owner_api, owner, label, device_machine)
         custody.write_certificate(nodes[label], certificate)
         fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])
         evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
@@ -379,6 +469,15 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         poll(f"{label} restarts certified", args.poll_timeout,
              lambda label=label: clients[label].request("GET", "/health"),
              lambda result: result[0] == 200 and result[1].get("ok") is True)
+        # The owner first: enrolling wakes owner sync at once, and that session
+        # must deliver the canonical Home pointer before the wait ends.
+        enroll_peer(evidence, clients[label], label, owner, owner_machine)
+        enroll_peer(evidence, clients[label], label, label, None)
+        device_status, device_home = settled_home(clients[label], label, args.poll_timeout)
+        evidence.check(f"{label} yields to the canonical Home instead of provisioning a duplicate",
+                       device_status == 200 and device_home.get("state") == "elsewhere"
+                       and device_home.get("canonical_group_id") == home_gid,
+                       status=device_status, state=device_home.get("state"))
         announce_status, _ = clients[label].request("POST", "/announce",
                                                     {"include_user_identity": True, "human_consent": True})
         evidence.check(f"{label} publishes owner certificate", announce_status in (200, 201), status=announce_status)
@@ -445,8 +544,21 @@ def main() -> int:
         evidence.assertions.append({"label": f"fixture {type(error).__name__}", "passed": False})
     finally:
         custody = resources.get("custody")
+        witnesses: list[dict[str, Any]] = []
         if custody is not None:
             for error in custody.restore(): evidence.assertions.append({"label": error, "passed": False}); succeeded = False
+            # Collected only after restore: every owned daemon is stopped, so
+            # each log is flushed and complete. The witness proves oversized
+            # transport and reassembly reached the handler boundary; it never
+            # claims the handler applied the payload.
+            try:
+                witnesses = custody.control_blob_witnesses()
+                evidence.assertions.extend(witness_assertions(witnesses))
+            except Exception as error:
+                witnesses = []
+                evidence.assertions.append({"label": f"control blob witness collection {type(error).__name__}", "passed": False}); succeeded = False
+        else:
+            evidence.assertions.append({"label": "control blob witness collection unavailable", "passed": False}); succeeded = False
         for tunnel in resources.get("tunnels", []):
             try: stop_ssh_tunnel(tunnel)
             except Exception as error: evidence.assertions.append({"label": f"tunnel cleanup {type(error).__name__}", "passed": False}); succeeded = False
@@ -454,6 +566,7 @@ def main() -> int:
             with open(args.report, "w", encoding="utf-8") as output:
                 json.dump({"scenario": "synthetic-home", "custody": resources.get("manifest"),
                            "stores": evidence.stores, "polls": evidence.polls,
+                           "control_blob_witnesses": witnesses,
                            "assertions": evidence.assertions}, output, indent=2)
         except Exception: succeeded = False
     return 0 if succeeded and all(row["passed"] for row in evidence.assertions) else 1

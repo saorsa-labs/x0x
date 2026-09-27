@@ -42,6 +42,8 @@ fn make_acl(entries: Vec<([u8; 32], [u8; 32], Vec<SocketAddr>)>) -> ConnectAcl {
                 targets,
             })
             .collect(),
+        owner_allow: Vec::new(),
+        grant_allow: Vec::new(),
     }
 }
 

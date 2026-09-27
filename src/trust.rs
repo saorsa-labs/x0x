@@ -16,10 +16,21 @@
 //! blocked?       → RejectBlocked
 //! pinned + wrong machine → RejectMachineMismatch
 //! pinned + right machine → Accept
+//! owner-trusted  → Accept          (ADR-0070 §1; only via `with_owner_trust`)
 //! Trusted level  → Accept
 //! Known level    → AcceptWithFlag
 //! Unknown level  → Unknown
 //! ```
+//!
+//! # Owner trust (ADR-0070 §1)
+//!
+//! The evaluator does not decide owner trust itself — that needs the
+//! agent's certificate, the owner device set and the revocation set (see
+//! [`crate::owner_trust`]). A caller that has established owner trust for
+//! the pair passes it in with
+//! [`TrustEvaluator::with_owner_trust`](crate::trust::TrustEvaluator::with_owner_trust).
+//! Owner trust sits after the explicit denials (`Blocked`, machine-pin mismatch)
+//! and before the contact-level rules, so it can never override a denial.
 //!
 //! # Example
 //!
@@ -52,6 +63,24 @@ pub enum TrustDecision {
     Unknown,
 }
 
+impl TrustDecision {
+    /// Apply the ADR-0070 §1 owner-trust input to a contact-derived decision.
+    ///
+    /// Owner trust ranks after revocation, `Blocked` and machine-pin
+    /// mismatch, and before the contact-level rules: an owner-trusted pair
+    /// yields [`TrustDecision::Accept`] where the contact rules gave
+    /// [`TrustDecision::Unknown`] or [`TrustDecision::AcceptWithFlag`]. The
+    /// two rejections are returned unchanged — owner trust never overrides an
+    /// explicit local denial.
+    #[must_use]
+    pub fn with_owner_trust(self, owner_trusted: bool) -> Self {
+        match self {
+            Self::Unknown | Self::AcceptWithFlag if owner_trusted => Self::Accept,
+            other => other,
+        }
+    }
+}
+
 impl std::fmt::Display for TrustDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -82,13 +111,29 @@ pub struct TrustContext<'a> {
 /// of the evaluation.
 pub struct TrustEvaluator<'a> {
     store: &'a ContactStore,
+    owner_trusted: bool,
 }
 
 impl<'a> TrustEvaluator<'a> {
     /// Create a new evaluator backed by the given contact store.
     #[must_use]
     pub fn new(store: &'a ContactStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            owner_trusted: false,
+        }
+    }
+
+    /// Supply the ADR-0070 §1 owner-trust input for the pair being evaluated.
+    ///
+    /// `owner_trusted` must only be `true` when the caller has verified the
+    /// pair against the local owner (see [`crate::owner_trust`]). It raises
+    /// `Unknown`/`AcceptWithFlag` to `Accept` and never overrides `Blocked`
+    /// or a machine-pin mismatch.
+    #[must_use]
+    pub fn with_owner_trust(mut self, owner_trusted: bool) -> Self {
+        self.owner_trusted = owner_trusted;
+        self
     }
 
     /// Evaluate trust for the given `(agent_id, machine_id)` pair.
@@ -100,10 +145,17 @@ impl<'a> TrustEvaluator<'a> {
     ///    → [`TrustDecision::RejectMachineMismatch`]
     /// 3. If `IdentityType::Pinned` and machine IS in the pinned list
     ///    → [`TrustDecision::Accept`]
-    /// 4. If `TrustLevel::Trusted` → [`TrustDecision::Accept`]
-    /// 5. If `TrustLevel::Known` → [`TrustDecision::AcceptWithFlag`]
-    /// 6. Agent not in contact store → [`TrustDecision::Unknown`]
+    /// 4. If owner-trusted ([`Self::with_owner_trust`]) → [`TrustDecision::Accept`]
+    /// 5. If `TrustLevel::Trusted` → [`TrustDecision::Accept`]
+    /// 6. If `TrustLevel::Known` → [`TrustDecision::AcceptWithFlag`]
+    /// 7. Agent not in contact store → [`TrustDecision::Unknown`]
     pub fn evaluate(&self, ctx: &TrustContext<'_>) -> TrustDecision {
+        self.evaluate_contact_rules(ctx)
+            .with_owner_trust(self.owner_trusted)
+    }
+
+    /// The contact-store rules alone (1–3 and 5–7 of [`Self::evaluate`]).
+    fn evaluate_contact_rules(&self, ctx: &TrustContext<'_>) -> TrustDecision {
         let contact = match self.store.get(ctx.agent_id) {
             Some(c) => c,
             None => return TrustDecision::Unknown,
@@ -128,17 +180,17 @@ impl<'a> TrustEvaluator<'a> {
             }
         }
 
-        // Rule 4: trusted
+        // Rule 5: trusted
         if contact.trust_level == TrustLevel::Trusted {
             return TrustDecision::Accept;
         }
 
-        // Rule 5: known
+        // Rule 6: known
         if contact.trust_level == TrustLevel::Known {
             return TrustDecision::AcceptWithFlag;
         }
 
-        // Rule 6: unknown trust level (shouldn't reach here since Unknown is default,
+        // Rule 7: unknown trust level (shouldn't reach here since Unknown is default,
         // but handle it for completeness)
         TrustDecision::Unknown
     }
@@ -387,6 +439,90 @@ mod tests {
                 machine_id: &unknown_mid,
             }),
             TrustDecision::Unknown
+        );
+    }
+
+    // ── ADR-0070 §1 owner trust ordering ──────────────────────────────────
+
+    #[test]
+    fn owner_trust_accepts_an_agent_with_no_contact_entry() {
+        // WHY: R3 — an owner's own agents must be trusted with no contact
+        // edits; without the owner input the same pair stays Unknown.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = ContactStore::new(dir.path().join("contacts.json"));
+        let aid = agent_id();
+        let mid = machine_id();
+        let ctx = TrustContext {
+            agent_id: &aid,
+            machine_id: &mid,
+        };
+        assert_eq!(
+            TrustEvaluator::new(&store).evaluate(&ctx),
+            TrustDecision::Unknown
+        );
+        assert_eq!(
+            TrustEvaluator::new(&store)
+                .with_owner_trust(true)
+                .evaluate(&ctx),
+            TrustDecision::Accept
+        );
+    }
+
+    #[test]
+    fn owner_trust_ranks_before_contact_rules() {
+        // WHY: ADR-0070 orders owner trust before the existing contact rules,
+        // so a Known contact that is also owner-trusted is a full Accept.
+        let (store, aid) = store_with_contact(TrustLevel::Known, IdentityType::Known);
+        let mid = machine_id();
+        let ctx = TrustContext {
+            agent_id: &aid,
+            machine_id: &mid,
+        };
+        assert_eq!(
+            TrustEvaluator::new(&store)
+                .with_owner_trust(true)
+                .evaluate(&ctx),
+            TrustDecision::Accept
+        );
+    }
+
+    #[test]
+    fn blocked_beats_owner_trust() {
+        // WHY: an explicit local denial always wins over owner trust. If the
+        // owner input were checked before Blocked this would return Accept.
+        let (store, aid) = store_with_contact(TrustLevel::Blocked, IdentityType::Anonymous);
+        let mid = machine_id();
+        assert_eq!(
+            TrustEvaluator::new(&store)
+                .with_owner_trust(true)
+                .evaluate(&TrustContext {
+                    agent_id: &aid,
+                    machine_id: &mid,
+                }),
+            TrustDecision::RejectBlocked
+        );
+    }
+
+    #[test]
+    fn machine_pin_mismatch_beats_owner_trust() {
+        // WHY: a contact pinned to other machines is an explicit denial for
+        // this machine; owner trust must not reopen it.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+        let aid = agent_id();
+        let pinned = machine_id();
+        let other = machine_id();
+        store.set_trust(&aid, TrustLevel::Trusted);
+        store.add_machine(&aid, MachineRecord::new(pinned, None));
+        store.pin_machine(&aid, &pinned);
+        assert_eq!(
+            TrustEvaluator::new(&store)
+                .with_owner_trust(true)
+                .evaluate(&TrustContext {
+                    agent_id: &aid,
+                    machine_id: &other,
+                }),
+            TrustDecision::RejectMachineMismatch
         );
     }
 
