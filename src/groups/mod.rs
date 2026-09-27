@@ -154,6 +154,23 @@ pub struct AnchoredGapRefusal {
     /// for another reason. Empty on older persisted records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_reason: BTreeMap<String, GapRefusalReasonAudit>,
+    /// #871 r3: the OWNER-ISSUED wire attestation that armed this gate
+    /// (base64 of the serialized server HeadAttestation — bytes only,
+    /// the type is server-private). The r2 escape MINTED a local
+    /// self-verified authorization (tautological, and only an install
+    /// holding the owner key could escape); r3 re-verifies THESE bytes
+    /// against the admission owner's public key, so ANY member holding
+    /// an armed record can escape. Older records (pre-r3) have None
+    /// and fail the escape closed with reseat_attestation_unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_attestation_b64: Option<String>,
+    /// #871 r3: the admission owner's USER public key as resolved at ARM
+    /// time through the policy-rooted certificate chain (base64 ML-DSA).
+    /// Fallback when the forked roster no longer carries a usable owner
+    /// certificate member for trusted_owner_public_key — provenance is
+    /// the same resolution that authenticated the chain at arm time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_public_key_b64: Option<String>,
     /// #871 r2: when this gate RETIRED (unix ms). A retired record is
     /// KEPT for audit — [`AnchoredGapRefusal::retired_by`] names the
     /// path — and the catch-up gate treats it as unarmed. `None` while

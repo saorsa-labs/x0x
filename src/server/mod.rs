@@ -1898,6 +1898,35 @@ pub async fn serve_with_options(
                         .await;
                     }
                 }
+                if let Ok(request) = serde_json::from_slice::<
+                    routes::named_groups::AnchoredGapSnapshotRequest,
+                >(&msg.payload)
+                {
+                    if request.message_type == "anchored_gap_snapshot_request" {
+                        routes::named_groups::handle_anchored_gap_snapshot_request(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            request,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                if let Ok(response) = serde_json::from_slice::<
+                    routes::named_groups::AnchoredGapSnapshotResponse,
+                >(&msg.payload)
+                {
+                    if response.message_type == "anchored_gap_snapshot_response" {
+                        routes::named_groups::handle_anchored_gap_snapshot_response(
+                            &catchup_state,
+                            &msg.sender,
+                            msg.verified,
+                            response,
+                        )
+                        .await;
+                    }
+                }
             }
         }));
     }

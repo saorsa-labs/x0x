@@ -6869,6 +6869,8 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
                 None,
                 v2_anchored,
                 v1_only,
+                Some(attestation),
+                None,
                 false,
             )
             .await
@@ -6944,6 +6946,8 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
                         None,
                         false,
                         genuine_v1_only,
+                        None,
+                        None,
                         false,
                     )
                     .await,
@@ -6990,6 +6994,8 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
                         None,
                         genuine_v2_anchored,
                         false,
+                        Some(attestation),
+                        None,
                         false,
                     )
                     .await,
@@ -7614,6 +7620,8 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             by_reason: Default::default(),
             retired_at_ms: None,
             retired_by: None,
+            head_attestation_b64: None,
+            owner_public_key_b64: None,
             reseat: None,
         });
     }

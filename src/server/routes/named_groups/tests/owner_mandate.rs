@@ -1765,7 +1765,7 @@ async fn manual_clear_owner_key_and_force_paths() -> Result<()> {
 ///   counts `anchored_gap_manual_clears`.
 #[tokio::test]
 async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
-    let (state, _dir, _owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
+    let (state, _dir, owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
     let (head_revision, head_state_hash) = {
         let groups = state.named_groups.read().await;
         let info = groups.get(&group_id).expect("live record");
@@ -1773,7 +1773,35 @@ async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
     };
     // Arm the gate: the owner-attested stale-base record whose head is
     // the CURRENT head and whose terminal is 9 revisions past it.
-    let terminal_revision = head_revision + 9;
+    // Real arm records are always ADJACENT (head = terminal - 1); the
+    // multi-commit case lives in attested_chain_hashes.
+    let terminal_revision = head_revision + 1;
+    // The OWNER-ISSUED attestation binding the recorded head and terminal
+    // (epoch None — the refusal record carries no TreeKEM epoch).
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal_commit = x0x::groups::GroupStateCommit {
+        group_id: group_id.clone(),
+        revision: terminal_revision,
+        prev_state_hash: Some(head_state_hash.clone()),
+        state_hash: "871r2-terminal".to_string(),
+        roster_root: "roster".to_string(),
+        policy_hash: "policy".to_string(),
+        public_meta_hash: "meta".to_string(),
+        security_binding: None,
+        committed_by: local_hex.clone(),
+        committed_at: 0,
+        signer_public_key: String::new(),
+        withdrawn: false,
+        signature: String::new(),
+    };
+    let attestation = super::super::HeadAttestation::sign_for_terminal(
+        &group_id,
+        &terminal_commit,
+        &local_hex,
+        None,
+        &owner_kp,
+    )
+    .expect("owner signs the head+terminal attestation");
     {
         let mut groups = state.named_groups.write().await;
         let info = groups.get_mut(&group_id).expect("live record");
@@ -1788,17 +1816,25 @@ async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
             occurrences: 1,
             first_observed_at_ms: 0,
             last_observed_at_ms: 0,
-            attested_chain_hashes: vec![head_state_hash.clone(), "871r2-terminal".to_string()],
+            attested_chain_hashes: vec!["871r2-terminal".to_string()],
             by_reason: Default::default(),
             retired_at_ms: None,
             retired_by: None,
+            // #871 r3: the OWNER-ISSUED wire attestation over this exact
+            // (head, terminal) pair, retained exactly as the arm path now
+            // retains it, plus the arm-time owner public key bytes.
+            head_attestation_b64: Some(
+                BASE64.encode(serde_json::to_vec(&attestation).expect("serialize attestation")),
+            ),
+            owner_public_key_b64: Some(BASE64.encode(owner_kp.public_key().as_bytes())),
             reseat: None,
         });
         // The wedge: the head FORKED PAST the anchor (a commit this
         // node should not have applied landed), so no attested page can
         // ever link from the current head — the gate stays armed
         // forever without the re-seat.
-        info.state_revision = head_revision + 1;
+        // A same-revision fork: the revision is below the terminal but
+        // the CONTENT diverged, so no attested page can ever link.
         info.state_hash = "871r2-forked-head".to_string();
     }
     assert!(
@@ -1819,6 +1855,97 @@ async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
     .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // #871 r3: a record with NO retained attestation (pre-r3) is
+    // refused — the escape is owner-ATTESTED, never keyless.
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("live record")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage
+            .anchored_gap_refusal
+            .as_mut()
+            .expect("armed")
+            .head_attestation_b64 = None;
+    }
+    let (status, body) = call_clear(
+        &state,
+        &group_id,
+        ClearQuarantineRequest {
+            force: false,
+            reason: "ops runbook R2".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("reseat_attestation_unavailable")),
+        "the refusal names the missing retained attestation: {body}"
+    );
+    // A FORGED attestation (a different user key) is refused — the
+    // escape verifies the OWNER's signature, it never trusts stored
+    // bytes blindly.
+    {
+        let foreign = crate::identity::UserKeypair::generate()?;
+        let forged = super::super::HeadAttestation::sign_for_terminal(
+            &group_id,
+            &terminal_commit,
+            &local_hex,
+            None,
+            &foreign,
+        )
+        .expect("foreign signs");
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("live record")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage
+            .anchored_gap_refusal
+            .as_mut()
+            .expect("armed")
+            .head_attestation_b64 =
+            Some(BASE64.encode(serde_json::to_vec(&forged).expect("serialize forged")));
+    }
+    let (status, body) = call_clear(
+        &state,
+        &group_id,
+        ClearQuarantineRequest {
+            force: false,
+            reason: "ops runbook R2".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("reseat_attestation_invalid")),
+        "a foreign-key attestation is refused by name: {body}"
+    );
+    // Restore the retained attestation for the authorized path below.
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("live record")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage
+            .anchored_gap_refusal
+            .as_mut()
+            .expect("armed")
+            .head_attestation_b64 =
+            Some(BASE64.encode(serde_json::to_vec(&attestation).expect("serialize attestation")));
+    }
     // force is refused for the armed gate.
     let (status, body) = call_clear(
         &state,
@@ -1845,16 +1972,18 @@ async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "the re-seat authorizes: {body}");
-    assert_eq!(body["cleared_by"], "owner-key-reseat");
+    assert_eq!(body["cleared_by"], "owner-attested-reseat");
     assert_eq!(
         body["anchored_gap"]["gate"], "armed-until-terminal-installs",
         "the response says the gate is NOT disarmed: {body}"
     );
-    assert_eq!(body["anchored_gap"]["head_rebased"], true);
+    // r3: the head is NOT rewritten in-place — the snapshot installer
+    // owns state replacement (no holder is reachable in this test, so
+    // the forked head stands and the install fails boundedly).
+    assert_eq!(body["anchored_gap"]["head_rebased"], false);
     let record = live_record(state.as_ref(), &group_id).await;
-    // The head was REPLACED with the owner-attested head.
-    assert_eq!(record.state_revision, head_revision);
-    assert_eq!(record.state_hash, head_state_hash);
+    assert_eq!(record.state_revision, head_revision, "forked head stands");
+    assert_eq!(record.state_hash, "871r2-forked-head");
     // The gate is STILL ARMED and the record is KEPT (B3) with the
     // authorization bound to the recorded terminal.
     assert!(

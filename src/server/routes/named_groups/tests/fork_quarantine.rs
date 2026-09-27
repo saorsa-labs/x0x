@@ -2545,6 +2545,8 @@ async fn manual_clear_cannot_force_retire_an_armed_anchored_gap_record() -> Resu
             by_reason: Default::default(),
             retired_at_ms: None,
             retired_by: None,
+            head_attestation_b64: None,
+            owner_public_key_b64: None,
             reseat: None,
         });
     }
@@ -2640,6 +2642,8 @@ async fn retired_and_converged_anchored_gap_records_are_unarmed() -> Result<()> 
         by_reason: Default::default(),
         retired_at_ms: None,
         retired_by: None,
+        head_attestation_b64: None,
+        owner_public_key_b64: None,
         reseat: None,
     };
     {

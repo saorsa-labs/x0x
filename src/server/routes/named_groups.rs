@@ -693,6 +693,80 @@ impl HeadAttestation {
         .is_ok()
     }
 
+    /// #871 r3 (review B2): verify the RETAINED owner-issued wire
+    /// attestation against the admission owner's public key for the
+    /// escape: the v1 head signature must verify over
+    /// `(stable id, head_revision, head_state_hash, member)`, the key
+    /// must BE the policy owner, the attested head must equal the armed
+    /// record's head, and the v2 terminal binding must cover the
+    /// record's terminal `(state hash, committed_by)` at epoch None
+    /// (the refusal record carries no TreeKEM epoch). This replaces the
+    /// r2 locally-minted, self-verified authorization.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_reseat_record_binding(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        expected_owner: &crate::identity::UserId,
+        stable_group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        terminal_state_hash: &str,
+        terminal_committed_by: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
+            return false;
+        }
+        if self.group_id != stable_group_id
+            || self.head_revision != head_revision
+            || self.head_state_hash != head_state_hash
+        {
+            return false;
+        }
+        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = Self::canonical_bytes(
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(terminal_sig_b64) = self.terminal_signature_b64.as_deref() else {
+            return false;
+        };
+        let Ok(terminal_sig_bytes) = BASE64.decode(terminal_sig_b64) else {
+            return false;
+        };
+        let Ok(terminal_sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&terminal_sig_bytes)
+        else {
+            return false;
+        };
+        let terminal_canonical =
+            self.terminal_canonical_bytes(terminal_state_hash, terminal_committed_by, None);
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &terminal_canonical,
+            &terminal_sig,
+        )
+        .is_ok()
+    }
+
     fn canonical_bytes(
         group_id: &str,
         head_revision: u64,
@@ -903,115 +977,6 @@ impl HeadAttestation {
             owner_public_key,
             &canonical,
             &sig,
-        )
-        .is_ok()
-    }
-
-    /// #871 r2 (owner-key re-seat authorization): the admission owner's
-    /// v2 TERMINAL-BOUND attestation over the fields an armed
-    /// [`x0x::groups::AnchoredGapRefusal`] records — the RECORDED head
-    /// `(head_revision, head_state_hash)`, the authorizing local agent,
-    /// and the v2 terminal binding over the RECORDED terminal
-    /// `(terminal_state_hash, terminal_committed_by)` — the same
-    /// `x0x.join-terminal-attest.v2` canonical bytes the join path's
-    /// terminal binding signs, so the exemption root that authenticated
-    /// the chain authenticates the escape. The node's CURRENT (possibly
-    /// forked) head is deliberately NOT attested: the operator accepts
-    /// exactly the recorded terminal as the re-seat target. The epoch tag
-    /// is `None` on both the sign and the verify side — the refusal
-    /// record carries no TreeKEM epoch.
-    fn sign_reseat_authorization(
-        stable_group_id: &str,
-        head_revision: u64,
-        head_state_hash: &str,
-        terminal_state_hash: &str,
-        terminal_committed_by: &str,
-        local_agent_hex: &str,
-        owner_kp: &crate::identity::UserKeypair,
-    ) -> Result<Self, String> {
-        use base64::Engine as _;
-        let mut attestation = Self::sign(
-            stable_group_id,
-            head_revision,
-            head_state_hash,
-            local_agent_hex,
-            owner_kp,
-        )?;
-        let canonical =
-            attestation.terminal_canonical_bytes(terminal_state_hash, terminal_committed_by, None);
-        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-            owner_kp.secret_key(),
-            &canonical,
-        )
-        .map_err(|e| format!("re-seat authorization terminal binding sign: {e:?}"))?;
-        attestation.terminal_signature_b64 = Some(BASE64.encode(sig.as_bytes()));
-        Ok(attestation)
-    }
-
-    /// Verify counterpart of [`Self::sign_reseat_authorization`]: the
-    #[allow(clippy::too_many_arguments)]
-    fn verify_reseat_authorization(
-        &self,
-        owner_public_key: &ant_quic::MlDsaPublicKey,
-        expected_owner: &crate::identity::UserId,
-        stable_group_id: &str,
-        head_revision: u64,
-        head_state_hash: &str,
-        terminal_state_hash: &str,
-        terminal_committed_by: &str,
-        local_agent_hex: &str,
-    ) -> bool {
-        use base64::Engine as _;
-        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
-            return false;
-        }
-        if self.group_id != stable_group_id
-            || self.head_revision != head_revision
-            || self.head_state_hash != head_state_hash
-            || self.member_agent_id != local_agent_hex
-        {
-            return false;
-        }
-        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
-            return false;
-        };
-        let Ok(sig) =
-            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
-        else {
-            return false;
-        };
-        let canonical = Self::canonical_bytes(
-            &self.group_id,
-            self.head_revision,
-            &self.head_state_hash,
-            &self.member_agent_id,
-        );
-        if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
-            owner_public_key,
-            &canonical,
-            &sig,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        let Some(binding_b64) = self.terminal_signature_b64.as_deref() else {
-            return false;
-        };
-        let Ok(binding_bytes) = BASE64.decode(binding_b64) else {
-            return false;
-        };
-        let Ok(binding) =
-            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&binding_bytes)
-        else {
-            return false;
-        };
-        let binding_canonical =
-            self.terminal_canonical_bytes(terminal_state_hash, terminal_committed_by, None);
-        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
-            owner_public_key,
-            &binding_canonical,
-            &binding,
         )
         .is_ok()
     }
@@ -4524,6 +4489,8 @@ async fn classify_refused_joiner_fork_chain(
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     served_chain_owner_anchored: bool,
     served_chain_owner_v1_only: bool,
+    head_attestation: Option<&HeadAttestation>,
+    arm_owner_public_key: Option<&ant_quic::MlDsaPublicKey>,
     persistence_lock_already_held: bool,
 ) -> bool {
     // Only a joiner with a served chain and stored lineage reaches the
@@ -4597,6 +4564,8 @@ async fn classify_refused_joiner_fork_chain(
             chain,
             current,
             "owner_attested_stale_base_gap",
+            head_attestation,
+            arm_owner_public_key,
             persistence_lock_already_held,
         )
         .await;
@@ -4620,6 +4589,8 @@ async fn classify_refused_joiner_fork_chain(
             chain,
             current,
             "v1_only_unverifiable",
+            head_attestation,
+            arm_owner_public_key,
             persistence_lock_already_held,
         )
         .await;
@@ -4668,6 +4639,7 @@ async fn classify_refused_joiner_fork_chain(
 
 /// Durably record (non-gating) an owner-attestation gap refusal on the
 /// group's invite lineage: the latest terminal/head plus a running count.
+#[allow(clippy::too_many_arguments)]
 async fn record_anchored_gap_refusal(
     state: &Arc<AppState>,
     group_key: &str,
@@ -4675,6 +4647,8 @@ async fn record_anchored_gap_refusal(
     chain: &[x0x::groups::state_commit::RetainedCommit],
     current: &x0x::groups::GroupInfo,
     reason: &'static str,
+    head_attestation: Option<&HeadAttestation>,
+    arm_owner_public_key: Option<&ant_quic::MlDsaPublicKey>,
     persistence_lock_already_held: bool,
 ) {
     let key = group_key.to_string();
@@ -4760,6 +4734,12 @@ async fn record_anchored_gap_refusal(
             by_reason,
             // #871 r2: the gate starts LIVE; retirement (converged or
             // owner-key re-seat) is a later, audited transition.
+            head_attestation_b64: head_attestation.and_then(|attestation| {
+                serde_json::to_vec(attestation)
+                    .ok()
+                    .map(|bytes| BASE64.encode(bytes))
+            }),
+            owner_public_key_b64: arm_owner_public_key.map(|key| BASE64.encode(key.as_bytes())),
             retired_at_ms: None,
             retired_by: None,
             reseat: None,
@@ -11366,6 +11346,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 owner_mandate.as_ref(),
                                 served_chain_owner_anchored,
                                 served_chain_owner_v1_only,
+                                served_attestation.as_ref(),
+                                served_chain_owner_v1_key(
+                                    &current,
+                                    &commit,
+                                    &adopt_chain,
+                                    &agent_id,
+                                    owner_certified_certificate.as_ref(),
+                                    served_attestation.as_ref(),
+                                    owner_mandate.as_ref(),
+                                    treekem_epoch,
+                                )
+                                .as_ref(),
                                 roster_lock_already_held,
                             )
                             .await;
@@ -14885,57 +14877,63 @@ pub(in crate::server) async fn clear_group_quarantine(
                 "force_required: the armed anchored-gap gate has no owner axis to attest with",
             );
         };
-        let Some(owner_kp) = state
-            .agent
-            .identity()
-            .user_keypair()
-            .filter(|kp| crate::identity::UserId::from_public_key(kp.public_key()) == *owner)
-        else {
+        // #871 r3 (review B2): the authorization is the OWNER-ISSUED wire
+        // attestation captured at ARM time, re-verified here against the
+        // admission owner's public key. Nothing is minted locally and no
+        // local owner key is required — ANY member holding an armed record
+        // can escape; the operator surface stays the durable token.
+        let Some(attestation_b64) = record.head_attestation_b64.as_deref() else {
             return conflict(
-                "owner_key_unavailable: re-seating the anchored-gap gate requires an \
-                 install holding the group's owner user key",
+                "reseat_attestation_unavailable: this armed record predates the \
+                 retained-attestation escape; the gate stays armed (fail-closed)",
             );
         };
-        let attestation = match HeadAttestation::sign_reseat_authorization(
-            &stable_group_id,
-            record.head_revision,
-            &record.head_state_hash,
-            &record.terminal_state_hash,
-            &record.committed_by,
-            &local_hex,
-            owner_kp,
-        ) {
-            Ok(attestation) => attestation,
-            Err(error) => {
-                tracing::warn!(
-                    group_id = %LogHexId::group(&stable_group_id),
-                    "quarantine clear: failed to mint the re-seat authorization: {error}"
-                );
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to mint the re-seat authorization",
-                );
-            }
+        let attestation = BASE64
+            .decode(attestation_b64)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<HeadAttestation>(&bytes).ok());
+        let Some(attestation) = attestation else {
+            return conflict(
+                "reseat_attestation_unavailable: the retained owner attestation is unreadable",
+            );
         };
-        if !attestation.verify_reseat_authorization(
-            owner_kp.public_key(),
+        // Owner key: live policy-rooted roster resolution first, the
+        // arm-time retained bytes as fallback (the fork may have removed
+        // the certificate member trusted_owner_public_key reads).
+        let owner_key = {
+            let groups = state.named_groups.read().await;
+            groups.get(&map_key).and_then(|info| {
+                trusted_owner_public_key(info, owner).or_else(|| {
+                    record
+                        .owner_public_key_b64
+                        .as_deref()
+                        .and_then(|b64| BASE64.decode(b64).ok())
+                        .and_then(|bytes| ant_quic::MlDsaPublicKey::from_bytes(&bytes).ok())
+                })
+            })
+        };
+        let Some(owner_key) = owner_key else {
+            return conflict(
+                "reseat_owner_key_unavailable: no trusted owner public key resolves \
+                 for this group",
+            );
+        };
+        if !attestation.verify_reseat_record_binding(
+            &owner_key,
             owner,
             &stable_group_id,
             record.head_revision,
             &record.head_state_hash,
             &record.terminal_state_hash,
             &record.committed_by,
-            &local_hex,
         ) {
-            // Our own fresh mint failed verification — key/signing
-            // material inconsistency, not an operator error.
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "re-seat authorization failed self-verification",
+            return conflict(
+                "reseat_attestation_invalid: the retained owner attestation does \
+                 not bind this record's head and terminal",
             );
         }
         reseat = Some(attestation);
-        cleared_by = "owner-key-reseat";
+        cleared_by = "owner-attested-reseat";
     } else if !req.force {
         // Path (a) for a fork marker alone: the local install holds the
         // OWNER user key (#469 A1b fence) — mint a fresh
@@ -15001,6 +14999,10 @@ pub(in crate::server) async fn clear_group_quarantine(
         }
         cleared_by = "owner-key";
     }
+    let (record_head_revision, record_head_state_hash) = gap
+        .as_ref()
+        .map(|record| (record.head_revision, record.head_state_hash.clone()))
+        .unwrap_or((0, String::new()));
     let reseat_attestation = reseat.clone();
     let authorized_reason: String = req.reason.chars().take(256).collect();
     let authorized_by = local_hex.clone();
@@ -15011,7 +15013,7 @@ pub(in crate::server) async fn clear_group_quarantine(
     // consumed for the counters and logs below.
     let mut marker_cleared = false;
     let mut gap_reseat_authorized = false;
-    let mut gap_rebased = false;
+    let gap_rebased = false;
     let mut gap_terminal: Option<(u64, String)> = None;
     let outcome = persist_named_groups_mutation(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
@@ -15065,17 +15067,10 @@ pub(in crate::server) async fn clear_group_quarantine(
                             .clone()
                             .unwrap_or_default(),
                     });
-                    // REPLACE the local head with the owner-attested head
-                    // (the terminal's parent — an interior link of the
-                    // attested sequence, so the gate's cursor picks up at
-                    // the terminal).
-                    if info.state_revision != record.head_revision
-                        || info.state_hash != record.head_state_hash
-                    {
-                        info.state_revision = record.head_revision;
-                        info.state_hash = record.head_state_hash.clone();
-                        gap_rebased = true;
-                    }
+                    // #871 r3: NO in-place head rewrite — a two-field
+                    // overwrite leaves the fork's CONTENT in place, so the
+                    // terminal's finalize recompute can never succeed.
+                    // The snapshot installer owns full state replacement.
                     gap_terminal =
                         Some((record.terminal_revision, record.terminal_state_hash.clone()));
                     gap_reseat_authorized = true;
@@ -15114,15 +15109,32 @@ pub(in crate::server) async fn clear_group_quarantine(
         state
             .groups_diagnostics
             .record_anchored_gap_manual_clear(&stable_group_id);
-        // Fetch + install: ask every active member for catch-up FROM
-        // the attested head, so the terminal arrives through the still-
+        // #871 r3 (review B1): FIRST fetch and FULLY install the
+        // owner-attested head SNAPSHOT from a holder (content verified
+        // against the record's head hash) — only then can the terminal's
+        // finalize recompute succeed. Then ask for catch-up FROM the
+        // installed head, so the terminal arrives through the still-
         // armed gate and retires it (marked, never deleted).
+        if !install_attested_head_snapshot(
+            &state,
+            &map_key,
+            &stable_group_id,
+            record_head_revision,
+            &record_head_state_hash,
+        )
+        .await
+        {
+            tracing::warn!(
+                group_id = %LogHexId::group(&stable_group_id),
+                "#871 r3: the attested head snapshot did not install; the gate stays armed — \
+                 re-run the clear once a holder is reachable"
+            );
+        }
         request_anchored_gap_reseat_catchup(
             &state,
             &map_key,
             &stable_group_id,
-            gap.as_ref()
-                .map(|record| (record.head_revision, record.head_state_hash.clone())),
+            Some((record_head_revision, record_head_state_hash.clone())),
         )
         .await;
     }
@@ -15173,6 +15185,283 @@ pub(in crate::server) async fn clear_group_quarantine(
         }
     }
     (StatusCode::OK, Json(body))
+}
+
+/// #871 r3 (review B1): a wedged node's local CONTENT is the fork's, so
+/// rewriting two bookkeeping fields (the r2 re-seat) can never install
+/// the attested terminal — finalize recomputes the terminal's hash
+/// from roster/policy/meta and refuses. The escape must REPLACE local
+/// state with the owner-attested HEAD SNAPSHOT fetched from a holder:
+///
+/// * the holder-side handler answers only when its own head IS the
+///   recorded (head_revision, head_state_hash);
+/// * the requester verifies the snapshot's CONTENT recomputes to
+///   head_state_hash before anything is installed;
+/// * the install replaces the full GroupInfo state under the persist
+///   mutation and keeps the gate ARMED — the terminal then arrives via
+///   the ordinary catch-up request and installs through the #846 gate.
+///
+/// Bounded, operator-triggered, one-shot per clear: a process-global
+/// waiter map keyed by stable group id (entries are drained on use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct AnchoredGapSnapshotRequest {
+    pub message_type: String,
+    pub group_id: String,
+    pub requester_agent_id: String,
+    pub head_revision: u64,
+    pub head_state_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct AnchoredGapSnapshotResponse {
+    pub message_type: String,
+    pub group_id: String,
+    pub responder_agent_id: String,
+    pub head_revision: u64,
+    pub head_state_hash: String,
+    /// The holder's serialized GroupInfo at exactly the attested head.
+    pub snapshot_json: String,
+}
+
+type GapSnapshotWaiters =
+    std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<x0x::groups::GroupInfo>>>;
+static ANCHORED_GAP_SNAPSHOT_WAITERS: std::sync::OnceLock<GapSnapshotWaiters> =
+    std::sync::OnceLock::new();
+
+fn anchored_gap_snapshot_waiters() -> &'static GapSnapshotWaiters {
+    ANCHORED_GAP_SNAPSHOT_WAITERS.get_or_init(GapSnapshotWaiters::default)
+}
+
+/// Plain verified-DM config for the snapshot exchange (no typed-route
+/// registration: the background direct listener handles it like the
+/// TreeKEM catch-up control traffic).
+fn snapshot_dm_config() -> x0x::dm::DmSendConfig {
+    x0x::dm::DmSendConfig {
+        max_retries: 1,
+        ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+/// Holder side: serve the head snapshot only to an ACTIVE member and
+/// only when this node IS at the requested attested head.
+pub(in crate::server) async fn handle_anchored_gap_snapshot_request(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    request: AnchoredGapSnapshotRequest,
+) {
+    if !verified || request.message_type != "anchored_gap_snapshot_request" {
+        return;
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != request.requester_agent_id {
+        return;
+    }
+    let snapshot_json = {
+        let groups = state.named_groups.read().await;
+        let found = groups
+            .get_key_value(&request.group_id)
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == request.group_id)
+            })
+            .filter(|(_, info)| {
+                !info.withdrawn
+                    && info.has_active_member(&sender_hex)
+                    && info.state_revision == request.head_revision
+                    && info.state_hash == request.head_state_hash
+            });
+        match found {
+            Some((_, info)) => serde_json::to_string(info).ok(),
+            None => return,
+        }
+    };
+    let response = AnchoredGapSnapshotResponse {
+        message_type: "anchored_gap_snapshot_response".to_string(),
+        group_id: request.group_id,
+        responder_agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+        head_revision: request.head_revision,
+        head_state_hash: request.head_state_hash,
+        snapshot_json: match snapshot_json {
+            Some(json) => json,
+            None => return,
+        },
+    };
+    let payload = match serde_json::to_vec(&response) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let _ = state
+        .agent
+        .send_direct_with_config(sender, payload, snapshot_dm_config())
+        .await;
+}
+
+/// Requester side: resolve the waiter with the FIRST verified-response
+/// snapshot whose head fields match (the content check runs again at
+/// install; this only routes the first candidate).
+pub(in crate::server) async fn handle_anchored_gap_snapshot_response(
+    state: &Arc<AppState>,
+    _sender: &AgentId,
+    verified: bool,
+    response: AnchoredGapSnapshotResponse,
+) {
+    if !verified || response.message_type != "anchored_gap_snapshot_response" {
+        return;
+    }
+    let _ = state;
+    let snapshot = match serde_json::from_str::<x0x::groups::GroupInfo>(&response.snapshot_json) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return,
+    };
+    if snapshot.stable_group_id() != response.group_id
+        || snapshot.state_revision != response.head_revision
+        || snapshot.state_hash != response.head_state_hash
+    {
+        return;
+    }
+    let registry = anchored_gap_snapshot_waiters();
+    let Ok(waiters) = registry.lock() else {
+        return;
+    };
+    if let Some(sender) = waiters.get(&response.group_id).cloned() {
+        drop(waiters);
+        let _ = sender.try_send(snapshot);
+    }
+}
+
+/// Fetch the owner-attested head snapshot from an active member and
+/// install it FULLY (roster, policy, meta, security binding, epoch,
+/// revision, hashes) — keeping the armed gate and the local invite
+/// lineage. Returns whether a verified snapshot was installed.
+pub(in crate::server) async fn install_attested_head_snapshot(
+    state: &Arc<AppState>,
+    map_key: &str,
+    stable_group_id: &str,
+    head_revision: u64,
+    head_state_hash: &str,
+) -> bool {
+    use tokio::sync::mpsc;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let members: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(map_key) else {
+            return false;
+        };
+        info.members_v2
+            .iter()
+            .filter(|(aid, m)| {
+                !aid.eq_ignore_ascii_case(&local_hex)
+                    && m.state == x0x::groups::GroupMemberState::Active
+            })
+            .map(|(aid, _)| aid.clone())
+            .collect()
+    };
+    let (tx, mut rx) = mpsc::channel::<x0x::groups::GroupInfo>(1);
+    {
+        let registry = anchored_gap_snapshot_waiters();
+        let Ok(mut waiters) = registry.lock() else {
+            return false;
+        };
+        waiters.insert(stable_group_id.to_string(), tx);
+    }
+    let request = AnchoredGapSnapshotRequest {
+        message_type: "anchored_gap_snapshot_request".to_string(),
+        group_id: stable_group_id.to_string(),
+        requester_agent_id: local_hex,
+        head_revision,
+        head_state_hash: head_state_hash.to_string(),
+    };
+    let cleanup = || {
+        anchored_gap_snapshot_waiters()
+            .lock()
+            .map(|mut waiters| waiters.remove(stable_group_id))
+            .ok();
+    };
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(_) => {
+            cleanup();
+            return false;
+        }
+    };
+    for member_hex in &members {
+        let Ok(peer) = parse_agent_id_hex(member_hex) else {
+            continue;
+        };
+        let _ = state
+            .agent
+            .send_direct_with_config(&peer, payload.clone(), snapshot_dm_config())
+            .await;
+    }
+    // Bounded wait for the first holder answer.
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv()).await;
+    cleanup();
+    let mut snapshot = match answered {
+        Ok(Some(snapshot)) => snapshot,
+        _ => {
+            tracing::warn!(
+                group_id = %LogHexId::group(stable_group_id),
+                "#871 r3: no member served the attested head snapshot; the gate stays armed — \
+                 re-run the clear once a holder is reachable"
+            );
+            return false;
+        }
+    };
+    // CONTENT verification: the snapshot must recompute to the attested
+    // head hash from its own roster/policy/meta — a served fork cannot.
+    if snapshot.state_revision != head_revision || snapshot.state_hash != head_state_hash {
+        tracing::warn!(
+            group_id = %LogHexId::group(stable_group_id),
+            "#871 r3: snapshot head mismatch; refused"
+        );
+        return false;
+    }
+    let claimed_hash = snapshot.state_hash.clone();
+    snapshot.recompute_state_hash();
+    if snapshot.state_hash != claimed_hash || snapshot.state_hash != head_state_hash {
+        tracing::warn!(
+            group_id = %LogHexId::group(stable_group_id),
+            "#871 r3: snapshot content does not recompute to the attested head hash; refused"
+        );
+        return false;
+    }
+    // FULL install: replace state fields, keep the local invite lineage
+    // (the armed gate lives there) and any local-only seating state.
+    let group_key = map_key.to_string();
+    let mut installed = false;
+    let outcome = persist_named_groups_mutation(state, |groups| {
+        let Some(info) = groups.get_mut(&group_key) else {
+            return false;
+        };
+        info.members_v2 = snapshot.members_v2.clone();
+        info.policy = snapshot.policy.clone();
+        info.name = snapshot.name.clone();
+        info.description = snapshot.description.clone();
+        info.security_binding = snapshot.security_binding.clone();
+        info.secret_epoch = snapshot.secret_epoch;
+        info.state_revision = snapshot.state_revision;
+        info.state_hash = snapshot.state_hash.clone();
+        info.prev_state_hash = snapshot.prev_state_hash.clone();
+        installed = true;
+        true
+    })
+    .await;
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        tracing::warn!(
+            group_id = %LogHexId::group(stable_group_id),
+            "#871 r3: snapshot install did not persist durably"
+        );
+        return false;
+    }
+    tracing::warn!(
+        group_id = %LogHexId::group(stable_group_id),
+        head_revision,
+        "#871 r3: owner-attested head snapshot installed (gate stays armed until the \
+         terminal installs through the #846 gate)"
+    );
+    installed
 }
 
 /// #871 r2: ask every ACTIVE member of `map_key`'s group for TreeKEM
