@@ -565,6 +565,17 @@ async fn owner_device_state(
     Ok((state, dir, cert))
 }
 
+/// How [`creator_offline_scenario`] promotes the admin.
+#[derive(Clone, Copy)]
+enum Promotion {
+    /// Set the role on the admin's local record.
+    LocalRecord,
+    /// Apply the creator's real signed role-update commit, published by
+    /// the production `update_member_role` route, through the normal
+    /// receive path.
+    SignedCommit,
+}
+
 /// The R19 Home cast, from the moment the creator went offline.
 struct CreatorOfflineScenario {
     /// Creator and original owner device ("nyc"). Already shut down.
@@ -597,9 +608,8 @@ struct CreatorOfflineScenario {
 ///    path. It is never handed a JoinResult: in R19 the seat event won
 ///    the race, the joiner stopped polling, and #970's JoinResult sidecar
 ///    never arrived.
-/// 5. The admin is promoted (role set on its local record, standing in for
-///    the creator's role-update commit).
-async fn creator_offline_scenario() -> Result<CreatorOfflineScenario> {
+/// 5. The admin is promoted, per `promotion`.
+async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOfflineScenario> {
     let seed: [u8; 32] = rand::random();
     let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
     let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
@@ -705,6 +715,43 @@ async fn creator_offline_scenario() -> Result<CreatorOfflineScenario> {
         },
     )
     .await?;
+    // (5a) With `Promotion::SignedCommit` the creator promotes the admin
+    // through the production role route BEFORE going offline, and the
+    // published signed role-update commit is captured for delivery.
+    let role_event = match promotion {
+        Promotion::LocalRecord => None,
+        Promotion::SignedCommit => {
+            let response = update_member_role(
+                State(Arc::clone(&creator)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path((group_id.clone(), admin_hex.clone())),
+                Json(UpdateMemberRoleRequest {
+                    role: "admin".to_string(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "the creator promotes");
+            let event = creator
+                .named_group_test_recorders
+                .publish_bytes
+                .lock()
+                .expect("publish hook")
+                .iter()
+                .filter_map(|(_topic, bytes)| {
+                    serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok()
+                })
+                .find(|event| {
+                    matches!(event, NamedGroupMetadataEvent::MemberRoleUpdated {
+                        agent_id, role: x0x::groups::GroupRole::Admin, commit: Some(_), ..
+                    } if *agent_id == admin_hex)
+                })
+                .expect("the creator published a signed role-update commit");
+            Some(event)
+        }
+    };
     let creator_id = creator.agent.agent_id();
     creator.agent.shutdown().await;
     drop(creator);
@@ -714,15 +761,34 @@ async fn creator_offline_scenario() -> Result<CreatorOfflineScenario> {
         apply_named_group_metadata_event(&admin, seat_event.clone(), creator_id, true, None).await;
     assert!(applied.accepted, "the seat event seats the admin");
 
-    // (5) Promotion.
+    // (5b) Promotion.
+    match role_event {
+        None => {
+            let mut groups = admin.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("admin's group");
+            assert!(info.has_active_member(&admin_hex), "the admin is seated");
+            info.members_v2
+                .get_mut(&admin_hex)
+                .expect("admin seat")
+                .role = x0x::groups::GroupRole::Admin;
+        }
+        Some(event) => {
+            let applied =
+                apply_named_group_metadata_event(&admin, event, creator_id, true, None).await;
+            assert!(
+                applied.accepted,
+                "the admin applies the creator's signed role-update commit"
+            );
+        }
+    }
     {
-        let mut groups = admin.named_groups.write().await;
-        let info = groups.get_mut(&group_id).expect("admin's group");
-        assert!(info.has_active_member(&admin_hex), "the admin is seated");
-        info.members_v2
-            .get_mut(&admin_hex)
-            .expect("admin seat")
-            .role = x0x::groups::GroupRole::Admin;
+        let groups = admin.named_groups.read().await;
+        let info = groups.get(&group_id).expect("admin's group");
+        assert_eq!(
+            info.members_v2.get(&admin_hex).map(|seat| seat.role),
+            Some(x0x::groups::GroupRole::Admin),
+            "the admin is promoted"
+        );
     }
     Ok(CreatorOfflineScenario {
         creator_hex,
@@ -788,7 +854,7 @@ async fn promoted_admin_seals_new_joiner(
 /// offline: the 20 refusals in the R19 Singapore log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
-    let s = creator_offline_scenario().await?;
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
     let commit = promoted_admin_seals_new_joiner(&s, &[])
         .await
         .unwrap_or_else(|err| {
@@ -823,6 +889,29 @@ async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
     Ok(())
 }
 
+/// The R19 case with a REAL promotion: the creator promotes the admin
+/// through the production role route before going offline, and the admin
+/// applies that signed `MemberRoleUpdated` commit through the normal
+/// receive path (no local role edit). The promoted admin then seals the
+/// next joiner. Fails without #1023 exactly like
+/// `promoted_admin_seals_join_while_creator_offline`: the role commit
+/// carries no certificates, so the creator's seat stays digest-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_promoted_by_signed_commit_seals_join_while_creator_offline() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::SignedCommit).await?;
+    let commit = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "the admin promoted by the creator's signed commit must seal while the creator is offline: {err}"
+            )
+        });
+    assert!(!commit.roster_root.is_empty());
+    assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
 /// The carry does not weaken the gate. A seat whose certificate was never
 /// carried anywhere (no seat event, no JoinResult, no announce) still
 /// blocks the promoted admin's seal with `OwnerCertMemberPending`, and it
@@ -830,7 +919,7 @@ async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
 /// is resolved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncarried_certificate_still_blocks_with_owner_cert_member_pending() -> Result<()> {
-    let s = creator_offline_scenario().await?;
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
     let x_kp = x0x::identity::AgentKeypair::generate().expect("x key");
     let x_hex = hex::encode(x_kp.agent_id().as_bytes());
     let x_cert = x0x::identity::AgentCertificate::issue(&s.owner, &x_kp).expect("x cert");
@@ -857,7 +946,7 @@ async fn uncarried_certificate_still_blocks_with_owner_cert_member_pending() -> 
 ///   and the result-level sidecar still carries the certificates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_added_certificate_sidecar_is_wire_compatible() -> Result<()> {
-    let s = creator_offline_scenario().await?;
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
     let mut json = serde_json::to_value(&s.seat_event)?;
     let object = json.as_object_mut().expect("event object");
     assert!(object.contains_key("roster_certificates_b64"));
