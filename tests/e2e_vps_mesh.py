@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """x0x VPS all-pairs DM matrix — Phase-A mesh harness (direct-DM control plane).
 
-Drives the full 6-node fleet through *one* SSH tunnel to an anchor node.
+Drives the full 6-node fleet through an anchor SSH tunnel, with short lived
+runner API tunnels used only to read each selected runner's agent ID.
 All test actions flow as direct DMs from the anchor's agent to each
 runner's agent; results return as direct DMs captured on the anchor's
-``/direct/events`` SSE stream. Pubsub is used only during discover, with
-bounded republish while runners are still missing.
+``/direct/events`` SSE stream. Direct DMs discover selected runners, with
+PubSub fallback and bounded republish while runners are still missing.
 
 Architecture::
 
     Mac harness ──SSH tunnel──► anchor daemon ──QUIC mesh──► every node
         │                            │
-        │                            ├── republishes discover envelopes
-        │                            │   on x0x.test.discover.v1
-        │                            │   carrying anchor_aid
+        │                            ├── direct discover DMs to selected runners
+        │                            │   (PubSub fallback for failed/self-DMs)
         │                            │
         │                            ├── /direct/send  command DMs
         │                            │     x0xtest|cmd|<b64-json>
@@ -47,12 +47,14 @@ import logging
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,6 +75,7 @@ PREFIX_RES = b"x0xtest|res|"
 # separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
 COMMAND_HTTP_TIMEOUT_SECS = 15.0
+DISCOVER_DIRECT_WORKERS = 8
 
 
 def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
@@ -211,6 +214,7 @@ class X0xClient:
         stop_fallback_on_raw_error: bool = False,
         require_gossip: bool = False,
         require_durable_app_ack: Optional[bool] = None,
+        http_timeout_secs: float = COMMAND_HTTP_TIMEOUT_SECS,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -228,7 +232,7 @@ class X0xClient:
             body["require_gossip"] = True
         if require_durable_app_ack is not None:
             body["require_durable_app_ack"] = require_durable_app_ack
-        return self._req("POST", "/direct/send", body=body)
+        return self._req("POST", "/direct/send", body=body, timeout=http_timeout_secs)
 
     def open_sse(self, path: str, timeout: float = 3600 * 6):
         req = urllib.request.Request(
@@ -249,6 +253,8 @@ class RunnerInfo:
     node: str
     agent_id: str
     machine_id: str
+    request_id: Optional[str] = None
+    received_at_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -420,11 +426,15 @@ def _enqueue_result_envelope(
     details.setdefault("via_sse", source)
     body["details"] = details
     if kind == "discover_reply" or kind == "runner_ready":
+        received_at_monotonic = time.monotonic()
+        request_id = body.get("request_id")
         bus.discover.put(
             RunnerInfo(
                 node=body.get("node", "?"),
                 agent_id=body.get("agent_id", ""),
                 machine_id=body.get("machine_id", ""),
+                request_id=request_id if isinstance(request_id, str) else None,
+                received_at_monotonic=received_at_monotonic,
             )
         )
     elif kind == "send_result":
@@ -452,34 +462,82 @@ def _enqueue_result_envelope(
 # ─── matrix orchestration ──────────────────────────────────────────────
 
 
+def discover_command(
+    anchor_aid: str,
+    request_id: str,
+    no_pubsub_after_discover: bool = False,
+    target_node: str = "*",
+) -> Dict[str, Any]:
+    """Build the common PubSub and direct-DM discovery envelope."""
+    return {
+        "command_id": request_id,
+        "target_node": target_node,
+        "action": "discover",
+        "anchor_aid": anchor_aid,
+        "params": {
+            "request_id": request_id,
+            "anchor_aid": anchor_aid,
+            "no_pubsub_after_discover": no_pubsub_after_discover,
+        },
+        "no_pubsub_after_discover": no_pubsub_after_discover,
+    }
+
+
 def publish_discover(
     client: X0xClient,
     anchor_aid: str,
     request_id: str,
     no_pubsub_after_discover: bool = False,
+    target_node: str = "*",
 ) -> None:
     """Pubsub announcement carrying anchor_aid for runners.
 
-    Every subsequent command flows as a direct DM, but discovery is a
-    chicken/egg case — runners don't yet know who the orchestrator is —
-    so discover_runners republishes this envelope until every runner has
-    replied or the discovery window expires.
+    This preserves the legacy announcement for lookup failures, failed DMs,
+    and the anchor's refused self-DM.
     """
-    payload = json.dumps(
-        {
-            "command_id": request_id,
-            "target_node": "*",
-            "action": "discover",
-            "anchor_aid": anchor_aid,
-            "params": {
-                "request_id": request_id,
-                "anchor_aid": anchor_aid,
-                "no_pubsub_after_discover": no_pubsub_after_discover,
-            },
-            "no_pubsub_after_discover": no_pubsub_after_discover,
-        }
-    ).encode("utf-8")
+    payload = json.dumps(discover_command(
+        anchor_aid, request_id, no_pubsub_after_discover, target_node,
+    )).encode("utf-8")
     client.publish(DISCOVER_TOPIC, payload)
+
+
+def lookup_runner_agents(
+    expected_nodes: List[str],
+    anchor_node: str,
+    anchor_aid: str,
+    tokens: Dict[str, Tuple[str, str]],
+    remote_port: int,
+    log: logging.Logger,
+) -> Dict[str, str]:
+    """Read selected runner IDs through owned, short lived API tunnels."""
+    ids: Dict[str, str] = {}
+    for node in dict.fromkeys(expected_nodes):
+        if node == anchor_node:
+            ids[node] = anchor_aid
+            continue
+        if node not in tokens:
+            log.warning("discover /agent lookup unavailable for %s: no token", node)
+            continue
+        ip, token = tokens[node]
+        tunnel = None
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                local_port = probe.getsockname()[1]
+            tunnel = start_ssh_tunnel(ip, local_port, remote_port=remote_port)
+            aid = X0xClient(f"http://127.0.0.1:{local_port}", token).agent().get("agent_id")
+            if not isinstance(aid, str) or re.fullmatch(r"[0-9a-fA-F]{64}", aid) is None:
+                log.warning("discover /agent lookup invalid for %s", node)
+            elif aid == anchor_aid:
+                log.warning("discover /agent lookup for %s returned anchor ID", node)
+            else:
+                ids[node] = aid
+        except Exception as exc:
+            log.warning("discover /agent lookup failed for %s: %s", node, exc)
+        finally:
+            if tunnel is not None:
+                stop_ssh_tunnel(tunnel)
+    return ids
 
 
 def send_command_dm(
@@ -489,6 +547,7 @@ def send_command_dm(
     log: logging.Logger,
     anchor_aid: Optional[str] = None,
     allow_anchor_pubsub: bool = True,
+    http_timeout_secs: float = COMMAND_HTTP_TIMEOUT_SECS,
 ) -> Optional[Dict[str, Any]]:
     """Send a runner command — direct DM if remote, pubsub if collocated.
 
@@ -522,6 +581,7 @@ def send_command_dm(
             require_durable_app_ack=(
                 False if COMMAND_RAW_QUIC_ACK_MS is not None else None
             ),
+            http_timeout_secs=http_timeout_secs,
         )
     except urllib.error.HTTPError as exc:
         try:
@@ -549,45 +609,134 @@ def discover_runners(
     log: logging.Logger,
     republish_every_secs: int = 12,
     no_pubsub_after_discover: bool = False,
+    runner_agent_ids: Optional[Dict[str, str]] = None,
 ) -> Dict[str, RunnerInfo]:
-    """Publish a discover announcement and collect node→runner_info.
+    """Directly announce to selected runners and collect node→runner_info.
 
-    The runner replies via direct DM rather than pubsub, so the orchestrator
-    only ever sees one pubsub round per harness run. The announcement is
-    republished periodically while runners are still missing — this is
-    cheap (one pubsub publish per cycle) and tolerates a runner that came
-    up after the first publish.
+    The runner replies via direct DM. PubSub covers missing IDs, failed DMs,
+    the anchor's refused self-DM, and acknowledged DMs without a reply after
+    one bounded direct-only interval.
     """
     log.info("discover: expecting %d runners (anchor=%s…)",
              len(expected_nodes), anchor_aid[:16])
     found: Dict[str, RunnerInfo] = {}
     deadline = time.time() + timeout_secs
     next_republish = 0.0
+    retry_interval = min(republish_every_secs, max(0.1, timeout_secs / 4))
+    runner_agent_ids = runner_agent_ids or {}
+    direct_attempted = set()
+    announcements: Dict[str, Tuple[str, str, float]] = {}
+
+    def send_direct_discover(node: str, aid: str, command: Dict[str, Any],
+                             budget: float) -> Optional[Dict[str, Any]]:
+        request_id = command["params"]["request_id"]
+        announcements[request_id] = (node, "direct", time.monotonic())
+        return send_command_dm(
+            client, aid, command, log, http_timeout_secs=budget,
+        )
+
     while time.time() < deadline and len(found) < len(expected_nodes):
         if time.time() >= next_republish:
-            try:
-                publish_discover(
-                    client,
-                    anchor_aid,
-                    str(uuid.uuid4()),
-                    no_pubsub_after_discover=no_pubsub_after_discover,
+            fallback_nodes = []
+            direct_targets = []
+            for node in dict.fromkeys(expected_nodes):
+                if node in found:
+                    continue
+                aid = runner_agent_ids.get(node)
+                if (not isinstance(aid, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{64}", aid) is None
+                        or aid == anchor_aid):
+                    fallback_nodes.append(node)
+                    continue
+                if node in direct_attempted:
+                    # An HTTP send ACK does not prove the runner processed
+                    # the command. Give the direct path one reply interval,
+                    # then publish only for nodes still missing.
+                    fallback_nodes.append(node)
+                    continue
+                # Pin the target label even though the agent ID was read via
+                # that node's API. A stale or wrong ID must not trigger an
+                # unselected runner to execute this discover command.
+                if len(direct_targets) < DISCOVER_DIRECT_WORKERS:
+                    direct_targets.append((node, aid))
+                else:
+                    # Keep the fan-out bounded even for custom node lists.
+                    fallback_nodes.append(node)
+            if direct_targets:
+                # All selected DMs start together. Cap each HTTP call and
+                # the aggregate wait so slow peers cannot spend the entire
+                # discovery window before PubSub fallback gets a turn.
+                direct_budget = min(
+                    COMMAND_HTTP_TIMEOUT_SECS,
+                    max(0.1, (deadline - time.time()) * 0.45),
                 )
-            except Exception as exc:
-                log.warning("discover republish failed: %s", exc)
-            next_republish = time.time() + republish_every_secs
-        remaining = min(
-            republish_every_secs,
-            max(0.25, deadline - time.time()),
-        )
+                executor = ThreadPoolExecutor(max_workers=len(direct_targets))
+                try:
+                    futures = {
+                        executor.submit(
+                            send_direct_discover, node, aid,
+                            discover_command(
+                                anchor_aid, str(uuid.uuid4()),
+                                no_pubsub_after_discover, target_node=node,
+                            ), direct_budget,
+                        ): node
+                        for node, aid in direct_targets
+                    }
+                    done, pending = wait(futures, timeout=direct_budget)
+                    for future, node in futures.items():
+                        if future in pending:
+                            log.warning("discover DM to %s exceeded %.1fs", node, direct_budget)
+                            fallback_nodes.append(node)
+                            continue
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            log.warning("discover DM to %s failed: %s", node, exc)
+                            result = None
+                        if not result or result.get("ok") is False:
+                            fallback_nodes.append(node)
+                        else:
+                            direct_attempted.add(node)
+                finally:
+                    # Every in-flight request has the bounded HTTP timeout;
+                    # wait for all workers to exit before another cycle.
+                    executor.shutdown(wait=True, cancel_futures=True)
+            for node in fallback_nodes:
+                request_id = str(uuid.uuid4())
+                announcements[request_id] = (node, "pubsub", time.monotonic())
+                try:
+                    publish_discover(
+                        client, anchor_aid, request_id,
+                        no_pubsub_after_discover=no_pubsub_after_discover,
+                        target_node=node,
+                    )
+                except Exception as exc:
+                    log.warning("discover republish to %s failed: %s", node, exc)
+            next_republish = time.time() + retry_interval
+        remaining = max(0.0, min(
+            next_republish - time.time(), deadline - time.time(),
+        ))
         try:
             info = bus.discover.get(timeout=remaining)
         except queue.Empty:
             continue
         if info.node in expected_nodes and info.node not in found:
             found[info.node] = info
+            announcement = announcements.get(info.request_id or "")
+            channel = "unknown"
+            latency = "unknown"
+            if (announcement is not None and announcement[0] == info.node
+                    and info.received_at_monotonic is not None):
+                elapsed_ms = (info.received_at_monotonic - announcement[2]) * 1000
+                if elapsed_ms >= 0:
+                    channel = announcement[1]
+                    latency = f"{elapsed_ms:.3f}"
             log.info(
-                "  ✓ %-12s agent=%s… machine=%s…",
+                "  ✓ node=%s channel=%s announce_reply_latency_ms=%s "
+                "agent=%s… machine=%s…",
                 info.node,
+                channel,
+                latency,
                 info.agent_id[:16],
                 info.machine_id[:16],
             )
@@ -904,6 +1053,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         anchor_token = args.api_token
         anchor_base = args.api_base
         tunnel = None
+        runner_agent_ids: Dict[str, str] = {}
         log.info("anchor=%s base=%s (no SSH tunnel)", args.anchor, anchor_base)
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -949,6 +1099,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.error("anchor /agent missing agent_id: %s", agent_info)
             return 3
         log.info("anchor agent_id=%s…", anchor_aid[:16])
+
+        if not args.no_tunnel:
+            runner_agent_ids = lookup_runner_agents(
+                args.nodes, args.anchor, anchor_aid, tokens, _net.api_port, log,
+            )
 
         if args.no_pubsub_after_discover:
             log.info("legacy results PubSub fallback disabled after discover")
@@ -999,6 +1154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout_secs=args.discover_secs,
             log=log,
             no_pubsub_after_discover=args.no_pubsub_after_discover,
+            runner_agent_ids=runner_agent_ids,
         )
         missing = sorted(set(args.nodes) - set(runners))
         if missing and not args.allow_skips:

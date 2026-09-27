@@ -43,7 +43,7 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 | Class | Lifetime | Source | Can act as |
 |---|---|---|---|
 | **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
-| **Session token** | 10 minutes | `POST /auth/session` (exchanged from the durable token) | browser/GUI surfaces |
+| **Session token** | 10 minutes; refreshable up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
 | **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
 
 Auth-class labels used throughout this reference:
@@ -86,6 +86,15 @@ view of a foreign group). The GUI prompts for the durable token (kept
 in tab-scoped `sessionStorage`, never a URL) the first time an
 owner-act surface is used from a session.
 
+**Named-group read authorization (#821):** the durable API token may read
+`GET /groups/:id` and `GET /groups/:id/members` across the operator's local
+groups. A session bearer requires active membership by this daemon's local
+agent. For a known group without that seat, both endpoints return typed 403
+`reason: "group_membership_required"`; an unknown ID returns 404. A session
+joiner awaiting the authority commit receives only `ok`, `group_id`, and
+`membership_state: "pending_authority_commit"` from `GET /groups/:id`;
+`GET /groups/:id/members` remains 403. Rider tokens are denied on both routes.
+
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
 durable API token and rider tokens are **never** valid in a query string
@@ -126,6 +135,15 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
     is the §5 shape; `reason` is `fork_quarantined`. Nothing is seated and
     nothing is written. **It is retryable:** a retry re-reads the group and
     either seats cleanly or refuses with the ordinary §1 gate.
+  - **Ownerless TreeKEM stale-base joins (#818 design decision).** The
+    walk-authenticated stale-base exemption from #816 is owner-anchored
+    ONLY: without an owner head attestation nothing authenticates "gap"
+    versus "fork" for a walk-clean chain, so an ORDINARY (ownerless)
+    TreeKEM group keeps the `signer_only` quarantine as the safe default
+    when a join result skips intervening commits. Mitigations: mint
+    just-in-time invites (after the intervening commits land), or clear
+    the marker via `POST /groups/:id/quarantine/clear` once canonical
+    state is restored.
   - **Encrypted (GSS) KvStore routes** now refuse with 409 `fork_quarantined`
     while the group is quarantined — previously the cached authorization
     context was blind to a marker installed after the store bound, so writes
@@ -181,6 +199,7 @@ table (#446–#451). This reference documents **175 endpoints — exactly the se
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
+| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a live **session** token for a fresh 10-minute one; the durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
 | GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 
@@ -501,7 +520,31 @@ needs a certifiable founding member), and no other device of this owner may
 have already advertised a Home. If one has, this device provisions nothing
 and `GET /home` answers `state:"elsewhere"`. An absent register value means
 "none advertised yet", not "none exists", so a first or un-synced device
-still provisions. The daemon's own owner-certified agent is the founding member
+still provisions, but not at once (#824). When the owner key and
+certificate are live, owner sync is available and no pointer is known, startup
+defers creating a fresh Home to a background task. The API stays up throughout,
+and `GET /home` answers `state:"provisioning_pending"` until the task finishes.
+The task re-runs provisioning, and yields to the pointer if one arrived, on the
+first of:
+
+- a committed record that names a canonical Home;
+- a successful owner-sync session, but only on the device whose machine id is
+  the lowest among the owner's enrolled machines (its *rank* is 0). A session
+  that brought no pointer does not release other devices, so two fresh,
+  mutually enrolled devices create one Home, not two. A pass that reaches no
+  device never counts;
+- `(rank + 1) × 90 s` after startup, where rank counts the enrolled machines
+  with a lower machine id. A genuinely first or offline device (rank 0) gets
+  its Home up to 90 s later.
+
+Before creating, the daemon waits out any in-flight owner-sync session, holds
+off new ones, and re-checks the pointer under the same gate that every pointer
+writer takes, so a pointer that lands during the wait is honoured rather than
+duplicated. To add an owner device without a duplicate Home, enroll it for
+owner sync while it is pending: enroll its machine on an existing owner device,
+install the owner key and certificate, restart it, then enroll the existing
+device's machine on it (see *Device sync* below; peer trust must be `trusted`
+both ways). The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -541,7 +584,7 @@ A `state:"local"` response (the settled case):
 
 - `owner_user_id` is the Home's `OwnerCertified` admission axis — the value a
   joining device must pin (`x0x group join … --home --owner <owner_user_id>`).
-- **There are three distinct `200` shapes**, keyed by `state`, plus two `404`s.
+- **There are four distinct `200` shapes**, keyed by `state`, plus two `404`s.
   `get_home` matches on `resolve_home` and calls `home_elsewhere_response`
   directly for the third:
 
@@ -550,9 +593,10 @@ A `state:"local"` response (the settled case):
   | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
   | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
   | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
+  | `"provisioning_pending"` | #824: startup provisioning is waiting for owner sync (at most `(rank + 1) × 90 s`) before creating a Home; transient, so poll until another state | the `elsewhere` short body with `canonical_group_id` and `local_group_id` both `null` and **no** `next_step`; poll again |
 
   `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
-  from `local`. `"elsewhere"` is a `200` rather than a `404` so a second device
+  from `local` and `provisioning_pending`. `"elsewhere"` is a `200` rather than a `404` so a second device
   is not misread as Home-less and does not provision a duplicate.
 
   The two `404`s are distinct: `no Home provisioned (un-owned install)` when no
@@ -561,7 +605,7 @@ A `state:"local"` response (the settled case):
   see. Neither is the `elsewhere` case.
 
   `POST /home/seat`'s `409 reason` values (`adoption_pending`, `elsewhere`,
-  `unknown`) are the **seat** endpoint's refusals, a separate surface from
+  `unknown`, `ambiguous_home`) are the **seat** endpoint's refusals, a separate surface from
   these `GET` shapes — do not read one as documentation of the other.
 - `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
 - `primary_agent.verified` is the fail-closed trust check that the primary's
@@ -607,8 +651,15 @@ mint seats into its duplicate. A successful `200` response has this shape:
 `400` covers a malformed or self-targeting `agent_id`; `404` means an un-owned
 install with no loaded owner key. An owned install with unresolved Home state
 returns `409 unknown`, not `404`. `409` includes typed `reason` values
-`adoption_pending`, `elsewhere`, or `unknown`, with a nullable
-`canonical_group_id`. The underlying invite authority can additionally return
+`adoption_pending`, `elsewhere`, `unknown`, or `ambiguous_home`, with a nullable
+`canonical_group_id`. `ambiguous_home` (#824) means this device is seated in
+more than one Home-shaped group (`GET /home` lists the others in `duplicates`)
+and the canonical `("home")` pointer is unknown or does not name the group the
+seat would mint into; the seat mints nothing rather than guess, and succeeds
+once owner sync delivers a pointer naming a Home this device holds. The guard is
+local: it never mints against an ambiguous or non-canonical view this device
+knows about. It is not a distributed invariant, because a second Home that
+arrives after the duplicate scan and before the invite is written is not fenced. The underlying invite authority can additionally return
 its documented errors, including `409 owner_key_unavailable`, `413
 invite_too_large`, `429 invite_cap_reached`, and persistence failures. A
 successful call is **not idempotent**: it records a new single-use invite and
@@ -773,6 +824,16 @@ records). CLI (all three flags together):
 Durable-owner only — a session token answers `403`; a missing
 `move_epoch` answers `400`. The one-id forms remain the agent/machine
 self- or user-authority revocations.
+
+Revoking the daemon's OWN agent binding (#797) resolves the certificate
+from the identity dir (`agent.cert`) when it was issued by the loaded
+owner user key — the discovery cache never contains the local agent and
+self-issuance keeps the journal lean. **Warning:** the tombstone is
+grow-only and never expires. Pointing it at the LOCAL machine
+(`machine_id` = this daemon's) permanently bars this daemon's agent from
+signing here until the owner re-issues its certificate; the daemon logs
+a `warn` when that case is taken — it is a legitimate retirement action,
+but never a silent one.
 
 `GET /owner/placement` lazily mints epoch-0 records on first read and
 returns `owner_user_id`, `minted_now`, `roaming_count`, `home_invariant_ok`
@@ -1145,6 +1206,10 @@ helper API.
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
+| GET | `/groups/:id/notes` | `x0x notes list <GROUP_ID>` | **ADR 0081**: list the notes (`{note_id, title, creator, created_at}`) in the group's `notes` store, which is opened through the group-store path and sealed like the Wiki store and task lists. Rider tokens are refused (403) |
+| POST | `/groups/:id/notes` | `x0x notes create <GROUP_ID> <TITLE>` | **ADR 0081**: create an empty note. Body `{"title":"…"}` (1–512 bytes). 201 `{note_id, title, text, version, degraded}` |
+| GET | `/groups/:id/notes/:note` | `x0x notes get <GROUP_ID> <NOTE_ID>` | **ADR 0081**: read `{title, text, version, degraded}` after importing new update records. Records reach the loro CRDT only after their ML-DSA-65 author signature verifies and their author was a writer at the roster epoch the record signs (ADR 0082, proposed; future or unknown epochs are held). `version` is the base64url `Frontiers` token. A degraded note returns its last good text with `degraded: true` |
+| PUT | `/groups/:id/notes/:note` | `x0x notes save <GROUP_ID> <NOTE_ID> <TEXT> --base-version <VERSION>` | **ADR 0081**: save the full text as one signed write-once record `n/<note>/u/<author>/<seq>` (split across consecutive seqs only above one record). Body `{"text":"…","base_version":"<version>"}`. 200 (202 when saved but not yet published) with the note plus `records_written` and `published`. Errors `{error, message}`: 409 `base_version_stale` (base is not the current version; the three-way merge is a later slice) or `base_version_unknown` (base names ops this replica lacks); 413 `note_too_large` (4 MiB of records per note) or `notes_store_full` (12 MiB retained-image budget per store; carries `current`, `projected`, `budget`); 503 `note_engine_fault` (the note is degraded after repeated engine faults). Engine counters are in `GET /diagnostics/groups` under `notes` |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set display name in group. Body `{"name":"<display name>"}` |
@@ -1410,6 +1475,11 @@ delegation JSON (arrays-of-bytes fields; no outer wrapper).
 durable history (survives restarts; fail-closed on incomplete history scans).
 Each row: `delegation_digest`, `from_agent`, `to_agent`, `scope`, `verbs`,
 `issued_at_ms`, `expiry_ms`, `depth`, `task_ref`.
+The durable operator token retains its read. A session bearer needs **active
+local membership** in the named group, even when its read policy is public;
+a known group with no active local seat returns 403 with
+`reason: "group_membership_required"` before any delegation fields are read
+or returned. An unknown group returns 404. Rider tokens receive 403.
 
 Verified behaviour (this campaign): delegate → B sends citing the digest →
 message accepted and attributed (author = B); the same send with a forged
@@ -1806,6 +1876,42 @@ value is a **400**. CLI: `x0x store create <name> <topic> --policy append_only`.
 }
 ```
 
+### Store put publish outcome (#976)
+
+A PUT whose local write succeeded but whose gossip publish failed (timeout
+or refusal — congested pubsub is the usual cause) returns **202 Accepted**,
+never an error: the value IS applied and persisted locally.
+
+```json
+{
+  "ok": true,
+  "published": false,
+  "reason": "<the publish failure cause>",
+  "direct_attempted": 2,
+  "evicted_keys": []
+}
+```
+
+- `published: false` — the mesh announcement failed. The delta is NOT
+  queued anywhere: the client re-issues the PUT to retry the publish
+  (an identical re-put, including on `append_only` stores, re-announces
+  the existing entry through the normal sealed publish path — a store
+  no-op, not a second write).
+- `direct_attempted` — how many directly-connected peers the daemon
+  ATTEMPTED to notify over the DM side channel after the publish
+  failure. The sends are fire-and-forget: this counts attempts, not
+  delivery confirmations.
+- `evicted_keys` — as on 200; eviction notices (`kv:evicted` SSE) fire on
+  this path too.
+
+### Store delete publish outcome (#976)
+
+`DELETE` behaves symmetrically: a remove whose local apply succeeded
+but whose publish failed returns **202** with
+`{"ok":true,"published":false,"reason":...,"direct_attempted":N}` —
+the key is gone locally, never an error, and there is no background
+replay: the client re-issues the DELETE to retry the publish.
+
 ### Store write authorization
 
 Stores default to the `Signed` policy: only the creating agent (the owner)
@@ -1962,6 +2068,16 @@ two: **reads always serve, the purge always refuses.**
 `GET /history/stats`, `GET /diagnostics/history` and
 `GET /groups/:id/messages` return the same rows they always did and add two
 envelope fields:
+
+A session bearer outside an active local group seat still receives retained
+history content under the existing history authorization rules, but the
+group's `fork_quarantined` / `fork_quarantine` envelope annotation and
+`fork_quarantined_at_ingest` row label are omitted. This also applies to
+cross-scope and node-wide history responses: only markers for groups in which
+the session's local agent is active appear. Durable operator and rider views
+retain their existing annotation behavior. `GET /groups/:id/messages` likewise
+keeps serving signed public messages under its read policy while omitting the
+quarantine envelope annotation for a session without an active local seat.
 
 ```json
 {
@@ -2135,11 +2251,30 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
+**Live `message` delivery is best-effort.** After a subscriber restart,
+subscribe-time anti-entropy can re-serve messages from the sender's roughly
+60-second cache, so applications should expect duplicate frames. Under
+backpressure, `feed_droppable` may also drop topic frames from the bounded
+outbound queue (`ws_outbound_dropped`). The event has no stable top-level
+transport `msg_id` and promises neither exactly-once delivery nor a complete
+feed; do not assume at-least-once delivery. Applications needing exactly-once
+effects must carry their own unique application ID to suppress duplicates and
+use a separate reconciliation path for missed messages. A decoded signed-group
+payload may provide a canonical application message ID for that format.
+`HistoryRecord.msg_id` identifies a local history-store record and is a
+separate identity; it is not the missing transport ID for this event.
+
 **Fork-quarantine annotation (ADR-0066 §3d).** When a group is
 fork-quarantined on this node, its group-scoped frames are **labelled, never
 refused and never dropped** — the WS plane is the live mirror of the
 annotated history reads, and an operator watching an incident must not lose
 the stream. Two frame classes carry the label:
+
+For a session bearer without active local membership in the group, backfill
+`message` and `live` frames and structured `mention` frames still arrive, but
+omit `fork_quarantined` and `fork_quarantine`. Durable operator connections
+and sessions with an active local seat keep the annotation. Raw live gossip
+`message` frames remain unchanged.
 
 - `mention` frames on the group's topic channel;
 - ADR-0023 `subscribe` **backfill** frames for a group topic — the replayed
@@ -2308,8 +2443,9 @@ not a contract.**
 The `x0x` CLI renders a reason-bearing error as
 `<message> (HTTP <code>, reason: <reason>)`, and one with no `reason` as
 `<message> (HTTP <code>)`. The reason-bearing responses today are the 409
-`fork_quarantined` below and the 409 `recipient_not_active` on group key
-sealing.
+`fork_quarantined` below, the 409 `recipient_not_active` on group key
+sealing, and the `POST /home/seat` 409s (`adoption_pending`, `elsewhere`,
+`unknown`, `ambiguous_home`).
 
 ### 409 `fork_quarantined` (ADR-0064 / ADR-0066 §5)
 
@@ -2386,6 +2522,7 @@ x0x accept-file <transfer_id>
 x0x reject-file <transfer_id> --reason "not now"
 x0x ws sessions
 x0x gui
+x0x gui --view dm/<agent_id>        # also groups/<group_id>[/board|files|…], people, network
 ```
 
 ## Diagnostics
@@ -2396,10 +2533,11 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
+| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
@@ -2492,6 +2630,7 @@ Key counter fields (flattened into each group row):
 | `task_deltas_quarantine_buffered` | Receiver | ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because this group's fork-quarantine marker is live. The CRDT state stays byte-identical while this climbs, from the first delta that observes the marker — the live admission path is not roster-pinned, so at most one already-admitted delta per listener can still merge just after the marker installs (accepted residual, see the runbook). Held deltas apply in arrival order once the marker clears. |
 | `task_deltas_quarantine_dropped` | Receiver | ADR-0068 D2: held task deltas dropped because the per-list bound (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss (merges are idempotent and anti-entropy refills after the clear), but a climbing value means the quarantine is outlasting the buffer. |
 | `task_deltas_quarantine_applied` | Receiver | ADR-0068 D2: held task deltas applied, in arrival order, after the marker cleared. |
+| `task_deltas_seal_rejected` | Receiver | #895: task deltas refused on a group-scoped list — plaintext on an encrypted group (un-upgraded or non-member sender), a sealed record that cannot be opened with the group's current key, or a sealed author that is not the gossip sender. Never merged. |
 | `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`

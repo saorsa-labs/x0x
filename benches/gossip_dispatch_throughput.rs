@@ -102,7 +102,7 @@ fn bench_handle_incoming(c: &mut Criterion) {
             |batch| {
                 rt.block_on(async {
                     for data in batch {
-                        manager.handle_incoming(from, data).await;
+                        manager.handle_incoming(from, None, data).await;
                     }
                 });
             },

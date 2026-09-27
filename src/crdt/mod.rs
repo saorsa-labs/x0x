@@ -35,6 +35,7 @@ pub mod encrypted;
 pub mod error;
 pub mod persistence;
 pub mod provenance;
+pub mod sealed;
 pub mod sync;
 pub mod task;
 pub mod task_item;
@@ -50,8 +51,9 @@ pub use provenance::{
     canonical_op_bytes, purge_unattested_elements, sign_attestation, verify_attestation,
     OpAttestation, OpKind, CLAIM_DOMAIN, COMPLETE_DOMAIN,
 };
+pub use sealed::{TaskDeltaProtector, TaskPublication, TaskPublicationPermit, TaskSealRejection};
 pub use sync::{
-    AuthorizedRoster, TaskIngestGate, TaskIngestGateSlot, TaskListSync,
+    AuthorizedRoster, StateServeGate, TaskIngestGate, TaskIngestGateSlot, TaskListSync,
     TASK_QUARANTINE_BUFFER_MAX_BYTES, TASK_QUARANTINE_BUFFER_MAX_DELTAS,
     TASK_QUARANTINE_DRAIN_POLL_SECS,
 };
