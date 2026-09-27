@@ -253,6 +253,7 @@ fn inbound_bootstrap_with_lineage_is_rejected() {
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     assert!(
         !validate_public_group_bootstrap(&info, &creator_hex, &creator_hex),
@@ -821,6 +822,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     let base = info.clone();
     state
@@ -866,6 +868,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
             &commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.description = mutation;
@@ -2196,6 +2199,7 @@ async fn r4_seed_lineage_group(
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -2231,6 +2235,7 @@ async fn r4_apply_through_wrapper(
         &commit,
         None,
         lock_held,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -3091,6 +3096,7 @@ async fn journal_recovery_records_fork_evidence_on_live_lineage() -> Result<()> 
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     let mut journal_record = base;
     journal_record.description = "journal".to_string();
