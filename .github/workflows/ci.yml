@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # #939: every installer must pin the real release-signing fingerprint,
+      # and it must match the key published with the latest release.
+      - name: Check installer signing-key fingerprints
+        run: python3 scripts/ci/check-installer-fingerprints.py --release
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -255,7 +260,7 @@ jobs:
           X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
         run: |
           set +e
-          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+          bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
             --run-ignored ignored-only --no-tests=fail \
             -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
           status=$?
@@ -380,6 +385,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+
+      # #894: scripts/install.ps1 must at least parse under both Windows
+      # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
+      - name: Parse-check scripts/install.ps1
+        shell: pwsh
+        run: |
+          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
+          foreach ($exe in @('powershell', 'pwsh')) {
+            & $exe -NoProfile -Command $check
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          }
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master

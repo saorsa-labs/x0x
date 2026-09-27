@@ -5454,6 +5454,30 @@ impl Agent {
                         // Use the real PeerId from the QUIC handshake (may differ
                         // from a zeroed placeholder in the discovery cache).
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
+                        // #898 (S1): an address is NOT identity. When the
+                        // agent's machine is KNOWN (non-zero), only that
+                        // machine may answer the dial — a different machine
+                        // at the stale address (CGNAT reuse, a second daemon
+                        // on the host) must not rebind the cache and the
+                        // DirectMessaging map, which would also turn its
+                        // later raw-Direct claims for this agent "verified".
+                        // A zero machine id is trust-on-first-use, as before.
+                        if agent.machine_id.0 != [0u8; 32]
+                            && connected_peer_id.0 != agent.machine_id.0
+                        {
+                            tracing::warn!(
+                                target: "x0x::connect",
+                                stage = "connect_to_agent",
+                                %agent_prefix,
+                                strategy = "direct_per_addr",
+                                outcome = "mismatched_machine",
+                                selected_addr = %addr,
+                                expected_machine_prefix = %network::hex_prefix(&agent.machine_id.0, 4),
+                                answered_machine_prefix = %network::hex_prefix(&real_machine_id.0, 4),
+                                "address answered by a different machine than the agent's known binding; not rebinding (#898)"
+                            );
+                            continue;
+                        }
                         // Enrich bootstrap cache with this successful address
                         if let Some(ref bc) = self.bootstrap_cache {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
@@ -13412,6 +13436,8 @@ impl Agent {
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
         let dm_inbox_service = std::sync::Arc::clone(&self.dm_inbox_service);
+        let authenticated_machine_bindings =
+            std::sync::Arc::clone(&self.authenticated_machine_bindings);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -13610,10 +13636,26 @@ impl Agent {
                 }
 
                 // Register and mark the sender as connected for future reverse
-                // direct sends — only for a VERIFIED binding (#898): an
-                // unverified sender claim never marks connected or rebinds.
-                dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
-                    .await;
+                // direct sends — only with EVIDENCE (#898): the discovery-cache
+                // binding matches this transport-authentic machine, OR an
+                // AuthenticatedMachineBindings entry (C1) names THIS machine
+                // for the sender — a moved agent whose announcement is too
+                // stale for the discovery cache (raw-path `verified` stays
+                // false) still updates once its authenticated binding lands,
+                // matching the #927 evidence rule. The DELIVERY annotation
+                // keeps the raw `verified`; only the routing write is eased.
+                let binding_names_this_machine = crate::dm_inbox::authenticated_machine_binding(
+                    &authenticated_machine_bindings,
+                    &sender,
+                )
+                .await
+                .is_some_and(|bound| bound == machine_id);
+                dm.mark_raw_direct_sender_connected(
+                    sender,
+                    machine_id,
+                    verified || binding_names_this_machine,
+                )
+                .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
                 // connection table (the same source add_from_connection()
@@ -14543,6 +14585,32 @@ impl Agent {
     ) {
         self.capability_store
             .insert(agent_id, machine_id, capabilities, dm::now_unix_ms());
+    }
+
+    /// Record an authenticated agent→machine binding (for testing only).
+    ///
+    /// Mirrors exactly what the identity-announcement path does at ingest
+    /// (`record_authenticated_machine_binding`) so tests can stage the
+    /// "binding landed but the discovery cache is stale" state that the
+    /// #898 C1 evidence branch resolves.
+    ///
+    /// # Visibility
+    ///
+    /// `#[doc(hidden)]` - tests-only seam. Production callers reach this
+    /// through the live announcement pipeline, never directly.
+    #[doc(hidden)]
+    pub async fn record_authenticated_machine_binding_for_testing(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+    ) {
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent_id,
+            machine_id,
+            Self::unix_timestamp_secs(),
+        )
+        .await;
     }
 
     /// # Arguments

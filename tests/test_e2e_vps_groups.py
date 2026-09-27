@@ -1,10 +1,12 @@
 import base64
 import importlib.util
+import io
 import json
 import logging
 import sys
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -415,6 +417,71 @@ class GroupDispatchDeadlineTests(unittest.TestCase):
         legacy_data["data"]["verified"] = True
         legacy_data["data"]["sender"] = wrong
         self.assertIsNone(route_and_take("message", legacy_data))
+
+
+class GroupReportRedactionTests(unittest.TestCase):
+    """Report rows never persist raw HTTP bodies, exception text or tokens."""
+
+    SECRET = "Bearer token-secret-value"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.groups = load_groups()
+
+    def _harness(self, perform_error):
+        groups = self.groups
+
+        class Client:
+            def perform(self, _action, _params):
+                raise perform_error
+
+        anchor = "a" * 64
+        return groups.FleetHarness(
+            Client(), groups.ResultRouter(logging.getLogger("group-redaction")), anchor, "anchor",
+            {"anchor": groups.Runner("anchor", anchor)}, logging.getLogger("group-redaction"),
+        )
+
+    def _report(self, harness, *responses):
+        # The shape main() writes, plus the recorded result envelopes.
+        return json.dumps({"passes": harness.passes, "failures": harness.failures,
+                           "responses": list(responses)})
+
+    def test_http_error_keeps_status_and_class_only(self):
+        # Codex #1021 P1: lowercase token-like and hex "reason"/"code" values
+        # passed the old character filter. No body field may be kept.
+        body = json.dumps({"ok": False, "error": self.SECRET, "reason": "token_secret_value",
+                           "code": "deadbeef" * 8}).encode()
+        error = urllib.error.HTTPError("http://127.0.0.1/contacts", 403, self.SECRET, {},
+                                       io.BytesIO(body))
+        self.addCleanup(error.close)
+        harness = self._harness(error)
+        response = harness.call("anchor", "contact_add", {"agent_id": "b" * 64})
+        self.assertEqual({"error_class": "HTTPError", "http_status": 403}, response["outcome"])
+        harness.assert_pass("anchor adds contact", response.get("outcome") == "ok",
+                            f"outcome={response.get('outcome')}")
+        report = self._report(harness, response)
+        for leaked in ("token-secret-value", "token_secret_value", "deadbeef"):
+            self.assertNotIn(leaked, report)
+
+    def test_generic_exception_keeps_class_only(self):
+        harness = self._harness(RuntimeError(self.SECRET))
+        response = harness.call("anchor", "contact_list")
+        self.assertEqual({"error_class": "RuntimeError"}, response["outcome"])
+        self.assertNotIn("token-secret-value", self._report(harness, response))
+
+    def test_unlisted_exception_class_is_other(self):
+        class TokenSecretValueError(Exception):
+            pass
+        response = self._harness(TokenSecretValueError(self.SECRET)).call("anchor", "contact_list")
+        self.assertEqual({"error_class": "Other"}, response["outcome"])
+
+    def test_unreachable_scenario_failure_row_keeps_class_only(self):
+        harness = self._harness(RuntimeError("unused"))
+        harness.runners["sfo"] = self.groups.Runner("sfo", "c" * 64)
+        harness.call = mock.Mock(side_effect=RuntimeError(self.SECRET))
+        harness.run_contacts_lifecycle()
+        self.assertIn("anchor contacts lifecycle unreachable: RuntimeError", harness.failures)
+        self.assertNotIn("token-secret-value", self._report(harness))
 
 
 if __name__ == "__main__":

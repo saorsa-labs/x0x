@@ -218,9 +218,14 @@ async fn issue_to(
     outbox: &GrantRedeliveryOutbox,
     receiver: &Receiver,
 ) -> GrantDelivery {
-    let mut out = deliver_grant_via(grant, &[world.a1], Some(outbox), world.now, |r, p, id| {
-        receiver.send(r, p, id)
-    })
+    let mut out = deliver_grant_via(
+        grant,
+        &[world.a1],
+        Some(outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| receiver.send(r, p, id),
+    )
     .await;
     assert_eq!(out.len(), 1);
     out.remove(0)
@@ -340,7 +345,12 @@ async fn corrupt_outbox_fails_closed() {
     assert!(outbox.load_error().is_some());
     assert!(outbox.is_empty());
     let err = outbox
-        .enqueue(&world.grant(3, 3_600), world.a1, world.now)
+        .enqueue(
+            &world.grant(3, 3_600),
+            world.a1,
+            world.now,
+            &world.revocations,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, OutboxError::Store(_)), "{err:?}");
@@ -434,7 +444,9 @@ async fn per_grantee_bound_is_enforced() {
         // Each entry goes to a DIFFERENT recipient agent: a per-recipient
         // cap would never trip here.
         assert_eq!(
-            outbox.enqueue(&grant, recipient(i), world.now).await,
+            outbox
+                .enqueue(&grant, recipient(i), world.now, &world.revocations)
+                .await,
             Ok(true)
         );
     }
@@ -444,7 +456,8 @@ async fn per_grantee_bound_is_enforced() {
             .enqueue(
                 &second_grant_same_grantee,
                 recipient(MAX_OUTBOX_ENTRIES_PER_GRANTEE),
-                world.now
+                world.now,
+                &world.revocations
             )
             .await,
         Err(OutboxError::GranteeFull)
@@ -452,12 +465,16 @@ async fn per_grantee_bound_is_enforced() {
     assert_eq!(outbox.len(), MAX_OUTBOX_ENTRIES_PER_GRANTEE);
     let other_grantee = world.grant_to(3, Grantee::Agent(AgentId([0x77; 32])));
     assert_eq!(
-        outbox.enqueue(&other_grantee, world.a1, world.now).await,
+        outbox
+            .enqueue(&other_grantee, world.a1, world.now, &world.revocations)
+            .await,
         Ok(true)
     );
     // Re-queueing the same (grant, recipient) is a no-op, not a new entry.
     assert_eq!(
-        outbox.enqueue(&other_grantee, world.a1, world.now).await,
+        outbox
+            .enqueue(&other_grantee, world.a1, world.now, &world.revocations)
+            .await,
         Ok(false)
     );
 }
@@ -477,7 +494,9 @@ async fn total_bound_is_enforced_and_reported() {
         );
         for _ in 0..MAX_OUTBOX_ENTRIES_PER_GRANTEE {
             assert_eq!(
-                outbox.enqueue(&grant, recipient(n), world.now).await,
+                outbox
+                    .enqueue(&grant, recipient(n), world.now, &world.revocations)
+                    .await,
                 Ok(true)
             );
             n += 1;
@@ -486,7 +505,9 @@ async fn total_bound_is_enforced_and_reported() {
     assert_eq!(n, MAX_OUTBOX_ENTRIES);
     let grant = world.grant(0xEE, 3_600);
     assert_eq!(
-        outbox.enqueue(&grant, world.a1, world.now).await,
+        outbox
+            .enqueue(&grant, world.a1, world.now, &world.revocations)
+            .await,
         Err(OutboxError::Full)
     );
     // The issue path reports the refusal to the owner.
@@ -545,7 +566,12 @@ async fn over_bound_file_fails_closed_and_is_never_truncated() {
     assert!(outbox.is_empty(), "nothing partial is held");
     assert!(matches!(
         outbox
-            .enqueue(&world.grant(2, 3_600), world.a1, world.now)
+            .enqueue(
+                &world.grant(2, 3_600),
+                world.a1,
+                world.now,
+                &world.revocations
+            )
             .await,
         Err(OutboxError::Store(_))
     ));
@@ -596,14 +622,20 @@ async fn entries_expire_at_ttl_or_grant_expiry() {
 
     // Long-lived grant: the outbox TTL is the deadline.
     let long = world.grant(7, 30 * 24 * 3_600);
-    assert!(outbox.enqueue(&long, world.a1, world.now).await.unwrap());
+    assert!(outbox
+        .enqueue(&long, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
     assert_eq!(
         outbox.pending()[0].deadline,
         world.now + OUTBOX_ENTRY_TTL_SECS
     );
     // Short grant: its expiry is the deadline.
     let short = world.grant(8, 600);
-    assert!(outbox.enqueue(&short, world.a1, world.now).await.unwrap());
+    assert!(outbox
+        .enqueue(&short, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
 
     // A restart after the short grant expired drops it on load.
     let after_short = world.now + 600;
@@ -628,7 +660,9 @@ async fn entries_expire_at_ttl_or_grant_expiry() {
     // An expired grant is never queued.
     let expired = world.grant(9, 1);
     assert!(matches!(
-        outbox.enqueue(&expired, world.a1, world.now + 1).await,
+        outbox
+            .enqueue(&expired, world.a1, world.now + 1, &world.revocations)
+            .await,
         Err(OutboxError::NotQueueable(_))
     ));
 }
@@ -642,7 +676,12 @@ async fn foreign_grants_are_not_queued() {
     let outbox = GrantRedeliveryOutbox::in_memory(Some(stranger.user_id()));
     assert!(matches!(
         outbox
-            .enqueue(&world.grant(10, 3_600), world.a1, world.now)
+            .enqueue(
+                &world.grant(10, 3_600),
+                world.a1,
+                world.now,
+                &world.revocations
+            )
             .await,
         Err(OutboxError::NotQueueable(_))
     ));
@@ -716,8 +755,7 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     );
 
     paused.release.notify_one();
-    let report = step.await;
-    assert_eq!(report.delivered, 1, "the in-flight send is ordered first");
+    let _ = step.await; // the in-flight send returns (the outcome is not the contract)
     revoke.await;
     assert!(world
         .revocations
@@ -728,12 +766,19 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     // From here on nothing of this grant is ever sent.
     let sends = receiver.sends.load(Ordering::SeqCst);
     let other = AgentId([0x42; 32]);
-    assert_eq!(outbox.enqueue(grant, other, world.now).await, Ok(true));
+    assert_eq!(
+        outbox
+            .enqueue(grant, other, world.now, &world.revocations)
+            .await,
+        Err(OutboxError::Revoked),
+        "a revoked grant can no longer be queued"
+    );
+    assert!(outbox.is_empty());
     outbox.nudge(&[other], due);
     let report = outbox
         .step(due, &world.revocations, |r, p, id| receiver.send(r, p, id))
         .await;
-    assert_eq!((report.delivered, report.dropped), (0, 1), "{report:?}");
+    assert_eq!(report, Default::default(), "{report:?}");
     assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
 }
 
@@ -749,7 +794,10 @@ async fn local_revoke_is_ordered_after_an_in_flight_send() {
     receiver.online.store(true, Ordering::SeqCst);
     let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
     let grant = world.grant(1, 3_600);
-    assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
     let identity_dir = world.identity_dir();
     let revoke = async {
         world.revoke(&grant, &identity_dir, &outbox).await.unwrap();
@@ -770,7 +818,10 @@ async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
         world.owner.user_id(),
     )));
     let grant = world.grant(1, 3_600);
-    assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
     let trust = OwnerTrust::new(
         Some(world.owner.user_id()),
         AuthenticatedMachineBindings::default(),
@@ -1071,4 +1122,395 @@ async fn revoke_fails_when_the_outbox_removal_is_not_durable() {
             .is_empty(),
         "the retry rewrote the outbox"
     );
+}
+
+/// WHY (#983 post-merge P1): `POST /grants` stores the grant, then awaits its
+/// initial DM. A `DELETE /grants/:id` that completes while that DM is still
+/// pending finds nothing queued to remove. When the DM then fails, the POST
+/// must NOT queue the (now revoked) grant — otherwise the worker would
+/// deliver it after DELETE returned success. Deterministic: the DM is
+/// paused on a notify, the DELETE is issued (and queues on the send gate),
+/// then the DM fails; the DELETE records the revocation before the POST can
+/// queue. Nothing may ever be queued or sent.
+#[tokio::test]
+async fn revoke_during_the_initial_dm_is_never_undone_by_the_post() {
+    use futures::FutureExt;
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner); // offline: DM fails
+    let outbox = world.outbox(world.now).await;
+    let grant = world.grant(1, 3_600);
+    let identity_dir = world.identity_dir();
+
+    let paused = PausedSend::new();
+    let recipients = [world.a1];
+    let post = deliver_grant_via(
+        &grant,
+        &recipients,
+        Some(&outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| paused.send(&receiver, r, p, id),
+    );
+    tokio::pin!(post);
+    assert!(post.as_mut().now_or_never().is_none());
+    assert!(
+        paused.entered.load(Ordering::SeqCst),
+        "control: the initial DM is in flight"
+    );
+
+    // DELETE is issued while the POST's DM is pending (it waits for the
+    // DM: #994 r1). It is queued on the send gate BEFORE the DM resolves,
+    // so it records the revocation before the POST can try to queue.
+    let delete = world.revoke(&grant, &identity_dir, &outbox);
+    tokio::pin!(delete);
+    assert!(delete.as_mut().now_or_never().is_none());
+
+    // The DM fails.
+    paused.release.notify_one();
+    let (mut deliveries, deleted) = tokio::join!(post, delete);
+    deleted.unwrap();
+    let delivery = deliveries.remove(0);
+    assert!(!delivery.delivered);
+    assert!(
+        !delivery.queued,
+        "a grant revoked during its initial DM must never be queued: {delivery:?}"
+    );
+    assert!(outbox.is_empty());
+    assert!(world.outbox(world.now).await.is_empty(), "nothing on disk");
+
+    // However long the worker runs afterwards, nothing is sent.
+    receiver.online.store(true, Ordering::SeqCst);
+    let sends = receiver.sends.load(Ordering::SeqCst);
+    for later in [world.now, world.now + 60, world.now + 3_000] {
+        let report = outbox
+            .step(later, &world.revocations, |r, p, id| {
+                receiver.send(r, p, id)
+            })
+            .await;
+        assert_eq!(report.delivered, 0, "{report:?}");
+    }
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
+    assert!(receiver.store.issued(&grant.grant_id).is_none());
+}
+
+fn typed_delivery_of(
+    grant: &ShareGrant,
+) -> (
+    DmTypedPayload,
+    tokio::sync::oneshot::Receiver<DmTypedPayloadCompletionResult>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    (
+        DmTypedPayload {
+            sender: AgentId([0xA0; 32]),
+            machine_id: MachineId([0xA1; 32]),
+            payload: grant.to_dm_payload().unwrap(),
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: 0,
+            request_id: [0; 16],
+            completion: Some(tx),
+        },
+        rx,
+    )
+}
+
+/// WHY (#983 post-merge P1, defence in depth): a daemon that already knows
+/// a grant is revoked must refuse to store a delivery of it (ACK withheld),
+/// even if a sender raced the revocation.
+#[tokio::test]
+async fn receiver_refuses_a_grant_it_knows_is_revoked() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    let store = ShareGrantStore::in_memory(world.a1, Some(world.owner.user_id()));
+
+    world.revoke_in_memory_only(&grant).await;
+    let (typed, rx) = typed_delivery_of(&grant);
+    assert!(
+        handle_share_grant_dm_checked(Some(&store), Some(&world.revocations), typed)
+            .await
+            .is_err()
+    );
+    assert!(matches!(rx.await, Ok(Err(_))), "ACK withheld");
+    assert!(store.issued(&grant.grant_id).is_none(), "not stored");
+
+    // Control: an unrevoked grant on the same path is stored.
+    let other = world.grant(2, 3_600);
+    let (typed, _rx) = typed_delivery_of(&other);
+    assert!(
+        handle_share_grant_dm_checked(Some(&store), Some(&world.revocations), typed)
+            .await
+            .is_ok()
+    );
+    assert!(store.issued(&other.grant_id).is_some());
+}
+
+/// WHY (#983 post-merge P2): after a failed write the outbox is dirty; the
+/// next worker pass must retry the write even when nothing is due, or a
+/// removed (e.g. revoked) entry lingers on disk until some other mutation.
+#[tokio::test]
+async fn idle_worker_retries_a_dirty_outbox_write() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    let dir = world.dir.path().join("o");
+    let path = dir.join(super::super::outbox::SHARE_GRANT_OUTBOX_FILE);
+    let outbox =
+        GrantRedeliveryOutbox::load(path.clone(), Some(world.owner.user_id()), world.now).await;
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
+
+    // The removal's write fails: memory is empty, the file still holds it.
+    let parked = world.dir.path().join("o.parked");
+    std::fs::rename(&dir, &parked).unwrap();
+    std::fs::write(&dir, b"not a dir").unwrap();
+    assert!(outbox.remove_grant(&grant.grant_id).await.is_err());
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::rename(&parked, &dir).unwrap();
+    assert_eq!(
+        GrantRedeliveryOutbox::load(path.clone(), Some(world.owner.user_id()), world.now)
+            .await
+            .len(),
+        1,
+        "control: the stale entry is on disk"
+    );
+
+    // An idle pass (nothing queued, nothing due) repairs the file.
+    let receiver = Receiver::new(world.a1, &world.owner);
+    let report = outbox
+        .step(world.now, &world.revocations, |r, p, id| {
+            receiver.send(r, p, id)
+        })
+        .await;
+    assert_eq!(report, Default::default());
+    assert!(
+        GrantRedeliveryOutbox::load(path, Some(world.owner.user_id()), world.now)
+            .await
+            .is_empty(),
+        "the dirty write was retried"
+    );
+}
+
+/// WHY (#994 r1/r2, contract 1): a `DELETE /grants/:id` issued while the
+/// POST's initial DM is in flight must not record the revocation until that
+/// send has returned, and once it has, the owner makes no new send or
+/// enqueue of the grant. (Whether the in-flight DM lands is contract 2, the
+/// receiver's job — see `stored_grant_stops_granting_when_the_revocation_arrives`.)
+/// Deterministic: the DM is paused on a notify and the DELETE is polled
+/// exactly once; without the POST holding the send gate, that single poll
+/// records the revocation (before any I/O) and the assertion fails.
+#[tokio::test]
+async fn delete_waits_for_an_in_flight_initial_send_then_nothing_new_is_sent() {
+    use futures::FutureExt;
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst); // the DM will succeed
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(1, 3_600);
+    let identity_dir = world.identity_dir();
+
+    let paused = PausedSend::new();
+    let recipients = [world.a1];
+    let post = deliver_grant_via(
+        &grant,
+        &recipients,
+        Some(&outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| paused.send(&receiver, r, p, id),
+    );
+    tokio::pin!(post);
+    assert!(post.as_mut().now_or_never().is_none());
+    assert!(
+        paused.entered.load(Ordering::SeqCst),
+        "control: the initial DM is in flight"
+    );
+
+    let delete = world.revoke(&grant, &identity_dir, &outbox);
+    tokio::pin!(delete);
+    assert!(
+        delete.as_mut().now_or_never().is_none(),
+        "DELETE must block while the initial DM is in flight"
+    );
+    assert!(
+        !world
+            .revocations
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+        "the revocation took effect while the initial DM was in flight"
+    );
+
+    paused.release.notify_one();
+    let _ = post.await; // the in-flight send returns (its outcome is contract 2)
+    delete.await.unwrap();
+    assert!(world
+        .revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+
+    // After DELETE returned: no new send and no new enqueue, by any path.
+    let sends = receiver.sends.load(Ordering::SeqCst);
+    let again = deliver_grant_via(
+        &grant,
+        &recipients,
+        Some(&outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| receiver.send(r, p, id),
+    )
+    .await;
+    assert!(!again[0].delivered && !again[0].queued, "{again:?}");
+    assert_eq!(
+        outbox
+            .enqueue(&grant, world.a1, world.now, &world.revocations)
+            .await,
+        Err(OutboxError::Revoked)
+    );
+    assert!(outbox.is_empty());
+    let report = outbox
+        .step(world.now + 3_000, &world.revocations, |r, p, id| {
+            receiver.send(r, p, id)
+        })
+        .await;
+    assert_eq!(report, Default::default());
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends, "no new send");
+}
+
+/// WHY (#994 r2, contract 2): a DM already on the wire when DELETE returns
+/// may still be stored by its recipient. That recipient must STOP granting
+/// access the moment the revocation reaches it by gossip — the real access
+/// decision (`evaluate_grant_access`), not just a flag — and must refuse any
+/// later redelivery of the grant.
+#[tokio::test]
+async fn stored_grant_stops_granting_when_the_revocation_arrives() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let grant = world.grant(1, 3_600);
+
+    // The in-flight DM lands and is stored before the revocation arrives.
+    let payload = grant.to_dm_payload().unwrap();
+    receiver
+        .send(world.a1, payload.clone(), [7; 16])
+        .await
+        .unwrap();
+    assert!(receiver.store.issued(&grant.grant_id).is_some());
+    assert!(world.b1_has_dm_on(&receiver).await, "control: honoured");
+
+    // The revocation arrives on the v3 gossip carrier.
+    let v3 = bincode::serialize(&vec![world.revocation_record(&grant)]).unwrap();
+    assert!(
+        crate::ingest_share_grant_revocations(
+            &OwnerTrust::default(),
+            &world.revocations,
+            Some(world.identity_dir()),
+            &v3,
+        )
+        .await
+    );
+    assert!(
+        !world.b1_has_dm_on(&receiver).await,
+        "a stored grant stops granting once its revocation arrives"
+    );
+
+    // And a later redelivery of it is refused on the checked route.
+    let fresh = ShareGrantStore::in_memory(world.a1, Some(world.owner.user_id()));
+    let (typed, _rx) = typed_delivery_of(&grant);
+    assert!(
+        handle_share_grant_dm_checked(Some(&fresh), Some(&world.revocations), typed)
+            .await
+            .is_err()
+    );
+    assert!(fresh.issued(&grant.grant_id).is_none());
+}
+
+/// WHY (#1004 P3 a): an entry that expired while the daemon was down must
+/// leave the outbox FILE on load, not only memory. Otherwise it stays on
+/// disk until some unrelated write happens. Here the file is loaded again
+/// at a time when that entry was still live: without the rewrite the stale
+/// entry would come back.
+#[tokio::test]
+async fn expired_entries_are_pruned_from_disk_on_load() {
+    let world = World::new().await;
+    let short = world.grant(0x31, 100);
+    let long = world.grant(0x32, 3_600);
+    {
+        let outbox = world.outbox(world.now).await;
+        for grant in [&short, &long] {
+            assert!(outbox
+                .enqueue(grant, world.a1, world.now, &world.revocations)
+                .await
+                .unwrap());
+        }
+    }
+    assert_eq!(
+        world.outbox(world.now).await.len(),
+        2,
+        "control: both entries are on disk"
+    );
+
+    // Restart after the short grant's deadline: it is dropped on load.
+    let restarted = world.outbox(world.now + 200).await;
+    assert!(restarted.load_error().is_none());
+    assert_eq!(restarted.len(), 1);
+    drop(restarted);
+
+    // Read the file back at a time when the short entry would still be
+    // live: only a rewritten file lacks it.
+    let reread = world.outbox(world.now).await;
+    let ids: Vec<[u8; 32]> = reread.pending().iter().map(|e| e.grant.grant_id).collect();
+    assert_eq!(
+        ids,
+        vec![long.grant_id],
+        "the entry that expired while down must be gone from share-grant-outbox.bin"
+    );
+}
+
+/// WHY (#1004 P3 b): when the grantee's machine reconnects, the nudge must
+/// cover every queued delivery to it, including one that is ALREADY due. It
+/// used to count only entries it moved earlier, so for an overdue entry it
+/// reported nothing and did not wake the worker, and the retry waited for
+/// the next poll.
+#[tokio::test]
+async fn reconnect_nudge_includes_already_due_entries() {
+    use futures::FutureExt;
+    let world = World::new().await;
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(0x33, 3_600);
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
+    // Consume the wake-up left by the enqueue.
+    assert!(outbox.notified().now_or_never().is_some());
+    assert!(
+        outbox.notified().now_or_never().is_none(),
+        "control: no wake-up pending"
+    );
+
+    // The entry is overdue when A1's machine connects again.
+    let later = world.now + retry_delay_secs(0) + 10;
+    let scheduled = outbox.pending()[0].next_attempt_at;
+    assert!(scheduled < later, "control: the entry is already due");
+
+    assert!(
+        outbox.nudge(&[world.a1], later),
+        "a nudge must include a delivery that is already due"
+    );
+    assert!(
+        outbox.notified().now_or_never().is_some(),
+        "the nudge must wake the worker for an already-due delivery"
+    );
+    assert_eq!(
+        outbox.pending()[0].next_attempt_at,
+        scheduled,
+        "an overdue entry keeps its earlier schedule"
+    );
+
+    // A peer with nothing queued is still not nudged.
+    assert!(!outbox.nudge(&[AgentId([0x42; 32])], later));
+    assert!(outbox.notified().now_or_never().is_none());
 }
