@@ -94,7 +94,6 @@ fn steps(agent_id: &str, card: &Card<'_>) -> Vec<Step> {
                 format!("curl -sfLO {INSTALL_SH_URL}"),
                 "cat install.sh   # review it first".to_string(),
                 "sh install.sh    # installs to ~/.local/bin and starts the daemon".to_string(),
-                "export PATH=\"$HOME/.local/bin:$PATH\"".to_string(),
             ],
             note: Some(format!(
                 "Ask your human before installing software or starting a background daemon. \
