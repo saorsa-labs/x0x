@@ -6,11 +6,12 @@
 //! tests. Records reach loro only after they decode (bounded), their author
 //! signature verifies, and their author is a current writer.
 
-use super::engine::{EngineRecord, NoteActor, NoteView, NotesEngine};
+use super::engine::{update_ops, EngineRecord, NoteActor, NoteView, NotesEngine, UpdateOps};
 use super::error::NoteError;
 use super::record::{
     decode_record, encode_record, is_note_id, meta_key, parse_record_key, record_prefix,
-    sign_record, verify_record, RecordRejection, MAX_UPDATE_BYTES, RECORD_CONTENT_TYPE,
+    sign_record, verify_record, RecordRejection, RosterEpoch, MAX_UPDATE_BYTES,
+    RECORD_CONTENT_TYPE,
 };
 use crate::identity::AgentId;
 use crate::kv::encrypted::AuthorSigning;
@@ -114,20 +115,130 @@ pub struct SyncReport {
     pub accepted: usize,
     /// Records refused for good (malformed or bad signature).
     pub rejected: usize,
-    /// Records held back (author key unknown or author not a writer).
+    /// Records held back: author key unknown, epoch not yet known, or a
+    /// dependency not yet accepted (ADR 0082 §3, §4).
     pub held: usize,
+    /// Records refused because their author was not a writer at the
+    /// record's epoch, or because they depend on a later epoch.
+    pub refused_epoch: usize,
 }
 
-/// Whether an agent is a current writer of the group.
-pub type WriterCheck = Arc<dyn Fn(&AgentId) -> bool + Send + Sync>;
+/// Whether an author was a writer at a roster epoch (ADR 0082 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochVerdict {
+    /// The author was an active member at the epoch.
+    Writer,
+    /// The epoch is known and the author was not an active member.
+    NotWriter,
+    /// The epoch is not (yet) known here: future, forked or pre-history
+    /// without evidence. The record is held.
+    Unknown,
+}
+
+/// The group's roster history as the notes store sees it (ADR 0082 §1).
+pub trait RosterView: Send + Sync {
+    /// The group head epoch, or `None` when no valid epoch exists (the
+    /// local daemon then cannot sign records).
+    fn head(&self) -> Option<RosterEpoch>;
+    /// Whether `author` was a writer at `epoch`.
+    fn writer_at(&self, author: &AgentId, epoch: &RosterEpoch) -> EpochVerdict;
+}
+
+/// A shared roster view.
+pub type SharedRosterView = Arc<dyn RosterView>;
+
+/// Roster history built from the group's signed state-commit chain: the
+/// head plus every retained commit's roster projection (ADR 0082 §1, §3).
+#[derive(Debug, Clone, Default)]
+pub struct RosterHistory {
+    head: Option<RosterEpoch>,
+    /// revision → (state_hash, active member ids).
+    epochs: std::collections::BTreeMap<u64, ([u8; 32], std::collections::BTreeSet<[u8; 32]>)>,
+}
+
+impl RosterHistory {
+    /// An empty history: every epoch is unknown and nothing can be signed
+    /// (a withdrawn or fork-quarantined group).
+    #[must_use]
+    pub fn unavailable() -> Self {
+        Self::default()
+    }
+
+    /// A history whose head is `head` with `active` members.
+    #[must_use]
+    pub fn new(head: RosterEpoch, active: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        let mut history = Self {
+            head: Some(head),
+            epochs: std::collections::BTreeMap::new(),
+        };
+        history.epochs.insert(
+            head.revision,
+            (head.state_hash, active.into_iter().collect()),
+        );
+        history
+    }
+
+    /// Add a retained epoch (a commit and the roster it sealed over).
+    #[must_use]
+    pub fn with_epoch(
+        mut self,
+        epoch: RosterEpoch,
+        active: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Self {
+        if self.head.is_none_or(|head| epoch.revision <= head.revision) {
+            self.epochs
+                .entry(epoch.revision)
+                .or_insert_with(|| (epoch.state_hash, active.into_iter().collect()));
+        }
+        self
+    }
+}
+
+impl RosterView for RosterHistory {
+    fn head(&self) -> Option<RosterEpoch> {
+        self.head
+    }
+
+    fn writer_at(&self, author: &AgentId, epoch: &RosterEpoch) -> EpochVerdict {
+        let Some(head) = self.head else {
+            return EpochVerdict::Unknown;
+        };
+        if epoch.revision > head.revision {
+            return EpochVerdict::Unknown; // a future epoch: held
+        }
+        if let Some((hash, active)) = self.epochs.get(&epoch.revision) {
+            if *hash != epoch.state_hash {
+                return EpochVerdict::Unknown; // another chain: held
+            }
+            return if active.contains(&author.0) {
+                EpochVerdict::Writer
+            } else {
+                EpochVerdict::NotWriter
+            };
+        }
+        // Pre-history: older than every roster held here. Accept authors
+        // who are writers at the earliest roster held; hold the rest until
+        // roster evidence arrives (ADR 0082 §3).
+        match self.epochs.first_key_value() {
+            Some((first, (_, active))) if epoch.revision < *first => {
+                if active.contains(&author.0) {
+                    EpochVerdict::Writer
+                } else {
+                    EpochVerdict::Unknown
+                }
+            }
+            _ => EpochVerdict::Unknown,
+        }
+    }
+}
 
 /// The notes store bound to one group store, one signer and the group's
-/// current writer rule.
+/// roster history.
 pub struct NotesStore<'a, K: NoteKv + ?Sized> {
     kv: &'a K,
     engine: &'a NotesEngine,
     signing: &'a AuthorSigning,
-    is_writer: WriterCheck,
+    roster: SharedRosterView,
 }
 
 fn now_ms() -> u64 {
@@ -184,15 +295,24 @@ pub fn check_budget(
 
 /// Verified-or-refused verdict for one candidate record.
 enum Verdict {
-    Accepted {
-        id: String,
-        update: Vec<u8>,
-        author: AgentId,
-    },
-    Rejected {
-        id: String,
-        permanent: bool,
-    },
+    Accepted(Box<Verified>),
+    Rejected { id: String, permanent: bool },
+}
+
+/// A record whose signature verified, pending the epoch rules.
+struct Verified {
+    id: String,
+    update: Vec<u8>,
+    author: AgentId,
+    epoch: RosterEpoch,
+    ops: UpdateOps,
+}
+
+/// Where a verified record stands against the epoch rules.
+enum EpochDecision {
+    Accept,
+    Hold,
+    Refuse,
 }
 
 impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
@@ -201,14 +321,37 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
         kv: &'a K,
         engine: &'a NotesEngine,
         signing: &'a AuthorSigning,
-        is_writer: WriterCheck,
+        roster: SharedRosterView,
     ) -> Self {
         Self {
             kv,
             engine,
             signing,
-            is_writer,
+            roster,
         }
+    }
+
+    /// ADR 0082 §3 and §4 for one verified record, against the op index.
+    fn epoch_decision(
+        &self,
+        record: &Verified,
+        cache: &super::engine::VerifyCache,
+    ) -> EpochDecision {
+        match self.roster.writer_at(&record.author, &record.epoch) {
+            EpochVerdict::NotWriter => return EpochDecision::Refuse,
+            EpochVerdict::Unknown => return EpochDecision::Hold,
+            EpochVerdict::Writer => {}
+        }
+        for (peer, counter) in &record.ops.deps {
+            match cache.op_epoch(*peer, *counter) {
+                None => return EpochDecision::Hold,
+                Some((revision, _)) if revision > record.epoch.revision => {
+                    return EpochDecision::Refuse;
+                }
+                Some(_) => {}
+            }
+        }
+        EpochDecision::Accept
     }
 
     async fn note_key(&self, note_id: &str) -> Result<String, NoteError> {
@@ -347,7 +490,6 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
         candidates.sort_by_key(|(key, _, _)| parse_record_key(key).map_or(u64::MAX, |k| k.seq));
         let store_id = self.kv.store_id().await?;
         let note = note_id.to_string();
-        let keys_before = author_keys.clone();
         // Decode and verify off the async runtime, each record isolated.
         let joined = tokio::task::spawn_blocking(move || {
             let mut verdicts = Vec::new();
@@ -356,7 +498,13 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
                     verify_candidate(&store_id, &note, &key, &value, &mut author_keys)
                 }));
                 verdicts.push(match verdict {
-                    Ok(Ok((update, author))) => Verdict::Accepted { id, update, author },
+                    Ok(Ok((update, author, epoch, ops))) => Verdict::Accepted(Box::new(Verified {
+                        id,
+                        update,
+                        author,
+                        epoch,
+                        ops,
+                    })),
                     Ok(Err(rejection)) => Verdict::Rejected {
                         id,
                         permanent: rejection.is_permanent(),
@@ -375,20 +523,11 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
             op: "verify_records",
         })?;
         let mut report = SyncReport::default();
-        let mut accepted = Vec::new();
         let mut permanent = Vec::new();
+        let mut verified = Vec::new();
         for verdict in verdicts {
             match verdict {
-                Verdict::Accepted { id, update, author } => {
-                    if (self.is_writer)(&author) {
-                        accepted.push(EngineRecord {
-                            id,
-                            update: Arc::new(update),
-                        });
-                    } else {
-                        report.held += 1;
-                    }
-                }
+                Verdict::Accepted(record) => verified.push(*record),
                 Verdict::Rejected {
                     id,
                     permanent: true,
@@ -397,15 +536,46 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
             }
         }
         report.rejected = permanent.len();
-        report.accepted = accepted.len();
-        actor.with_verify_cache(|cache| {
-            cache.rejected.extend(permanent);
+        // ADR 0082: resolve the epoch rules to a fixpoint, since a record
+        // may depend on another record of the same batch.
+        let accepted = actor.with_verify_cache(|cache| {
             for (author, key) in author_keys {
-                if !keys_before.contains_key(&author) {
-                    cache.author_keys.insert(author, key);
+                cache.author_keys.entry(author).or_insert(key);
+            }
+            let mut accepted = Vec::new();
+            loop {
+                let mut progress = false;
+                let mut still_held = Vec::new();
+                for record in verified.drain(..) {
+                    match self.epoch_decision(&record, cache) {
+                        EpochDecision::Accept => {
+                            cache.index_ops(
+                                &record.ops.spans,
+                                (record.epoch.revision, record.epoch.state_hash),
+                            );
+                            accepted.push(EngineRecord {
+                                id: record.id,
+                                update: Arc::new(record.update),
+                            });
+                            progress = true;
+                        }
+                        EpochDecision::Refuse => {
+                            report.refused_epoch += 1;
+                            permanent.push(record.id);
+                        }
+                        EpochDecision::Hold => still_held.push(record),
+                    }
+                }
+                verified = still_held;
+                if !progress {
+                    break;
                 }
             }
+            report.held += verified.len();
+            cache.rejected.extend(permanent);
+            accepted
         });
+        report.accepted = accepted.len();
         actor.import(accepted).await?;
         Ok(report)
     }
@@ -484,6 +654,7 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
                 }
             }
         }
+        let (epoch, chunk_ops) = self.save_epoch(actor, &prepared).await?;
         let mut encoded = Vec::with_capacity(prepared.updates.len());
         for (i, update) in prepared.updates.into_iter().enumerate() {
             let seq = next_seq.saturating_add(i as u64);
@@ -493,6 +664,7 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
                 note_id,
                 seq,
                 prepared.loro_peer,
+                epoch,
                 update,
             )?;
             let bytes = encode_record(&record)?;
@@ -516,8 +688,77 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
             });
         }
         let written = local.len();
+        actor.with_verify_cache(|cache| {
+            for ops in &chunk_ops {
+                cache.index_ops(&ops.spans, (epoch.revision, epoch.state_hash));
+            }
+        });
         actor.import(local).await?;
         Ok((written, published))
+    }
+
+    /// The epoch a save signs under (ADR 0082 §2): the later of the group
+    /// head and every epoch the saved ops depend on. The local author must
+    /// be a writer at it.
+    async fn save_epoch(
+        &self,
+        actor: &NoteActor,
+        prepared: &super::engine::PreparedSave,
+    ) -> Result<(RosterEpoch, Vec<UpdateOps>), NoteError> {
+        let head = self
+            .roster
+            .head()
+            .ok_or_else(|| NoteError::Forbidden("the group has no valid roster epoch".into()))?;
+        let updates = prepared.updates.clone();
+        let peer = prepared.loro_peer;
+        let chunk_ops = tokio::task::spawn_blocking(move || {
+            updates
+                .iter()
+                .map(|u| checked_ops(u, peer))
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .await
+        .map_err(|_| NoteError::EngineFault {
+            note_id: actor.note_id().to_string(),
+            op: "save_epoch",
+        })?
+        .map_err(NoteError::Store)?;
+        let mut epoch = head;
+        let resolved = actor.with_verify_cache(|cache| {
+            for ops in &chunk_ops {
+                for (dep_peer, counter) in &ops.deps {
+                    if *dep_peer == peer {
+                        // An earlier chunk of this same save.
+                        if cache.op_epoch(*dep_peer, *counter).is_none() {
+                            continue;
+                        }
+                    }
+                    let Some((revision, hash)) = cache.op_epoch(*dep_peer, *counter) else {
+                        return Err(NoteError::Store(
+                            "a saved op depends on an op with no known epoch".into(),
+                        ));
+                    };
+                    if revision > epoch.revision {
+                        epoch = RosterEpoch {
+                            revision,
+                            state_hash: hash,
+                        };
+                    } else if revision == epoch.revision && hash != epoch.state_hash {
+                        return Err(NoteError::Forbidden(
+                            "the note depends on a different roster chain (fork)".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        });
+        resolved?;
+        if self.roster.writer_at(&self.signing.agent_id, &epoch) != EpochVerdict::Writer {
+            return Err(NoteError::Forbidden(
+                "this agent is not a writer at the save's roster epoch".into(),
+            ));
+        }
+        Ok((epoch, chunk_ops))
     }
 }
 
@@ -528,7 +769,7 @@ fn verify_candidate(
     key: &str,
     value: &[u8],
     author_keys: &mut std::collections::HashMap<[u8; 32], Vec<u8>>,
-) -> Result<(Vec<u8>, AgentId), RecordRejection> {
+) -> Result<(Vec<u8>, AgentId, RosterEpoch, UpdateOps), RecordRejection> {
     let parsed = parse_record_key(key)
         .ok_or_else(|| RecordRejection::Malformed("not a record key".into()))?;
     if parsed.note_id != note_id {
@@ -542,7 +783,20 @@ fn verify_candidate(
             .entry(parsed.author)
             .or_insert_with(|| pk.clone());
     }
-    Ok((record.update, author))
+    let ops = checked_ops(&record.update, record.loro_peer).map_err(RecordRejection::Malformed)?;
+    let epoch = record.epoch();
+    Ok((record.update, author, epoch, ops))
+}
+
+/// Decode an update's ops and require that they all belong to the record's
+/// own session peer: a record may not carry (and so re-date) other
+/// writers' ops (ADR 0082 §4).
+fn checked_ops(update: &[u8], loro_peer: u64) -> Result<UpdateOps, String> {
+    let ops = update_ops(update)?;
+    if ops.spans.is_empty() || ops.spans.iter().any(|(peer, _, _)| *peer != loro_peer) {
+        return Err("update ops do not all belong to the record's loro peer".into());
+    }
+    Ok(ops)
 }
 
 fn document(note_id: String, title: String, view: NoteView) -> NoteDocument {

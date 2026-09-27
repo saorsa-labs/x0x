@@ -23,6 +23,11 @@ All notable changes to this project will be documented in this file.
   base is a later slice, 409 `base_version_stale`). New dependency: `loro`
   1.16.2 and its loro-family crates, exact-pinned; the transitive `im`,
   `bitmaps` and `sized-chunks` crates are MPL-2.0.
+  Records are write-once in the KV layer: a verified record is never
+  replaced or removed by another member's value. A record is accepted if its
+  author was a writer at the roster epoch the record signs (ADR 0082,
+  proposed), so a removed member's earlier edits are kept and replicas
+  converge.
 - **Share-grant outbox P3 fixes (#1004).** Entries that expired while the
   daemon was down are now removed from `share-grant-outbox.bin` on load, not
   only from memory (a file that fails validation is still never rewritten).

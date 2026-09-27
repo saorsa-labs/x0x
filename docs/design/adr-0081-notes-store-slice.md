@@ -110,3 +110,26 @@ to the roster epoch it was written in, and accepting any record whose
 author was a writer at that epoch. That changes the ADR's "current
 writer" rule, so this slice does not do it. The code follows the ADR as
 written; this is a question for David.
+
+**Resolution (2026-09-27).** David chose an epoch-bound writer rule, proposed
+as ADR 0082 (PR #1020, awaiting acceptance). This branch now implements it:
+
+- **Records.** Records are `NoteUpdateRecordV2`, signing the
+  `(state_revision, state_hash)` they were written under.
+- **Verification.** A replica judges each record against its retained roster
+  at that epoch (`commit_log`). Records naming a future, forked or
+  pre-history epoch it cannot verify are held.
+- **Dependencies.** A record whose epoch is lower than an epoch it depends on
+  is refused. Every record's ops must belong to its own `loro_peer`, so a
+  record cannot re-date other writers' ops.
+
+Tests:
+
+- `removed_writers_earlier_records_survive_everywhere_including_restart`
+- `post_removal_record_is_refused`
+- `later_edit_depending_on_removed_writers_text_is_not_held`
+- `unknown_epoch_record_is_held_then_accepted`
+- `backdated_record_is_refused_only_when_it_builds_on_later_epochs`
+
+Each epoch-rule test has a control: under the old rule it would fail, or it
+fails with the relevant check disabled.

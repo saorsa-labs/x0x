@@ -7453,13 +7453,27 @@ mod tests {
             &note_id,
             0,
             1,
+            crate::notes::record::RosterEpoch {
+                revision: 1,
+                state_hash: [1; 32],
+            },
             update.clone(),
         )
         .expect("sign");
         // B's forgery under A's key: B's own signature, A's author field.
-        let (_, mut forged_record) =
-            crate::notes::record::sign_record(&b_signing, id.as_bytes(), &note_id, 0, 2, update)
-                .expect("sign");
+        let (_, mut forged_record) = crate::notes::record::sign_record(
+            &b_signing,
+            id.as_bytes(),
+            &note_id,
+            0,
+            2,
+            crate::notes::record::RosterEpoch {
+                revision: 1,
+                state_hash: [1; 32],
+            },
+            update,
+        )
+        .expect("sign");
         forged_record.author = a.0;
         let genuine = KvEntry::new(
             key.clone(),
@@ -7645,6 +7659,10 @@ mod tests {
             &note_id,
             0,
             LORO_PEER,
+            crate::notes::record::RosterEpoch {
+                revision: 1,
+                state_hash: [1; 32],
+            },
             update,
         )
         .expect("sign record");

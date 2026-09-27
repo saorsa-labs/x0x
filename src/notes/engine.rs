@@ -115,6 +115,47 @@ pub fn decode_version_bytes(token: &str) -> Result<Vec<u8>, NoteError> {
         .map_err(|e| NoteError::InvalidVersion(e.to_string()))
 }
 
+/// The ops one loro update contains and the external ops it depends on
+/// (ADR 0082 §4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateOps {
+    /// `(peer, start, end)` counter ranges the update contains.
+    pub spans: Vec<(u64, i32, i32)>,
+    /// External dependencies `(peer, counter)`: ops outside the update that
+    /// its changes depend on.
+    pub deps: Vec<(u64, i32)>,
+}
+
+/// Decode the op spans and external dependencies of a loro update blob.
+/// Peer bytes: the decode runs inside `catch_unwind`, and callers run it
+/// off the async runtime. Only `Updates`-mode blobs are accepted.
+///
+/// # Errors
+///
+/// A description of the decode failure (including a caught panic).
+pub fn update_ops(update: &[u8]) -> Result<UpdateOps, String> {
+    let meta = catch_unwind(AssertUnwindSafe(|| {
+        LoroDoc::decode_import_blob_meta(update, true)
+    }))
+    .map_err(|_| "update metadata decode panicked".to_string())?
+    .map_err(|e| format!("update metadata decode failed: {e}"))?;
+    if meta.mode != loro::EncodedBlobMode::Updates {
+        return Err(format!("not an updates blob: {}", meta.mode));
+    }
+    let mut spans = Vec::new();
+    for (peer, start) in meta.partial_start_vv.iter() {
+        let end = meta.partial_end_vv.get(peer).copied().unwrap_or(*start);
+        spans.push((*peer, *start, end));
+    }
+    spans.sort_unstable();
+    let deps = meta
+        .start_frontiers
+        .iter()
+        .map(|id| (id.peer, id.counter))
+        .collect();
+    Ok(UpdateOps { spans, deps })
+}
+
 /// Longest accepted version token (frontiers grow with concurrent heads,
 /// not history; 4 KiB is far above any real value).
 pub const MAX_VERSION_TOKEN_LEN: usize = 4096;
@@ -714,6 +755,13 @@ pub struct NoteActor {
     note_id: String,
 }
 
+/// A roster epoch as `(revision, state_hash)` (ADR 0082 §1).
+pub type OpEpoch = (u64, [u8; 32]);
+
+/// `(start, end, epoch)`: a counter range of one peer's ops and the epoch
+/// of the accepted record that carried them.
+pub type OpRange = (i32, i32, OpEpoch);
+
 /// Per-note record-verification state kept by the store layer.
 #[derive(Debug, Default)]
 pub struct VerifyCache {
@@ -722,6 +770,32 @@ pub struct VerifyCache {
     /// Author → ML-DSA-65 public key from that author's verified seq-0
     /// record of this note.
     pub author_keys: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    /// Op ranges of accepted records → the roster epoch
+    /// `(revision, state_hash)` they were written under (ADR 0082 §4).
+    pub op_index: std::collections::HashMap<u64, Vec<OpRange>>,
+}
+
+impl VerifyCache {
+    /// The epoch of the accepted record holding op `(peer, counter)`.
+    #[must_use]
+    pub fn op_epoch(&self, peer: u64, counter: i32) -> Option<OpEpoch> {
+        self.op_index.get(&peer).and_then(|ranges| {
+            ranges
+                .iter()
+                .find(|(start, end, _)| *start <= counter && counter < *end)
+                .map(|(_, _, epoch)| *epoch)
+        })
+    }
+
+    /// Record the op ranges of an accepted record.
+    pub fn index_ops(&mut self, spans: &[(u64, i32, i32)], epoch: OpEpoch) {
+        for (peer, start, end) in spans {
+            self.op_index
+                .entry(*peer)
+                .or_default()
+                .push((*start, *end, epoch));
+        }
+    }
 }
 
 impl std::fmt::Debug for NoteActor {

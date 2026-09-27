@@ -1,11 +1,13 @@
-//! `NoteUpdateRecordV1`: one write-once, author-signed record per save
-//! (ADR 0081 §5).
+//! `NoteUpdateRecordV2`: one write-once, author-signed record per save
+//! (ADR 0081 §5, epoch-bound by ADR 0082 §2).
 //!
 //! The record is the VALUE of key `n/<note_id>/u/<author_agent_hex>/<seq>`
 //! in the group's sealed `notes` store. It lives only inside
 //! `KvEntry.value`, which the #914 envelope seals; no outer field is added.
 //! Receivers accept a record only when its author signature verifies under
 //! a key that derives to the key segment's author, whoever published it.
+//! ADR 0082 adds the roster epoch the author wrote under to the signed
+//! fields, so the writer rule is evaluated at that epoch, not "now".
 
 use super::error::NoteError;
 use crate::identity::AgentId;
@@ -15,32 +17,47 @@ use bincode::Options as _;
 use serde::{Deserialize, Serialize};
 
 /// Domain prefix of every record signature.
-pub const RECORD_SIGNATURE_DOMAIN: &[u8] = b"x0x.notes.update-record.v1";
+pub const RECORD_SIGNATURE_DOMAIN: &[u8] = b"x0x.notes.update-record.v2";
 
 /// Largest encoded record accepted from a peer: the KV inline value cap.
 pub const MAX_RECORD_BYTES: u64 = crate::kv::entry::MAX_INLINE_SIZE as u64;
 
 /// Content type of an update record entry.
-pub const RECORD_CONTENT_TYPE: &str = "application/x-x0x-note-update-v1";
+pub const RECORD_CONTENT_TYPE: &str = "application/x-x0x-note-update-v2";
 
 /// Worst-case bytes a record adds around its `update`: the fixed fields,
 /// length prefixes, an ML-DSA-65 public key (seq 0) and signature, plus
 /// margin. `MAX_INLINE_SIZE - RECORD_OVERHEAD_BYTES` is the largest update
 /// one record carries.
-pub const RECORD_OVERHEAD_BYTES: usize = 32 + 8 + 8 + 8 + 1 + 8 + 1952 + 8 + 3309 + 256;
+pub const RECORD_OVERHEAD_BYTES: usize = 32 + 8 + 8 + 8 + 32 + 8 + 1 + 8 + 1952 + 8 + 3309 + 256;
 
 /// Largest loro update one record may carry.
 pub const MAX_UPDATE_BYTES: usize = crate::kv::entry::MAX_INLINE_SIZE - RECORD_OVERHEAD_BYTES;
 
-/// A signed note update record (ADR 0081 §5, field order is normative).
+/// A group roster epoch (ADR 0082 §1): a `state_revision` of the group's
+/// signed state-commit chain and the `state_hash` of that revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RosterEpoch {
+    /// The state-commit revision.
+    pub revision: u64,
+    /// The state hash of that revision.
+    pub state_hash: [u8; 32],
+}
+
+/// A signed note update record (ADR 0081 §5 as amended by ADR 0082 §2;
+/// field order is normative).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NoteUpdateRecordV1 {
+pub struct NoteUpdateRecordV2 {
     /// Author agent id; must equal the key's author segment.
     pub author: [u8; 32],
     /// Sequence number; must equal the key's seq segment.
     pub seq: u64,
     /// The session peer id that produced `update`.
     pub loro_peer: u64,
+    /// The roster epoch revision the author wrote under.
+    pub roster_epoch: u64,
+    /// The state hash of `roster_epoch`.
+    pub roster_state_hash: [u8; 32],
     /// loro `export(ExportMode::updates(vv_before_save))` (or one counter
     /// range of it when a save is split across seqs).
     pub update: Vec<u8>,
@@ -50,6 +67,17 @@ pub struct NoteUpdateRecordV1 {
     pub author_sig: Vec<u8>,
 }
 
+impl NoteUpdateRecordV2 {
+    /// The roster epoch the record claims (ADR 0082 §2).
+    #[must_use]
+    pub fn epoch(&self) -> RosterEpoch {
+        RosterEpoch {
+            revision: self.roster_epoch,
+            state_hash: self.roster_state_hash,
+        }
+    }
+}
+
 /// The signed fields, in the record's order, for the `blake3(bincode(..))`
 /// digest.
 #[derive(Serialize)]
@@ -57,6 +85,8 @@ struct SignedFields<'a> {
     author: &'a [u8; 32],
     seq: u64,
     loro_peer: u64,
+    roster_epoch: u64,
+    roster_state_hash: &'a [u8; 32],
     update: &'a [u8],
     author_pubkey: &'a Option<Vec<u8>>,
 }
@@ -69,17 +99,19 @@ fn codec() -> impl bincode::Options {
         .reject_trailing_bytes()
 }
 
-/// `"x0x.notes.update-record.v1" || store_id || key || blake3(bincode(fields))`.
+/// `"x0x.notes.update-record.v2" || store_id || key || blake3(bincode(fields))`.
 ///
 /// # Errors
 ///
 /// [`NoteError::Signing`] if the fields cannot be encoded.
+#[allow(clippy::too_many_arguments)]
 pub fn signing_bytes(
     store_id: &[u8; 32],
     key: &str,
     author: &[u8; 32],
     seq: u64,
     loro_peer: u64,
+    epoch: &RosterEpoch,
     update: &[u8],
     author_pubkey: &Option<Vec<u8>>,
 ) -> Result<Vec<u8>, NoteError> {
@@ -87,6 +119,8 @@ pub fn signing_bytes(
         author,
         seq,
         loro_peer,
+        roster_epoch: epoch.revision,
+        roster_state_hash: &epoch.state_hash,
         update,
         author_pubkey,
     };
@@ -187,8 +221,9 @@ pub fn sign_record(
     note_id: &str,
     seq: u64,
     loro_peer: u64,
+    epoch: RosterEpoch,
     update: Vec<u8>,
-) -> Result<(String, NoteUpdateRecordV1), NoteError> {
+) -> Result<(String, NoteUpdateRecordV2), NoteError> {
     let author = signing.agent_id.0;
     let key = record_key(note_id, &author, seq);
     let author_pubkey = (seq == 0).then(|| signing.public_key_bytes());
@@ -198,6 +233,7 @@ pub fn sign_record(
         &author,
         seq,
         loro_peer,
+        &epoch,
         &update,
         &author_pubkey,
     )?;
@@ -206,10 +242,12 @@ pub fn sign_record(
         .map_err(|e| NoteError::Signing(e.to_string()))?;
     Ok((
         key,
-        NoteUpdateRecordV1 {
+        NoteUpdateRecordV2 {
             author,
             seq,
             loro_peer,
+            roster_epoch: epoch.revision,
+            roster_state_hash: epoch.state_hash,
             update,
             author_pubkey,
             author_sig,
@@ -222,7 +260,7 @@ pub fn sign_record(
 /// # Errors
 ///
 /// [`NoteError::Signing`] if encoding fails or exceeds the inline cap.
-pub fn encode_record(record: &NoteUpdateRecordV1) -> Result<Vec<u8>, NoteError> {
+pub fn encode_record(record: &NoteUpdateRecordV2) -> Result<Vec<u8>, NoteError> {
     codec()
         .serialize(record)
         .map_err(|e| NoteError::Signing(format!("record encode failed: {e}")))
@@ -234,7 +272,7 @@ pub fn encode_record(record: &NoteUpdateRecordV1) -> Result<Vec<u8>, NoteError> 
 /// # Errors
 ///
 /// A description of the decode failure.
-pub fn decode_record(bytes: &[u8]) -> Result<NoteUpdateRecordV1, String> {
+pub fn decode_record(bytes: &[u8]) -> Result<NoteUpdateRecordV2, String> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err("record larger than the inline cap".into());
     }
@@ -280,7 +318,7 @@ impl RecordRejection {
 pub fn verify_record(
     store_id: &[u8; 32],
     key: &str,
-    record: &NoteUpdateRecordV1,
+    record: &NoteUpdateRecordV2,
     known_key: Option<&[u8]>,
 ) -> Result<AgentId, RecordRejection> {
     let parsed = parse_record_key(key)
@@ -322,6 +360,7 @@ pub fn verify_record(
         &record.author,
         record.seq,
         record.loro_peer,
+        &record.epoch(),
         &record.update,
         &record.author_pubkey,
     )

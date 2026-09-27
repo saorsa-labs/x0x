@@ -7,12 +7,12 @@
 use super::engine::NotesEngine;
 use super::error::NoteError;
 use super::record::{
-    decode_record, encode_record, record_key, record_prefix, sign_record, signing_bytes,
-    NoteUpdateRecordV1,
+    decode_record, encode_record, record_key, sign_record, signing_bytes, NoteUpdateRecordV2,
+    RosterEpoch,
 };
 use super::store::{
-    check_budget, entry_cost, KvFuture, NoteKv, NotesStore, WriterCheck, NOTE_CAP_BYTES,
-    STORE_BUDGET_BYTES,
+    check_budget, entry_cost, EpochVerdict, KvFuture, NoteKv, NotesStore, RosterHistory,
+    RosterView, SharedRosterView, NOTE_CAP_BYTES, STORE_BUDGET_BYTES,
 };
 use crate::identity::{AgentId, AgentKeypair};
 use crate::kv::encrypted::AuthorSigning;
@@ -98,14 +98,62 @@ impl Member {
         self.signing.agent_id
     }
 
-    fn store(&self, writers: &WriterCheck) -> NotesStore<'_, MemKv> {
-        NotesStore::new(&self.kv, &self.engine, &self.signing, Arc::clone(writers))
+    fn store(&self, roster: &SharedRosterView) -> NotesStore<'_, MemKv> {
+        NotesStore::new(&self.kv, &self.engine, &self.signing, Arc::clone(roster))
+    }
+
+    /// The same member after a daemon restart: same key and store, fresh
+    /// in-memory engine (every record is re-verified).
+    fn restarted(self) -> Self {
+        Self {
+            signing: self.signing,
+            engine: NotesEngine::new(None),
+            kv: self.kv,
+        }
     }
 }
 
-fn writers(ids: &[AgentId]) -> WriterCheck {
-    let set: BTreeSet<[u8; 32]> = ids.iter().map(|a| a.0).collect();
-    Arc::new(move |agent: &AgentId| set.contains(&agent.0))
+/// Roster epoch `n` of the test group's state-commit chain.
+fn e(n: u8) -> RosterEpoch {
+    RosterEpoch {
+        revision: u64::from(n),
+        state_hash: [n; 32],
+    }
+}
+
+/// A single-epoch roster (head `e(1)`) whose active members are `ids`.
+fn writers(ids: &[AgentId]) -> SharedRosterView {
+    Arc::new(RosterHistory::new(e(1), ids.iter().map(|a| a.0)))
+}
+
+/// The ADR 0081 "current writer" rule, kept as the CONTROL for the ADR 0082
+/// tests: a record is judged against the head roster, whatever its epoch.
+struct CurrentWriterOnly(RosterHistory);
+
+impl RosterView for CurrentWriterOnly {
+    fn head(&self) -> Option<RosterEpoch> {
+        self.0.head()
+    }
+
+    fn writer_at(&self, author: &AgentId, _epoch: &RosterEpoch) -> EpochVerdict {
+        match self.0.head() {
+            Some(head) => self.0.writer_at(author, &head),
+            None => EpochVerdict::Unknown,
+        }
+    }
+}
+
+/// A loro update of `text` from a fresh doc: `(loro_peer, update)`.
+fn loro_update(text: &str) -> (u64, Vec<u8>) {
+    let doc = loro::LoroDoc::new();
+    doc.get_text(super::engine::TEXT_CONTAINER)
+        .insert(0, text)
+        .expect("insert");
+    doc.commit();
+    (
+        doc.peer_id(),
+        doc.export(loro::ExportMode::all_updates()).expect("export"),
+    )
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -149,26 +197,14 @@ fn forged_author_is_rejected_and_relayed_genuine_record_accepted() {
 
         // Forgery 1: B signs a record under A's segment with B's own key.
         let victim_key = record_key(&note.note_id, &a.id().0, 1);
-        let donor = Member::new();
-        let donor_store = donor.store(&all);
-        let donor_note = donor_store.create("donor").await.expect("create");
-        donor_store
-            .save(&donor_note.note_id, "FORGED", &donor_note.version)
-            .await
-            .expect("donor save");
-        let (_, donor_value) = donor
-            .kv
-            .snapshot()
-            .into_iter()
-            .find(|(k, _)| k.starts_with(&record_prefix(&donor_note.note_id)))
-            .expect("donor record");
-        let forged_update = decode_record(&donor_value).expect("decode").update;
+        let (forged_peer, forged_update) = loro_update("FORGED");
         let (_, b_signed) = sign_record(
             &b.signing,
             &STORE_ID,
             &note.note_id,
             1,
-            7,
+            forged_peer,
+            e(1),
             forged_update.clone(),
         )
         .expect("sign");
@@ -187,15 +223,18 @@ fn forged_author_is_rejected_and_relayed_genuine_record_accepted() {
             &seq0_key,
             &a.id().0,
             0,
-            7,
+            forged_peer,
+            &e(1),
             &forged_update,
             &Some(pk.clone()),
         )
         .expect("bytes");
-        let forged0 = NoteUpdateRecordV1 {
+        let forged0 = NoteUpdateRecordV2 {
             author: a.id().0,
             seq: 0,
-            loro_peer: 7,
+            loro_peer: forged_peer,
+            roster_epoch: 1,
+            roster_state_hash: [1; 32],
             update: forged_update.clone(),
             author_pubkey: Some(pk),
             author_sig: b.signing.sign(&message).expect("b signs"),
@@ -217,8 +256,16 @@ fn forged_author_is_rejected_and_relayed_genuine_record_accepted() {
         );
 
         // Control: the same bytes signed by A itself verify and import.
-        let (genuine_key, genuine) =
-            sign_record(&a.signing, &STORE_ID, &note.note_id, 5, 7, forged_update).expect("sign");
+        let (genuine_key, genuine) = sign_record(
+            &a.signing,
+            &STORE_ID,
+            &note.note_id,
+            5,
+            forged_peer,
+            e(1),
+            forged_update,
+        )
+        .expect("sign");
         let control = Member::new();
         replicate(&a.kv, &control.kv);
         control
@@ -229,29 +276,309 @@ fn forged_author_is_rejected_and_relayed_genuine_record_accepted() {
     });
 }
 
-/// A record whose author is not a current writer never reaches loro, and
-/// is imported once the author becomes a writer.
+/// Group history for the ADR 0082 tests: A, B and C are writers at epoch 1;
+/// commit 2 removes A. `before_removal` is a replica still at epoch 1;
+/// `after_removal` holds both epochs with head 2.
+struct RemovalHistory {
+    before_removal: SharedRosterView,
+    after_removal: SharedRosterView,
+    /// The ADR 0081 control: the head (post-removal) roster judges all.
+    current_writer_only: SharedRosterView,
+}
+
+fn removal_history(a: &Member, b: &Member, c: &Member) -> RemovalHistory {
+    let all = [a.id().0, b.id().0, c.id().0];
+    let after = RosterHistory::new(e(2), [b.id().0, c.id().0]).with_epoch(e(1), all);
+    RemovalHistory {
+        before_removal: Arc::new(RosterHistory::new(e(1), all)),
+        after_removal: Arc::new(after.clone()),
+        current_writer_only: Arc::new(CurrentWriterOnly(after)),
+    }
+}
+
+/// ADR 0082 (WHY): A's edits made while A was a writer are kept after A is
+/// removed — on a replica that first sees them after the removal, and
+/// again after that replica restarts (every record re-verified). Control:
+/// under the ADR 0081 "current writer" rule the same replica loses them.
 #[test]
-fn non_writer_records_are_held_until_the_author_is_a_writer() {
+fn removed_writers_earlier_records_survive_everywhere_including_restart() {
     runtime().block_on(async {
-        let a = Member::new();
-        let reader = Member::new();
-        let only_reader = writers(&[reader.id()]);
-        let both = writers(&[a.id(), reader.id()]);
-        let note = a.store(&both).create("n").await.expect("create");
-        a.store(&both)
-            .save(&note.note_id, "secret plan", &note.version)
+        let (a, b, c) = (Member::new(), Member::new(), Member::new());
+        let h = removal_history(&a, &b, &c);
+        let note = a
+            .store(&h.before_removal)
+            .create("n")
             .await
-            .expect("save");
-        replicate(&a.kv, &reader.kv);
-        let read = reader
-            .store(&only_reader)
+            .expect("create");
+        a.store(&h.before_removal)
+            .save(&note.note_id, "A wrote this", &note.version)
+            .await
+            .expect("A saves at epoch 1");
+        // A is removed (commit 2); B and C only see A's record afterwards.
+        replicate(&a.kv, &b.kv);
+        replicate(&a.kv, &c.kv);
+        for member in [&b, &c] {
+            let read = member
+                .store(&h.after_removal)
+                .read(&note.note_id)
+                .await
+                .expect("read");
+            assert_eq!(read.text, "A wrote this", "A's earlier save is kept");
+        }
+        let c = c.restarted();
+        let read = c
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("read after restart");
+        assert_eq!(read.text, "A wrote this", "kept across a restart");
+
+        // Control: the "current writer" rule drops A's history.
+        let control = Member::new();
+        replicate(&a.kv, &control.kv);
+        let read = control
+            .store(&h.current_writer_only)
+            .read(&note.note_id)
+            .await
+            .expect("control read");
+        assert_eq!(read.text, "", "control: current-writer rule loses A's save");
+    });
+}
+
+/// ADR 0082 §3: a record A signs under an epoch at which A is no longer an
+/// active member is refused. Control: the identical record is accepted by
+/// a replica whose roster at that epoch still has A.
+#[test]
+fn post_removal_record_is_refused() {
+    runtime().block_on(async {
+        let (a, b, c) = (Member::new(), Member::new(), Member::new());
+        let h = removal_history(&a, &b, &c);
+        let note = b.store(&h.after_removal).create("n").await.expect("create");
+        let (peer, update) = loro_update("AFTER REMOVAL");
+        let (key, record) =
+            sign_record(&a.signing, &STORE_ID, &note.note_id, 0, peer, e(2), update).expect("sign");
+        let bytes = encode_record(&record).expect("encode");
+        b.kv.insert(key.clone(), bytes.clone());
+        let read = b
+            .store(&h.after_removal)
             .read(&note.note_id)
             .await
             .expect("read");
-        assert_eq!(read.text, "", "a non-writer's record must not import");
-        let read = reader.store(&both).read(&note.note_id).await.expect("read");
-        assert_eq!(read.text, "secret plan");
+        assert_eq!(read.text, "", "a post-removal record is refused");
+
+        // Control: a replica whose epoch-2 roster (same hash) still lists A.
+        let still_member: SharedRosterView = Arc::new(
+            RosterHistory::new(e(2), [a.id().0, b.id().0, c.id().0])
+                .with_epoch(e(1), [a.id().0, b.id().0, c.id().0]),
+        );
+        let control = Member::new();
+        replicate(&b.kv, &control.kv);
+        let read = control
+            .store(&still_member)
+            .read(&note.note_id)
+            .await
+            .expect("control read");
+        assert_eq!(
+            read.text, "AFTER REMOVAL",
+            "control: accepted while A is a writer"
+        );
+    });
+}
+
+/// ADR 0082 §4 (WHY): a later edit that builds on a removed writer's
+/// earlier text is not held — B's post-removal insert inside A's text
+/// applies on every replica. Control: under the "current writer" rule A's
+/// record is dropped, so B's dependent edit stays pending and is lost.
+#[test]
+fn later_edit_depending_on_removed_writers_text_is_not_held() {
+    runtime().block_on(async {
+        let (a, b, c) = (Member::new(), Member::new(), Member::new());
+        let h = removal_history(&a, &b, &c);
+        let note = a
+            .store(&h.before_removal)
+            .create("n")
+            .await
+            .expect("create");
+        a.store(&h.before_removal)
+            .save(&note.note_id, "hello", &note.version)
+            .await
+            .expect("A saves at epoch 1");
+        replicate(&a.kv, &b.kv);
+        let seen = b
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("B reads");
+        b.store(&h.after_removal)
+            .save(&note.note_id, "helBBlo", &seen.version)
+            .await
+            .expect("B edits inside A's text at epoch 2");
+        replicate(&b.kv, &c.kv);
+        let read = c
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("C reads");
+        assert_eq!(read.text, "helBBlo");
+
+        let control = Member::new();
+        replicate(&b.kv, &control.kv);
+        let read = control
+            .store(&h.current_writer_only)
+            .read(&note.note_id)
+            .await
+            .expect("control read");
+        assert!(
+            !read.text.contains("BB"),
+            "control: B's dependent edit is held when A's record is dropped: {:?}",
+            read.text
+        );
+    });
+}
+
+/// ADR 0082 §3: a record naming an epoch this replica has not reached is
+/// held — not refused — and accepted once the group state reaches it.
+#[test]
+fn unknown_epoch_record_is_held_then_accepted() {
+    runtime().block_on(async {
+        let (a, b, c) = (Member::new(), Member::new(), Member::new());
+        let h = removal_history(&a, &b, &c);
+        let note = b.store(&h.after_removal).create("n").await.expect("create");
+        b.store(&h.after_removal)
+            .save(&note.note_id, "from epoch two", &note.version)
+            .await
+            .expect("B saves at epoch 2");
+        replicate(&b.kv, &c.kv);
+        // C has not applied commit 2 yet.
+        let lagging = c.store(&h.before_removal);
+        let actor_key = format!("{}/{}", hex::encode(STORE_ID), note.note_id);
+        let read = lagging.read(&note.note_id).await.expect("read");
+        assert_eq!(read.text, "", "a future-epoch record is held");
+        let actor = c.engine.get(&actor_key).await.expect("actor");
+        let report = lagging.sync(&note.note_id, &actor).await.expect("sync");
+        assert_eq!(report.held, 1, "held, not refused");
+        assert_eq!(report.refused_epoch, 0);
+        // Commit 2 arrives.
+        let read = c
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("read");
+        assert_eq!(
+            read.text, "from epoch two",
+            "accepted once the epoch is known"
+        );
+    });
+}
+
+/// Build a record A signs after removal, backdated to epoch 1: its ops are
+/// made on a doc holding `base` records (all of them decoded from `kv`
+/// entries whose key starts with `prefix`), inserting `token` at `at`.
+fn backdated_record(
+    a: &Member,
+    kv: &MemKv,
+    note_id: &str,
+    include_b: &AgentId,
+    use_b: bool,
+    token: &str,
+) -> (String, Vec<u8>) {
+    let doc = loro::LoroDoc::new();
+    for (key, value) in kv.snapshot() {
+        let Some(parsed) = super::record::parse_record_key(&key) else {
+            continue;
+        };
+        if parsed.note_id != note_id || (!use_b && parsed.author == include_b.0) {
+            continue;
+        }
+        let record = decode_record(&value).expect("decode");
+        doc.import(&record.update).expect("import");
+    }
+    let before = doc.oplog_vv();
+    let text = doc.get_text(super::engine::TEXT_CONTAINER);
+    let at = if use_b {
+        // Right after B's post-removal text: depends on B's ops.
+        text.to_string().find("BB").map_or(0, |i| i + 2)
+    } else {
+        0
+    };
+    text.insert(at, token).expect("insert");
+    doc.commit();
+    let update = doc
+        .export(loro::ExportMode::updates(&before))
+        .expect("export");
+    let (key, record) = sign_record(
+        &a.signing,
+        &STORE_ID,
+        note_id,
+        77,
+        doc.peer_id(),
+        e(1),
+        update,
+    )
+    .expect("sign");
+    (key, encode_record(&record).expect("encode"))
+}
+
+/// ADR 0082 §4 backdating: removed A signs a new record claiming epoch 1.
+/// When it builds on B's post-removal (epoch-2) text it is refused, because
+/// a record's epoch must be at least every epoch it depends on. The same
+/// forgery built only on pre-removal text is ACCEPTED: the stated, bounded
+/// limit (and the control showing the refusal is the dependency rule).
+#[test]
+fn backdated_record_is_refused_only_when_it_builds_on_later_epochs() {
+    runtime().block_on(async {
+        let (a, b, c) = (Member::new(), Member::new(), Member::new());
+        let h = removal_history(&a, &b, &c);
+        let note = a
+            .store(&h.before_removal)
+            .create("n")
+            .await
+            .expect("create");
+        a.store(&h.before_removal)
+            .save(&note.note_id, "hello", &note.version)
+            .await
+            .expect("A saves at epoch 1");
+        replicate(&a.kv, &b.kv);
+        let seen = b
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("B reads");
+        b.store(&h.after_removal)
+            .save(&note.note_id, "helloBB", &seen.version)
+            .await
+            .expect("B writes at epoch 2");
+
+        // Refused: backdated, but depends on B's epoch-2 ops.
+        let (key, value) = backdated_record(&a, &b.kv, &note.note_id, &b.id(), true, "XX");
+        let refused = Member::new();
+        replicate(&b.kv, &refused.kv);
+        refused.kv.insert(key, value);
+        let read = refused
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("read");
+        assert_eq!(
+            read.text, "helloBB",
+            "backdated edit on later text is refused"
+        );
+
+        // Known limit: backdated onto pre-removal text only — accepted.
+        let (key, value) = backdated_record(&a, &b.kv, &note.note_id, &b.id(), false, "YY");
+        let limit = Member::new();
+        replicate(&b.kv, &limit.kv);
+        limit.kv.insert(key, value);
+        let read = limit
+            .store(&h.after_removal)
+            .read(&note.note_id)
+            .await
+            .expect("read");
+        assert!(
+            read.text.contains("YY") && read.text.contains("BB"),
+            "ADR 0082 §4 limit: a backdated edit on pre-removal text is accepted: {:?}",
+            read.text
+        );
     });
 }
 

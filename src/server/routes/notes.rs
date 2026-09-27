@@ -16,12 +16,11 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::Arc;
-use x0x::groups::{GroupInfo, GroupRole, GroupWriteAccess};
-use x0x::identity::AgentId;
+use x0x::groups::{GroupInfo, GroupMemberState};
 use x0x::kv::encrypted::AuthorSigning;
-use x0x::notes::store::WriterCheck;
+use x0x::notes::record::RosterEpoch;
+use x0x::notes::store::{RosterHistory, SharedRosterView};
 use x0x::notes::{NoteError, NotesStore, NOTES_STORE_NAME};
 
 type NotesResponse = (StatusCode, Json<serde_json::Value>);
@@ -39,29 +38,58 @@ pub(in crate::server) struct SaveNoteRequest {
     base_version: String,
 }
 
-/// The group's current writer rule: an active member, and an admin when
-/// the group's write access is admin-only (the same rule the group KV
-/// contexts enforce). A withdrawn or fork-quarantined group has no writers.
-fn group_writer_check(info: &GroupInfo) -> WriterCheck {
-    if info.withdrawn || info.is_fork_quarantined() {
-        return Arc::new(|_: &AgentId| false);
+/// The group's roster history for the ADR 0082 epoch-bound writer rule:
+/// the head `(state_revision, state_hash, members_v2)` plus every retained
+/// commit's roster projection (`commit_log`, #111). A withdrawn or
+/// fork-quarantined group has no usable history: every record is held and
+/// nothing can be signed.
+fn group_roster_history(info: &GroupInfo) -> SharedRosterView {
+    fn hash32(hex_str: &str) -> Option<[u8; 32]> {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(hex_str, &mut out).ok()?;
+        Some(out)
     }
-    let writers: HashMap<[u8; 32], GroupRole> = info
-        .active_members()
-        .filter_map(|member| {
-            let mut id = [0u8; 32];
-            hex::decode_to_slice(&member.agent_id, &mut id).ok()?;
-            Some((id, member.role))
-        })
-        .collect();
-    let access = info.policy.write_access;
-    Arc::new(move |agent: &AgentId| match access {
-        GroupWriteAccess::MembersOnly => writers.contains_key(&agent.0),
-        GroupWriteAccess::AdminOnly => writers
-            .get(&agent.0)
-            .is_some_and(|role| role.at_least(GroupRole::Admin)),
-        GroupWriteAccess::ModeratedPublic => false,
-    })
+    fn agent32(hex_str: &str) -> Option<[u8; 32]> {
+        hash32(hex_str)
+    }
+    if info.withdrawn || info.is_fork_quarantined() {
+        return Arc::new(RosterHistory::unavailable());
+    }
+    let head_hash = hash32(&info.state_hash).or_else(|| {
+        let mut probe = info.clone();
+        probe.recompute_state_hash();
+        hash32(&probe.state_hash)
+    });
+    let Some(head_hash) = head_hash else {
+        return Arc::new(RosterHistory::unavailable());
+    };
+    let head = RosterEpoch {
+        revision: info.state_revision,
+        state_hash: head_hash,
+    };
+    let mut history = RosterHistory::new(
+        head,
+        info.active_members()
+            .filter_map(|member| agent32(&member.agent_id)),
+    );
+    for retained in &info.commit_log {
+        let Some(state_hash) = hash32(&retained.commit.state_hash) else {
+            continue;
+        };
+        let active = retained
+            .roster
+            .iter()
+            .filter(|(_, snapshot)| snapshot.state == GroupMemberState::Active)
+            .filter_map(|(agent_hex, _)| agent32(agent_hex));
+        history = history.with_epoch(
+            RosterEpoch {
+                revision: retained.commit.revision,
+                state_hash,
+            },
+            active,
+        );
+    }
+    Arc::new(history)
 }
 
 /// Map a notes error to its HTTP status and `{error: <reason>, message}`.
@@ -126,7 +154,7 @@ async fn open_notes_store(
     state: &Arc<AppState>,
     group_id: &str,
     actor: &ActorContext,
-) -> Result<(x0x::KvStoreHandle, WriterCheck, AuthorSigning), NotesResponse> {
+) -> Result<(x0x::KvStoreHandle, SharedRosterView, AuthorSigning), NotesResponse> {
     if matches!(actor, ActorContext::Rider { .. }) {
         return Err(forbidden("rider tokens have no note access"));
     }
@@ -135,7 +163,7 @@ async fn open_notes_store(
         let (_, info) = find_store_group(&groups, group_id)?;
         let (_, topic) =
             x0x::kv::encrypted::group_store_identity(info.stable_group_id(), NOTES_STORE_NAME);
-        (topic, group_writer_check(info))
+        (topic, group_roster_history(info))
     };
     let existing = state.kv_stores.read().await.get(&topic).cloned();
     let handle = match existing {

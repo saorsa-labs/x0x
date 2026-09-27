@@ -6,7 +6,7 @@
 //! (`n/<note_id>/meta`). The store is opened through the ordinary group-store
 //! path, so it is sealed exactly like the Wiki store and #914 task lists.
 //!
-//! - `record`: `NoteUpdateRecordV1`, keys, signing and the receiver rule.
+//! - `record`: `NoteUpdateRecordV2`, keys, signing and the receiver rule.
 //! - `engine`: the loro doc per note, isolated with `spawn_blocking` and
 //!   `catch_unwind`, poisoned-doc quarantine, peer-id allocation, versions.
 //! - `store`: metadata, sync, save, the 4 MiB note cap and 12 MiB store
@@ -34,7 +34,7 @@ pub mod store;
 
 pub use engine::{EngineCountersSnapshot, NoteView, NotesEngine};
 pub use error::NoteError;
-pub use record::NoteUpdateRecordV1;
+pub use record::NoteUpdateRecordV2;
 pub use store::{
     NoteDocument, NoteKv, NoteSummary, NotesStore, SaveOutcome, NOTES_STORE_NAME, NOTE_CAP_BYTES,
     STORE_BUDGET_BYTES,
