@@ -21749,20 +21749,37 @@ pub(in crate::server) async fn escape_leave_group(
                  torn down; re-check the wedge before retrying",
             );
         }
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            // The entry IS gone from memory (the replacement happened;
+            // only the parent-dir fsync is unconfirmed): the node is
+            // already partially torn down, so FINISH the teardown below
+            // and report the true partial state. R4/R4b: this is the
+            // ONLY durability outcome that may proceed.
+            tracing::error!(
+                group_id = %LogHexId::group(&stable_group_id),
+                "#871: the durable remove is unconfirmed (ReplacedNotDurable); \
+                 the in-memory group is GONE — finishing the local teardown \
+                 and reporting 503 escape_partial"
+            );
+        }
         outcome => {
-            // A DURABILITY failure. With ReplacedNotDurable the in-memory
-            // map has already lost the group, so the node IS partially
-            // torn down: finish the teardown (below we return 503 naming
-            // the true partial state) rather than claiming nothing
-            // happened. R4.
+            // Err(io) — from the durability preflight or the save — and
+            // NotReplaced: the persist helper RESTORED the group
+            // (compare_and_restore), so nothing may be torn down. R4b:
+            // returning an untrue "teardown completed" here would wipe
+            // the keys of a group that is still present.
             tracing::error!(
                 group_id = %LogHexId::group(&stable_group_id),
                 ?outcome,
-                removed_armed,
-                "#871: the durable remove did not confirm; the node is in a \
-                 PARTIAL state (audit written; in-memory group {}); finishing \
-                 the local teardown and reporting 503",
-                if removed_armed { "removed" } else { "intact" }
+                "#871: the durable remove FAILED and the group was restored; \
+                 nothing is torn down — retrying the leave is safe and \
+                 appends a second audit entry"
+            );
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "escape_not_durable: the durable remove failed and the group \
+                 was RESTORED — nothing was torn down; retry the leave (a \
+                 retry appends a second audit entry)",
             );
         }
     }
@@ -38425,6 +38442,63 @@ pub(in crate::server) mod tests {
             Ok(())
         }
 
+        /// R4b: a durability FAILURE of the durable remove (Err or
+        /// NotReplaced) restores the group — the leave must tear down
+        /// NOTHING and answer a truthful 503. RED on the r3 behaviour
+        /// (teardown proceeding + escape_partial) via the save-fault
+        /// cell.
+        #[tokio::test]
+        async fn escape_durable_remove_failure_tears_nothing_down() {
+            let (wedged, _dir) = fresh_state().await;
+            let group = "f3".repeat(16);
+            seed_authority_group(&wedged, &group, "not-durable", None, false, false).await;
+            {
+                let mut groups = wedged.named_groups.write().await;
+                let info = groups.get_mut(&group).expect("group");
+                let head_revision = info.state_revision;
+                let lineage = info.invite_lineage.get_or_insert_with(Default::default);
+                lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+                    reason: "owner_attested_stale_base_gap".to_string(),
+                    head_revision,
+                    head_state_hash: info.state_hash.clone(),
+                    terminal_revision: head_revision + 1,
+                    terminal_state_hash: "871r4-terminal".to_string(),
+                    committed_by: hex::encode(wedged.agent.agent_id().as_bytes()),
+                    occurrences: 1,
+                    first_observed_at_ms: 0,
+                    last_observed_at_ms: 0,
+                    attested_chain_hashes: vec!["871r4-terminal".to_string()],
+                    by_reason: Default::default(),
+                });
+                info.state_hash = "871r4-forked".to_string();
+            }
+            // Force the NEXT persist_named_groups_mutation save to
+            // NotReplaced — the exact R4b arm (compare_and_restore
+            // brings the forked GroupInfo BACK).
+            let _fault = set_save_fault(wedged.as_ref(), SaveFault::NotReplaced);
+            let left = escape_call(
+                &wedged,
+                &group,
+                "ops runbook R4b",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(left.0, StatusCode::SERVICE_UNAVAILABLE, "{}", left.1);
+            assert!(
+                left.1.contains("escape_not_durable"),
+                "the 503 names the truthful nothing-torn-down state: {}",
+                left.1
+            );
+            // The forked GroupInfo is RESTORED and still armed — the
+            // persist helper rolled the removal back.
+            let groups = wedged.named_groups.read().await;
+            let info = groups.get(&group).expect("the group was RESTORED");
+            assert_eq!(info.state_hash, "871r4-forked");
+            assert!(
+                armed_anchored_gap_sequence(info).is_some(),
+                "the gate is still armed — a retry is safe"
+            );
+        }
         /// Direct-handler call helper for the #871 escape route.
         async fn escape_call(
             state: &Arc<AppState>,
