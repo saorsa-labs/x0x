@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 201,
+  "endpoint_count": 205,
   "endpoints": [
     {
       "category": "status",
@@ -2935,6 +2935,68 @@
             "cli": "NAME",
             "in": "body",
             "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "notes list",
+      "description": "List the notes in a group's sealed notes store (ADR 0081)",
+      "method": "GET",
+      "path": "/groups/:id/notes",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "notes create",
+      "description": "Create an empty note in a group's sealed notes store (ADR 0081); riders are refused",
+      "method": "POST",
+      "path": "/groups/:id/notes",
+      "request": {
+        "fields": [
+          {
+            "cli": "TITLE",
+            "in": "body",
+            "name": "title",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "notes get",
+      "description": "Read a note ({title, text, version}), first importing new signed records",
+      "method": "GET",
+      "path": "/groups/:id/notes/:note",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "notes save",
+      "description": "Save a note's full text against its current version as one signed record; 409 base_version_stale/base_version_unknown, 413 note_too_large/notes_store_full, 503 note_engine_fault",
+      "method": "PUT",
+      "path": "/groups/:id/notes/:note",
+      "request": {
+        "fields": [
+          {
+            "cli": "TEXT",
+            "in": "body",
+            "name": "text",
+            "required": true
+          },
+          {
+            "cli": "--base-version",
+            "in": "body",
+            "name": "base_version",
             "required": true
           }
         ],

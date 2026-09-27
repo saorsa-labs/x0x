@@ -135,6 +135,10 @@ pub mod crdt;
 /// CRDT-backed key-value store.
 pub mod kv;
 
+/// Collaborative notes: the loro text CRDT in the sealed group `notes`
+/// store (ADR 0081).
+pub mod notes;
+
 /// High-level group management (MLS + KvStore + gossip).
 pub mod groups;
 
@@ -19250,6 +19254,27 @@ impl KvStoreHandle {
     pub async fn name(&self) -> error::Result<String> {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
+    }
+
+    /// The store's 32-byte id.
+    pub async fn store_id_bytes(&self) -> [u8; 32] {
+        *self.sync.read().await.id().as_bytes()
+    }
+
+    /// Encoded size of the store's retained image: the bincode encoding a
+    /// retained-state serve ships (ADR 0081 §6 measures the notes budget
+    /// against it).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be measured.
+    pub async fn retained_image_len(&self) -> error::Result<u64> {
+        let store = self.sync.read().await;
+        bincode::serialized_size(&*store).map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "cannot measure retained image: {e}"
+            )))
+        })
     }
 }
 

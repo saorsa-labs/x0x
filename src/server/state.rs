@@ -846,6 +846,9 @@ pub(super) struct AppState {
     /// store contents — and in particular `AppendOnly` immutability knowledge
     /// — survive a daemon restart instead of coming back as empty replicas.
     pub(super) kv_store_state_dir: PathBuf,
+    /// ADR 0081 notes engine: one isolated loro actor per open note, the
+    /// poisoned-doc quarantine and the engine counters.
+    pub(super) notes: Arc<x0x::notes::NotesEngine>,
     /// Directory holding per-list task-list state snapshots
     /// (`task-lists/<list-id-hex>.bin`, issue #557). Restored on
     /// create/join/rehydrate so task content survives a daemon restart even

@@ -1225,6 +1225,13 @@ pub(in crate::server) async fn groups_diagnostics(
             "ok": true,
             "groups": snap.groups,
             "treekem_recovery_cache": treekem_recovery_cache,
+            // ADR 0081: notes engine counters.
+            "notes": serde_json::json!({
+                "engine": state.notes.counters(),
+                "open_notes": state.notes.open_notes().await,
+                "note_cap_bytes": x0x::notes::NOTE_CAP_BYTES,
+                "store_budget_bytes": x0x::notes::STORE_BUDGET_BYTES,
+            }),
         })),
     )
 }

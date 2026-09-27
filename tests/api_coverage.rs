@@ -555,6 +555,27 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/:id/stores",
         create_group_kv_store_route_creates_encrypted_store
     ),
+    // ── ADR 0081 notes (route lib tests in src/server/routes/notes.rs) ───
+    covered!(
+        Get,
+        "/groups/:id/notes",
+        notes_routes_create_list_read_save_round_trip
+    ),
+    covered!(
+        Post,
+        "/groups/:id/notes",
+        notes_routes_create_list_read_save_round_trip
+    ),
+    covered!(
+        Get,
+        "/groups/:id/notes/:note",
+        notes_routes_create_list_read_save_round_trip
+    ),
+    covered!(
+        Put,
+        "/groups/:id/notes/:note",
+        notes_routes_create_list_read_save_round_trip
+    ),
     covered!(
         Get,
         "/groups/:id/stores/:app/legacy-imports",
@@ -661,6 +682,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/stores.rs",
         include_str!("../src/server/routes/stores.rs"),
+    ),
+    (
+        "src/server/routes/notes.rs",
+        include_str!("../src/server/routes/notes.rs"),
     ),
     (
         "src/server/routes/sync.rs",

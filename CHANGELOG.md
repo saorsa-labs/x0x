@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Collaborative notes store (#965, ADR 0081).** Each group gets a sealed
+  `notes` store (opened through the group-store path, so it uses the #914
+  envelope) holding loro text-CRDT notes as write-once, ML-DSA-65
+  author-signed update records, one per save. Records reach loro only after
+  their signature verifies and their author is a current writer; every
+  loro call runs in `spawn_blocking` + `catch_unwind`, a panic becomes a
+  typed engine fault, poisoned docs are quarantined (never dropped) and the
+  note rebuilt from its records, and three faults in a row degrade the note
+  (503 `note_engine_fault` for writes). Peer ids are fresh CSPRNG ids per
+  writing session, persisted before use and never reused. Limits: 4 MiB of
+  records per note (413 `note_too_large`) and a 12 MiB retained-image budget
+  per store (413 `notes_store_full`). REST: `GET|POST /groups/:id/notes`,
+  `GET|PUT /groups/:id/notes/:note` (`x0x notes list|create|get|save`); a
+  save must name the current `version` (the three-way merge from an older
+  base is a later slice, 409 `base_version_stale`). New dependency: `loro`
+  1.16.2 and its loro-family crates, exact-pinned; the transitive `im`,
+  `bitmaps` and `sized-chunks` crates are MPL-2.0.
 - **Share-grant outbox P3 fixes (#1004).** Entries that expired while the
   daemon was down are now removed from `share-grant-outbox.bin` on load, not
   only from memory (a file that fails validation is still never rewritten).

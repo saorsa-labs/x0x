@@ -286,6 +286,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<StoreSub>,
     },
+    /// Collaborative notes in a group's sealed notes store (ADR 0081).
+    Notes {
+        #[command(subcommand)]
+        sub: NotesSub,
+    },
     /// Collaborative task lists (CRDTs).
     Tasks {
         #[command(subcommand)]
@@ -1855,6 +1860,42 @@ enum GroupStoreLegacySub {
 }
 
 #[derive(Subcommand)]
+enum NotesSub {
+    /// List the notes of a group.
+    List {
+        /// Group id.
+        group_id: String,
+    },
+    /// Create an empty note.
+    Create {
+        /// Group id.
+        group_id: String,
+        /// Note title.
+        title: String,
+    },
+    /// Read a note: title, text and version.
+    Get {
+        /// Group id.
+        group_id: String,
+        /// Note id.
+        note_id: String,
+    },
+    /// Save a note's full text against its current version (one signed
+    /// record per save; a stale version is refused with 409).
+    Save {
+        /// Group id.
+        group_id: String,
+        /// Note id.
+        note_id: String,
+        /// The note's full new text.
+        text: String,
+        /// The `version` returned by the last read or save.
+        #[arg(long, value_name = "VERSION")]
+        base_version: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum StoreSub {
     /// List all stores.
     List,
@@ -3024,6 +3065,21 @@ async fn run(
             Some(StoreSub::Rm { store_id, key }) => {
                 commands::store::rm(&client, &store_id, &key).await
             }
+        },
+        Commands::Notes { sub } => match sub {
+            NotesSub::List { group_id } => commands::notes::list(&client, &group_id).await,
+            NotesSub::Create { group_id, title } => {
+                commands::notes::create(&client, &group_id, &title).await
+            }
+            NotesSub::Get { group_id, note_id } => {
+                commands::notes::get(&client, &group_id, &note_id).await
+            }
+            NotesSub::Save {
+                group_id,
+                note_id,
+                text,
+                base_version,
+            } => commands::notes::save(&client, &group_id, &note_id, &text, &base_version).await,
         },
         Commands::Tasks { sub } => match sub {
             None => commands::tasks::list(&client).await,

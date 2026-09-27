@@ -23,6 +23,7 @@ mod machines;
 mod messaging;
 pub(crate) mod named_groups;
 mod network;
+mod notes;
 mod owner;
 mod presence;
 mod profile;
@@ -123,6 +124,7 @@ pub(super) use network::{
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
     probe_peer_handler, relay_diagnostics, state_sync_diagnostics, transport_diagnostics,
 };
+pub(super) use notes::{create_group_note, get_group_note, list_group_notes, save_group_note};
 pub(super) use owner::{
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
     owner_riders_revoke,

@@ -815,6 +815,16 @@ pub(in crate::server) struct CreateGroupStoreRequest {
     name: String,
 }
 
+impl CreateGroupStoreRequest {
+    /// A request for the group store named `name` (used by the notes routes
+    /// to open the group's `notes` store through this same path).
+    pub(in crate::server) fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
+    }
+}
+
 type GroupStoreResponse = (StatusCode, Json<serde_json::Value>);
 
 /// Creation-fixed identity; app names retain the existing trim-only semantics.
@@ -1215,7 +1225,7 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
     }
 }
 
-fn find_store_group<'a>(
+pub(in crate::server) fn find_store_group<'a>(
     groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
     id: &str,
 ) -> Result<(&'a String, &'a x0x::groups::GroupInfo), GroupStoreResponse> {

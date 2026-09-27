@@ -7421,6 +7421,202 @@ mod tests {
         sync.stop().await.expect("stop");
     }
 
+    /// ADR 0081 wire test (WHY): notes ride the #914 sealed envelope with no
+    /// outer field, so the exact bytes handed to `pubsub.publish` for a note
+    /// record — as a delta AND inside a state serve — must carry no note
+    /// text, record key, note id, author id, public key, signature or loro
+    /// peer id. Control: a member opens both, finds the record and its
+    /// author signature verifies.
+    #[tokio::test]
+    async fn notes_record_publish_and_state_serve_carry_only_ciphertext() {
+        const SECRET: &str = "board meeting moved to the lighthouse";
+        const LORO_PEER: u64 = 0x5EC2_E7AB_CD01_2345;
+        let node = make_node().await;
+        let keypair = AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let (_, contexts, group_id) = encrypted_group(&[owner]);
+        let context = contexts[0].clone();
+        let id = store_id(81);
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+
+        // A real signed note record carrying a loro update of SECRET.
+        let doc = loro::LoroDoc::new();
+        doc.set_peer_id(LORO_PEER).expect("peer");
+        doc.get_text(crate::notes::engine::TEXT_CONTAINER)
+            .insert(0, SECRET)
+            .expect("insert");
+        doc.commit();
+        let update = doc.export(loro::ExportMode::all_updates()).expect("export");
+        let note_id = "ab".repeat(16);
+        let (key, record) = crate::notes::record::sign_record(
+            &signing,
+            id.as_bytes(),
+            &note_id,
+            0,
+            LORO_PEER,
+            update,
+        )
+        .expect("sign record");
+        let value = crate::notes::record::encode_record(&record).expect("encode record");
+
+        let mut store = KvStore::new_encrypted(
+            id,
+            "notes".to_string(),
+            owner,
+            group_id,
+            context.clone() as SharedKvSecureContext,
+        )
+        .expect("encrypted store");
+        store
+            .put(
+                key.clone(),
+                value.clone(),
+                crate::notes::record::RECORD_CONTENT_TYPE.to_string(),
+                peer(1),
+            )
+            .expect("put record");
+        let topic = "group/private/notes-wire";
+        let mut sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("sync");
+        sync.set_secure_context(context.clone(), None);
+        sync.set_author_signing((*signing).clone());
+        let mut main_probe = pubsub.subscribe(topic.to_string()).await;
+
+        let author_hex = hex::encode(owner.as_bytes());
+        let pubkey = record.author_pubkey.clone().expect("seq-0 pubkey");
+        let peer_hex = format!("{LORO_PEER:x}");
+        let needles: Vec<(&str, Vec<u8>)> = vec![
+            ("note text", SECRET.as_bytes().to_vec()),
+            ("record key", key.as_bytes().to_vec()),
+            ("note id", note_id.as_bytes().to_vec()),
+            ("author id hex", author_hex.as_bytes().to_vec()),
+            ("author id raw", owner.as_bytes().to_vec()),
+            ("author public key", pubkey[..64].to_vec()),
+            ("author signature", record.author_sig[..64].to_vec()),
+            ("loro peer id", LORO_PEER.to_le_bytes().to_vec()),
+            ("loro peer id hex", peer_hex.as_bytes().to_vec()),
+        ];
+        let assert_ciphertext_only = |payload: &[u8], what: &str| {
+            for (label, needle) in &needles {
+                assert!(
+                    !payload
+                        .windows(needle.len())
+                        .any(|w| w == needle.as_slice()),
+                    "{what}: {label} is on the wire"
+                );
+            }
+        };
+        let verify_found = |found: &[u8]| {
+            assert_eq!(
+                found,
+                value.as_slice(),
+                "control: member recovers the record"
+            );
+            let opened = crate::notes::record::decode_record(found).expect("decode");
+            crate::notes::record::verify_record(id.as_bytes(), &key, &opened, None)
+                .expect("control: author signature verifies");
+        };
+
+        // 1. The delta publish of the record.
+        let entry = KvEntry::new(
+            key.clone(),
+            value.clone(),
+            crate::notes::record::RECORD_CONTENT_TYPE.to_string(),
+        );
+        let mut delta = KvStoreDelta::new(1);
+        delta.added.insert(key.clone(), (entry, (peer(1), 1)));
+        sync.publish_delta(peer(1), delta)
+            .await
+            .expect("publish note delta");
+        let msg = tokio::time::timeout(Duration::from_secs(5), main_probe.recv())
+            .await
+            .expect("published record")
+            .expect("probe open");
+        assert_ciphertext_only(&msg.payload, "delta publish");
+        let (_, sealed) =
+            decode_delta::<EncryptedKvStoreRecordV1>(&msg.payload).expect("sealed envelope");
+        let mutation = open_mutation(context.as_ref(), &id, &sealed).expect("member opens delta");
+        let opened: KvStoreDelta = bincode::deserialize(&mutation.payload).expect("inner delta");
+        let (found, _) = opened.added.get(&key).expect("record in delta");
+        verify_found(&found.value);
+
+        // 2. The state serve a (re)joining member asks for.
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let request = KvSyncMessage::StateRequest { requester: peer(9) };
+        let request_bytes = KvStoreSync::seal_control_message(
+            &(context.clone() as SharedKvSecureContext),
+            None,
+            &signing,
+            &id,
+            peer(9),
+            &request,
+        )
+        .await
+        .expect("sealed request");
+        pubsub
+            .publish(
+                format!("{topic}/state-sync"),
+                bytes::Bytes::from(request_bytes),
+            )
+            .await
+            .expect("publish request");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&context.group_id());
+        hasher.update(&context.current_epoch().to_le_bytes());
+        let authorization = *hasher.finalize().as_bytes();
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let served = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = main_probe.recv().await.expect("serve response");
+                assert_ciphertext_only(&response.payload, "state serve");
+                let Ok((_, sealed)) = decode_delta::<EncryptedKvStoreRecordV1>(&response.payload)
+                else {
+                    continue;
+                };
+                let Ok(mutation) = open_mutation(context.as_ref(), &id, &sealed) else {
+                    continue;
+                };
+                match mutation.kind {
+                    KvMutationKind::RetainedState => {
+                        if let Some(image) = assemble_retained_group_image(
+                            &mutation.payload,
+                            &id,
+                            &mutation.author_id,
+                            authorization,
+                            &pages,
+                        )
+                        .expect("assemble retained image")
+                        {
+                            let image: KvStore =
+                                bincode::deserialize(&image).expect("retained image");
+                            break image.get(&key).expect("record served").value.clone();
+                        }
+                    }
+                    KvMutationKind::FullState | KvMutationKind::Delta => {
+                        if let Ok(full) = bincode::deserialize::<KvStoreDelta>(&mutation.payload) {
+                            if let Some((entry, _)) = full.added.get(&key) {
+                                break entry.value.clone();
+                            }
+                        }
+                    }
+                    KvMutationKind::Control => {}
+                }
+            }
+        })
+        .await
+        .expect("state serve timeout");
+        verify_found(&served);
+        sync.stop().await.expect("stop");
+    }
+
     async fn wait_for_key(sync: &KvStoreSync, key: &str) -> bool {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

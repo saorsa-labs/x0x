@@ -25,6 +25,19 @@ ant-quic = "=0.27.53"
 # constrain the transitive dep (via ant-quic) until tinyvec or the toolchain moves.
 tinyvec = { version = ">=1.9, <1.13", default-features = false }
 saorsa-mls = "0.3.8"
+# ADR 0081 §1: the notes text CRDT. loro is exact-pinned, and so is every
+# loro-family crate that loro itself only caret-pins: Cargo.lock is not
+# committed, so a caret would let a fresh resolve change the CRDT under us.
+# A loro version change is its own PR (ADR 0081 upgrade policy).
+loro = "=1.16.2"
+loro-internal = "=1.16.2"
+loro-common = "=1.16.0"
+loro-delta = "=1.13.0"
+loro-kv-store = "=1.16.0"
+loro-rle = "=1.6.0"
+loro_fractional_index = "=1.13.0"
+loro-thunderdome = "=0.6.2"
+generic-btree = "=0.10.7"
 async-trait = "0.1"
 bincode = "1.3"
 blake3 = "1.5"

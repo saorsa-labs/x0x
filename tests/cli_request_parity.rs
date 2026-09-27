@@ -772,6 +772,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/messaging.rs",
     "src/server/routes/named_groups.rs",
     "src/server/routes/network.rs",
+    "src/server/routes/notes.rs",
     "src/server/routes/owner.rs",
     "src/server/routes/presence.rs",
     "src/server/routes/profile.rs",
