@@ -166,6 +166,11 @@ pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/groups").await
 }
 
+/// `x0x diagnostics state-sync` — local counters for open KV stores.
+pub async fn diagnostics_state_sync(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/state-sync").await
+}
+
 /// `x0x diagnostics ws` — GET /diagnostics/ws
 ///
 /// WebSocket outbound-queue health: capacity and drop/slow-consumer-close

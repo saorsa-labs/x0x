@@ -145,10 +145,10 @@ async fn dropping_handle_requests_shutdown() {
 /// tracked Phase 2b item — but they do not hold the API port or block re-serve.)
 ///
 /// FIXED QUIC PORT (ant-quic 0.27.27 / #196): the QUIC `bind_address` is pinned
-/// to a FIXED loopback UDP port (not ephemeral). `Agent::shutdown()` aborts the
-/// NetworkNode receiver/accept/eviction tasks and calls
-/// `ant_quic::Node::shutdown()`, and as of ant-quic 0.27.27 the endpoint UDP
-/// socket IS released in-process on shutdown (#196). So the second `serve()`
+/// to a FIXED loopback UDP port (not ephemeral). `Agent::try_shutdown()` aborts
+/// the NetworkNode receiver/accept/eviction tasks and requires typed
+/// `ant_quic::Node::try_shutdown()` success, confirming that the endpoint UDP
+/// socket was released in-process. So the second `serve()`
 /// must rebind the SAME fixed QUIC port — the real proof #196 delivers, which
 /// was impossible pre-0.27.27 (the socket only freed on process exit). If this
 /// fixed-port rebind ever fails, #196 does not cover x0x's endpoint path.
@@ -211,6 +211,64 @@ async fn serve_tears_down_cleanly_and_rebinds() {
         .shutdown_and_wait()
         .await
         .expect("second shutdown_and_wait returns Ok");
+}
+
+/// A startup rejection after the Agent has bound its QUIC socket must run the
+/// same typed teardown as a normally-started server. A corrupt self-profile is
+/// loaded after Agent construction, making this a real post-bind failure rather
+/// than a production-only fault hook.
+#[tokio::test]
+#[ignore]
+async fn corrupt_self_profile_releases_fixed_quic_port_during_startup_rejection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = hermetic_config(tmp.path());
+    let quic_port = free_udp_port();
+    let quic_addr = SocketAddr::from(([127, 0, 0, 1], quic_port));
+    config.bind_address = quic_addr;
+
+    // Exercise custody of a server task that starts before AppState as well as
+    // the Agent/network itself. The watchdog remains asleep throughout this
+    // test, so teardown must cancel its strong Agent reference explicitly.
+    config.zero_peer_restart_secs = Some(60);
+
+    std::fs::create_dir_all(&config.data_dir).expect("create owned data dir");
+    let profile_path = x0x::profile::SelfProfile::path_in(&config.data_dir);
+    std::fs::write(&profile_path, b"{ invalid self profile")
+        .expect("write corrupt owned self-profile fixture");
+
+    let startup = tokio::time::timeout(Duration::from_secs(30), serve(config.clone()))
+        .await
+        .expect("post-bind startup rejection must finish promptly");
+    let error = match startup {
+        Err(error) => error,
+        Ok(handle) => {
+            handle
+                .shutdown_and_wait()
+                .await
+                .expect("unexpectedly started server must still shut down cleanly");
+            panic!("corrupt self-profile must reject startup");
+        }
+    };
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("failed to load self-profile from data dir")
+            && chain.contains("parse self profile"),
+        "startup must report the real self-profile parse failure: {chain}"
+    );
+
+    // The port file is published only after all startup validation succeeds.
+    assert!(
+        !config.data_dir.join("api.port").exists(),
+        "rejected startup must not advertise an API port"
+    );
+
+    // No retry or settling interval: returning the startup error is itself the
+    // release boundary promised by typed shutdown.
+    let rebound = std::net::UdpSocket::bind(quic_addr);
+    assert!(
+        rebound.is_ok(),
+        "startup rejection must release fixed QUIC port {quic_addr} before returning: {rebound:?}"
+    );
 }
 
 /// Storage boundary: with a fully-specified config and a sentinel HOME/XDG

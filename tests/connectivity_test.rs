@@ -372,6 +372,102 @@ async fn machine_for_agent_returns_linked_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// #927/#898: unverified claims must not reach the discovery cache via
+// connect_to_agent's DirectMessaging promotion
+// ---------------------------------------------------------------------------
+
+/// #898 (promotion arm): a raw Direct payload from a LIVE machine M2 that
+/// claims agent A (verified binding on M1) must not rebind A — and crucially
+/// must not be PROMOTED: `connect_to_agent` rewrites A's discovery-cache
+/// machine whenever `DirectMessaging` maps A to a transport-connected
+/// machine, so the gate has to hold at the routing write, not just the
+/// listener.
+///
+/// This test builds the live connection for real (so `is_connected(M2)` is
+/// genuinely true and the promotion branch is reachable), makes the exact
+/// listener call for a spoof (`mark_raw_direct_sender_connected(A, M2,
+/// verified=false)`), and then runs `connect_to_agent(A)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unverified_raw_claim_cannot_promote_into_discovery_cache() {
+    let local_dir = TempDir::new().unwrap();
+    let m2_dir = TempDir::new().unwrap();
+    let local = build_agent(&local_dir).await;
+    let m2 = build_agent(&m2_dir).await;
+
+    // A real, live connection to M2 so the promotion branch's
+    // `is_connected(M2)` is true — otherwise this test would prove nothing
+    // (without a live M2 the promotion cannot fire even if the gate is
+    // reverted).
+    let m2_addr = m2.bound_addr().await.expect("m2 bound addr");
+    let m2_machine = m2.machine_id();
+    local
+        .network()
+        .expect("local network")
+        .connect_addr(m2_addr)
+        .await
+        .expect("dial m2");
+    let m2_peer = ant_quic::PeerId(m2_machine.0);
+    let local_network = local.network().expect("local network");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !local_network.is_connected(&m2_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "m2 never became transport-connected"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Agent A: verified binding on M1 (fake, offline), cached in discovery.
+    let da = fake_discovered(0x21, vec![], None, Some(true), None, None);
+    let a_id = da.agent_id;
+    let m1 = da.machine_id;
+    let _ = m2_machine; // used implicitly via m2_peer above
+    local.insert_discovered_agent_for_testing(da).await;
+    local
+        .direct_messaging()
+        .mark_raw_direct_sender_connected(a_id, m1, true)
+        .await;
+    assert_eq!(
+        local.direct_messaging().get_machine_id(&a_id).await,
+        Some(m1),
+        "precondition: A's verified binding is M1"
+    );
+
+    // The spoof: M2 prefixes A's id; the listener computed verified=false
+    // and made exactly this call.
+    assert!(
+        !local
+            .direct_messaging()
+            .mark_raw_direct_sender_connected(a_id, m2.machine_id(), false)
+            .await,
+        "the unverified claim must be refused"
+    );
+    // The promotion: connect_to_agent reads DirectMessaging and rewrites
+    // the discovery cache when the mapped machine is live. With the gate
+    // held, A stays on M1 in BOTH structures.
+    let _outcome = local.connect_to_agent(&a_id).await.unwrap();
+    assert_eq!(
+        local.direct_messaging().get_machine_id(&a_id).await,
+        Some(m1),
+        "connect_to_agent must not promote the refused claim (#898)"
+    );
+    // `machine_for_agent` resolves from the discovery cache, so this pins
+    // the promotion target too.
+    let resolved = local
+        .machine_for_agent(a_id)
+        .await
+        .unwrap()
+        .expect("A stays in the discovery cache");
+    assert_eq!(
+        resolved.machine_id, m1,
+        "the discovery cache must still route A to M1"
+    );
+
+    local.shutdown().await;
+    m2.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // ReachabilityInfo: all NAT type heuristics
 // ---------------------------------------------------------------------------
 
