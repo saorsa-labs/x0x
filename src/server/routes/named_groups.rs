@@ -21558,6 +21558,33 @@ async fn withdraw_named_group_terminal(
 }
 
 /// DELETE /groups/:id — leave a group.
+/// R3: set to a group key to disarm that group's anchored-gap
+/// record inside the escape handler, between the read-side check
+/// and the removal closure (the B4 window).
+#[cfg(test)]
+static ESCAPE_LEAVE_TEST_DISARM: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn escape_leave_test_disarm_hook(state: &AppState, map_key: &str) {
+    let target = ESCAPE_LEAVE_TEST_DISARM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(target) = target.filter(|t| t == map_key) {
+        let mut groups = state.named_groups.write().await;
+        if let Some(info) = groups.get_mut(&target) {
+            if let Some(lineage) = info.invite_lineage.as_mut() {
+                // Converge the record: revision at/after the
+                // terminal disarms armed_anchored_gap_sequence.
+                if let Some(record) = lineage.anchored_gap_refusal.as_ref() {
+                    info.state_revision = record.terminal_revision;
+                }
+            }
+        }
+    }
+}
+
 /// #871 (redesign: leave-and-rejoin): POST /groups/:id/escape/leave —
 /// the wedge escape for a genuinely-forked node. The #846 anchored-gap
 /// gate is fail-safe (the node refuses rather than corrupts), but a
@@ -21572,7 +21599,7 @@ async fn withdraw_named_group_terminal(
 /// Runbook (the r2 review's B2 ruling; see also docs/api-reference.md):
 /// 1. On the WEDGED node (durable token): POST this route.
 /// 2. On an OWNER/ADMIN device: REMOVE the wedged member first
-///    (DELETE /groups/:id/member/:agent or the equivalent surface).
+///    (DELETE /groups/:id/members/:agent_id or the equivalent surface).
 ///    `MemberRemoved` also rotates keys, evicting the wiped leaf and
 ///    giving forward secrecy — a fresh Welcome is only staged for a
 ///    member the authority no longer seats.
@@ -21637,7 +21664,6 @@ pub(in crate::server) async fn escape_leave_group(
                 groups
                     .iter()
                     .find(|(_, info)| info.stable_group_id().eq_ignore_ascii_case(&id))
-                    .map(|(key, _)| (key, groups.get(key).expect("just found")))
             })
             .map(|(key, info)| {
                 (
@@ -21655,6 +21681,12 @@ pub(in crate::server) async fn escape_leave_group(
         let armed = armed_anchored_gap_sequence(&info).cloned();
         (map_key, stable_group_id, armed)
     };
+    // R3 test hook: lets a test disarm the gate AFTER the read-side
+    // check but BEFORE the removal closure re-checks (the B4 TOCTOU the
+    // in-closure re-check exists for). No-op outside tests.
+    #[cfg(test)]
+    escape_leave_test_disarm_hook(&state, &map_key).await;
+
     let Some(record) = armed else {
         return api_error(
             StatusCode::CONFLICT,
@@ -21692,28 +21724,47 @@ pub(in crate::server) async fn escape_leave_group(
     // record between the read above and this write aborts with 409 and
     // NOTHING was torn down.
     let mut removed_armed = false;
-    if !matches!(
-        persist_named_groups_mutation(&state, |groups| {
-            let Some(info) = groups.get_mut(&map_key) else {
-                return false;
-            };
-            if armed_anchored_gap_sequence(info).is_none() {
-                // The gate retired (converged) or the record changed —
-                // this is no longer the wedge this route escapes.
-                return false;
-            }
-            removed_armed = groups.remove(&map_key).is_some();
-            removed_armed
-        })
-        .await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        return api_error(
-            StatusCode::CONFLICT,
-            "escape_no_longer_armed: the anchored-gap gate retired (the group \
-             converged or changed) while the leave was in flight — nothing was \
-             torn down; re-check the wedge before retrying",
-        );
+    let remove_outcome = persist_named_groups_mutation(&state, |groups| {
+        let Some(info) = groups.get_mut(&map_key) else {
+            return false;
+        };
+        if armed_anchored_gap_sequence(info).is_none() {
+            // The gate retired (converged) or the record changed —
+            // this is no longer the wedge this route escapes.
+            return false;
+        }
+        removed_armed = groups.remove(&map_key).is_some();
+        removed_armed
+    })
+    .await;
+    match &remove_outcome {
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(_) if !removed_armed => {
+            // The closure REFUSED (the gate retired mid-flight): the
+            // in-memory map was not changed — nothing was torn down.
+            return api_error(
+                StatusCode::CONFLICT,
+                "escape_no_longer_armed: the anchored-gap gate retired (the group \
+                 converged or changed) while the leave was in flight — nothing was \
+                 torn down; re-check the wedge before retrying",
+            );
+        }
+        outcome => {
+            // A DURABILITY failure. With ReplacedNotDurable the in-memory
+            // map has already lost the group, so the node IS partially
+            // torn down: finish the teardown (below we return 503 naming
+            // the true partial state) rather than claiming nothing
+            // happened. R4.
+            tracing::error!(
+                group_id = %LogHexId::group(&stable_group_id),
+                ?outcome,
+                removed_armed,
+                "#871: the durable remove did not confirm; the node is in a \
+                 PARTIAL state (audit written; in-memory group {}); finishing \
+                 the local teardown and reporting 503",
+                if removed_armed { "removed" } else { "intact" }
+            );
+        }
     }
 
     // B1: a live pending-join attempt is the stale-credential rejoin
@@ -21796,6 +21847,16 @@ pub(in crate::server) async fn escape_leave_group(
          rotation evicts the wiped leaf), then mints a FRESH addressed invite"
     );
 
+    if !matches!(remove_outcome, Ok(AtomicWriteOutcome::Durable)) {
+        // R4: the teardown finished, but the durable remove did not
+        // confirm — report the TRUE partial state, never "nothing".
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "escape_partial: the local teardown completed but the durable \
+             remove did not confirm — retry is idempotent (the audit append \
+             is the record; a second leave of an absent group is 404)",
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -37984,6 +38045,384 @@ pub(in crate::server) mod tests {
                     "no forked state survived the leave-and-rejoin"
                 );
             }
+        }
+
+        /// R3 (B3): a corrupt audit file fails LOUD — 503, the corrupt
+        /// bytes untouched, and NOTHING torn down.
+        #[tokio::test]
+        async fn corrupt_escape_audit_fails_loud_and_tears_nothing_down() {
+            let (wedged, _dir) = fresh_state().await;
+            let group = "f1".repeat(16);
+            seed_authority_group(&wedged, &group, "audit-corrupt", None, false, false).await;
+            {
+                let mut groups = wedged.named_groups.write().await;
+                let info = groups.get_mut(&group).expect("group");
+                let head_revision = info.state_revision;
+                let lineage = info.invite_lineage.get_or_insert_with(Default::default);
+                lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+                    reason: "owner_attested_stale_base_gap".to_string(),
+                    head_revision,
+                    head_state_hash: info.state_hash.clone(),
+                    terminal_revision: head_revision + 1,
+                    terminal_state_hash: "871r3-terminal".to_string(),
+                    committed_by: hex::encode(wedged.agent.agent_id().as_bytes()),
+                    occurrences: 1,
+                    first_observed_at_ms: 0,
+                    last_observed_at_ms: 0,
+                    attested_chain_hashes: vec!["871r3-terminal".to_string()],
+                    by_reason: Default::default(),
+                });
+                info.state_hash = "871r3-forked".to_string();
+            }
+            // A CORRUPT audit file (valid UTF-8, invalid JSON).
+            let audit_path = wedged
+                .predecessor_relay_outbox_path
+                .parent()
+                .expect("audit dir")
+                .join("escape_leave_audit.json");
+            std::fs::create_dir_all(audit_path.parent().expect("dir")).expect("dirs");
+            let corrupt = b"{not json".to_vec();
+            std::fs::write(&audit_path, &corrupt).expect("pre-write corrupt audit");
+
+            let left = escape_call(
+                &wedged,
+                &group,
+                "ops runbook R3",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(left.0, StatusCode::SERVICE_UNAVAILABLE, "{}", left.1);
+            assert!(
+                left.1.contains("refusing to touch it"),
+                "the 503 names the fail-loud refusal: {}",
+                left.1
+            );
+            // The corrupt bytes are UNCHANGED.
+            assert_eq!(std::fs::read(&audit_path).expect("read"), corrupt);
+            // NOTHING was torn down: the group, its forked hash and the
+            // armed record are intact.
+            let groups = wedged.named_groups.read().await;
+            let info = groups.get(&group).expect("the group survives");
+            assert_eq!(info.state_hash, "871r3-forked");
+            assert!(
+                armed_anchored_gap_sequence(info).is_some(),
+                "the gate is still armed"
+            );
+        }
+
+        /// R3 (B4): the gate disarmed between the read and the closure —
+        /// typed 409, nothing torn down.
+        #[tokio::test]
+        async fn escape_disarmed_mid_flight_refuses_and_tears_nothing_down() {
+            let (wedged, _dir) = fresh_state().await;
+            let group = "f2".repeat(16);
+            seed_authority_group(&wedged, &group, "disarm-mid", None, false, false).await;
+            {
+                let mut groups = wedged.named_groups.write().await;
+                let info = groups.get_mut(&group).expect("group");
+                let head_revision = info.state_revision;
+                let lineage = info.invite_lineage.get_or_insert_with(Default::default);
+                lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+                    reason: "owner_attested_stale_base_gap".to_string(),
+                    head_revision,
+                    head_state_hash: info.state_hash.clone(),
+                    terminal_revision: head_revision + 1,
+                    terminal_state_hash: "871r3-terminal".to_string(),
+                    committed_by: hex::encode(wedged.agent.agent_id().as_bytes()),
+                    occurrences: 1,
+                    first_observed_at_ms: 0,
+                    last_observed_at_ms: 0,
+                    attested_chain_hashes: vec!["871r3-terminal".to_string()],
+                    by_reason: Default::default(),
+                });
+                info.state_hash = "871r3-forked".to_string();
+            }
+            // Arm the B4 window: the hook converges the record AFTER the
+            // read-side check passes but BEFORE the closure re-checks.
+            super::super::ESCAPE_LEAVE_TEST_DISARM
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .replace(group.clone());
+            struct DisarmGuard;
+            impl Drop for DisarmGuard {
+                fn drop(&mut self) {
+                    let _ = super::super::ESCAPE_LEAVE_TEST_DISARM
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                }
+            }
+            let _disarm = DisarmGuard;
+
+            let left = escape_call(
+                &wedged,
+                &group,
+                "ops runbook R3",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(left.0, StatusCode::CONFLICT, "{}", left.1);
+            assert!(
+                left.1.contains("escape_no_longer_armed"),
+                "the typed 409 names the mid-flight disarm: {}",
+                left.1
+            );
+            // NOTHING torn down.
+            let groups = wedged.named_groups.read().await;
+            let info = groups.get(&group).expect("the group survives");
+            assert_eq!(info.state_hash, "871r3-forked");
+        }
+
+        /// R2 (r2 review): the FULL leave-and-rejoin sequence on a
+        /// TreeKEM group — the authority SEATS W, W's head forks with an
+        /// armed gap, W escapes, the authority REMOVES W (epoch
+        /// advances), a FRESH invite is minted, W joins through the real
+        /// route, the authority accepts W's own stored resend and STAGES
+        /// A WELCOME, W installs it, and W converges (roster, state
+        /// hash, epoch equal to the authority's).
+        #[tokio::test]
+        async fn escape_leave_treekem_welcome_converges() -> Result<()> {
+            let (authority, _a) = secure_endpoint_test_state().await?;
+            let (w, _w) = secure_endpoint_test_state().await?;
+            let group_id = "e1".repeat(32);
+            let group_bytes = hex::decode(&group_id)?;
+            let auth_id = authority.agent.agent_id();
+            let w_id = w.agent.agent_id();
+            let w_hex = hex::encode(w_id.as_bytes());
+            let auth_hex = hex::encode(auth_id.as_bytes());
+
+            // 1. AUTHORITY: live TreeKEM group + metadata info.
+            let auth_seed = [0xe1u8; 32];
+            let auth_group =
+                x0x::mls::TreeKemMlsGroup::create(group_bytes.clone(), auth_id, &auth_seed)?;
+            let mut info = treekem_metadata_group_info(auth_id, &group_id, &group_id);
+            info.secret_epoch = auth_group.epoch();
+            authority
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+            let auth_group_arc = Arc::new(Mutex::new(auth_group));
+            authority
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_id.clone(), Arc::clone(&auth_group_arc));
+
+            // 2. SEAT W at the current epoch: add -> welcome -> W joins.
+            let w_seed = agent_treekem_seed(w.agent.as_ref(), &group_bytes);
+            let prepared_w = x0x::mls::TreeKemMlsGroup::prepare_member(w_id, &w_seed)?;
+            let add = auth_group_arc
+                .lock()
+                .await
+                .add_member(w_id, prepared_w.key_package_bytes())?;
+            let w_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared_w, &add.welcome)?;
+            let seated_epoch = w_group.epoch();
+            let mut w_info = info.clone();
+            w_info.roster_revision = w_info.roster_revision.saturating_add(1);
+            w_info.add_member(
+                w_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(auth_hex.clone()),
+                None,
+            );
+            w_info.secret_epoch = seated_epoch;
+            w_info.security_binding = Some(format!("treekem:epoch={seated_epoch}"));
+            w_info.recompute_state_hash();
+            let authority_pre_hash = {
+                // The authority's info after seating W (same roster shape).
+                let mut auth_next = info.clone();
+                auth_next.roster_revision = auth_next.roster_revision.saturating_add(1);
+                auth_next.add_member(
+                    w_hex.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(auth_hex.clone()),
+                    None,
+                );
+                auth_next.secret_epoch = seated_epoch;
+                auth_next.security_binding = Some(format!("treekem:epoch={seated_epoch}"));
+                auth_next.recompute_state_hash();
+                auth_next.state_hash.clone()
+            };
+            install_joined_treekem_group_after_crypto_recheck(
+                w.as_ref(),
+                &group_id,
+                w_info.clone(),
+                w_group,
+                "escape_treekem_fixture_seat",
+            )
+            .await?;
+            assert_eq!(
+                w.named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .map(|i| i.state_hash.clone()),
+                Some(authority_pre_hash.clone()),
+                "precondition: W is seated and converged with the authority"
+            );
+
+            // 3. W's head FORKS with an armed gap (the wedge).
+            {
+                let mut groups = w.named_groups.write().await;
+                let forked = groups.get_mut(&group_id).expect("W group");
+                let head_revision = forked.state_revision;
+                let lineage = forked.invite_lineage.get_or_insert_with(Default::default);
+                lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+                    reason: "owner_attested_stale_base_gap".to_string(),
+                    head_revision,
+                    head_state_hash: head_revision.to_string(),
+                    terminal_revision: head_revision + 1,
+                    terminal_state_hash: "871r3-terminal".to_string(),
+                    committed_by: auth_hex.clone(),
+                    occurrences: 1,
+                    first_observed_at_ms: 0,
+                    last_observed_at_ms: 0,
+                    attested_chain_hashes: vec!["871r3-terminal".to_string()],
+                    by_reason: Default::default(),
+                });
+                forked.state_hash = "871r3-forked".to_string();
+            }
+
+            // 4. W ESCAPES.
+            let left = escape_call(
+                &w,
+                &group_id,
+                "treek forked head; leave for rejoin",
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )
+            .await;
+            assert_eq!(left.0, StatusCode::OK, "{}", left.1);
+            assert!(
+                w.named_groups.read().await.get(&group_id).is_none(),
+                "the forked GroupInfo is GONE (goes red when the leave keeps it)"
+            );
+            assert!(
+                w.treekem_groups.read().await.get(&group_id).is_none(),
+                "W's TreeKEM key material is wiped"
+            );
+
+            // 5. The AUTHORITY removes W (the runbook step): epoch
+            //    advances, the roster drops W.
+            let removed_epoch = {
+                let mut groups = authority.treekem_groups.write().await;
+                let group = groups.get_mut(&group_id).expect("authority MLS group");
+                let mut live = group.lock().await;
+                let _commit = live.remove_member(w_id)?;
+                live.epoch()
+            };
+            {
+                let mut groups = authority.named_groups.write().await;
+                let info = groups.get_mut(&group_id).expect("authority info");
+                info.roster_revision = info.roster_revision.saturating_add(1);
+                info.remove_member(&w_hex, Some(auth_hex.clone()));
+                info.secret_epoch = removed_epoch;
+                info.security_binding = Some(format!("treekem:epoch={removed_epoch}"));
+                info.recompute_state_hash();
+            }
+
+            // 6. FRESH invite (the production mint helper).
+            let (_inviter, link) = mint_real_invite(&authority, &group_id).await;
+
+            // 7. W JOINS through the real route (no pending attempt
+            //    survived the escape).
+            let response = join_group_via_invite(
+                State(Arc::clone(&w)),
+                Json(JoinGroupRequest {
+                    invite: link,
+                    display_name: None,
+                    mode: None,
+                    expected_owner_user_id: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "fresh invite accepted");
+
+            // 8. The AUTHORITY accepts W's OWN stored resend and stages
+            //    a Welcome (the real apply path).
+            let resend_event = {
+                let attempts = w
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                attempts
+                    .values()
+                    .find(|a| a.local_group_key == group_id)
+                    .and_then(|a| a.stored_resend.as_ref())
+                    .map(|r| r.event.clone())
+                    .expect("the join stored W's signed MemberJoined resend")
+            };
+            let applied = apply_named_group_metadata_event(
+                &authority,
+                resend_event.clone(),
+                w_id,
+                true,
+                None,
+            )
+            .await;
+            assert!(
+                applied.accepted,
+                "the authority ACCEPTS W's own resend: {:?}",
+                applied
+            );
+            // The Welcome is staged for W.
+            let welcome_bytes = {
+                let welcomes = authority.pending_welcomes.read().await;
+                welcomes
+                    .iter()
+                    .find(|(_, pending)| {
+                        pending.group_id == group_id && pending.joiner_agent == w_hex
+                    })
+                    .map(|(_, pending)| pending.bytes.clone())
+                    .expect("a Welcome is staged for W")
+            };
+
+            // 9. W INSTALLS the Welcome (the joiner-side install path).
+            let prepared2 = x0x::mls::TreeKemMlsGroup::prepare_member(w_id, &w_seed)?;
+            let w_joined = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared2, &welcome_bytes)?;
+            let authority_post = {
+                let groups = authority.named_groups.read().await;
+                groups.get(&group_id).expect("authority info").clone()
+            };
+            install_joined_treekem_group_after_crypto_recheck(
+                w.as_ref(),
+                &group_id,
+                authority_post.clone(),
+                w_joined,
+                "escape_treekem_rejoin",
+            )
+            .await?;
+
+            // 10. CONVERGED: W's roster, state hash and epoch equal the
+            //     authority's.
+            let w_now = {
+                let groups = w.named_groups.read().await;
+                groups.get(&group_id).expect("W rejoined group").clone()
+            };
+            assert!(
+                w_now.has_active_member(&w_hex),
+                "W is seated actively after the Welcome"
+            );
+            assert_ne!(w_now.state_hash, "871r3-forked", "no forked state survived");
+            assert_eq!(
+                w_now.state_hash, authority_post.state_hash,
+                "CONVERGED: the state hashes match"
+            );
+            assert_eq!(
+                w_now.secret_epoch, authority_post.secret_epoch,
+                "CONVERGED: the epochs match"
+            );
+            let w_live = {
+                let groups = w.treekem_groups.read().await;
+                Arc::clone(groups.get(&group_id).expect("W live treekem group"))
+            };
+            let w_epoch_now = w_live.lock().await.epoch();
+            assert_eq!(
+                w_epoch_now, authority_post.secret_epoch,
+                "CONVERGED: W's live TreeKEM epoch equals the authority's"
+            );
+            Ok(())
         }
 
         /// Direct-handler call helper for the #871 escape route.
