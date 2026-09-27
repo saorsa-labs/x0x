@@ -33,6 +33,7 @@ pub mod error;
 mod kv_handle;
 pub mod record;
 pub mod store;
+#[allow(dead_code)] // red proof: only the tests use it
 mod text_diff;
 
 pub use engine::{EngineCountersSnapshot, NoteView, NotesEngine};

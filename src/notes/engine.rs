@@ -26,7 +26,6 @@
 //! containment can be exercised in isolation.
 
 use super::error::NoteError;
-use super::text_diff::{apply_edit_script, DIFF_WORK_BUDGET};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use loro::{ExportMode, Frontiers, IdSpan, LoroDoc, UpdateOptions};
@@ -662,7 +661,7 @@ impl NoteEngine {
         let vv_before = fork.oplog_vv();
         let root = fork.get_text(TEXT_CONTAINER);
         let diffed = if text.len() > LINE_DIFF_THRESHOLD_BYTES {
-            apply_edit_script(&root, text, DIFF_WORK_BUDGET).is_ok()
+            root.update_by_line(text, save_diff_options()).is_ok()
         } else {
             root.update(text, save_diff_options()).is_ok()
         };
