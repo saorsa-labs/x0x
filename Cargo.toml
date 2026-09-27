@@ -208,7 +208,7 @@ members = [
 
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
-# only its concrete crypto path and test target; dev and release stay unchanged.
+# only its concrete crypto path in `test`; dev and release stay unchanged.
 [profile.test.package.keccak]
 opt-level = 3
 
@@ -221,18 +221,13 @@ opt-level = 3
 [profile.test.package.ant-quic]
 opt-level = 3
 
-[profile.test.package.x0x]
-opt-level = 3
+# x0x itself is optimized only for the #703 test (`--cargo-profile
+# signing-acceptance`). On `test` it compiled all ~115 x0x test binaries at
+# opt-level 3, which took the CI workspace test build from ~20 to ~57 minutes.
+[profile.signing-acceptance]
+inherits = "test"
 
-# #965: the notes tests drive loro through thousands of imports/exports;
-# unoptimised loro made the ADR-0081 peer-id restart test time out in CI.
-[profile.test.package.loro-internal]
-opt-level = 3
-
-[profile.test.package.loro]
-opt-level = 3
-
-[profile.test.package.generic-btree]
+[profile.signing-acceptance.package.x0x]
 opt-level = 3
 
 [profile.release-profiling]

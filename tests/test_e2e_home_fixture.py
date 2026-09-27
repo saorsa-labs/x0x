@@ -467,8 +467,8 @@ esac
                 "    certify_same_owner_device(outsider)\n    evidence.check(\"outsider holds no owner key before denial\",")),
                 None),
             "history before admin stop": (None, mutant(harness, "m_hist", (
-                """        stop_admin()
-        self.e.check(history_offline_label""", """        self.e.check(history_offline_label"""), (
+                """            stop_admin()
+            self.e.check(history_offline_label""", """            self.e.check(history_offline_label"""), (
                 "        expected = set(actor_ids.values())\n",
                 "        stop_admin()\n        expected = set(actor_ids.values())\n")).Scenario),
             "late seat minted by owner after stop": (None, mutant(harness, "m_owner", (
@@ -895,9 +895,10 @@ esac
         self.assertEqual("timeout", data["polls"][0]["outcome"])
         self.assertEqual(200, data["polls"][0]["last_http_status"])
         self.assertFalse(data["polls"][0]["expected_member_present"])
-        failure = [row for row in data["assertions"] if row["label"] == "fixture AssertionError"]
+        failure = [row for row in data["assertions"] if row["label"] == "fixture PollTimeout"]
         self.assertEqual(1, len(failure), data["assertions"])
         self.assertFalse(failure[0]["passed"])
+        self.assertIn("did not converge", failure[0]["poll_timeout"])
 
 
 if __name__ == "__main__": unittest.main()

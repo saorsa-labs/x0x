@@ -82,7 +82,12 @@ def trace_scenario(h, label: str) -> tuple[list[tuple], set[str]]:
     scenario.open_store = mock.Mock(side_effect=lambda node, _gid, app: (
         events.append(("history", node)) if node == "late" else None, {"id": f"sid-{app}"})[1])
     scenario.put = mock.Mock(side_effect=lambda node, *_a: (403, {}) if node == "revoked" else (200, {}))
-    scenario.await_value = mock.Mock(side_effect=lambda node, *_a: events.append(("history", node)) if node == "late" else None)
+    def await_value(node, sid, key, *_a, **_k):
+        if node == "late":
+            events.append(("history", node))
+        elif node == "writer" and key.endswith("-owner"):
+            events.append(("owner-key", node, sid))
+    scenario.await_value = mock.Mock(side_effect=await_value)
     scenario.await_absent = mock.Mock(side_effect=lambda node, *_a: events.append(("history", node)) if node == "late" else None)
     scenario.prove_denied_did_not_converge = mock.Mock()
 
@@ -108,6 +113,11 @@ def assert_decision_b(test: unittest.TestCase, label: str, events: list[tuple], 
              ("join", "writer", "late"), ("stop", "admin"), ("history", "late"), ("restart",)]
     positions = [first(event) for event in chain]
     test.assertEqual(sorted(positions), positions, f"{label}: out of order {list(zip(chain, positions))}")
+    # R19: once the owner and Admin stop, the writer is the only history
+    # source, so it must hold BOTH owner keys before the owner goes offline.
+    for sid in ("sid-wiki", "sid-web"):
+        test.assertLess(first(("owner-key", "writer", sid)), first(("stop", "owner")),
+                        f"{label}: writer {sid} owner-key barrier must precede the offline step")
     test.assertNotIn(("promote", "owner", "writer"), events, "writer must stay a plain Member")
     test.assertEqual([("mint", "admin", "late")], [e for e in events if e[:1] == ("mint",) and e[2] == "late"])
     test.assertEqual(set(IDS[n] for n in ("owner", "writer", "late", "admin")), expected)
@@ -494,9 +504,9 @@ class PrivateKvHarnessTests(unittest.TestCase):
 
     def test_revert_controls_fail(self):
         history_before_stop_admin = load_mutant("mut_history_before_stop_admin", (
-            """        stop_admin()
-        self.e.check(history_offline_label or f"{label} owner and admin stopped before late history",
-                     is_offline(owner) and is_offline(admin))
+            """            stop_admin()
+            self.e.check(history_offline_label or f"{label} owner and admin stopped before late history",
+                         is_offline(owner) and is_offline(admin))
 """, ""), ("""        expected = set(actor_ids.values())
 """, """        stop_admin()
         expected = set(actor_ids.values())
@@ -522,16 +532,114 @@ class PrivateKvHarnessTests(unittest.TestCase):
 """, """        late_invite = mint_late()
         self.await_admin(writer, admin, gid)
 """))
+        owner_key_barrier = ("""            self.await_owner_key_barrier(label, writer, stores, owner_key)
+""", "")
+        owner_key_barrier_removed = load_mutant("mut_owner_key_barrier_removed", owner_key_barrier)
+        owner_key_barrier_after_offline = load_mutant(
+            "mut_owner_key_barrier_after_offline", owner_key_barrier, ("""            join_late(late_invite)
+""", """            join_late(late_invite)
+            self.await_owner_key_barrier(label, writer, stores, owner_key)
+"""))
         for name, mutant in (("history before stop_admin", history_before_stop_admin),
                              ("owner-minted late invite", owner_minted),
                              ("late mint before removal", mint_before_removal),
                              ("writer barrier removed", barrier_removed),
-                             ("writer barrier moved after mint", barrier_after_mint)):
+                             ("writer barrier moved after mint", barrier_after_mint),
+                             ("owner-key barrier removed", owner_key_barrier_removed),
+                             ("owner-key barrier after owner offline", owner_key_barrier_after_offline)):
             for label in ("private_secure", "home"):
                 with self.subTest(mutant=name, label=label):
                     events, expected = trace_scenario(mutant, label)
                     with self.assertRaises(AssertionError):
                         assert_decision_b(self, label, events, expected)
+
+    def _failing_exercise(self, await_value, state_sync):
+        """Run exercise() to its failure; return (scenario, stopped, error)."""
+        scenario = self.h.Scenario({n: FakeApi(i) for n, i in IDS.items()}, self.h.Evidence())
+        for node, api in scenario.c.items():
+            api.request = mock.Mock(side_effect=lambda method, path, body=None, node=node: (
+                state_sync(node) if path == "/diagnostics/state-sync" else (200, {"ok": True})))
+        scenario.open_store = mock.Mock(side_effect=lambda _node, _gid, app: {"id": f"sid-{app}"})
+        scenario.put = mock.Mock(side_effect=lambda node, *_a: (403, {}) if node == "revoked" else (200, {}))
+        scenario.await_value = mock.Mock(side_effect=await_value)
+        for method in ("await_absent", "prove_denied_did_not_converge", "promote_admin", "await_admin"):
+            setattr(scenario, method, mock.Mock())
+        stopped: list[str] = []
+        with mock.patch.object(self.h, "poll", return_value=(403, {})), \
+                self.assertRaises(AssertionError) as raised:
+            scenario.exercise("private_secure", "owner", "writer", "late", "admin", "revoked", "gid",
+                              mock.Mock(), mock.Mock(return_value="x0x://invite/l"), mock.Mock(),
+                              lambda: stopped.append("owner"), lambda: stopped.append("admin"),
+                              lambda node: node in stopped, mock.Mock())
+        return scenario, stopped, raised.exception
+
+    def test_owner_key_barrier_timeout_is_a_product_failure_before_any_stop(self):
+        # R19: a writer that never held the owner key leaves the late member
+        # nothing to sync. Everything is online at the barrier, so the timeout
+        # is a product (writer convergence) failure, and it leaves the
+        # late-history precondition unmet; the owner must still be online.
+        def await_value(node, _sid, key, *_a, **_k):
+            if node == "writer" and key.endswith("-owner"):
+                raise self.h.PollTimeout("writer receives k", 120, 120.2, 404, None)
+        scenario, stopped, error = self._failing_exercise(
+            await_value, lambda _node: (200, {"ok": True, "stores": {}}))
+        self.assertIn("did not converge", str(error))
+        self.assertEqual([], stopped)
+        barrier_calls = [c for c in scenario.await_value.call_args_list
+                         if c.args[0] == "writer" and c.args[2].endswith("-owner")]
+        self.assertEqual({"barrier": "writer_owner_key_before_offline"}, barrier_calls[0].kwargs)
+        failed = [row for row in scenario.e.assertions if not row["passed"]]
+        self.assertEqual(1, len(failed))
+        self.assertIn("product failure", failed[0]["label"])
+        self.assertIn("late-history precondition unmet", failed[0]["label"])
+        self.assertNotIn("not a product verdict", failed[0]["label"])
+        self.assertEqual("product_failure", failed[0]["verdict"])
+        self.assertEqual("unmet", failed[0]["late_history_precondition"])
+        self.assertIn("writer receives k did not converge", failed[0]["poll_timeout"])
+
+    def test_owner_key_barrier_passes_both_stores_before_offline(self):
+        scenario = self.h.Scenario({n: FakeApi(i) for n, i in IDS.items()}, self.h.Evidence())
+        scenario.await_value = mock.Mock()
+        scenario.await_owner_key_barrier("private_secure", "writer",
+                                         {"wiki": "sid-wiki", "web": "sid-web"}, "k-owner")
+        self.assertEqual([mock.call("writer", "sid-wiki", "k-owner", "private_secure-owner-wiki",
+                                    barrier="writer_owner_key_before_offline"),
+                          mock.call("writer", "sid-web", "k-owner", "private_secure-owner-web",
+                                    barrier="writer_owner_key_before_offline")],
+                         scenario.await_value.call_args_list)
+
+    def test_late_history_failure_captures_paired_safe_state_sync_counters(self):
+        secret = "Bearer token-secret-value"
+        def await_value(node, _sid, key, *_a, **_k):
+            if node == "late" and key.endswith("-owner"):
+                raise self.h.PollTimeout("late receives k", 120, 120.2, 404, None)
+        def state_sync(node):
+            if node == "late":
+                return 200, {"ok": True, "token": secret, "stores": {
+                    "sid-wiki": {"requests_sent": 4, "incoming_record_merges": 2,
+                                 "rejected_other": True, "requests_answered": secret,
+                                 "note": secret},
+                    secret: {"requests_sent": 9}}}
+            raise RuntimeError(secret)
+        scenario, stopped, error = self._failing_exercise(await_value, state_sync)
+        self.assertIn("did not converge", str(error))
+        self.assertEqual(["owner", "admin"], stopped)
+        rows = [row for row in scenario.e.polls if row.get("operation") == "state_sync_failure_snapshot"]
+        self.assertEqual([("writer", "wiki"), ("writer", "web"), ("late", "wiki"), ("late", "web")],
+                         [(row["node"], row["app"]) for row in rows])
+        by_key = {(row["node"], row["app"]): row for row in rows}
+        self.assertEqual({"requests_sent": 4, "incoming_record_merges": 2},
+                         by_key[("late", "wiki")]["counters"])
+        self.assertTrue(by_key[("late", "wiki")]["topic_open"])
+        self.assertEqual(200, by_key[("late", "wiki")]["http_status"])
+        self.assertFalse(by_key[("late", "web")]["topic_open"])
+        self.assertEqual({}, by_key[("late", "web")]["counters"])
+        self.assertEqual("RuntimeError", by_key[("writer", "wiki")]["error_class"])
+        self.assertIsNone(by_key[("writer", "wiki")]["http_status"])
+        for row in rows:
+            self.assertLessEqual(set(row["counters"]), set(self.h.STATE_SYNC_COUNTERS))
+            self.assertTrue(all(type(value) is int for value in row["counters"].values()))
+        self.assertNotIn("token-secret-value", json.dumps(scenario.e.report()))
 
     def test_partial_tunnel_acquisition_and_report_failure_still_cleanup(self):
         nodes = ["a", "b", "c", "d", "e"]
