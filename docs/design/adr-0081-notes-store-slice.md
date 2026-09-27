@@ -2,7 +2,7 @@
 
 - **Issue:** #965 (the "Notes store" slice of ADR 0081)
 - **Branch:** `feat/965-notes-store`
-- **Kind:** notes for the PR and for cross-model review. They record two
+- **Kind:** notes for the PR and for cross-model review. They record
   points the ADR does not settle, and how this slice handles them.
 
 ## 1. Record keys are write-once in the KV layer
@@ -133,3 +133,77 @@ Tests:
 
 Each epoch-rule test has a control: under the old rule it would fail, or it
 fails with the relevant check disabled.
+
+## 3. Saves above 256 KiB do not use `update_by_line` (#1029)
+
+ADR 0081 §8 says a save above 256 KiB uses `LoroText::update_by_line`.
+
+**Problem.** In loro 1.16.2 `update_by_line` diffs whole lines. It deletes
+each changed line and inserts the new version as new ops, including the
+characters the user did not change. A concurrent delete of those characters
+cannot remove the new copies:
+
+- A deletes part of a line and B edits another part of it. After the merge
+  the text A deleted is back, and the line appears twice.
+- On the concurrent-delete scenario below, `update_by_line` fails 175 of
+  512 seeds (scratch run). It also emits about 4× the ops of the edit, and
+  took 56 s on a 4 MiB note in which every line changed.
+
+**Change.** `src/notes/text_diff.rs` computes the edit script itself and
+applies it as explicit `insert`/`delete` ops. It never calls `update` or
+`update_by_line`.
+
+1. Trim the common prefix and suffix, cut back to whole lines.
+2. Myers diff over line ids.
+3. Widen each changed run of lines to the nearest anchor. An anchor is a
+   non-blank line that occurs exactly once in each text; blank or repeated
+   lines can match the wrong occurrence.
+4. Myers diff over the characters of each widened run.
+
+The line diff, the 256 KiB threshold and "no diff crate" are kept. The
+<256 KiB path (`update` with `use_refined_diff: false`) is unchanged.
+
+**Bounds.**
+- **Work budget.** The line and character diffs share a work budget of
+  16 M units (about 100 ms if all of it is spent). A region still
+  unresolved when it runs out is replaced whole, as `update_by_line` would
+  replace it; `EditScript::replaced_chars` counts it. Only rewrites run
+  out: 500 scattered edits on 4 MiB spend 1.7 M.
+- **Ties.** Like loro's character diff below the threshold, Myers picks
+  one of several minimal scripts. If one edit both deletes and inserts a
+  newline, a minimal script can re-insert a neighbouring character
+  instead.
+
+**Measured** (loro 1.16.2, release, Apple silicon; 4 MiB of word lines;
+time and peak RSS growth):
+
+| Save | edit script | `update_by_line` | `update` (char) |
+|---|---|---|---|
+| 1 edit | 3.4 ms, +0.1 MiB | 17 ms, +6.9 MiB | 7.1 ms, +32 MiB |
+| 3 edits | 8.1 ms, +1.8 MiB | 20 ms, +5.5 MiB | 8.6 ms, +32 MiB |
+| 50 edits | 15 ms, +1.2 MiB | 35 ms, +5.6 MiB | 28 ms, +32 MiB |
+| 500 edits | 18 ms, +1.8 MiB | 90 ms, +7.1 MiB | 223 ms, +33 MiB |
+| 500 pure deletes | 446 ms, +1.8 MiB | 100 ms, +6.5 MiB | 520 ms, +37 MiB |
+| every line changed | 103 ms, +29 MiB (budget spent, replaced whole) | 56 s | not measured |
+
+Consecutive deletes in one transaction cost loro about 0.8 ms each on a
+4 MiB note; each insert is applied before its paired delete for that
+reason. Many pure deletes cost the same as loro's own character diff.
+
+**Tests** (`src/notes/engine_tests.rs`):
+- `large_save_never_resurrects_a_concurrent_delete`: a property test over
+  the real save path. A deletes a region (1–300 characters) of a >256 KiB
+  note. B concurrently saves one to three edits elsewhere, mostly on the
+  lines A's region touches. Every replica and a reversed-order observer
+  must end with exactly both edits applied.
+- `update_by_line_control_resurrects_deleted_text`: the same scenarios
+  and checker with `update_by_line` fail (seeds 4 and 11 of 0..16).
+- `large_save_regression_seeds_converge`, `large_save_emits_only_edited_characters`
+  (op count equals edited characters; `update_by_line` emits more),
+  `edit_script_reproduces_text_under_any_budget`,
+  `spent_budget_replaces_the_region_whole`.
+
+**Question for David.** ADR 0081 §8 names `update_by_line`. This keeps the
+threshold and the line-first diff, but not that call. It is an
+implementation change within the ADR's intent; say if you want it recorded
+in an ADR.

@@ -22,10 +22,11 @@
 //!   [`NoteError::BaseVersionUnknown`], never a partial text.
 //!
 //! This file depends only on `std`, `tokio`, `loro`, `rand`, `base64`,
-//! `blake3`, `serde` and [`super::error`], so the containment can be
-//! exercised in isolation.
+//! `blake3`, `serde`, [`super::error`] and `super::text_diff`, so the
+//! containment can be exercised in isolation.
 
 use super::error::NoteError;
+use super::text_diff::{apply_edit_script, DIFF_WORK_BUDGET};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use loro::{ExportMode, Frontiers, IdSpan, LoroDoc, UpdateOptions};
@@ -39,8 +40,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// Name of the single text root container of a note doc.
 pub const TEXT_CONTAINER: &str = "text";
 
-/// Above this many bytes of text, a save uses `LoroText::update_by_line`
-/// instead of the character diff (ADR 0081 §8).
+/// Above this many bytes of text, a save uses the line-first edit script
+/// of `super::text_diff` instead of loro's character diff (ADR 0081 §8).
+/// Not `LoroText::update_by_line`: it re-inserts whole changed lines, which
+/// brings back text a concurrent save deleted (#1029).
 pub const LINE_DIFF_THRESHOLD_BYTES: usize = 256 * 1024;
 
 /// Diff options for a save.
@@ -659,11 +662,13 @@ impl NoteEngine {
         let vv_before = fork.oplog_vv();
         let root = fork.get_text(TEXT_CONTAINER);
         let diffed = if text.len() > LINE_DIFF_THRESHOLD_BYTES {
-            root.update_by_line(text, save_diff_options())
+            apply_edit_script(&root, text, DIFF_WORK_BUDGET).is_ok()
         } else {
-            root.update(text, save_diff_options())
+            root.update(text, save_diff_options()).is_ok()
         };
-        diffed.map_err(|_| self.fault("text_update"))?;
+        if !diffed {
+            return Err(self.fault("text_update"));
+        }
         fork.commit();
         let vv_after = fork.oplog_vv();
         let start = vv_before.get(&peer).copied().unwrap_or(0);

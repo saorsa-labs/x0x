@@ -7,6 +7,8 @@
 //! path, so it is sealed exactly like the Wiki store and #914 task lists.
 //!
 //! - `record`: `NoteUpdateRecordV2`, keys, signing and the receiver rule.
+//! - `text_diff`: the character-exact edit script for saves above 256 KiB
+//!   (#1029).
 //! - `engine`: the loro doc per note, isolated with `spawn_blocking` and
 //!   `catch_unwind`, poisoned-doc quarantine, peer-id allocation, versions.
 //! - `store`: metadata, sync, save, the 4 MiB note cap and 12 MiB store
@@ -31,6 +33,7 @@ pub mod error;
 mod kv_handle;
 pub mod record;
 pub mod store;
+mod text_diff;
 
 pub use engine::{EngineCountersSnapshot, NoteView, NotesEngine};
 pub use error::NoteError;

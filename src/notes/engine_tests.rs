@@ -9,9 +9,10 @@
 
 use super::engine::{
     encode_version, EngineRecord, EngineShared, NoteActor, NotesEngine, OsPeerIdSource,
-    PeerIdSource, MAX_CONSECUTIVE_FAULTS,
+    PeerIdSource, LINE_DIFF_THRESHOLD_BYTES, MAX_CONSECUTIVE_FAULTS,
 };
 use super::error::NoteError;
+use super::text_diff::{apply_edit_script, edit_script, DIFF_WORK_BUDGET};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -334,6 +335,368 @@ fn lww_control_fails_the_convergence_checker() {
             "LWW must lose a concurrent insert (n = {n})"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// #1029: saves above LINE_DIFF_THRESHOLD_BYTES.
+// ---------------------------------------------------------------------
+
+/// Unique token `n` for the large-note tests: planes 1 and up (4 UTF-8
+/// bytes, never a newline), so about 66 000 of them exceed 256 KiB.
+fn big_token(n: u32) -> char {
+    char::from_u32(0x1_0000 + n).expect("scalar value")
+}
+
+/// One edit of B's save, in base-text character positions.
+enum BEdit {
+    /// Insert `run` before `base[at]`.
+    Insert { at: usize, run: Vec<char> },
+    /// Delete `base[from..to]`.
+    Delete { from: usize, to: usize },
+}
+
+/// A deletes a region of a note above the threshold while B concurrently
+/// saves one to three edits elsewhere, mostly on the lines A's region
+/// touches.
+struct LargeScenario {
+    base: String,
+    a_text: String,
+    b_text: String,
+    /// Both saves applied to `base`: the only correct merge.
+    expected: String,
+    /// Tokens A or B deleted.
+    deleted: BTreeSet<char>,
+    /// Characters B's save changes (inserted plus deleted).
+    b_edited: usize,
+}
+
+/// Every edit starts and ends on a token and keeps at least one surviving
+/// character between it and any other edit, so exactly one minimal edit
+/// script exists for each save and `expected` is the unique correct merge.
+fn large_scenario(seed: u64) -> LargeScenario {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut next = 0u32;
+    let mut base: Vec<char> = Vec::new();
+    let mut bytes = 0;
+    while bytes <= LINE_DIFF_THRESHOLD_BYTES + 4096 {
+        base.push(big_token(next));
+        next += 1;
+        bytes += 4;
+        if rng.gen_bool(0.15) {
+            base.push('\n');
+            bytes += 1;
+            if rng.gen_bool(0.2) {
+                base.push('\n');
+                bytes += 1;
+            }
+        }
+    }
+    let len = base.len();
+    // A: delete base[a0..a1], 1..=300 characters, first and last a token.
+    let mut a0 = rng.gen_range(1000..len - 1000);
+    while base[a0] == '\n' {
+        a0 += 1;
+    }
+    let mut a1 = (a0 + rng.gen_range(1..=300)).max(a0 + 1);
+    while base[a1 - 1] == '\n' {
+        a1 -= 1;
+    }
+    // Reserved closed intervals: an edit plus one neighbour on each side.
+    let mut reserved: Vec<(usize, usize)> = vec![(a0 - 1, a1)];
+    let free = |reserved: &[(usize, usize)], lo: usize, hi: usize| {
+        reserved.iter().all(|&(l, h)| hi < l || lo > h)
+    };
+    let mut edits = Vec::new();
+    for _ in 0..rng.gen_range(1..=3) {
+        for _attempt in 0..100 {
+            // Mostly on the lines A's region touches, where a whole-line
+            // diff re-inserts what A deleted.
+            let at = match rng.gen_range(0..4) {
+                0 | 1 if rng.gen_bool(0.5) => a0 - rng.gen_range(2..10),
+                0 | 1 => a1 + rng.gen_range(2..10),
+                2 => rng.gen_range(a0 - 120..a1 + 120),
+                _ => rng.gen_range(1..len - 1),
+            };
+            if rng.gen_bool(0.5) {
+                if !free(&reserved, at - 1, at) {
+                    continue;
+                }
+                let mut run = vec![big_token(next)];
+                next += 1;
+                for _ in 0..rng.gen_range(0..12) {
+                    if rng.gen_bool(0.3) {
+                        run.push('\n');
+                    }
+                    run.push(big_token(next));
+                    next += 1;
+                }
+                reserved.push((at - 1, at));
+                edits.push(BEdit::Insert { at, run });
+            } else {
+                let to = (at + rng.gen_range(1..=8)).min(len - 1);
+                if base[at..to].contains(&'\n') || !free(&reserved, at - 1, to) {
+                    continue;
+                }
+                reserved.push((at - 1, to));
+                edits.push(BEdit::Delete { from: at, to });
+            }
+            break;
+        }
+    }
+    let mut inserts: Vec<Vec<char>> = vec![Vec::new(); len + 1];
+    let mut b_deleted = vec![false; len];
+    let mut b_edited = 0;
+    for e in &edits {
+        match e {
+            BEdit::Insert { at, run } => {
+                inserts[*at].extend(run);
+                b_edited += run.len();
+            }
+            BEdit::Delete { from, to } => {
+                b_deleted[*from..*to].iter_mut().for_each(|d| *d = true);
+                b_edited += to - from;
+            }
+        }
+    }
+    let (mut a_text, mut b_text, mut expected) = (String::new(), String::new(), String::new());
+    let mut deleted = BTreeSet::new();
+    for i in 0..=len {
+        b_text.extend(&inserts[i]);
+        expected.extend(&inserts[i]);
+        let Some(&c) = base.get(i) else { break };
+        let by_a = (a0..a1).contains(&i);
+        if !by_a {
+            a_text.push(c);
+        }
+        if !b_deleted[i] {
+            b_text.push(c);
+        }
+        if by_a || b_deleted[i] {
+            if c != '\n' {
+                deleted.insert(c);
+            }
+        } else {
+            expected.push(c);
+        }
+    }
+    LargeScenario {
+        base: base.into_iter().collect(),
+        a_text,
+        b_text,
+        expected,
+        deleted,
+        b_edited,
+    }
+}
+
+/// `Err` names the first way a merged text differs from the only correct
+/// merge: deleted text back, a duplicated token or line, or other drift.
+fn check_large(s: &LargeScenario, texts: &[String]) -> Result<(), String> {
+    for (i, t) in texts.iter().enumerate() {
+        if *t == s.expected {
+            continue;
+        }
+        let back = t.chars().filter(|c| s.deleted.contains(c)).count();
+        if back > 0 {
+            return Err(format!("replica {i}: {back} deleted characters came back"));
+        }
+        let mut seen = BTreeSet::new();
+        if t.chars().filter(|&c| c != '\n').any(|c| !seen.insert(c)) {
+            return Err(format!("replica {i}: a character appears twice"));
+        }
+        let mut lines = BTreeSet::new();
+        if t.lines()
+            .filter(|l| !l.is_empty())
+            .any(|l| !lines.insert(l))
+        {
+            return Err(format!("replica {i}: a line appears twice"));
+        }
+        return Err(format!("replica {i} differs from the expected merge"));
+    }
+    Ok(())
+}
+
+/// The scenario through the real save path: engine actors, records
+/// exchanged shuffled with duplicates, and a fresh observer that receives
+/// every record in reverse order.
+async fn run_large_engine(s: &LargeScenario, seed: u64) -> Vec<String> {
+    let mut rng = StdRng::seed_from_u64(seed ^ 1029);
+    let a = open(&shared(), "a").await;
+    let b = open(&shared(), "b").await;
+    let (mut seq_a, mut seq_b) = (0, 0);
+    let base = save(&a, &s.base, "a", &mut seq_a).await;
+    b.import(base.clone()).await.expect("base import");
+    let from_a = save(&a, &s.a_text, "a", &mut seq_a).await;
+    let from_b = save(&b, &s.b_text, "b", &mut seq_b).await;
+    a.import(shuffled_with_dups(&mut rng, &from_b))
+        .await
+        .expect("a imports b");
+    b.import(shuffled_with_dups(&mut rng, &from_a))
+        .await
+        .expect("b imports a");
+    let observer = open(&shared(), "observer").await;
+    let mut all: Vec<EngineRecord> = base.into_iter().chain(from_a).chain(from_b).collect();
+    all.reverse();
+    observer.import(all).await.expect("observer import");
+    let mut texts = Vec::new();
+    for actor in [&a, &b, &observer] {
+        texts.push(actor.view().await.expect("view").text);
+    }
+    texts
+}
+
+/// The scenario on plain loro docs, each save made by `diff`. Returns the
+/// merged texts and the ops B's save emitted.
+fn run_large_loro(s: &LargeScenario, diff: fn(&loro::LoroText, &str)) -> (Vec<String>, usize) {
+    let text = |d: &loro::LoroDoc| d.get_text(super::engine::TEXT_CONTAINER);
+    let a = loro::LoroDoc::new();
+    a.set_peer_id(1).expect("peer");
+    text(&a).insert(0, &s.base).expect("base");
+    a.commit();
+    let b = loro::LoroDoc::new();
+    b.set_peer_id(2).expect("peer");
+    b.import(&a.export(loro::ExportMode::all_updates()).expect("export"))
+        .expect("import");
+    diff(&text(&a), &s.a_text);
+    a.commit();
+    diff(&text(&b), &s.b_text);
+    b.commit();
+    let b_ops = b.oplog_vv().get(&2).copied().unwrap_or(0);
+    let from_a = a.export(loro::ExportMode::all_updates()).expect("export");
+    let from_b = b.export(loro::ExportMode::all_updates()).expect("export");
+    a.import(&from_b).expect("import");
+    b.import(&from_a).expect("import");
+    let texts = vec![text(&a).to_string(), text(&b).to_string()];
+    (texts, usize::try_from(b_ops).expect("ops"))
+}
+
+fn diff_by_edit_script(text: &loro::LoroText, new: &str) {
+    apply_edit_script(text, new, DIFF_WORK_BUDGET).expect("edit script");
+}
+
+fn diff_by_line(text: &loro::LoroText, new: &str) {
+    text.update_by_line(new, super::engine::save_diff_options())
+        .expect("update_by_line");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 24,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    /// #1029: on a note above 256 KiB, A deletes a region while B saves
+    /// edits elsewhere, often on the same lines. After every replica
+    /// merges, the text is exactly both edits applied: the deleted text is
+    /// gone and no character or line appears twice.
+    #[test]
+    fn large_save_never_resurrects_a_concurrent_delete(seed in any::<u64>()) {
+        let s = large_scenario(seed);
+        prop_assert!(s.base.len() > LINE_DIFF_THRESHOLD_BYTES);
+        let texts = runtime().block_on(run_large_engine(&s, seed));
+        prop_assert!(check_large(&s, &texts).is_ok(), "{:?}", check_large(&s, &texts));
+    }
+}
+
+/// #1029 fixed cases: seeds on which `update_by_line` brings deleted text
+/// back (see the control below) converge exactly through the save path.
+#[test]
+fn large_save_regression_seeds_converge() {
+    for seed in [4, 11] {
+        let s = large_scenario(seed);
+        let texts = runtime().block_on(run_large_engine(&s, seed));
+        assert!(
+            check_large(&s, &texts).is_ok(),
+            "seed {seed}: {:?}",
+            check_large(&s, &texts)
+        );
+    }
+}
+
+/// Control for the property test: loro's `update_by_line`, the diff
+/// ADR 0081 §8 named for large saves, fails the same checker on the same
+/// scenarios (it re-inserts whole changed lines), so the checker can fail.
+#[test]
+fn update_by_line_control_resurrects_deleted_text() {
+    let failures: Vec<u64> = (0..16)
+        .filter(|&seed| {
+            let s = large_scenario(seed);
+            check_large(&s, &run_large_loro(&s, diff_by_line).0).is_err()
+        })
+        .collect();
+    assert!(
+        !failures.is_empty(),
+        "control: update_by_line must bring deleted text back on some seed"
+    );
+    assert!(
+        failures.contains(&4) && failures.contains(&11),
+        "{failures:?}"
+    );
+}
+
+/// WHY (R9): a large save must emit an op only for a character the user
+/// changed; any re-inserted unchanged character is one a concurrent
+/// delete cannot remove. Control: `update_by_line` emits many more.
+#[test]
+fn large_save_emits_only_edited_characters() {
+    let mut by_line_extra = 0;
+    for seed in 0..16 {
+        let s = large_scenario(seed);
+        let (texts, ops) = run_large_loro(&s, diff_by_edit_script);
+        assert_eq!(ops, s.b_edited, "seed {seed}: extra ops");
+        assert!(check_large(&s, &texts).is_ok(), "seed {seed}");
+        by_line_extra += run_large_loro(&s, diff_by_line).1 - s.b_edited;
+    }
+    assert!(
+        by_line_extra > 0,
+        "control: update_by_line re-inserts lines"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    /// The edit script always reproduces the new text, whatever the work
+    /// budget: a spent budget replaces the unresolved region whole (the
+    /// documented bound) and counts it.
+    #[test]
+    fn edit_script_reproduces_text_under_any_budget(
+        old in "[ab\n\u{e9}\u{4e00}]{0,40}",
+        new in "[ab\n\u{e9}\u{4e00}]{0,40}",
+        budget in prop_oneof![0u64..64, Just(DIFF_WORK_BUDGET)],
+    ) {
+        let script = edit_script(&old, &new, budget);
+        let mut out = old.clone();
+        for e in script.edits.iter().rev() {
+            out.replace_range(e.old_start..e.old_end, &new[e.new_start..e.new_end]);
+        }
+        prop_assert_eq!(&out, &new);
+        prop_assert!(script.edits.windows(2).all(|w| w[0].old_end <= w[1].old_start));
+        if budget == DIFF_WORK_BUDGET {
+            prop_assert_eq!(script.replaced_chars, 0);
+        }
+        let doc = loro::LoroDoc::new();
+        let text = doc.get_text(super::engine::TEXT_CONTAINER);
+        text.insert(0, &old).expect("insert");
+        apply_edit_script(&text, &new, budget).expect("apply");
+        prop_assert_eq!(text.to_string(), new);
+    }
+}
+
+/// The documented bound: with no budget, a multi-line rewrite is replaced
+/// whole, and `replaced_chars` says so.
+#[test]
+fn spent_budget_replaces_the_region_whole() {
+    let old = "one\ntwo\nthree\nfour\n";
+    let new = "one\nTWO\nthree\nFOUR\n";
+    assert_eq!(edit_script(old, new, DIFF_WORK_BUDGET).replaced_chars, 0);
+    let spent = edit_script(old, new, 0);
+    assert!(spent.replaced_chars > 0);
 }
 
 /// A peer-id source that returns queued values first, then CSPRNG values.
