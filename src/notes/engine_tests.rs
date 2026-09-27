@@ -4,6 +4,7 @@
 //! These use only [`super::engine`] and [`super::error`], never a daemon or
 //! the network.
 
+#![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::engine::{

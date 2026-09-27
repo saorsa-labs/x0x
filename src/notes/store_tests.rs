@@ -2,6 +2,7 @@
 //! per-note cap and store budget, and convergence through the full
 //! sign → store → verify → import path with no delivery gate.
 
+#![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::engine::NotesEngine;
