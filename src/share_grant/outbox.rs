@@ -564,8 +564,9 @@ impl GrantRedeliveryOutbox {
         {
             let mut entries = self.lock();
             for entry in entries.values_mut() {
-                if recipients.contains(&entry.recipient) {
-                    entry.next_attempt_at = entry.next_attempt_at.min(now_unix);
+                // RED PROOF (#1004 b): already-due entries are skipped again.
+                if recipients.contains(&entry.recipient) && entry.next_attempt_at > now_unix {
+                    entry.next_attempt_at = now_unix;
                     nudged = true;
                 }
             }
