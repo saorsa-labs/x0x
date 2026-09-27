@@ -15,9 +15,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWrite;
 use x0x::identity::{MachineId, UserKeypair};
 use x0x::owner_sync::{
     run_sync_session, OwnerEnrollment, OwnerSyncStore, SyncKind, SyncValue, VersionedRecord,
@@ -49,6 +53,34 @@ async fn cross_enroll(a: &OwnerSyncStore, b: &OwnerSyncStore, owner: &UserKeypai
         .unwrap();
 }
 
+/// Records whether a successful session closed its send half after Done.
+/// The real ant-quic send half maps AsyncWrite shutdown to FIN; dropping it
+/// unfinished resets the peer's receive half.
+struct ShutdownProbe<W> {
+    inner: W,
+    called: Arc<AtomicBool>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ShutdownProbe<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.called.store(true, Ordering::SeqCst);
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 /// Run one session between two stores over a duplex pipe. Returns both
 /// summaries (initiator, responder).
 async fn session_between(
@@ -63,8 +95,14 @@ async fn session_between(
     let responder_owner = UserKeypair::from_seed(&[7u8; 32]).expect("owner keypair");
     let (client, server) = tokio::io::duplex(64 * 1024);
     let b_clone = Arc::clone(b);
+    let responder_shutdown = Arc::new(AtomicBool::new(false));
+    let responder_shutdown_for_task = Arc::clone(&responder_shutdown);
     let responder = tokio::spawn(async move {
-        let (mut r_recv, mut r_send) = tokio::io::split(client);
+        let (mut r_recv, r_send) = tokio::io::split(client);
+        let mut r_send = ShutdownProbe {
+            inner: r_send,
+            called: responder_shutdown_for_task,
+        };
         run_sync_session(
             &mut r_send,
             &mut r_recv,
@@ -77,7 +115,12 @@ async fn session_between(
         .await
         .expect("responder session")
     });
-    let (mut c_recv, mut c_send) = tokio::io::split(server);
+    let (mut c_recv, c_send) = tokio::io::split(server);
+    let initiator_shutdown = Arc::new(AtomicBool::new(false));
+    let mut c_send = ShutdownProbe {
+        inner: c_send,
+        called: Arc::clone(&initiator_shutdown),
+    };
     let initiator_summary = run_sync_session(
         &mut c_send,
         &mut c_recv,
@@ -90,6 +133,14 @@ async fn session_between(
     .await
     .expect("initiator session");
     let responder_summary = responder.await.expect("responder task");
+    assert!(
+        initiator_shutdown.load(Ordering::SeqCst),
+        "initiator must shut down the send half after Done"
+    );
+    assert!(
+        responder_shutdown.load(Ordering::SeqCst),
+        "responder must shut down the send half after Done"
+    );
     (initiator_summary, responder_summary)
 }
 
@@ -692,6 +743,70 @@ async fn two_agents_converge_over_real_syncv1_stream() {
         service_a.sync_all().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let bob_status = service_b.store().session_statuses().await;
+        if bob_status
+            .get(&alice.machine_id().0)
+            .is_some_and(|status| status.last_session_ok)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bob did not complete inbound sync"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let alice_status = service_a.store().session_statuses().await;
+    let bob_status = service_b.store().session_statuses().await;
+    assert_eq!(
+        alice_status
+            .get(&bob.machine_id().0)
+            .map(|status| status.last_session_ok),
+        Some(true),
+        "alice must report a successful outbound session"
+    );
+    assert_eq!(
+        bob_status
+            .get(&alice.machine_id().0)
+            .map(|status| status.last_session_ok),
+        Some(true),
+        "bob must report a successful inbound session"
+    );
+
+    // Run the opposite direction as a separate session. Both devices must
+    // complete it successfully even when their records already converge.
+    let mut alice_sessions = service_a.store().successful_sessions_rx();
+    let before = *alice_sessions.borrow();
+    service_b.sync_all().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *alice_sessions.borrow_and_update() == before {
+            alice_sessions
+                .changed()
+                .await
+                .expect("session status sender");
+        }
+    })
+    .await
+    .expect("alice did not complete inbound sync");
+    let alice_status = service_a.store().session_statuses().await;
+    let bob_status = service_b.store().session_statuses().await;
+    assert_eq!(
+        alice_status
+            .get(&bob.machine_id().0)
+            .map(|status| status.last_session_ok),
+        Some(true),
+        "alice must report a successful inbound session"
+    );
+    assert_eq!(
+        bob_status
+            .get(&alice.machine_id().0)
+            .map(|status| status.last_session_ok),
+        Some(true),
+        "bob must report a successful outbound session"
+    );
 
     // Non-enrolled machine rejected at accept: an unenrolled third agent's
     // stream never reaches the session (gate refuses before any byte).

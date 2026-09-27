@@ -36,7 +36,9 @@
 //! *refused* daemon's error message, read best-effort.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+
+use crate::file_lock::{open_failure_means_contention, open_lock_file, try_lock_exclusive};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -275,77 +277,6 @@ fn read_holder_pid(path: &Path) -> Option<u32> {
     let mut text = String::new();
     File::open(path).ok()?.read_to_string(&mut text).ok()?;
     text.trim().parse::<u32>().ok()
-}
-
-#[cfg(unix)]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    // FILE_SHARE_READ only: a refused second daemon can still READ the
-    // lockfile (for the holder pid in its error message), but its own
-    // write-access open fails with a sharing violation — the guard.
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(FILE_SHARE_READ)
-        .open(path)
-}
-
-/// Whether an `open_lock_file` failure means "another live daemon holds the
-/// lock" rather than a genuine I/O failure. Only Windows can answer yes:
-/// there the share-mode open IS the guard and contention surfaces as
-/// `ERROR_SHARING_VIOLATION` (32) on the existing lockfile.
-#[cfg(windows)]
-fn open_failure_means_contention(source: &std::io::Error) -> bool {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    source.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
-}
-
-/// Unix has no open-time contention (`flock` is taken separately in
-/// [`try_lock_exclusive`]), so no open failure ever means "held".
-#[cfg(not(windows))]
-fn open_failure_means_contention(_source: &std::io::Error) -> bool {
-    false
-}
-
-/// Take the exclusive lock non-blocking. `Ok(true)` = acquired,
-/// `Ok(false)` = held by another live process, `Err` = lock syscall failure.
-#[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: `flock` operates on our own open fd and never invalidates it;
-    // LOCK_NB makes contention return EWOULDBLOCK instead of blocking
-    // daemon startup indefinitely.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(false);
-    }
-    Err(err)
-}
-
-#[cfg(windows)]
-fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
-    // The share-mode(READ)-only open in `open_lock_file` is the guard:
-    // reaching here means our open succeeded, so no other process holds a
-    // write handle. A contending daemon fails inside `open_lock_file` and
-    // is mapped to `Held` there.
-    Ok(true)
 }
 
 #[cfg(test)]

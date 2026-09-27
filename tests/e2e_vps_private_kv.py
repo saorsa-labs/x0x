@@ -9,21 +9,49 @@ is a failed prerequisite, never a skip or a substitute group.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import time
 import uuid
 from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
-from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll
+from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier
+
+
+# #824: the documented transient `GET /home` state while startup provisioning
+# waits (at most 90 s) for owner sync. Readers poll through it, and only it.
+HOME_PROVISIONING_PENDING = "provisioning_pending"
+
+
+def settled_home(client: Api, label: str, timeout: float) -> tuple[int, dict[str, Any]]:
+    """`GET /home` once provisioning has left the transient pending state."""
+    return poll(f"{label} Home provisioning settles", timeout,
+                lambda: client.request("GET", "/home"),
+                lambda result: not (result[0] == 200
+                                    and result[1].get("state") == HOME_PROVISIONING_PENDING))
+
+
+def machine_id(client: Api) -> str:
+    status, body = client.request("GET", "/agent")
+    value = body.get("machine_id")
+    if status != 200 or not isinstance(value, str) or len(value) != 64:
+        raise RuntimeError("/agent did not return a 64-hex machine_id")
+    return value
 
 
 class Scenario(SharedScenario):
     def join_private(self, owner: str, member: str, gid: str, invite: str | None = None) -> None:
-        self.join(owner, member, gid, invite)
+        invite = invite or self.invite(owner, member, gid)
+        self._join_with_local_readiness(
+            owner, member, gid, {"invite": invite},
+            accepted_label=f"{member} joined expected group",
+            readiness_label=f"{member} private join reaches owner and local readiness",
+            operation="private_join_readiness")
 
     def home(self, owner: str) -> tuple[str, str]:
-        status, body = self.c[owner].request("GET", "/home")
+        status, body = settled_home(self.c[owner], owner, self.timeout)
         self.e.check("canonical Home is locally available", status == 200 and body.get("state") == "local",
                      status=status, state=body.get("state"))
         gid, owner_id = body.get("group_id"), body.get("owner_user_id")
@@ -42,6 +70,15 @@ class Scenario(SharedScenario):
                      and body.get("user_id") == owner_id, status=status)
 
     def home_invite(self, owner: str, member: str, gid: str, owner_id: str) -> str:
+        # Product contract: only a device serving the canonical Home may seat
+        # (`POST /home/seat` refuses otherwise). A device that has just been
+        # seated reaches `local` with the canonical gid only once its own join
+        # completes, so waiting for exactly that is readiness, not masking. A
+        # device stuck on a duplicate never matches and the poll fails.
+        poll(f"{owner} serves the canonical Home before seating {member}", self.timeout,
+             lambda: self.c[owner].request("GET", "/home"),
+             lambda result: result[0] == 200 and result[1].get("state") == "local"
+             and result[1].get("group_id") == gid)
         aid = self.c[member].agent_id()
         status, body = self.c[owner].request("POST", "/home/seat", {"agent_id": aid})
         self.e.check(f"Home seat invite for {member}", status == 200 and body.get("ok") is True
@@ -54,16 +91,137 @@ class Scenario(SharedScenario):
         return invite
 
     def join_home(self, owner: str, member: str, gid: str, owner_id: str, invite: str) -> None:
-        status, body = self.c[member].request("POST", "/groups/join", {
-            "invite": invite, "mode": "home", "expected_owner_user_id": owner_id})
-        self.e.check(f"{member} joined canonical Home", status in (200, 201)
+        self._join_with_local_readiness(
+            owner, member, gid,
+            {"invite": invite, "mode": "home", "expected_owner_user_id": owner_id},
+            accepted_label=f"{member} canonical Home join request accepted",
+            readiness_label=f"{member} Home seat reaches owner and local readiness",
+            operation="home_join_readiness")
+
+    def _join_with_local_readiness(self, owner: str, member: str, gid: str,
+                                   join_body: dict[str, Any], accepted_label: str,
+                                   readiness_label: str, operation: str) -> None:
+        status, body = self.c[member].request("POST", "/groups/join", join_body)
+        body = body if isinstance(body, dict) else {}
+        join_state = body.get("join_state")
+        if join_state not in ("active", "pending_authority_commit", "idle", "timed_out"):
+            join_state = "other" if join_state is not None else None
+        self.e.check(accepted_label, status in (200, 201)
                      and body.get("ok") is not False and body.get("group_id", gid) == gid,
-                     status=status)
+                     status=status, join_state=join_state)
         aid = self.c[member].agent_id()
-        poll(f"{member} Home seat reaches owner", self.timeout,
-             lambda: self.c[owner].request("GET", f"/groups/{enc(gid)}/members"),
-             lambda result: result[0] == 200
-             and any(row.get("agent_id") == aid for row in result[1].get("members", [])))
+        started = time.monotonic()
+        deadline = started + self.timeout
+        owner_samples = local_samples = 0
+        owner_last: Any = None
+        local_last: Any = None
+        owner_body: dict[str, Any] = {}
+        local_body: dict[str, Any] = {}
+        owner_ready = False
+        local_ready = False
+        first_sample_utc = last_sample_utc = None
+        last_error: str | None = None
+        deadline_reached = False
+
+        def safe_request(client: Any, method: str, path: str) -> tuple[Any, str | None]:
+            try:
+                return client.request(method, path), None
+            except Exception as error:
+                return None, type(error).__name__
+
+        def state_label(response_body: dict[str, Any]) -> str | None:
+            value = response_body.get("membership_state")
+            allowed = {"active", "pending_authority_commit", "pending", "idle", "not_member"}
+            return value if isinstance(value, str) and value in allowed else (
+                "other" if value is not None else None)
+
+        while time.monotonic() < deadline:
+            sampled = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            first_sample_utc = first_sample_utc or sampled
+            last_sample_utc = sampled
+            owner_samples += 1
+            owner_last, request_error = safe_request(
+                self.c[owner], "GET", f"/groups/{enc(gid)}/members")
+            last_error = request_error or last_error
+            owner_body = (owner_last[1] if isinstance(owner_last, tuple) and len(owner_last) > 1
+                          and isinstance(owner_last[1], dict) else {})
+            members = owner_body.get("members")
+            rows = members if isinstance(members, list) else None
+            owner_ready = (isinstance(owner_last, tuple) and owner_last[0] == 200
+                           and rows is not None
+                           and any(isinstance(row, dict) and row.get("agent_id") == aid for row in rows))
+            if time.monotonic() >= deadline:
+                deadline_reached = True
+                break
+            local_samples += 1
+            local_last, request_error = safe_request(
+                self.c[member], "GET", f"/groups/{enc(gid)}")
+            last_error = request_error or last_error
+            local_body = (local_last[1] if isinstance(local_last, tuple) and len(local_last) > 1
+                          and isinstance(local_last[1], dict) else {})
+            local_ready = (isinstance(local_last, tuple) and local_last[0] == 200
+                           and local_body.get("group_id") == gid
+                           and state_label(local_body) == "active")
+            if time.monotonic() >= deadline:
+                deadline_reached = True
+                break
+            if owner_ready and local_ready:
+                elapsed = round(time.monotonic() - started, 3)
+                self.e.record_poll(
+                    {"label": readiness_label, "elapsed_seconds": elapsed,
+                     "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                     "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+                     "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_membership_state": "active", "outcome": "accepted",
+                     "local_observed_group_id": safe_identifier(local_body.get("group_id")),
+                     "observed_member_count": len(rows) if rows is not None else None,
+                     "expected_member_present": True, "last_error_class": last_error},
+                    operation=operation, node=member, owner=owner,
+                    group_id=safe_identifier(gid), deadline_seconds=self.timeout,
+                    observed_member_count=len(rows) if rows is not None else None,
+                    expected_member_present=True, local_probe_count=local_samples)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+
+        diagnostic_started = time.monotonic()
+        deadline_reached = time.monotonic() >= deadline
+        join_status, terminal_error = safe_request(
+            self.c[member], "GET", f"/groups/{enc(gid)}/join-status")
+        terminal_body = (join_status[1] if isinstance(join_status, tuple) and len(join_status) > 1
+                         and isinstance(join_status[1], dict) else {})
+        terminal = terminal_body.get("last_join_outcome")
+        terminal_value = terminal.get("outcome") if isinstance(terminal, dict) else None
+        terminal_outcome = (terminal_value if isinstance(terminal_value, str)
+                            and terminal_value in {"refused", "timed_out"} else
+                            ("other" if terminal_value is not None else None))
+        elapsed = round(diagnostic_started - started, 3)
+        self.e.record_poll(
+            {"label": readiness_label, "elapsed_seconds": elapsed,
+             "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+             "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+             "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+             "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+             "local_membership_state": state_label(local_body),
+             "local_observed_group_id": safe_identifier(local_body.get("group_id")),
+             "terminal_join_status": join_status[0] if isinstance(join_status, tuple) else None,
+             "terminal_join_outcome": terminal_outcome,
+             "terminal_join_status_error_class": terminal_error,
+             "deadline_reached_before_acceptance": deadline_reached,
+             "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
+             "last_error_class": last_error, "outcome": "timeout"},
+            operation=operation, node=member, owner=owner,
+            group_id=safe_identifier(gid), deadline_seconds=self.timeout,
+            observed_member_count=(len(owner_body.get("members"))
+                                   if isinstance(owner_last, tuple) and owner_last[0] == 200
+                                   and isinstance(owner_body.get("members"), list) else None),
+            expected_member_present=(owner_ready if isinstance(owner_last, tuple)
+                                     and owner_last[0] == 200
+                                     and isinstance(owner_body.get("members"), list) else None),
+            local_probe_count=local_samples)
+        raise AssertionError(f"{readiness_label} did not converge in {self.timeout:g}s")
 
     def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
                  gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],

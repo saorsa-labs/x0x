@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 182,
+  "endpoint_count": 201,
   "endpoints": [
     {
       "category": "status",
@@ -55,6 +55,16 @@
       "description": "Exchange the durable API token for a short-lived browser session token",
       "method": "POST",
       "path": "/auth/session",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "status",
+      "cli_name": "auth refresh",
+      "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
+      "method": "POST",
+      "path": "/auth/session/refresh",
       "request": {
         "kind": "none"
       }
@@ -914,6 +924,16 @@
       }
     },
     {
+      "category": "network",
+      "cli_name": "diagnostics state-sync",
+      "description": "Local state-sync counters for currently open KV stores",
+      "method": "GET",
+      "path": "/diagnostics/state-sync",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
       "category": "history",
       "cli_name": "history list",
       "description": "List durable history for one scope (dm:/group:/topic:), keyset-paginated",
@@ -1759,6 +1779,80 @@
       "description": "List local pending and remote active exec sessions",
       "method": "GET",
       "path": "/exec/sessions",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call",
+      "description": "Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates",
+      "method": "POST",
+      "path": "/calls",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "body",
+            "name": "agent_id",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "video",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call list",
+      "description": "List calls with gate and lifecycle counters",
+      "method": "GET",
+      "path": "/calls",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call show",
+      "description": "Show one call's lifecycle state",
+      "method": "GET",
+      "path": "/calls/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call accept",
+      "description": "Answer a ringing incoming call",
+      "method": "POST",
+      "path": "/calls/:id/accept",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call reject",
+      "description": "Decline a ringing incoming call",
+      "method": "POST",
+      "path": "/calls/:id/reject",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call hangup",
+      "description": "End or cancel a call",
+      "method": "POST",
+      "path": "/calls/:id/hangup",
       "request": {
         "kind": "none"
       }
@@ -3143,6 +3237,166 @@
       "description": "Active forward-stream count + connect-ACL counters",
       "method": "GET",
       "path": "/streams",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect list",
+      "description": "List connect ACL entries (TOML floor + API-managed) and reload status",
+      "method": "GET",
+      "path": "/acl/connect",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect add",
+      "description": "Add an API-managed connect ACL entry (TOML entry schema as JSON)",
+      "method": "POST",
+      "path": "/acl/connect",
+      "request": {
+        "kind": "passthrough"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl connect rm",
+      "description": "Remove an API-managed connect ACL entry (floor entries: 409)",
+      "method": "DELETE",
+      "path": "/acl/connect/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec list",
+      "description": "List exec ACL entries (TOML floor + API-managed) and reload status",
+      "method": "GET",
+      "path": "/acl/exec",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec add",
+      "description": "Add an API-managed exec ACL entry (TOML entry schema as JSON)",
+      "method": "POST",
+      "path": "/acl/exec",
+      "request": {
+        "kind": "passthrough"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl exec rm",
+      "description": "Remove an API-managed exec ACL entry (floor entries: 409)",
+      "method": "DELETE",
+      "path": "/acl/exec/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "acl",
+      "cli_name": "acl reload",
+      "description": "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
+      "method": "POST",
+      "path": "/acl/reload",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant list",
+      "description": "List share grants this install's owner issued, with status",
+      "method": "GET",
+      "path": "/grants",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant issue",
+      "description": "Sign a share grant with the owner key, store it, and deliver it by durable DM",
+      "method": "POST",
+      "path": "/grants",
+      "request": {
+        "fields": [
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_user",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_agent",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "agents",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "caps",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "not_before",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "expiry",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "ttl_secs",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "deliver_to",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant revoke",
+      "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+      "method": "DELETE",
+      "path": "/grants/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant received",
+      "description": "List share grants that name this install as grantee",
+      "method": "GET",
+      "path": "/grants/received",
       "request": {
         "kind": "none"
       }
