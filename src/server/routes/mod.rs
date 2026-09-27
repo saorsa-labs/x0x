@@ -58,7 +58,9 @@ pub(super) use files::{
     file_accept_handler, file_reject_handler, file_send_handler, file_transfer_status_handler,
     file_transfers_handler, handle_file_message, FileChunkAckSlot,
 };
-pub(super) use grants::{grants_issue, grants_list, grants_received, grants_revoke};
+pub(super) use grants::{
+    grants_issue, grants_list, grants_received, grants_revoke, handle_share_grant_delivery,
+};
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
@@ -120,8 +122,8 @@ pub(super) use named_groups::{
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use names::{
-    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
-    names_unpin,
+    names_accept, names_list, names_machine_label, names_owner_bind, names_owner_unbind,
+    names_resolve, names_unpin,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,

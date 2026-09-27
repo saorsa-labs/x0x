@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 207,
+  "endpoint_count": 208,
   "endpoints": [
     {
       "category": "status",
@@ -3382,6 +3382,12 @@
             "in": "body",
             "name": "deliver_to",
             "required": false
+          },
+          {
+            "cli": "derived",
+            "in": "body",
+            "name": "include_names",
+            "required": false
           }
         ],
         "kind": "fields"
@@ -3487,6 +3493,24 @@
             "cli": "default",
             "in": "body",
             "name": "machine_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names accept",
+      "description": "Apply a pending grant-name suggestion (ADR-0079): bind the owner petname and its machine labels",
+      "method": "POST",
+      "path": "/names/accept",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "label",
             "required": true
           }
         ],

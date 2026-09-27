@@ -43,6 +43,13 @@ pub async fn machine_label(client: &DaemonClient, name: &str, machine_id: &str) 
     Ok(())
 }
 
+/// `x0x names accept LABEL` — apply a pending grant-name suggestion.
+pub async fn accept(client: &DaemonClient, label: &str) -> Result<()> {
+    let resp = client.post("/names/accept", &accept_body(label)).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x names unpin NAME` — drop a pin (canonical `agent:`/`machine:` name).
 pub async fn unpin(client: &DaemonClient, name: &str) -> Result<()> {
     let resp = client.delete(&format!("/names/pins/{name}")).await?;
@@ -60,6 +67,10 @@ fn owner_add_body(label: &str, user_id: &str) -> serde_json::Value {
 
 fn machine_label_body(name: &str, machine_id: &str) -> serde_json::Value {
     serde_json::json!({ "name": name, "machine_id": machine_id })
+}
+
+fn accept_body(label: &str) -> serde_json::Value {
+    serde_json::json!({ "label": label })
 }
 
 #[cfg(test)]
@@ -81,6 +92,11 @@ mod tests {
         assert_eq!(
             machine_label_body("machine:box.bob", "cd"),
             serde_json::json!({ "name": "machine:box.bob", "machine_id": "cd" })
+        );
+        assert_eq!(accept_body("bob"), serde_json::json!({ "label": "bob" }));
+        assert_eq!(
+            crate::api::find_by_cli_name("names accept").map(|e| e.path),
+            Some("/names/accept")
         );
     }
 }

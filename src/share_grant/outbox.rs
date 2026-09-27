@@ -15,7 +15,8 @@
 //! opens a DM/stream, and a daemon that missed delivery asks for the grant.
 //! That needs a new wire carrier (old peers must ignore it) and a new typed
 //! request/response. The outbox needs neither: it re-sends the exact
-//! `x0x-sharegrant-v1\0` typed DM that #924 already sends, with the same
+//! typed DM that #924 already sends (`x0x-sharegrant-v1\0`, or the ADR-0079
+//! `x0x-sharegrant-v2\0` envelope when that was sent), with the same
 //! logical request id, so the receiver verifies and stores it on exactly the
 //! #924 path ([`super::handle_share_grant_dm`]) and answers a replay as
 //! `Duplicate`. Nothing changes on the wire or on the receiving side.
@@ -100,8 +101,14 @@
 //!
 //! # Storage
 //!
-//! `X0GO` magic ‖ strict bincode, written durably (temp, fsync, rename, dir
-//! fsync) with mode 0600, like the grant store. Every stored grant is
+//! `X0G2` magic ‖ strict bincode, written durably (temp, fsync, rename, dir
+//! fsync) with mode 0600, like the grant store. Each entry records its
+//! delivery envelope ([`GrantEnvelope`], ADR-0079): `V1`, or `V2` with the
+//! exact owner-signed names section, so a retry resends the same bytes and
+//! the same logical request id ([`super::envelope_delivery_request`]). A
+//! file with the pre-ADR-0079 `X0GO` magic (entries without an envelope) is
+//! still read, every entry as `V1`, and is rewritten as `X0G2` on the next
+//! write. Every stored grant is
 //! re-verified on load and must be signed by this install's owner. An
 //! unreadable, malformed or over-bound file — including an entry that no
 //! longer verifies or is not this owner's — yields an empty outbox that
@@ -120,14 +127,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{Grantee, ShareGrant, ShareGrantError};
+use super::{GrantEnvelope, Grantee, ShareGrant, ShareGrantError};
 use crate::identity::{AgentId, UserId};
 use crate::revocation::RevocationSet;
 
 /// File name of the outbox, next to [`super::SHARE_GRANT_STORE_FILE`].
 pub const SHARE_GRANT_OUTBOX_FILE: &str = "share-grant-outbox.bin";
 
-const OUTBOX_MAGIC: &[u8; 4] = b"X0GO";
+/// Current outbox format (entries carry their [`GrantEnvelope`]).
+const OUTBOX_MAGIC: &[u8; 4] = b"X0G2";
+
+/// Pre-ADR-0079 outbox format (every entry is a v1 delivery).
+const LEGACY_OUTBOX_MAGIC: &[u8; 4] = b"X0GO";
 
 /// Hard bound on queued deliveries across all recipients.
 pub const MAX_OUTBOX_ENTRIES: usize = 1024;
@@ -180,11 +191,44 @@ pub struct PendingGrantDelivery {
     /// Outbox attempts made so far (the initial `POST /grants` delivery is
     /// not counted).
     pub attempts: u32,
+    /// The delivery envelope (ADR-0079): every retry resends exactly its
+    /// bytes.
+    pub envelope: GrantEnvelope,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OutboxFile {
     entries: Vec<PendingGrantDelivery>,
+}
+
+/// A pre-ADR-0079 (`X0GO`) entry: no envelope, so a v1 delivery.
+#[derive(Debug, Deserialize)]
+struct LegacyPendingGrantDelivery {
+    recipient: AgentId,
+    grant: ShareGrant,
+    queued_at: u64,
+    deadline: u64,
+    next_attempt_at: u64,
+    attempts: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyOutboxFile {
+    entries: Vec<LegacyPendingGrantDelivery>,
+}
+
+impl From<LegacyPendingGrantDelivery> for PendingGrantDelivery {
+    fn from(e: LegacyPendingGrantDelivery) -> Self {
+        Self {
+            recipient: e.recipient,
+            grant: e.grant,
+            queued_at: e.queued_at,
+            deadline: e.deadline,
+            next_attempt_at: e.next_attempt_at,
+            attempts: e.attempts,
+            envelope: GrantEnvelope::V1,
+        }
+    }
 }
 
 type EntryKey = ([u8; 32], [u8; 32]);
@@ -288,14 +332,20 @@ impl GrantRedeliveryOutbox {
                 return outbox;
             }
         };
-        let file =
-            if bytes.len() >= OUTBOX_MAGIC.len() && &bytes[..OUTBOX_MAGIC.len()] == OUTBOX_MAGIC {
-                let body = &bytes[OUTBOX_MAGIC.len()..];
-                super::strict_decode::<OutboxFile>(body, body.len() as u64)
-                    .map_err(|e| format!("decode {}: {e}", path.display()))
-            } else {
-                Err(format!("{} missing X0GO magic", path.display()))
-            };
+        let magic = bytes.get(..OUTBOX_MAGIC.len());
+        let body = bytes.get(OUTBOX_MAGIC.len()..).unwrap_or_default();
+        let file = if magic == Some(OUTBOX_MAGIC.as_slice()) {
+            super::strict_decode::<OutboxFile>(body, body.len() as u64)
+                .map_err(|e| format!("decode {}: {e}", path.display()))
+        } else if magic == Some(LEGACY_OUTBOX_MAGIC.as_slice()) {
+            super::strict_decode::<LegacyOutboxFile>(body, body.len() as u64)
+                .map(|legacy| OutboxFile {
+                    entries: legacy.entries.into_iter().map(Into::into).collect(),
+                })
+                .map_err(|e| format!("decode {}: {e}", path.display()))
+        } else {
+            Err(format!("{} missing X0G2/X0GO magic", path.display()))
+        };
         let file = match file {
             Ok(file) if file.entries.len() > MAX_OUTBOX_ENTRIES => Err(format!(
                 "{} holds {} entries (bound {MAX_OUTBOX_ENTRIES})",
@@ -342,6 +392,9 @@ impl GrantRedeliveryOutbox {
         let mut expired = 0usize;
         for entry in file.entries {
             if let Err(e) = self.queueable(&entry.grant) {
+                return Err(format!("{}: {e}", path.display()));
+            }
+            if let Err(e) = envelope_valid(&entry.grant, &entry.envelope) {
                 return Err(format!("{}: {e}", path.display()));
             }
             if entry.deadline > entry.grant.expiry {
@@ -471,7 +524,27 @@ impl GrantRedeliveryOutbox {
         now_unix: u64,
         revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, OutboxError> {
+        self.enqueue_envelope(grant, GrantEnvelope::V1, recipient, now_unix, revocations)
+            .await
+    }
+
+    /// [`Self::enqueue`] recording the delivery's envelope (ADR-0079), so
+    /// every retry resends exactly the bytes of the original delivery. A
+    /// `V2` envelope's names signature must verify for `grant`.
+    ///
+    /// # Errors
+    /// As [`Self::enqueue`]; a `V2` envelope whose names do not verify is
+    /// `NotQueueable`.
+    pub async fn enqueue_envelope(
+        &self,
+        grant: &ShareGrant,
+        envelope: GrantEnvelope,
+        recipient: AgentId,
+        now_unix: u64,
+        revocations: &RwLock<RevocationSet>,
+    ) -> Result<bool, OutboxError> {
         self.queueable(grant)?;
+        envelope_valid(grant, &envelope)?;
         let deadline = grant
             .expiry
             .min(now_unix.saturating_add(OUTBOX_ENTRY_TTL_SECS));
@@ -518,6 +591,7 @@ impl GrantRedeliveryOutbox {
                     deadline,
                     next_attempt_at: now_unix.saturating_add(retry_delay_secs(0)),
                     attempts: 0,
+                    envelope,
                 },
             );
         }
@@ -587,7 +661,8 @@ impl GrantRedeliveryOutbox {
     ///    schedule first, concurrently via `send(recipient, payload,
     ///    request_id)`, which must return `Ok` only on the recipient's
     ///    durable v2 ACK. `payload`/`request_id` are exactly those of the
-    ///    original delivery ([`super::grant_delivery_request`]).
+    ///    original delivery, in its recorded envelope
+    ///    ([`super::envelope_delivery_request`]).
     /// 3. Drop ACKed entries; reschedule the rest on bounded backoff.
     ///
     /// A zero clock (failed read) does nothing: deadlines cannot be judged.
@@ -664,7 +739,7 @@ impl GrantRedeliveryOutbox {
             return report;
         }
         let sends = due.into_iter().map(|entry| {
-            let request = super::grant_delivery_request(&entry.grant);
+            let request = super::envelope_delivery_request(&entry.grant, &entry.envelope);
             let fut =
                 request.map(|(payload, request_id)| send(entry.recipient, payload, request_id));
             async move {
@@ -740,6 +815,17 @@ impl GrantRedeliveryOutbox {
         crate::storage::write_private_bytes_durable(path, bytes)
             .await
             .map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// A `V2` envelope's names section must verify for its grant (a `V1`
+/// envelope always passes).
+fn envelope_valid(grant: &ShareGrant, envelope: &GrantEnvelope) -> Result<(), OutboxError> {
+    match envelope {
+        GrantEnvelope::V1 => Ok(()),
+        GrantEnvelope::V2(signed) => signed
+            .verify(grant)
+            .map_err(|e| OutboxError::NotQueueable(format!("names section: {e}"))),
     }
 }
 

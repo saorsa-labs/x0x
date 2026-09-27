@@ -363,6 +363,9 @@ pub struct Agent {
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    /// ADR-0079: advertise the signed `share_grant_names` capability
+    /// extension (set by a daemon that routes `x0x-sharegrant-v2\0`).
+    share_grant_names_supported: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Single-flight registry for ADR 0030 strict capability refreshes, so
     /// concurrent strict sends to one recipient publish a single targeted
     /// request between them.
@@ -10590,6 +10593,7 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            std::sync::Arc::clone(&self.share_grant_names_supported),
             #[cfg(test)]
             convergence_observer,
         )
@@ -16344,6 +16348,9 @@ impl AgentBuilder {
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            share_grant_names_supported: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
             capability_convergence_observer: std::sync::Mutex::new(None),

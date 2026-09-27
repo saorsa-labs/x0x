@@ -235,6 +235,52 @@ pub(crate) fn ingest_verified_digest_extension(
     )
 }
 
+/// Verify and ingest one ADR-0079 `share_grant_names` extension, with the
+/// same authenticated-sender boundary as [`ingest_verified_digest_extension`]:
+/// a verified pubsub envelope whose sender is the extension's agent, the
+/// record tag, the freshness pre-check, then the ML-DSA-65 signature under
+/// the sender's key.
+pub(crate) fn ingest_verified_share_grant_names_extension(
+    store: &CapabilityStore,
+    self_agent_id: AgentId,
+    message: &PubSubMessage,
+) -> bool {
+    let (pubsub_sender, sender_pubkey) =
+        match (message.sender, message.sender_public_key.as_deref()) {
+            (Some(sender), Some(public_key)) if message.verified => (sender, public_key),
+            _ => return false,
+        };
+    if pubsub_sender == self_agent_id {
+        return false;
+    }
+    let Ok(extension) =
+        crate::dm_capability::ShareGrantNamesExtension::from_postcard(&message.payload)
+    else {
+        return false;
+    };
+    if extension.protocol_version != crate::dm_capability::SHARE_GRANT_NAMES_EXTENSION_TAG
+        || extension.agent_id != *pubsub_sender.as_bytes()
+    {
+        return false;
+    }
+    if !store.would_accept_share_grant_names_extension(
+        &AgentId(extension.agent_id),
+        extension.created_at_unix_ms,
+    ) {
+        store.record_prefiltered_stale_advert();
+        return false;
+    }
+    if !verify_share_grant_names_extension_signature(&extension, sender_pubkey) {
+        return false;
+    }
+    store.apply_share_grant_names_extension(
+        AgentId(extension.agent_id),
+        MachineId(extension.machine_id),
+        extension.share_grant_names,
+        extension.created_at_unix_ms,
+    )
+}
+
 /// Owns the optional blob responder even while an asynchronous stop is cancelled.
 /// Ordinary stop joins this task; Drop can only request its cancellation.
 #[derive(Default)]
@@ -327,6 +373,7 @@ impl CapabilityAdvertService {
             store,
             publish_interval,
             periodic,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             None,
         )
@@ -343,6 +390,7 @@ impl CapabilityAdvertService {
         store: Arc<CapabilityStore>,
         publish_interval: Duration,
         periodic: bool,
+        share_grant_names: Arc<std::sync::atomic::AtomicBool>,
         #[cfg(test)] observation: Option<Arc<ConvergenceServiceObserver>>,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
@@ -405,6 +453,22 @@ impl CapabilityAdvertService {
         let digest_store_sub = Arc::clone(&store);
         let digest_subscriber = tokio::spawn(async move {
             while let Some(message) = digest_subscription.recv().await {
+                // ADR-0079: the `share_grant_names` extension shares this
+                // topic; its record tag keeps the two decoders disjoint.
+                if ingest_verified_share_grant_names_extension(
+                    &digest_store_sub,
+                    self_agent_for_sub,
+                    &message,
+                ) {
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_share_grant_names_extension_ingested",
+                        sender = message
+                            .sender
+                            .map(|agent_id| hex::encode(agent_id.as_bytes())),
+                    );
+                    continue;
+                }
                 if ingest_verified_digest_extension(&digest_store_sub, self_agent_for_sub, &message)
                 {
                     tracing::debug!(
@@ -590,6 +654,29 @@ impl CapabilityAdvertService {
                                 .await
                             {
                                 tracing::warn!("digest extension publish failed: {e}");
+                            }
+                        }
+                        // ADR-0079: the `share_grant_names` extension rides
+                        // the same cycle and topic, only while the daemon
+                        // routes `x0x-sharegrant-v2\0`.
+                        if share_grant_names.load(std::sync::atomic::Ordering::Acquire) {
+                            if let Ok(ext) = build_signed_share_grant_names_extension(
+                                &publisher_signing,
+                                self_agent_id,
+                                self_machine_id,
+                            ) {
+                                if let Err(e) = publisher_pubsub
+                                    .publish(
+                                        crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC
+                                            .to_string(),
+                                        Bytes::from(ext),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "share_grant_names extension publish failed: {e}"
+                                    );
+                                }
                             }
                         }
                         let bytes = Bytes::from(bytes);
@@ -882,6 +969,55 @@ pub fn build_signed_digest_extension(
     postcard::to_stdvec(&extension)
         .map_err(|e| NetworkError::SerializationError(format!("digest ext encode: {e}")))
         .map(Some)
+}
+
+/// Build the signed ADR-0079 `share_grant_names` extension record
+/// (`share_grant_names: true`) for this agent and machine.
+///
+/// # Errors
+/// Encoding or signing failure.
+pub fn build_signed_share_grant_names_extension(
+    signing: &SigningContext,
+    self_agent_id: AgentId,
+    self_machine_id: MachineId,
+) -> NetworkResult<Vec<u8>> {
+    let mut extension = crate::dm_capability::ShareGrantNamesExtension {
+        protocol_version: crate::dm_capability::SHARE_GRANT_NAMES_EXTENSION_TAG,
+        agent_id: *self_agent_id.as_bytes(),
+        machine_id: *self_machine_id.as_bytes(),
+        created_at_unix_ms: now_unix_ms(),
+        share_grant_names: true,
+        signature: Vec::new(),
+    };
+    extension.signature = signing.sign(&extension.signed_bytes())?;
+    postcard::to_stdvec(&extension)
+        .map_err(|e| NetworkError::SerializationError(format!("share_grant_names ext encode: {e}")))
+}
+
+/// Verify a `share_grant_names` extension against the sender's ML-DSA-65
+/// public key, with the same derived-id binding as
+/// [`verify_digest_extension_signature`].
+pub fn verify_share_grant_names_extension_signature(
+    extension: &crate::dm_capability::ShareGrantNamesExtension,
+    public_key_bytes: &[u8],
+) -> bool {
+    let Ok(public_key) = ant_quic::MlDsaPublicKey::from_bytes(public_key_bytes) else {
+        return false;
+    };
+    if crate::identity::AgentId::from_public_key(&public_key).0 != extension.agent_id {
+        return false;
+    }
+    let Ok(signature) =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&extension.signature)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+        &public_key,
+        &extension.signed_bytes(),
+        &signature,
+    )
+    .is_ok()
 }
 
 /// Verify an extension record against the sender's ML-DSA-65 public key,

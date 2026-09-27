@@ -3,11 +3,12 @@
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
 
-/// `x0x grant issue GRANT_JSON` — GRANT_JSON is the `POST /grants` body
-/// (literal, `@path` or a bare path, or `-` for stdin), e.g.
+/// `x0x grant issue GRANT_JSON [--no-names]` — GRANT_JSON is the `POST
+/// /grants` body (literal, `@path` or a bare path, or `-` for stdin), e.g.
 /// `{"grantee_user":"<hex>","agents":["<hex>"],"caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}`.
-pub async fn issue(client: &DaemonClient, grant_json: &str) -> Result<()> {
-    let body = read_json_arg(grant_json)?;
+/// `--no-names` sets `include_names: false` (ADR-0079: send v1 only).
+pub async fn issue(client: &DaemonClient, grant_json: &str, no_names: bool) -> Result<()> {
+    let body = issue_body(read_json_arg(grant_json)?, no_names)?;
     let resp = client.post("/grants", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -32,6 +33,17 @@ pub async fn received(client: &DaemonClient) -> Result<()> {
     let resp = client.get("/grants/received").await?;
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// Apply `--no-names` to the grant document: `include_names: false`.
+fn issue_body(mut body: serde_json::Value, no_names: bool) -> Result<serde_json::Value> {
+    if no_names {
+        let object = body
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("grant JSON must be an object"))?;
+        object.insert("include_names".into(), serde_json::Value::Bool(false));
+    }
+    Ok(body)
 }
 
 fn read_json_arg(spec: &str) -> Result<serde_json::Value> {
@@ -78,6 +90,18 @@ mod tests {
         );
         let _ = std::fs::remove_file(&p);
         assert!(read_json_arg("/nonexistent/x0x-grant.json").is_err());
+    }
+
+    /// WHY (ADR-0079): `--no-names` must reach the daemon as
+    /// `include_names: false`, or the grant carries names the owner withheld.
+    #[test]
+    fn no_names_sets_include_names_false_and_default_leaves_it_out() {
+        let doc = serde_json::json!({"agents":["aa"],"caps":["dm"],"ttl_secs":60});
+        let with = issue_body(doc.clone(), true).expect("object");
+        assert_eq!(with["include_names"], serde_json::Value::Bool(false));
+        let without = issue_body(doc.clone(), false).expect("object");
+        assert_eq!(without, doc, "default leaves the daemon default (names on)");
+        assert!(issue_body(serde_json::json!([1]), true).is_err());
     }
 
     #[test]

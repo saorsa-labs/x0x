@@ -69,6 +69,17 @@ pub const DIGEST_EXTENSION_PROTOCOL_VERSION: u16 = 1;
 /// Domain-separation prefix for the advert signature bytes.
 const ADVERT_SIGN_DOMAIN: &[u8] = b"x0x-caps-v1";
 
+/// Record tag of the ADR-0079 `share_grant_names` extension. It sits in the
+/// `protocol_version` slot, so a [`DigestSupportExtension`] decoder on the
+/// same topic (every #448 build) drops the record at its version check,
+/// before any signature verify, and vice versa.
+pub const SHARE_GRANT_NAMES_EXTENSION_TAG: u16 = 0x534E;
+
+/// Domain-separation prefix for the `share_grant_names` extension
+/// signature: distinct from the advert and digest domains, so no record can
+/// be reinterpreted as another.
+const SHARE_GRANT_NAMES_EXTENSION_SIGN_DOMAIN: &[u8] = b"x0x-caps-share-grant-names-v1";
+
 /// Cadence at which agents republish their advert. Kept in step with
 /// `IDENTITY_HEARTBEAT_INTERVAL_SECS` (10 min): idle-network broadcast cost
 /// scales linearly with cadence, and the 900 s cache TTL still tolerates a
@@ -250,6 +261,56 @@ impl DigestSupportExtension {
     }
 }
 
+/// Signed `share_grant_names` extension (ADR-0079), published on
+/// [`DM_CAPABILITY_DIGEST_TOPIC`] beside the #448 digest extension and
+/// modelled on it: the SAME agent ML-DSA-65 key signs it, bound to the SAME
+/// agent + machine as the base advert, under its own sign domain. An owner
+/// sends the names-carrying `x0x-sharegrant-v2\0` grant envelope only to a
+/// grantee agent whose fresh extension is machine-bound to its live advert
+/// ([`CapabilityStore::supports_share_grant_names`]). Domain-separated
+/// signed bytes: `SHARE_GRANT_NAMES_EXTENSION_SIGN_DOMAIN || protocol_version
+/// || agent_id || machine_id || created_at_unix_ms || [supported byte]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareGrantNamesExtension {
+    /// Record tag; must be [`SHARE_GRANT_NAMES_EXTENSION_TAG`].
+    pub protocol_version: u16,
+    /// Advertising agent's id (must equal the authenticated pubsub sender).
+    pub agent_id: [u8; 32],
+    /// Machine binding — must match the base advert's machine.
+    pub machine_id: [u8; 32],
+    /// Sender-local unix-ms at extension generation.
+    pub created_at_unix_ms: u64,
+    /// Whether the agent accepts `x0x-sharegrant-v2\0` grant envelopes.
+    pub share_grant_names: bool,
+    /// ML-DSA-65 signature over the domain-separated extension bytes.
+    pub signature: Vec<u8>,
+}
+
+impl ShareGrantNamesExtension {
+    /// Canonical signed-bytes representation.
+    #[must_use]
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(SHARE_GRANT_NAMES_EXTENSION_SIGN_DOMAIN.len() + 2 + 32 + 32 + 8 + 1);
+        out.extend_from_slice(SHARE_GRANT_NAMES_EXTENSION_SIGN_DOMAIN);
+        out.extend_from_slice(&self.protocol_version.to_be_bytes());
+        out.extend_from_slice(&self.agent_id);
+        out.extend_from_slice(&self.machine_id);
+        out.extend_from_slice(&self.created_at_unix_ms.to_be_bytes());
+        out.push(u8::from(self.share_grant_names));
+        out
+    }
+
+    /// Postcard decode (one wire shape).
+    ///
+    /// # Errors
+    ///
+    /// Returns the postcard error on malformed bytes.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 /// In-memory cache of `AgentId → latest CapabilityAdvert`, with TTL
 /// eviction.
 /// Senders consult this cache before each `send_direct` call to determine
@@ -272,6 +333,11 @@ struct CapabilityStoreInner {
     /// extension carry different created_at stamps and arrive in either
     /// order).
     digest_exts: HashMap<[u8; 32], CachedDigestExt>,
+    /// Signed `share_grant_names` extensions (ADR-0079), kept apart like
+    /// the digest extensions and consulted only with a machine-matching
+    /// live advert. The shared record's `digest_support` slot holds the
+    /// `share_grant_names` bit.
+    names_exts: HashMap<[u8; 32], CachedDigestExt>,
 }
 
 struct CachedDigestExt {
@@ -412,6 +478,92 @@ impl CapabilityStore {
                 Instant::now() > existing.expires_at
                     || created_at_unix_ms > existing.created_at_unix_ms
             })
+    }
+
+    /// Would [`Self::apply_share_grant_names_extension`] accept an extension
+    /// with this signed timestamp? Same contract as
+    /// [`Self::would_accept_digest_extension`].
+    pub(crate) fn would_accept_share_grant_names_extension(
+        &self,
+        agent_id: &AgentId,
+        created_at_unix_ms: u64,
+    ) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return true;
+        };
+        inner
+            .names_exts
+            .get(agent_id.as_bytes())
+            .is_none_or(|existing| {
+                Instant::now() > existing.expires_at
+                    || created_at_unix_ms > existing.created_at_unix_ms
+            })
+    }
+
+    /// Record a verified [`ShareGrantNamesExtension`] (ADR-0079). Ordered by
+    /// signed timestamp (stale and replayed records are ignored) with a
+    /// lifetime derived from the signed timestamp, exactly like the digest
+    /// extension. Returns `true` when fresh signed state was recorded.
+    pub fn apply_share_grant_names_extension(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        supported: bool,
+        created_at_unix_ms: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let Some(expires_at) =
+            self.expiry_for_signed_timestamp_at(created_at_unix_ms, now_unix_ms(), now)
+        else {
+            return false;
+        };
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if let Some(existing) = inner.names_exts.get(agent_id.as_bytes()) {
+            if now <= existing.expires_at && created_at_unix_ms <= existing.created_at_unix_ms {
+                return false;
+            }
+        }
+        inner.names_exts.insert(
+            *agent_id.as_bytes(),
+            CachedDigestExt {
+                machine_id: *machine_id.as_bytes(),
+                digest_support: supported,
+                expires_at,
+                created_at_unix_ms,
+            },
+        );
+        true
+    }
+
+    /// Whether `agent_id` advertises `share_grant_names` (ADR-0079): a fresh
+    /// signed extension saying so, from the SAME machine as a fresh cached
+    /// base advert. Anything else — no extension, an expired one, no live
+    /// advert, a different machine, a poisoned lock — is `false` (the owner
+    /// then sends v1).
+    #[must_use]
+    pub fn supports_share_grant_names(&self, agent_id: &AgentId) -> bool {
+        self.supports_share_grant_names_at(agent_id, Instant::now())
+    }
+
+    /// Clock seam for [`Self::supports_share_grant_names`].
+    #[must_use]
+    pub fn supports_share_grant_names_at(&self, agent_id: &AgentId, now: Instant) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(ext) = inner
+            .names_exts
+            .get(agent_id.as_bytes())
+            .filter(|ext| now <= ext.expires_at && ext.digest_support)
+        else {
+            return false;
+        };
+        inner
+            .adverts
+            .get(agent_id.as_bytes())
+            .is_some_and(|advert| now <= advert.expires_at && advert.machine_id == ext.machine_id)
     }
 
     /// Count one advert-family frame the service dropped at the freshness

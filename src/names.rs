@@ -24,6 +24,13 @@
 //!   a different id fails loud with [`NameError::PinMismatch`]. Nothing
 //!   silently rebinds; the owner re-pins by removing the pin.
 //!
+//! - **Grant defaults (ADR-0079 §2).** A verified v2 grant carries the
+//!   owner-signed `owner_name` and machine names. They are defaults only:
+//!   applied directly when the grant's owner is a Known/Trusted contact,
+//!   otherwise kept as an [`OwnerSuggestion`] the local owner applies with
+//!   [`NameStore::accept_suggestion`]. A default never rebinds a label or
+//!   pin; a clash is recorded as a [`DefaultConflict`] (`default_conflict`).
+//!
 //! Resolution is local, makes no network query and adds **no trust**: it
 //! only maps a name to an id. The identity gate, the contact rules and the
 //! connect ACL still decide whether anything may be reached.
@@ -35,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 use crate::owner_sync::OwnerEnrollment;
-use crate::share_grant::ShareGrant;
+use crate::share_grant::{GrantNames, ShareGrant};
 
 /// File name of the name store inside the instance data dir.
 pub const NAMES_STORE_FILE: &str = "names.json";
@@ -54,6 +61,12 @@ pub const MAX_OWNER_LABELS: usize = 1024;
 
 /// Most pins the store holds.
 pub const MAX_PINS: usize = 4096;
+
+/// Most pending grant-name suggestions the store holds (one per owner).
+pub const MAX_SUGGESTIONS: usize = MAX_OWNER_LABELS;
+
+/// Most `default_conflict` records kept; the oldest is dropped first.
+pub const MAX_DEFAULT_CONFLICTS: usize = 256;
 
 const STORE_VERSION: u32 = 1;
 
@@ -617,6 +630,8 @@ pub enum BindSource {
     Manual,
     /// Pinned at the first successful resolution.
     FirstUse,
+    /// A default from a verified grant's owner-signed names (ADR-0079).
+    Grant,
 }
 
 /// An owner petname.
@@ -671,16 +686,152 @@ struct PinRecord {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MachineDefaultRecord {
+    label: String,
+    machine_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestionRecord {
+    label: String,
+    grant_id: String,
+    machines: Vec<MachineDefaultRecord>,
+    received_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictRecord {
+    grant_id: String,
+    owner: String,
+    target: DefaultTarget,
+    label: String,
+    id: String,
+    reason: ConflictReason,
+    at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NamesFile {
     version: u32,
     owners: BTreeMap<String, OwnerRecord>,
     pins: BTreeMap<String, PinRecord>,
+    /// ADR-0079 pending suggestions, keyed by owner user id (hex).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    suggestions: BTreeMap<String, SuggestionRecord>,
+    /// ADR-0079 `default_conflict` records, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<ConflictRecord>,
+}
+
+/// What a grant default names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultTarget {
+    /// An owner petname (`label` → `UserId`).
+    Owner,
+    /// A shared machine label (`machine:<label>.<owner>` → `MachineId`).
+    Machine,
+}
+
+/// Why a grant default was reported and not applied (ADR-0079 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictReason {
+    /// The default's label is already bound to another key or machine.
+    LabelTaken,
+    /// The target already has a different label (a later grant carries a
+    /// different name).
+    DiffersFromExisting,
+}
+
+/// A grant default that was reported, not applied (`default_conflict`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultConflict {
+    /// The grant that carried the default.
+    pub grant_id: [u8; 32],
+    /// The grant's owner.
+    pub owner: UserId,
+    /// Owner petname or machine label.
+    pub target: DefaultTarget,
+    /// The default label.
+    pub label: String,
+    /// The id the default named (`UserId` or `MachineId` bytes).
+    pub id: [u8; 32],
+    /// Why it was not applied.
+    pub reason: ConflictReason,
+    /// Unix seconds recorded.
+    pub at: u64,
+}
+
+impl DefaultConflict {
+    /// REST/CLI view.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": "default_conflict",
+            "grant_id": hex::encode(self.grant_id),
+            "owner_user_id": hex::encode(self.owner.as_bytes()),
+            "target": self.target,
+            "label": self.label,
+            "id": hex::encode(self.id),
+            "reason": self.reason,
+            "at": self.at,
+        })
+    }
+
+    fn same_report(&self, other: &Self) -> bool {
+        self.grant_id == other.grant_id
+            && self.owner == other.owner
+            && self.target == other.target
+            && self.label == other.label
+            && self.id == other.id
+            && self.reason == other.reason
+    }
+}
+
+/// A grant owner's name defaults held for the local owner to accept
+/// (`x0x names accept <label>`), because the owner is not a Known/Trusted
+/// contact (ADR-0079 §2 contact gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSuggestion {
+    /// The grant's owner.
+    pub user_id: UserId,
+    /// The suggested owner petname.
+    pub label: String,
+    /// The grant that carried it.
+    pub grant_id: [u8; 32],
+    /// Suggested shared-machine labels under that petname: `(label, machine)`.
+    pub machines: Vec<(String, MachineId)>,
+    /// Unix seconds received.
+    pub received_at: u64,
+}
+
+impl OwnerSuggestion {
+    /// REST/CLI view.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "user_id": hex::encode(self.user_id.as_bytes()),
+            "grant_id": hex::encode(self.grant_id),
+            "machines": self.machines.iter().map(|(label, m)| serde_json::json!({
+                "label": label,
+                "machine_id": hex::encode(m.as_bytes()),
+            })).collect::<Vec<_>>(),
+            "received_at": self.received_at,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 struct NamesState {
     owners: BTreeMap<String, OwnerBinding>,
     pins: BTreeMap<String, NamePin>,
+    suggestions: BTreeMap<[u8; 32], OwnerSuggestion>,
+    conflicts: Vec<DefaultConflict>,
 }
 
 fn decode32(field: &str, raw: &str) -> Result<[u8; 32], String> {
@@ -734,6 +885,47 @@ impl NamesState {
                 },
             );
         }
+        if file.suggestions.len() > MAX_SUGGESTIONS || file.conflicts.len() > MAX_DEFAULT_CONFLICTS
+        {
+            return Err("names.json exceeds its size bounds".into());
+        }
+        for (user, record) in file.suggestions {
+            let user_id = UserId(decode32("suggestion user", &user)?);
+            validate_label(&record.label).map_err(|e| e.to_string())?;
+            if is_reserved(&record.label) {
+                return Err(format!("suggested label {:?} is reserved", record.label));
+            }
+            let mut machines = Vec::with_capacity(record.machines.len());
+            for m in record.machines {
+                validate_label(&m.label).map_err(|e| e.to_string())?;
+                machines.push((
+                    m.label,
+                    MachineId(decode32("suggestion machine", &m.machine_id)?),
+                ));
+            }
+            state.suggestions.insert(
+                user_id.0,
+                OwnerSuggestion {
+                    user_id,
+                    label: record.label,
+                    grant_id: decode32("suggestion grant", &record.grant_id)?,
+                    machines,
+                    received_at: record.received_at,
+                },
+            );
+        }
+        for record in file.conflicts {
+            validate_label(&record.label).map_err(|e| e.to_string())?;
+            state.conflicts.push(DefaultConflict {
+                grant_id: decode32("conflict grant", &record.grant_id)?,
+                owner: UserId(decode32("conflict owner", &record.owner)?),
+                target: record.target,
+                label: record.label,
+                id: decode32("conflict id", &record.id)?,
+                reason: record.reason,
+                at: record.at,
+            });
+        }
         Ok(state)
     }
 
@@ -769,7 +961,222 @@ impl NamesState {
                     )
                 })
                 .collect(),
+            suggestions: self
+                .suggestions
+                .iter()
+                .map(|(user, s)| {
+                    (
+                        hex::encode(user),
+                        SuggestionRecord {
+                            label: s.label.clone(),
+                            grant_id: hex::encode(s.grant_id),
+                            machines: s
+                                .machines
+                                .iter()
+                                .map(|(label, m)| MachineDefaultRecord {
+                                    label: label.clone(),
+                                    machine_id: hex::encode(m.as_bytes()),
+                                })
+                                .collect(),
+                            received_at: s.received_at,
+                        },
+                    )
+                })
+                .collect(),
+            conflicts: self
+                .conflicts
+                .iter()
+                .map(|c| ConflictRecord {
+                    grant_id: hex::encode(c.grant_id),
+                    owner: hex::encode(c.owner.as_bytes()),
+                    target: c.target,
+                    label: c.label.clone(),
+                    id: hex::encode(c.id),
+                    reason: c.reason,
+                    at: c.at,
+                })
+                .collect(),
         }
+    }
+
+    fn owner_label_of(&self, user: &UserId) -> Option<String> {
+        self.owners
+            .iter()
+            .find(|(_, b)| b.user_id == *user)
+            .map(|(label, _)| label.clone())
+    }
+
+    /// Record a `default_conflict` (deduplicated; oldest dropped past the
+    /// bound). Returns whether the state changed.
+    fn report(&mut self, conflict: DefaultConflict, out: &mut Vec<DefaultConflict>) -> bool {
+        out.push(conflict.clone());
+        if self.conflicts.iter().any(|c| c.same_report(&conflict)) {
+            return false;
+        }
+        if self.conflicts.len() >= MAX_DEFAULT_CONFLICTS {
+            self.conflicts.remove(0);
+        }
+        self.conflicts.push(conflict);
+        true
+    }
+
+    /// Apply one machine default under bound owner label `owner_label`
+    /// (never rebinding). Returns `(status, changed)`.
+    fn apply_machine_default(
+        &mut self,
+        ctx: &DefaultCtx,
+        owner_label: &str,
+        label: &str,
+        machine: MachineId,
+        conflicts: &mut Vec<DefaultConflict>,
+    ) -> (MachineDefaultStatus, bool) {
+        let conflict = |reason| DefaultConflict {
+            grant_id: ctx.grant_id,
+            owner: ctx.owner,
+            target: DefaultTarget::Machine,
+            label: label.to_string(),
+            id: machine.0,
+            reason,
+            at: ctx.now_unix,
+        };
+        let suffix = format!(".{owner_label}");
+        let existing = self.pins.iter().find_map(|(key, pin)| {
+            (pin.id == machine.0 && pin.owner == ctx.owner)
+                .then(|| key.strip_prefix("machine:")?.strip_suffix(&suffix))
+                .flatten()
+                .map(str::to_string)
+        });
+        if let Some(existing) = existing {
+            let changed = if existing == label {
+                false
+            } else {
+                self.report(conflict(ConflictReason::DiffersFromExisting), conflicts)
+            };
+            return (MachineDefaultStatus::Existing(existing), changed);
+        }
+        let key = format!("machine:{label}.{owner_label}");
+        if self.pins.contains_key(&key) {
+            let changed = self.report(conflict(ConflictReason::LabelTaken), conflicts);
+            return (MachineDefaultStatus::Conflict(key), changed);
+        }
+        if self.pins.len() >= MAX_PINS {
+            return (MachineDefaultStatus::StoreFull, false);
+        }
+        self.pins.insert(
+            key.clone(),
+            NamePin {
+                id: machine.0,
+                owner: ctx.owner,
+                pinned_at: ctx.now_unix,
+                source: BindSource::Grant,
+            },
+        );
+        (MachineDefaultStatus::Pinned(key), true)
+    }
+}
+
+/// Inputs shared by one grant's default application.
+struct DefaultCtx {
+    grant_id: [u8; 32],
+    owner: UserId,
+    now_unix: u64,
+}
+
+/// What happened to the owner-name default of one grant (ADR-0079 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerDefaultStatus {
+    /// The owner already had this petname (or another one; see conflicts).
+    Existing(String),
+    /// The default was bound (Known/Trusted owner).
+    Bound(String),
+    /// The default is held as a suggestion (stranger owner).
+    Suggested(String),
+    /// Reported as `default_conflict`, not applied.
+    Conflict(String),
+    /// No usable default (no `owner_name`, or it maps to no label).
+    NoDefault,
+    /// The owner is this install's owner (always `me`).
+    LocalOwner,
+    /// The petname table is full.
+    StoreFull,
+}
+
+/// What happened to one machine-name default (ADR-0079 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineDefaultStatus {
+    /// Pinned under the owner's petname (the canonical name).
+    Pinned(String),
+    /// The machine already has this label (or another; see conflicts).
+    Existing(String),
+    /// Held in the owner's suggestion (label).
+    Suggested(String),
+    /// Reported as `default_conflict`, not applied (the canonical name).
+    Conflict(String),
+    /// The machine name maps to no label.
+    NoDefault,
+    /// The owner has no petname and no suggestion to hold it.
+    NoOwnerLabel,
+    /// The pin table is full.
+    StoreFull,
+}
+
+fn status_json(kind: &str, value: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "status": kind, "name": value })
+}
+
+impl OwnerDefaultStatus {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Existing(l) => status_json("existing", Some(l)),
+            Self::Bound(l) => status_json("bound", Some(l)),
+            Self::Suggested(l) => status_json("suggested", Some(l)),
+            Self::Conflict(l) => status_json("default_conflict", Some(l)),
+            Self::NoDefault => status_json("no_default", None),
+            Self::LocalOwner => status_json("local_owner", None),
+            Self::StoreFull => status_json("store_full", None),
+        }
+    }
+}
+
+impl MachineDefaultStatus {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Pinned(n) => status_json("pinned", Some(n)),
+            Self::Existing(n) => status_json("existing", Some(n)),
+            Self::Suggested(n) => status_json("suggested", Some(n)),
+            Self::Conflict(n) => status_json("default_conflict", Some(n)),
+            Self::NoDefault => status_json("no_default", None),
+            Self::NoOwnerLabel => status_json("no_owner_label", None),
+            Self::StoreFull => status_json("store_full", None),
+        }
+    }
+}
+
+/// The outcome of applying one grant's name defaults: the grant-receipt
+/// result of ADR-0079 §2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantDefaultsReport {
+    /// The owner-name default.
+    pub owner: OwnerDefaultStatus,
+    /// Each listed machine's default, in section order.
+    pub machines: Vec<(MachineId, MachineDefaultStatus)>,
+    /// Every `default_conflict` this grant raised (also kept in the store).
+    pub conflicts: Vec<DefaultConflict>,
+}
+
+impl GrantDefaultsReport {
+    /// REST/log view.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "owner": self.owner.to_json(),
+            "machines": self.machines.iter().map(|(m, status)| {
+                let mut v = status.to_json();
+                v["machine_id"] = serde_json::json!(hex::encode(m.as_bytes()));
+                v
+            }).collect::<Vec<_>>(),
+            "default_conflict": self.conflicts.iter().map(DefaultConflict::to_json).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -1053,6 +1460,338 @@ impl NameStore {
         self.usable()?;
         let state = self.state.lock().await;
         Ok((state.owners.clone(), state.pins.clone()))
+    }
+
+    /// Pending grant-name suggestions and recorded `default_conflict`s.
+    ///
+    /// # Errors
+    /// [`NameError::Store`].
+    pub async fn defaults_snapshot(
+        &self,
+    ) -> Result<(Vec<OwnerSuggestion>, Vec<DefaultConflict>), NameError> {
+        self.usable()?;
+        let state = self.state.lock().await;
+        Ok((
+            state.suggestions.values().cloned().collect(),
+            state.conflicts.clone(),
+        ))
+    }
+
+    /// Apply the owner-signed names of a verified, stored grant as ADR-0079
+    /// §2 **defaults** for `owner` (the grant's owner). The caller has
+    /// verified the names signature.
+    ///
+    /// - **Owner label.** Considered only if `owner` has no petname yet. The
+    ///   `owner_name` maps to a label by [`label_from_display`] (no mapping,
+    ///   no default). With `apply_directly` (the owner is a Known/Trusted
+    ///   contact) the label is bound with source `grant`; otherwise it is
+    ///   kept as a suggestion for [`Self::accept_suggestion`].
+    /// - **Machine labels.** For a Known/Trusted owner with a petname, each
+    ///   listed machine with no label under it is pinned
+    ///   `machine:<label>.<owner>` with source `grant`. For a stranger (even
+    ///   one the local owner already named) they ride in the suggestion.
+    ///   Resolution still requires the machine to host an active granted
+    ///   agent.
+    /// - **Never rebinds.** A default whose label is bound to another key or
+    ///   machine, or whose target already has a different label, is
+    ///   reported as a [`DefaultConflict`] and not applied.
+    ///
+    /// `local_owner` (always `me`) gets no default.
+    ///
+    /// # Errors
+    /// [`NameError::Store`] (nothing applied).
+    pub async fn apply_grant_defaults(
+        &self,
+        grant_id: [u8; 32],
+        owner: UserId,
+        names: &GrantNames,
+        apply_directly: bool,
+        local_owner: Option<UserId>,
+        now_unix: u64,
+    ) -> Result<GrantDefaultsReport, NameError> {
+        let ctx = DefaultCtx {
+            grant_id,
+            owner,
+            now_unix,
+        };
+        self.commit(|state| {
+            let mut conflicts = Vec::new();
+            let mut changed = false;
+            if local_owner == Some(owner) {
+                return Ok((
+                    GrantDefaultsReport {
+                        owner: OwnerDefaultStatus::LocalOwner,
+                        machines: Vec::new(),
+                        conflicts,
+                    },
+                    false,
+                ));
+            }
+            let owner_conflict = |label: &str, reason| DefaultConflict {
+                grant_id,
+                owner,
+                target: DefaultTarget::Owner,
+                label: label.to_string(),
+                id: owner.0,
+                reason,
+                at: now_unix,
+            };
+            let default = names.owner_name.as_deref().and_then(label_from_display);
+            let mut owner_label = None;
+            let mut suggest = false;
+            let owner_status = match (state.owner_label_of(&owner), default) {
+                (Some(existing), default) => {
+                    if let Some(default) = default.filter(|d| *d != existing) {
+                        changed |= state.report(
+                            owner_conflict(&default, ConflictReason::DiffersFromExisting),
+                            &mut conflicts,
+                        );
+                    }
+                    if apply_directly {
+                        owner_label = Some(existing.clone());
+                    } else if !names.machines.is_empty() {
+                        // Contact gate: a stranger's machine defaults wait
+                        // under the petname the local owner already chose.
+                        let full = state.suggestions.len() >= MAX_SUGGESTIONS;
+                        match state.suggestions.get_mut(&owner.0) {
+                            Some(held) if held.label != existing => {
+                                held.label = existing.clone();
+                                changed = true;
+                                suggest = true;
+                            }
+                            Some(_) => suggest = true,
+                            None if full => {}
+                            None => {
+                                state.suggestions.insert(
+                                    owner.0,
+                                    OwnerSuggestion {
+                                        user_id: owner,
+                                        label: existing.clone(),
+                                        grant_id,
+                                        machines: Vec::new(),
+                                        received_at: now_unix,
+                                    },
+                                );
+                                changed = true;
+                                suggest = true;
+                            }
+                        }
+                    }
+                    OwnerDefaultStatus::Existing(existing)
+                }
+                (None, None) => OwnerDefaultStatus::NoDefault,
+                (None, Some(label)) if state.owners.contains_key(&label) => {
+                    changed |= state.report(
+                        owner_conflict(&label, ConflictReason::LabelTaken),
+                        &mut conflicts,
+                    );
+                    OwnerDefaultStatus::Conflict(label)
+                }
+                (None, Some(label)) if apply_directly => {
+                    if state.owners.len() >= MAX_OWNER_LABELS {
+                        OwnerDefaultStatus::StoreFull
+                    } else {
+                        state.owners.insert(
+                            label.clone(),
+                            OwnerBinding {
+                                user_id: owner,
+                                bound_at: now_unix,
+                                source: BindSource::Grant,
+                            },
+                        );
+                        // A suggestion held from before the owner became a
+                        // contact is superseded by the direct bind.
+                        state.suggestions.remove(&owner.0);
+                        changed = true;
+                        owner_label = Some(label.clone());
+                        OwnerDefaultStatus::Bound(label)
+                    }
+                }
+                (None, Some(label)) => {
+                    let held = state.suggestions.get(&owner.0).map(|s| s.label.clone());
+                    match held {
+                        Some(held) => {
+                            if held != label {
+                                changed |= state.report(
+                                    owner_conflict(&label, ConflictReason::DiffersFromExisting),
+                                    &mut conflicts,
+                                );
+                            }
+                            suggest = true;
+                            OwnerDefaultStatus::Suggested(held)
+                        }
+                        None if state.suggestions.values().any(|s| s.label == label) => {
+                            changed |= state.report(
+                                owner_conflict(&label, ConflictReason::LabelTaken),
+                                &mut conflicts,
+                            );
+                            OwnerDefaultStatus::Conflict(label)
+                        }
+                        None if state.suggestions.len() >= MAX_SUGGESTIONS => {
+                            OwnerDefaultStatus::StoreFull
+                        }
+                        None => {
+                            state.suggestions.insert(
+                                owner.0,
+                                OwnerSuggestion {
+                                    user_id: owner,
+                                    label: label.clone(),
+                                    grant_id,
+                                    machines: Vec::new(),
+                                    received_at: now_unix,
+                                },
+                            );
+                            changed = true;
+                            suggest = true;
+                            OwnerDefaultStatus::Suggested(label)
+                        }
+                    }
+                }
+            };
+            let mut machines = Vec::with_capacity(names.machines.len());
+            for entry in &names.machines {
+                let machine = entry.machine_id;
+                let Some(label) = label_from_display(&entry.machine_name) else {
+                    machines.push((machine, MachineDefaultStatus::NoDefault));
+                    continue;
+                };
+                let status = if let Some(owner_label) = &owner_label {
+                    let (status, c) = state.apply_machine_default(
+                        &ctx,
+                        owner_label,
+                        &label,
+                        machine,
+                        &mut conflicts,
+                    );
+                    changed |= c;
+                    status
+                } else if suggest {
+                    match state.suggestions.get_mut(&owner.0) {
+                        Some(s) if !s.machines.iter().any(|(_, m)| *m == machine) => {
+                            s.machines.push((label.clone(), machine));
+                            changed = true;
+                            MachineDefaultStatus::Suggested(label)
+                        }
+                        Some(_) => MachineDefaultStatus::Suggested(label),
+                        None => MachineDefaultStatus::NoOwnerLabel,
+                    }
+                } else {
+                    MachineDefaultStatus::NoOwnerLabel
+                };
+                machines.push((machine, status));
+            }
+            Ok((
+                GrantDefaultsReport {
+                    owner: owner_status,
+                    machines,
+                    conflicts,
+                },
+                changed,
+            ))
+        })
+        .await
+    }
+
+    /// `x0x names accept <label>`: apply the pending suggestion carrying
+    /// `label` — bind the owner petname (source `grant`) and pin its machine
+    /// defaults, never rebinding (clashes are reported as
+    /// `default_conflict`). The suggestion is then dropped.
+    ///
+    /// # Errors
+    /// `UnknownName` (no suggestion by that label), `AmbiguousName` (two
+    /// owners suggest it), `PinMismatch` (the label is now bound to another
+    /// owner), `Invalid` (that owner already has another petname), or
+    /// `Store`.
+    pub async fn accept_suggestion(
+        &self,
+        label: &str,
+        now_unix: u64,
+    ) -> Result<GrantDefaultsReport, NameError> {
+        validate_label(label)?;
+        self.commit(|state| {
+            let owners: Vec<[u8; 32]> = state
+                .suggestions
+                .iter()
+                .filter(|(_, s)| s.label == label)
+                .map(|(user, _)| *user)
+                .collect();
+            let user = match owners.as_slice() {
+                [] => {
+                    return Err(NameError::UnknownName(format!(
+                        "no pending suggestion for {label:?}"
+                    )))
+                }
+                [user] => *user,
+                _ => {
+                    return Err(NameError::AmbiguousName {
+                        name: label.to_string(),
+                        candidates: owners.iter().map(hex::encode).collect(),
+                    })
+                }
+            };
+            let suggestion = state
+                .suggestions
+                .remove(&user)
+                .ok_or_else(|| NameError::UnknownName(label.to_string()))?;
+            let owner = suggestion.user_id;
+            if let Some(held) = state.owners.get(label) {
+                if held.user_id != owner {
+                    return Err(NameError::PinMismatch {
+                        name: label.to_string(),
+                        pinned: hex::encode(held.user_id.as_bytes()),
+                        current: hex::encode(owner.as_bytes()),
+                    });
+                }
+            }
+            let owner_status = match state.owner_label_of(&owner) {
+                Some(existing) if existing != label => {
+                    return Err(NameError::Invalid(format!(
+                        "that owner is already labelled {existing:?}; remove it first"
+                    )));
+                }
+                Some(existing) => OwnerDefaultStatus::Existing(existing),
+                None => {
+                    if state.owners.len() >= MAX_OWNER_LABELS {
+                        return Err(NameError::Store("owner label table is full".into()));
+                    }
+                    state.owners.insert(
+                        label.to_string(),
+                        OwnerBinding {
+                            user_id: owner,
+                            bound_at: now_unix,
+                            source: BindSource::Grant,
+                        },
+                    );
+                    OwnerDefaultStatus::Bound(label.to_string())
+                }
+            };
+            let ctx = DefaultCtx {
+                grant_id: suggestion.grant_id,
+                owner,
+                now_unix,
+            };
+            let mut conflicts = Vec::new();
+            let mut machines = Vec::with_capacity(suggestion.machines.len());
+            for (machine_label, machine) in &suggestion.machines {
+                let (status, _) = state.apply_machine_default(
+                    &ctx,
+                    label,
+                    machine_label,
+                    *machine,
+                    &mut conflicts,
+                );
+                machines.push((*machine, status));
+            }
+            Ok((
+                GrantDefaultsReport {
+                    owner: owner_status,
+                    machines,
+                    conflicts,
+                },
+                true,
+            ))
+        })
+        .await
     }
 }
 

@@ -25,6 +25,12 @@
 //! owner-side redelivery outbox ([`outbox`], #926) and retried until it ACKs,
 //! the grant is revoked, or the entry expires.
 //!
+//! A grantee agent that advertises the signed `share_grant_names`
+//! capability instead gets the ADR-0079 `x0x-sharegrant-v2\0` envelope: the
+//! same v1 grant plus an owner-signed names section ([`names`]). It is
+//! stored byte-identical to a v1 delivery; the names go only to the
+//! grantee's name store.
+//!
 //! # Storage
 //!
 //! [`ShareGrantStore`] keeps two roles in one file (`share-grants.bin`,
@@ -925,30 +931,73 @@ pub async fn handle_share_grant_dm_checked(
         completion,
         ..
     } = typed;
-    let result = match store {
-        None => Err("share grants are not enabled on this daemon".to_string()),
-        Some(store) => match ShareGrant::from_dm_payload(&payload) {
-            Ok(grant) => {
-                let revoked = match revocations {
-                    Some(set) => set
-                        .read()
-                        .await
-                        .is_share_grant_revoked(&grant.grant_id, &grant.owner),
-                    None => false,
-                };
-                if revoked {
-                    Err("share grant is revoked; not stored".to_string())
-                } else {
-                    store
-                        .accept(grant, unix_now_secs())
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        },
+    let result = receive_share_grant_payload(store, revocations, &payload)
+        .await
+        .map(|receipt| receipt.outcome);
+    log_share_grant_receipt(&sender, &result);
+    if let Some(completion) = completion {
+        let _ = completion.send(result.clone());
+    }
+    result
+}
+
+/// A verified and stored grant delivery (v1 or ADR-0079 v2).
+#[derive(Debug, Clone)]
+pub struct ShareGrantReceipt {
+    /// The stored grant (byte-identical for v1 and v2).
+    pub grant: ShareGrant,
+    /// `Inserted` or `Duplicate`.
+    pub outcome: DmTypedPayloadCompletion,
+    /// The role the grant took here.
+    pub role: Option<GrantRole>,
+    /// The verified names section, for a v2 delivery.
+    pub names: Option<GrantNames>,
+}
+
+/// Decode (v1 or v2), verify and store one grant delivery WITHOUT resolving
+/// any completion: the caller releases the ACK. A v2 envelope whose grant
+/// or names section fails is refused whole; a grant already revoked in
+/// `revocations` is refused (#983 post-merge P1). The grant itself is
+/// stored exactly as a v1 delivery stores it, so a v1 and a v2 copy of one
+/// `grant_id` are an idempotent `Duplicate`.
+///
+/// # Errors
+/// The refusal reason (nothing stored).
+pub async fn receive_share_grant_payload(
+    store: Option<&ShareGrantStore>,
+    revocations: Option<&RwLock<RevocationSet>>,
+    payload: &[u8],
+) -> Result<ShareGrantReceipt, String> {
+    let Some(store) = store else {
+        return Err("share grants are not enabled on this daemon".to_string());
     };
-    match &result {
+    let (grant, names) = decode_grant_delivery(payload).map_err(|e| e.to_string())?;
+    let revoked = match revocations {
+        Some(set) => set
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+        None => false,
+    };
+    if revoked {
+        return Err("share grant is revoked; not stored".to_string());
+    }
+    let outcome = store
+        .accept(grant.clone(), unix_now_secs())
+        .await
+        .map_err(|e| e.to_string())?;
+    let role = store.classify(&grant);
+    Ok(ShareGrantReceipt {
+        grant,
+        outcome,
+        role,
+        names,
+    })
+}
+
+/// Log one grant receipt outcome.
+pub fn log_share_grant_receipt(sender: &AgentId, result: &DmTypedPayloadCompletionResult) {
+    match result {
         Ok(outcome) => tracing::info!(
             sender = %hex::encode(sender.as_bytes()),
             ?outcome,
@@ -960,10 +1009,6 @@ pub async fn handle_share_grant_dm_checked(
             "share grant refused; not stored, ACK withheld"
         ),
     }
-    if let Some(completion) = completion {
-        let _ = completion.send(result.clone());
-    }
-    result
 }
 
 /// Send-layer retries for one grant delivery. Every retry reuses the same
@@ -978,6 +1023,8 @@ pub struct GrantDelivery {
     pub agent: String,
     /// `true` once the recipient's durable v2 ACK arrived.
     pub delivered: bool,
+    /// `"v1"` or `"v2"` (ADR-0079: v2 carries the owner-signed names).
+    pub envelope: &'static str,
     /// `true` when delivery failed and the grant was durably queued in the
     /// owner-side redelivery outbox (#926), which keeps retrying it.
     pub queued: bool,
@@ -995,7 +1042,24 @@ pub struct GrantDelivery {
 /// # Errors
 /// The grant cannot be encoded ([`ShareGrant::to_dm_payload`]).
 pub fn grant_delivery_request(grant: &ShareGrant) -> Result<(Vec<u8>, [u8; 16]), ShareGrantError> {
-    let payload = grant.to_dm_payload()?;
+    envelope_delivery_request(grant, &GrantEnvelope::V1)
+}
+
+/// [`grant_delivery_request`] for either envelope (ADR-0079). The payload is
+/// a pure function of the grant and the recorded envelope (the names
+/// signature is stored, never re-made), so an outbox retry resends the
+/// exact bytes and the same logical request id.
+///
+/// # Errors
+/// The envelope cannot be encoded.
+pub fn envelope_delivery_request(
+    grant: &ShareGrant,
+    envelope: &GrantEnvelope,
+) -> Result<(Vec<u8>, [u8; 16]), ShareGrantError> {
+    let payload = match envelope {
+        GrantEnvelope::V1 => grant.to_dm_payload()?,
+        GrantEnvelope::V2(signed) => ShareGrantEnvelopeV2::new(grant, signed).to_dm_payload()?,
+    };
     let mut request_id = [0u8; 16];
     request_id.copy_from_slice(&blake3::hash(&payload).as_bytes()[..16]);
     Ok((payload, request_id))
@@ -1029,20 +1093,48 @@ where
     F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let (payload, request_id) = match grant_delivery_request(grant) {
-        Ok(request) => request,
-        Err(e) => {
-            return recipients
-                .iter()
-                .map(|a| GrantDelivery {
-                    agent: hex::encode(a.as_bytes()),
-                    delivered: false,
-                    queued: false,
-                    error: Some(e.to_string()),
-                })
-                .collect();
-        }
+    let recipients: Vec<(AgentId, GrantEnvelope)> = recipients
+        .iter()
+        .map(|agent| (*agent, GrantEnvelope::V1))
+        .collect();
+    deliver_grant_envelopes_via(grant, &recipients, outbox, revocations, now, send).await
+}
+
+/// [`deliver_grant_via`] with a per-recipient envelope (ADR-0079): each
+/// recipient gets exactly the bytes of its [`GrantEnvelope`], and a failed
+/// delivery is queued with that envelope so every retry resends the same
+/// bytes.
+pub async fn deliver_grant_envelopes_via<F, Fut>(
+    grant: &ShareGrant,
+    recipients: &[(AgentId, GrantEnvelope)],
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    revocations: &RwLock<RevocationSet>,
+    now: impl Fn() -> u64,
+    send: F,
+) -> Vec<GrantDelivery>
+where
+    F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let failed = |recipient: &AgentId, envelope: &GrantEnvelope, error: String| GrantDelivery {
+        agent: hex::encode(recipient.as_bytes()),
+        delivered: false,
+        envelope: envelope.version_str(),
+        queued: false,
+        error: Some(error),
     };
+    let mut requests = Vec::with_capacity(recipients.len());
+    for (recipient, envelope) in recipients {
+        match envelope_delivery_request(grant, envelope) {
+            Ok(request) => requests.push((*recipient, envelope, request)),
+            Err(e) => {
+                return recipients
+                    .iter()
+                    .map(|(a, env)| failed(a, env, e.to_string()))
+                    .collect();
+            }
+        }
+    }
     let permit = match outbox {
         Some(outbox) => Some(outbox.send_permit().await),
         None => None,
@@ -1054,33 +1146,32 @@ where
     {
         return recipients
             .iter()
-            .map(|a| GrantDelivery {
-                agent: hex::encode(a.as_bytes()),
-                delivered: false,
-                queued: false,
-                error: Some("grant is revoked; not delivered".to_string()),
-            })
+            .map(|(a, env)| failed(a, env, "grant is revoked; not delivered".to_string()))
             .collect();
     }
-    let sends = recipients.iter().map(|recipient| {
-        let fut = send(*recipient, payload.clone(), request_id);
-        async move { (*recipient, outbox::bounded_send(fut).await) }
-    });
+    let sends = requests
+        .into_iter()
+        .map(|(recipient, envelope, (payload, request_id))| {
+            let fut = send(recipient, payload, request_id);
+            async move { (recipient, envelope, outbox::bounded_send(fut).await) }
+        });
     let results = futures::future::join_all(sends).await;
     // Release before queueing: `enqueue` takes the gate again, and a
     // revocation queued for it in between must be allowed to run first.
     drop(permit);
     let mut out = Vec::with_capacity(recipients.len());
-    for (recipient, result) in results {
+    for (recipient, envelope, result) in results {
         let mut delivery = GrantDelivery {
             agent: hex::encode(recipient.as_bytes()),
             delivered: result.is_ok(),
+            envelope: envelope.version_str(),
             queued: false,
             error: result.err(),
         };
         if !delivery.delivered {
             delivery.queued = queue_failed_delivery(
                 grant,
+                envelope,
                 recipient,
                 outbox,
                 revocations,
@@ -1098,6 +1189,7 @@ where
 /// is appended to `error` so the owner sees why it will not be retried.
 async fn queue_failed_delivery(
     grant: &ShareGrant,
+    envelope: &GrantEnvelope,
     recipient: AgentId,
     outbox: Option<&outbox::GrantRedeliveryOutbox>,
     revocations: &RwLock<RevocationSet>,
@@ -1108,7 +1200,7 @@ async fn queue_failed_delivery(
         return false;
     };
     match outbox
-        .enqueue(grant, recipient, now_unix, revocations)
+        .enqueue_envelope(grant, envelope.clone(), recipient, now_unix, revocations)
         .await
     {
         Ok(_) => true,
@@ -1299,6 +1391,205 @@ impl crate::Agent {
             },
         )
         .await
+    }
+
+    /// [`Self::deliver_share_grant`] with the ADR-0079 names section: `names`
+    /// is signed with this install's owner key and sent as the v2 envelope
+    /// to each grantee agent that advertises `share_grant_names`; shared
+    /// agents' daemons and every other recipient get v1. `None` (no names,
+    /// or `--no-names`) sends v1 to everyone.
+    pub async fn deliver_share_grant_with_names(
+        &self,
+        grant: &ShareGrant,
+        recipients: &[AgentId],
+        names: Option<GrantNames>,
+    ) -> Vec<GrantDelivery> {
+        let signed = match (names, self.identity.user_keypair()) {
+            (Some(names), Some(owner_key)) => {
+                match SignedGrantNames::sign(owner_key, grant, names) {
+                    Ok(signed) => Some(signed),
+                    Err(e) => {
+                        tracing::warn!("grant names not signed; sending v1 only: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let envelopes = self
+            .share_grant_envelopes(grant, recipients, signed.as_ref())
+            .await;
+        let outbox = self.share_grant_outbox();
+        deliver_grant_envelopes_via(
+            grant,
+            &envelopes,
+            outbox.as_deref(),
+            &self.revocation_set,
+            unix_now_secs,
+            |recipient, payload, request_id| {
+                self.send_share_grant_dm(recipient, payload, request_id, GRANT_DELIVERY_RETRIES)
+            },
+        )
+        .await
+    }
+
+    /// The envelope each recipient gets ([`choose_grant_envelope`]).
+    pub async fn share_grant_envelopes(
+        &self,
+        grant: &ShareGrant,
+        recipients: &[AgentId],
+        names: Option<&SignedGrantNames>,
+    ) -> Vec<(AgentId, GrantEnvelope)> {
+        // Concurrent: a recipient with no cached advert costs one bounded
+        // capability refresh, and those must not add up serially.
+        let decisions = recipients.iter().map(|recipient| async move {
+            let envelope = if names.is_some() && !grant.agents.contains(recipient) {
+                let grantee = self.is_share_grantee_agent(grant, recipient).await;
+                let advertises =
+                    grantee && self.recipient_advertises_share_grant_names(recipient).await;
+                choose_grant_envelope(grant, recipient, grantee, advertises, names)
+            } else {
+                GrantEnvelope::V1
+            };
+            (*recipient, envelope)
+        });
+        futures::future::join_all(decisions).await
+    }
+
+    /// Whether `recipient` is provably one of the grant's grantee agents:
+    /// `Agent(a)` ⇒ exactly `a`; `User(u)` ⇒ a cached, valid, unexpired
+    /// certificate for `recipient` chaining to `u`.
+    async fn is_share_grantee_agent(&self, grant: &ShareGrant, recipient: &AgentId) -> bool {
+        match grant.grantee {
+            Grantee::Agent(agent) => agent == *recipient,
+            Grantee::User(user) => {
+                let cert = self
+                    .identity_discovery_cache
+                    .read()
+                    .await
+                    .get(recipient)
+                    .and_then(|entry| entry.agent_certificate.clone());
+                let now = unix_now_secs();
+                cert.is_some_and(|cert| {
+                    crate::owner_trust::certificate_chains_to_owner(
+                        &user, recipient, &cert, false, now,
+                    )
+                })
+            }
+        }
+    }
+
+    /// Whether `recipient` advertises the signed `share_grant_names`
+    /// extension, machine-bound to its live capability advert. With no
+    /// advert cached at all, one bounded targeted refresh is made first (the
+    /// strict send would make it anyway); otherwise the cache decides.
+    pub async fn recipient_advertises_share_grant_names(&self, recipient: &AgentId) -> bool {
+        if self.capability_store.supports_share_grant_names(recipient) {
+            return true;
+        }
+        if self.capability_store.lookup_binding(recipient).is_none() {
+            self.refresh_strict_dm_capability(*recipient).await;
+            return self.capability_store.supports_share_grant_names(recipient);
+        }
+        false
+    }
+
+    /// The names section this owner install sends with `grant` (ADR-0079
+    /// §1): `owner_name` (the owner's `human_name`), and each machine with a
+    /// synced `machine_name` that holds a current enrollment by the grant's
+    /// owner in `devices`, is not revoked, and — by its authenticated
+    /// binding — hosts at least one of `grant.agents`. `None` when nothing
+    /// qualifies.
+    pub async fn share_grant_names_for(
+        &self,
+        grant: &ShareGrant,
+        owner_name: Option<&str>,
+        devices: Option<&crate::owner_sync::OwnerSyncStore>,
+    ) -> Option<GrantNames> {
+        let owner = grant.owner;
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        let mut named = Vec::new();
+        let mut enrolled = BTreeSet::new();
+        if let Some(devices) = devices {
+            for enrollment in devices.enrolled_devices().await {
+                if enrollment.verify_owner(&owner).is_ok() && enrollment.is_current_at(now_ms) {
+                    enrolled.insert(enrollment.machine_id);
+                }
+            }
+            for record in devices.records_snapshot().await {
+                if let crate::owner_sync::SyncValue::MachineNames {
+                    machine_name: Some(machine_name),
+                    ..
+                } = &record.value
+                {
+                    let mut id = [0u8; 32];
+                    if hex::decode_to_slice(&record.key, &mut id).is_ok()
+                        && record.verify_owner(&owner).is_ok()
+                    {
+                        named.push((MachineId(id), machine_name.clone()));
+                    }
+                }
+            }
+        }
+        let mut hosting = BTreeSet::new();
+        if grant.agents.contains(&self.agent_id()) {
+            hosting.insert(self.machine_id().0);
+        }
+        for agent in &grant.agents {
+            if let Some(machine) = crate::dm_inbox::authenticated_machine_binding(
+                &self.authenticated_machine_bindings,
+                agent,
+            )
+            .await
+            {
+                hosting.insert(machine.0);
+            }
+        }
+        {
+            let revoked = self.revocation_set.read().await;
+            hosting.retain(|m| !revoked.is_machine_revoked(&MachineId(*m)));
+        }
+        build_grant_names(owner_name, &named, &enrolled, &hosting)
+    }
+
+    /// ADR-0079 §2 contact gate: whether a grant owner's name defaults may
+    /// apply directly. True only when a `Known` or `Trusted` contact agent
+    /// has a cached, valid, unrevoked certificate chaining to `owner`, and
+    /// no such agent is `Blocked`. Otherwise defaults become suggestions.
+    pub async fn share_grant_owner_is_contact(&self, owner: &UserId) -> bool {
+        let contacts: Vec<(AgentId, crate::contacts::TrustLevel)> = self
+            .contact_store
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .map(|c| (c.agent_id, c.trust_level))
+            .collect();
+        let mut observed = Vec::with_capacity(contacts.len());
+        {
+            let cache = self.identity_discovery_cache.read().await;
+            let revoked = self.revocation_set.read().await;
+            for (agent, trust) in contacts {
+                let cert = cache
+                    .get(&agent)
+                    .and_then(|entry| entry.agent_certificate.clone());
+                observed.push(names::ContactObservation {
+                    agent,
+                    trust,
+                    certificate: cert,
+                    revoked: revoked.is_agent_revoked(&agent),
+                });
+            }
+        }
+        names::owner_contact_gate(owner, &observed, unix_now_secs())
+    }
+
+    /// Advertise (or stop advertising) the signed `share_grant_names`
+    /// capability extension (ADR-0079). The daemon sets this once it routes
+    /// `x0x-sharegrant-v2\0`; takes effect at the next advert cycle.
+    pub fn set_share_grant_names_supported(&self, supported: bool) {
+        self.share_grant_names_supported
+            .store(supported, std::sync::atomic::Ordering::Release);
     }
 
     /// One durable typed-DM grant send; `Ok` only on the durable v2 ACK.
@@ -1512,7 +1803,14 @@ pub async fn record_local_share_grant_revocation(
     }
 }
 
+pub mod names;
 pub mod outbox;
+
+pub use names::{
+    build_grant_names, choose_grant_envelope, decode_grant_delivery, GrantEnvelope,
+    GrantMachineName, GrantNames, ShareGrantEnvelopeV2, SignedGrantNames, MAX_SHARE_GRANT_V2_BYTES,
+    SHARE_GRANT_V2_DM_PREFIX,
+};
 
 #[cfg(test)]
 mod tests;

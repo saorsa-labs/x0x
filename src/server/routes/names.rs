@@ -110,6 +110,7 @@ fn source_str(source: BindSource) -> &'static str {
         BindSource::Card => "card",
         BindSource::Manual => "manual",
         BindSource::FirstUse => "first_use",
+        BindSource::Grant => "grant",
     }
 }
 
@@ -122,6 +123,10 @@ pub(in crate::server) async fn names_list(
         return forbidden();
     }
     let (owners, pins) = match state.names.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return name_error(&e),
+    };
+    let (suggestions, conflicts) = match state.names.defaults_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(e) => return name_error(&e),
     };
@@ -150,7 +155,13 @@ pub(in crate::server) async fn names_list(
         .collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "owners": owners, "pins": pins })),
+        Json(serde_json::json!({
+            "ok": true,
+            "owners": owners,
+            "pins": pins,
+            "suggestions": suggestions.iter().map(x0x::names::OwnerSuggestion::to_json).collect::<Vec<_>>(),
+            "default_conflict": conflicts.iter().map(x0x::names::DefaultConflict::to_json).collect::<Vec<_>>(),
+        })),
     )
         .into_response()
 }
@@ -307,6 +318,40 @@ pub(in crate::server) async fn names_machine_label(
             })),
         )
             .into_response(),
+        Err(e) => name_error(&e),
+    }
+}
+
+/// `POST /names/accept` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct NameAcceptRequest {
+    /// The suggested owner petname (from `GET /names` `suggestions`).
+    label: String,
+}
+
+/// POST /names/accept — apply a pending grant-name suggestion (ADR-0079
+/// §2): bind the owner petname and pin its machine defaults, never
+/// rebinding. Clashes come back as `default_conflict`.
+pub(in crate::server) async fn names_accept(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
+    Json(req): Json<NameAcceptRequest>,
+) -> Response {
+    if !actor.is_durable_owner() {
+        return forbidden();
+    }
+    match state
+        .names
+        .accept_suggestion(&req.label, unix_now_secs())
+        .await
+    {
+        Ok(report) => {
+            let mut body = report.to_json();
+            body["ok"] = serde_json::json!(true);
+            body["label"] = serde_json::json!(req.label);
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(e) => name_error(&e),
     }
 }

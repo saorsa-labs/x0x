@@ -621,6 +621,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Delete, "/names/owners/:label", names_routes_wired),
     covered!(Post, "/names/machines", names_routes_wired),
     covered!(Delete, "/names/pins/:name", names_routes_wired),
+    covered!(
+        Post,
+        "/names/accept",
+        names_accept_applies_a_stranger_grant_suggestion_once
+    ),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[

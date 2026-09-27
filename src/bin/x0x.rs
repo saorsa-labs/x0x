@@ -447,6 +447,13 @@ enum NamesSub {
         #[command(subcommand)]
         sub: NamesMachineSub,
     },
+    /// Apply a pending grant-name suggestion: bind the suggested owner
+    /// petname and its machine labels (ADR-0079; see `names list`).
+    Accept {
+        /// The suggested owner petname.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
     /// Drop a pin (e.g. `agent:studio.bob`) so the name re-pins at next use.
     Unpin {
         /// Canonical pinned name, with its `agent:` or `machine:` prefix.
@@ -500,6 +507,10 @@ enum GrantSub {
         /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
         #[arg(value_name = "GRANT_JSON")]
         grant: String,
+        /// Send this grant without the owner-signed names section
+        /// (ADR-0079): every recipient gets the v1 grant.
+        #[arg(long)]
+        no_names: bool,
     },
     /// List grants this install's owner issued, with status.
     List,
@@ -3228,7 +3239,9 @@ async fn run(
             }
         },
         Commands::Grant { sub } => match sub {
-            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::Issue { grant, no_names } => {
+                commands::grant::issue(&client, &grant, no_names).await
+            }
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
@@ -3247,6 +3260,7 @@ async fn run(
                     commands::names::machine_label(&client, &name, &machine_id).await
                 }
             },
+            NamesSub::Accept { label } => commands::names::accept(&client, &label).await,
             NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
         },
         Commands::Onboard {

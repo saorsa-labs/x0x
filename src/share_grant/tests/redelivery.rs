@@ -524,9 +524,10 @@ async fn total_bound_is_enforced_and_reported() {
     assert_eq!(outbox.len(), MAX_OUTBOX_ENTRIES, "nothing was evicted");
 }
 
-/// Write `entries` as an outbox file, bypassing `enqueue`'s checks.
+/// Write `entries` as an outbox file (current `X0G2` format), bypassing
+/// `enqueue`'s checks.
 fn write_raw_outbox(path: &std::path::Path, entries: &[PendingGrantDelivery]) {
-    let mut bytes = b"X0GO".to_vec();
+    let mut bytes = b"X0G2".to_vec();
     bytes.extend_from_slice(&bincode::serialize(&entries.to_vec()).unwrap());
     std::fs::write(path, bytes).unwrap();
 }
@@ -539,6 +540,7 @@ fn raw_entry(grant: &ShareGrant, to: AgentId, now: u64) -> PendingGrantDelivery 
         deadline: grant.expiry,
         next_attempt_at: now,
         attempts: 0,
+        envelope: super::super::GrantEnvelope::V1,
     }
 }
 

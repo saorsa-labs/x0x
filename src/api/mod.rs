@@ -1879,6 +1879,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
             RequestField::body_json_doc("expiry", false),
             RequestField::body_json_doc("ttl_secs", false),
             RequestField::body_json_doc("deliver_to", false),
+            RequestField::body_derived("include_names", false),
         ]),
     },
     EndpointDef {
@@ -1943,6 +1944,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
             RequestField::body("name", true),
             RequestField::body("machine_id", true),
         ]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/accept",
+        cli_name: "names accept",
+        description: "Apply a pending grant-name suggestion (ADR-0079): bind the owner petname and its machine labels",
+        category: "names",
+        request: RequestSpec::Fields(&[RequestField::body("label", true)]),
     },
     EndpointDef {
         method: Method::Delete,

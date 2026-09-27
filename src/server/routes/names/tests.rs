@@ -17,6 +17,7 @@ fn names_router(state: Arc<AppState>) -> axum::Router {
         .route("/names/owners/:label", delete(names_owner_unbind))
         .route("/names/machines", post(names_machine_label))
         .route("/names/pins/:name", delete(names_unpin))
+        .route("/names/accept", post(names_accept))
         .route("/forwards", post(super::super::connect::forward_add))
         .route(
             "/agent/card/import",
@@ -312,5 +313,101 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
         Some(bob.user_id()),
         "the first bind stands"
     );
+    Ok(())
+}
+
+/// WHY (ADR-0079 §2, end to end through the daemon's grant route): a v2
+/// grant from a stranger (not a Known/Trusted contact) is stored like v1
+/// and ACKed, but its owner-signed names only become a SUGGESTION — nothing
+/// is bound until the local owner runs `names accept`, which then binds the
+/// petname and machine label with source `grant`, exactly once.
+#[tokio::test]
+async fn names_accept_applies_a_stranger_grant_suggestion_once() -> anyhow::Result<()> {
+    use x0x::share_grant::{
+        GrantMachineName, GrantNames, Grantee, ShareCap, ShareGrant, ShareGrantEnvelopeV2,
+        ShareGrantStore, SignedGrantNames,
+    };
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    state
+        .agent
+        .install_share_grant_store(Arc::new(ShareGrantStore::in_memory(
+            state.agent.agent_id(),
+            None,
+        )));
+    let app = names_router(Arc::clone(&state));
+    let owner = crate::identity::UserKeypair::generate()?;
+    let shared = crate::identity::AgentKeypair::generate()?.agent_id();
+    let now = unix_now_secs();
+    let grant = ShareGrant::sign(
+        &owner,
+        [0x5A; 32],
+        Grantee::Agent(state.agent.agent_id()),
+        vec![shared],
+        vec![ShareCap::Dm],
+        now - 60,
+        now + 3_600,
+    )?;
+    let names = GrantNames {
+        owner_name: Some("Bob Smith".into()),
+        machines: vec![GrantMachineName {
+            machine_id: MachineId([0xD1; 32]),
+            machine_name: "Studio".into(),
+        }],
+    };
+    let signed = SignedGrantNames::sign(&owner, &grant, names)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let typed = x0x::dm_inbox::DmTypedPayload {
+        sender: crate::identity::AgentId([0xEE; 32]),
+        machine_id: MachineId([0xEF; 32]),
+        payload: ShareGrantEnvelopeV2::new(&grant, &signed).to_dm_payload()?,
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms: 0,
+        request_id: [0; 16],
+        completion: Some(tx),
+    };
+    let report = super::super::grants::handle_share_grant_delivery(&state, typed).await;
+    assert_eq!(
+        rx.await?,
+        Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted),
+        "stored and ACKed like v1"
+    );
+    let report = report.ok_or_else(|| anyhow::anyhow!("no names report"))?;
+    assert_eq!(report["owner"]["status"], "suggested", "{report}");
+
+    let (status, body) = send(&app, "GET", "/names", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["owners"],
+        serde_json::json!([]),
+        "a stranger binds nothing"
+    );
+    assert_eq!(body["suggestions"][0]["label"], "bob-smith", "{body}");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/names/accept",
+        serde_json::json!({ "label": "bob-smith" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["owner"]["status"], "bound", "{body}");
+    assert_eq!(body["machines"][0]["name"], "machine:studio.bob-smith");
+    let (status, body) = send(&app, "GET", "/names", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["owners"][0]["label"], "bob-smith");
+    assert_eq!(body["owners"][0]["source"], "grant");
+    assert_eq!(body["suggestions"], serde_json::json!([]));
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/names/accept",
+        serde_json::json!({ "label": "bob-smith" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "applies once: {body}");
+    assert_eq!(body["code"], "unknown_name");
     Ok(())
 }

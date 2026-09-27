@@ -2185,11 +2185,14 @@ pub async fn serve_with_options(
     // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
     // the grant before completing, so the v2 ACK means "stored"; every
     // refusal withholds it.
+    // ADR-0079: the same route carries `x0x-sharegrant-v2\0`; a v2
+    // envelope's verified names are applied to the name store as defaults
+    // before the completion is resolved.
     {
-        let grant_agent = Arc::clone(&agent);
+        let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
-                let _ = grant_agent.handle_share_grant_delivery(typed).await;
+                let _ = routes::handle_share_grant_delivery(&grant_state, typed).await;
             }
         }));
     }
@@ -2525,6 +2528,7 @@ pub async fn serve_with_options(
         .route("/names/owners/:label", delete(routes::names_owner_unbind))
         .route("/names/machines", post(routes::names_machine_label))
         .route("/names/pins/:name", delete(routes::names_unpin))
+        .route("/names/accept", post(routes::names_accept))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -2931,10 +2935,19 @@ async fn start_dm_inbox_when_gossip_ready(
         // ADR-0070 §2: durable, never validated-and-fallthrough — a
         // malformed grant must fail the handler (ACK withheld), never be
         // shown as a generic DM.
-        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
-            x0x::share_grant::SHARE_GRANT_DM_PREFIX,
-            share_grant_route_tx.clone(),
-        );
+        let dm_inbox_config = dm_inbox_config
+            .with_durable_typed_payload_route(
+                x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            )
+            // ADR-0079: the names-carrying envelope, same durable contract.
+            .with_durable_typed_payload_route(
+                x0x::share_grant::SHARE_GRANT_V2_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            );
+        // Advertise the signed `share_grant_names` extension only now that
+        // the v2 prefix is routed (never to a peer that would junk it).
+        agent.set_share_grant_names_supported(true);
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await

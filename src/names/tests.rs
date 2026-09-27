@@ -686,3 +686,370 @@ async fn names_and_pins_persist_across_restart() {
         assert_eq!(err.code(), "name_store", "{bad}: must refuse, not re-pin");
     }
 }
+
+// ─── ADR-0079 grant-carried name defaults ──────────────────────────────────
+
+fn grant_names(owner_name: &str, machines: &[(u8, &str)]) -> GrantNames {
+    GrantNames {
+        owner_name: Some(owner_name.to_string()),
+        machines: machines
+            .iter()
+            .map(|(b, n)| crate::share_grant::GrantMachineName {
+                machine_id: MachineId([*b; 32]),
+                machine_name: (*n).to_string(),
+            })
+            .collect(),
+    }
+}
+
+const GRANT_A: [u8; 32] = [0xA1; 32];
+const GRANT_B: [u8; 32] = [0xB2; 32];
+
+/// WHY (ADR-0079 §2): a Known/Trusted owner's defaults apply once (source
+/// `grant`) and are then frozen: a later grant with other names is REPORTED
+/// as `default_conflict`, never applied.
+#[tokio::test]
+async fn trusted_owner_defaults_apply_once_and_are_never_rebound() {
+    let store = NameStore::in_memory();
+    let owner = user().user_id();
+    let report = store
+        .apply_grant_defaults(
+            GRANT_A,
+            owner,
+            &grant_names("Bob Smith", &[(1, "Studio Mac")]),
+            true,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.owner, OwnerDefaultStatus::Bound("bob-smith".into()));
+    assert_eq!(
+        report.machines,
+        vec![(
+            MachineId([1; 32]),
+            MachineDefaultStatus::Pinned("machine:studio-mac.bob-smith".into())
+        )]
+    );
+    let bound = store.owner("bob-smith").await.unwrap().unwrap();
+    assert_eq!((bound.user_id, bound.source), (owner, BindSource::Grant));
+    let pin = store
+        .get_pin("machine:studio-mac.bob-smith")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((pin.id, pin.source), ([1; 32], BindSource::Grant));
+
+    // A later grant renames both: reported, not applied.
+    let later = store
+        .apply_grant_defaults(
+            GRANT_B,
+            owner,
+            &grant_names("Robert", &[(1, "Renamed")]),
+            true,
+            None,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        later.owner,
+        OwnerDefaultStatus::Existing("bob-smith".into())
+    );
+    assert_eq!(
+        later.machines[0].1,
+        MachineDefaultStatus::Existing("studio-mac".into())
+    );
+    let reasons: Vec<_> = later
+        .conflicts
+        .iter()
+        .map(|c| (c.target, c.label.as_str(), c.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (
+                DefaultTarget::Owner,
+                "robert",
+                ConflictReason::DiffersFromExisting
+            ),
+            (
+                DefaultTarget::Machine,
+                "renamed",
+                ConflictReason::DiffersFromExisting
+            ),
+        ]
+    );
+    assert!(
+        store.owner("robert").await.unwrap().is_none(),
+        "not applied"
+    );
+    assert!(store
+        .get_pin("machine:renamed.bob-smith")
+        .await
+        .unwrap()
+        .is_none());
+    let (_, conflicts) = store.defaults_snapshot().await.unwrap();
+    assert_eq!(conflicts.len(), 2, "conflicts are kept for GET /names");
+    assert_eq!(conflicts[0].to_json()["code"], "default_conflict");
+
+    // A replay of the same grant adds no duplicate conflict.
+    store
+        .apply_grant_defaults(
+            GRANT_B,
+            owner,
+            &grant_names("Robert", &[(1, "Renamed")]),
+            true,
+            None,
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.defaults_snapshot().await.unwrap().1.len(), 2);
+}
+
+/// WHY (ADR-0079 §2 contact gate): a stranger can grant anyone, so their
+/// defaults are only a SUGGESTION until the local owner accepts it.
+#[tokio::test]
+async fn stranger_defaults_are_suggestions_until_accepted() {
+    let store = NameStore::in_memory();
+    let owner = user().user_id();
+    let report = store
+        .apply_grant_defaults(
+            GRANT_A,
+            owner,
+            &grant_names("Bob Smith", &[(1, "Studio")]),
+            false,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.owner,
+        OwnerDefaultStatus::Suggested("bob-smith".into())
+    );
+    assert_eq!(
+        report.machines[0].1,
+        MachineDefaultStatus::Suggested("studio".into())
+    );
+    assert!(
+        store.owner("bob-smith").await.unwrap().is_none(),
+        "nothing bound for a stranger"
+    );
+    assert!(store.machine_labels("bob-smith").await.unwrap().is_empty());
+    let (suggestions, _) = store.defaults_snapshot().await.unwrap();
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0].grant_id, GRANT_A);
+
+    let err = store.accept_suggestion("nobody", NOW).await.unwrap_err();
+    assert_eq!(err.code(), "unknown_name");
+    let accepted = store.accept_suggestion("bob-smith", NOW + 1).await.unwrap();
+    assert_eq!(
+        accepted.owner,
+        OwnerDefaultStatus::Bound("bob-smith".into())
+    );
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(owner)
+    );
+    assert_eq!(
+        store.machine_labels("bob-smith").await.unwrap(),
+        vec![("studio".to_string(), MachineId([1; 32]))]
+    );
+    assert!(store.defaults_snapshot().await.unwrap().0.is_empty());
+    assert_eq!(
+        store
+            .accept_suggestion("bob-smith", NOW + 2)
+            .await
+            .unwrap_err()
+            .code(),
+        "unknown_name",
+        "a suggestion applies once"
+    );
+
+    // A stranger the local owner already named: the petname stays, but the
+    // machine defaults still wait for `accept`.
+    let store = NameStore::in_memory();
+    let named = user().user_id();
+    store
+        .bind_owner("dave", named, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let report = store
+        .apply_grant_defaults(
+            GRANT_B,
+            named,
+            &grant_names("Dave", &[(4, "Nas")]),
+            false,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.owner, OwnerDefaultStatus::Existing("dave".into()));
+    assert_eq!(
+        report.machines[0].1,
+        MachineDefaultStatus::Suggested("nas".into())
+    );
+    assert!(store.machine_labels("dave").await.unwrap().is_empty());
+    let accepted = store.accept_suggestion("dave", NOW + 1).await.unwrap();
+    assert_eq!(accepted.owner, OwnerDefaultStatus::Existing("dave".into()));
+    assert_eq!(
+        store.machine_labels("dave").await.unwrap(),
+        vec![("nas".to_string(), MachineId([4; 32]))]
+    );
+
+    // Two strangers claiming one label: the second is a conflict.
+    let store = NameStore::in_memory();
+    let (a, b) = (user().user_id(), user().user_id());
+    for who in [a, b] {
+        store
+            .apply_grant_defaults(GRANT_A, who, &grant_names("Bob", &[]), false, None, NOW)
+            .await
+            .unwrap();
+    }
+    let (suggestions, conflicts) = store.defaults_snapshot().await.unwrap();
+    assert_eq!(suggestions.len(), 1, "first suggestion wins");
+    assert_eq!(suggestions[0].user_id, a);
+    assert_eq!(conflicts[0].reason, ConflictReason::LabelTaken);
+    assert_eq!(conflicts[0].id, b.0);
+}
+
+/// WHY (ADR-0079 §2 no silent rebinding): a default never takes a label
+/// already bound — owner petname or pinned machine name — even from a
+/// trusted owner; it is reported as `default_conflict` and the existing
+/// binding is untouched.
+#[tokio::test]
+async fn default_never_rebinds_a_pinned_name() {
+    let store = NameStore::in_memory();
+    let (bob, other) = (user().user_id(), user().user_id());
+    store
+        .bind_owner("bob-smith", other, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let report = store
+        .apply_grant_defaults(
+            GRANT_A,
+            bob,
+            &grant_names("Bob Smith", &[]),
+            true,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.owner,
+        OwnerDefaultStatus::Conflict("bob-smith".into())
+    );
+    assert_eq!(report.conflicts[0].reason, ConflictReason::LabelTaken);
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(other),
+        "the petname still names the other key"
+    );
+
+    // Machine: `machine:box.bob` is pinned to M1; a grant naming M2 "box"
+    // must not move it.
+    store
+        .bind_owner("bob", bob, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    store
+        .pin("machine:box.bob", bob, [1; 32], BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let report = store
+        .apply_grant_defaults(
+            GRANT_B,
+            bob,
+            &grant_names("Bob", &[(2, "Box")]),
+            true,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.machines[0].1,
+        MachineDefaultStatus::Conflict("machine:box.bob".into())
+    );
+    assert!(report
+        .conflicts
+        .iter()
+        .any(|c| c.target == DefaultTarget::Machine && c.reason == ConflictReason::LabelTaken));
+    let pin = store.get_pin("machine:box.bob").await.unwrap().unwrap();
+    assert_eq!(
+        (pin.id, pin.source),
+        ([1; 32], BindSource::Manual),
+        "pinned name kept"
+    );
+
+    // The local owner is always `me`: no default at all.
+    let me = user().user_id();
+    let report = store
+        .apply_grant_defaults(GRANT_A, me, &grant_names("Me", &[]), true, Some(me), NOW)
+        .await
+        .unwrap();
+    assert_eq!(report.owner, OwnerDefaultStatus::LocalOwner);
+    assert!(store.label_for(&me).await.unwrap().is_none());
+}
+
+/// WHY: suggestions and conflicts are durable (a restart must not lose a
+/// pending suggestion or re-surface an accepted one), and a names.json with
+/// neither keeps the slice-1 shape.
+#[tokio::test]
+async fn grant_defaults_persist_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let owner = user().user_id();
+    {
+        let store = NameStore::load(path.clone()).await;
+        store
+            .bind_owner("carol", user().user_id(), BindSource::Manual, NOW)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("suggestions") && !text.contains("conflicts"));
+        store
+            .apply_grant_defaults(
+                GRANT_A,
+                owner,
+                &grant_names("Bob", &[(3, "Pi")]),
+                false,
+                None,
+                NOW,
+            )
+            .await
+            .unwrap();
+        store
+            .apply_grant_defaults(
+                GRANT_B,
+                user().user_id(),
+                &grant_names("Carol", &[]),
+                true,
+                None,
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (suggestions, conflicts) = store.defaults_snapshot().await.unwrap();
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(
+        suggestions[0].machines,
+        vec![("pi".to_string(), MachineId([3; 32]))]
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].label, "carol");
+    store.accept_suggestion("bob", NOW + 1).await.unwrap();
+    let store = NameStore::load(path).await;
+    assert!(store.defaults_snapshot().await.unwrap().0.is_empty());
+    assert_eq!(
+        store.owner("bob").await.unwrap().map(|b| b.source),
+        Some(BindSource::Grant)
+    );
+}

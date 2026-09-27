@@ -2720,6 +2720,11 @@ These are local names for agents and machines: `[agent:|machine:]<label>.<owner>
 - **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
 - **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
 - **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. To re-pin on purpose, delete the pin.
+- **Grant-carried defaults (ADR-0079).** An owner can send a `ShareGrant` with an owner-signed names section: the owner's `human_name` and the synced names of the owner's enrolled machines that host the shared agents. It is sent only to grantee agents whose daemon advertises support; shared-agent daemons and older peers get the plain grant. `POST /grants` takes `"include_names": false` (`x0x grant issue <GRANT_JSON> --no-names`) to send a grant without names, and each `delivery` entry reports `"envelope": "v1"` or `"v2"`. On receipt the names are **defaults only**:
+  - If the grant's owner is a `Known` or `Trusted` contact (a contact agent whose certificate chains to that owner, and none of them `Blocked`), the owner petname and the machine labels (`machine:<label>.<owner>`, source `grant`) are applied directly.
+  - Otherwise they become a **suggestion**, listed under `suggestions` in `GET /names`. Apply it with `POST /names/accept` (`x0x names accept <LABEL>`).
+  - A default never rebinds a petname or pin. If its label is already bound to another key or machine, or the owner or machine already has a different label, it is reported and not applied: `default_conflict` in `GET /names`, and per grant in `GET /grants/received`.
+  - A machine label from a grant still resolves only while that machine hosts an agent of an active grant.
 
 Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
 
@@ -2730,7 +2735,10 @@ Resolution is local and makes no network query. It adds no trust: every identity
 | POST | `/names/owners` | `x0x names owner add <LABEL> <USER_ID>` | Bind an owner petname |
 | DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
 | POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
+| POST | `/names/accept` | `x0x names accept <LABEL>` | Apply a pending grant-name suggestion (ADR-0079) |
 | DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+
+`GET /names` returns `owners` and `pins` (each with `source`: `card`, `manual`, `first_use` or `grant`), plus `suggestions` (`label`, `user_id`, `grant_id`, `machines`) and `default_conflict` (`grant_id`, `owner_user_id`, `target` `owner`/`machine`, `label`, `id`, `reason` `label_taken`/`differs_from_existing`). `POST /names/accept` takes `{"label": "bob-smith"}` and returns the applied `owner` and `machines` statuses and any `default_conflict`. It fails with `unknown_name` when no suggestion carries that label, `ambiguous_name` when two owners suggest it, and `pin_mismatch` when the label is now bound to another owner.
 
 `POST /names/resolve` takes `{"name": "studio.me"}` and returns:
 

@@ -17,7 +17,7 @@ use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 use x0x::identity::{AgentId, UserId};
-use x0x::share_grant::{GrantRole, Grantee, ShareCap, ShareGrantError};
+use x0x::share_grant::{GrantNames, GrantRole, Grantee, ShareCap, ShareGrantError};
 
 const DURABLE_REQUIRED: &str =
     "share-grant management requires the durable API token (not a session or rider token)";
@@ -84,6 +84,12 @@ pub(in crate::server) struct GrantIssueRequest {
     /// known agents and the shared agents' daemons.
     #[serde(default)]
     deliver_to: Vec<String>,
+    /// ADR-0079: include the owner-signed names section (owner name and
+    /// the names of machines hosting the shared agents) for grantee agents
+    /// that advertise support (default `true`). `false` (CLI `--no-names`)
+    /// sends this grant as v1 to everyone.
+    #[serde(default)]
+    include_names: Option<bool>,
 }
 
 /// GET /grants — grants this install's owner issued, with status.
@@ -117,10 +123,32 @@ async fn list_role(state: &AppState, role: GrantRole) -> Response {
         .into_response();
     };
     let now = unix_now_secs();
+    // ADR-0079 §2: received grants show their pending name suggestion and
+    // any `default_conflict` they raised.
+    let (suggestions, conflicts) = if role == GrantRole::Received {
+        state.names.defaults_snapshot().await.unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let mut views = Vec::new();
     for grant in store.grants(role) {
         let revoked = state.agent.is_share_grant_revoked(&grant).await;
-        views.push(grant.to_view(now, revoked));
+        let mut view = grant.to_view(now, revoked);
+        if role == GrantRole::Received {
+            view["name_suggestion"] = suggestions
+                .iter()
+                .find(|s| s.grant_id == grant.grant_id)
+                .map_or(
+                    serde_json::Value::Null,
+                    x0x::names::OwnerSuggestion::to_json,
+                );
+            view["default_conflict"] = serde_json::json!(conflicts
+                .iter()
+                .filter(|c| c.grant_id == grant.grant_id)
+                .map(x0x::names::DefaultConflict::to_json)
+                .collect::<Vec<_>>());
+        }
+        views.push(view);
     }
     (
         StatusCode::OK,
@@ -212,16 +240,115 @@ pub(in crate::server) async fn grants_issue(
         .agent
         .share_grant_recipients(&grant, &deliver_to)
         .await;
-    let delivery = state.agent.deliver_share_grant(&grant, &recipients).await;
+    let names = if req.include_names.unwrap_or(true) {
+        grant_names(&state, &grant).await
+    } else {
+        None
+    };
+    let names_included = names.is_some();
+    let delivery = state
+        .agent
+        .deliver_share_grant_with_names(&grant, &recipients, names)
+        .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "grant": grant.to_view(unix_now_secs(), false),
+            "names_included": names_included,
             "delivery": delivery,
         })),
     )
         .into_response()
+}
+
+/// ADR-0079 §1: the names section for `grant` — this install's
+/// `human_name` and the synced names of the owner's enrolled machines that
+/// host a shared agent. `None` when nothing qualifies.
+async fn grant_names(state: &AppState, grant: &x0x::share_grant::ShareGrant) -> Option<GrantNames> {
+    let owner_name = state.profile.read().await.human_name.clone();
+    let devices = state.owner_sync.as_ref().map(|s| &**s.store());
+    state
+        .agent
+        .share_grant_names_for(grant, owner_name.as_deref(), devices)
+        .await
+}
+
+/// Handle one delivered share grant (v1 or ADR-0079 v2) for the daemon's
+/// durable typed-DM route. The grant is verified and stored first; for a
+/// v2 envelope received as grantee, the verified names are then applied to
+/// the name store as defaults (contact gate: Known/Trusted owners bind
+/// directly, strangers become suggestions). Only then is the completion
+/// resolved: `Ok` (the v2 ACK) means the grant is durably stored. A
+/// name-store failure is logged and does not withhold the ACK — the names
+/// are defaults and the grant itself is stored.
+pub(in crate::server) async fn handle_share_grant_delivery(
+    state: &AppState,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) -> Option<serde_json::Value> {
+    let x0x::dm_inbox::DmTypedPayload {
+        sender,
+        payload,
+        completion,
+        ..
+    } = typed;
+    let store = state.agent.share_grant_store();
+    let revocations = state.agent.revocation_set();
+    let receipt = x0x::share_grant::receive_share_grant_payload(
+        store.as_deref(),
+        Some(&*revocations),
+        &payload,
+    )
+    .await;
+    let mut report = None;
+    if let Ok(receipt) = &receipt {
+        if let (Some(GrantRole::Received), Some(names)) = (receipt.role, &receipt.names) {
+            report = Some(apply_grant_names(state, &receipt.grant, names).await);
+        }
+    }
+    let result = receipt.map(|r| r.outcome);
+    x0x::share_grant::log_share_grant_receipt(&sender, &result);
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+    report
+}
+
+/// Apply a received grant's verified names as defaults; returns the
+/// grant-receipt result (`default_conflict` included).
+pub(in crate::server) async fn apply_grant_names(
+    state: &AppState,
+    grant: &x0x::share_grant::ShareGrant,
+    names: &GrantNames,
+) -> serde_json::Value {
+    let trusted = state.agent.share_grant_owner_is_contact(&grant.owner).await;
+    match state
+        .names
+        .apply_grant_defaults(
+            grant.grant_id,
+            grant.owner,
+            names,
+            trusted,
+            state.agent.user_id(),
+            unix_now_secs(),
+        )
+        .await
+    {
+        Ok(report) => {
+            let json = report.to_json();
+            tracing::info!(
+                grant = %grant.id_hex(),
+                owner_trusted = trusted,
+                names = %json,
+                "share grant names applied as defaults"
+            );
+            json
+        }
+        Err(e) => {
+            tracing::warn!(grant = %grant.id_hex(), "share grant names not applied: {e}");
+            serde_json::json!({ "status": "name_store_error", "error": e.to_string() })
+        }
+    }
 }
 
 /// DELETE /grants/:id — revoke a grant with the owner key. Effective locally
