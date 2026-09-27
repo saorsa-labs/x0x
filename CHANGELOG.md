@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant outbox P3 fixes (#1004).** Entries that expired while the
+  daemon was down are now removed from `share-grant-outbox.bin` on load, not
+  only from memory (a file that fails validation is still never rewritten).
+  The reconnect nudge now covers every queued delivery to the reconnected
+  agent, including ones already due, and always wakes the worker for them.
+- **Share-grant revoke during `POST /grants` can no longer be undone
+  (#983 post-merge P1).** A `DELETE /grants/:id` that completed while the
+  grant's initial DM was still pending could be followed by the POST queueing
+  the revoked grant and the worker delivering it. Queueing now runs under the
+  outbox send gate, re-checks revocation under it and never queues a revoked
+  grant (timestamped at queue time); the worker selects due entries from the
+  same revocation-checked snapshot and re-checks each before sending; the
+  initial POST DMs hold the same gate, so a DELETE waits for them (each send
+  bounded at 30 s); the receiving daemon refuses to store a grant it already
+  knows is revoked; and an idle worker pass retries a failed (dirty) outbox
+  write. Contract: after `DELETE` returns the owner makes no new send or
+  enqueue of the grant; a DM already on the wire is dropped by the receiver
+  when the revocation reaches it by gossip.
 - **Share-grant redelivery outbox (#926, ADR-0070 §2).** A grant delivery
   whose durable-DM attempts all fail is now queued in
   `<data_dir>/share-grant-outbox.bin` (durable, 0600) and retried on bounded

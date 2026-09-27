@@ -2153,8 +2153,7 @@ pub async fn serve_with_options(
         let grant_agent = Arc::clone(&agent);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
-                let store = grant_agent.share_grant_store();
-                let _ = x0x::share_grant::handle_share_grant_dm(store.as_deref(), typed).await;
+                let _ = grant_agent.handle_share_grant_delivery(typed).await;
             }
         }));
     }

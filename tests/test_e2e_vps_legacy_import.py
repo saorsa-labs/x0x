@@ -124,6 +124,23 @@ class LegacyHarnessTests(unittest.TestCase):
         self.assertEqual("permission_denied", self.m.observer_response_class((403, {"error": secret})))
         self.assertEqual("key_not_found", self.m.observer_response_class((404, {"error": "key_not_found"})))
 
+    def test_harness_failure_keeps_poll_timeout_text_but_never_other_error_text(self):
+        # A bare "harness AssertionError" hid R19's barrier timeout. The
+        # poll's own message (label/status/error class) is safe to keep;
+        # any other exception may echo a token and must stay class-only.
+        secret = "Bearer token-secret-value"
+        poll_timeout = self.m.with_poll_timeout.__globals__["PollTimeout"]
+        for error, expect_text in (
+            (poll_timeout("valid barrier converges", 120, 120.4, 404, None), True),
+            (RuntimeError(secret), False),
+            (AssertionError(secret), False),
+            # Codex #1021 P1: a spoofed phrase in a plain AssertionError is not poll()'s.
+            (AssertionError(f"{secret} did not converge in 120s; last_status=404"), False),
+        ):
+            failure = self.m.harness_failure(error)
+            self.assertEqual(expect_text, "poll_timeout" in failure)
+            self.assertNotIn(secret, json.dumps(failure))
+
     def test_observer_wrong_value_cannot_satisfy_poll_or_leak_value(self):
         observer = FakeApi()
         secret = "unexpected-private-value"
@@ -308,7 +325,10 @@ class LegacyHarnessTests(unittest.TestCase):
             scenario.run(*nodes, stop_owner, restart_writer)
         refused = [x for x in scenario.e.assertions if x["label"] == "revoked import mutation refused"]
         self.assertEqual([removal_status], [x["status"] for x in refused])
-        self.assertEqual(["revoked_import_refusal", "legacy_observer_imported_value",
+        # Both barriers now leave a receipt, so a barrier timeout is visible
+        # with its elapsed time instead of a bare "harness AssertionError".
+        self.assertEqual(["revoked_import_refusal", "valid_barrier_converges",
+                          "valid_barrier_converges", "legacy_observer_imported_value",
                           "legacy_observer_imported_value"],
                          [receipt["operation"] for receipt in scenario.e.polls])
         self.assertTrue(all(receipt["outcome"] == "accepted" for receipt in scenario.e.polls))

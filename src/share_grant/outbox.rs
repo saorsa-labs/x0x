@@ -41,19 +41,62 @@
 //! [`OUTBOX_MAX_SENDS_PER_STEP`] entries, so an offline peer cannot turn the
 //! outbox into a hot send loop.
 //!
+//! # The revocation contract (#994 r2)
+//!
+//! Over a network nobody can promise that nothing lands after `DELETE
+//! /grants/:id` returns: a DM already published may still be in transit, and
+//! a send cut off by [`GRANT_SEND_DEADLINE`] may already have left. The
+//! contract is therefore exactly:
+//!
+//! 1. **Owner side (enforced here):** once a revocation has been recorded,
+//!    this install makes NO new send and NO new enqueue of that grant.
+//! 2. **In-flight sends (enforced by the receiver):** the revocation reaches
+//!    the recipient on the `x0x.revocation.v3` gossip carrier (there is no
+//!    separate direct push). A receiver that already knows the revocation
+//!    refuses to store the grant ([`super::handle_share_grant_dm_checked`]);
+//!    one that stored it first stops honouring it the moment the revocation
+//!    arrives — every access decision filters grants through the local
+//!    revocation set ([`super::evaluate_grant_access`]).
+//!
+//!    **Window:** until that gossip arrives, a receiver that stored an
+//!    in-flight grant still honours it. Closing the window needs a direct
+//!    revocation push, a wire change tracked in #1003.
+//!
 //! # Revocation is serialized with sending
 //!
 //! A worker pass holds the outbox's send gate (shared) from its revocation
-//! check until its sends have completed. EVERY path that makes a share-grant
-//! revocation effective — the local API revoke, the `x0x.revocation.v3`
-//! gossip carrier, and a share-grant record arriving on any other revocation
-//! carrier — takes the gate exclusively
+//! check until its sends have returned or hit the deadline. EVERY path that
+//! makes a share-grant revocation effective — the local API revoke, the
+//! `x0x.revocation.v3` gossip carrier, and a share-grant record arriving on
+//! any other revocation carrier — takes the gate exclusively
 //! ([`GrantRedeliveryOutbox::revocation_barrier`], reached through
 //! [`crate::owner_trust::OwnerTrust::share_grant_revocation_barrier`]) before
 //! it inserts the record. So once a revocation has been recorded no pass
-//! can start a send of that grant, and a send already in flight when the
-//! revoke began completes BEFORE the revoke returns (it is ordered before
-//! the revocation, exactly like a delivery at issue time).
+//! can START a send of that grant (contract 1).
+//!
+//! The INITIAL delivery made by `POST /grants` takes the same gate shared
+//! across its DMs ([`GrantRedeliveryOutbox::send_permit`], #994 r1), so a
+//! `DELETE /grants/:id` racing a POST waits until the POST's sends have
+//! returned (or timed out) and no send of the grant is started afterwards.
+//! This orders the owner's own actions; it does not claim the remote side
+//! has finished processing a DM already on the wire (contract 2 covers that).
+//!
+//! Every send made while the gate is held is bounded by
+//! [`GRANT_SEND_DEADLINE`], so a revoke waits at most that long (plus the
+//! local I/O of the pass) for the gate — a stuck send cannot hang DELETE.
+//!
+//! # Lock order
+//!
+//! Acquired in this order only, never the reverse, so no cycle is possible:
+//!
+//! 1. the outbox send gate (`tokio::sync::RwLock`; shared for sends and
+//!    enqueue, exclusive for a revocation) — never re-entered while held:
+//!    the POST releases its shared permit before it queues;
+//! 2. the agent's revocation set (`tokio::sync::RwLock`);
+//! 3. the `revocations-v3.bin` writer: its process-local `tokio` mutex,
+//!    then the OS advisory file lock;
+//! 4. the outbox `write_lock` (`tokio::sync::Mutex`);
+//! 5. the outbox entry map (`std::sync::Mutex`, never held across `.await`).
 //!
 //! # Storage
 //!
@@ -64,7 +107,8 @@
 //! longer verifies or is not this owner's — yields an empty outbox that
 //! refuses writes ([`GrantRedeliveryOutbox::load_error`]), so the file is
 //! never silently truncated or replaced. Only entries past their deadline
-//! are dropped on load, as the lifecycle rules say. A failed write marks the
+//! are dropped on load, as the lifecycle rules say, and the pruned set is
+//! written back at once (#1004) so they do not linger on disk. A failed write marks the
 //! outbox dirty; the next mutation (including a retried revocation) rewrites
 //! it even if it changes nothing in memory.
 
@@ -111,6 +155,13 @@ pub const OUTBOX_MAX_SENDS_PER_STEP: usize = 8;
 /// Send-layer retries inside one outbox attempt (the outbox itself is the
 /// outer retry loop).
 pub const OUTBOX_SEND_RETRIES: u8 = 1;
+
+/// Hard bound on any single grant send made while the send gate is held
+/// (an initial `POST /grants` DM or a worker redelivery). It bounds how long
+/// a revocation can wait for the gate. A send cut off here counts as not
+/// delivered (the POST queues it; the worker reschedules it) — safe, since
+/// every retry is the same idempotent logical request.
+pub const GRANT_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One queued grant delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +210,9 @@ pub enum OutboxError {
     /// The outbox file could not be read or written.
     #[error("redelivery outbox store: {0}")]
     Store(String),
+    /// The grant is revoked: it is never queued (#983 post-merge P1).
+    #[error("grant is revoked")]
+    Revoked,
 }
 
 /// What one worker pass did.
@@ -216,7 +270,9 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Load `path` (missing ⇒ empty). Entries whose deadline has passed at
-    /// `now_unix` are dropped. Anything else wrong — unreadable, malformed,
+    /// `now_unix` are dropped and the file is rewritten without them (a
+    /// failed rewrite leaves the outbox dirty for the worker to retry).
+    /// Anything else wrong — unreadable, malformed,
     /// a duplicate key, an entry that no longer verifies or is not signed
     /// by `local_owner`, or a total or per-grantee bound exceeded — yields
     /// an empty outbox that refuses writes ([`Self::load_error`]); nothing
@@ -250,8 +306,21 @@ impl GrantRedeliveryOutbox {
         };
         let file = file.and_then(|file| outbox.validate_loaded(file, now_unix, &path));
         match file {
-            Ok(entries) => {
+            Ok((entries, expired)) => {
                 outbox.entries = std::sync::Mutex::new(entries);
+                // #1004: entries that expired while the daemon was down are
+                // gone from memory; rewrite the file so they are gone from
+                // disk too. Only a fully validated file reaches here, so a
+                // fail-closed file is never rewritten. A failed write leaves
+                // the outbox dirty and the first worker pass retries it.
+                if expired > 0 {
+                    let _write = outbox.write_lock.lock().await;
+                    if let Err(e) = outbox.persist().await {
+                        tracing::warn!(
+                            "share-grant outbox: pruning expired entries not persisted: {e}"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("share-grant outbox unreadable, holding no deliveries: {e}");
@@ -262,13 +331,13 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Check every loaded entry (see [`Self::load`]); only past-deadline
-    /// entries are dropped.
+    /// entries are dropped. Returns the kept entries and how many expired.
     fn validate_loaded(
         &self,
         file: OutboxFile,
         now_unix: u64,
         path: &std::path::Path,
-    ) -> Result<BTreeMap<EntryKey, PendingGrantDelivery>, String> {
+    ) -> Result<(BTreeMap<EntryKey, PendingGrantDelivery>, usize), String> {
         let mut entries = BTreeMap::new();
         let mut expired = 0usize;
         for entry in file.entries {
@@ -308,7 +377,7 @@ impl GrantRedeliveryOutbox {
                 "share-grant outbox: dropped expired entries on load"
             );
         }
-        Ok(entries)
+        Ok((entries, expired))
     }
 
     /// Exclusive side of the send gate. Hold it while recording a local
@@ -316,6 +385,14 @@ impl GrantRedeliveryOutbox {
     /// to finish its sends and keeps a new pass from starting.
     pub async fn revocation_barrier(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         std::sync::Arc::clone(&self.send_gate).write_owned().await
+    }
+
+    /// Shared side of the send gate for a send made outside a worker pass
+    /// (the initial `POST /grants` delivery). Hold it across the sends and
+    /// release it before calling [`Self::enqueue`] (the gate is not
+    /// re-entrant: a queued revocation would otherwise deadlock).
+    pub async fn send_permit(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        std::sync::Arc::clone(&self.send_gate).read_owned().await
     }
 
     /// Why the on-disk outbox is not in force, if it is not.
@@ -374,14 +451,25 @@ impl GrantRedeliveryOutbox {
     /// Durably queue `grant` for `recipient`. Returns `Ok(true)` once the
     /// entry is on disk, `Ok(false)` if it was already queued.
     ///
+    /// Runs under the send gate (shared) and re-checks `revocations` under
+    /// it (#983 post-merge P1). Every revocation takes the gate exclusively
+    /// before it becomes effective and then removes the grant's entries, so
+    /// either the revocation is already visible here (refused: a revoked
+    /// grant is NEVER queued) or it lands after this insert and removes it.
+    /// A `DELETE /grants/:id` that completes while the `POST`'s initial DM is
+    /// still pending therefore cannot be undone by the `POST` queueing the
+    /// grant afterwards.
+    ///
     /// # Errors
-    /// Not queueable (foreign, forged or expired grant), a bound reached, or
-    /// a store failure. A refused entry leaves the outbox unchanged.
+    /// Not queueable (foreign, forged or expired grant), revoked, a bound
+    /// reached, or a store failure. A refused entry leaves the outbox
+    /// unchanged.
     pub async fn enqueue(
         &self,
         grant: &ShareGrant,
         recipient: AgentId,
         now_unix: u64,
+        revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, OutboxError> {
         self.queueable(grant)?;
         let deadline = grant
@@ -396,6 +484,14 @@ impl GrantRedeliveryOutbox {
             )));
         }
         let key = key_of(&grant.grant_id, &recipient);
+        let _gate = self.send_gate.read().await;
+        if revocations
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner)
+        {
+            return Err(OutboxError::Revoked);
+        }
         let _write = self.write_lock.lock().await;
         {
             let mut entries = self.lock();
@@ -458,16 +554,18 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Make every delivery to one of `recipients` due at `now_unix` (the
-    /// recipient's machine was seen again) and wake the worker. Returns
-    /// whether anything was nudged. In memory only: the persisted schedule
-    /// is merely later, which is safe.
+    /// recipient's machine was seen again) and wake the worker. An entry
+    /// that is already due is included too (#1004): it keeps its earlier
+    /// schedule and still wakes the worker. Returns whether any delivery to
+    /// `recipients` is queued. In memory only: the persisted schedule is
+    /// merely later, which is safe.
     pub fn nudge(&self, recipients: &[AgentId], now_unix: u64) -> bool {
         let mut nudged = false;
         {
             let mut entries = self.lock();
             for entry in entries.values_mut() {
-                if recipients.contains(&entry.recipient) && entry.next_attempt_at > now_unix {
-                    entry.next_attempt_at = now_unix;
+                if recipients.contains(&entry.recipient) {
+                    entry.next_attempt_at = entry.next_attempt_at.min(now_unix);
                     nudged = true;
                 }
             }
@@ -508,19 +606,32 @@ impl GrantRedeliveryOutbox {
             return report;
         }
         let _gate = self.send_gate.read().await;
-        // 1. Drop dead entries.
+        // 0. A previous write failed and nothing has rewritten the file
+        //    since: retry it now, even if the outbox is otherwise idle, so a
+        //    stale entry does not linger on disk (#983 post-merge P2).
+        if self.dirty.load(Ordering::Acquire) {
+            let _write = self.write_lock.lock().await;
+            if self.dirty.load(Ordering::Acquire) {
+                if let Err(e) = self.persist().await {
+                    tracing::warn!("share-grant outbox: dirty rewrite failed again: {e}");
+                }
+            }
+        }
+        // 1. One snapshot, judged once against the revocation set: the same
+        //    snapshot supplies both the dead entries and the due ones, so no
+        //    entry is ever sent without having been checked.
         let snapshot = self.pending();
-        let dead: Vec<EntryKey> = {
+        let (dead, live): (Vec<PendingGrantDelivery>, Vec<PendingGrantDelivery>) = {
             let revoked = revocations.read().await;
-            snapshot
-                .iter()
-                .filter(|e| {
-                    now_unix >= e.deadline
-                        || revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner)
-                })
-                .map(|e| key_of(&e.grant.grant_id, &e.recipient))
-                .collect()
+            snapshot.into_iter().partition(|e| {
+                now_unix >= e.deadline
+                    || revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner)
+            })
         };
+        let dead: Vec<EntryKey> = dead
+            .iter()
+            .map(|e| key_of(&e.grant.grant_id, &e.recipient))
+            .collect();
         if !dead.is_empty() {
             let _write = self.write_lock.lock().await;
             {
@@ -535,14 +646,20 @@ impl GrantRedeliveryOutbox {
                 tracing::warn!("share-grant outbox: dropping dead entries not persisted: {e}");
             }
         }
-        // 2. Pick due entries.
-        let mut due: Vec<PendingGrantDelivery> = self
-            .pending()
+        // 2. Pick due entries from that SAME checked snapshot, and re-check
+        //    each one against the revocation set right before sending
+        //    (#983 post-merge P1; the gate keeps local and gossiped
+        //    revocations out for the rest of this pass).
+        let mut due: Vec<PendingGrantDelivery> = live
             .into_iter()
             .filter(|e| e.next_attempt_at <= now_unix)
             .collect();
         due.sort_by_key(|e| (e.next_attempt_at, e.queued_at));
         due.truncate(OUTBOX_MAX_SENDS_PER_STEP);
+        {
+            let revoked = revocations.read().await;
+            due.retain(|e| !revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner));
+        }
         if due.is_empty() {
             return report;
         }
@@ -552,7 +669,7 @@ impl GrantRedeliveryOutbox {
                 request.map(|(payload, request_id)| send(entry.recipient, payload, request_id));
             async move {
                 let outcome = match fut {
-                    Ok(fut) => fut.await,
+                    Ok(fut) => bounded_send(fut).await,
                     Err(e) => Err(e.to_string()),
                 };
                 (entry, outcome)
@@ -623,5 +740,20 @@ impl GrantRedeliveryOutbox {
         crate::storage::write_private_bytes_durable(path, bytes)
             .await
             .map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// Run one grant send under [`GRANT_SEND_DEADLINE`]; a timeout is a failed
+/// send.
+pub(crate) async fn bounded_send<Fut>(send: Fut) -> Result<(), String>
+where
+    Fut: Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(GRANT_SEND_DEADLINE, send).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(format!(
+            "grant send timed out after {}s",
+            GRANT_SEND_DEADLINE.as_secs()
+        )),
     }
 }

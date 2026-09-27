@@ -17,12 +17,21 @@ from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
-from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier
+from e2e_vps_kv import Api, Evidence, PollTimeout, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier, with_poll_timeout
 
 
 # #824: the documented transient `GET /home` state while startup provisioning
 # waits (at most 90 s) for owner sync. Readers poll through it, and only it.
 HOME_PROVISIONING_PENDING = "provisioning_pending"
+
+# `GET /diagnostics/state-sync` per-store counters (docs/api-reference.md). Only
+# these names, and only integer values, ever enter a report.
+STATE_SYNC_COUNTERS = (
+    "requests_sent", "request_seal_failed", "requests_received", "requests_answered",
+    "retained_pages_served", "incoming_record_merges", "rejected_verify",
+    "rejected_unauthorized_request", "rejected_unauthorized_control",
+    "rejected_authorization_version", "rejected_cooldown", "rejected_no_retained",
+    "rejected_other")
 
 
 def settled_home(client: Api, label: str, timeout: float) -> tuple[int, dict[str, Any]]:
@@ -221,7 +230,59 @@ class Scenario(SharedScenario):
                                      and owner_last[0] == 200
                                      and isinstance(owner_body.get("members"), list) else None),
             local_probe_count=local_samples)
-        raise AssertionError(f"{readiness_label} did not converge in {self.timeout:g}s")
+        raise PollTimeout(readiness_label, self.timeout, elapsed,
+                          owner_last[0] if isinstance(owner_last, tuple) else None, last_error)
+
+    def await_owner_key_barrier(self, label: str, writer: str, stores: dict[str, str],
+                                owner_key: str) -> None:
+        """The writer holds every store's owner key before the owner goes offline.
+
+        Everything is still online here, so a timeout is a PRODUCT failure: the
+        writer did not converge an owner-authored value. It also leaves the
+        late-history precondition unmet, so no cold-history verdict is reached.
+        """
+        for app, sid in stores.items():
+            try:
+                self.await_value(writer, sid, owner_key, f"{label}-owner-{app}",
+                                 barrier="writer_owner_key_before_offline")
+            except AssertionError as error:
+                self.e.assertions.append(with_poll_timeout({
+                    "label": (f"{label} product failure: {writer} did not converge the {app} "
+                              f"owner key while the owner was online; late-history precondition "
+                              f"unmet, so no cold-history verdict"),
+                    "passed": False, "verdict": "product_failure",
+                    "check": "writer_owner_key_convergence_while_online",
+                    "late_history_precondition": "unmet",
+                    "app": app, "error_class": type(error).__name__}, error))
+                raise
+
+    def capture_state_sync(self, label: str, nodes: tuple[str, ...], stores: dict[str, str]) -> None:
+        """Record paired `/diagnostics/state-sync` counters for each store at failure.
+
+        Only allow-listed counter names with integer values, the HTTP status and
+        an error class are kept; never a response body or error text. Capture
+        problems are recorded, never raised, so the original failure stands.
+        """
+        for node in nodes:
+            sampled = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            try:
+                status, body = self.c[node].request("GET", "/diagnostics/state-sync")
+                error_class = None
+            except Exception as error:
+                status, body, error_class = None, {}, type(error).__name__
+            open_stores = body.get("stores") if status == 200 and isinstance(body, dict) else None
+            open_stores = open_stores if isinstance(open_stores, dict) else {}
+            for app, sid in stores.items():
+                row = open_stores.get(sid)
+                counters = ({name: row[name] for name in STATE_SYNC_COUNTERS
+                             if type(row.get(name)) is int} if isinstance(row, dict) else {})
+                self.e.record_poll(
+                    {"label": f"{label} {node} {app} state-sync counters at failure",
+                     "sampled_utc": sampled, "http_status": status if isinstance(status, int) else None,
+                     "error_class": error_class, "topic_open": isinstance(row, dict),
+                     "counters": counters},
+                    operation="state_sync_failure_snapshot", node=node, app=app,
+                    store_topic=safe_identifier(sid))
 
     def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
                  gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],
@@ -277,19 +338,26 @@ class Scenario(SharedScenario):
             before_admission()
         late_invite = mint_late()
         self.e.check(f"{label} late invite retained", late_invite.startswith("x0x://invite/"))
-        stop_owner()
-        if admission_offline_label is not None:
-            self.e.check(admission_offline_label, is_offline(owner))
-        join_late(late_invite)
-        stop_admin()
-        self.e.check(history_offline_label or f"{label} owner and admin stopped before late history",
-                     is_offline(owner) and is_offline(admin))
-        for app, sid in stores.items():
-            reopened = self.open_store(late, gid, app)
-            self.e.check(f"{label} late {app} identity", reopened.get("id") == sid)
-            self.await_value(late, sid, owner_key, f"{label}-owner-{app}")
-            self.await_value(late, sid, member_key, f"{label}-member-{app}")
-            self.await_absent(late, sid, removed_key)
+        try:
+            # Once the owner and Admin stop, the writer is the only source of
+            # the owner's history, so it must hold both owner keys first.
+            self.await_owner_key_barrier(label, writer, stores, owner_key)
+            stop_owner()
+            if admission_offline_label is not None:
+                self.e.check(admission_offline_label, is_offline(owner))
+            join_late(late_invite)
+            stop_admin()
+            self.e.check(history_offline_label or f"{label} owner and admin stopped before late history",
+                         is_offline(owner) and is_offline(admin))
+            for app, sid in stores.items():
+                reopened = self.open_store(late, gid, app)
+                self.e.check(f"{label} late {app} identity", reopened.get("id") == sid)
+                self.await_value(late, sid, owner_key, f"{label}-owner-{app}")
+                self.await_value(late, sid, member_key, f"{label}-member-{app}")
+                self.await_absent(late, sid, removed_key)
+        except Exception:
+            self.capture_state_sync(label, (writer, late), stores)
+            raise
 
         expected = set(actor_ids.values())
         restart_writer(gid, expected)
@@ -443,7 +511,9 @@ def main() -> int:
                     custody.restore_required.remove(node)
         succeeded = True
     except Exception as error:
-        evidence.assertions.append({"label": "harness", "passed": False, "error": str(error)})
+        # Class only: str(error) could echo a server body or bearer token.
+        evidence.assertions.append(with_poll_timeout({"label": "harness", "passed": False,
+                                                      "error": type(error).__name__}, error))
     finally:
         for error in custody.restore(await_health):
             evidence.assertions.append({"label": error, "passed": False})

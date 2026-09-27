@@ -3733,6 +3733,18 @@ function renderNetwork(){
       <div><span class="k">Decode→delivery drops</span>: <span id="g-drops" class="v">—</span></div>
     </div>
     <div id="g-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
+    <div style="margin-top:var(--sp2)">
+      <strong>Leaf egress</strong> <span style="color:var(--tx3);font-size:11px">(policy / 60s rate / budget exceedances / epidemic forward — #945)</span>
+      <div class="grid g2" style="gap:var(--sp3);margin-top:var(--sp2)">
+        <div><span class="k">Byte policy</span>: <span id="g-ege-policy" class="v">—</span></div>
+        <div><span class="k">Applies to Leaf</span>: <span id="g-ege-applies" class="v">—</span></div>
+        <div><span class="k">Outbound 60s (B/s)</span>: <span id="g-ege-rate" class="v">—</span></div>
+        <div><span class="k">Epidemic forwarded (B)</span>: <span id="g-ege-fwd" class="v">—</span></div>
+        <div><span class="k">Soft exceeded</span>: <span id="g-ege-soft" class="v">—</span></div>
+        <div><span class="k">Hard exceeded</span>: <span id="g-ege-hard" class="v">—</span></div>
+      </div>
+      <div id="g-ege-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
+    </div>
   </div>
   <div class="card mb2" id="n-transport-card" style="font-size:12px">
     <div class="grid g2" style="gap:var(--sp3)">
@@ -4018,6 +4030,28 @@ async function pollNetworkView(){
       note.innerHTML=drops>0
         ? '<span class="trust trust-blocked" style="font-size:10px">drops detected</span> investigate — any non-zero counter above means messages were lost'
         : '<span class="trust trust-trusted" style="font-size:10px">clean</span> all gossip stages balanced, zero drops since startup';
+    }
+    // #945 visibility: the first-class leaf_egress block — whether this
+    // default Leaf is over its egress budget (ADR 0078 precondition).
+    const le=gg.leaf_egress;
+    if(le){
+      if(g('g-ege-policy'))g('g-ege-policy').textContent=le.byte_policy??'—';
+      if(g('g-ege-applies'))g('g-ege-applies').textContent=le.applies_to_leaf===true?'yes':(le.applies_to_leaf===false?'no':'—');
+      if(g('g-ege-rate'))g('g-ege-rate').textContent=le.subscribed_outbound_bytes_per_sec_60s??'—';
+      if(g('g-ege-fwd'))g('g-ege-fwd').textContent=le.epidemic_forward_bytes??'—';
+      if(g('g-ege-soft'))g('g-ege-soft').innerHTML=warn(le.soft_exceeded|0);
+      if(g('g-ege-hard'))g('g-ege-hard').innerHTML=warn(le.hard_exceeded|0);
+      const lnote=g('g-ege-note');
+      if(lnote){
+        const over=(le.hard_exceeded|0)>0;
+        const policy=String(le.byte_policy||'');
+        const policyNote=policy==='shed_normal'
+          ?'shed_normal: over-budget forwarded traffic is being deferred (Critical topics never shed)'
+          :'observe_only meters this and sheds nothing';
+        lnote.innerHTML=over
+          ? '<span class="trust trust-blocked" style="font-size:10px">over hard budget</span> this Leaf is forwarding beyond its configured egress budget ('+policyNote+' — see ADR 0078)'
+          : '<span class="trust trust-trusted" style="font-size:10px">within budget</span> no hard-budget exceedance samples since startup (policy: '+esc(policy||'—')+')';
+      }
     }
   }
   await Promise.allSettled([
