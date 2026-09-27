@@ -720,6 +720,7 @@ pub(in crate::server) fn roster_certificate_sidecar_for_info(
 /// fitted a direct message still does, so attaching certificates never
 /// moves an event onto a transport a legacy receiver may not support.
 /// A no-op for anything but an owner-certified `MemberAdded`.
+#[allow(dead_code)] // #1023 red proof: fix reverted
 pub(in crate::server) fn attach_roster_certificates_to_member_added(
     state: &AppState,
     next: &crate::groups::GroupInfo,
@@ -763,6 +764,7 @@ pub(in crate::server) fn attach_roster_certificates_to_member_added(
 /// #1023 receiver side: the certificate sidecar a `MemberAdded` carries,
 /// keyed by the event's group id, captured before the apply consumes the
 /// event. `None` for every other event and for an empty sidecar.
+#[allow(dead_code)] // #1023 red proof: fix reverted
 pub(in crate::server) fn member_added_sidecar(
     event: &super::NamedGroupMetadataEvent,
 ) -> Option<(String, Vec<String>)> {

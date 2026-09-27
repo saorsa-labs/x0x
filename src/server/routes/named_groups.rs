@@ -10388,7 +10388,6 @@ async fn apply_named_group_metadata_event_with_binding(
     };
     // #1023: a seat event's certificate sidecar, captured before `event`
     // moves and installed only after every apply guard has dropped.
-    let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10409,7 +10408,6 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
-    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
         if let Some((gid, member)) = departing_member.as_ref() {
             clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
@@ -10430,6 +10428,7 @@ async fn apply_named_group_metadata_event_with_binding(
 /// the group owner before install
 /// (`seat_cert_fetch::hydrate_from_roster_certificate_sidecar`). MUST be
 /// called with no membership or `named_groups` guard held.
+#[allow(dead_code)] // #1023 red proof: fix reverted
 async fn hydrate_from_member_added_sidecar(
     state: &Arc<AppState>,
     sidecar: Option<(String, Vec<String>)>,
@@ -10669,7 +10668,6 @@ async fn apply_named_group_metadata_event_inner(
     // notification is consumed only after the (guard-free) replay call.
     let mut cleared_quarantine = std::collections::BTreeSet::new();
     // #1023: as in `apply_named_group_metadata_event_with_binding`.
-    let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10692,7 +10690,6 @@ async fn apply_named_group_metadata_event_inner(
         }
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
-    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
         if let Some(event_gid) = member_landing_group {
             // Resolve to the local map key AFTER the apply (the group may
@@ -13805,7 +13802,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && verify_authority_attested_member_joined_recovery(&next, recovery)
                 })
                 .await;
-            let mut event = NamedGroupMetadataEvent::MemberAdded {
+            let event = NamedGroupMetadataEvent::MemberAdded {
                 roster_certificates_b64: Vec::new(),
                 group_id: event_group_id.clone(),
                 revision,
@@ -13832,7 +13829,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // #1023: every other owner-certified seat's certificate rides
             // the seat event, so the joiner holds them even when it is
             // seated by this copy and never fetches its JoinResult.
-            seat_cert_fetch::attach_roster_certificates_to_member_added(state, &next, &mut event);
             // #477 T4(b): park in the seat→Result staging interval — a
             // fetch issued here blocks on the membership mutex and then
             // observes the staged RESULT after release (never a torn
@@ -18906,7 +18902,7 @@ pub(in crate::server) async fn add_named_group_member(
         }
         drop(mls_groups);
         save_mls_groups(&state).await;
-        let mut event = NamedGroupMetadataEvent::MemberAdded {
+        let event = NamedGroupMetadataEvent::MemberAdded {
             roster_certificates_b64: Vec::new(),
             group_id: event_group_id,
             revision,
@@ -18930,11 +18926,6 @@ pub(in crate::server) async fn add_named_group_member(
             commit: Some(commit),
         };
         // #1023: the sealed roster's other certificates ride the seat event.
-        seat_cert_fetch::attach_roster_certificates_to_member_added(
-            &state,
-            &bootstrap_group,
-            &mut event,
-        );
         (metadata_topic, event, members, epoch, bootstrap_group)
     };
 
@@ -19173,7 +19164,7 @@ async fn add_treekem_named_group_member(
     drop(guard);
 
     let welcome_ref = stage_treekem_welcome(&state, &event_group_id, &agent_hex, out.welcome).await;
-    let mut event = NamedGroupMetadataEvent::MemberAdded {
+    let event = NamedGroupMetadataEvent::MemberAdded {
         roster_certificates_b64: Vec::new(),
         group_id: event_group_id,
         revision,
@@ -19202,7 +19193,6 @@ async fn add_treekem_named_group_member(
         commit: Some(commit),
     };
     // #1023: the sealed roster's other certificates ride the seat event.
-    seat_cert_fetch::attach_roster_certificates_to_member_added(&state, &next, &mut event);
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &agent_hex),
