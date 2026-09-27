@@ -7652,7 +7652,12 @@ mod tests {
             .expect("insert");
         doc.commit();
         let update = doc.export(loro::ExportMode::all_updates()).expect("export");
-        let note_id = "ab".repeat(16);
+        // The note id must be distinct from the fixture's group id: the test
+        // group is `"ab".repeat(16)`, and the stable group id travels in the
+        // clear in `EncryptedKvStoreRecordV1.group_id` by design (it is also
+        // derivable from the topic). With `"ab".repeat(16)` as the note id
+        // too, the scan below matched the public group id, not a leak.
+        let note_id = "5e".repeat(16);
         let (key, record) = crate::notes::record::sign_record(
             &signing,
             id.as_bytes(),
@@ -7672,7 +7677,7 @@ mod tests {
             id,
             "notes".to_string(),
             owner,
-            group_id,
+            group_id.clone(),
             context.clone() as SharedKvSecureContext,
         )
         .expect("encrypted store");
@@ -7711,6 +7716,20 @@ mod tests {
             ("loro peer id", LORO_PEER.to_le_bytes().to_vec()),
             ("loro peer id hex", peer_hex.as_bytes().to_vec()),
         ];
+        // Fixture sanity: no secret needle may coincide with the envelope's
+        // legitimately public fields (group id, store id), or a match would
+        // be a fixture collision rather than a leak.
+        let mut public_fields = group_id.clone();
+        public_fields.extend_from_slice(id.as_bytes());
+        public_fields.extend_from_slice(topic.as_bytes());
+        for (label, needle) in &needles {
+            assert!(
+                !public_fields
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_slice()),
+                "fixture collision: {label} appears in the public envelope fields"
+            );
+        }
         let assert_ciphertext_only = |payload: &[u8], what: &str| {
             for (label, needle) in &needles {
                 assert!(
