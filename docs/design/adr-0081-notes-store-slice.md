@@ -154,41 +154,64 @@ applies it as explicit `insert`/`delete` ops. It never calls `update` or
 `update_by_line`.
 
 1. Trim the common prefix and suffix, cut back to whole lines.
-2. Myers diff over line ids.
-3. Widen each changed run of lines to the nearest anchor. An anchor is a
-   non-blank line that occurs exactly once in each text; blank or repeated
-   lines can match the wrong occurrence.
-4. Myers diff over the characters of each widened run.
+2. Split the rest into hunks at anchors. An anchor is a non-blank line that
+   occurs exactly once in each text; blank or repeated lines can match the
+   wrong occurrence. Anchors are matched by patience diff (longest
+   increasing run, `O(n log n)`, no budget). A hunk is the text between two
+   matched anchors where old and new differ.
+3. Diff each hunk down a ladder of rungs. A whole region is never replaced
+   because a budget ran out (Codex review of c85eb5e, P1).
+   - **Exact.** Myers over the hunk's characters, within the shared
+     `EXACT_WORK_BUDGET` (16 M units). This gives a minimal character
+     script.
+   - **Line-paired.** Used only for a hunk the exact rung could not finish.
+     The hunk's lines are aligned by Myers over line ids, spending at most
+     `LINE_ALIGN_WORK` (4 M units). If that runs out and old and new have
+     the same number of lines, they are paired by position. Each aligned
+     span is then diffed by character, line against line when the counts
+     match, within the shared `LINE_WORK_BUDGET` (16 M units). A line whose
+     character diff still runs out is replaced whole and counted.
+   - **Refuse.** The line alignment ran out and the line counts differ.
+     The save fails with `NoteError::EditTooLargeToMergeSafely`, and REST
+     returns 422 `note_edit_too_large_to_merge_safely` ("save the change in
+     smaller steps"). Nothing is applied, and nothing is written.
 
-The line diff, the 256 KiB threshold and "no diff crate" are kept. The
-<256 KiB path (`update` with `use_refined_diff: false`) is unchanged.
+The line-first diff, the 256 KiB threshold and "no diff crate" are kept.
+The <256 KiB path (`update` with `use_refined_diff: false`) is unchanged.
 
-**Bounds.**
-- **Work budget.** The line and character diffs share a work budget of
-  16 M units (about 100 ms if all of it is spent). A region still
-  unresolved when it runs out is replaced whole, as `update_by_line` would
-  replace it; `EditScript::replaced_chars` counts it. Only rewrites run
-  out: 500 scattered edits on 4 MiB spend 1.7 M.
-- **Ties.** Like loro's character diff below the threshold, Myers picks
-  one of several minimal scripts. If one edit both deletes and inserts a
-  newline, a minimal script can re-insert a neighbouring character
-  instead.
+**Loss bound.** A character the user did not change is deleted and
+re-inserted, which lets it survive a concurrent delete of it, only in one
+of two cases:
+- **(a) Ties.** Myers breaks a tie between equal minimal scripts that way.
+  This is the same tie loro's character diff has below the threshold, and
+  it needs an edit that deletes and inserts a repeated character such as a
+  newline.
+- **(b) Replaced lines.** The character is on an old line that the
+  line-paired rung replaced whole. Such a line is always changed, moved,
+  blank or repeated (an unchanged unique line would have been an anchor).
+  No replacement ever spans more than one aligned span of changed lines.
+
+Case (b) is reported on every save as `large_save: {rung, replaced_lines,
+replaced_chars}` in the PUT response. `/diagnostics/groups` counts it
+under `notes`: `large_saves`, `large_saves_line_paired`,
+`large_save_replaced_lines` and `large_saves_refused`.
 
 **Measured** (loro 1.16.2, release, Apple silicon; 4 MiB of word lines;
-time and peak RSS growth):
+time and peak RSS growth; the 3,000-line row is a 423 KB note):
 
 | Save | edit script | `update_by_line` | `update` (char) |
 |---|---|---|---|
-| 1 edit | 3.4 ms, +0.1 MiB | 17 ms, +6.9 MiB | 7.1 ms, +32 MiB |
-| 3 edits | 8.1 ms, +1.8 MiB | 20 ms, +5.5 MiB | 8.6 ms, +32 MiB |
-| 50 edits | 15 ms, +1.2 MiB | 35 ms, +5.6 MiB | 28 ms, +32 MiB |
+| 1 edit | 4.2 ms, +0.1 MiB | 17 ms, +6.9 MiB | 7.1 ms, +32 MiB |
+| 50 edits | 19 ms, +1.2 MiB | 35 ms, +5.6 MiB | 28 ms, +32 MiB |
 | 500 edits | 18 ms, +1.8 MiB | 90 ms, +7.1 MiB | 223 ms, +33 MiB |
 | 500 pure deletes | 446 ms, +1.8 MiB | 100 ms, +6.5 MiB | 520 ms, +37 MiB |
-| every line changed | 103 ms, +29 MiB (budget spent, replaced whole) | 56 s | not measured |
+| 3,000 one-char edits (Codex) | 80 ms, line-paired, 0 lines replaced | — | — |
+| every line changed (`a`→`A`) | 274 ms, line-paired, 79,970 changed lines replaced and reported | 56 s | not measured |
 
 Consecutive deletes in one transaction cost loro about 0.8 ms each on a
-4 MiB note; each insert is applied before its paired delete for that
-reason. Many pure deletes cost the same as loro's own character diff.
+4 MiB note, so each insert is applied before its paired delete. Many pure
+deletes cost the same as loro's own character diff. In a debug build, the
+3,000-edit save takes about 2.5 s.
 
 **Tests** (`src/notes/engine_tests.rs`):
 - `large_save_never_resurrects_a_concurrent_delete`: a property test over
@@ -196,12 +219,27 @@ reason. Many pure deletes cost the same as loro's own character diff.
   note. B concurrently saves one to three edits elsewhere, mostly on the
   lines A's region touches. Every replica and a reversed-order observer
   must end with exactly both edits applied.
-- `update_by_line_control_resurrects_deleted_text`: the same scenarios
-  and checker with `update_by_line` fail (seeds 4 and 11 of 0..16).
-- `large_save_regression_seeds_converge`, `large_save_emits_only_edited_characters`
-  (op count equals edited characters; `update_by_line` emits more),
-  `edit_script_reproduces_text_under_any_budget`,
-  `spent_budget_replaces_the_region_whole`.
+- `update_by_line_control_resurrects_deleted_text`: the same scenarios and
+  checker with `update_by_line` fail (seeds 4 and 11 of 0..16).
+- `scattered_edits_never_resurrect_a_concurrent_delete`: a property test
+  with 200–3,000 one-token edits (a contiguous block plus scattered lines)
+  on a >256 KiB note, with a concurrent delete, through the save path.
+- `codex_3000_edit_save_keeps_a_concurrent_delete`: Codex's exact case
+  (3,000 lines of 141 bytes, 423,000 bytes, one character changed per
+  line) with A concurrently deleting 50 characters of line 1,500. It is red
+  on c85eb5e and green on the ladder.
+- `unmergeable_large_save_fails_closed_with_a_typed_error`: the same edit
+  plus one inserted line is refused with `EditTooLargeToMergeSafely`. The
+  text is unchanged, and the refusal is counted and is not a fault.
+- `spent_budgets_replace_only_the_changed_lines`,
+  `unalignable_save_is_refused_not_replaced`,
+  `scattered_edits_use_the_line_rung_without_replacing_lines`,
+  `large_save_regression_seeds_converge`,
+  `large_save_emits_only_edited_characters`,
+  `edit_script_reproduces_text_under_any_budget`.
+- The route test `note_errors_map_to_the_adr_statuses` covers the 422. The
+  CLI test `error_with_message_prints_the_code_and_the_sentence` checks that
+  the CLI prints the code and the "save in smaller steps" sentence.
 
 **Question for David.** ADR 0081 §8 names `update_by_line`. This keeps the
 threshold and the line-first diff, but not that call. It is an

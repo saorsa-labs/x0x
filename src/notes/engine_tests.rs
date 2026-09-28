@@ -12,7 +12,10 @@ use super::engine::{
     PeerIdSource, LINE_DIFF_THRESHOLD_BYTES, MAX_CONSECUTIVE_FAULTS,
 };
 use super::error::NoteError;
-use super::text_diff::{apply_edit_script, edit_script, DIFF_WORK_BUDGET};
+use super::text_diff::{
+    apply_edit_script, edit_script, Budgets, DiffRung, TooLargeToMergeSafely, EXACT_WORK_BUDGET,
+    LINE_WORK_BUDGET,
+};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -571,7 +574,7 @@ fn run_large_loro(s: &LargeScenario, diff: fn(&loro::LoroText, &str)) -> (Vec<St
 }
 
 fn diff_by_edit_script(text: &loro::LoroText, new: &str) {
-    apply_edit_script(text, new, DIFF_WORK_BUDGET).expect("edit script");
+    apply_edit_script(text, new, Budgets::DEFAULT).expect("edit script");
 }
 
 fn diff_by_line(text: &loro::LoroText, new: &str) {
@@ -661,42 +664,346 @@ proptest! {
         .. ProptestConfig::default()
     })]
 
-    /// The edit script always reproduces the new text, whatever the work
-    /// budget: a spent budget replaces the unresolved region whole (the
-    /// documented bound) and counts it.
+    /// Whatever the budgets, the edit script either reproduces the new text
+    /// or refuses; with the production budgets it never refuses these, and
+    /// on the exact rung it replaces nothing whole.
     #[test]
     fn edit_script_reproduces_text_under_any_budget(
         old in "[ab\n\u{e9}\u{4e00}]{0,40}",
         new in "[ab\n\u{e9}\u{4e00}]{0,40}",
-        budget in prop_oneof![0u64..64, Just(DIFF_WORK_BUDGET)],
+        exact in prop_oneof![0u64..64, Just(EXACT_WORK_BUDGET)],
+        line in prop_oneof![0u64..64, Just(LINE_WORK_BUDGET)],
     ) {
-        let script = edit_script(&old, &new, budget);
+        let budgets = Budgets { exact, line };
+        let Ok(script) = edit_script(&old, &new, budgets) else {
+            prop_assert!(budgets != Budgets::DEFAULT, "default budgets refused a tiny edit");
+            return Ok(());
+        };
         let mut out = old.clone();
         for e in script.edits.iter().rev() {
             out.replace_range(e.old_start..e.old_end, &new[e.new_start..e.new_end]);
         }
         prop_assert_eq!(&out, &new);
         prop_assert!(script.edits.windows(2).all(|w| w[0].old_end <= w[1].old_start));
-        if budget == DIFF_WORK_BUDGET {
-            prop_assert_eq!(script.replaced_chars, 0);
+        if script.rung == DiffRung::Exact {
+            prop_assert_eq!(script.replaced_lines, 0);
         }
         let doc = loro::LoroDoc::new();
         let text = doc.get_text(super::engine::TEXT_CONTAINER);
         text.insert(0, &old).expect("insert");
-        apply_edit_script(&text, &new, budget).expect("apply");
+        apply_edit_script(&text, &new, budgets).expect("apply");
         prop_assert_eq!(text.to_string(), new);
     }
 }
 
-/// The documented bound: with no budget, a multi-line rewrite is replaced
-/// whole, and `replaced_chars` says so.
+/// Ladder rung 2's bound: with both budgets spent, a save that changes some
+/// lines replaces exactly those lines whole, never an unchanged one and
+/// never a region spanning them.
 #[test]
-fn spent_budget_replaces_the_region_whole() {
-    let old = "one\ntwo\nthree\nfour\n";
-    let new = "one\nTWO\nthree\nFOUR\n";
-    assert_eq!(edit_script(old, new, DIFF_WORK_BUDGET).replaced_chars, 0);
-    let spent = edit_script(old, new, 0);
-    assert!(spent.replaced_chars > 0);
+fn spent_budgets_replace_only_the_changed_lines() {
+    let old: String = (0..50).map(|i| format!("line {i} of the note\n")).collect();
+    let mut new = old.clone();
+    for i in [3, 4, 5, 20, 41] {
+        new = new.replace(&format!("line {i} of"), &format!("LINE {i} of"));
+    }
+    let exact = edit_script(&old, &new, Budgets::DEFAULT).expect("exact");
+    assert_eq!((exact.rung, exact.replaced_lines), (DiffRung::Exact, 0));
+    let spent = edit_script(&old, &new, Budgets { exact: 0, line: 0 }).expect("line rung");
+    assert_eq!(spent.rung, DiffRung::LinePaired);
+    assert_eq!(spent.replaced_lines, 5);
+    for e in &spent.edits {
+        let replaced = &old[e.old_start..e.old_end];
+        assert!(
+            replaced.starts_with("line ") && replaced.matches('\n').count() == 1,
+            "only one whole changed line per edit: {replaced:?}"
+        );
+    }
+}
+
+/// Ladder rung 3: when neither the character diff nor the line alignment
+/// fits the budgets and the line counts differ, there is no safe script,
+/// and the diff refuses rather than replacing the region.
+#[test]
+fn unalignable_save_is_refused_not_replaced() {
+    let old: String = (0..40).map(|i| format!("old {i}\n")).collect();
+    let new: String = (0..41).map(|i| format!("new {i}\n")).collect();
+    let refused = edit_script(&old, &new, Budgets { exact: 0, line: 0 });
+    assert_eq!(
+        refused,
+        Err(TooLargeToMergeSafely {
+            old_lines: 40,
+            new_lines: 41,
+        })
+    );
+    assert!(edit_script(&old, &new, Budgets::DEFAULT).is_ok());
+}
+
+/// A note of `lines` distinct 141-byte ASCII lines (140 + `\n`).
+fn codex_note(lines: usize) -> String {
+    let mut rng = StdRng::seed_from_u64(1029);
+    (0..lines)
+        .map(|k| {
+            let body: String = (0..133)
+                .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+                .collect();
+            format!("L{k:05}:{body}\n")
+        })
+        .collect()
+}
+
+/// B's side of Codex's case: one character changed on every line (column
+/// 70 becomes `X`, which no old line holds there).
+fn change_every_line(base: &str) -> String {
+    base.lines()
+        .map(|l| format!("{}X{}\n", &l[..70], &l[71..]))
+        .collect()
+}
+
+/// A region of line `line` that A deletes: `from..to` bytes of the note,
+/// clear of column 70, and with no equal character across either edge, so
+/// A's minimal script is unique.
+fn codex_delete(base: &str, line: usize) -> (usize, usize) {
+    let start = line * 141;
+    let b = base.as_bytes();
+    let mut from = start + 10;
+    let mut to = start + 60;
+    while b[from - 1] == b[to - 1] || b[from] == b[to] {
+        from += 1;
+        to -= 1;
+    }
+    (from, to)
+}
+
+/// #1029 review (Codex, P1): 3,000 one-character edits across a 423 KB
+/// note (0.7 % changed) while A concurrently deletes 50 characters of
+/// line 1,500. The exact rung runs out; before the ladder the whole
+/// 422,860-character region was re-inserted and A's delete undone. Now
+/// every replica ends with exactly both edits and nothing replaced whole.
+#[test]
+fn codex_3000_edit_save_keeps_a_concurrent_delete() {
+    let base = codex_note(3000);
+    assert_eq!(base.len(), 423_000);
+    let b_text = change_every_line(&base);
+    let (from, to) = codex_delete(&base, 1500);
+    let a_text = format!("{}{}", &base[..from], &base[to..]);
+    let expected = format!("{}{}", &b_text[..from], &b_text[to..]);
+    let deleted = &base[from..to];
+    let texts = runtime().block_on(async {
+        let a = open(&shared(), "a").await;
+        let b = open(&shared(), "b").await;
+        let (mut seq_a, mut seq_b) = (0, 0);
+        let first = save(&a, &base, "a", &mut seq_a).await;
+        b.import(first).await.expect("base import");
+        let from_a = save(&a, &a_text, "a", &mut seq_a).await;
+        let view = b.view().await.expect("view");
+        let prepared = b
+            .prepare_save(b_text.clone(), &view.version, MAX_UPDATE)
+            .await
+            .expect("prepare");
+        let report = prepared.large_save.expect("a large save");
+        assert_eq!(report.replaced_lines, 0, "{report:?}");
+        let from_b: Vec<EngineRecord> = prepared
+            .updates
+            .into_iter()
+            .map(|update| {
+                seq_b += 1;
+                EngineRecord {
+                    id: format!("b/{seq_b}"),
+                    update: Arc::new(update),
+                }
+            })
+            .collect();
+        b.import(from_b.clone()).await.expect("b local");
+        a.import(from_b).await.expect("a imports b");
+        b.import(from_a).await.expect("b imports a");
+        let mut texts = Vec::new();
+        for actor in [&a, &b] {
+            texts.push(actor.view().await.expect("view").text);
+        }
+        texts
+    });
+    for (i, t) in texts.iter().enumerate() {
+        assert!(
+            !t.contains(deleted),
+            "replica {i}: A's deleted text came back"
+        );
+        assert!(
+            *t == expected,
+            "replica {i} differs from the expected merge"
+        );
+    }
+}
+
+/// Rung 3 through the save path: 3,000 changed lines plus one inserted
+/// line in one place cannot be aligned within the budgets, so the save is
+/// refused with `EditTooLargeToMergeSafely` (422), nothing is applied, and
+/// the refusal is counted.
+#[test]
+fn unmergeable_large_save_fails_closed_with_a_typed_error() {
+    let base = codex_note(3000);
+    let mut edited = change_every_line(&base);
+    edited.insert_str(141 * 1500, "an inserted line\n");
+    runtime().block_on(async {
+        let shared = shared();
+        let a = open(&shared, "a").await;
+        let mut seq = 0;
+        save(&a, &base, "a", &mut seq).await;
+        let view = a.view().await.expect("view");
+        let refused = a
+            .prepare_save(edited, &view.version, MAX_UPDATE)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(
+                refused,
+                NoteError::EditTooLargeToMergeSafely {
+                    old_lines: 3000,
+                    new_lines: 3001
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.reason(), "note_edit_too_large_to_merge_safely");
+        let after = a.view().await.expect("view");
+        assert_eq!(after.text, base, "nothing applied");
+        assert_eq!(after.version, view.version);
+        let counters = shared.counters().snapshot();
+        assert_eq!(counters.large_saves_refused, 1);
+        assert_eq!(counters.engine_faults, 0, "a refusal is not a fault");
+    });
+}
+
+/// Scattered-edit scenario over a >256 KiB note of unique tokens: B changes
+/// one token on each of `edits` lines (a contiguous block plus scattered
+/// lines, so the exact rung runs out on the block) while A deletes a
+/// token-edged region clear of every B edit.
+fn scattered_scenario(seed: u64, edits: usize) -> LargeScenario {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut next = 0u32;
+    let lines = 3000;
+    let mut base_lines: Vec<Vec<char>> = (0..lines)
+        .map(|_| {
+            (0..rng.gen_range(20..=40))
+                .map(|_| {
+                    next += 1;
+                    big_token(next)
+                })
+                .collect()
+        })
+        .collect();
+    // B: which lines and which column.
+    let block = edits * 3 / 4;
+    let block_start = rng.gen_range(0..lines - block);
+    let mut changed: BTreeSet<usize> = (block_start..block_start + block).collect();
+    while changed.len() < edits {
+        changed.insert(rng.gen_range(0..lines));
+    }
+    let cols: Vec<Option<usize>> = (0..lines)
+        .map(|l| {
+            changed
+                .contains(&l)
+                .then(|| rng.gen_range(0..base_lines[l].len()))
+        })
+        .collect();
+    // A: one line's tokens a0..a1, at least one token clear of B's column.
+    let mut a_line;
+    let (mut a0, mut a1);
+    loop {
+        a_line = rng.gen_range(0..lines);
+        let len = base_lines[a_line].len();
+        a0 = rng.gen_range(0..len - 1);
+        a1 = rng.gen_range(a0 + 1..=len);
+        match cols[a_line] {
+            Some(c) if c + 1 >= a0 && c <= a1 => continue,
+            _ => break,
+        }
+    }
+    let (mut base, mut a_text, mut b_text, mut expected) =
+        (String::new(), String::new(), String::new(), String::new());
+    let mut deleted = BTreeSet::new();
+    let mut b_edited = 0;
+    for (l, tokens) in base_lines.iter_mut().enumerate() {
+        for (k, &t) in tokens.iter().enumerate() {
+            let by_a = l == a_line && (a0..a1).contains(&k);
+            let by_b = cols[l] == Some(k);
+            base.push(t);
+            if !by_a {
+                a_text.push(t);
+            }
+            if by_b {
+                next += 1;
+                b_text.push(big_token(next));
+                expected.push(big_token(next));
+                b_edited += 2;
+            } else {
+                b_text.push(t);
+            }
+            if by_a || by_b {
+                deleted.insert(t);
+            } else {
+                expected.push(t);
+            }
+        }
+        for s in [&mut base, &mut a_text, &mut b_text, &mut expected] {
+            s.push('\n');
+        }
+    }
+    LargeScenario {
+        base,
+        a_text,
+        b_text,
+        expected,
+        deleted,
+        b_edited,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 6,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    /// #1029 review: hundreds to thousands of scattered one-character edits
+    /// on a note above 256 KiB, with a concurrent delete, through the real
+    /// save path. Whatever rung the diff needs, the deleted text never
+    /// comes back and every replica ends with exactly both edits.
+    #[test]
+    fn scattered_edits_never_resurrect_a_concurrent_delete(
+        seed in any::<u64>(),
+        edits in 200usize..=3000,
+    ) {
+        let s = scattered_scenario(seed, edits);
+        prop_assert!(s.base.len() > LINE_DIFF_THRESHOLD_BYTES);
+        let texts = runtime().block_on(run_large_engine(&s, seed));
+        prop_assert!(check_large(&s, &texts).is_ok(), "{:?}", check_large(&s, &texts));
+    }
+}
+
+/// On either rung the scattered scenario stays character-exact:
+/// B's save emits one op per changed character and replaces no line.
+#[test]
+fn scattered_edits_use_the_line_rung_without_replacing_lines() {
+    // 3,000 edits (a 2,250-line block) exhaust the exact rung; 1,500 do not.
+    for (seed, edits, rung) in [(1, 3000, DiffRung::LinePaired), (2, 1500, DiffRung::Exact)] {
+        let s = scattered_scenario(seed, edits);
+        let text = loro::LoroDoc::new();
+        let root = text.get_text(super::engine::TEXT_CONTAINER);
+        root.insert(0, &s.base).expect("base");
+        text.commit();
+        let before = text.oplog_vv().get(&text.peer_id()).copied().unwrap_or(0);
+        let script = apply_edit_script(&root, &s.b_text, Budgets::DEFAULT).expect("apply");
+        text.commit();
+        let after = text.oplog_vv().get(&text.peer_id()).copied().unwrap_or(0);
+        assert_eq!(script.rung, rung, "seed {seed}");
+        assert_eq!(script.replaced_lines, 0, "seed {seed}");
+        assert_eq!(
+            usize::try_from(after - before).expect("ops"),
+            s.b_edited,
+            "seed {seed}"
+        );
+    }
 }
 
 /// A peer-id source that returns queued values first, then CSPRNG values.

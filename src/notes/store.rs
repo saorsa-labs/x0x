@@ -106,6 +106,10 @@ pub struct SaveOutcome {
     pub records_written: usize,
     /// Whether every record was also published (else saved locally only).
     pub published: bool,
+    /// For a save above 256 KiB: the diff rung it needed and the old lines
+    /// it replaced whole (#1029).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub large_save: Option<super::engine::LargeSaveReport>,
 }
 
 /// What one sync pass did with the store's records.
@@ -609,12 +613,14 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
         let prepared = actor
             .prepare_save(text.to_string(), base_version, MAX_UPDATE_BYTES)
             .await?;
+        let large_save = prepared.large_save;
         if prepared.updates.is_empty() {
             let view = actor.view().await?;
             return Ok(SaveOutcome {
                 note: document(note_id.to_string(), meta.title, view),
                 records_written: 0,
                 published: true,
+                large_save,
             });
         }
         match self.write_records(note_id, &actor, prepared).await {
@@ -624,6 +630,7 @@ impl<'a, K: NoteKv + ?Sized> NotesStore<'a, K> {
                     note: document(note_id.to_string(), meta.title, view),
                     records_written,
                     published,
+                    large_save,
                 })
             }
             Err(error) => {

@@ -102,6 +102,7 @@ fn note_error(error: &NoteError) -> NotesResponse {
             StatusCode::CONFLICT
         }
         NoteError::InvalidVersion(_) | NoteError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        NoteError::EditTooLargeToMergeSafely { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         NoteError::NoteTooLarge { .. } | NoteError::StoreFull { .. } => {
             StatusCode::PAYLOAD_TOO_LARGE
         }
@@ -468,6 +469,18 @@ mod tests {
         });
         assert_eq!(degraded.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(degraded.1 .0["error"], "note_engine_fault");
+        let unsafe_merge = note_error(&NoteError::EditTooLargeToMergeSafely {
+            old_lines: 6000,
+            new_lines: 6001,
+        });
+        assert_eq!(unsafe_merge.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            unsafe_merge.1 .0["error"],
+            "note_edit_too_large_to_merge_safely"
+        );
+        assert!(unsafe_merge.1 .0["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("smaller steps")));
         let unknown = note_error(&NoteError::BaseVersionUnknown);
         assert_eq!(unknown.0, StatusCode::CONFLICT);
         assert_eq!(unknown.1 .0["error"], "base_version_unknown");

@@ -8,44 +8,98 @@
 //! deleted comes back, and two members who edit the same line concurrently
 //! end up with the line twice.
 //!
-//! **What this does instead.** A diff that is line-first for speed and
-//! character-exact in its output:
+//! **What this does instead.** The script is applied as explicit
+//! `insert` / `delete` ops, so a character the script leaves unchanged
+//! keeps its original op. It is built in three steps:
 //!
 //! 1. Trim the common prefix and suffix, cut back to whole lines.
-//! 2. Myers diff over the remaining lines (each line interned to an id).
-//!    Each changed run of lines is widened to the nearest *anchor*: a
-//!    non-blank line that occurs exactly once in each text. A blank or
-//!    repeated line may be matched to the wrong occurrence; an anchor can
-//!    only be wrong if the user moved it.
-//! 3. Myers diff over the characters of each widened run.
+//! 2. Split the rest into *hunks* at anchors: a non-blank line that occurs
+//!    exactly once in each text. Anchors are matched by patience (longest
+//!    increasing run of unique lines, `O(n log n)`). A hunk is the text
+//!    between two matched anchors where old and new differ.
+//! 3. Diff each hunk down a ladder of rungs:
+//!    - **Exact.** Myers over the hunk's characters, within the shared
+//!      [`EXACT_WORK_BUDGET`]. The result is a minimal character script.
+//!    - **Line-paired.** Reached only when the exact diff runs out of budget.
+//!      The hunk's lines are aligned by Myers over line ids. If that runs
+//!      out and the old and new hunk have the same number of lines, they
+//!      are paired by position instead. Each span of changed lines is then
+//!      diffed by character (line against line when the counts match). This
+//!      uses the shared [`LINE_WORK_BUDGET`]. A line whose character diff
+//!      still runs out is replaced whole and counted in
+//!      [`EditScript::replaced_lines`].
+//!    - **Refuse.** The line alignment ran out and the line counts differ.
+//!      There is no safe script within the budgets:
+//!      [`TooLargeToMergeSafely`], and the caller refuses the save.
 //!
-//! The result is applied as explicit `insert` / `delete` ops, so every
-//! character the diff leaves unchanged keeps its original op.
+//! **Loss bound.** A character the user did not change is deleted and
+//! re-inserted, so a concurrent delete of it is undone, only when:
+//! - (a) Myers breaks a tie between equal minimal scripts that way. This is
+//!   the same tie loro's character diff below the threshold has; it needs an
+//!   edit that deletes and inserts a repeated character such as a newline.
+//! - (b) It lies on an old line counted in `replaced_lines`, which is
+//!   reported with each save.
 //!
-//! **Bounds.**
-//! - Both diffs share one work budget ([`DIFF_WORK_BUDGET`]). A region
-//!   still unresolved when it runs out is replaced whole, as
-//!   `update_by_line` would replace its lines;
-//!   [`EditScript::replaced_chars`] counts it. Only a save that rewrites,
-//!   rather than edits, a large part of a note runs out (for example
-//!   thousands of scattered edits in one save).
-//! - Like loro's own character diff below the threshold, Myers picks one
-//!   of several minimal scripts. When an edit both deletes and inserts a
-//!   repeated character (a newline), a minimal script may re-insert a
-//!   character next to it instead.
+//! No region larger than one span of changed lines is ever replaced whole.
+//! Every old line in a hunk is changed, moved, blank or repeated: an
+//! unchanged unique line would have been an anchor.
 //!
 //! The Myers middle-snake search follows the `similar` crate
 //! (<https://github.com/mitsuhiko/similar>, MIT/Apache-2.0), which loro's
 //! own `diff_impl` also copies. It depends only on `std` and `loro`.
 
-use loro::{LoroError, LoroResult, LoroText};
+use loro::LoroText;
 use std::collections::HashMap;
 
-/// Work units (one diagonal step or one compared element) the line and
-/// character diffs of one save may spend together: about 100 ms in a
-/// release build when all of it is spent. 500 scattered edits on a 4 MiB
-/// note spend about 1.7 M.
-pub const DIFF_WORK_BUDGET: u64 = 16 * 1024 * 1024;
+/// Work units (one diagonal step or one compared element) the exact rung may
+/// spend across all hunks of one save: about 100 ms in a release build when
+/// all of it is spent. 500 scattered edits on a 4 MiB note spend about 1.7 M.
+pub const EXACT_WORK_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// Work units the line-paired rung may spend across all hunks of one save.
+pub const LINE_WORK_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// Most of [`LINE_WORK_BUDGET`] one hunk's line alignment may spend. The
+/// rest is left for the character diffs of its lines.
+pub const LINE_ALIGN_WORK: u64 = 4 * 1024 * 1024;
+
+/// The work budgets of one save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// For the exact rung.
+    pub exact: u64,
+    /// For the line-paired rung.
+    pub line: u64,
+}
+
+impl Budgets {
+    /// The production budgets.
+    pub const DEFAULT: Self = Self {
+        exact: EXACT_WORK_BUDGET,
+        line: LINE_WORK_BUDGET,
+    };
+}
+
+/// The lowest rung of the ladder a save needed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiffRung {
+    /// Every hunk has a minimal character script.
+    #[default]
+    Exact,
+    /// At least one hunk was diffed line by line.
+    LinePaired,
+}
+
+impl DiffRung {
+    /// Stable name for the save result and diagnostics.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::LinePaired => "line_paired",
+        }
+    }
+}
 
 /// One replacement, as byte ranges into the old and the new text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +119,35 @@ pub struct Replace {
 pub struct EditScript {
     /// Non-overlapping replacements in ascending order.
     pub edits: Vec<Replace>,
-    /// Old characters replaced whole because the work budget ran out
-    /// (0 = every edit is character-exact).
+    /// The lowest rung used.
+    pub rung: DiffRung,
+    /// Old lines replaced whole (loss bound (b)); 0 on the exact rung.
+    pub replaced_lines: usize,
+    /// Characters of those lines.
     pub replaced_chars: usize,
-    /// Work units the diffs spent (see [`DIFF_WORK_BUDGET`]).
+    /// Work units spent on both rungs.
     pub work: u64,
+}
+
+/// No safe edit script exists within the budgets: the save must be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooLargeToMergeSafely {
+    /// Old lines in the hunk that could not be aligned.
+    pub old_lines: usize,
+    /// New lines in that hunk.
+    pub new_lines: usize,
+}
+
+/// Why [`apply_edit_script`] failed.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The save is too large to merge safely; nothing was applied.
+    TooLarge(TooLargeToMergeSafely),
+    /// loro refused an op (the caller discards the fork).
+    Loro,
+    /// The ops did not reproduce the saved text (the caller discards the
+    /// fork).
+    Mismatch,
 }
 
 /// Index ranges into two sequences: `old[o0..o1]` becomes `new[n0..n1]`.
@@ -81,8 +159,7 @@ struct Span {
     n1: usize,
 }
 
-/// Remaining work units. Once spent, every open sub-problem is replaced
-/// whole.
+/// Remaining work units.
 #[derive(Debug)]
 struct Budget {
     left: u64,
@@ -103,11 +180,41 @@ impl Budget {
     }
 }
 
-/// Compute the edit script from `old` to `new` with the given work budget.
-#[must_use]
-pub fn edit_script(old: &str, new: &str, budget: u64) -> EditScript {
-    let initial = budget;
-    let mut budget = Budget { left: budget };
+/// The texts, the trimmed prefix and the interned lines of the middle.
+struct Ctx<'a> {
+    old: &'a str,
+    new: &'a str,
+    prefix: usize,
+    lines: Lines,
+}
+
+impl Ctx<'_> {
+    /// Absolute byte offset of old line `i` (or the end).
+    fn old_at(&self, i: usize) -> usize {
+        self.prefix + self.lines.old_starts.get(i).copied().unwrap_or(0)
+    }
+
+    /// Absolute byte offset of new line `i` (or the end).
+    fn new_at(&self, i: usize) -> usize {
+        self.prefix + self.lines.new_starts.get(i).copied().unwrap_or(0)
+    }
+}
+
+/// Compute the edit script from `old` to `new`.
+///
+/// # Errors
+///
+/// [`TooLargeToMergeSafely`] when a hunk can be neither diffed by character
+/// nor aligned by line within the budgets.
+pub fn edit_script(
+    old: &str,
+    new: &str,
+    budgets: Budgets,
+) -> Result<EditScript, TooLargeToMergeSafely> {
+    let mut exact = Budget {
+        left: budgets.exact,
+    };
+    let mut line = Budget { left: budgets.line };
     let (ob, nb) = (old.as_bytes(), new.as_bytes());
 
     // 1. Common prefix and suffix, cut back to whole lines so the middle is
@@ -125,54 +232,166 @@ pub fn edit_script(old: &str, new: &str, budget: u64) -> EditScript {
     let (old_end, new_end) = (ob.len() - suffix, nb.len() - suffix);
     let mut script = EditScript::default();
     if prefix == old_end && prefix == new_end {
-        return script;
+        return Ok(script);
     }
-    let old_mid = &old[prefix..old_end];
-    let new_mid = &new[prefix..new_end];
+    let ctx = Ctx {
+        old,
+        new,
+        prefix,
+        lines: intern_lines(&old[prefix..old_end], &new[prefix..new_end]),
+    };
 
-    // 2. Lines, then widen each changed run to the nearest anchor lines.
-    let lines = intern_lines(old_mid, new_mid);
-    let mut line_spans = Vec::new();
-    myers(&lines.old_ids, &lines.new_ids, &mut budget, &mut line_spans);
-    let hunks = widen_to_anchors(&line_spans, &lines);
-
-    // 3. Characters within each hunk. A hunk also takes the `\n` that ends
-    // the line before it (an anchor, or the prefix): only an anchor's other
-    // characters are fixed, so the diff may pair that newline differently.
-    for hunk in hunks {
-        let byte = |starts: &[usize], i: usize| prefix + starts.get(i).copied().unwrap_or(0);
-        let (mut ob0, ob1) = (
-            byte(&lines.old_starts, hunk.o0),
-            byte(&lines.old_starts, hunk.o1),
-        );
-        let (mut nb0, nb1) = (
-            byte(&lines.new_starts, hunk.n0),
-            byte(&lines.new_starts, hunk.n1),
-        );
-        if ob0 > 0 && nb0 > 0 {
-            ob0 -= 1;
-            nb0 -= 1;
-        }
-        let (Some(old_hunk), Some(new_hunk)) = (old.get(ob0..ob1), new.get(nb0..nb1)) else {
-            continue;
-        };
-        let old_chars: Vec<char> = old_hunk.chars().collect();
-        let new_chars: Vec<char> = new_hunk.chars().collect();
-        let mut spans = Vec::new();
-        script.replaced_chars += myers(&old_chars, &new_chars, &mut budget, &mut spans);
-        let mut old_cursor = CharCursor::default();
-        let mut new_cursor = CharCursor::default();
-        for s in spans {
-            script.edits.push(Replace {
-                old_start: ob0 + old_cursor.byte_at(old_hunk, s.o0),
-                old_end: ob0 + old_cursor.byte_at(old_hunk, s.o1),
-                new_start: nb0 + new_cursor.byte_at(new_hunk, s.n0),
-                new_end: nb0 + new_cursor.byte_at(new_hunk, s.n1),
+    // 2. Hunks between matched anchors.
+    let (n_old, n_new) = (ctx.lines.old_ids.len(), ctx.lines.new_ids.len());
+    let mut hunks = Vec::new();
+    let (mut o0, mut n0) = (0, 0);
+    for (i, j) in matched_anchors(&ctx.lines)
+        .into_iter()
+        .chain(std::iter::once((n_old, n_new)))
+    {
+        let differs =
+            old.get(ctx.old_at(o0)..ctx.old_at(i)) != new.get(ctx.new_at(n0)..ctx.new_at(j));
+        if differs {
+            hunks.push(Span {
+                o0,
+                o1: i,
+                n0,
+                n1: j,
             });
         }
+        (o0, n0) = (i + 1, j + 1);
     }
-    script.work = initial - budget.left;
-    script
+
+    // 3. The ladder, hunk by hunk.
+    for hunk in hunks {
+        if !exact_hunk(&ctx, hunk, &mut exact, &mut script) {
+            line_paired_hunk(&ctx, hunk, &mut line, &mut script)?;
+            script.rung = DiffRung::LinePaired;
+        }
+    }
+    script.work = (budgets.exact - exact.left) + (budgets.line - line.left);
+    Ok(script)
+}
+
+/// Push the edits turning old bytes `ob0..ob1` into new bytes `nb0..nb1`,
+/// diffed by character. Returns `false`, pushing nothing, if the budget
+/// runs out.
+fn diff_chars(
+    ctx: &Ctx<'_>,
+    (ob0, ob1): (usize, usize),
+    (nb0, nb1): (usize, usize),
+    budget: &mut Budget,
+    script: &mut EditScript,
+) -> bool {
+    let (Some(old), Some(new)) = (ctx.old.get(ob0..ob1), ctx.new.get(nb0..nb1)) else {
+        return false;
+    };
+    let old_chars: Vec<char> = old.chars().collect();
+    let new_chars: Vec<char> = new.chars().collect();
+    let mut spans = Vec::new();
+    if myers(&old_chars, &new_chars, budget, &mut spans) > 0 {
+        return false;
+    }
+    let mut old_cursor = CharCursor::default();
+    let mut new_cursor = CharCursor::default();
+    for s in spans {
+        script.edits.push(Replace {
+            old_start: ob0 + old_cursor.byte_at(old, s.o0),
+            old_end: ob0 + old_cursor.byte_at(old, s.o1),
+            new_start: nb0 + new_cursor.byte_at(new, s.n0),
+            new_end: nb0 + new_cursor.byte_at(new, s.n1),
+        });
+    }
+    true
+}
+
+/// The exact rung. The hunk also takes the `\n` that ends the line before
+/// it (an anchor, or the prefix): only an anchor's other characters are
+/// fixed, so the diff may pair that newline differently.
+fn exact_hunk(ctx: &Ctx<'_>, hunk: Span, budget: &mut Budget, script: &mut EditScript) -> bool {
+    let (mut ob0, mut nb0) = (ctx.old_at(hunk.o0), ctx.new_at(hunk.n0));
+    if ob0 > 0 && nb0 > 0 {
+        ob0 -= 1;
+        nb0 -= 1;
+    }
+    let old = (ob0, ctx.old_at(hunk.o1));
+    let new = (nb0, ctx.new_at(hunk.n1));
+    diff_chars(ctx, old, new, budget, script)
+}
+
+/// The line-paired rung (see the module docs).
+fn line_paired_hunk(
+    ctx: &Ctx<'_>,
+    hunk: Span,
+    budget: &mut Budget,
+    script: &mut EditScript,
+) -> Result<(), TooLargeToMergeSafely> {
+    let old_ids = ctx.lines.old_ids.get(hunk.o0..hunk.o1).unwrap_or(&[]);
+    let new_ids = ctx.lines.new_ids.get(hunk.n0..hunk.n1).unwrap_or(&[]);
+    let mut align = Budget {
+        left: budget.left.min(LINE_ALIGN_WORK),
+    };
+    let before = align.left;
+    let mut spans = Vec::new();
+    let unaligned = myers(old_ids, new_ids, &mut align, &mut spans);
+    budget.left -= before - align.left;
+    if unaligned > 0 {
+        if old_ids.len() != new_ids.len() {
+            return Err(TooLargeToMergeSafely {
+                old_lines: old_ids.len(),
+                new_lines: new_ids.len(),
+            });
+        }
+        // Same line count: pair by position.
+        spans = vec![Span {
+            o0: 0,
+            o1: old_ids.len(),
+            n0: 0,
+            n1: new_ids.len(),
+        }];
+    }
+    for s in spans {
+        let (o0, o1) = (hunk.o0 + s.o0, hunk.o0 + s.o1);
+        let (n0, n1) = (hunk.n0 + s.n0, hunk.n0 + s.n1);
+        if o1 - o0 == n1 - n0 {
+            for k in 0..o1 - o0 {
+                replace_lines(
+                    ctx,
+                    (o0 + k, o0 + k + 1),
+                    (n0 + k, n0 + k + 1),
+                    budget,
+                    script,
+                );
+            }
+        } else {
+            replace_lines(ctx, (o0, o1), (n0, n1), budget, script);
+        }
+    }
+    Ok(())
+}
+
+/// Diff old lines `o0..o1` into new lines `n0..n1` by character, or replace
+/// them whole (counted) if the budget runs out.
+fn replace_lines(
+    ctx: &Ctx<'_>,
+    (o0, o1): (usize, usize),
+    (n0, n1): (usize, usize),
+    budget: &mut Budget,
+    script: &mut EditScript,
+) {
+    let old = (ctx.old_at(o0), ctx.old_at(o1));
+    let new = (ctx.new_at(n0), ctx.new_at(n1));
+    if diff_chars(ctx, old, new, budget, script) {
+        return;
+    }
+    script.replaced_lines += o1 - o0;
+    script.replaced_chars += ctx.old.get(old.0..old.1).map_or(0, |s| s.chars().count());
+    script.edits.push(Replace {
+        old_start: old.0,
+        old_end: old.1,
+        new_start: new.0,
+        new_end: new.1,
+    });
 }
 
 /// Save `new` into `text` by applying the edit script from its current
@@ -180,12 +399,16 @@ pub fn edit_script(old: &str, new: &str, budget: u64) -> EditScript {
 ///
 /// # Errors
 ///
-/// A loro error from `insert` / `delete`, or a
-/// `TransactionError` if the result is not exactly `new` (the caller
-/// discards the fork either way).
-pub fn apply_edit_script(text: &LoroText, new: &str, budget: u64) -> LoroResult<EditScript> {
+/// [`ApplyError::TooLarge`] before any op is applied; otherwise
+/// [`ApplyError::Loro`] or [`ApplyError::Mismatch`] (the caller discards
+/// the fork).
+pub fn apply_edit_script(
+    text: &LoroText,
+    new: &str,
+    budgets: Budgets,
+) -> Result<EditScript, ApplyError> {
     let old = text.to_string();
-    let script = edit_script(&old, new, budget);
+    let script = edit_script(&old, new, budgets).map_err(ApplyError::TooLarge)?;
     // Ascending order, unicode positions, and each replacement's insert
     // before its delete. On a 4 MiB note loro 1.16.2 spends ~0.8 ms on a
     // delete issued right after another delete in the same transaction and
@@ -200,18 +423,17 @@ pub fn apply_edit_script(text: &LoroText, new: &str, budget: u64) -> LoroResult<
         let inserted = new.get(e.new_start..e.new_end).unwrap_or("");
         let inserted_chars = inserted.chars().count();
         if inserted_chars > 0 {
-            text.insert(pos, inserted)?;
+            text.insert(pos, inserted).map_err(|_| ApplyError::Loro)?;
         }
         if end > at {
-            text.delete(pos + inserted_chars, end - at)?;
+            text.delete(pos + inserted_chars, end - at)
+                .map_err(|_| ApplyError::Loro)?;
         }
         shift = pos + inserted_chars;
         consumed = end;
     }
     if text.to_string() != new {
-        return Err(LoroError::TransactionError(
-            "edit script did not reproduce the saved text".into(),
-        ));
+        return Err(ApplyError::Mismatch);
     }
     Ok(script)
 }
@@ -281,36 +503,46 @@ fn intern_lines<'a>(old: &'a str, new: &'a str) -> Lines {
     }
 }
 
-/// Merge changed line runs whose separating equal lines hold no anchor,
-/// and extend the first and last run to the edge of the text when no
-/// anchor lies between. Every hunk is then bounded by anchors or edges, so
-/// a character that an edit (not a move) leaves in place has its old and
-/// new position inside one hunk, where the character diff keeps it.
-fn widen_to_anchors(spans: &[Span], lines: &Lines) -> Vec<Span> {
-    let no_anchor = |from: usize, to: usize| {
-        lines
-            .old_ids
-            .get(from..to)
-            .is_some_and(|ids| !ids.iter().any(|&id| lines.is_anchor(id)))
-    };
-    let mut out: Vec<Span> = Vec::new();
-    for s in spans {
-        match out.last_mut() {
-            Some(last) if no_anchor(last.o1, s.o0) => {
-                last.o1 = s.o1;
-                last.n1 = s.n1;
-            }
-            None if no_anchor(0, s.o0) => out.push(Span { o0: 0, n0: 0, ..*s }),
-            _ => out.push(*s),
+/// The anchors matched between the texts, as `(old line, new line)` in
+/// ascending order: the longest run of anchors whose order agrees in both
+/// texts (patience diff; `O(n log n)`, no budget).
+fn matched_anchors(lines: &Lines) -> Vec<(usize, usize)> {
+    let new_pos: HashMap<u32, usize> = lines
+        .new_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, &id)| lines.is_anchor(id))
+        .map(|(j, &id)| (id, j))
+        .collect();
+    let pairs: Vec<(usize, usize)> = lines
+        .old_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| new_pos.get(id).map(|&j| (i, j)))
+        .collect();
+    // Longest increasing subsequence of the new positions.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (k, &(_, j)) in pairs.iter().enumerate() {
+        let at = tails.partition_point(|&t| pairs.get(t).is_some_and(|p| p.1 < j));
+        if let Some(slot) = prev.get_mut(k) {
+            *slot = at.checked_sub(1).and_then(|p| tails.get(p)).copied();
+        }
+        if at == tails.len() {
+            tails.push(k);
+        } else if let Some(t) = tails.get_mut(at) {
+            *t = k;
         }
     }
-    let (old_len, new_len) = (lines.old_ids.len(), lines.new_ids.len());
-    if let Some(last) = out.last_mut() {
-        if no_anchor(last.o1, old_len) {
-            last.o1 = old_len;
-            last.n1 = new_len;
+    let mut out = Vec::new();
+    let mut cur = tails.last().copied();
+    while let Some(k) = cur {
+        if let Some(&p) = pairs.get(k) {
+            out.push(p);
         }
+        cur = prev.get(k).copied().flatten();
     }
+    out.reverse();
     out
 }
 
@@ -363,8 +595,9 @@ fn common_suffix<T: PartialEq>(a: &[T], b: &[T]) -> usize {
 }
 
 /// Append to `out` the spans turning `old` into `new` (ascending, adjacent
-/// spans merged). Returns how many old elements were replaced whole
-/// because the budget ran out.
+/// spans merged). Returns how many old elements the budget could not
+/// resolve; their spans are whole replacements, so every caller discards a
+/// result with a nonzero count.
 fn myers<T: PartialEq>(old: &[T], new: &[T], budget: &mut Budget, out: &mut Vec<Span>) -> usize {
     // A middle-snake search that reaches d costs at least d² units, so the
     // diagonals never exceed √budget: size the vectors for that, not for
@@ -396,7 +629,7 @@ fn push(out: &mut Vec<Span>, s: Span) {
 }
 
 /// Divide and conquer on the middle snake. A sub-problem the budget cannot
-/// resolve is replaced whole and counted in `unresolved`.
+/// resolve becomes one span and is counted in `unresolved`.
 fn conquer<T: PartialEq>(
     old: &[T],
     new: &[T],
