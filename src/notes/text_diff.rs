@@ -264,9 +264,17 @@ pub fn edit_script(
 
     // 3. The ladder, hunk by hunk.
     for hunk in hunks {
+        // RED PROOF: c85eb5e's fallback, the whole unresolved hunk replaced.
         if !exact_hunk(&ctx, hunk, &mut exact, &mut script) {
-            line_paired_hunk(&ctx, hunk, &mut line, &mut script)?;
-            script.rung = DiffRung::LinePaired;
+            let _ = (&mut line, line_paired_hunk as fn(_, _, _, _) -> _);
+            let (o0, o1) = (ctx.old_at(hunk.o0), ctx.old_at(hunk.o1));
+            let (n0, n1) = (ctx.new_at(hunk.n0), ctx.new_at(hunk.n1));
+            script.edits.push(Replace {
+                old_start: o0,
+                old_end: o1,
+                new_start: n0,
+                new_end: n1,
+            });
         }
     }
     script.work = (budgets.exact - exact.left) + (budgets.line - line.left);
