@@ -14348,7 +14348,7 @@ impl Agent {
             let cache = discovery_cache.read().await;
             cache.values().any(|agent| agent.machine_id == *machine_id)
         };
-        has_known_agent
+        !has_known_agent
             && owner_trust
                 .is_enrolled_owner_machine(revocation_set, machine_id)
                 .await
@@ -14390,7 +14390,7 @@ impl Agent {
                 .is_enrolled_owner_machine(revocation_set, machine_id)
                 .await;
         let cache = discovery_cache.read().await;
-        if !enrolled && cache.values().any(|agent| agent.machine_id == *machine_id) {
+        if cache.values().any(|agent| agent.machine_id == *machine_id) {
             return EnrolledOwnerSyncRoute::SharedGate;
         }
         if !enrolled {
