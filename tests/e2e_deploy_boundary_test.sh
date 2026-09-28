@@ -39,6 +39,9 @@ x0x_upload_binary() {
 }
 x0x_scan_and_repush_stragglers() {
     STRAGGLERS_REPUSHED=0
+    if [ "${X0X_FAKE_STRAGGLER_FAIL:-0}" = "1" ]; then
+        FAILED_NODES+=(sfo)
+    fi
 }
 EOF
     cat > "$root/bin/cargo" <<'EOF'
@@ -66,7 +69,13 @@ for arg in "$@"; do
 done
 printf '%s|%s\n' "$host" "$cmd" >> "$X0X_FAKE_REMOTE_LOG"
 case "$cmd" in
-    true) exit 0 ;;
+    true)
+        if [ "${X0X_FAKE_INITIAL_FAIL_HOST:-}" = "$host" ] \
+            && [ ! -e "$X0X_FAKE_INITIAL_FAIL_MARKER" ]; then
+            : > "$X0X_FAKE_INITIAL_FAIL_MARKER"
+            exit 1
+        fi
+        exit 0 ;;
     *"systemctl is-active"*) echo active ;;
     *"cat /root/.local/share/x0x-testnet/api-token"*) echo "super-secret-token-material" ;;
     *"/health"*) printf '{"ok":true,"version":"9.8.7"}\n' ;;
@@ -128,6 +137,56 @@ EOF
         pass "successful testnet deploy skips global log policy and emits no token bytes"
     else
         fail "successful opt-out boundary (status=$STATUS)"
+    fi
+}
+
+# A node that failed initial SSH must keep the deployment non-zero even when
+# its later health probe happens to report the old, still-running daemon as
+# healthy. This prevents FAILED_NODES from being lost in the final OVERALL.
+{
+    ROOT="$TMP/initial-failure"; make_fixture "$ROOT"
+    : > "$ROOT/remote.log"
+    set +e
+    OUTPUT=$(cd "$ROOT" && PATH="$ROOT/bin:$PATH" SKIP_BUILD=1 DEPLOY_RUNNER=0 MESH_VERIFY=1 \
+        CONFIGURE_LOG_CAPS=0 X0X_FAKE_INITIAL_FAIL_HOST=142.93.199.50 \
+        X0X_FAKE_INITIAL_FAIL_MARKER="$ROOT/initial-failure.marker" \
+        X0X_FAKE_REMOTE_LOG="$ROOT/remote.log" \
+        X0X_DEPLOY_SSH_CMD="$ROOT/bin/fake-ssh" \
+        bash tests/e2e_deploy.sh 2>&1)
+    STATUS=$?
+    set -e
+    if [ "$STATUS" -gt 0 ] \
+        && grep -q 'Deployment failed on: nyc' <<<"$OUTPUT" \
+        && grep -q 'deployment node(s) failed' <<<"$OUTPUT" \
+        && ! grep -Eq 'ALL [0-9]+ CHECKS PASSED' <<<"$OUTPUT" \
+        && ! grep -q 'Mesh-driven verification' <<<"$OUTPUT"; then
+        pass "initial FAILED_NODES entry remains part of final exit status"
+    else
+        fail "initial FAILED_NODES exit propagation (status=$STATUS)"
+    fi
+}
+
+# A straggler re-push failure appended after the main deployment loop must
+# also block mesh verification and the success banner, even when health checks
+# later pass for every node.
+{
+    ROOT="$TMP/straggler-failure"; make_fixture "$ROOT"
+    : > "$ROOT/remote.log"
+    set +e
+    OUTPUT=$(cd "$ROOT" && PATH="$ROOT/bin:$PATH" SKIP_BUILD=1 DEPLOY_RUNNER=0 MESH_VERIFY=1 \
+        CONFIGURE_LOG_CAPS=0 X0X_FAKE_STRAGGLER_FAIL=1 \
+        X0X_FAKE_REMOTE_LOG="$ROOT/remote.log" \
+        X0X_DEPLOY_SSH_CMD="$ROOT/bin/fake-ssh" \
+        bash tests/e2e_deploy.sh 2>&1)
+    STATUS=$?
+    set -e
+    if [ "$STATUS" -gt 0 ] \
+        && grep -q 'deployment node(s) failed' <<<"$OUTPUT" \
+        && ! grep -Eq 'ALL [0-9]+ CHECKS PASSED' <<<"$OUTPUT" \
+        && ! grep -q 'Mesh-driven verification' <<<"$OUTPUT"; then
+        pass "straggler FAILED_NODES entry remains part of final exit status"
+    else
+        fail "straggler FAILED_NODES exit propagation (status=$STATUS)"
     fi
 }
 

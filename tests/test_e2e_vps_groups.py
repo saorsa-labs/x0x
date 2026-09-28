@@ -1,9 +1,12 @@
 import base64
 import importlib.util
+import io
 import json
 import logging
 import sys
+import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +24,143 @@ def load_groups():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class GroupDiscoveryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.groups = load_groups()
+
+    def test_targeted_direct_discovery_reports_channel_and_latency(self):
+        groups = self.groups
+        router = groups.ResultRouter(logging.getLogger("groups-discovery-direct"))
+
+        class Client:
+            sent = []
+            published = []
+
+            def direct_send(self, aid, wire, **kwargs):
+                self.sent.append((aid, wire, kwargs))
+                command = json.loads(base64.b64decode(wire[len(groups.PREFIX_CMD):]))
+                router.deliver({
+                    "kind": "discover_reply", "node": command["target_node"],
+                    "agent_id": aid, "machine_id": "machine",
+                    "request_id": command["params"]["request_id"],
+                }, aid)
+                return {"ok": True}
+
+            def publish(self, topic, payload):
+                self.published.append((topic, payload))
+
+        client = Client()
+        with self.assertLogs("groups-discovery-direct", level=logging.INFO) as logs:
+            found = groups.discover_runners(
+                client, router, "a" * 64, "nyc", ["sfo", "sydney"], 1,
+                logging.getLogger("groups-discovery-direct"),
+                runner_agent_ids={"sfo": "b" * 64, "sydney": "c" * 64},
+            )
+        self.assertEqual({"sfo", "sydney"}, set(found))
+        self.assertEqual([], client.published)
+        self.assertEqual(2, len(client.sent))
+        request_ids = set()
+        for aid, wire, kwargs in client.sent:
+            self.assertTrue(wire.startswith(groups.PREFIX_CMD))
+            command = json.loads(base64.b64decode(wire[len(groups.PREFIX_CMD):]))
+            self.assertIn(command["target_node"], found)
+            self.assertEqual(found[command["target_node"]].agent_id, aid)
+            self.assertEqual(command["command_id"], command["params"]["request_id"])
+            self.assertLess(kwargs["timeout"], 1)
+            request_ids.add(command["command_id"])
+        self.assertEqual(2, len(request_ids))
+        self.assertEqual(2, sum("channel=direct" in line for line in logs.output))
+        self.assertRegex("\n".join(logs.output), r"announce_reply_latency_ms=[0-9]+\.[0-9]+")
+
+    def test_direct_ack_without_reply_falls_back_only_after_interval(self):
+        groups = self.groups
+        router = groups.ResultRouter(logging.getLogger("groups-discovery-fallback"))
+
+        class Client:
+            sent = []
+            published = []
+
+            def direct_send(self, aid, wire, **_kwargs):
+                self.sent.append((aid, wire))
+                return {"ok": True}
+
+            def publish(self, topic, payload):
+                self.published.append((topic, payload))
+                command = json.loads(payload)
+                router.deliver({
+                    "kind": "discover_reply", "node": command["target_node"],
+                    "agent_id": "b" * 64, "machine_id": "machine",
+                    "request_id": command["params"]["request_id"],
+                }, "b" * 64)
+
+        client = Client()
+        start = time.monotonic()
+        with self.assertLogs("groups-discovery-fallback", level=logging.INFO) as logs:
+            found = groups.discover_runners(
+                client, router, "a" * 64, "nyc", ["sfo"], 1,
+                logging.getLogger("groups-discovery-fallback"),
+                runner_agent_ids={"sfo": "b" * 64},
+                republish_every_secs=0.05,
+            )
+        self.assertGreaterEqual(time.monotonic() - start, 0.04)
+        self.assertEqual("sfo", found["sfo"].name)
+        self.assertEqual(1, len(client.sent))
+        self.assertEqual(1, len(client.published))
+        command = json.loads(client.published[0][1])
+        self.assertEqual("sfo", command["target_node"])
+        self.assertEqual(command["command_id"], command["params"]["request_id"])
+        self.assertIn("node=sfo channel=pubsub", "\n".join(logs.output))
+
+    def test_missing_or_self_id_uses_targeted_pubsub(self):
+        groups = self.groups
+        for ids in ({}, {"sfo": "invalid"}, {"sfo": "a" * 64}):
+            with self.subTest(ids=ids):
+                router = groups.ResultRouter(logging.getLogger("groups-discovery-id"))
+
+                class Client:
+                    sent = []
+                    published = []
+
+                    def direct_send(self, aid, wire, **_kwargs):
+                        self.sent.append((aid, wire))
+                        return {"ok": True}
+
+                    def publish(self, topic, payload):
+                        self.published.append((topic, payload))
+                        command = json.loads(payload)
+                        router.deliver({
+                            "kind": "discover_reply", "node": "sfo",
+                            "agent_id": "b" * 64,
+                            "request_id": command["params"]["request_id"],
+                        }, "b" * 64)
+
+                client = Client()
+                found = groups.discover_runners(
+                    client, router, "a" * 64, "nyc", ["sfo"], 1,
+                    logging.getLogger("groups-discovery-id"), runner_agent_ids=ids,
+                )
+                self.assertIn("sfo", found)
+                self.assertEqual([], client.sent)
+                self.assertEqual(groups.DISCOVER_TOPIC, client.published[0][0])
+                self.assertEqual("sfo", json.loads(client.published[0][1])["target_node"])
+
+    def test_lookup_closes_owned_tunnel_after_agent_failure(self):
+        groups = self.groups
+        handle = mock.Mock()
+        with mock.patch.object(groups, "start_ssh_tunnel", return_value=handle), \
+             mock.patch.object(groups, "stop_ssh_tunnel") as stop, \
+             mock.patch.object(groups, "X0xClient") as client_type:
+            client_type.return_value.agent.side_effect = OSError("API unavailable")
+            ids = groups.lookup_runner_agents(
+                ["nyc", "sfo"], "nyc", "a" * 64,
+                {"sfo": ("sfo.invalid", "token")}, 13600,
+                logging.getLogger("groups-discovery-lookup"),
+            )
+        self.assertEqual({"nyc": "a" * 64}, ids)
+        stop.assert_called_once_with(handle)
 
 
 class GroupDispatchDeadlineTests(unittest.TestCase):
@@ -277,6 +417,71 @@ class GroupDispatchDeadlineTests(unittest.TestCase):
         legacy_data["data"]["verified"] = True
         legacy_data["data"]["sender"] = wrong
         self.assertIsNone(route_and_take("message", legacy_data))
+
+
+class GroupReportRedactionTests(unittest.TestCase):
+    """Report rows never persist raw HTTP bodies, exception text or tokens."""
+
+    SECRET = "Bearer token-secret-value"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.groups = load_groups()
+
+    def _harness(self, perform_error):
+        groups = self.groups
+
+        class Client:
+            def perform(self, _action, _params):
+                raise perform_error
+
+        anchor = "a" * 64
+        return groups.FleetHarness(
+            Client(), groups.ResultRouter(logging.getLogger("group-redaction")), anchor, "anchor",
+            {"anchor": groups.Runner("anchor", anchor)}, logging.getLogger("group-redaction"),
+        )
+
+    def _report(self, harness, *responses):
+        # The shape main() writes, plus the recorded result envelopes.
+        return json.dumps({"passes": harness.passes, "failures": harness.failures,
+                           "responses": list(responses)})
+
+    def test_http_error_keeps_status_and_class_only(self):
+        # Codex #1021 P1: lowercase token-like and hex "reason"/"code" values
+        # passed the old character filter. No body field may be kept.
+        body = json.dumps({"ok": False, "error": self.SECRET, "reason": "token_secret_value",
+                           "code": "deadbeef" * 8}).encode()
+        error = urllib.error.HTTPError("http://127.0.0.1/contacts", 403, self.SECRET, {},
+                                       io.BytesIO(body))
+        self.addCleanup(error.close)
+        harness = self._harness(error)
+        response = harness.call("anchor", "contact_add", {"agent_id": "b" * 64})
+        self.assertEqual({"error_class": "HTTPError", "http_status": 403}, response["outcome"])
+        harness.assert_pass("anchor adds contact", response.get("outcome") == "ok",
+                            f"outcome={response.get('outcome')}")
+        report = self._report(harness, response)
+        for leaked in ("token-secret-value", "token_secret_value", "deadbeef"):
+            self.assertNotIn(leaked, report)
+
+    def test_generic_exception_keeps_class_only(self):
+        harness = self._harness(RuntimeError(self.SECRET))
+        response = harness.call("anchor", "contact_list")
+        self.assertEqual({"error_class": "RuntimeError"}, response["outcome"])
+        self.assertNotIn("token-secret-value", self._report(harness, response))
+
+    def test_unlisted_exception_class_is_other(self):
+        class TokenSecretValueError(Exception):
+            pass
+        response = self._harness(TokenSecretValueError(self.SECRET)).call("anchor", "contact_list")
+        self.assertEqual({"error_class": "Other"}, response["outcome"])
+
+    def test_unreachable_scenario_failure_row_keeps_class_only(self):
+        harness = self._harness(RuntimeError("unused"))
+        harness.runners["sfo"] = self.groups.Runner("sfo", "c" * 64)
+        harness.call = mock.Mock(side_effect=RuntimeError(self.SECRET))
+        harness.run_contacts_lifecycle()
+        self.assertIn("anchor contacts lifecycle unreachable: RuntimeError", harness.failures)
+        self.assertNotIn("token-secret-value", self._report(harness))
 
 
 if __name__ == "__main__":

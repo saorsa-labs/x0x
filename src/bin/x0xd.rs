@@ -375,6 +375,26 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // ADR-0070 §3: SIGHUP re-reads the connect/exec ACL floors and API
+    // overlays. A rejected reload keeps the last good ACL (the reason is
+    // logged and surfaced in /diagnostics/connect and /diagnostics/exec).
+    #[cfg(unix)]
+    {
+        let acl_reload = handle.acl_reload_trigger();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(mut sighup) => {
+                    while sighup.recv().await.is_some() {
+                        match acl_reload.reload().await {
+                            Ok(()) => tracing::info!("SIGHUP: ACL reload applied"),
+                            Err(e) => tracing::warn!("SIGHUP: {e}"),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("failed to install SIGHUP handler: {e}"),
+            }
+        });
+    }
 
     // #368/#371: bounded shutdown. saorsa-gossip 0.5.71's IHAVE flusher is a
     // detached loop with no shutdown handle; once the node is torn down its

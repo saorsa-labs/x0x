@@ -2092,6 +2092,54 @@ fn _type_witness(_: AgentId, _: MachineId) {}
 
 #[cfg(test)]
 mod tests {
+
+    /// #979 r2 (B1 hazard pin): the in-flight ACK registry is keyed by
+    /// request id ALONE — registering the SAME id twice replaces (and
+    /// closes) the first waiter. This is why the relay fan-out MUST derive
+    /// PER-TARGET request ids: one shared id would make concurrent
+    /// witnesses cancel each other (0 successes).
+    #[tokio::test]
+    async fn shared_request_id_closes_the_first_waiter() {
+        let registry = super::InFlightAcks::new();
+        let id = [0x42u8; 16];
+        let (rx1, _cell1) = registry.register_for_protocol_with_provenance(
+            id,
+            2,
+            crate::identity::AgentId([1; 32]),
+            Some(crate::identity::MachineId([1; 32])),
+        );
+        let (_rx2, _cell2) = registry.register_for_protocol_with_provenance(
+            id,
+            2,
+            crate::identity::AgentId([2; 32]),
+            Some(crate::identity::MachineId([2; 32])),
+        );
+        // The first waiter was replaced: its channel closed.
+        assert!(
+            rx1.await.is_err(),
+            "a shared request id closes the first waiter (the B1 hazard)"
+        );
+        // DISTINCT ids coexist.
+        let (rx3, _cell3) = registry.register_for_protocol_with_provenance(
+            [0x43u8; 16],
+            2,
+            crate::identity::AgentId([3; 32]),
+            Some(crate::identity::MachineId([3; 32])),
+        );
+        let (_rx4, _cell4) = registry.register_for_protocol_with_provenance(
+            [0x44u8; 16],
+            2,
+            crate::identity::AgentId([4; 32]),
+            Some(crate::identity::MachineId([4; 32])),
+        );
+        // rx3 is STILL OPEN: a recv with a short timeout times out rather
+        // than returning closed.
+        let still_open = tokio::time::timeout(std::time::Duration::from_millis(10), rx3)
+            .await
+            .is_err();
+        assert!(still_open, "a distinct id keeps its waiter registered");
+    }
+
     use super::*;
 
     fn dummy_agent_id(seed: u8) -> [u8; 32] {
