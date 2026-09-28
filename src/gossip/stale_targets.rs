@@ -101,8 +101,8 @@ impl StaleTargetTracker {
             }
             let since = *self.absent_since.entry(*peer).or_insert(now);
             if now.saturating_duration_since(since) >= self.threshold {
-                plan.prune.push(*peer);
-                self.pruned.insert(*peer);
+                // RED PROOF: pre-fix behaviour, stale targets are kept.
+                tracing::trace!(peer = %peer, "stale target kept (fix reverted)");
             }
         }
 
@@ -173,11 +173,8 @@ pub(crate) fn presence_broadcast_targets(
     active_view: Vec<PeerId>,
     connected: &[PeerId],
 ) -> Vec<PeerId> {
-    let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
-    let mut targets: Vec<PeerId> = active_view
-        .into_iter()
-        .filter(|peer| connected_set.contains(peer))
-        .collect();
+    // RED PROOF: pre-fix behaviour, active_view() ∪ connected unfiltered.
+    let mut targets: Vec<PeerId> = active_view;
     targets.extend(connected.iter().copied());
     targets.sort_unstable_by_key(|peer| *peer.as_bytes());
     targets.dedup();
