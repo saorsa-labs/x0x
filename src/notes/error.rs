@@ -76,6 +76,21 @@ pub enum NoteError {
     /// The caller is not permitted to write this store.
     #[error("not permitted: {0}")]
     Forbidden(String),
+    /// A save above 256 KiB changes so much in one place that no edit
+    /// script within the diff budgets keeps the unchanged text's identity:
+    /// 422 `note_edit_too_large_to_merge_safely`. Accepting it could bring
+    /// back text another member deleted concurrently (#1029), so it is
+    /// refused and nothing is written.
+    #[error(
+        "this save turns {old_lines} lines into {new_lines} in one place, too much to merge \
+         safely with concurrent edits; save the change in smaller steps"
+    )]
+    EditTooLargeToMergeSafely {
+        /// Old lines in the region that could not be aligned.
+        old_lines: usize,
+        /// New lines in that region.
+        new_lines: usize,
+    },
 }
 
 impl NoteError {
@@ -96,6 +111,7 @@ impl NoteError {
             Self::Signing(_) => "record_signing_failed",
             Self::Store(_) => "notes_store_error",
             Self::Forbidden(_) => "forbidden",
+            Self::EditTooLargeToMergeSafely { .. } => "note_edit_too_large_to_merge_safely",
         }
     }
 }

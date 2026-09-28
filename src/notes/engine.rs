@@ -26,7 +26,7 @@
 //! containment can be exercised in isolation.
 
 use super::error::NoteError;
-use super::text_diff::{apply_edit_script, DIFF_WORK_BUDGET};
+use super::text_diff::{apply_edit_script, ApplyError, Budgets, DiffRung};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use loro::{ExportMode, Frontiers, IdSpan, LoroDoc, UpdateOptions};
@@ -174,6 +174,10 @@ pub struct EngineCounters {
     degraded_notes: AtomicU64,
     peer_id_redraws: AtomicU64,
     sessions_started: AtomicU64,
+    large_saves: AtomicU64,
+    large_saves_line_paired: AtomicU64,
+    large_save_replaced_lines: AtomicU64,
+    large_saves_refused: AtomicU64,
 }
 
 /// A point-in-time copy of [`EngineCounters`].
@@ -195,6 +199,15 @@ pub struct EngineCountersSnapshot {
     pub peer_id_redraws: u64,
     /// Writing sessions started (one peer id each).
     pub sessions_started: u64,
+    /// Saves above 256 KiB diffed by the #1029 edit script.
+    pub large_saves: u64,
+    /// Of those, saves that needed the line-paired rung.
+    pub large_saves_line_paired: u64,
+    /// Old lines those saves replaced whole (the only lines that can undo a
+    /// concurrent delete).
+    pub large_save_replaced_lines: u64,
+    /// Saves refused as too large to merge safely (422).
+    pub large_saves_refused: u64,
 }
 
 impl EngineCounters {
@@ -214,6 +227,10 @@ impl EngineCounters {
             degraded_notes: self.degraded_notes.load(Ordering::Relaxed),
             peer_id_redraws: self.peer_id_redraws.load(Ordering::Relaxed),
             sessions_started: self.sessions_started.load(Ordering::Relaxed),
+            large_saves: self.large_saves.load(Ordering::Relaxed),
+            large_saves_line_paired: self.large_saves_line_paired.load(Ordering::Relaxed),
+            large_save_replaced_lines: self.large_save_replaced_lines.load(Ordering::Relaxed),
+            large_saves_refused: self.large_saves_refused.load(Ordering::Relaxed),
         }
     }
 }
@@ -384,6 +401,32 @@ pub struct PreparedSave {
     pub loro_peer: u64,
     /// Updates in counter order, each small enough for one record.
     pub updates: Vec<Vec<u8>>,
+    /// How a save above [`LINE_DIFF_THRESHOLD_BYTES`] was diffed (#1029).
+    pub large_save: Option<LargeSaveReport>,
+}
+
+/// How a save above [`LINE_DIFF_THRESHOLD_BYTES`] was diffed (#1029): the
+/// rung of the diff ladder it needed and the old lines it replaced whole.
+/// Only replaced lines can undo a concurrent delete of text they held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargeSaveReport {
+    /// The lowest rung used.
+    pub rung: DiffRung,
+    /// Old lines replaced whole.
+    pub replaced_lines: usize,
+    /// Characters of those lines.
+    pub replaced_chars: usize,
+}
+
+impl serde::Serialize for LargeSaveReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut out = serializer.serialize_struct("LargeSaveReport", 3)?;
+        out.serialize_field("rung", self.rung.as_str())?;
+        out.serialize_field("replaced_lines", &self.replaced_lines)?;
+        out.serialize_field("replaced_chars", &self.replaced_chars)?;
+        out.end()
+    }
 }
 
 /// The readable state of a note.
@@ -649,6 +692,7 @@ impl NoteEngine {
         text: &str,
         base_version: &[u8],
         max_update_bytes: usize,
+        budgets: Budgets,
     ) -> Result<PreparedSave, NoteError> {
         let doc = self.live_doc()?;
         let peer = self.session_peer.ok_or_else(|| self.degraded_error())?;
@@ -661,14 +705,29 @@ impl NoteEngine {
             .map_err(|_| self.fault("set_peer_id"))?;
         let vv_before = fork.oplog_vv();
         let root = fork.get_text(TEXT_CONTAINER);
-        let diffed = if text.len() > LINE_DIFF_THRESHOLD_BYTES {
-            apply_edit_script(&root, text, DIFF_WORK_BUDGET).is_ok()
+        let large_save = if text.len() > LINE_DIFF_THRESHOLD_BYTES {
+            let script = match apply_edit_script(&root, text, budgets) {
+                Ok(script) => script,
+                Err(ApplyError::TooLarge(too_large)) => {
+                    return Err(NoteError::EditTooLargeToMergeSafely {
+                        old_lines: too_large.old_lines,
+                        new_lines: too_large.new_lines,
+                    });
+                }
+                Err(ApplyError::Loro | ApplyError::Mismatch) => {
+                    return Err(self.fault("text_update"));
+                }
+            };
+            Some(LargeSaveReport {
+                rung: script.rung,
+                replaced_lines: script.replaced_lines,
+                replaced_chars: script.replaced_chars,
+            })
         } else {
-            root.update(text, save_diff_options()).is_ok()
+            root.update(text, save_diff_options())
+                .map_err(|_| self.fault("text_update"))?;
+            None
         };
-        if !diffed {
-            return Err(self.fault("text_update"));
-        }
         fork.commit();
         let vv_after = fork.oplog_vv();
         let start = vv_before.get(&peer).copied().unwrap_or(0);
@@ -682,6 +741,7 @@ impl NoteEngine {
         Ok(PreparedSave {
             loro_peer: peer,
             updates,
+            large_save,
         })
     }
 
@@ -996,11 +1056,50 @@ impl NoteActor {
         base_version: &str,
         max_update_bytes: usize,
     ) -> Result<PreparedSave, NoteError> {
+        self.prepare_save_with(text, base_version, max_update_bytes, Budgets::DEFAULT)
+            .await
+    }
+
+    /// [`Self::prepare_save`] with explicit diff budgets. Counts large saves
+    /// in the engine counters.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::prepare_save`].
+    pub async fn prepare_save_with(
+        &self,
+        text: String,
+        base_version: &str,
+        max_update_bytes: usize,
+        budgets: Budgets,
+    ) -> Result<PreparedSave, NoteError> {
         let base = decode_version_bytes(base_version)?;
-        self.run("prepare_save", move |engine, _| {
-            engine.prepare_save(&text, &base, max_update_bytes)
-        })
-        .await
+        let result = self
+            .run("prepare_save", move |engine, _| {
+                engine.prepare_save(&text, &base, max_update_bytes, budgets)
+            })
+            .await;
+        let counters = &self.shared.counters;
+        match &result {
+            Ok(PreparedSave {
+                large_save: Some(report),
+                ..
+            }) => {
+                EngineCounters::bump(&counters.large_saves);
+                if report.rung == DiffRung::LinePaired {
+                    EngineCounters::bump(&counters.large_saves_line_paired);
+                }
+                let lines = u64::try_from(report.replaced_lines).unwrap_or(u64::MAX);
+                counters
+                    .large_save_replaced_lines
+                    .fetch_add(lines, Ordering::Relaxed);
+            }
+            Err(NoteError::EditTooLargeToMergeSafely { .. }) => {
+                EngineCounters::bump(&counters.large_saves_refused);
+            }
+            _ => {}
+        }
+        result
     }
 
     /// End the current writing session and start a new one with a fresh

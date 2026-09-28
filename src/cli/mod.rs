@@ -453,9 +453,17 @@ fn error_from_body(status: reqwest::StatusCode, body: &serde_json::Value) -> any
         .get("error")
         .and_then(|e| e.as_str())
         .unwrap_or("unknown error");
-    match body.get("reason").and_then(|r| r.as_str()) {
-        Some(reason) => anyhow::anyhow!("{} (HTTP {}, reason: {})", msg, status.as_u16(), reason),
-        None => anyhow::anyhow!("{} (HTTP {})", msg, status.as_u16()),
+    match (
+        body.get("reason").and_then(|r| r.as_str()),
+        body.get("message").and_then(|m| m.as_str()),
+    ) {
+        (Some(reason), _) => {
+            anyhow::anyhow!("{} (HTTP {}, reason: {})", msg, status.as_u16(), reason)
+        }
+        // Bodies shaped `{error: <code>, message: <sentence>}` (the notes
+        // routes): the code alone does not tell the user what to do.
+        (None, Some(message)) => anyhow::anyhow!("{}: {} (HTTP {})", msg, message, status.as_u16()),
+        (None, None) => anyhow::anyhow!("{} (HTTP {})", msg, status.as_u16()),
     }
 }
 
@@ -565,6 +573,22 @@ mod tests {
         assert_eq!(
             error_from_body(reqwest::StatusCode::NOT_FOUND, &body).to_string(),
             "group not found (HTTP 404)"
+        );
+    }
+
+    /// A notes refusal carries a stable code and a sentence telling the user
+    /// what to do (#1029: save in smaller steps); the CLI prints both.
+    #[test]
+    fn error_with_message_prints_the_code_and_the_sentence() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "note_edit_too_large_to_merge_safely",
+            "message": "too much to merge safely; save the change in smaller steps",
+        });
+        assert_eq!(
+            error_from_body(reqwest::StatusCode::UNPROCESSABLE_ENTITY, &body).to_string(),
+            "note_edit_too_large_to_merge_safely: too much to merge safely; save the change \
+             in smaller steps (HTTP 422)"
         );
     }
 
