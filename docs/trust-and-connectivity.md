@@ -38,8 +38,12 @@ Owner sync now rests on the owner-signed enrollment alone:
   `OwnerEnrollment` signature chains to the local owner key, the enrollment is
   current (not expired, not deleted), and the machine is not in the ADR-0018
   revocation set. If it is, the loop reads the protocol prefix and re-verifies
-  the enrollment. A `SyncV1` stream is then handed to the registered
-  owner-sync acceptor, and never to the default channel. Any other protocol
+  the enrollment. It also re-checks, under the discovery-cache lock and
+  atomically with the handoff, that the machine STILL has no known agent. An
+  agent that became known during the prefix read sends the stream through the
+  normal agent-level gate, including trust, revocation and the connect ACL. A
+  `SyncV1` stream is otherwise handed to the registered owner-sync acceptor,
+  and never to the default channel. Any other protocol
   is denied `deny_not_verified`, as it was before. The owner-sync session then
   still requires the owner-key possession proof. Nothing else is widened: a
   machine with any known agent goes through the normal agent-level gate, and
