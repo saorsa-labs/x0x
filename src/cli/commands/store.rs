@@ -80,6 +80,16 @@ pub async fn put(
         .put(&format!("/stores/{store_id}/{key}"), &body)
         .await?;
     print_value(client.format(), &resp);
+    // #849: a self_keyed put over quota evicts the writer's lex-highest keys.
+    if let Some(evicted) = resp["evicted_keys"].as_array().filter(|e| !e.is_empty()) {
+        eprintln!(
+            "warning: this put evicted {} of your keys (self_keyed quota, lowest-N admission):",
+            evicted.len()
+        );
+        for key in evicted.iter().filter_map(|k| k.as_str()) {
+            eprintln!("  {key}");
+        }
+    }
     Ok(())
 }
 

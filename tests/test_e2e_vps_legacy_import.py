@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +38,19 @@ class LegacyHarnessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls): cls.m = load()
 
+    def observer_timeout_receipt(self, status, body):
+        observer = FakeApi()
+        observer.request = mock.Mock(return_value=(status, body))
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"observer": observer}, evidence, 1)
+        ticks = iter((0.0, 0.0, 2.0, 2.0))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: next(ticks)), \
+             mock.patch.object(self.m.time, "sleep"):
+            with self.assertRaises(AssertionError):
+                scenario.await_observer_snapshot("observer", "store", "wiki")
+        self.assertEqual(1, len(evidence.polls))
+        return evidence.polls[0]
+
     def test_legacy_source_uses_exact_historical_topic_and_real_store_routes(self):
         api = FakeApi(); evidence = self.m.Evidence()
         scenario = self.m.LegacyScenario({"writer": api}, evidence, 1)
@@ -58,24 +73,90 @@ class LegacyHarnessTests(unittest.TestCase):
 
     def test_observer_and_refusal_oracles_use_positive_barriers(self):
         writer, observer = FakeApi(), FakeApi()
-        scenario = self.m.LegacyScenario({"writer": writer, "observer": observer}, self.m.Evidence(), 20)
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"writer": writer, "observer": observer}, evidence, 20)
         scenario.put = mock.Mock(return_value=200)
+        observer.request = mock.Mock(side_effect=[
+            (200, {"value": base64.b64encode(b"legacy-web").decode()}),
+        ])
         scenario.read = mock.Mock(side_effect=[
-            (200, "legacy-web"), (404, None),
+            (404, None),
             (200, "barrier"), (404, None), (404, None),
         ])
         scenario.await_observer_snapshot("observer", "store", "web")
+        self.assertEqual("accepted", evidence.polls[0]["outcome"])
+        self.assertEqual("value_present", evidence.polls[0]["response_class"])
+        self.assertTrue(evidence.polls[0]["value_matches_expected"])
         ticks = iter(range(100))
         with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
              mock.patch.object(self.m.time, "sleep"):
             scenario.barrier_absence("observer", "writer", "store", "forbidden")
         scenario.put.assert_called_once()
         calls = scenario.read.call_args_list
-        self.assertEqual("legacy-imported", calls[0].args[2])
-        self.assertEqual("legacy-removed", calls[1].args[2])
-        self.assertTrue(calls[2].args[2].startswith("barrier-"))
+        self.assertEqual("legacy-removed", calls[0].args[2])
+        self.assertTrue(calls[1].args[2].startswith("barrier-"))
+        self.assertEqual("forbidden", calls[2].args[2])
         self.assertEqual("forbidden", calls[3].args[2])
-        self.assertEqual("forbidden", calls[4].args[2])
+
+    def test_observer_timeout_records_bounded_http_class_without_body(self):
+        receipt = self.observer_timeout_receipt(404, {"error": "store not found", "secret": "do-not-record"})
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(404, receipt["last_status"])
+        self.assertEqual("store_not_found", receipt["response_class"])
+        self.assertFalse(receipt["value_matches_expected"])
+        self.assertNotIn("do-not-record", json.dumps(receipt))
+
+    def test_observer_timeout_distinguishes_group_absence_spelling(self):
+        for error in ("group not found", "group_not_found"):
+            with self.subTest(error=error):
+                receipt = self.observer_timeout_receipt(404, {"error": error})
+                self.assertEqual(404, receipt["last_status"])
+                self.assertEqual("group_not_found", receipt["response_class"])
+                self.assertFalse(receipt["value_matches_expected"])
+
+    def test_observer_unknown_error_body_remains_redacted(self):
+        secret = "token=private-invite-and-value"
+        receipt = self.observer_timeout_receipt(404, {"error": secret, "value": secret, "invite": secret})
+        self.assertEqual(404, receipt["last_status"])
+        self.assertEqual("http_error", receipt["response_class"])
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertEqual("authentication_denied", self.m.observer_response_class((401, {"error": secret})))
+        self.assertEqual("permission_denied", self.m.observer_response_class((403, {"error": secret})))
+        self.assertEqual("key_not_found", self.m.observer_response_class((404, {"error": "key_not_found"})))
+
+    def test_harness_failure_keeps_poll_timeout_text_but_never_other_error_text(self):
+        # A bare "harness AssertionError" hid R19's barrier timeout. The
+        # poll's own message (label/status/error class) is safe to keep;
+        # any other exception may echo a token and must stay class-only.
+        secret = "Bearer token-secret-value"
+        poll_timeout = self.m.with_poll_timeout.__globals__["PollTimeout"]
+        for error, expect_text in (
+            (poll_timeout("valid barrier converges", 120, 120.4, 404, None), True),
+            (RuntimeError(secret), False),
+            (AssertionError(secret), False),
+            # Codex #1021 P1: a spoofed phrase in a plain AssertionError is not poll()'s.
+            (AssertionError(f"{secret} did not converge in 120s; last_status=404"), False),
+        ):
+            failure = self.m.harness_failure(error)
+            self.assertEqual(expect_text, "poll_timeout" in failure)
+            self.assertNotIn(secret, json.dumps(failure))
+
+    def test_observer_wrong_value_cannot_satisfy_poll_or_leak_value(self):
+        observer = FakeApi()
+        secret = "unexpected-private-value"
+        observer.request = mock.Mock(return_value=(200, {"value": base64.b64encode(secret.encode()).decode()}))
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"observer": observer}, evidence, 1)
+        ticks = iter((0.0, 0.0, 2.0, 2.0))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: next(ticks)), \
+             mock.patch.object(self.m.time, "sleep"):
+            with self.assertRaises(AssertionError):
+                scenario.await_observer_snapshot("observer", "store", "wiki")
+        receipt = evidence.polls[0]
+        self.assertEqual("value_present", receipt["response_class"])
+        self.assertFalse(receipt["value_matches_expected"])
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertNotIn(base64.b64encode(secret.encode()).decode(), json.dumps(receipt))
 
     def test_conflict_and_full_receipt_binding_are_mandatory(self):
         scenario = self.m.LegacyScenario({}, self.m.Evidence(), 1)
@@ -153,15 +234,56 @@ class LegacyHarnessTests(unittest.TestCase):
         custody.restart.assert_called_once_with("writer")
 
     def test_full_scenario_requires_open_handles_and_rejects_stopped_nodes(self):
+        for removal_status in (403, 404):
+            with self.subTest(removal_status=removal_status):
+                self._run_full_scenario(removal_status)
+
+    def test_refusal_rejects_unrelated_404_server_errors_and_import_permission(self):
+        for response in [(404, {"error": "source not found"}), (404, {}),
+                         (500, {}), (401, {}), (200, {"candidates": []}),
+                         (200, {"candidates": [{"can_import": True}]})]:
+            with self.subTest(response=response):
+                self.assertFalse(self.m.revoked_listing_refusal(response))
+
+    def _run_full_scenario(self, removal_status):
+        scenario, backend, stop_owner, restart_writer = self._full_scenario(removal_status)
+        ticks = iter(range(1000))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
+             mock.patch.object(self.m.time, "sleep"):
+            scenario.run("owner", "writer", "observer", "revoked", stop_owner, restart_writer)
+        refused = [x for x in scenario.e.assertions if x["label"] == "revoked import mutation refused"]
+        self.assertEqual([removal_status], [x["status"] for x in refused])
+        # Both barriers now leave a receipt, so a barrier timeout is visible
+        # with its elapsed time instead of a bare "harness AssertionError".
+        self.assertEqual(["revoked_import_refusal", "valid_barrier_converges",
+                          "valid_barrier_converges", "legacy_observer_imported_value",
+                          "legacy_observer_imported_value"],
+                         [receipt["operation"] for receipt in scenario.e.polls])
+        self.assertTrue(all(receipt["outcome"] == "accepted" for receipt in scenario.e.polls))
+        self.assertIn("owner", backend.stopped)
+        self.assertIn("observer", backend.stopped)
+
+    def _full_scenario(self, removal_status=403, state_sync=None, observer_misses=(),
+                       barrier_never_converges=False, log=None):
+        """In-memory four-node backend; the hooks inject the failures the R20 run saw."""
         class Backend:
             def __init__(self):
                 self.groups = {}; self.opens = set(); self.values = {}; self.sources = {}
                 self.stopped = set(); self.group_seq = 0
 
             def request(self, node, method, path, body):
+                if log is not None:
+                    log.append((node, method, path, dict(body)))
                 if node in self.stopped:
                     raise RuntimeError("stopped node request")
+                if path == "/diagnostics/state-sync" and state_sync is not None:
+                    return state_sync(node)
                 parts = path.strip("/").split("/")
+                if node == "observer" and method == "GET" and len(parts) == 3 and parts[0] == "stores":
+                    if parts[2] == "legacy-imported" and parts[1].rsplit("-", 1)[1] in observer_misses:
+                        return 404, {"error": "key not found"}
+                    if barrier_never_converges and parts[2].startswith("barrier-"):
+                        return 404, {"error": "key not found"}
                 if method == "POST" and path == "/groups":
                     self.group_seq += 1; gid = f"group-{self.group_seq:02d}" + "0" * 56
                     self.groups[gid] = {"preset": body["preset"], "members": {"owner"}}
@@ -182,6 +304,8 @@ class LegacyHarnessTests(unittest.TestCase):
                     return 201, {"id": sid}
                 if len(parts) >= 3 and parts[0] == "groups" and parts[2] == "stores":
                     gid = parts[1]
+                    if removal_status == 404 and node not in self.groups[gid]["members"]:
+                        return 404, {"error": "group not found"}
                     app = body["name"] if len(parts) == 3 else parts[3]
                     sid = f"canonical-{gid}-{app}"
                     if method == "POST" and len(parts) == 3:
@@ -221,15 +345,113 @@ class LegacyHarnessTests(unittest.TestCase):
 
         backend = Backend(); nodes = ("owner", "writer", "observer", "revoked")
         scenario = self.m.LegacyScenario({n: Client(backend, n) for n in nodes}, self.m.Evidence(), 20)
-        ticks = iter(range(1000))
         def stop_owner(): backend.stopped.add("owner")
         def restart_writer(_gid):
             backend.stopped.add("observer"); backend.stopped.add("writer"); backend.stopped.remove("writer")
+        return scenario, backend, stop_owner, restart_writer
+
+    def _run_failing(self, **hooks):
+        """Run the full scenario to its (expected) failure; return (scenario, error)."""
+        scenario, _backend, stop_owner, restart_writer = self._full_scenario(**hooks)
+        ticks = iter(range(10000))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
+             mock.patch.object(self.m.time, "sleep"), self.assertRaises(AssertionError) as raised:
+            scenario.run("owner", "writer", "observer", "revoked", stop_owner, restart_writer)
+        return scenario, raised.exception
+
+    ROW_KEYS = {"phase", "role", "node", "app", "store_topic", "sampled_utc", "http_status",
+                "error_class", "topic_open", "counters"}
+
+    def assert_safe_rows(self, rows, secret):
+        for row in rows:
+            self.assertEqual(self.ROW_KEYS, set(row))
+            self.assertLessEqual(set(row["counters"]), set(self.m.STATE_SYNC_COUNTERS))
+            self.assertTrue(all(type(v) is int and 0 <= v < 2**64 for v in row["counters"].values()))
+        self.assertNotIn(secret, json.dumps(rows))
+
+    def test_observer_import_failure_captures_paired_safe_state_sync_counters(self):
+        # R20: the wiki observer poll timed out and nothing said whether the
+        # observer asked, the writer answered, or the answer was dropped. The
+        # failure must leave both ends' counters for that store, and only them.
+        secret = "Bearer token-secret-value"
+        sid = "canonical-group-01" + "0" * 56 + "-wiki"
+        calls = {"writer": 0}
+        def state_sync(node):
+            if node == "writer":
+                calls["writer"] += 1
+                if calls["writer"] > 1:   # after the wiki baseline: the failure capture
+                    raise RuntimeError(secret)
+                return 200, {"ok": True, "stores": {sid: {"requests_received": 1}}}
+            return 200, {"ok": True, "authorization": secret, "stores": {
+                sid: {"requests_sent": 4, "incoming_record_merges": 2, "rejected_other": True,
+                      "requests_answered": secret, "retained_pages_served": -1,
+                      "rejected_verify": 2**64, secret: 7, "note": secret},
+                secret: {"requests_sent": 9}}}
+        scenario, error = self._run_failing(state_sync=state_sync, observer_misses=("wiki",))
+        # The observer poll's own timeout still stands; capture never replaces it.
+        self.assertIsInstance(error, self.m.with_poll_timeout.__globals__["PollTimeout"])
+        self.assertIn("wiki observer imported value did not converge", str(error))
+        failed = [r for r in scenario.state_sync if r["phase"] == "observer_imported_value_failure"]
+        self.assertEqual([("writer", "writer"), ("observer", "observer")],
+                         [(r["role"], r["node"]) for r in failed])
+        self.assertEqual({sid}, {r["store_topic"] for r in failed})
+        self.assertEqual({"wiki"}, {r["app"] for r in failed})
+        by_role = {r["role"]: r for r in failed}
+        self.assertEqual({"requests_sent": 4, "incoming_record_merges": 2}, by_role["observer"]["counters"])
+        self.assertEqual(200, by_role["observer"]["http_status"])
+        self.assertTrue(by_role["observer"]["topic_open"])
+        self.assertEqual("RuntimeError", by_role["writer"]["error_class"])
+        self.assertIsNone(by_role["writer"]["http_status"])
+        self.assertEqual({}, by_role["writer"]["counters"])
+        self.assert_safe_rows(scenario.state_sync, secret)
+        self.assertNotIn(secret, json.dumps(scenario.e.polls))
+        self.assertNotIn(secret, json.dumps(scenario.e.assertions))
+
+    def test_unlisted_exception_class_is_reported_as_other(self):
+        class LeakyError(Exception):
+            pass
+        secret = "Bearer token-secret-value"
+        def state_sync(_node):
+            raise LeakyError(secret)
+        scenario, _error = self._run_failing(state_sync=state_sync, observer_misses=("wiki",))
+        self.assertTrue(scenario.state_sync)
+        self.assertEqual({"Other"}, {r["error_class"] for r in scenario.state_sync})
+        self.assert_safe_rows(scenario.state_sync, secret)
+
+    def test_baseline_is_taken_from_both_nodes_before_observer_opens_each_store(self):
+        log = []
+        scenario, _backend, stop_owner, restart_writer = self._full_scenario(
+            state_sync=lambda node: (200, {"ok": True, "stores": {}}), log=log)
+        ticks = iter(range(1000))
         with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
              mock.patch.object(self.m.time, "sleep"):
-            scenario.run(*nodes, stop_owner, restart_writer)
-        self.assertIn("owner", backend.stopped)
-        self.assertIn("observer", backend.stopped)
+            scenario.run("owner", "writer", "observer", "revoked", stop_owner, restart_writer)
+        baselines = [r for r in scenario.state_sync if r["phase"] == "baseline_before_observer_open"]
+        self.assertEqual([("wiki", "writer"), ("wiki", "observer"), ("web", "writer"), ("web", "observer")],
+                         [(r["app"], r["role"]) for r in baselines])
+        self.assertEqual([], [r for r in scenario.state_sync if r["phase"] != "baseline_before_observer_open"])
+        for app in ("wiki", "web"):
+            with self.subTest(app=app):
+                imported = min(i for i, (node, method, path, _b) in enumerate(log)
+                               if node == "writer" and method == "POST"
+                               and f"/stores/{app}/legacy-imports/" in path)
+                opened = next(i for i, (node, method, path, body) in enumerate(log)
+                              if i > imported and node == "observer" and method == "POST"
+                              and path.endswith("/stores") and body.get("name") == app)
+                sampled = [node for node, _m, path, _b in log[imported:opened]
+                           if path == "/diagnostics/state-sync"]
+                self.assertEqual(["writer", "observer"], sampled)
+
+    def test_barrier_failure_captures_writer_and_observer_pair(self):
+        scenario, error = self._run_failing(
+            state_sync=lambda node: (200, {"ok": True, "stores": {}}), barrier_never_converges=True)
+        self.assertIn("valid barrier converges did not converge", str(error))
+        rows = scenario.state_sync
+        self.assertEqual([("barrier_failure", "writer", "writer"), ("barrier_failure", "observer", "observer")],
+                         [(r["phase"], r["role"], r["node"]) for r in rows])
+        self.assertEqual(1, len({r["store_topic"] for r in rows}))
+        self.assertTrue(rows[0]["store_topic"].endswith("-wiki"))
+        self.assertTrue(all(r["http_status"] == 200 and r["topic_open"] is False for r in rows))
 
 
 if __name__ == "__main__": unittest.main()

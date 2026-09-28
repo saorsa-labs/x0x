@@ -4,6 +4,10 @@ set -euo pipefail
 build=()
 metadata=(--format-version 1)
 metadata_locked=false
+if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+  metadata+=(--locked)
+  metadata_locked=true
+fi
 while [[ $# -gt 0 && $1 != -- ]]; do
   case "$1" in
     --locked)

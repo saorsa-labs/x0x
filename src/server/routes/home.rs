@@ -370,7 +370,7 @@ pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolu
 /// `OwnerCertified(owner)` Home-shaped AND our own agent is an active
 /// member. Anything else (injected metadata, a foreign owner's Home, a
 /// group we were removed from) is not trusted.
-pub(in crate::server) async fn find_home(
+pub(crate) async fn find_home(
     state: &AppState,
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
@@ -538,6 +538,13 @@ async fn stamp_and_seal_home(
         placements,
         provisioned_at_ms: now_millis_u64(),
     });
+    // #565: bind the builder-issued owner→agent certificate onto the
+    // founding seat BEFORE the seal. `primary_agent_trusted` (the read
+    // side behind `GET /home`'s `verified` bit) trusts only
+    // roster-EMBEDDED bytes — the seal's verdict alone consults live
+    // identity evidence, so without this bind every freshly provisioned
+    // Home reported an unverified primary forever.
+    bind_primary_agent_certificate(state, &mut info);
     // Seal through the OwnerCertified wrapper: it re-verifies the roster
     // (refusing on any failing member) and the seal covers the freshly
     // stamped home digest.
@@ -629,6 +636,11 @@ async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::gro
         );
         return None;
     }
+    // #565: a Home whose primary seat lost (or never carried) certificate
+    // bytes gets them rebound before this seal — the reseal is the
+    // chokepoint for legacy-unsigned records, so the heal rides the same
+    // authority, epoch check, and owner-certified commit.
+    bind_primary_agent_certificate(state, &mut info);
     if seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64())
         .await
         .is_err()
@@ -765,7 +777,150 @@ async fn strip_home_metadata(state: &AppState, group_id: &str) {
 /// Auto-provision the Home space for an owned install. Idempotent and
 /// best-effort: never fails startup — a provisioning failure logs loudly
 /// and retries on the next daemon start (no marker is written on failure).
-pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
+/// #824: how long a startup with an owner but no canonical Home pointer
+/// waits for the owner's pointer before provisioning a Home of its own.
+///
+/// The periodic Tier-1 loop passes every
+/// [`crate::owner_sync::DEFAULT_SYNC_INTERVAL`] (60 s), and an enrollment or
+/// merged record wakes it early. So a device enrolled during the wait is
+/// dialled at once, and a failed first dial is retried within 60 s. 90 s
+/// covers one full interval plus 30 s for that session to deliver the
+/// pointer. A device that reaches no owner device in time (a genuinely first
+/// or offline device) provisions as it did before #824: an unreachable owner
+/// device must not leave this one without a Home.
+pub(in crate::server) const HOME_POINTER_SYNC_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
+/// Whether a startup provisioning pass finished or must wait for owner sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisionStep {
+    Done,
+    AwaitOwnerSync,
+}
+
+pub(crate) async fn provision_home(state: &Arc<AppState>) {
+    let _ = provision_home_steps(state, false).await;
+}
+
+/// Startup Home provisioning (#824).
+///
+/// Every step that needs no network runs now: restore verification, repair
+/// of an existing Home, crash recovery, and yielding to a known canonical
+/// pointer. The one step that can fork the owner's Home is creating a fresh
+/// Home. An owned device that would create one while it knows NO canonical
+/// pointer may be the owner's second device before its first sync. That step
+/// is deferred to the returned task, which waits as described on
+/// `wait_for_owner_sync_round` and then re-runs [`provision_home`] from the
+/// top. Creation there is linearized against pointer arrival (step 3a). The API stays up throughout; `GET /home` reports
+/// `provisioning_pending` until the task finishes.
+pub(in crate::server) async fn provision_home_at_startup(
+    state: &Arc<AppState>,
+    wait: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if provision_home_steps(state, true).await == ProvisionStep::Done {
+        return None;
+    }
+    state
+        .home_provisioning_deferred
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let state = Arc::clone(state);
+    Some(tokio::spawn(async move {
+        let mut shutdown = state.shutdown_notify.subscribe();
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            () = wait_for_owner_sync_round(&state, wait) => {
+                tracing::info!("deferred Home provisioning resuming after owner sync (#824)");
+                provision_home(&state).await;
+            }
+        }
+        state
+            .home_provisioning_deferred
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }))
+}
+
+/// This device's rank among the owner's enrolled machines (#824): how many
+/// OTHER enrolled machines have a smaller machine id. Every device computes
+/// the same order, so at most one of a set of mutually enrolled, pointerless
+/// devices has rank 0.
+async fn home_creator_rank(state: &AppState) -> u32 {
+    let (Some(sync), Some(owner)) = (
+        state.owner_sync.as_ref(),
+        state.agent.identity().user_keypair().map(|kp| kp.user_id()),
+    ) else {
+        return 0;
+    };
+    let local = state.agent.machine_id();
+    let mut rank: u32 = 0;
+    for device in sync.store().enrolled_devices().await {
+        let machine = crate::identity::MachineId(device.machine_id);
+        if machine.0 < local.0 && sync.store().is_enrolled(&machine, &owner).await {
+            rank = rank.saturating_add(1);
+        }
+    }
+    rank
+}
+
+/// Resolve when this device should re-run provisioning (#824):
+///
+/// - a committed record makes a canonical Home known (it will then yield);
+/// - a session with an owner device completes and this device is the
+///   designated creator (rank 0): that session either delivered the pointer
+///   or showed that the device it reached advertises none — #863 makes
+///   "advertises none" TRUSTWORTHY: every session (both directions)
+///   materializes the local Home pointer into the Tier-1 store BEFORE the
+///   version-vector exchange, so a peer holding an unpublished Home can no
+///   longer answer with an empty HomePointer vector;
+/// - or `(rank + 1) × wait` has passed since the wait began.
+///
+/// A completed session that brought no pointer releases ONLY the rank-0
+/// device. Two fresh, mutually enrolled devices would otherwise both wake on
+/// the same empty session and both create a Home. A non-leader keeps waiting
+/// for the leader's pointer, and its own deadline is one `wait` later per
+/// lower-ranked machine, so it creates only if every lower-ranked device
+/// failed to publish in time (a partition or an offline leader). A pass that
+/// reached nobody never counts.
+async fn wait_for_owner_sync_round(state: &Arc<AppState>, wait: std::time::Duration) {
+    let Some(sync) = state.owner_sync.as_ref() else {
+        return;
+    };
+    let started = tokio::time::Instant::now();
+    let mut sessions = sync.store().successful_sessions_rx();
+    sessions.borrow_and_update();
+    let mut generation = sync.store().generation_rx();
+    generation.borrow_and_update();
+    loop {
+        if effective_canonical_home(state).await.is_some() {
+            return;
+        }
+        let rank = home_creator_rank(state).await;
+        let deadline = started + wait.saturating_mul(rank.saturating_add(1));
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::info!(
+                    rank,
+                    wait_secs = wait.as_secs(),
+                    "no canonical Home pointer arrived before this device's deadline; provisioning locally (#824)"
+                );
+                return;
+            }
+            changed = sessions.changed() => {
+                if changed.is_err() || home_creator_rank(state).await == 0 {
+                    return;
+                }
+            }
+            // Enrollment and merged records both land here; re-evaluate the
+            // pointer and this device's rank.
+            changed = generation.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> ProvisionStep {
     // Round-4 fix 1: the restore sweep runs FIRST, before ANY owned-install
     // guard — EVERY restored nonempty `home` record is digest-verified even
     // on un-owned installs or installs without an agent certificate (there
@@ -778,11 +933,11 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     // certifiable founding member).
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         tracing::debug!("no owner user key: Home not provisioned (anonymous install)");
-        return;
+        return ProvisionStep::Done;
     };
     if state.agent.identity().agent_certificate().is_none() {
         tracing::warn!("owner key present but no agent certificate: Home not provisioned");
-        return;
+        return ProvisionStep::Done;
     }
     let owner = user_kp.user_id();
     let owner_hex = hex::encode(owner.as_bytes());
@@ -807,7 +962,7 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
                 Some(resealed) => {
                     tracing::info!(group_id = %id, "legacy Home metadata resealed");
                     repair_or_write_marker(state, &owner_hex, &marker_path, &id, &resealed).await;
-                    return;
+                    return ProvisionStep::Done;
                 }
                 None => {
                     tracing::warn!(
@@ -825,10 +980,36 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
                     // recovery candidate below and is re-stamped fresh.
                 }
             }
+        } else if !primary_agent_trusted(
+            &info,
+            &owner,
+            crate::groups::owner_cert::restore_clock_now(),
+        ) && bindable_primary_certificate(state, &info).is_some()
+        {
+            // #565: a Home provisioned before the founding-seat
+            // certificate bind (the pre-fix roster shape) reports an
+            // unverified primary on every start — the read side trusts
+            // only roster-embedded bytes. When this device IS the
+            // primary and lawfully holds a currently verifying
+            // certificate, heal the seat through the owner-certified
+            // reseal instead of leaving the warning standing; anything
+            // less attributable (remote primary, digest mismatch, no
+            // held certificate) stays fail-closed with no reseal churn.
+            let info = match reseal_home(state, &id).await {
+                Some(resealed) => {
+                    tracing::info!(
+                        group_id = %id,
+                        "#565: rebound the primary agent certificate onto the Home seat"
+                    );
+                    resealed
+                }
+                None => info,
+            };
+            repair_or_write_marker(state, &owner_hex, &marker_path, &id, &info).await;
         } else {
             repair_or_write_marker(state, &owner_hex, &marker_path, &id, &info).await;
         }
-        return;
+        return ProvisionStep::Done;
     }
 
     // 2) Crash recovery (review fix 3): a group matching the FULL Home
@@ -893,8 +1074,37 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
             )
             .await;
         }
-        return;
+        return ProvisionStep::Done;
     }
+
+    // 3a) #824: linearize the pointer check against the create. Every writer
+    //     of the canonical pointer takes `canonical_home_gate` for write, so
+    //     holding it for read from the check below to the end of creation and
+    //     stamping means no pointer can commit locally in between. A pointer
+    //     from another device arrives only inside an owner-sync session, so
+    //     before creating we also wait out every in-flight session and hold
+    //     off new ones. This covers a session still running when the wait's
+    //     timer expires. Lock order: session slots, then the gate, then
+    //     group state. Sessions take a slot before the gate.
+    let _sessions_quiesced = match (defer_fresh, state.owner_sync.as_ref()) {
+        (false, Some(sync)) => {
+            let bound = crate::owner_sync::SESSION_TIMEOUT + std::time::Duration::from_secs(30);
+            match tokio::time::timeout(bound, sync.quiesce_sessions()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!(
+                        "owner-sync sessions did not drain before Home creation; relying on the pointer gate alone (#824)"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let _canonical_gate = match state.owner_sync.as_ref() {
+        Some(sync) => Some(sync.store().canonical_home_gate_read().await),
+        None => None,
+    };
 
     // 3) #449: another owner device has already advertised the owner's Home.
     //    Minting a second one here is exactly the reported bug — N devices
@@ -912,7 +1122,21 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
             canonical_group_id = %canonical,
             "owner's Home is advertised by another device; not provisioning a duplicate (#449)"
         );
-        return;
+        return ProvisionStep::Done;
+    }
+
+    // 3b) #824: an owned device with no canonical pointer may be the owner's
+    //     second device before its first sync, as with a copied owner key.
+    //     At startup, wait for owner sync before minting a Home the owner
+    //     already has.
+    //     This applies with or without enrolled peers: a new device is
+    //     enrolled only once it is running with the owner key, which is
+    //     during this wait. Without owner sync there is nothing to wait for.
+    if defer_fresh && state.owner_sync.is_some() {
+        tracing::info!(
+            "owned device knows no canonical Home pointer; deferring provisioning until owner sync (#824)"
+        );
+        return ProvisionStep::AwaitOwnerSync;
     }
 
     // 4) Fresh provisioning through the full creation path.
@@ -930,7 +1154,7 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
             status = %resp.status(),
             "Home auto-provisioning failed (will retry on next start)"
         );
-        return;
+        return ProvisionStep::Done;
     }
     // Round-2 fix 2: stamp the group id the creation call RETURNED — never
     // re-scan. A scan could pick a concurrently provisioned same-policy
@@ -947,7 +1171,7 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         });
     let Some(group_id) = created else {
         tracing::error!("Home creation response carried no group_id; marker not written");
-        return;
+        return ProvisionStep::Done;
     };
     // Defensive existence check (the create path inserted it durably).
     if !state.named_groups.read().await.contains_key(&group_id) {
@@ -955,7 +1179,7 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
             group_id = %group_id,
             "Home creation returned an id that is not in the roster; marker not written"
         );
-        return;
+        return ProvisionStep::Done;
     }
     if let Some(info) = stamp_and_seal_home(state, &group_id).await {
         write_marker(
@@ -968,7 +1192,14 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         )
         .await;
         tracing::info!(group_id = %group_id, "provisioned Home (ADR-0038)");
+        // #824: publish the new Home's pointer now rather than at the next
+        // 60 s pass, so a device enrolled right after this one reads the
+        // pointer in its first session instead of minting a duplicate.
+        if let Some(sync) = state.owner_sync.as_ref() {
+            sync.kick();
+        }
     }
+    ProvisionStep::Done
 }
 
 /// Roaming-guarantee warning computed from a GroupInfo ALREADY IN HAND
@@ -1037,6 +1268,72 @@ fn primary_agent_trusted(
         )
         .is_ok()
     })
+}
+
+/// The owner→agent certificate this device may lawfully bind onto its
+/// Home's PRIMARY seat, or `None` when it may not (#565).
+///
+/// Bindings are deliberately narrow so the heal can never mint trust:
+/// the primary must be THIS agent (a remote/nonlocal primary holds a
+/// certificate this device does not hold — not ours to install), the
+/// seat must be active and byte-less, the locally held certificate must
+/// verify against the roster's OWN OwnerCertified owner (correct
+/// owner+agent binding, fail-closed), and any committed digest must
+/// already match the held bytes — a differing digest is committed state
+/// under the signed roster root and is never rewritten here.
+fn bindable_primary_certificate(
+    state: &AppState,
+    info: &crate::groups::GroupInfo,
+) -> Option<crate::identity::AgentCertificate> {
+    let home = info.home.as_ref()?;
+    let owner = info.policy.admission.owner_certified_user_id().copied()?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !home.primary_agent.eq_ignore_ascii_case(&local_hex) {
+        return None;
+    }
+    let seat = info.members_v2.get(&home.primary_agent)?;
+    if !seat.is_active() || seat.certificate.is_some() {
+        return None;
+    }
+    let cert = state.agent.identity().agent_certificate()?;
+    crate::groups::owner_cert::verify_cert_against_owner(
+        &owner,
+        &home.primary_agent,
+        cert,
+        false,
+        crate::groups::owner_cert::restore_clock_now(),
+    )
+    .ok()?;
+    let digest = crate::groups::owner_cert::certificate_digest_hex(cert);
+    seat.certificate_digest
+        .as_deref()
+        .is_none_or(|committed| committed == digest)
+        .then(|| cert.clone())
+}
+
+/// Bind [`bindable_primary_certificate`] onto the primary seat so the
+/// signed state-commit's roster root covers it (#565). Returns whether
+/// bytes were installed; a refusal (digest mismatch) leaves the roster
+/// untouched and trust stays fail-closed.
+fn bind_primary_agent_certificate(state: &AppState, info: &mut crate::groups::GroupInfo) -> bool {
+    let Some(cert) = bindable_primary_certificate(state, info) else {
+        return false;
+    };
+    let primary = info
+        .home
+        .as_ref()
+        .map_or_else(String::new, |h| h.primary_agent.clone());
+    match info.set_member_certificate(&primary, cert) {
+        Ok(()) => true,
+        Err(crate::groups::SetMemberCertificateError::CertificateDigestMismatch) => {
+            tracing::warn!(
+                group_id = %info.stable_group_id(),
+                "primary seat commits to a different certificate digest; refusing to rewrite \
+                 committed state under the signed roster root"
+            );
+            false
+        }
+    }
 }
 
 /// 200 body for "the owner's Home lives on another device" (#449).
@@ -1114,6 +1411,26 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         }
         HomeResolution::Elsewhere { canonical } => {
             return home_elsewhere_response(&owner, &canonical, None, &local_agent_hex)
+        }
+        HomeResolution::Unknown
+            if state
+                .home_provisioning_deferred
+                .load(std::sync::atomic::Ordering::SeqCst) =>
+        {
+            // #824: startup provisioning is waiting for owner sync to reveal
+            // whether the owner already has a Home. A 404 here would read as
+            // "Home-less", which is the misreading `elsewhere` avoids.
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "state": "provisioning_pending",
+                    "owner_user_id": hex::encode(owner.as_bytes()),
+                    "canonical_group_id": null,
+                    "local_group_id": null,
+                    "detail": "waiting for owner sync to deliver the owner's canonical Home before provisioning one here",
+                })),
+            );
         }
         HomeResolution::Unknown => return not_found("no Home provisioned"),
     };
@@ -1304,7 +1621,7 @@ pub(in crate::server::routes::home) fn seat_selected_canonical_hook() -> &'stati
 
 /// #449 option (c): 409 body for a seat request this device cannot serve.
 /// `reason` is a TYPED token (`elsewhere` / `adoption_pending` /
-/// `unknown`), not prose — the CLI and the GUI branch on it.
+/// `unknown` / `ambiguous_home`), not prose — the CLI and the GUI branch on it.
 fn seat_conflict(reason: &str, canonical: Option<&str>, detail: &str) -> Response {
     (
         StatusCode::CONFLICT,
@@ -1366,7 +1683,7 @@ pub(in crate::server) async fn seat_home(
         )
             .into_response();
     }
-    if state.agent.identity().user_keypair().is_none() {
+    let Some(owner) = state.agent.identity().user_keypair().map(|kp| kp.user_id()) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -1375,7 +1692,7 @@ pub(in crate::server) async fn seat_home(
             })),
         )
             .into_response();
-    }
+    };
 
     let joiner = req.agent_id;
     if joiner.len() != 64
@@ -1434,6 +1751,29 @@ pub(in crate::server) async fn seat_home(
             return seat_conflict("unknown", None, "no Home provisioned on this device")
         }
     };
+    // #824: `Local` is NOT proof that the resolved group is the owner's Home.
+    // With no canonical pointer known yet, `resolve_home` falls back to
+    // `find_home`'s smallest-stable-id rule, and a device seated in both its
+    // own optimistically provisioned duplicate and the owner's real Home can
+    // resolve to the DUPLICATE. Minting there hands the joiner a seat in the
+    // wrong Home with a 200. When more than one Home-shaped group holds us,
+    // only the register can say which is canonical, so require it to name
+    // exactly the group we would mint into; anything else is ambiguous.
+    if !home_duplicates(&state, &group_id, &owner).await.is_empty() {
+        let canonical = effective_canonical_home(&state).await;
+        let matches = canonical
+            .as_deref()
+            .is_some_and(|c| c == group_id || c == info.stable_group_id());
+        if !matches {
+            return seat_conflict(
+                "ambiguous_home",
+                canonical.as_deref(),
+                "this device is seated in more than one Home and the owner's canonical Home \
+                 pointer does not identify which one is canonical yet; wait for owner sync \
+                 to deliver it, or run this on the device that holds the canonical Home",
+            );
+        }
+    }
     // The join pin the operator will type MUST be the owner axis of the group
     // the invite actually belongs to. Deriving it from the local user key
     // would echo what this device believes rather than what the group
@@ -2647,6 +2987,294 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
+    /// WHY (#565): a freshly provisioned Home must report a VERIFIED
+    /// primary agent. The synthetic-owner live receipt proved the
+    /// opposite — `GET /home` answered `state: local` with
+    /// `primary_agent.verified=false` and
+    /// `warnings.primary_agent_unverified=true` — because the stamp
+    /// sealed Home metadata without binding the builder-issued
+    /// owner→agent certificate into the founding roster seat, while the
+    /// read side (`primary_agent_trusted`) trusts only roster-EMBEDDED
+    /// bytes. The verification must also survive a restart on roster
+    /// bytes alone, with no repair pass involved.
+    #[tokio::test]
+    async fn freshly_provisioned_home_reports_verified_primary() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x77; 32]).await?;
+        provision_home(&state).await;
+
+        let owner = owner_of(&state);
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (_, info) = find_home(&state, &owner).await.expect("home provisioned");
+        let founding = info.members_v2.get(&local_hex).expect("founding seat");
+        assert!(
+            founding.certificate.is_some() && founding.certificate_digest.is_some(),
+            "trust must come from roster-embedded bytes (the committed evidence the \
+             signed roster root covers), not from live identity evidence"
+        );
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "local");
+        assert_eq!(body["primary_agent"]["agent_id"], local_hex);
+        assert_eq!(
+            body["primary_agent"]["verified"], true,
+            "a fresh owned install must verify its own primary agent"
+        );
+        assert_eq!(body["warnings"]["primary_agent_unverified"], false);
+
+        // Restart over the same data dir: the persisted roster bytes keep
+        // the primary verified without the heal path firing.
+        drop(state);
+        let state2 = owned_state(dir.path(), [0x77; 32]).await?;
+        let (status, body2) =
+            response_json(get_home(State(Arc::clone(&state2))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body2}");
+        assert_eq!(body2["primary_agent"]["verified"], true);
+        assert_eq!(body2["warnings"]["primary_agent_unverified"], false);
+        Ok(())
+    }
+
+    /// WHY (#565): Homes provisioned by the pre-fix build carry a sealed,
+    /// restart-stable `verified=false` (root reproduced this on the live
+    /// synthetic owner). This device is the primary and lawfully holds the
+    /// owner-issued certificate, so the next provisioning pass (daemon
+    /// start) must heal the seat through the owner-certified reseal — no
+    /// operator action, no duplicate group, and no trust without
+    /// roster-embedded bytes.
+    #[tokio::test]
+    async fn unverified_existing_home_is_healed_on_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x78; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Rewind the roster to the exact pre-#565 shape: founding seat
+        // with NO certificate bytes and NO committed digest, state hash
+        // current (the old stamp sealed precisely this roster).
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            if let Some(seat) = info.members_v2.get_mut(&local_hex) {
+                seat.certificate = None;
+                seat.certificate_digest = None;
+            }
+            seal_commit_owner_certified(
+                &state,
+                &mut info,
+                state.agent.identity().agent_keypair(),
+                now_millis_u64(),
+            )
+            .await
+            .expect("re-seal the stripped roster");
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the rewound roster");
+        }
+
+        // The fixture reproduces the live receipt before any heal.
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["primary_agent"]["verified"], false,
+            "fixture must reproduce #565 before the heal"
+        );
+
+        provision_home(&state).await;
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["primary_agent"]["verified"], true, "healed on start");
+        assert_eq!(body["warnings"]["primary_agent_unverified"], false);
+        let (_, info) = find_home(&state, &owner).await.expect("home still present");
+        assert!(
+            info.members_v2
+                .get(&local_hex)
+                .is_some_and(|seat| seat.certificate.is_some()),
+            "the heal must install roster bytes under a fresh seal, not flip a read-side bit"
+        );
+        Ok(())
+    }
+
+    /// WHY (#565 scope): a Home whose primary is a REMOTE agent with valid
+    /// committed certificate bytes is already verified; the heal path must
+    /// leave it untouched — no reseal churn, no rewriting a seat this
+    /// device holds no certificate for.
+    #[tokio::test]
+    async fn verified_remote_primary_is_left_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x79; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+
+        // Seat a second, owner-certified agent as the Home primary — the
+        // shape `x0x home seat <agent>` produces on another device (#449
+        // option (c)).
+        let other = crate::identity::AgentKeypair::generate()?;
+        let other_hex = hex::encode(other.agent_id().as_bytes());
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned fixture");
+        let other_cert = crate::identity::AgentCertificate::issue(owner_kp, &other)?;
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            let mut member = crate::groups::GroupMember::new_member(
+                other_hex.clone(),
+                None,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+                0,
+            );
+            member.state = crate::groups::GroupMemberState::Active;
+            info.members_v2.insert(other_hex.clone(), member);
+            info.set_member_certificate(&other_hex, other_cert)
+                .expect("seat the remote primary's certificate");
+            if let Some(home) = info.home.as_mut() {
+                home.primary_agent = other_hex.clone();
+            }
+            seal_commit_owner_certified(
+                &state,
+                &mut info,
+                state.agent.identity().agent_keypair(),
+                now_millis_u64(),
+            )
+            .await
+            .expect("seal the remote-primary roster");
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the remote-primary roster");
+        }
+        let expected_digest = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .and_then(|info| info.members_v2.get(&other_hex))
+                .and_then(|seat| seat.certificate_digest.clone())
+                .expect("remote primary digest")
+        };
+        let revision_before = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| info.state_revision)
+                .expect("home")
+        };
+
+        provision_home(&state).await;
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["primary_agent"]["agent_id"], other_hex);
+        assert_eq!(
+            body["primary_agent"]["verified"], true,
+            "an already-valid remote primary keeps its verification"
+        );
+        let (revision_after, digest_after) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&id).expect("home");
+            (
+                info.state_revision,
+                info.members_v2
+                    .get(&other_hex)
+                    .and_then(|seat| seat.certificate_digest.clone())
+                    .expect("remote primary digest"),
+            )
+        };
+        assert_eq!(
+            revision_after, revision_before,
+            "an already-verified Home must not be resealed"
+        );
+        assert_eq!(digest_after, expected_digest);
+        Ok(())
+    }
+
+    /// WHY (#565 fail-closed): a primary seat that already commits to a
+    /// DIFFERENT certificate digest than the one this device holds must
+    /// not be rewritten — the digest is part of the signed roster root,
+    /// and healing over it would silently rewrite committed state (e.g.
+    /// evidence of an owner re-key in flight). The warning stays;
+    /// digest-only seats belong to the hydration paths, not the heal.
+    #[tokio::test]
+    async fn heal_refuses_a_primary_seat_committed_to_another_digest() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x7A; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let foreign_digest = "00".repeat(32);
+
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            if let Some(seat) = info.members_v2.get_mut(&local_hex) {
+                seat.certificate = None;
+                seat.certificate_digest = Some(foreign_digest.clone());
+            }
+            info.recompute_state_hash();
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the digest-only roster");
+        }
+        let revision_before = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| info.state_revision)
+                .expect("home")
+        };
+
+        provision_home(&state).await;
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["primary_agent"]["verified"], false,
+            "a digest-committed seat is not healable by this device"
+        );
+        let (revision_after, digest_after) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&id).expect("home");
+            (
+                info.state_revision,
+                info.members_v2
+                    .get(&local_hex)
+                    .and_then(|seat| seat.certificate_digest.clone())
+                    .expect("primary digest"),
+            )
+        };
+        assert_eq!(
+            revision_after, revision_before,
+            "no reseal churn on refusal"
+        );
+        assert_eq!(digest_after, foreign_digest, "committed digest untouched");
+        Ok(())
+    }
+
     fn durable_owner() -> crate::server::rider_auth::ActorContext {
         crate::server::rider_auth::ActorContext::Owner { durable: true }
     }
@@ -3054,6 +3682,480 @@ pub(in crate::server::routes) mod tests {
             before,
             "a device that lost the election must mint nothing"
         );
+        Ok(())
+    }
+
+    async fn home_shaped_group_count(state: &Arc<AppState>) -> usize {
+        let owner = owner_of(state);
+        state
+            .named_groups
+            .read()
+            .await
+            .values()
+            .filter(|info| is_home_policy(&info.policy, &owner))
+            .count()
+    }
+
+    fn deferral_active(state: &AppState) -> bool {
+        state
+            .home_provisioning_deferred
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// WHY (#824 option 1): an owner device that starts before owner sync has
+    /// delivered the owner's canonical Home pointer must not mint its own Home
+    /// in the meantime. That duplicate is what later let `POST /home/seat`
+    /// seat devices into the wrong Home. When the pointer arrives during the
+    /// wait, the device must yield (`elsewhere`) and have created NO
+    /// Home-shaped group, while `GET /home` answers a 200 pending state
+    /// instead of a 404 that reads as "Home-less".
+    #[tokio::test]
+    async fn startup_waits_for_owner_sync_and_never_duplicates_an_arriving_home(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x84; 32]).await?;
+
+        let task = provision_home_at_startup(&state, std::time::Duration::from_secs(60)).await;
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "an owner device must not mint a Home before owner sync can deliver the owner's"
+        );
+        let task = task.ok_or_else(|| anyhow::anyhow!("provisioning must be deferred"))?;
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "provisioning_pending", "{body}");
+
+        let canonical = "e1".repeat(16);
+        commit_canonical_home(&state, &canonical).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "the owner's Home arrived during the wait; minting one here is the #824 duplicate"
+        );
+        assert!(!deferral_active(&state));
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        assert_eq!(body["canonical_group_id"], canonical.as_str());
+        Ok(())
+    }
+
+    /// WHY (#824): the wait must stay bounded. A genuinely first or offline
+    /// owner device never hears a pointer and must still end up with exactly
+    /// one working Home, not zero and not two.
+    #[tokio::test]
+    async fn startup_provisions_exactly_one_home_when_the_sync_wait_expires() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x85; 32]).await?;
+
+        let task = provision_home_at_startup(&state, std::time::Duration::from_millis(200))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("an enrolled owner device without a pointer must defer")
+            })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+
+        assert_eq!(home_shaped_group_count(&state).await, 1);
+        assert!(!deferral_active(&state));
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "local", "{body}");
+        Ok(())
+    }
+
+    /// Enroll `machine` for this state's owner (offline agent: nothing dials).
+    async fn enroll_machine(state: &Arc<AppState>, machine: [u8; 32]) -> anyhow::Result<()> {
+        let sync = state
+            .owner_sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .ok_or_else(|| anyhow::anyhow!("owned state has a user key"))?;
+        sync.store()
+            .enroll(crate::owner_sync::OwnerEnrollment::sign(
+                crate::identity::MachineId(machine),
+                owner_kp,
+                1_000,
+                None,
+            )?)
+            .await?;
+        Ok(())
+    }
+
+    fn sync_of(state: &AppState) -> anyhow::Result<&Arc<crate::owner_sync::OwnerSyncService>> {
+        state
+            .owner_sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))
+    }
+
+    /// WHY (#824 OMP D1): two fresh, mutually enrolled owner devices with no
+    /// pointer complete one successful but EMPTY session with each other. If
+    /// that session released both, both would create a Home: the #824
+    /// duplicate. Exactly one (the lowest machine id) may create. The other
+    /// must keep waiting and yield once the creator's pointer reaches it.
+    #[tokio::test]
+    async fn two_fresh_devices_sharing_an_empty_session_create_exactly_one_home(
+    ) -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = owned_state(dir_a.path(), [0x89; 32]).await?;
+        let b = owned_state(dir_b.path(), [0x89; 32]).await?;
+        let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
+        anyhow::ensure!(ma != mb, "distinct machines");
+        enroll_machine(&a, mb.0).await?;
+        enroll_machine(&b, ma.0).await?;
+        let (leader, follower) = if ma.0 < mb.0 { (&a, &b) } else { (&b, &a) };
+        let (leader_machine, follower_machine) =
+            (leader.agent.machine_id(), follower.agent.machine_id());
+
+        let wait = std::time::Duration::from_secs(600);
+        let leader_task = provision_home_at_startup(leader, wait)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader must defer"))?;
+        let follower_task = provision_home_at_startup(follower, wait)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("follower must defer"))?;
+
+        // Let both waiters subscribe before the session is recorded.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // One successful session, no pointer on either side: both record it.
+        sync_of(leader)?
+            .store()
+            .set_session_status(&follower_machine, true)
+            .await;
+        sync_of(follower)?
+            .store()
+            .set_session_status(&leader_machine, true)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), leader_task).await??;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(home_shaped_group_count(leader).await, 1);
+        assert_eq!(
+            home_shaped_group_count(follower).await,
+            0,
+            "an empty session released the follower too: two Homes for one owner"
+        );
+        assert!(!follower_task.is_finished());
+
+        // The leader's pointer reaches the follower; it yields.
+        let (leader_gid, _) = find_home(leader.as_ref(), &owner_of(leader))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader Home"))?;
+        commit_canonical_home(follower, &leader_gid).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), follower_task).await??;
+        assert_eq!(home_shaped_group_count(follower).await, 0);
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(follower))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#863): provisioning does NOT publish the Home pointer — only a
+    /// sync pass (or, post-fix, a session) does. That gap is the hole: a
+    /// peer holding an unpublished Home answers a session's version-vector
+    /// exchange with an EMPTY HomePointer kind. `materialize_local_home_
+    /// pointer` (what every session path now runs first) closes it. With
+    /// the helper disabled (the fail-before) the canonical pointer stays
+    /// None and both assertions below fail.
+    #[tokio::test]
+    async fn materialize_local_home_pointer_publishes_an_unpublished_local_home(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8C; 32]).await?;
+        // The server startup attaches the daemon view to the sync
+        // service; owned_state skips startup, so mirror it here.
+        sync_of(&state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        provision_home(&state).await;
+        let sync = sync_of(&state)?;
+        assert!(
+            sync.canonical_home().await.is_none(),
+            "the #863 gap: a freshly provisioned Home is unpublished"
+        );
+        sync.materialize_local_home_pointer().await;
+        let canonical = sync.canonical_home().await.expect("published");
+        let (gid, _) = find_home(&state, &owner_of(&state)).await.expect("Home");
+        assert_eq!(canonical.group_id, gid);
+        // The version vector now ADVERTISES the HomePointer kind — an
+        // empty vector from this peer is henceforth genuine proof it
+        // holds no Home.
+        let vector = sync.store().version_vector().await;
+        assert!(vector.iter().any(|kv| {
+            kv.kind == crate::owner_sync::SyncKind::HomePointer && !kv.entries.is_empty()
+        }));
+        Ok(())
+    }
+
+    /// WHY (#863, the reported duplicate): the rank-0 wait may treat an
+    /// empty session as "no Home exists" only because every session now
+    /// PUBLISHES the peer's local Home pointer before the exchange. Model:
+    /// the follower holds a Home whose pointer is unpublished; its
+    /// session-side publication runs; the session delivers exactly what
+    /// the follower ADVERTISES; the leader's wait yields on the POINTER —
+    /// it reports "elsewhere" and creates nothing. With the publication
+    /// disabled (the fail-before) nothing is advertised, the empty session
+    /// releases rank 0, and the leader creates a duplicate Home.
+    #[tokio::test]
+    async fn rank_zero_adopts_an_unpublished_peer_home_instead_of_duplicating() -> anyhow::Result<()>
+    {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = owned_state(dir_a.path(), [0x8D; 32]).await?;
+        let b = owned_state(dir_b.path(), [0x8D; 32]).await?;
+        for state in [&a, &b] {
+            // Mirror the server-startup view attachment (see above).
+            sync_of(state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(state))));
+        }
+        let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
+        anyhow::ensure!(ma != mb, "distinct machines");
+        enroll_machine(&a, mb.0).await?;
+        enroll_machine(&b, ma.0).await?;
+        let (leader, follower) = if ma.0 < mb.0 { (&a, &b) } else { (&b, &a) };
+        let (leader_machine, follower_machine) =
+            (leader.agent.machine_id(), follower.agent.machine_id());
+
+        // The follower already holds a Home whose pointer is unpublished
+        // (created since its last reconcile pass — the #863 gap).
+        provision_home(follower).await;
+        assert_eq!(home_shaped_group_count(follower).await, 1);
+        assert!(
+            sync_of(follower)?.canonical_home().await.is_none(),
+            "the follower's Home is real but unpublished"
+        );
+
+        // The leader (rank 0 — the only lower machine id) defers.
+        let task = provision_home_at_startup(leader, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader must defer"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A session happens: both sides run the session-side publication
+        // the production session paths run; the merge delivers exactly
+        // what the follower ADVERTISES; both sides record the session.
+        sync_of(follower)?.materialize_local_home_pointer().await;
+        sync_of(leader)?.materialize_local_home_pointer().await;
+        if let Some(canonical) = sync_of(follower)?.canonical_home().await {
+            commit_canonical_home(leader, &canonical.group_id).await?;
+        }
+        sync_of(leader)?
+            .store()
+            .set_session_status(&follower_machine, true)
+            .await;
+        sync_of(follower)?
+            .store()
+            .set_session_status(&leader_machine, true)
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(
+            home_shaped_group_count(leader).await,
+            0,
+            "#863: the leader ADOPTED the follower's Home — no duplicate"
+        );
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(leader))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#824): a pass that reached nobody, or a failed session, says
+    /// nothing about whether the owner already has a Home. Right after the
+    /// key-bearing restart that is the normal case, so neither may end the
+    /// wait. A successful session releases the designated creator (here the
+    /// only candidate, since the one enrolled peer has a higher machine id).
+    #[tokio::test]
+    async fn only_a_successful_session_releases_the_designated_creator() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x86; 32]).await?;
+        let peer = [0xff; 32];
+        enroll_machine(&state, peer).await?;
+        let task = provision_home_at_startup(&state, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("must defer"))?;
+        let sync = sync_of(&state)?;
+        let peer = crate::identity::MachineId(peer);
+
+        sync.sync_all().await;
+        sync.store().set_session_status(&peer, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "an empty or failed pass ended the wait"
+        );
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        assert!(deferral_active(&state));
+
+        sync.store().set_session_status(&peer, true).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(home_shaped_group_count(&state).await, 1);
+        Ok(())
+    }
+
+    /// WHY (#824 OMP D2): the final pointer check and the create must be one
+    /// step. A pointer merged by a session after the check but before the
+    /// create would leave this device holding a duplicate. Creation waits out
+    /// in-flight sessions, then re-checks under the pointer gate.
+    #[tokio::test]
+    async fn a_pointer_landing_while_creation_waits_is_honoured() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8a; 32]).await?;
+        let slot = sync_of(&state)?
+            .hold_session_slot_for_testing()
+            .ok_or_else(|| anyhow::anyhow!("slot"))?;
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { provision_home(&state).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "created a Home while a session that could carry the pointer was in flight"
+        );
+        // The in-flight session merges the owner's pointer, then ends.
+        let canonical = "e1".repeat(16);
+        commit_canonical_home(&state, &canonical).await?;
+        drop(slot);
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        Ok(())
+    }
+
+    /// WHY (#824 OMP D3): the wait's timer is not a safety boundary by itself.
+    /// A 60 s session can still be running when it fires, and could merge the
+    /// owner's pointer just after. Expiry must not create until that session
+    /// has finished, and then must honour what it brought.
+    #[tokio::test]
+    async fn timer_expiry_during_an_in_flight_session_creates_no_duplicate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8b; 32]).await?;
+        let slot = sync_of(&state)?
+            .hold_session_slot_for_testing()
+            .ok_or_else(|| anyhow::anyhow!("slot"))?;
+        let task = provision_home_at_startup(&state, std::time::Duration::from_millis(100))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("must defer"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "timer expiry created a Home while a session was still in flight"
+        );
+        let canonical = "e2".repeat(16);
+        commit_canonical_home(&state, &canonical).await?;
+        drop(slot);
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#824): the wait is for owner devices only. An install with no
+    /// owner provisions nothing, defers nothing, and still answers 404.
+    #[tokio::test]
+    async fn startup_on_an_unowned_install_is_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let unowned = unowned_state(dir.path()).await?;
+        assert!(
+            provision_home_at_startup(&unowned, std::time::Duration::from_secs(60))
+                .await
+                .is_none()
+        );
+        assert!(!deferral_active(&unowned));
+        assert!(unowned.named_groups.read().await.is_empty());
+        let (status, _) =
+            response_json(get_home(State(Arc::clone(&unowned))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// WHY (#824): an owner-key-copied device provisions its OWN Home before
+    /// the owner's canonical pointer syncs, later joins the real Home, and is
+    /// then seated in two Home-shaped groups. With no pointer, `resolve_home`
+    /// picks the smallest stable id — which may be the duplicate — and the
+    /// seat used to MINT there with a 200, handing the joiner a seat in the
+    /// wrong Home. Neither group can be proven canonical locally, so the seat
+    /// must refuse with a typed reason and record no invite anywhere.
+    #[tokio::test]
+    async fn home_seat_refuses_ambiguous_duplicate_without_canonical_pointer() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x82; 32]).await?;
+        provision_home(&state).await;
+        provision_duplicate_home(&state).await?;
+        let owner = owner_of(&state);
+        let (resolved, _) = find_home(state.as_ref(), &owner)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("seated in a Home"))?;
+        anyhow::ensure!(
+            !home_duplicates(&state, &resolved, &owner).await.is_empty(),
+            "fixture must seat this device in two Home-shaped groups"
+        );
+        anyhow::ensure!(
+            effective_canonical_home(&state).await.is_none(),
+            "fixture must have no canonical pointer yet"
+        );
+        let before = issued_invite_count(&state).await;
+
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "ambiguous_home");
+        assert!(body["canonical_group_id"].is_null(), "{body}");
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "an ambiguous Home must mint nothing into either group"
+        );
+        Ok(())
+    }
+
+    /// WHY (#824): the refusal must be precise, not a blanket "duplicates
+    /// exist, never seat". Once the register names one of the two Homes, that
+    /// Home is the owner's, and the seat must mint into IT — never into the
+    /// duplicate — whichever of the two sorts first. A pointer naming a Home
+    /// this device does not hold keeps refusing, and mints nothing.
+    #[tokio::test]
+    async fn home_seat_with_duplicates_mints_only_into_the_canonical_home() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x83; 32]).await?;
+        provision_home(&state).await;
+        provision_duplicate_home(&state).await?;
+        let owner = owner_of(&state);
+        let (smallest, _) = find_home(state.as_ref(), &owner)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("seated in a Home"))?;
+        let others = home_duplicates(&state, &smallest, &owner).await;
+        let largest = others
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("two Homes expected"))?;
+        // Name the group `find_home` would NOT pick, so a mint that ignored
+        // the pointer would land in the wrong Home and fail the assertion.
+        commit_canonical_home(&state, &largest).await?;
+
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["group_id"], largest.as_str());
+
+        // A pointer naming a Home this device holds no seat in stays refused.
+        let before = issued_invite_count(&state).await;
+        commit_canonical_home(&state, &"e1".repeat(16)).await?;
+        let (status, body) = seat(&state, &"7d".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issued_invite_count(&state).await, before);
         Ok(())
     }
 

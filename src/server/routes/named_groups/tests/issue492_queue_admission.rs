@@ -414,6 +414,7 @@ fn member_added_with_owner_mandate_still_queues_on_revision_gap() {
         })
     };
     let build = |owner_mandate| NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: f.info.stable_group_id().to_string(),
         revision: f.info.roster_revision + 4,
         actor: actor.clone(),
@@ -493,6 +494,7 @@ fn refusing_capability_does_not_poison_queue_admission() {
     )
     .expect("signed future commit");
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: f.info.stable_group_id().to_string(),
         revision: f.info.roster_revision + 9,
         actor: actor.clone(),
