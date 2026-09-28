@@ -788,6 +788,17 @@ fn codex_3000_edit_save_keeps_a_concurrent_delete() {
     let a_text = format!("{}{}", &base[..from], &base[to..]);
     let expected = format!("{}{}", &b_text[..from], &b_text[to..]);
     let deleted = &base[from..to];
+    // The cause, checked first: B's script touches only the changed
+    // character of each line (before the ladder: one 422,860-char edit).
+    let script = edit_script(&base, &b_text, Budgets::DEFAULT).expect("script");
+    assert!(script.edits.len() >= 3000, "{} edits", script.edits.len());
+    assert!(
+        script
+            .edits
+            .iter()
+            .all(|e| e.old_end - e.old_start <= 1 && e.new_end - e.new_start <= 1),
+        "an edit re-inserts unchanged text"
+    );
     let texts = runtime().block_on(async {
         let a = open(&shared(), "a").await;
         let b = open(&shared(), "b").await;
@@ -843,6 +854,10 @@ fn unmergeable_large_save_fails_closed_with_a_typed_error() {
     let base = codex_note(3000);
     let mut edited = change_every_line(&base);
     edited.insert_str(141 * 1500, "an inserted line\n");
+    assert!(
+        edit_script(&base, &edited, Budgets::DEFAULT).is_err(),
+        "no safe script exists"
+    );
     runtime().block_on(async {
         let shared = shared();
         let a = open(&shared, "a").await;
@@ -905,11 +920,16 @@ fn scattered_scenario(seed: u64, edits: usize) -> LargeScenario {
                 .then(|| rng.gen_range(0..base_lines[l].len()))
         })
         .collect();
-    // A: one line's tokens a0..a1, at least one token clear of B's column.
+    // A: one line's tokens a0..a1, at least one token clear of B's column,
+    // mostly inside B's block (where a whole-region fallback would undo it).
     let mut a_line;
     let (mut a0, mut a1);
     loop {
-        a_line = rng.gen_range(0..lines);
+        a_line = if rng.gen_bool(0.75) && block > 0 {
+            rng.gen_range(block_start..block_start + block)
+        } else {
+            rng.gen_range(0..lines)
+        };
         let len = base_lines[a_line].len();
         a0 = rng.gen_range(0..len - 1);
         a1 = rng.gen_range(a0 + 1..=len);
@@ -976,6 +996,13 @@ proptest! {
     ) {
         let s = scattered_scenario(seed, edits);
         prop_assert!(s.base.len() > LINE_DIFF_THRESHOLD_BYTES);
+        // Every edit of B's script is one token (the cause of any
+        // resurrection would be a wider replacement).
+        let script = edit_script(&s.base, &s.b_text, Budgets::DEFAULT).expect("script");
+        prop_assert!(script
+            .edits
+            .iter()
+            .all(|e| s.base[e.old_start..e.old_end].chars().count() <= 1));
         let texts = runtime().block_on(run_large_engine(&s, seed));
         prop_assert!(check_large(&s, &texts).is_ok(), "{:?}", check_large(&s, &texts));
     }
