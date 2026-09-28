@@ -72,7 +72,7 @@ amnesia".
   It fails with `UnexpectedEof` on the unfixed candidate and passes with the
   fix.
 - `v045_snapshot_resaves_as_v2_and_round_trips` checks that loading v1 and
-  saving again produces v2, and that v2 re-encoding is a fixed point.
+  saving again produces v2, and that a second v2 save loses nothing.
 - `v2_snapshot_round_trips_new_fields` round-trips `last_history_endorser`
   and the counter, and rejects trailing bytes.
 - `prerelease_v1_current_shape_snapshot_still_loads` covers the candidate

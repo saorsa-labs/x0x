@@ -4665,8 +4665,14 @@ mod tests {
             counter,
             "seq counter round-trips"
         );
-        // v2 re-encode is a fixed point.
-        assert_eq!(encode_snapshot(&again).expect("re-encode"), v2);
+        // v2 -> load -> save stays v2 and loses nothing. (Bytes are not
+        // compared: HashMap/HashSet iteration order varies per instance.)
+        let v2_again = encode_snapshot(&again).expect("re-encode");
+        assert!(v2_again.starts_with(SNAPSHOT_MAGIC_V2));
+        assert_eq!(v2_again.len(), v2.len());
+        let third = load_snapshot_bytes(&v2_again).expect("v2 reloads");
+        assert_v045_fixture_contents(&third);
+        assert_eq!(third.seq_counter_value(), counter);
     }
 
     #[test]
