@@ -4262,10 +4262,7 @@ pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
             let body: SnapshotBodyV2 = snapshot_bincode().deserialize(body_bytes)?;
             (body.store, body.seq_counter)
         } else if let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC_V1.as_slice()) {
-            // RED PROOF (CI mirror only): the 74c34f2 decode of v1 bodies.
-            let _ = decode_snapshot_body_v1;
-            let body: SnapshotBodyV1PreRelease = bincode::deserialize(body_bytes)?;
-            (body.store, body.seq_counter)
+            decode_snapshot_body_v1(body_bytes)?
         } else {
             return Err(std::io::Error::other(
                 "unrecognized kv snapshot format (missing v1/v2 magic) — corrupt or foreign file; \
