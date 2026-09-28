@@ -149,6 +149,27 @@ unchanged:
 
   Short superseding ADRs are proposed alongside this PR.
 
+Owner-sync admission correction, 2026-09-28 (#1040, merged via #1044). The ADR
+file stays unchanged:
+
+- **ADR 0041**: the Decision says owner-to-owner sync runs "over authenticated
+  streams (ADR-0022 identity gate + …)". Since #1040, one narrow path admits an
+  inbound `SyncV1` owner-sync stream without the identity gate. This applies
+  only when the transport-authenticated machine has no known agent in the
+  discovery cache, and the machine is in this device's verified, owner-signed,
+  unexpired, unrevoked enrollment set.
+  - Admission re-checks under the discovery-cache guard. If an agent becomes
+    known during the prefix read, the stream goes through the full ADR-0022
+    gate instead.
+  - The enrollment-only path admits nothing but `SyncV1`, and only to the
+    registered owner-sync acceptor.
+  - The owner-sync dialer may reach an enrolled machine through its
+    bootstrap-cache address, authenticated by peer id, when discovery has no
+    entry.
+  - Reason: a restarted owner device otherwise could not sync with its own
+    enrolled machines until a gossip identity announcement arrived (the R20
+    Home deadlock, #843).
+
 Audit-trim relocations, 2026-08-29. Per the 2026-08-23 ADR audit, the
 mutable mechanics named below were relocated **verbatim** from the
 immutable ADR bodies into maintained design-doc homes (new
