@@ -561,7 +561,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     };
 
     // 1. Miss: no cache entry at all → typed failure, denied.
-    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         denied,
         Err(x0x::groups::owner_cert::OwnerCertFailure::NoCertificate),
@@ -572,7 +572,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     //    promotion) and the SAME check now returns the cert for binding.
     let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &joiner)?;
     announce_cert_for(state.as_ref(), cert.clone()).await;
-    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         admitted,
         Ok(Some(cert)),
@@ -903,6 +903,7 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
     let outsider = AgentKeypair::generate()?;
     let outsider_hex = hex::encode(outsider.agent_id().as_bytes());
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_id.clone(),
         revision: 2,
         actor: owner_hex.clone(),
@@ -979,6 +980,7 @@ async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
         .verify_and_insert(record, Some(&cert))?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_id.clone(),
         revision: 2,
         actor: owner_hex,
@@ -1079,8 +1081,13 @@ async fn reseal_refuses_while_restore_quarantined() -> Result<()> {
     }
     let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
     let req: ResealRequest = serde_json::from_value(serde_json::json!({ "recipient": owner_hex }))?;
-    let (status, json) =
-        secure_group_reseal(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let (status, json) = secure_group_reseal(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,

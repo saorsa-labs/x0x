@@ -176,17 +176,26 @@ async fn call_create(
         "name": "slice 5",
         "topic": topic,
     }))?;
-    let resp = create_task_list(State(Arc::clone(state)), Json(req))
-        .await
-        .into_response();
+    let resp = create_task_list(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     response_json(resp).await
 }
 
 async fn call_add(state: &Arc<AppState>, id: &str) -> Result<(StatusCode, serde_json::Value)> {
     let req: AddTaskRequest = serde_json::from_value(serde_json::json!({ "title": "t" }))?;
-    let resp = add_task(State(Arc::clone(state)), Path(id.to_string()), Json(req))
-        .await
-        .into_response();
+    let resp = add_task(
+        State(Arc::clone(state)),
+        Path(id.to_string()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     response_json(resp).await
 }
 
@@ -199,6 +208,7 @@ async fn call_update(
     let resp = update_task(
         State(Arc::clone(state)),
         Path((id.to_string(), task_hex.to_string())),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(req),
     )
     .await

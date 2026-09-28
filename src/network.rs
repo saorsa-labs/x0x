@@ -30,7 +30,7 @@ pub use self::churn::ChurnSnapshot;
 
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
-use saorsa_gossip_transport::GossipStreamType;
+use saorsa_gossip_transport::{AuthenticatedSession, GossipStreamType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -45,15 +45,164 @@ type AntPeerId = ant_quic::PeerId;
 /// Saorsa gossip PeerId type alias
 type GossipPeerId = saorsa_gossip_types::PeerId;
 
+/// The transport's ML-DSA signer, shared with hop-local pub-sub controls.
+/// The upstream key type derives `Debug` over raw secret bytes, so keep it
+/// behind a redacted wrapper when `NetworkNode` is formatted.
+#[derive(Clone)]
+struct TransportSigningKey(Arc<saorsa_gossip_identity::MlDsaKeyPair>);
+
+impl std::fmt::Debug for TransportSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransportSigningKey([redacted])")
+    }
+}
+
+/// Refuse a signer that cannot authenticate as the actual adjacent QUIC peer.
+fn bound_transport_signing_key(
+    peer_id: AntPeerId,
+    public_key: &ant_quic::MlDsaPublicKey,
+    secret_key: &ant_quic::MlDsaSecretKey,
+) -> NetworkResult<saorsa_gossip_identity::MlDsaKeyPair> {
+    let signer = saorsa_gossip_identity::MlDsaKeyPair::from_keypair_bytes(
+        public_key.as_bytes().to_vec(),
+        secret_key.as_bytes().to_vec(),
+    );
+    if signer.peer_id().to_bytes() != peer_id.0 {
+        return Err(NetworkError::NodeCreation(
+            "pub-sub signer does not match transport peer ID".to_string(),
+        ));
+    }
+
+    const BINDING_PROBE: &[u8] = b"x0x transport signer binding";
+    let signature = signer
+        .sign(BINDING_PROBE)
+        .map_err(|e| NetworkError::NodeCreation(format!("pub-sub transport signer failed: {e}")))?;
+    let valid = saorsa_gossip_identity::MlDsaKeyPair::verify(
+        signer.public_key(),
+        BINDING_PROBE,
+        &signature,
+    )
+    .map_err(|e| NetworkError::NodeCreation(format!("pub-sub signer verification failed: {e}")))?;
+    if !valid {
+        return Err(NetworkError::NodeCreation(
+            "pub-sub signer does not match transport public key".to_string(),
+        ));
+    }
+    Ok(signer)
+}
+
 /// Module-private gossip frame queued between ant-quic receive and gossip dispatch.
 ///
 /// `enqueued_at` is intentionally carried with each frame so diagnostics can
 /// report queue dwell time. The wrapper never crosses the public API boundary.
+/// `session` is the SG-authenticated provenance token stamped at the receive
+/// boundary from the frame's *source* ant connection generation — never looked
+/// up again after dequeue — so a frame queued on connection A cannot acquire
+/// connection B's identity across a reconnect. Membership/Bulk frames carry
+/// `None` (SG's legacy three-tuple projection).
 #[derive(Debug)]
 struct GossipPayload {
     peer_id: AntPeerId,
     data: Bytes,
     enqueued_at: Instant,
+    session: Option<AuthenticatedSession>,
+}
+
+/// One retained live ant connection backing an SG session token.
+///
+/// The QUIC connection handle is retained so its stable id can never be
+/// aliased by a replacement connection for the same peer: a new connection
+/// has a different stable id and therefore must mint a new token.
+struct SessionEntry {
+    connection: ant_quic::high_level::Connection,
+    ant_generation: u64,
+    token: AuthenticatedSession,
+    last_used: Instant,
+}
+
+/// Bounded per-peer registry of live authenticated sessions.
+///
+/// `next` mints process-unique SG token generations; it is unrelated to ant's
+/// connection generation namespace stored alongside in each entry.
+#[derive(Default)]
+struct AuthenticatedSessions {
+    next: u64,
+    peers: HashMap<AntPeerId, SessionEntry>,
+}
+
+/// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
+const STALE_GENERATION_SENTINEL: u64 = u64::MAX;
+
+fn source_generation_matches(source: u64, current: Option<u64>) -> bool {
+    source != STALE_GENERATION_SENTINEL && current == Some(source)
+}
+
+/// Resolve the SG token for a frame whose ant source generation is `source`.
+///
+/// Requires the source to be a non-sentinel generation that is still the
+/// peer's current generation both before and after registry resolution, and
+/// the registry entry to have been minted for exactly that generation. Any
+/// mismatch — reconnect between receive and enqueue, stale pre-auth data,
+/// unknown or evicted registry entry — yields `None` (unauthenticated
+/// provenance), never a relabel of the dequeued frame.
+fn stamped_receive_session(
+    source: u64,
+    before: Option<u64>,
+    registered: Option<(u64, AuthenticatedSession)>,
+    after: Option<u64>,
+) -> Option<AuthenticatedSession> {
+    if !source_generation_matches(source, before) || !source_generation_matches(source, after) {
+        return None;
+    }
+    registered.and_then(|(generation, session)| (generation == source).then_some(session))
+}
+
+/// Post-`open_uni` admission for a guarded gossip egress frame.
+///
+/// Runs synchronously after ant-quic has allocated the stream on the pinned
+/// generation. Every precondition — exact generation, unchanged live SG
+/// token, unsuppressed peer, cleared gossip plane — must still hold before
+/// SG's own `admit` callback is allowed to produce bytes; only then is the
+/// stream-type byte prepended. A refusal returns an error and ant-quic
+/// admits zero bytes without reconnect fallback.
+fn frame_guarded_admission(
+    stream_type: GossipStreamType,
+    expected_generation: u64,
+    actual_generation: u64,
+    expected_session: AuthenticatedSession,
+    current_session: Option<(u64, AuthenticatedSession)>,
+    policy_allows: bool,
+    admit: &saorsa_gossip_transport::SessionAdmission,
+) -> Result<Vec<u8>, ant_quic::EndpointError> {
+    if actual_generation != expected_generation
+        || current_session != Some((expected_generation, expected_session))
+    {
+        return Err(ant_quic::EndpointError::Connection(
+            "authenticated session changed while queued".to_owned(),
+        ));
+    }
+    if !policy_allows {
+        return Err(ant_quic::EndpointError::Connection(
+            "gossip plane policy refuses guarded send".to_owned(),
+        ));
+    }
+    let data = admit(expected_session)
+        .map_err(|error| ant_quic::EndpointError::Connection(error.to_string()))?;
+    let mut framed = Vec::with_capacity(1 + data.len());
+    framed.push(stream_type.to_byte());
+    framed.extend_from_slice(&data);
+    Ok(framed)
+}
+
+impl std::fmt::Debug for AuthenticatedSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Connection handles are not meaningfully printable; report the
+        // bounded registry shape only.
+        f.debug_struct("AuthenticatedSessions")
+            .field("next", &self.next)
+            .field("live_entries", &self.peers.len())
+            .finish()
+    }
 }
 
 /// Default port for x0x nodes (when specified).
@@ -1380,6 +1529,59 @@ fn is_pubsub_shed_eligible(kind: saorsa_gossip_types::MessageKind) -> bool {
     )
 }
 
+/// #810: resolves a PubSub frame's `TopicId` to its admission priority at the
+/// receive pump, so the proactive control-frame shed can exempt Critical
+/// topics. Wired by the gossip runtime once `PubSubManager` (and its priority
+/// registry) exists; while unset the pump keeps the pre-#810 behaviour for
+/// every topic.
+#[derive(Clone)]
+pub(crate) struct PubsubTopicPriorityResolver(
+    Arc<dyn Fn(&saorsa_gossip_types::TopicId) -> saorsa_gossip_types::TopicPriority + Send + Sync>,
+);
+
+impl PubsubTopicPriorityResolver {
+    pub(crate) fn new(
+        resolve: impl Fn(&saorsa_gossip_types::TopicId) -> saorsa_gossip_types::TopicPriority
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self(Arc::new(resolve))
+    }
+
+    fn resolve(&self, topic: &saorsa_gossip_types::TopicId) -> saorsa_gossip_types::TopicPriority {
+        (self.0)(topic)
+    }
+}
+
+impl std::fmt::Debug for PubsubTopicPriorityResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PubsubTopicPriorityResolver")
+    }
+}
+
+/// #810: true when an already-eligible pressured control frame's topic
+/// resolves Critical through the shared resolver slot. The slot is read
+/// lazily per frame (the receiver task is spawned before the runtime fills
+/// it), a missing resolver keeps the pre-#810 behaviour for every topic, and
+/// a structurally uninspectable header falls back to Normal — the shed
+/// decision itself never depended on that inspection pre-#810.
+fn is_critical_pubsub_control(
+    data: &[u8],
+    topic_priority: Option<&Arc<OnceLock<PubsubTopicPriorityResolver>>>,
+) -> bool {
+    let Some(slot) = topic_priority else {
+        return false;
+    };
+    let Some(resolver) = slot.get() else {
+        return false;
+    };
+    let Some(header) = saorsa_gossip_pubsub::inspect_message_header(data) else {
+        return false;
+    };
+    resolver.resolve(&header.topic) == saorsa_gossip_types::TopicPriority::Critical
+}
+
 fn channel_depth<T>(tx: &mpsc::Sender<T>) -> usize {
     tx.max_capacity().saturating_sub(tx.capacity())
 }
@@ -1528,13 +1730,16 @@ impl<T: Send + 'static> DmSpillForwarder<T> {
 /// 16 MiB direct-message plus sustained burst without risking process memory.
 const DM_SPILL_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)] // matches the targeted allow used in named_groups.rs
 async fn forward_gossip_payload(
     tx: &mpsc::Sender<GossipPayload>,
     peer_id: AntPeerId,
     stream_type: GossipStreamType,
     payload: Bytes,
+    session: Option<AuthenticatedSession>,
     channel_name: &'static str,
     diagnostics: &RecvPumpDiagnostics,
+    topic_priority: Option<&Arc<OnceLock<PubsubTopicPriorityResolver>>>,
 ) -> Result<ForwardGossipOutcome, mpsc::error::SendError<GossipPayload>> {
     warn_forward_channel_pressure(tx, peer_id, Some(stream_type), channel_name);
     let max = tx.max_capacity();
@@ -1543,6 +1748,7 @@ async fn forward_gossip_payload(
         peer_id,
         data: payload,
         enqueued_at: Instant::now(),
+        session,
     };
 
     // #378 fix D: NO gossip class may block the single global receive pump.
@@ -1552,14 +1758,22 @@ async fn forward_gossip_payload(
     // class behind one full channel. Direct/relayed DM never reach this
     // function (they have a lossless spill forwarder in `spawn_receiver`).
     if stream_type == GossipStreamType::PubSub {
-        // ADR 0013: under near-overload (>90% full, available < max/10), proactively shed
-        // recoverable control frames (IHAVE/IWANT/AntiEntropy) so the last
-        // slots stay available for data (EAGER). The kind-peek is gated on the
-        // shed threshold, so the steady-state path keeps ADR 0009's flat
-        // try_send behavior with no decode cost.
+        // ADR 0013 + #810: under near-overload (>90% full, available <
+        // max/10), proactively shed recoverable control frames (IHAVE/IWANT/
+        // AntiEntropy) so the last slots stay available for data (EAGER) —
+        // EXCEPT when the frame's topic is Critical: sender-side `ShedNormal`
+        // already protects Critical control on the wire, and dropping the
+        // receiver-side IHAVE/IWANT repair under saturation would re-open the
+        // #807 black hole. Both peeks are gated on the shed threshold, so
+        // the steady-state path keeps ADR 0009's flat try_send behavior with
+        // no decode cost. Kind eligibility keeps the cheap pre-#810 peek; the
+        // structural topic inspection only runs for already-eligible frames,
+        // and a frame whose header will not inspect falls back to the
+        // pre-#810 Normal treatment (review item 3).
         if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
             && saorsa_gossip_pubsub::peek_message_kind(&message.data)
                 .is_some_and(is_pubsub_shed_eligible)
+            && !is_critical_pubsub_control(&message.data, topic_priority)
         {
             let depth = channel_depth(tx);
             diagnostics.record_shed_priority(stream_type, depth, max);
@@ -1723,6 +1937,18 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
+    /// #810: TopicId→priority resolver consulted by the receive pump before
+    /// it proactively sheds a recoverable PubSub control frame. Set once by
+    /// the gossip runtime after `PubSubManager` (and its registry) exists.
+    /// Shared via `Arc` (NetworkNode is Clone) and read lazily per pressured
+    /// frame by the already-spawned receiver task — a spawn-time snapshot
+    /// would always see it empty because the runtime is constructed later.
+    pubsub_topic_priority: Arc<OnceLock<PubsubTopicPriorityResolver>>,
+    /// #810 test-only: the exact resolver handle `spawn_receiver` moved
+    /// into the pump task, so the wiring test observes the PUMP's captured
+    /// local rather than re-deriving it. Set once at spawn.
+    #[cfg(test)]
+    receiver_captured_priority: Arc<OnceLock<Arc<OnceLock<PubsubTopicPriorityResolver>>>>,
     /// Connection-churn observation counters (#368 gate 2). Arc so the
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
@@ -1739,10 +1965,17 @@ pub struct NetworkNode {
     relayed_dm_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<RelayedDmEvent>>>,
     /// Cached local peer ID (ant-quic PeerId).
     peer_id: AntPeerId,
+    /// Key bound to that peer ID for signed adjacent-peer PubSub controls.
+    transport_signing_key: TransportSigningKey,
     /// Bootstrap peer cache for recording connection outcomes.
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
     /// x0x-side connection pool tracking activity, caps, and idle eviction.
     connection_pool: Arc<ConnectionPool>,
+    /// Bounded registry of live authenticated sessions, mapping ant's
+    /// per-connection generations to SG session tokens (receive provenance
+    /// and guarded egress admission). Entries retain their QUIC connection
+    /// handle so a replacement connection can never alias a stable id.
+    authenticated_sessions: Arc<Mutex<AuthenticatedSessions>>,
     /// Per-peer liveness repair locks. Prevents concurrent fanout and
     /// maintenance tasks from repeatedly disconnecting/reconnecting the same
     /// stale connection.
@@ -1780,12 +2013,89 @@ pub struct NetworkNode {
     /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
     /// they must be aborted before `shutdown` can take the *write* lock to drop
     /// the node. Without this, `shutdown` would deadlock on an idle node that
-    /// never receives another packet/connection. (Note: ant-quic frees the bound
-    /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
+    /// never receives another packet/connection. The typed ant-quic shutdown
+    /// then verifies release of the bound UDP socket before reporting success.
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// One-shot shutdown coordinator shared by every clone. The ant node is
+    /// consumed by shutdown, so both success and failure must remain visible
+    /// after the first caller takes it; concurrent callers wait on this same
+    /// terminal result instead of treating an empty `node` slot as success.
+    shutdown_state: Arc<NetworkShutdownCoordinator>,
+    /// Per-instance typed-shutdown failure injected after real cleanup.
+    #[cfg(test)]
+    shutdown_failure_for_test: Arc<Mutex<Option<String>>>,
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+}
+
+#[derive(Clone, Debug)]
+enum NetworkShutdownOutcome {
+    Pending,
+    Complete(Result<(), Arc<str>>),
+}
+
+#[derive(Debug)]
+struct NetworkShutdownCoordinator {
+    started: std::sync::atomic::AtomicBool,
+    outcome: tokio::sync::watch::Sender<NetworkShutdownOutcome>,
+}
+
+impl NetworkShutdownCoordinator {
+    fn new() -> Self {
+        let (outcome, _receiver) = tokio::sync::watch::channel(NetworkShutdownOutcome::Pending);
+        Self {
+            started: std::sync::atomic::AtomicBool::new(false),
+            outcome,
+        }
+    }
+
+    async fn run<F>(&self, shutdown: F) -> NetworkResult<()>
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let mut outcome = self.outcome.subscribe();
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let completion = self.outcome.clone();
+            tokio::spawn(async move {
+                // Keep custody independent of the initiating caller: dropping
+                // or cancelling that caller must not lose the consumed node or
+                // let a later caller manufacture success from an empty slot.
+                let worker = tokio::spawn(shutdown);
+                let result = match worker.await {
+                    Ok(result) => result.map_err(Arc::<str>::from),
+                    Err(error) => Err(Arc::<str>::from(format!(
+                        "network shutdown task failed: {error}"
+                    ))),
+                };
+                completion.send_replace(NetworkShutdownOutcome::Complete(result));
+            });
+        }
+
+        loop {
+            match outcome.borrow_and_update().clone() {
+                NetworkShutdownOutcome::Pending => {}
+                NetworkShutdownOutcome::Complete(Ok(())) => return Ok(()),
+                NetworkShutdownOutcome::Complete(Err(error)) => {
+                    return Err(NetworkError::NodeError(format!(
+                        "network shutdown failed: {error}"
+                    )));
+                }
+            }
+            // The coordinator retains the sender for its whole lifetime, so
+            // closure is not expected. Still fail closed if that invariant is
+            // ever broken rather than spinning or reporting release success.
+            if outcome.changed().await.is_err() {
+                return Err(NetworkError::NodeError(
+                    "network shutdown completion channel closed".to_string(),
+                ));
+            }
+        }
+    }
 }
 
 /// #677 test-only seam: when armed for a node id, THAT node's accept loop
@@ -1831,6 +2141,21 @@ impl NetworkNode {
         bootstrap_cache_config: Option<ant_quic::BootstrapCacheConfig>,
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
+        // Resolve the key before constructing ant-quic: its `None` path uses
+        // this same ML-DSA generator, but would keep the secret inside the
+        // endpoint and leave PubSub unable to sign as the transport peer.
+        let (public_key, secret_key) = match keypair {
+            Some(pair) => pair,
+            None => ant_quic::generate_ml_dsa_keypair().map_err(|e| {
+                NetworkError::NodeCreation(format!("failed to generate transport keypair: {e}"))
+            })?,
+        };
+        let expected_peer_id = ant_quic::derive_peer_id_from_public_key(&public_key);
+        let transport_signing_key = TransportSigningKey(Arc::new(bound_transport_signing_key(
+            expected_peer_id,
+            &public_key,
+            &secret_key,
+        )?));
         let mut builder = NodeConfig::builder()
             // Mitigation, not a correctness fix: give ant-quic's bounded
             // app-facing recv queue enough headroom to match x0x's forwarding
@@ -1880,10 +2205,8 @@ impl NetworkNode {
             builder = builder.known_peer(*peer_addr);
         }
 
-        // Pass the machine keypair to ant-quic so that transport PeerId == MachineId
-        if let Some((pk, sk)) = keypair {
-            builder = builder.keypair(pk, sk);
-        }
+        // The exact pair retained for PubSub must also identify the QUIC node.
+        builder = builder.keypair(public_key, secret_key);
 
         // X0X-0062 reviewer P2 #2: surface ant-quic's best-effort UPnP
         // port-mapping toggle so operators on networks without IGD support
@@ -1921,6 +2244,12 @@ impl NetworkNode {
         })?;
 
         let peer_id = node.peer_id();
+        if transport_signing_key.0.peer_id().to_bytes() != peer_id.0 {
+            node.shutdown().await;
+            return Err(NetworkError::NodeCreation(
+                "ant-quic peer ID does not match pub-sub signer".to_string(),
+            ));
+        }
         // Share the endpoint's cache instance (never a second handle on the
         // same file). The endpoint runs cache maintenance itself.
         let bootstrap_cache = Some(node.bootstrap_cache());
@@ -1960,14 +2289,19 @@ impl NetworkNode {
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
+            pubsub_topic_priority: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            receiver_captured_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
             relayed_dm_rx: Arc::new(tokio::sync::Mutex::new(relayed_dm_rx)),
             peer_id,
+            transport_signing_key,
             bootstrap_cache,
             connection_pool,
+            authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -1975,6 +2309,9 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
+            shutdown_state: Arc::new(NetworkShutdownCoordinator::new()),
+            #[cfg(test)]
+            shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2261,6 +2598,85 @@ impl NetworkNode {
         }
         self.note_connection_pool_activity(*peer_id).await;
         Ok(())
+    }
+
+    /// Upper bound on tracked authenticated sessions. Mirrors the
+    /// connection-pool cap: a zero config falls back to the default.
+    fn session_registry_cap(&self) -> usize {
+        if self.config.max_connections == 0 {
+            DEFAULT_MAX_CONNECTIONS as usize
+        } else {
+            self.config.max_connections as usize
+        }
+    }
+
+    /// Current `(ant generation, SG token)` for a peer with a live, open QUIC
+    /// connection, minting/reusing a registry entry as needed.
+    ///
+    /// A returned entry proves: a non-sentinel current ant generation, a
+    /// non-closed retained QUIC connection whose stable id matches the one
+    /// recorded with the token, and the same ant generation observed before
+    /// and after the registry lock. Eviction is LRU over closed connections
+    /// first, then oldest-used, bounded by `max_peers`.
+    fn current_session_for_peer(
+        node: &Node,
+        registry: &Arc<Mutex<AuthenticatedSessions>>,
+        max_peers: usize,
+        ant_peer: &AntPeerId,
+    ) -> Option<(u64, AuthenticatedSession)> {
+        if max_peers == 0 {
+            return None;
+        }
+        let ant_generation = node.current_connection_generation(ant_peer)?;
+        if ant_generation == STALE_GENERATION_SENTINEL {
+            return None;
+        }
+        let connection = node
+            .inner_endpoint()
+            .get_quic_connection(ant_peer)
+            .ok()
+            .flatten()?;
+        if connection.close_reason().is_some()
+            || node.current_connection_generation(ant_peer) != Some(ant_generation)
+        {
+            return None;
+        }
+        let mut sessions = registry.lock().ok()?;
+        if let Some(entry) = sessions.peers.get_mut(ant_peer) {
+            if entry.connection.stable_id() == connection.stable_id()
+                && entry.ant_generation == ant_generation
+            {
+                entry.last_used = Instant::now();
+                return Some((ant_generation, entry.token));
+            }
+        }
+        let next = sessions.next.checked_add(1)?;
+        sessions
+            .peers
+            .retain(|_, entry| entry.connection.close_reason().is_none());
+        if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(ant_peer) {
+            let oldest = sessions
+                .peers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(peer, _)| *peer)?;
+            sessions.peers.remove(&oldest);
+        }
+        sessions.next = next;
+        let token = AuthenticatedSession {
+            peer: ant_to_gossip_peer_id(ant_peer),
+            generation: next,
+        };
+        sessions.peers.insert(
+            *ant_peer,
+            SessionEntry {
+                connection,
+                ant_generation,
+                token,
+                last_used: Instant::now(),
+            },
+        );
+        Some((ant_generation, token))
     }
 
     async fn disconnect_pool_candidates(&self, peer_ids: Vec<AntPeerId>, reason: &'static str) {
@@ -3795,42 +4211,79 @@ impl NetworkNode {
     /// that never receives another packet. After the tasks are aborted (releasing
     /// their read guards and `node` clones), the node is taken and shut down.
     ///
-    /// NOTE: this closes connections but does **not** synchronously free the
-    /// bound UDP socket — ant-quic's endpoint driver releases it only on process
-    /// exit (saorsa-labs/ant-quic#196). In-process callers that restart must bind
-    /// an *ephemeral* QUIC port rather than reuse a fixed one, until that upstream
-    /// fix lands.
+    /// Compatibility wrapper for callers that cannot consume a typed shutdown
+    /// result. Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
     pub async fn shutdown(&self) {
-        let handles: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
-            Ok(mut tasks) => tasks.drain(..).collect(),
-            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-        };
-        for handle in &handles {
-            handle.abort();
+        if let Err(error) = self.try_shutdown().await {
+            warn!(%error, "network shutdown did not fully release its resources");
         }
-        // Await the aborted tasks so their `Node` clones are dropped before we
-        // drop the node here. An aborted task yields `Err(JoinError::Cancelled)`;
-        // that is expected.
-        for handle in handles {
-            let _ = handle.await;
-        }
-        // Take the node out and shut it down explicitly so connections close
-        // deterministically. As of ant-quic 0.27.27 (#196), `Node::shutdown()`
-        // releases the bound endpoint UDP socket in-process (it swaps in a
-        // throwaway ephemeral socket and drops the original), so a same-process
-        // re-bind on the SAME fixed QUIC port works for a single stop→restart
-        // (proven by tests/server_inprocess.rs::serve_tears_down_cleanly_and_rebinds).
-        // The release is NOT perfectly synchronous: the OS FD for the fixed port
-        // closes once the endpoint driver drops its last reference, shortly after
-        // this returns, so a tight zero-gap loop re-binding the same fixed port
-        // may still see "address already in use" — an embedder should retry.
-        let node = {
-            let mut node_guard = self.node.write().await;
-            node_guard.take()
-        };
-        if let Some(node) = node {
-            node.shutdown().await;
-        }
+    }
+
+    /// Gracefully shut down the node and report whether ant-quic released its
+    /// resources. The first call owns the teardown; every concurrent or later
+    /// call observes the same terminal result, including failures.
+    ///
+    /// The teardown worker is detached from the initiating future so caller
+    /// cancellation cannot abandon a consumed ant node or erase its result.
+    pub async fn try_shutdown(&self) -> NetworkResult<()> {
+        let node = Arc::clone(&self.node);
+        let background_tasks = Arc::clone(&self.background_tasks);
+        let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
+        #[cfg(test)]
+        let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
+        self.shutdown_state
+            .run(async move {
+                let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
+                    Ok(mut tasks) => tasks.drain(..).collect(),
+                    Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+                };
+                for handle in &handles {
+                    handle.abort();
+                }
+                // Await aborted tasks so their Node clones are gone before the
+                // sole owned Node is consumed by ant-quic shutdown.
+                for handle in handles {
+                    let _ = handle.await;
+                }
+
+                let node = {
+                    let mut node_guard = node.write().await;
+                    node_guard.take()
+                };
+                // Drop retained session-registry connections alongside the
+                authenticated_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .peers
+                    .clear();
+                let Some(node) = node else {
+                    return Err(
+                        "network node was absent before shutdown established a result".to_string(),
+                    );
+                };
+                node.try_shutdown()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                #[cfg(test)]
+                if let Some(error) = shutdown_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Inject a terminal failure after the real node teardown completes.
+    #[cfg(test)]
+    pub(crate) fn fail_shutdown_for_test(&self, error: impl Into<String>) {
+        *self
+            .shutdown_failure_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
     }
 
     /// Get a clone of the inner node, returning an error if not initialized.
@@ -3853,6 +4306,11 @@ impl NetworkNode {
     /// The PeerId for this node.
     pub fn peer_id(&self) -> AntPeerId {
         self.peer_id
+    }
+
+    /// A copy of the signer bound to the authenticated transport identity.
+    pub(crate) fn pubsub_signing_key(&self) -> saorsa_gossip_identity::MlDsaKeyPair {
+        self.transport_signing_key.0.as_ref().clone()
     }
 
     // === Tailnet byte-streams (#132 T1) ===
@@ -4112,24 +4570,64 @@ impl NetworkNode {
             .map_err(|e| NetworkError::ConnectionFailed(format!("inject direct: {e}")))
     }
 
-    async fn receive_from_gossip_channel(
+    async fn receive_from_gossip_channel_with_session(
         rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
         diagnostics: &RecvPumpDiagnostics,
         stream_type: GossipStreamType,
         stream_name: &'static str,
-    ) -> anyhow::Result<(GossipPeerId, Bytes)> {
+    ) -> anyhow::Result<(GossipPeerId, Bytes, Option<AuthenticatedSession>)> {
         let mut rx = rx.lock().await;
         let payload = rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("{stream_name} receive channel closed"))?;
         diagnostics.record_dequeued(stream_type, payload.enqueued_at.elapsed());
-        Ok((ant_to_gossip_peer_id(&payload.peer_id), payload.data))
+        let peer = ant_to_gossip_peer_id(&payload.peer_id);
+        // A token whose peer differs from the dequeued frame's peer is not
+        // provenance for this frame; drop it rather than relabel.
+        let session = payload.session.filter(|session| session.peer == peer);
+        Ok((peer, payload.data, session))
+    }
+
+    async fn receive_from_gossip_channel(
+        rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+        diagnostics: &RecvPumpDiagnostics,
+        stream_type: GossipStreamType,
+        stream_name: &'static str,
+    ) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        let (peer, data, _session) = Self::receive_from_gossip_channel_with_session(
+            rx,
+            diagnostics,
+            stream_type,
+            stream_name,
+        )
+        .await?;
+        Ok((peer, data))
     }
 
     /// Receive the next PubSub gossip message from the dedicated PubSub queue.
     pub async fn receive_pubsub_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
         Self::receive_from_gossip_channel(
+            &self.recv_pubsub_rx,
+            self.recv_pump_diagnostics.as_ref(),
+            GossipStreamType::PubSub,
+            "PubSub",
+        )
+        .await
+    }
+
+    /// Receive the next PubSub gossip message together with the SG session
+    /// token stamped from its source ant connection at the receive boundary.
+    ///
+    /// The token is carried from enqueue time — never re-derived here — so
+    /// frames queued before a reconnect keep their original (by then no
+    /// longer current) provenance, which SG's authenticated dispatcher
+    /// refuses. Returns `None` for frames whose provenance was constrained,
+    /// unknown, or evicted.
+    pub async fn receive_pubsub_message_with_session(
+        &self,
+    ) -> anyhow::Result<(GossipPeerId, Bytes, Option<AuthenticatedSession>)> {
+        Self::receive_from_gossip_channel_with_session(
             &self.recv_pubsub_rx,
             self.recv_pump_diagnostics.as_ref(),
             GossipStreamType::PubSub,
@@ -4160,6 +4658,36 @@ impl NetworkNode {
         .await
     }
 
+    /// The receive pump's shared TopicId→priority slot (#810). The receiver
+    /// task captures this handle at spawn; the gossip runtime fills the slot
+    /// afterwards, and the pump reads it lazily per pressured frame.
+    #[cfg(test)]
+    fn pubsub_topic_priority_slot(&self) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+        Arc::clone(&self.pubsub_topic_priority)
+    }
+
+    /// The resolver handle the receiver PUMP captures at spawn (#810).
+    /// Extracted as the single capture site so the wiring test observes the
+    /// pump's actual handle — reintroducing a spawn-time snapshot here (the
+    /// original #830 blocker) disconnects the pump from the runtime wiring
+    /// and fails that test.
+    fn receiver_topic_priority_handle(
+        slot: &Arc<OnceLock<PubsubTopicPriorityResolver>>,
+    ) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+        Arc::clone(slot)
+    }
+
+    /// Install the #810 TopicId→priority resolver consulted by the receive
+    /// pump before it proactively sheds a recoverable PubSub control frame.
+    /// One-shot: the first resolver wins and later installs are ignored, so
+    /// test doubles cannot silently replace the production wiring.
+    pub(crate) fn set_pubsub_topic_priority_resolver(
+        &self,
+        resolver: PubsubTopicPriorityResolver,
+    ) -> bool {
+        self.pubsub_topic_priority.set(resolver).is_ok()
+    }
+
     /// Spawn background receiver task that parses gossip stream types.
     ///
     /// This task continuously receives messages from ant-quic, parses the
@@ -4168,8 +4696,18 @@ impl NetworkNode {
     /// - Gossip transport channel (for 0x00, 0x01, 0x02 gossip messages)
     fn spawn_receiver(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
+        let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
+        let session_registry_cap = self.session_registry_cap();
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
+        let pubsub_topic_priority =
+            Self::receiver_topic_priority_handle(&self.pubsub_topic_priority);
+        #[cfg(test)]
+        {
+            let _ = self
+                .receiver_captured_priority
+                .set(Arc::clone(&pubsub_topic_priority));
+        }
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         // #378 fix D: DM classes go through lossless spill forwarders so the
@@ -4200,7 +4738,7 @@ impl NetworkNode {
                     }
                 };
 
-                let recv_result = node_ref.recv().await;
+                let recv_result = node_ref.recv_with_generation().await;
                 // Explicitly drop the read lock guard so we don't hold it
                 // across channel sends — otherwise a backpressured direct_tx
                 // or stream-specific gossip channel can stall every other caller
@@ -4208,7 +4746,7 @@ impl NetworkNode {
                 drop(node_guard);
 
                 match recv_result {
-                    Ok((peer_id, data)) => {
+                    Ok((peer_id, source_generation, data)) => {
                         if data.is_empty() {
                             continue;
                         }
@@ -4397,6 +4935,45 @@ impl NetworkNode {
                             peer_id
                         );
 
+                        // Stamp receive provenance *before* enqueue. The
+                        // frame's ant source generation (from
+                        // `recv_with_generation`) must still be the peer's
+                        // current generation both before and after registry
+                        // resolution; a reconnect in that window, sentinel
+                        // (constrained/pre-auth) provenance, or an
+                        // unknown/evicted registry entry all yield `None` —
+                        // the dequeued frame is never relabelled with a
+                        // later connection's identity. Only PubSub consumes
+                        // the token; Membership/Bulk keep the legacy
+                        // three-tuple projection.
+                        let session = {
+                            let guard = node.read().await;
+                            match guard.as_ref() {
+                                Some(n) => {
+                                    let before = n.current_connection_generation(&peer_id);
+                                    let registered =
+                                        source_generation_matches(source_generation, before)
+                                            .then(|| {
+                                                Self::current_session_for_peer(
+                                                    n,
+                                                    &authenticated_sessions,
+                                                    session_registry_cap,
+                                                    &peer_id,
+                                                )
+                                            })
+                                            .flatten();
+                                    let after = n.current_connection_generation(&peer_id);
+                                    stamped_receive_session(
+                                        source_generation,
+                                        before,
+                                        registered,
+                                        after,
+                                    )
+                                }
+                                None => None,
+                            }
+                        };
+
                         let forward_result = match stream_type {
                             GossipStreamType::PubSub => {
                                 forward_gossip_payload(
@@ -4404,8 +4981,10 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    session,
                                     "recv_pubsub_tx",
                                     recv_pump_diagnostics.as_ref(),
+                                    Some(&pubsub_topic_priority),
                                 )
                                 .await
                             }
@@ -4415,8 +4994,10 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    None,
                                     "recv_membership_tx",
                                     recv_pump_diagnostics.as_ref(),
+                                    None,
                                 )
                                 .await
                             }
@@ -4426,8 +5007,10 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    None,
                                     "recv_bulk_tx",
                                     recv_pump_diagnostics.as_ref(),
+                                    None,
                                 )
                                 .await
                             }
@@ -5366,8 +5949,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 
     async fn close(&self) -> anyhow::Result<()> {
-        self.shutdown().await;
-        Ok(())
+        self.try_shutdown().await.map_err(anyhow::Error::new)
     }
 
     async fn send_to_peer(
@@ -5456,6 +6038,86 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .collect()
     }
 
+    fn authenticated_session(&self, peer: GossipPeerId) -> Option<AuthenticatedSession> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+        let node_guard = self.node.try_read().ok()?;
+        let node = node_guard.as_ref()?;
+        Self::current_session_for_peer(
+            node,
+            &self.authenticated_sessions,
+            self.session_registry_cap(),
+            &ant_peer,
+        )
+        .map(|(_, session)| session)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: GossipPeerId,
+        stream_type: saorsa_gossip_transport::GossipStreamType,
+        admit: saorsa_gossip_transport::SessionAdmission,
+    ) -> anyhow::Result<()> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Capture the exact (ant generation, SG token) before any queue
+        // wait: the node read lock below can park behind shutdown's write
+        // lock, and ant-quic pins the same generation for stream
+        // allocation. Policy is *not* settled here — the authoritative
+        // rechecks run inside the post-`open_uni` callback below.
+        let (ant_generation, session) = {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            Self::current_session_for_peer(
+                node,
+                &self.authenticated_sessions,
+                self.session_registry_cap(),
+                &ant_peer,
+            )
+            .ok_or_else(|| anyhow::anyhow!("authenticated session unavailable"))?
+        };
+
+        // Cheap pre-waits refusal: a suppressed or non-cleared peer fails
+        // the same policy the callback enforces, without allocating a
+        // stream first. Still an error with zero bytes admitted — guarded
+        // egress never silently holds like the ordinary path's `Ok(())`.
+        if self.is_reconnect_suppressed(ant_peer.0) || !self.plane_gate_allows(&ant_peer) {
+            return Err(anyhow::anyhow!(
+                "gossip plane policy refuses guarded send to peer {:?}",
+                peer
+            ));
+        }
+
+        {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
+                frame_guarded_admission(
+                    stream_type,
+                    ant_generation,
+                    actual,
+                    session,
+                    Self::current_session_for_peer(
+                        node,
+                        &self.authenticated_sessions,
+                        self.session_registry_cap(),
+                        &ant_peer,
+                    ),
+                    !self.is_reconnect_suppressed(ant_peer.0) && self.plane_gate_allows(&ant_peer),
+                    &admit,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("guarded send failed: {}", e))?;
+        }
+        // Match the ordinary send path's pool bookkeeping on success.
+        self.note_connection_pool_activity(ant_peer).await;
+        Ok(())
+    }
+
     async fn receive_message(
         &self,
     ) -> anyhow::Result<(
@@ -5490,6 +6152,46 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         }
     }
 
+    async fn receive_message_with_session(
+        &self,
+    ) -> anyhow::Result<(
+        GossipPeerId,
+        saorsa_gossip_transport::GossipStreamType,
+        bytes::Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        // Same biased select as `receive_message`; only a PubSub-queued
+        // payload carries a stamped token (Bulk/Membership stay `None`),
+        // and a token whose peer differs from the dequeued frame is
+        // dropped rather than relabelled onto those bytes.
+        let mut bulk_rx = self.recv_bulk_rx.lock().await;
+        let mut membership_rx = self.recv_membership_rx.lock().await;
+        let mut pubsub_rx = self.recv_pubsub_rx.lock().await;
+
+        tokio::select! {
+            biased;
+            msg = bulk_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Bulk receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Bulk, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Bulk, payload.data, None))
+            }
+            msg = membership_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Membership receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Membership, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Membership, payload.data, None))
+            }
+            msg = pubsub_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("PubSub receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::PubSub, payload.enqueued_at.elapsed());
+                let peer = ant_to_gossip_peer_id(&payload.peer_id);
+                let session = payload.session.filter(|session| session.peer == peer);
+                Ok((peer, GossipStreamType::PubSub, payload.data, session))
+            }
+        }
+    }
     fn local_peer_id(&self) -> GossipPeerId {
         ant_to_gossip_peer_id(&self.peer_id())
     }
@@ -5791,6 +6493,209 @@ mod map_gossip_send_error_tests {
     }
 }
 
+/// Pure receive-provenance and guarded-admission tests for the SG session
+/// seam. These exercise the decision helpers only — no sockets, no Node.
+#[cfg(test)]
+mod session_provenance_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn token(generation: u64) -> AuthenticatedSession {
+        AuthenticatedSession {
+            peer: GossipPeerId::new([9; 32]),
+            generation,
+        }
+    }
+
+    #[test]
+    fn old_queued_generation_stays_old_across_reconnect() {
+        // Frame read on generation 5; a reconnect (now 6) happened before
+        // the stamp completed. The frame must NOT inherit generation 6's
+        // token — provenance becomes None, not a relabel.
+        assert_eq!(
+            stamped_receive_session(5, Some(5), Some((5, token(41))), Some(6)),
+            None
+        );
+        // Reconnect observed before registry resolution: equally refused.
+        assert_eq!(
+            stamped_receive_session(5, Some(6), Some((6, token(42))), Some(6)),
+            None
+        );
+    }
+
+    #[test]
+    fn sentinel_or_unknown_source_generation_is_none() {
+        // ant-quic's u64::MAX sentinel denotes constrained / pre-auth
+        // ingress and must never authorize a session.
+        assert_eq!(
+            stamped_receive_session(
+                STALE_GENERATION_SENTINEL,
+                Some(STALE_GENERATION_SENTINEL),
+                Some((STALE_GENERATION_SENTINEL, token(1))),
+                Some(STALE_GENERATION_SENTINEL),
+            ),
+            None
+        );
+        // Unknown / evicted registry entry: no token.
+        assert_eq!(stamped_receive_session(3, Some(3), None, Some(3)), None);
+        // No live connection at all.
+        assert_eq!(stamped_receive_session(3, None, None, None), None);
+    }
+
+    #[test]
+    fn matching_source_generation_keeps_enqueued_token_identity() {
+        let enqueued = token(77);
+        let resolved = stamped_receive_session(5, Some(5), Some((5, enqueued)), Some(5))
+            .expect("live matching generation resolves to the enqueued token");
+        assert_eq!(resolved, enqueued);
+        // A registry entry minted for a *different* ant generation cannot
+        // vouch for this frame.
+        assert_eq!(
+            stamped_receive_session(5, Some(5), Some((6, token(78))), Some(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_generation_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            6,
+            token(1),
+            Some((6, token(2))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ant_quic::EndpointError::Connection(_)),
+            "generation change must be a connection refusal, got {err:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_session_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        // Same ant generation, but the registry now holds a different SG
+        // token (connection was replaced under the same generation number):
+        // the queued token is stale.
+        let err = frame_guarded_admission(
+            GossipStreamType::Bulk,
+            5,
+            5,
+            token(1),
+            Some((5, token(2))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_policy_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        // Generation and session intact, but the peer became suppressed or
+        // lost plane clearance while the send waited.
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            token(1),
+            Some((5, token(1))),
+            false,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_propagates_admit_refusal_as_error() {
+        let admit: saorsa_gossip_transport::SessionAdmission =
+            Arc::new(|_| anyhow::bail!("SG refused the session"));
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            token(1),
+            Some((5, token(1))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        let ant_quic::EndpointError::Connection(reason) = err else {
+            panic!("admit refusal must surface as a connection error");
+        };
+        assert_eq!(reason, "SG refused the session");
+    }
+    #[test]
+    fn frame_guarded_admission_prepends_stream_byte_after_checks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let expected = token(1);
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            Arc::new(move |session| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(session);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        let framed = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            expected,
+            Some((5, expected)),
+            true,
+            &admit,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            framed,
+            std::iter::once(GossipStreamType::PubSub.to_byte())
+                .chain(b"payload".iter().copied())
+                .collect::<Vec<u8>>()
+        );
+        let observed = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(*observed, vec![expected]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -5812,6 +6717,130 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    #[test]
+    fn pubsub_signer_is_bound_to_transport_machine_not_agent_identity() {
+        let (machine_public, machine_secret) =
+            ant_quic::generate_ml_dsa_keypair().expect("machine keypair");
+        let (agent_public, agent_secret) =
+            ant_quic::generate_ml_dsa_keypair().expect("distinct agent keypair");
+        let machine_peer_id = ant_quic::derive_peer_id_from_public_key(&machine_public);
+
+        let signer = bound_transport_signing_key(machine_peer_id, &machine_public, &machine_secret)
+            .expect("matching transport signer");
+        assert_eq!(
+            format!("{:?}", TransportSigningKey(Arc::new(signer.clone()))),
+            "TransportSigningKey([redacted])"
+        );
+        assert_eq!(signer.peer_id().to_bytes(), machine_peer_id.0);
+        let signature = signer.sign(b"application frame").expect("sign frame");
+        assert!(saorsa_gossip_identity::MlDsaKeyPair::verify(
+            machine_public.as_bytes(),
+            b"application frame",
+            &signature,
+        )
+        .expect("verify against transport public key"));
+
+        assert!(
+            bound_transport_signing_key(machine_peer_id, &agent_public, &agent_secret).is_err(),
+            "an agent key must not impersonate the transport machine"
+        );
+        assert!(
+            bound_transport_signing_key(machine_peer_id, &machine_public, &agent_secret).is_err(),
+            "a transport public key paired with an unrelated secret must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_runs_once_and_shares_success() {
+        let coordinator = Arc::new(NetworkShutdownCoordinator::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_calls = Arc::clone(&calls);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .run(async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    first_release.notified().await;
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.expect("shutdown worker started");
+
+        let second_coordinator = Arc::clone(&coordinator);
+        let second_calls = Arc::clone(&calls);
+        let mut second = Box::pin(second_coordinator.run(async move {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "a second caller that has actually polled must wait for first-call custody"
+        );
+        release.notify_one();
+
+        first
+            .await
+            .expect("first caller joins")
+            .expect("first success");
+        second.await.expect("second caller observes shared success");
+        coordinator
+            .run(async { Err("must not run".to_string()) })
+            .await
+            .expect("later caller observes terminal success");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one shutdown worker");
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_persists_failure_for_every_caller() {
+        let coordinator = NetworkShutdownCoordinator::new();
+        let first = coordinator
+            .run(async { Err("injected release failure".to_string()) })
+            .await
+            .expect_err("first caller receives release failure");
+        let second = coordinator
+            .run(async { Ok(()) })
+            .await
+            .expect_err("consumed node cannot become later success");
+        assert!(first.to_string().contains("injected release failure"));
+        assert_eq!(first.to_string(), second.to_string());
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_keeps_custody_after_initiator_cancellation() {
+        let coordinator = Arc::new(NetworkShutdownCoordinator::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let caller_coordinator = Arc::clone(&coordinator);
+        let caller_release = Arc::clone(&release);
+        let caller = tokio::spawn(async move {
+            caller_coordinator
+                .run(async move {
+                    let _ = started_tx.send(());
+                    caller_release.notified().await;
+                    Err("release failed after caller cancellation".to_string())
+                })
+                .await
+        });
+        started_rx.await.expect("shutdown worker started");
+        caller.abort();
+        let _ = caller.await;
+        release.notify_one();
+
+        let error = coordinator
+            .run(async { Ok(()) })
+            .await
+            .expect_err("later caller receives detached worker result");
+        assert!(error
+            .to_string()
+            .contains("release failed after caller cancellation"));
     }
 
     /// Boundary regression for ant-quic's transport-aware connected snapshot.
@@ -6783,8 +7812,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"one"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -6793,8 +7824,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"two"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -6826,8 +7859,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::Membership,
             Bytes::from_static(b"first"),
+            None,
             "recv_membership_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -6838,8 +7873,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::Membership,
             Bytes::from_static(b"second"),
+            None,
             "recv_membership_tx",
             &diagnostics,
+            None,
         );
         // ADR 0033 (amends ADR 0009 §2): the receive pump must NEVER await a
         // full class channel — the old await here head-of-line stalled every
@@ -6873,8 +7910,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::Bulk,
             Bytes::from_static(b"first"),
+            None,
             "recv_bulk_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -6884,8 +7923,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::Bulk,
             Bytes::from_static(b"second"),
+            None,
             "recv_bulk_tx",
             &diagnostics,
+            None,
         );
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
             .await
@@ -6966,8 +8007,11 @@ mod pressure_tests {
                     payload_hash: None,
                 },
                 payload: None,
-                signature: Vec::new(),
-                public_key: Vec::new(),
+                // Structurally valid fixed sizes (ML-DSA-65 signature +
+                // public key) so the pump's header inspection accepts the
+                // frame; the shed gate never verifies the signature itself.
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
             };
             postcard::to_stdvec(&msg).expect("frame serializes").into()
         }
@@ -6984,6 +8028,7 @@ mod pressure_tests {
                 peer_id: peer,
                 data: Bytes::from_static(b"x"),
                 enqueued_at: Instant::now(),
+                session: None,
             })
             .expect("prefill should fit");
         }
@@ -6995,8 +8040,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::IHave),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -7013,8 +8060,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::Eager),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -7027,8 +8076,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::Eager),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();
@@ -7046,6 +8097,386 @@ mod pressure_tests {
         assert_eq!(
             snapshot.pubsub.enqueued_total, 1,
             "exactly one EAGER enqueued into the preserved slot"
+        );
+    }
+
+    #[test]
+    fn pubsub_control_shed_decision_is_priority_aware() {
+        // #810: under near-overload (pressure is checked by the caller), the
+        // shed decision — eligible kind via the cheap peek AND NOT a Critical
+        // topic — must exempt Critical control entirely while keeping
+        // Normal/Bulk control shedding bounded exactly as before.
+        use saorsa_gossip_pubsub::GossipMessage;
+        use saorsa_gossip_types::{MessageHeader, MessageKind, TopicId, TopicPriority};
+
+        fn frame(kind: MessageKind, topic: TopicId) -> Bytes {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic,
+                    msg_id: [0u8; 32],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
+            };
+            postcard::to_stdvec(&msg).expect("frame serializes").into()
+        }
+
+        let critical_topic = TopicId::new([7u8; 32]);
+        let slot: Arc<OnceLock<PubsubTopicPriorityResolver>> = Arc::new(OnceLock::new());
+        assert!(
+            slot.get().is_none(),
+            "precondition: slot empty (pre-wiring state)"
+        );
+
+        // The exact composition the pressured pump applies, per frame.
+        let sheds = |data: &Bytes| -> bool {
+            saorsa_gossip_pubsub::peek_message_kind(data).is_some_and(is_pubsub_shed_eligible)
+                && !is_critical_pubsub_control(data, Some(&slot))
+        };
+
+        // Before the runtime wires the resolver, everything eligible sheds
+        // (the pre-#810 fail-safe default).
+        let critical_ihave = frame(MessageKind::IHave, critical_topic);
+        assert!(sheds(&critical_ihave), "unwired slot: pre-#810 behaviour");
+
+        // After wiring: Critical control is exempt, Normal/Bulk is not.
+        let normal_topic = TopicId::new([0u8; 32]);
+        let bulk_topic = TopicId::new([9u8; 32]);
+        assert!(slot
+            .set(PubsubTopicPriorityResolver::new(move |topic| {
+                if *topic == critical_topic {
+                    TopicPriority::Critical
+                } else if *topic == bulk_topic {
+                    TopicPriority::Bulk
+                } else {
+                    TopicPriority::Normal
+                }
+            }))
+            .is_ok());
+        assert!(
+            !sheds(&frame(MessageKind::IHave, critical_topic)),
+            "Critical IHAVE is never proactively shed"
+        );
+        assert!(
+            !sheds(&frame(MessageKind::IWant, critical_topic)),
+            "Critical IWANT is never proactively shed"
+        );
+        assert!(
+            !sheds(&frame(MessageKind::AntiEntropy, critical_topic)),
+            "Critical anti-entropy is never proactively shed"
+        );
+        assert!(
+            sheds(&frame(MessageKind::IHave, normal_topic)),
+            "Normal control shedding is unchanged"
+        );
+        assert!(
+            sheds(&frame(MessageKind::IWant, bulk_topic)),
+            "Bulk control shedding is unchanged"
+        );
+        assert!(
+            !sheds(&frame(MessageKind::Eager, bulk_topic)),
+            "EAGER (data) is never proactively shed regardless of priority"
+        );
+
+        // A structurally malformed control frame (bad signature/key sizes)
+        // keeps the cheap kind peek, and falls back to Normal for the topic:
+        // still shed, exactly as pre-#810 (review item 3).
+        let malformed = {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic: critical_topic,
+                    msg_id: [0u8; 32],
+                    kind: MessageKind::IHave,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: Vec::new(),
+                public_key: Vec::new(),
+            };
+            Bytes::from(postcard::to_stdvec(&msg).expect("frame serializes"))
+        };
+        assert!(
+            saorsa_gossip_pubsub::peek_message_kind(&malformed)
+                .is_some_and(is_pubsub_shed_eligible),
+            "kind peek still recognises the malformed control frame"
+        );
+        assert!(
+            !is_critical_pubsub_control(&malformed, Some(&slot)),
+            "uninspectable header falls back to Normal (not Critical)"
+        );
+        assert!(sheds(&malformed), "malformed control sheds as pre-#810");
+    }
+
+    #[tokio::test]
+    async fn recv_pump_topic_priority_slot_is_lazily_wired_by_the_runtime() {
+        // #810 wiring (review item 2, r2 form): the receiver task is spawned
+        // inside `NetworkNode::new`, BEFORE `GossipRuntime` exists. The
+        // pump's captured handle must therefore be the SHARED resolver slot
+        // (read lazily per pressured frame), never a spawn-time snapshot —
+        // a snapshot is always empty, so the Critical exemption never runs
+        // and every node still sheds Critical IHAVE/IWANT. This test takes
+        // its handle from the pump's single capture site
+        // (`receiver_topic_priority_handle`, exactly what `spawn_receiver`
+        // captures) around the REAL construction path, so reintroducing the
+        // snapshot at that site fails here.
+        use crate::gossip::runtime::GossipRuntime;
+        use crate::gossip::GossipConfig;
+        use saorsa_gossip_types::TopicId;
+
+        let network = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("network node");
+
+        // The exact handle the spawned pump captured.
+        let pump_handle = network
+            .receiver_captured_priority
+            .get()
+            .expect("spawn_receiver recorded the handle it moved into the pump")
+            .clone();
+        assert!(
+            pump_handle.get().is_none(),
+            "pre-runtime: the pump's slot is empty"
+        );
+
+        // The real wiring: GossipRuntime::new constructs PubSubManager and
+        // installs the registry-backed resolver into the shared slot.
+        let runtime = GossipRuntime::new(GossipConfig::default(), Arc::new(network), None)
+            .await
+            .expect("gossip runtime");
+        assert!(
+            Arc::ptr_eq(&pump_handle, &runtime_network_slot(&runtime)),
+            "the pump's captured handle IS the slot the runtime filled"
+        );
+        assert!(
+            pump_handle.get().is_some(),
+            "the already-spawned pump must observe the resolver the runtime installed"
+        );
+
+        // The resolver answers through the real registry: `x0x/dm/v1/bus` is
+        // statically registered Critical; an arbitrary unregistered topic
+        // reads Normal (the documented relay-side limit).
+        let dm_bus = TopicId::from_entity(b"x0x/dm/v1/bus");
+        assert!(
+            is_critical_pubsub_control(&critical_topic_frame(dm_bus), Some(&pump_handle)),
+            "the pump's captured handle resolves a registered Critical topic"
+        );
+        assert_eq!(
+            pump_handle
+                .get()
+                .expect("resolver installed")
+                .resolve(&TopicId::new([42u8; 32])),
+            saorsa_gossip_types::TopicPriority::Normal,
+            "unregistered topics read Normal through the same slot"
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+
+        fn runtime_network_slot(
+            runtime: &GossipRuntime,
+        ) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+            runtime.network().pubsub_topic_priority_slot()
+        }
+
+        fn critical_topic_frame(topic: saorsa_gossip_types::TopicId) -> Bytes {
+            use saorsa_gossip_pubsub::GossipMessage;
+            use saorsa_gossip_types::{MessageHeader, MessageKind};
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic,
+                    msg_id: [0u8; 32],
+                    kind: MessageKind::IHave,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
+            };
+            Bytes::from(postcard::to_stdvec(&msg).expect("frame serializes"))
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_pump_preserves_critical_control_under_pressure_but_sheds_bulk() {
+        // #810 (Rule 9): the >90% proactive control shed must be
+        // priority-aware. A Critical-topic control frame — the
+        // `x0x/dm/v1/*` IHAVE/IWANT lazy repair that fixes #807 — must
+        // still reach PubSub when the queue is near-full, while Bulk
+        // control is still shed. On the pre-#810 kind-only shed both
+        // frames are dropped, so the Critical assertions below fail.
+        use saorsa_gossip_pubsub::GossipMessage;
+        use saorsa_gossip_types::{MessageHeader, MessageKind, TopicId, TopicPriority};
+
+        fn frame(kind: MessageKind, topic: TopicId) -> Bytes {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic,
+                    msg_id: [0u8; 32],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                // Structurally valid fixed sizes so the pump's header
+                // inspection accepts the frame.
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
+            };
+            postcard::to_stdvec(&msg).expect("frame serializes").into()
+        }
+
+        let critical_topic = TopicId::new([7u8; 32]);
+        let bulk_topic = TopicId::new([9u8; 32]);
+        let slot: Arc<OnceLock<PubsubTopicPriorityResolver>> = Arc::new(OnceLock::new());
+        assert!(slot
+            .set(PubsubTopicPriorityResolver::new(move |topic| {
+                if *topic == critical_topic {
+                    TopicPriority::Critical
+                } else if *topic == bulk_topic {
+                    TopicPriority::Bulk
+                } else {
+                    TopicPriority::Normal
+                }
+            }))
+            .is_ok());
+        let peer = ant_quic::PeerId([11; 32]);
+
+        fn prefill(tx: &tokio::sync::mpsc::Sender<GossipPayload>, peer: ant_quic::PeerId) {
+            for _ in 0..19 {
+                tx.try_send(GossipPayload {
+                    peer_id: peer,
+                    data: Bytes::from_static(b"x"),
+                    enqueued_at: Instant::now(),
+                    session: None,
+                })
+                .expect("prefill should fit");
+            }
+            assert_eq!(tx.capacity(), 1, "channel should have one free slot");
+        }
+
+        // Critical IHAVE claims the last slot instead of being shed.
+        let (tx, _rx) = mpsc::channel::<GossipPayload>(20);
+        let diagnostics = RecvPumpDiagnostics::new();
+        prefill(&tx, peer);
+        let critical = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IHave, critical_topic),
+            None,
+            "recv_pubsub_tx",
+            &diagnostics,
+            Some(&slot),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            critical,
+            ForwardGossipOutcome::Enqueued,
+            "Critical IHAVE must reach PubSub under near-overload"
+        );
+        assert_eq!(
+            tx.capacity(),
+            0,
+            "the Critical frame consumed the last slot"
+        );
+        assert_eq!(
+            diagnostics.snapshot().pubsub.shed_priority,
+            0,
+            "preserving Critical control must not count as a shed"
+        );
+
+        // Bulk IHAVE on the now-full queue is still shed (bounded as before).
+        let bulk = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IHave, bulk_topic),
+            None,
+            "recv_pubsub_tx",
+            &diagnostics,
+            Some(&slot),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bulk,
+            ForwardGossipOutcome::Shed,
+            "Bulk control shedding is unchanged under near-overload"
+        );
+        assert_eq!(
+            diagnostics.snapshot().pubsub.shed_priority,
+            1,
+            "exactly the Bulk control frame was shed"
+        );
+
+        // Critical IWANT is preserved the same way (fresh queue).
+        let (tx, _rx) = mpsc::channel::<GossipPayload>(20);
+        let diagnostics = RecvPumpDiagnostics::new();
+        prefill(&tx, peer);
+        let critical_iwant = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IWant, critical_topic),
+            None,
+            "recv_pubsub_tx",
+            &diagnostics,
+            Some(&slot),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            critical_iwant,
+            ForwardGossipOutcome::Enqueued,
+            "Critical IWANT must reach PubSub under near-overload"
+        );
+        assert_eq!(diagnostics.snapshot().pubsub.shed_priority, 0);
+
+        // Without a resolver installed the pump keeps the pre-#810
+        // behaviour for every topic (fail-safe default).
+        let (tx, _rx) = mpsc::channel::<GossipPayload>(20);
+        let diagnostics = RecvPumpDiagnostics::new();
+        prefill(&tx, peer);
+        let unresolved = forward_gossip_payload(
+            &tx,
+            peer,
+            GossipStreamType::PubSub,
+            frame(MessageKind::IHave, critical_topic),
+            None,
+            "recv_pubsub_tx",
+            &diagnostics,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unresolved,
+            ForwardGossipOutcome::Shed,
+            "no resolver installed: pre-#810 shed behaviour is retained"
         );
     }
 
@@ -7119,8 +8550,10 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"payload"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
+            None,
         )
         .await
         .unwrap();

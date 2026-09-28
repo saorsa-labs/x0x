@@ -31,14 +31,40 @@ fn ephemeral_family_payloads() -> Vec<(&'static str, Vec<u8>)> {
     })
     .expect("serialize chunk ack");
 
-    let mut group_public = b"X0X-GROUP-PUBLIC-V1\n".to_vec();
-    group_public.extend_from_slice(br#"{"group_id":"g"}"#);
+    let keypair = x0x::identity::AgentKeypair::generate().expect("generate group author");
+    let group_message = x0x::groups::GroupPublicMessage::sign(
+        "g".into(),
+        "state-hash".into(),
+        1,
+        &keypair,
+        None,
+        x0x::groups::GroupPublicMessageKind::Chat,
+        "hello group".into(),
+        1_000,
+        None,
+        None,
+        None,
+    )
+    .expect("sign group public message");
+    let mut group_public = x0x::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX.to_vec();
+    group_public.extend_from_slice(
+        &serde_json::to_vec(&group_message).expect("serialize group public message"),
+    );
     let mut kv_delta = b"X0X-KV-DELTA-V1\n".to_vec();
-    kv_delta.extend_from_slice(b"delta-bytes");
+    kv_delta.extend_from_slice(
+        &serde_json::to_vec(&serde_json::json!({
+            "store_id": "store-1",
+            "peer_id": saorsa_gossip_types::PeerId::new([9; 32]),
+            "delta": x0x::kv::KvStoreDelta::new(42),
+        }))
+        .expect("serialize KV delta"),
+    );
     let mut ltc_card = b"X0X-LTC-CARD-V1\n".to_vec();
     ltc_card.extend_from_slice(b"frame");
-    let mut exec = x0x::exec::protocol::EXEC_DM_PREFIX.to_vec();
-    exec.extend_from_slice(b"exec-frame");
+    let exec = x0x::exec::encode_frame_payload(&x0x::exec::ExecFrame::LeaseRenew {
+        request_id: x0x::exec::ExecRequestId([7; 16]),
+    })
+    .expect("encode exec frame");
     let mut voice_sig = x0x::history::classify::VOICE_SIGNALING_DM_PREFIX.to_vec();
     voice_sig.extend_from_slice(br#"{"type":"connection_ready","session_id":"call-1"}"#);
 
@@ -112,6 +138,26 @@ fn durable_dm_families_are_recorded() {
     .expect("serialize offer");
     for (name, payload, want_ct) in [
         ("chat-text", b"hello over x0x".to_vec(), "text/plain"),
+        (
+            "malformed-group-public-prefix",
+            b"X0X-GROUP-PUBLIC-V1\n{\"group_id\":\"g\"}".to_vec(),
+            "text/plain",
+        ),
+        (
+            "bare-group-public-prefix",
+            x0x::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX.to_vec(),
+            "text/plain",
+        ),
+        (
+            "bare-kv-prefix",
+            x0x::history::classify::KV_STORE_DELTA_DM_PREFIX.to_vec(),
+            "text/plain",
+        ),
+        (
+            "bare-exec-prefix",
+            x0x::exec::protocol::EXEC_DM_PREFIX.to_vec(),
+            "text/plain",
+        ),
         (
             "a2a-jsonrpc",
             br#"{"jsonrpc":"2.0","method":"tasks/send","id":1}"#.to_vec(),

@@ -74,11 +74,19 @@ struct Probe {
 pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
     // Typed byte-prefix frames: plumbing families with their own durable
     // surfaces (group ingest, KV store, exec audit log, card import).
-    if payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
+    if payload
+        .strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
+        .is_some_and(|bytes| {
+            serde_json::from_slice::<crate::groups::GroupPublicMessage>(bytes).is_ok()
+        })
+        || payload
+            .strip_prefix(KV_STORE_DELTA_DM_PREFIX)
+            .is_some_and(|bytes| {
+                serde_json::from_slice::<crate::kv::KvStoreDirectDelta>(bytes).is_ok()
+            })
+        || crate::exec::protocol::decode_frame_payload(payload).is_ok()
         || payload.starts_with(LTC_CARD_FRAME_PREFIX)
-        || payload.starts_with(KV_STORE_DELTA_DM_PREFIX)
         || payload.starts_with(VOICE_SIGNALING_DM_PREFIX)
-        || payload.starts_with(crate::exec::protocol::EXEC_DM_PREFIX)
     {
         return DmPayloadClass::Ephemeral;
     }
@@ -112,6 +120,13 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         }
     }
 
+    classify_ordinary_dm_payload(payload)
+}
+
+/// Classify bytes after a registered typed route declined them. The literal
+/// prefix belongs to the user's message and must not suppress its history.
+#[must_use]
+pub(crate) fn classify_ordinary_dm_payload(payload: &[u8]) -> DmPayloadClass {
     if std::str::from_utf8(payload).is_ok() {
         DmPayloadClass::Durable("text/plain")
     } else {
@@ -124,17 +139,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefix_frames_are_ephemeral() {
+    fn typed_prefix_collision_is_durable_user_communication() {
         for prefix in [
-            &b"X0X-GROUP-PUBLIC-V1\n"[..],
-            &b"X0X-LTC-CARD-V1\n"[..],
-            &b"X0X-KV-DELTA-V1\n"[..],
+            GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+            KV_STORE_DELTA_DM_PREFIX,
             crate::exec::protocol::EXEC_DM_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
-            payload.extend_from_slice(b"{\"anything\":1}");
-            assert_eq!(classify_dm_payload(&payload), DmPayloadClass::Ephemeral);
+            payload.extend_from_slice(b"ordinary message");
+            assert_eq!(
+                classify_dm_payload(&payload),
+                DmPayloadClass::Durable("text/plain")
+            );
         }
+        assert_eq!(
+            classify_dm_payload(b"X0X-LTC-CARD-V1\n{\"anything\":1}"),
+            DmPayloadClass::Ephemeral
+        );
+    }
+
+    #[test]
+    fn valid_exec_frame_remains_ephemeral() {
+        let frame = crate::exec::ExecFrame::LeaseRenew {
+            request_id: crate::exec::ExecRequestId([7; 16]),
+        };
+        let payload = crate::exec::encode_frame_payload(&frame).expect("encode exec frame");
+        assert!(crate::server::valid_exec_typed_dm(&payload));
+        assert_eq!(classify_dm_payload(&payload), DmPayloadClass::Ephemeral);
     }
 
     #[test]
