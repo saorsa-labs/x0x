@@ -192,8 +192,20 @@ async fn issue_rider(d: &OwnedDaemon, label: &str, groups: Vec<String>) -> (Stri
 }
 
 /// The stable group id of this daemon's Home.
+///
+/// #824: a fresh owned daemon defers provisioning for up to 90 s while it
+/// waits for owner sync, answering the documented transient state
+/// `provisioning_pending` meanwhile. Poll through that state only.
 async fn home_group_id(d: &OwnedDaemon) -> String {
-    let (status, body) = owner_json(d, reqwest::Method::GET, "/home", None).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (status, body) = loop {
+        let (status, body) = owner_json(d, reqwest::Method::GET, "/home", None).await;
+        let pending = status == reqwest::StatusCode::OK && body["state"] == "provisioning_pending";
+        if !pending || tokio::time::Instant::now() >= deadline {
+            break (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     assert_eq!(status, reqwest::StatusCode::OK, "home: {body}");
     body["group_id"]
         .as_str()

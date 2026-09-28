@@ -21,6 +21,46 @@ Each agent maintains a `ContactStore` of known peers with:
 
 The identity listener applies trust evaluation to every incoming announcement. Blocked and machine-mismatched announcements are silently dropped.
 
+## Owner-sync admission for enrolled machines (#1040)
+
+The inbound stream gate resolves a transport-authenticated machine to the
+agents announced on it and denies a machine with no known agent as
+`deny_not_verified`. An owner device that has just restarted has an empty
+discovery cache, so before #1040 it refused its own enrolled owner machine's
+ADR-0041 `SyncV1` stream, and it could not dial that machine either
+(`machine not in discovery cache`). Both lasted until an identity
+announcement arrived, which kept Home at `provisioning_pending` (#824).
+
+Owner sync now rests on the owner-signed enrollment alone:
+
+- **Inbound.** When the machine has **no** known agent, the accept loop checks
+  whether it is in this device's *verified* owner enrollment set: the
+  `OwnerEnrollment` signature chains to the local owner key, the enrollment is
+  current (not expired, not deleted), and the machine is not in the ADR-0018
+  revocation set. If it is, the loop reads the protocol prefix and re-verifies
+  the enrollment. It also re-checks, under the discovery-cache lock and
+  atomically with the handoff, that the machine STILL has no known agent. An
+  agent that became known during the prefix read sends the stream through the
+  normal agent-level gate, including trust, revocation and the connect ACL. A
+  `SyncV1` stream is otherwise handed to the registered owner-sync acceptor,
+  and never to the default channel. Any other protocol
+  is denied `deny_not_verified`, as it was before. The owner-sync session then
+  still requires the owner-key possession proof. Nothing else is widened: a
+  machine with any known agent goes through the normal agent-level gate, and
+  the shared gate used by the datagram lane and forwards is unchanged. The
+  enrollment is verified on every admission; there is no verification cache.
+  Admitted streams log `outcome = "admit_enrolled_owner_sync"`.
+- **Outbound.** If no agent is known on an enrolled machine, the sync pass
+  dials it by its machine id. Enrollment records carry **no addresses**, so the
+  only address source is the bootstrap cache entry for that PeerId. Every dial
+  is peer-authenticated, so no other peer can answer it. An existing
+  connection is reused. No announcement or other unauthenticated hint is used.
+- **Re-announce.** When an enrolled owner machine connects, the device
+  re-announces its identity and starts a sync pass. It does this at most once
+  per machine every 60 s (`OWNER_REANNOUNCE_MIN_INTERVAL`), because every
+  announcement is a network-wide publish that every receiver verifies. Owner
+  sync does not depend on this re-announcement.
+
 ## Connectivity (`connectivity.rs`)
 
 `ReachabilityInfo` summarises how reachable a discovered agent is:

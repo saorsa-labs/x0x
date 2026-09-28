@@ -18,10 +18,31 @@ PREFIX = b"ISSUE501_MEASUREMENT "
 SELECTOR = "legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout"
 KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
+# Reserved SG key-cache control topic: blake3 hex8 of the Rust literal
+# SG_KEY_CACHE_CONTROL_TOPIC in src/legacy_bus_interop_tests.rs (saorsa-gossip
+# 997abc75 crates/pubsub/src/key_cache.rs CONTROL_DOMAIN, pub(crate) upstream).
+# Protected hop-local control egress only; its rows must carry zero msgs and
+# bytes in all four KINDS wherever they appear.
+KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
+CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-PUBSUB_VERSION = "0.5.84"
-PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
+# crates.io 0.5.86: outbound meters, wire_bytes_for_peer and key_cache
+# CONTROL_DOMAIN retain the reviewed git producer's accounting semantics.
+# Group-roster eager selection can change the observed attempt counts.
+REGISTRY_PUBSUB_VERSION = "0.5.86"
+REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+REGISTRY_PUBSUB_SHA = "6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82"
+GIT_PUBSUB_VERSION = "0.5.85"
+GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
+# SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
+# ordinary legacy/v3 Full outbound submissions use final frame lengths.
+# The per-topic application snapshot still exposes exactly four KINDS.
+# Its descendant 9258cee9 keeps the same meter definitions.
+GIT_PUBSUB_REV_ACCOUNTING = "997abc7560d9aabc1ca248b8c6774268aaf57867"
+GIT_PUBSUB_REV_CURRENT = "9258cee9b5f30455675279d02730df1345e6aedc"
+GIT_PUBSUB_SOURCE_ACCOUNTING = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV_ACCOUNTING}#{GIT_PUBSUB_REV_ACCOUNTING}"
+GIT_PUBSUB_SOURCE_CURRENT = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV_CURRENT}#{GIT_PUBSUB_REV_CURRENT}"
 
 
 class Inconclusive(ValueError):
@@ -38,23 +59,57 @@ def integer(value):
     return value
 
 
+def reviewed_producer(package):
+    """Only the exact source graphs whose meter implementations were compared.
+
+    Meter premise (reviewed comparison, luna 2026-09-23): both graphs expose
+    exactly the four application KINDS per topic; `bytes` are the measured
+    wire bytes for each claimed peer (the git 997abc75 producer records the
+    actual Full/Ref/legacy frame length per peer rather than one shared
+    legacy serialized length). Its separate key-cache snapshot counts
+    ordinary legacy/v3 Full outbound submissions by final frame length;
+    hop-local key-cache control stays on a reserved topic outside the four
+    application fields. Source-bound acceptance
+    only — never a wildcard on version, URL, revision, or checksum presence.
+    """
+    return (
+        package.get("version") == REGISTRY_PUBSUB_VERSION
+        and package.get("source") == REGISTRY_PUBSUB_SOURCE
+        and package.get("checksum") == REGISTRY_PUBSUB_SHA
+    ) or (
+        package.get("version") == GIT_PUBSUB_VERSION
+        and package.get("source") in (GIT_PUBSUB_SOURCE_ACCOUNTING, GIT_PUBSUB_SOURCE_CURRENT)
+        and "checksum" not in package
+    )
+
+
 def validate_source_premise(cargo_bytes, rust_bytes):
-    """Bind this evidence premise to the workspace pin and Rust producer check."""
-    dependencies = tomllib.loads(cargo_bytes.decode()).get("dependencies", {})
-    require(
-        dependencies.get("saorsa-gossip-pubsub") == f"={PUBSUB_VERSION}",
-        "WORKSPACE_PUBSUB_PIN_MISMATCH",
-    )
+    """Bind the workspace pin and Rust producer check to the reviewed graphs."""
+    manifest = tomllib.loads(cargo_bytes.decode())
+    pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
+    patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
+    # Registry 0.5.86 is the current package; the historical git producers
+    # remain at 0.5.85 and require an exact reviewed patch revision.
+    if patch is None:
+        require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
+    else:
+        require(pin == f"={GIT_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
+        require(patch in ({"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV_ACCOUNTING},
+                          {"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV_CURRENT}),
+                "WORKSPACE_PUBSUB_PATCH_MISMATCH")
     rust = rust_bytes.decode()
-    versions = re.findall(
-        r'pinned\[0\]\["version"\]\.as_str\(\) != Some\("([^"]+)"\)', rust
-    )
-    checksums = re.findall(
-        r'pinned\[0\]\["checksum"\]\.as_str\(\)\s*!= Some\("([0-9a-f]{64})"\)',
-        rust,
-    )
-    require(versions == [PUBSUB_VERSION], "RUST_PUBSUB_VERSION_MISMATCH")
-    require(checksums == [PUBSUB_SHA], "RUST_PUBSUB_SHA_MISMATCH")
+    for name, expected in (
+        ("REGISTRY_PUBSUB_VERSION", REGISTRY_PUBSUB_VERSION),
+        ("REGISTRY_PUBSUB_SOURCE", REGISTRY_PUBSUB_SOURCE),
+        ("REGISTRY_PUBSUB_SHA", REGISTRY_PUBSUB_SHA),
+        ("GIT_PUBSUB_VERSION", GIT_PUBSUB_VERSION),
+        ("GIT_PUBSUB_SOURCE_ACCOUNTING", GIT_PUBSUB_SOURCE_ACCOUNTING),
+        ("GIT_PUBSUB_SOURCE_CURRENT", GIT_PUBSUB_SOURCE_CURRENT),
+        ("SG_KEY_CACHE_CONTROL_TOPIC", KEY_CACHE_CONTROL_TOPIC),
+    ):
+        values = re.findall(rf'const {name}: &str =\s*"([^"]+)";', rust)
+        require(values == [expected], f"RUST_{name}_MISMATCH")
+        require(rust.count(name) >= 2, f"RUST_{name}_UNUSED")
 
 
 LABELS = ("G5", "D5", "O5", "W5")
@@ -208,7 +263,7 @@ def derive(record, lock_bytes):
     require(hashlib.sha256(lock_bytes).hexdigest() == record["build_lock_sha256"], "BUILD_LOCK_MISMATCH")
     require(HEX64.fullmatch(record["binary_sha256"]) is not None, "BINARY_HASH_MISSING")
     packages = [p for p in tomllib.loads(lock_bytes.decode())["package"] if p["name"] == "saorsa-gossip-pubsub"]
-    require(len(packages) == 1 and packages[0]["version"] == PUBSUB_VERSION and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
+    require(len(packages) == 1 and reviewed_producer(packages[0]), "PRODUCER_PIN_MISMATCH")
     require(0 < len(record["universe"]) <= 64, "UNIVERSE_BOUND")
     full, allowed = set(), set()
     for topic in record["universe"]:
@@ -253,6 +308,15 @@ def derive(record, lock_bytes):
                     y = counters[kind][field]
                     require(y >= x, "COUNTER_DECREASE")
                     deltas[key][kind][field] = y - x
+        # Match the Rust FAIL verdict after row and counter-continuity checks:
+        # protected control traffic is separate from these four data-plane
+        # kinds, and never contributes to the bus-only savings arithmetic.
+        for rows_by_topic in (before, after):
+            reserved = rows_by_topic.get(CONTROL)
+            if reserved is not None and any(reserved[kind][field] != 0
+                                            for kind in KINDS for field in ("msgs", "bytes")):
+                oracle_failures.append(arm + "_RESERVED_TOPIC_DATA_PLANE")
+                break
         if arm == "D5":
             require(BUS in after, "POSITIVE_BUS_ROW_ABSENT")
             # Endpoint peer_scores are retained diagnostics, not a send premise.

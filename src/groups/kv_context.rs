@@ -33,6 +33,7 @@ use crate::identity::AgentId;
 use crate::kv::encrypted::{
     bind_public_payload, encrypted_record_aad, seal_mutation_with_snapshot, store_record_key,
     AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext,
+    PublicAuthorizationVersion,
 };
 use crate::kv::{KvError, KvStoreId, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -46,6 +47,7 @@ struct GssState {
     stable_group_id: String,
     shared_secret: Option<Vec<u8>>,
     secret_epoch: u64,
+    generation: u64,
     active_members: HashSet<AgentId>,
     member_roles: std::collections::HashMap<AgentId, GroupRole>,
     write_access: GroupWriteAccess,
@@ -65,21 +67,29 @@ impl GssState {
             stable_group_id: info.stable_group_id().to_string(),
             shared_secret: info.shared_secret.clone(),
             secret_epoch: info.secret_epoch,
+            generation: 0,
             active_members,
             member_roles,
             write_access: info.policy.write_access,
         }
     }
 
-    fn authorizes_writer(&self, agent: &AgentId) -> bool {
+    fn roster_authorizes_writer(&self, agent: &AgentId) -> bool {
+        if !self.active_members.contains(agent) {
+            return false;
+        }
         match self.write_access {
-            GroupWriteAccess::MembersOnly => self.active_members.contains(agent),
+            GroupWriteAccess::MembersOnly => true,
             GroupWriteAccess::AdminOnly => self
                 .member_roles
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
             GroupWriteAccess::ModeratedPublic => false,
         }
+    }
+
+    fn authorizes_writer(&self, agent: &AgentId) -> bool {
+        self.shared_secret.is_some() && self.roster_authorizes_writer(agent)
     }
 }
 
@@ -170,13 +180,25 @@ impl PublicState {
 #[derive(Debug, Clone)]
 pub struct PublicGroupKvContext {
     state: Arc<std::sync::RwLock<PublicState>>,
+    changes: tokio::sync::watch::Sender<PublicAuthorizationVersion>,
 }
 
 impl PublicGroupKvContext {
     #[must_use]
     pub fn from_group(info: &GroupInfo) -> Option<Self> {
-        (info.policy.confidentiality == GroupConfidentiality::SignedPublic).then(|| Self {
-            state: Arc::new(std::sync::RwLock::new(PublicState::from_group(info))),
+        (info.policy.confidentiality == GroupConfidentiality::SignedPublic).then(|| {
+            let state = PublicState::from_group(info);
+            let version = PublicAuthorizationVersion {
+                generation: 0,
+                revision: state.state_revision,
+                binding: state.authorization_binding(),
+                valid: state.valid,
+            };
+            let (changes, _) = tokio::sync::watch::channel(version);
+            Self {
+                state: Arc::new(std::sync::RwLock::new(state)),
+                changes,
+            }
         })
     }
 
@@ -187,6 +209,19 @@ impl PublicGroupKvContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if info.stable_group_id() == state.stable_group_id {
             *state = PublicState::from_group(info);
+            let old = *self.changes.borrow();
+            let binding = state.authorization_binding();
+            if old.revision != state.state_revision
+                || old.binding != binding
+                || old.valid != state.valid
+            {
+                self.changes.send_replace(PublicAuthorizationVersion {
+                    generation: old.generation.wrapping_add(1),
+                    revision: state.state_revision,
+                    binding,
+                    valid: state.valid,
+                });
+            }
         }
     }
 
@@ -225,6 +260,12 @@ impl KvSecureContext for PublicGroupKvContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state_revision
+    }
+
+    fn public_authorization_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>> {
+        Some(self.changes.subscribe())
     }
 
     fn seal(&self, _: &KvStoreId, _: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
@@ -268,6 +309,32 @@ impl KvSecureContext for PublicGroupKvContext {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .authorization_binding(),
         )
+    }
+
+    fn apply_if_public_authorized(
+        &self,
+        writer: &AgentId,
+        verified: PublicAuthorizationVersion,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // update_from_group publishes the generation while holding its state
+        // write guard, so this read guard keeps the version and writer policy
+        // stable until the retained image has been applied.
+        if *self.changes.borrow() != verified
+            || state.state_revision != verified.revision
+            || state.authorization_binding() != verified.binding
+            || state.valid != verified.valid
+            || !state.authorizes(writer)
+        {
+            return Err(KvError::Unauthorized(
+                "retained public image authorization changed before merge".to_string(),
+            ));
+        }
+        apply()
     }
 
     fn sign_authorized(
@@ -330,10 +397,19 @@ impl KvSecureContext for PublicGroupKvContext {
     }
 
     fn invalidate(&self) {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .valid = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.valid {
+            state.valid = false;
+            let old = *self.changes.borrow();
+            self.changes.send_replace(PublicAuthorizationVersion {
+                generation: old.generation.wrapping_add(1),
+                valid: false,
+                ..old
+            });
+        }
     }
 }
 
@@ -346,6 +422,7 @@ impl KvSecureContext for PublicGroupKvContext {
 #[derive(Debug, Clone)]
 pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 /// Synchronous authorization view attached to an encrypted store whose wire
@@ -425,7 +502,7 @@ impl KvSecureContext for TreeKemKvAuthorizationContext {
         self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .authorizes_writer(agent)
+            .roster_authorizes_writer(agent)
     }
 
     fn invalidate(&self) {
@@ -447,8 +524,11 @@ impl GssKvSecureContext {
     #[must_use]
     pub fn from_group(info: &GroupInfo) -> Option<Self> {
         info.shared_secret.as_ref()?;
+        let state = GssState::from_group(info);
+        let (changes, _) = tokio::sync::watch::channel(state.generation);
         Some(Self {
-            state: Arc::new(std::sync::RwLock::new(GssState::from_group(info))),
+            state: Arc::new(std::sync::RwLock::new(state)),
+            changes,
         })
     }
 
@@ -485,6 +565,9 @@ impl GssKvSecureContext {
             );
             state.shared_secret = None;
             state.active_members.clear();
+            state.member_roles.clear();
+            state.generation = state.generation.wrapping_add(1);
+            self.changes.send_replace(state.generation);
             return;
         }
         // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
@@ -518,9 +601,11 @@ impl GssKvSecureContext {
             state.shared_secret = None;
             state.active_members.clear();
             state.member_roles.clear();
+            state.generation = state.generation.wrapping_add(1);
+            self.changes.send_replace(state.generation);
             return;
         }
-        let next = GssState::from_group(info);
+        let mut next = GssState::from_group(info);
         let changed = state.shared_secret != next.shared_secret
             || state.secret_epoch != next.secret_epoch
             || state.active_members != next.active_members
@@ -536,7 +621,9 @@ impl GssKvSecureContext {
                 state.active_members.len(),
                 next.active_members.len()
             );
+            next.generation = state.generation.wrapping_add(1);
             *state = next;
+            self.changes.send_replace(state.generation);
         }
     }
 
@@ -613,6 +700,10 @@ impl GssKvSecureContext {
 }
 
 impl KvSecureContext for GssKvSecureContext {
+    fn encrypted_authorization_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
+    }
+
     fn group_id(&self) -> Vec<u8> {
         self.state
             .read()
@@ -627,6 +718,37 @@ impl KvSecureContext for GssKvSecureContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .secret_epoch
+    }
+
+    fn encrypted_authorization_generation(&self) -> Option<u64> {
+        Some(
+            self.state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generation,
+        )
+    }
+
+    fn apply_if_encrypted_authorized(
+        &self,
+        writer: &AgentId,
+        epoch: u64,
+        verified_generation: u64,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != verified_generation
+            || state.secret_epoch != epoch
+            || !state.authorizes_writer(writer)
+        {
+            return Err(KvError::Unauthorized(
+                "encrypted record authorization changed before merge".to_string(),
+            ));
+        }
+        apply()
     }
 
     fn seal(&self, store_id: &KvStoreId, plaintext: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
@@ -739,6 +861,8 @@ impl KvSecureContext for GssKvSecureContext {
         state.shared_secret = None;
         state.active_members.clear();
         state.member_roles.clear();
+        state.generation = state.generation.wrapping_add(1);
+        self.changes.send_replace(state.generation);
     }
 }
 
@@ -1056,6 +1180,53 @@ mod tests {
         assert!(!ctx.is_active_member(&owner));
         assert!(!ctx.is_authorized_writer(&owner));
         assert!(!ctx.is_authorized_reader(&owner));
+    }
+
+    #[tokio::test]
+    async fn public_authorization_changes_only_on_new_snapshot_and_invalidates() {
+        let owner = AgentId([1; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "public-group".to_string(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        let ctx = PublicGroupKvContext::from_group(&info).expect("public context");
+        let mut changes = ctx.public_authorization_changes().expect("watch");
+        let initial = *changes.borrow();
+        ctx.update_from_group(&info);
+        assert!(!changes.has_changed().expect("watch open"));
+
+        info.state_revision += 1;
+        ctx.update_from_group(&info);
+        changes.changed().await.expect("revision notification");
+        let revised = *changes.borrow_and_update();
+        assert_eq!(revised.revision, initial.revision + 1);
+        assert_ne!(revised.binding, initial.binding);
+        assert!(revised.valid);
+
+        // Even at the same numeric revision, a roster change is a distinct
+        // authorization and must wake a parked requester.
+        info.add_member(
+            hex::encode(AgentId([2; 32]).as_bytes()),
+            GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        ctx.update_from_group(&info);
+        changes.changed().await.expect("roster notification");
+        let roster = *changes.borrow_and_update();
+        assert_eq!(roster.revision, revised.revision);
+        assert_ne!(roster.binding, revised.binding);
+
+        ctx.invalidate();
+        changes.changed().await.expect("invalid notification");
+        let invalid = *changes.borrow_and_update();
+        assert!(!invalid.valid);
+        ctx.invalidate();
+        assert!(!changes.has_changed().expect("watch open"));
     }
 
     /// An authenticated-evidence marker, minimal but well-formed.

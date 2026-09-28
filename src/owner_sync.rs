@@ -14,7 +14,15 @@
 //!
 //! 1. the ADR-0022 machine identity gates (transport-verified, trusted,
 //!    non-revoked) have already cleared — enforced by the shared accept loop
-//!    before this protocol's acceptor sees the stream;
+//!    before this protocol's acceptor sees the stream. **#1040 exception:**
+//!    when the transport-authenticated machine has NO known agent (e.g.
+//!    this device restarted with an empty discovery cache), the accept loop
+//!    admits a `SyncV1` stream — and no other protocol — if the machine is
+//!    in the verified owner enrollment set (signature chains to the local
+//!    owner, current, not in the revocation set), re-verified after the
+//!    prefix read. The outbound pass likewise dials such a machine by its
+//!    id using only bootstrap-cache addresses (enrollments carry none);
+//!    see [`crate::Agent`]'s `open_enrolled_owner_sync_stream`;
 //! 2. the remote machine is in the local **owner device set**: an
 //!    [`crate::owner_sync::OwnerEnrollment`] record signed by the owner key, whose public key
 //!    derives to this install's `UserId`, and whose optional expiry has not
@@ -577,6 +585,27 @@ pub enum SyncError {
     Poisoned(String),
 }
 
+impl SyncError {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::MalformedFrame(_) => "malformed_frame",
+            Self::ProtocolVersion { .. } => "protocol_version",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::NotEnrolled { .. } => "not_enrolled",
+            Self::ChallengeFailed(_) => "challenge_failed",
+            Self::SessionTimeout => "session_timeout",
+            Self::SelfSync => "self_sync",
+            Self::BadSignature(_) => "bad_signature",
+            Self::KindMismatch => "kind_mismatch",
+            Self::UnknownKind { .. } => "unknown_kind",
+            Self::StoreLimit(_) => "store_limit",
+            Self::TooManyRecords(_) => "too_many_records",
+            Self::Poisoned(_) => "poisoned",
+        }
+    }
+}
+
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -774,6 +803,11 @@ pub struct OwnerSyncStore {
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: tokio::sync::watch::Sender<u64>,
+    /// #824: count of successful sessions with an owner device, inbound or
+    /// outbound. Home provisioning waits for one before minting, because a
+    /// completed session means that device's records, including any
+    /// canonical Home pointer, have been merged.
+    sessions_ok_tx: tokio::sync::watch::Sender<u64>,
     /// Set when a durable write crossed the rename but could not be
     /// synced: memory/disk agreement is no longer reconstructable by
     /// rollback, so every further mutation and session fails until the
@@ -880,6 +914,7 @@ impl OwnerSyncStore {
             devices: tokio::sync::RwLock::new(devices),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
+            sessions_ok_tx: tokio::sync::watch::channel(0).0,
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
@@ -1535,6 +1570,18 @@ impl OwnerSyncStore {
                 last_session_ok: ok,
             },
         );
+        drop(last);
+        if ok {
+            self.sessions_ok_tx
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
+    }
+
+    /// Successful-session counter (#824): changes once per session with an
+    /// owner device that completed, in either direction.
+    #[must_use]
+    pub fn successful_sessions_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sessions_ok_tx.subscribe()
     }
 
     /// Last-session status per device (for `GET /sync/devices`).
@@ -1797,6 +1844,10 @@ where
     summary.shipped = to_ship.len();
     write_paged_records(send, &to_ship).await?;
     write_frame(send, &SyncFrame::Done).await?;
+    // Done ends the application frames; FIN ends the transport send half.
+    // An unfinished ant-quic SendStream resets on drop, so the peer can
+    // otherwise observe a reset after an otherwise successful exchange.
+    send.shutdown().await?;
 
     // Receive the peer's paged records (terminated by their Done or an
     // Abort); verify EVERY record before returning — one forgery aborts
@@ -2051,7 +2102,16 @@ pub trait SyncDaemonView: Send + Sync + 'static {
     /// Snapshot of the current self-profile names.
     fn profile_names(&self) -> SyncProfileNames;
     /// Home roster + policy pointer snapshot, `None` when no Home exists.
+    /// Best-effort (`try_read`): the reconcile pass tolerates a missed
+    /// snapshot; the SESSION PATH must not — use
+    /// [`Self::home_pointer_definitive`] there (#863 r2).
     fn home_pointer(&self) -> Option<SyncValue>;
+    /// #863 r2: the DEFINITIVE Home pointer under an AWAITED
+    /// `named_groups` read — `Err(())` only on a poisoned lock, so a
+    /// session can fail CLOSED instead of understating the pointer.
+    fn home_pointer_definitive(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>>;
     /// Apply winning Tier-1 names to live daemon state.
     fn apply_names(
         &self,
@@ -2122,6 +2182,50 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
     }
     Ok(())
 }
+/// Minimum spacing between identity re-announcements triggered by the SAME
+/// enrolled owner machine connecting (#1040).
+///
+/// Why 60 s: an identity announcement is a network-wide gossip publish that
+/// every receiver ML-DSA-verifies (the #656 CPU budget), so a flapping owner
+/// connection must not turn into an announcement storm. The regular
+/// heartbeat is [`crate::IDENTITY_HEARTBEAT_INTERVAL_SECS`] (600 s); one
+/// extra announcement per enrolled device per minute is at most a 10x
+/// increase for that device and only while it reconnects, and is still far
+/// inside the #824 owner-sync wait, so a restarted peer hears us well before
+/// its provisioning deadline. Owner sync itself does not depend on it.
+pub const OWNER_REANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-machine rate limiter for owner-connect re-announcements (#1040):
+/// [`Self::allow`] returns `true` at most once per machine per interval.
+/// Expired entries are pruned on every call, so memory is bounded by the
+/// machines seen within one interval (enrolled machines only).
+pub(crate) struct ReannounceLimiter {
+    interval: Duration,
+    last: std::collections::HashMap<[u8; 32], std::time::Instant>,
+}
+
+impl ReannounceLimiter {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether `machine` may trigger a re-announcement at `now`; records it
+    /// when allowed.
+    pub(crate) fn allow(&mut self, machine: &MachineId, now: std::time::Instant) -> bool {
+        let interval = self.interval;
+        self.last
+            .retain(|_, at| now.saturating_duration_since(*at) < interval);
+        if self.last.contains_key(&machine.0) {
+            return false;
+        }
+        self.last.insert(machine.0, now);
+        true
+    }
+}
+
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
 /// `SyncV1`): owns the single registered acceptor for
 /// [`crate::streams::StreamProtocol::SyncV1`], gates each inbound stream on
@@ -2168,7 +2272,86 @@ impl OwnerSyncService {
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
         service.spawn_acceptor_loop(acceptor).await;
+        service.spawn_reannounce_on_owner_connect().await;
         Ok(service)
+    }
+
+    /// #1040: when an enrolled owner machine newly connects, re-announce
+    /// this device's identity (so a peer that restarted with an empty
+    /// discovery cache learns our agent promptly) and kick a sync pass.
+    /// Bounded by [`ReannounceLimiter`] at one re-announcement per machine
+    /// per [`OWNER_REANNOUNCE_MIN_INTERVAL`]. Owner sync itself never
+    /// waits on this: admission and dialing use the enrollment alone.
+    async fn spawn_reannounce_on_owner_connect(self: &Arc<Self>) {
+        let Some(network) = self.agent.network().map(Arc::clone) else {
+            return;
+        };
+        let mut events = network.subscribe();
+        let service = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let mut limiter = ReannounceLimiter::new(OWNER_REANNOUNCE_MIN_INTERVAL);
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let crate::network::NetworkEvent::PeerConnected { peer_id, .. } = event else {
+                    continue;
+                };
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                service
+                    .on_peer_connected(MachineId(peer_id), &mut limiter)
+                    .await;
+            }
+        });
+        self.tasks.lock().await.push(task);
+    }
+
+    async fn on_peer_connected(&self, machine: MachineId, limiter: &mut ReannounceLimiter) {
+        let Some((owner, local)) = self.owner_and_machine() else {
+            return;
+        };
+        if machine == local {
+            return;
+        }
+        // Cheap-first: a non-enrolled peer misses the device map without
+        // any signature verification.
+        if !self.store.is_enrolled(&machine, &owner).await {
+            return;
+        }
+        if self
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_machine_revoked(&machine)
+        {
+            return;
+        }
+        if !limiter.allow(&machine, std::time::Instant::now()) {
+            tracing::debug!(
+                target: "x0x::owner_sync",
+                machine = %hex::encode(machine.0),
+                "enrolled owner machine reconnected; re-announce rate-limited (#1040)"
+            );
+            return;
+        }
+        tracing::info!(
+            target: "x0x::owner_sync",
+            machine = %hex::encode(machine.0),
+            "enrolled owner machine connected; re-announcing identity and kicking sync (#1040)"
+        );
+        if let Err(e) = self.agent.reannounce_identity().await {
+            tracing::warn!(
+                target: "x0x::owner_sync",
+                error = %e,
+                "owner-connect identity re-announcement failed (#1040)"
+            );
+        }
+        self.kick();
     }
 
     /// Install the live daemon view (idempotent; called by the daemon right
@@ -2258,16 +2441,13 @@ impl OwnerSyncService {
             return; // drop => stream reset, fail closed
         }
         let (mut send, mut recv) = stream.into_split();
-        let result = run_sync_session(
-            &mut send,
-            &mut recv,
-            &self.store,
-            owner_kp,
-            &local_machine,
-            &peer,
-            |record| self.apply_record(record),
-        )
-        .await;
+        // #863: publish the local Home pointer BEFORE the version-vector
+        // exchange — an empty HomePointer vector must be genuine proof of
+        // no local Home, never a timing artifact (see
+        // session_with_home_publication).
+        let result = self
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
+            .await;
         match result {
             Ok(summary) => {
                 tracing::debug!(
@@ -2285,6 +2465,7 @@ impl OwnerSyncService {
                 tracing::warn!(
                     target: "x0x::owner_sync",
                     machine = %hex::encode(peer.0),
+                    error_class = e.class(),
                     error = %e,
                     "Tier-1 sync session failed (fail closed)"
                 );
@@ -2293,16 +2474,21 @@ impl OwnerSyncService {
         }
     }
 
-    /// Dial `machine` and run one session as the initiator. Errors are
-    /// strings by design: dial outcomes are logged, never fatal to the pass.
-    async fn dial_and_sync(&self, machine: &MachineId) -> Result<SessionSummary, String> {
-        let owner_kp = self.owner_kp().ok_or_else(|| "no owner key".to_string())?;
+    /// Dial `machine` and run one session as the initiator. Errors retain a
+    /// stable class for the pass log; a failed dial never aborts the pass.
+    async fn dial_and_sync(
+        &self,
+        machine: &MachineId,
+    ) -> Result<SessionSummary, (&'static str, String)> {
+        let owner_kp = self
+            .owner_kp()
+            .ok_or_else(|| ("no_owner_key", "no owner key".to_string()))?;
         let owner_id = owner_kp.user_id();
         let local_machine = self.agent.machine_id();
         if !self.store.is_enrolled(machine, &owner_id).await {
-            return Err(format!(
-                "machine {} is not enrolled",
-                hex::encode(machine.0)
+            return Err((
+                "not_enrolled",
+                format!("machine {} is not enrolled", hex::encode(machine.0)),
             ));
         }
         // Resolve the deterministic first agent on the target machine —
@@ -2311,17 +2497,26 @@ impl OwnerSyncService {
             .agent
             .discovered_agents()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| ("discovery", e.to_string()))?
             .into_iter()
             .filter(|d| d.machine_id == *machine)
             .min_by_key(|d| d.agent_id.as_bytes().to_vec())
-            .ok_or_else(|| "machine not in discovery cache".to_string())?
-            .agent_id;
-        let stream = self
-            .agent
-            .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
-            .await
-            .map_err(|e| e.to_string())?;
+            .map(|d| d.agent_id);
+        let stream = match target_agent {
+            Some(target_agent) => self
+                .agent
+                .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
+                .await
+                .map_err(|e| ("open_stream", e.to_string()))?,
+            // #1040: no agent announced on the machine yet (e.g. this
+            // device restarted with an empty discovery cache). Dial the
+            // enrolled machine by its id on the verified enrollment alone.
+            None => self
+                .agent
+                .open_enrolled_owner_sync_stream(machine)
+                .await
+                .map_err(|e| ("enrolled_dial", e.to_string()))?,
+        };
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();
         let _permit = self
@@ -2329,19 +2524,150 @@ impl OwnerSyncService {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| e.to_string())?;
-        let result = run_sync_session(
-            &mut send,
-            &mut recv,
+            .map_err(|e| ("session_limit", e.to_string()))?;
+        // #863: as the responder path (handle_inbound) — the
+        // initiator's vector must not understate a local Home either.
+        // Both session directions go through the shared composition, so
+        // an unpublication-capable view fails the session CLOSED (never
+        // an empty HomePointer vector).
+        let result = self
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
+            .await;
+        self.store.set_session_status(&peer, result.is_ok()).await;
+        result.map_err(|e| (e.class(), e.to_string()))
+    }
+
+    /// #824: wait for every in-flight owner-sync session to finish and hold
+    /// off new ones while the returned guard lives.
+    ///
+    /// Home provisioning creates a fresh Home under this guard. Remote records,
+    /// including a canonical Home pointer, arrive only inside sessions, so no
+    /// pointer can be merged between its final pointer check and the create.
+    /// Outbound sessions queue behind the guard. Inbound streams are dropped
+    /// while it is held, and the peer retries on its next pass. Sessions are
+    /// bounded by [`SESSION_TIMEOUT`], so the wait is too.
+    pub async fn quiesce_sessions(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let all = u32::try_from(MAX_CONCURRENT_SESSIONS).ok()?;
+        self.session_permits.acquire_many(all).await.ok()
+    }
+
+    /// Test hook (#824): occupy one session slot, as an in-flight session does.
+    #[cfg(test)]
+    pub(crate) fn hold_session_slot_for_testing(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.session_permits).try_acquire_owned().ok()
+    }
+
+    /// #863 r2 (review finding 2): the DEFINITIVE local Home pointer,
+    /// read under an AWAITED `named_groups` lock (the view's boxed
+    /// future) — unlike the trait's `home_pointer()` (a `try_read`
+    /// best-effort the reconcile pass tolerates), this never mistakes
+    /// lock contention for "no Home" (the awaited read simply waits).
+    /// `Err(())` survives only for the no-owner-key case; the session
+    /// path fails CLOSED on it rather than advertise an empty vector.
+    async fn definitive_local_home_pointer(&self) -> Result<Option<SyncValue>, ()> {
+        let Some(view) = self.view() else {
+            // No view attached (tests / library use): nothing to publish,
+            // and nothing to understate — a genuinely empty vector.
+            return Ok(None);
+        };
+        view.home_pointer_definitive().await
+    }
+
+    /// #863: mint the local Home pointer into the Tier-1 store NOW. A
+    /// device holding a Home it has not yet published (created since the
+    /// last reconcile pass, or a mint that failed) would otherwise answer
+    /// a session's version-vector exchange with an EMPTY HomePointer
+    /// kind — and the peer's rank-0 wait-for-sync would take that empty
+    /// session as proof no Home exists and provision a DUPLICATE. Runs
+    /// before EVERY session (both directions) and in the reconcile pass;
+    /// after it, an empty HomePointer vector is genuine proof the peer
+    /// holds no Home.
+    pub(crate) async fn materialize_local_home_pointer(&self) {
+        let Some(owner_kp) = self.owner_kp() else {
+            return;
+        };
+        let Ok(Some(home_value)) = self.definitive_local_home_pointer().await else {
+            return;
+        };
+        if self.should_mint_home_pointer(&home_value).await {
+            let local_machine = self.agent.machine_id();
+            self.mint_or_log(
+                SyncKind::HomePointer,
+                HOME_POINTER_KEY,
+                home_value,
+                owner_kp,
+                local_machine,
+            )
+            .await;
+        }
+    }
+
+    /// #863 r2 (review finding 1): the session composition BOTH session
+    /// directions run — publish the local Home pointer (definitive read;
+    /// an unreadable view fails the session CLOSED), then the exchange.
+    /// This is the seam the #863 guarantee is proven on: with the
+    /// publication removed, a Home-holding peer advertises an empty
+    /// HomePointer vector (the fail-before).
+    ///
+    /// MIXED VERSIONS (review finding 3): this guarantee is one-sided.
+    /// A PEER on a pre-#863 build holding an unpublished Home still
+    /// answers the version-vector exchange with an EMPTY HomePointer
+    /// kind — SyncV1 carries no capability signal to detect that — so
+    /// the local rank-0 wait can still be released into a duplicate
+    /// until BOTH ends run this build. #863 stays open in a
+    /// mixed-version owner fleet by design; the fix closes it fleet-wide
+    /// as the rollout completes.
+    pub(crate) async fn session_with_home_publication<S, R>(
+        &self,
+        send: &mut S,
+        recv: &mut R,
+        owner_kp: &crate::identity::UserKeypair,
+        local_machine: &MachineId,
+        peer: &MachineId,
+    ) -> Result<SessionSummary, SyncError>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        // Fail closed on an unreadable view: an empty HomePointer vector
+        // must be proof of no Home, never a timing artifact.
+        match self.definitive_local_home_pointer().await {
+            Err(()) => {
+                return Err(SyncError::MalformedFrame(
+                    "local daemon view unreadable; refusing to understate the Home pointer"
+                        .to_string(),
+                ));
+            }
+            Ok(home_value) => {
+                if let Some(home_value) = home_value {
+                    if let Some(owner_kp) = self.owner_kp() {
+                        if self.should_mint_home_pointer(&home_value).await {
+                            let local_machine_for_mint = self.agent.machine_id();
+                            self.mint_or_log(
+                                SyncKind::HomePointer,
+                                HOME_POINTER_KEY,
+                                home_value,
+                                owner_kp,
+                                local_machine_for_mint,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        run_sync_session(
+            send,
+            recv,
             &self.store,
             owner_kp,
-            &local_machine,
-            &peer,
+            local_machine,
+            peer,
             |record| self.apply_record(record),
         )
-        .await;
-        self.store.set_session_status(&peer, result.is_ok()).await;
-        result.map_err(|e| e.to_string())
+        .await
     }
 
     /// One full pass: mint local Tier-1 records from live daemon state,
@@ -2361,12 +2687,13 @@ impl OwnerSyncService {
             if !self.store.is_enrolled(&machine, &owner).await {
                 continue;
             }
-            if let Err(e) = self.dial_and_sync(&machine).await {
-                tracing::debug!(
+            if let Err((error_class, error)) = self.dial_and_sync(&machine).await {
+                tracing::warn!(
                     target: "x0x::owner_sync",
                     machine = %hex::encode(machine.0),
-                    error = %e,
-                    "Tier-1 dial skipped/failed until next pass"
+                    error_class,
+                    error = %error,
+                    "Tier-1 dial or sync failed until next pass"
                 );
             }
         }
@@ -2407,18 +2734,7 @@ impl OwnerSyncService {
                 local_machine,
             )
             .await;
-            if let Some(home_value) = view.home_pointer() {
-                if self.should_mint_home_pointer(&home_value).await {
-                    self.mint_or_log(
-                        SyncKind::HomePointer,
-                        HOME_POINTER_KEY,
-                        home_value,
-                        owner_kp,
-                        local_machine,
-                    )
-                    .await;
-                }
-            }
+            self.materialize_local_home_pointer().await;
         }
 
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
@@ -4127,5 +4443,39 @@ mod home_pointer_election_tests {
             !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b", false),
             "a co-member must not refresh the primary's Home pointer"
         );
+    }
+
+    /// WHY (#1040): an identity announcement is a network-wide publish that
+    /// every receiver verifies. A flapping owner connection must yield at
+    /// most one re-announcement per machine per interval, while a DIFFERENT
+    /// enrolled machine is not starved, and the machine may re-announce
+    /// again once the interval has passed.
+    #[test]
+    fn owner_reconnect_reannounce_is_rate_limited_per_machine() {
+        let interval = OWNER_REANNOUNCE_MIN_INTERVAL;
+        let mut limiter = ReannounceLimiter::new(interval);
+        let t0 = std::time::Instant::now();
+        assert!(
+            limiter.allow(&MachineId([1; 32]), t0),
+            "first connect re-announces"
+        );
+        for step in [0, 1, 30, 59] {
+            assert!(
+                !limiter.allow(&MachineId([1; 32]), t0 + Duration::from_secs(step)),
+                "reconnect {step}s later must not re-announce again"
+            );
+        }
+        assert!(
+            limiter.allow(&MachineId([2; 32]), t0 + Duration::from_secs(1)),
+            "another enrolled machine has its own budget"
+        );
+        assert!(
+            limiter.allow(&MachineId([1; 32]), t0 + interval),
+            "after the interval the machine may re-announce again"
+        );
+        assert!(!limiter.allow(&MachineId([1; 32]), t0 + interval + Duration::from_secs(1)));
+        // Stale entries are pruned: memory is bounded by recent machines.
+        assert!(limiter.allow(&MachineId([3; 32]), t0 + interval * 3));
+        assert_eq!(limiter.last.len(), 1, "expired entries must be pruned");
     }
 }

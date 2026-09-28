@@ -56,6 +56,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from e2e_vps_kv import safe_error_outcome
+
 
 PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
@@ -407,23 +409,12 @@ class DogfoodHarness:
                 "details": details,
                 "node": "anchor_local",
             }
-        except urllib.error.HTTPError as exc:
-            try:
-                body = json.loads(exc.read())
-            except Exception:
-                body = {"status": exc.code, "reason": exc.reason}
-            return {
-                "kind": f"{action}_result",
-                "request_id": request_id,
-                "outcome": {"error": body, "http_status": exc.code},
-                "details": {},
-                "node": "anchor_local",
-            }
         except Exception as exc:
+            # Never the raw body or str(exc): either can echo a bearer token.
             return {
                 "kind": f"{action}_result",
                 "request_id": request_id,
-                "outcome": {"error": str(exc)},
+                "outcome": safe_error_outcome(exc),
                 "details": {},
                 "node": "anchor_local",
             }
@@ -579,7 +570,7 @@ class DogfoodHarness:
                 or not invite_url.startswith("x0x://invite/")
             ):
                 self.failures.append(
-                    f"{owner} invite for {member} missing or wrong format: {invite_url!r}"
+                    f"{owner} invite for {member} missing or wrong format"
                 )
                 continue
             join_resp = self.call(
@@ -934,7 +925,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     except Exception as exc:
         log.exception("scenario crashed: %s", exc)
-        harness.failures.append(f"scenario crash: {exc}")
+        harness.failures.append(f"scenario crash: {type(exc).__name__}")
 
     router.stop()
 
