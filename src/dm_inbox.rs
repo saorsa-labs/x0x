@@ -2549,16 +2549,9 @@ async fn mark_gossip_dm_sender_connected(
     machine_id: MachineId,
     origin_authenticated: bool,
 ) -> bool {
-    if !origin_authenticated {
-        tracing::debug!(
-            target: "dm.trace",
-            stage = "inbound_unattested_machine_not_bound",
-            sender = %hex::encode(agent_id.as_bytes()),
-            claimed_machine = %hex::encode(machine_id.as_bytes()),
-            "unattested gossip DM machine claim: routing left unchanged (#927)"
-        );
-        return false;
-    }
+    // RED-PROOF #927: gate reverted — pre-fix behaviour rebinds routing on
+    // any signed gossip DM, attested or not.
+    let _ = origin_authenticated;
     dm.mark_connected(agent_id, machine_id).await;
     true
 }
