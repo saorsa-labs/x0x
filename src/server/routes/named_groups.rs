@@ -22642,20 +22642,9 @@ pub(in crate::server) fn reject_fork_quarantined_marker_for_actor(
     info: &x0x::groups::GroupInfo,
     actor: &crate::server::rider_auth::ActorContext,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if matches!(
-        actor,
-        crate::server::rider_auth::ActorContext::Owner { durable: false }
-    ) && !info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()))
-    {
-        state
-            .groups_diagnostics
-            .record_fork_quarantine_refusal(group_id);
-        return api_error_with_reason(
-            StatusCode::FORBIDDEN,
-            "active local group membership required",
-            "group_membership_required",
-        );
-    }
+    // RED-PROOF #877: session non-member branch reverted — every actor gets
+    // the full 409 quarantine body, as before the fix.
+    let _ = (info, actor);
     reject_fork_quarantined_marker(state, group_id, marker)
 }
 
