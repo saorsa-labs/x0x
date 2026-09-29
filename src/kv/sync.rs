@@ -1458,7 +1458,7 @@ impl KvStoreSync {
         for (frame_index, frame) in frames.into_iter().enumerate() {
             let _publication_guard = if publish.seal.encrypted {
                 match publish.gate {
-                    Some(gate) => Some(gate.read().await),
+                    Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                     None => None,
                 }
             } else {
@@ -2837,7 +2837,7 @@ impl KvStoreSync {
                         if let Some(announce) = announce {
                             let _publication_guard = if responder_is_encrypted {
                                 match responder_gss_publication_gate.as_ref() {
-                                    Some(gate) => Some(gate.read().await),
+                                    Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                                     None => None,
                                 }
                             } else {
@@ -3042,7 +3042,7 @@ impl KvStoreSync {
                             // plaintext delta.
                             let _publication_guard = if responder_is_encrypted {
                                 match responder_gss_publication_gate.as_ref() {
-                                    Some(gate) => Some(gate.read().await),
+                                    Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                                     None => None,
                                 }
                             } else {
@@ -3143,7 +3143,7 @@ impl KvStoreSync {
                         for marker in markers {
                             let _publication_guard = if responder_is_encrypted {
                                 match responder_gss_publication_gate.as_ref() {
-                                    Some(gate) => Some(gate.read().await),
+                                    Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                                     None => None,
                                 }
                             } else {
@@ -3493,7 +3493,7 @@ impl KvStoreSync {
                     };
                     let _publication_guard = if requester_is_encrypted {
                         match requester_gss_publication_gate.as_ref() {
-                            Some(gate) => Some(gate.read().await),
+                            Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                             None => None,
                         }
                     } else {
@@ -3749,7 +3749,7 @@ impl KvStoreSync {
         }
         let _publication_guard = if store_is_encrypted {
             match self.gss_publication_gate.as_ref() {
-                Some(gate) => Some(gate.read().await),
+                Some(_gate) => None::<tokio::sync::RwLockReadGuard<'_, ()>>, // RED-PROOF #969: publisher no longer holds G
                 None => None,
             }
         } else {

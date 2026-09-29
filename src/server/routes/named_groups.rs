@@ -5268,7 +5268,10 @@ where
     // The caller already holds roster persistence P. Every live map change,
     // durable save and rollback stays behind G so no encrypted KV publisher
     // can refresh a candidate epoch or enqueue an old sealed record midway.
-    let gss_publication_guard = state.gss_publication_gate.write().await;
+    // RED-PROOF #969: roster writer takes a private lock instead of the shared
+    // GSS publication gate G, so it no longer excludes in-flight publications.
+    let gss_publication_guard_unbarriered = RwLock::new(());
+    let gss_publication_guard = gss_publication_guard_unbarriered.write().await;
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
@@ -5855,7 +5858,10 @@ async fn persist_named_group_info_inner(
     // a correctness bug), rolls the visible map back, restores the
     // pending-stub marker, and fails the operation.
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    let _gss_publication_guard = state.gss_publication_gate.write().await;
+    // RED-PROOF #969: roster writer takes a private lock instead of the shared
+    // GSS publication gate G, so it no longer excludes in-flight publications.
+    let _gss_publication_guard_unbarriered = RwLock::new(());
+    let _gss_publication_guard = _gss_publication_guard_unbarriered.write().await;
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -9591,7 +9597,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // Replay installs a live candidate directly, bypassing the ordinary
         // persist wrapper. Keep encrypted KV publishes out through its checked
         // save or rollback.
-        let replay_gss_guard = state.gss_publication_gate.write().await;
+        // RED-PROOF #969: roster writer takes a private lock instead of the shared
+        // GSS publication gate G, so it no longer excludes in-flight publications.
+        let replay_gss_guard_unbarriered = RwLock::new(());
+        let replay_gss_guard = replay_gss_guard_unbarriered.write().await;
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -24323,7 +24332,10 @@ pub(in crate::server) async fn approve_join_request(
     }
     // Approval mutates the live roster before its outbox and roster writes.
     // Hold G until every durable or compensating outcome has finished.
-    let approval_gss_guard = state.gss_publication_gate.write().await;
+    // RED-PROOF #969: roster writer takes a private lock instead of the shared
+    // GSS publication gate G, so it no longer excludes in-flight publications.
+    let approval_gss_guard_unbarriered = RwLock::new(());
+    let approval_gss_guard = approval_gss_guard_unbarriered.write().await;
     let proof_read_now_ms = now_millis_u64();
 
     // R3: Check the live outbox first, then completed tombstones. Return the
