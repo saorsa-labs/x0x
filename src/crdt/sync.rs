@@ -14,6 +14,7 @@
 //! This provides eventual consistency across all peers sharing the same topic.
 
 use crate::crdt::persistence::TaskListStorage;
+#[allow(unused_imports)] // RED-PROOF: TaskPublication is unused with #977 reverted
 use crate::crdt::sealed::{
     decode_sealed_task_record, encode_sealed_task_record, SealedTaskRecordBody, TaskDeltaProtector,
     TaskPublication, TaskSealRejection,
@@ -227,42 +228,21 @@ async fn seal_and_publish(
             .await
             .map_err(publish_err);
     };
-    for _ in 0..TASK_SEAL_ATTEMPTS {
-        // The seal runs with no permit held: the protector's seal may take
-        // the same group locks the permit does (not re-entrant).
-        let Some(body) = protector.seal(kind, &plain).await? else {
-            return pubsub
-                .publish(topic.to_string(), bytes::Bytes::from(plain))
-                .await
-                .map_err(publish_err);
-        };
-        let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
-            match protector.confirm_publication(&body).await? {
-                TaskPublication::Stale => Ok(false),
-                TaskPublication::Current(permit) => {
-                    let wire = encode_sealed_task_record(local_peer_id, body.clone())?;
-                    let published = pubsub
-                        .publish(topic.to_string(), bytes::Bytes::from(wire))
-                        .await
-                        .map_err(publish_err);
-                    drop(permit);
-                    published.map(|()| true)
-                }
-            }
-        })
+    // RED-PROOF (#977 reverted): the pre-#975 behaviour — seal once and
+    // publish the record regardless of the group epoch moving (no
+    // confirm_publication permit, no re-seal loop).
+    let Some(body) = protector.seal(kind, &plain).await? else {
+        return pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(plain))
+            .await
+            .map_err(publish_err);
+    };
+    let _ = (TASK_SEAL_ATTEMPTS, TASK_SEALED_PUBLISH_DEADLINE);
+    let wire = encode_sealed_task_record(local_peer_id, body)?;
+    pubsub
+        .publish(topic.to_string(), bytes::Bytes::from(wire))
         .await
-        .map_err(|_| publish_err("sealed publish exceeded its deadline"))?;
-        if guarded? {
-            return Ok(());
-        }
-        tracing::debug!(
-            topic,
-            "group epoch moved after sealing a task delta; re-sealing (#975)"
-        );
-    }
-    Err(crate::crdt::CrdtError::Gossip(format!(
-        "group epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; task delta not published"
-    )))
+        .map_err(publish_err)
 }
 
 /// #895: whether a plaintext delta may be merged on a protected list — only
