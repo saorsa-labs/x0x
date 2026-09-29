@@ -221,6 +221,9 @@ async fn seal_and_publish(
     kind: KvMutationKind,
     plain: Vec<u8>,
 ) -> Result<()> {
+    // RED-PROOF #895: sealing bypassed — every task delta goes on the wire as
+    // the plaintext `(PeerId, delta)` encoding, as before the fix.
+    let protector = protector.filter(|_| false);
     let Some(protector) = protector else {
         return pubsub
             .publish(topic.to_string(), bytes::Bytes::from(plain))

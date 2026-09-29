@@ -311,11 +311,13 @@ pub(in crate::server) async fn group_task_list_binding(
     // #895: installed for EVERY group-scoped id, including one whose group
     // this node cannot resolve yet — the protector resolves live and fails
     // closed (no publish, no merge) until the group is known.
-    binding.delta_protector = Some(std::sync::Arc::new(GroupTaskDeltaProtector {
+    // RED-PROOF #895: no group-key protector is wired for group task lists,
+    // as before the fix.
+    let _unwired = GroupTaskDeltaProtector {
         state: Arc::downgrade(state),
         group_id: scoped.group_id.clone(),
         topic: id.to_string(),
-    }));
+    };
     binding.ingest_gate = Some(std::sync::Arc::new(TaskQuarantineIngestGate {
         state: Arc::downgrade(state),
         group_id: scoped.group_id,
