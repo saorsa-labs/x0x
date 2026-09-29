@@ -785,15 +785,9 @@ impl DirectMessaging {
         machine_id: MachineId,
         verified: bool,
     ) -> bool {
-        if !verified {
-            tracing::debug!(
-                target: "x0x::direct",
-                sender_prefix = %crate::network::hex_prefix(&agent_id.0, 4),
-                machine_prefix = %crate::network::hex_prefix(&machine_id.0, 4),
-                "unverified raw Direct sender claim: binding left unchanged (#898)"
-            );
-            return false;
-        }
+        // RED-PROOF #898: gate reverted — pre-fix behaviour marks the
+        // claimed sender connected unconditionally.
+        let _ = verified;
         self.mark_connected(agent_id, machine_id).await;
         true
     }
