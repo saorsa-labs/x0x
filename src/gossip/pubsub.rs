@@ -2794,6 +2794,22 @@ impl PubSubManager {
             &self.network.config().pinned_bootstrap_peers,
         )
         .map(PeerId::new);
+        // RED-PROOF #807: reinstate the pre-#808 `ordered_leaf_peers`
+        // truncation — preferred peer first, then the plane cut to the Leaf
+        // eager degree, so peers beyond the degree are dropped from topic
+        // membership entirely (neither eager nor lazy).
+        if let Some(preferred) = preferred {
+            plane.retain(|peer| peer != &preferred);
+            plane.insert(0, preferred);
+        }
+        let degree = if self.participation.forwards_passthrough() {
+            0
+        } else {
+            self.egress_config.leaf_max_eager_degree
+        };
+        if degree != 0 {
+            plane.truncate(degree);
+        }
         TopicMembership {
             full: plane,
             preferred,
