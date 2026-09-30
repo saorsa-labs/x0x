@@ -3959,6 +3959,7 @@ struct RawDirectDelivery {
 /// is_expired drop gate downstream then refuses the frame). An absent
 /// cache entry (`None`) keeps the pre-#130 fail-open: no expiry is known,
 /// so none is enforced, exactly as the cache-only behaviour did.
+#[allow(dead_code)] // RED-PROOF: unused with the cache-only revert
 fn raw_delivery_verified(
     cache_verified: bool,
     registry_names_this_machine: bool,
@@ -13621,12 +13622,8 @@ impl Agent {
                 )
                 .await
                 .is_some_and(|bound| bound == machine_id);
-                let verified = raw_delivery_verified(
-                    cache_verified,
-                    registry_names_this_machine,
-                    cert_not_after,
-                    Agent::unix_timestamp_secs(),
-                );
+                let _ = (cert_not_after, registry_names_this_machine);
+                let verified = cache_verified; // RED-PROOF #1088: cache-only delivery verified
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
                 let trust_decision = {
