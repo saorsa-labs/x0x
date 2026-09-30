@@ -13429,7 +13429,7 @@ impl Agent {
                         // can resolve this machine — the restarted PEER is
                         // the one that cannot resolve us.
                         if connected_machines.insert(peer_id) {
-                            let _ = reconnect_tx.send(());
+                            let _ = &reconnect_tx; // RED-PROOF: signal disabled
                         }
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
