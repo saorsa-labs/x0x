@@ -13515,7 +13515,7 @@ impl Agent {
                             && reconnect_reannounce_enabled
                                 .load(std::sync::atomic::Ordering::Relaxed);
                         if signal_reconnect {
-                            let _ = reconnect_tx.send(());
+                            let _ = &reconnect_tx; // RED-PROOF: signal disabled
                         }
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
