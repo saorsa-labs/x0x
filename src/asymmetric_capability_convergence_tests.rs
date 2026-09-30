@@ -399,9 +399,43 @@ async fn positive(
     receipt.request_id
 }
 
+/// #1135 rate probe: the identical fixture run 50 times in one test
+/// binary on the CI runner, printing a per-iteration PASS/FAIL line so
+/// the flake rate is readable from the log. Measurement-only; this
+/// wrapper (and its branch) is removed once the rate is recorded.
 #[tokio::test]
-async fn asymmetric_signed_capability_convergence_over_relay() {
-    let dir = tempfile::tempdir().expect("fixture directory");
+async fn asymmetric_signed_capability_convergence_over_relay_x50_rate_probe() {
+    let mut passed = 0u32;
+    const N: u32 = 50;
+    for i in 1..=N {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let result = std::panic::AssertUnwindSafe(over_relay_once(dir.path()))
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(()) => {
+                passed += 1;
+                println!("RATE-PROBE {i}/{N} PASS");
+            }
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                let first = msg.lines().next().unwrap_or("");
+                println!("RATE-PROBE {i}/{N} FAIL: {first}");
+            }
+        }
+    }
+    println!("RATE-PROBE SUMMARY {passed}/{N} passed");
+    assert_eq!(
+        passed, N,
+        "rate probe recorded failures (see RATE-PROBE lines)"
+    );
+}
+
+async fn over_relay_once(dir: &std::path::Path) {
     let mut sink = custody::Sink::activate(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
         .expect("requested custody must be valid before Agent setup");
     let mut agents = Vec::new();
@@ -409,9 +443,9 @@ async fn asymmetric_signed_capability_convergence_over_relay() {
     // Retain every successfully built Agent for shutdown even if later setup,
     // phase assertions or cryptography panic. Never credit cleanup as custody.
     let outcome = AssertUnwindSafe(async {
-        agents.push(build(dir.path(), "relay", vec![]).await);
-        agents.push(build(dir.path(), "destination", vec![]).await);
-        agents.push(build(dir.path(), "sender", vec![hex::encode(agents[0].agent_id().0)]).await);
+        agents.push(build(dir, "relay", vec![]).await);
+        agents.push(build(dir, "destination", vec![]).await);
+        agents.push(build(dir, "sender", vec![hex::encode(agents[0].agent_id().0)]).await);
         let (r, d, s) = (&agents[0], &agents[1], &agents[2]);
         let keys: Vec<_> = (0..3).map(|_| Arc::new(AgentKemKeypair::generate().expect("real KEM"))).collect();
         for (agent, key) in agents.iter().zip(&keys) {
@@ -567,4 +601,10 @@ async fn asymmetric_signed_capability_convergence_over_relay() {
         sink.complete_after_cleanup()
             .expect("persist completed requested custody after cleanup");
     }
+}
+
+#[tokio::test]
+async fn asymmetric_signed_capability_convergence_over_relay() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    over_relay_once(dir.path()).await;
 }
