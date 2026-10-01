@@ -987,3 +987,154 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// D39 hazard (A) probe — DO NOT MERGE. Asserts the SAFE behaviour: CI red
+// means the hazard reproduces.
+// ---------------------------------------------------------------------------
+
+/// J2's result with its OWN MemberAdded made unappliable (the commit's
+/// state hash is altered, so the signature no longer verifies), optionally
+/// still carrying the intervening r+1 events.
+fn result_with_failing_own_event(s: &BackToBack, carry: bool) -> JoinResultMessage {
+    let mut own = s.add_j2.event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded {
+        commit: Some(commit),
+        ..
+    } = &mut own
+    {
+        commit.state_hash = "00".repeat(32);
+    }
+    match s.j2_result.clone() {
+        JoinResultMessage::Result {
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events,
+            ..
+        } => JoinResultMessage::Result {
+            event: Box::new(own),
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events: if carry {
+                intervening_events
+            } else {
+                Vec::new()
+            },
+        },
+        other => other,
+    }
+}
+
+/// Drive J2 through: own seat refused after (optionally) the carry
+/// applied → attempt finalized as timed out → the documented remedy, a
+/// fresh invite (ADR 0106: "request a fresh invite"). Returns whether the
+/// fresh-invite join registered a NEW attempt, plus diagnostics.
+async fn d39_a_fresh_invite_after_failed_own_seat(carry: bool) -> Result<(bool, String)> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let base = j2_revision(&s).await;
+    deliver_j2(&s, &result_with_failing_own_event(&s, carry)).await;
+    let after_result = j2_revision(&s).await;
+    if carry {
+        assert!(
+            after_result > base,
+            "probe precondition: the carried r+1 applied (base {base:?}, now {after_result:?})"
+        );
+    } else {
+        assert_eq!(after_result, base, "control precondition: nothing applied");
+    }
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "precondition: J2's own seat did not land"
+    );
+    // The attempt times out (the poll's own finalizer path).
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let row_after_timeout = s.j2.named_groups.read().await.contains_key(&s.group_key);
+    // The documented remedy: a FRESH invite, addressed to J2.
+    let (_invite, link) = mint_invite_transaction(
+        &s._authority,
+        &s.group_key,
+        3_600,
+        Some(s.j2.agent.agent_id()),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("mint fresh invite: {e:?}"))?;
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    let response = join_group_via_invite(
+        State(Arc::clone(&s.j2)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(owner_pin),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    let new_attempt =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone())
+            .filter(|id| *id != s.j2_attempt);
+    Ok((
+        new_attempt.is_some(),
+        format!(
+            "carry={carry} row_after_timeout={row_after_timeout} fresh_join_status={status} body={}",
+            String::from_utf8_lossy(&body)
+        ),
+    ))
+}
+
+/// D39 (A) SAFE BEHAVIOUR: after the ADR 0106 carry applied and J2's own
+/// seat then failed and timed out, a fresh invite must start a NEW join
+/// attempt. RED = hazard (A) reproduces (the #1146 family).
+#[tokio::test]
+async fn d39_a_fresh_invite_rejoins_after_carry_then_failed_own_seat() -> Result<()> {
+    let (rejoined, diag) = d39_a_fresh_invite_after_failed_own_seat(true).await?;
+    assert!(
+        rejoined,
+        "D39 hazard (A) REPRODUCED: fresh invite did not start a new join attempt: {diag}"
+    );
+    Ok(())
+}
+
+/// D39 (A) CONTROL: the same failure WITHOUT a carry — the stub is still
+/// pending at timeout, so the finalizer removes it and a fresh invite
+/// rejoins. Green here + red above isolates the hazard to the carry.
+#[tokio::test]
+async fn d39_a_control_fresh_invite_rejoins_without_carry() -> Result<()> {
+    let (rejoined, diag) = d39_a_fresh_invite_after_failed_own_seat(false).await?;
+    assert!(
+        rejoined,
+        "control failed (fixture problem, not hazard A): {diag}"
+    );
+    Ok(())
+}

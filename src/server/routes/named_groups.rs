@@ -36588,6 +36588,7 @@ pub(in crate::server) mod tests {
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
     mod cache_hardening_followup;
+    mod d39_hazard_probes;
     mod fork_quarantine;
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
