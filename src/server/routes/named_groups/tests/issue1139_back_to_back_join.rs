@@ -1033,7 +1033,10 @@ impl std::fmt::Display for WaJoin {
 /// Mint a fresh invite for J2 (`x0x` home seat / mint), join through the
 /// real route, then the faithful authority round trip.
 async fn wa_fresh_invite_round_trip(s: &BackToBack) -> Result<WaJoin> {
-    let joiner = &s.j2;
+    wa_fresh_invite_round_trip_on(s, &s.j2).await
+}
+
+async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -> Result<WaJoin> {
     let j2_hex = hex::encode(joiner.agent.agent_id().as_bytes());
     let before: Option<String> = {
         let key = join_result_key(&s.stable_group_id, &j2_hex);
@@ -1119,6 +1122,10 @@ async fn wa_fresh_invite_round_trip(s: &BackToBack) -> Result<WaJoin> {
             .get(&key)
             .map(|p| (p.event.clone(), p.head_attestation.clone()));
         out.staged = staged.is_some();
+        if !out.authority_accepted {
+            let counters = super::group_counters_for_test(&s._authority, &s.stable_group_id).await;
+            out.body = format!("{} authority_counters={counters:?}", out.body);
+        }
         if let Some((event, head_attestation)) = staged {
             let from = joiner
                 .named_groups
@@ -1356,6 +1363,57 @@ async fn wa_not_member_owner_removes_delivered_then_reinvite_recovers_keys() -> 
 #[tokio::test]
 async fn wa_not_member_owner_removes_undelivered_then_reinvite_recovers_keys() -> Result<()> {
     let (ctx, r) = wa_workaround(false, false).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+/// Restart arm (Root, 2026-10-02): the join-attempt registry is in-memory
+/// (`AppState::pending_join_attempts`), so a device restart clears the
+/// keyless attempt that the finalizer never removes ("the seat wins").
+/// keyless `active` → owner `x0x group remove-member` (delivered or not) →
+/// DEVICE RESTART → fresh invite → must end `active` WITH keys.
+async fn wa_restart_workaround(
+    dir: &std::path::Path,
+    deliver_removal: bool,
+) -> Result<(String, WaJoin)> {
+    let s = build_back_to_back(dir).await?;
+    let r = wa_stuck_keyless(&s).await?;
+    assert!(
+        r.final_state == "active" && !r.treekem,
+        "keyless precondition: {r}"
+    );
+    let after_removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    let key_bytes = s.j2.agent.identity().agent_keypair().to_bytes();
+    s.j2.agent.shutdown().await;
+    let restarted = joiner_state(
+        dir,
+        "j2",
+        x0x::identity::AgentKeypair::from_bytes(&key_bytes.0, &key_bytes.1)?,
+    )
+    .await?;
+    let after_restart = wa_state(&restarted, &s.group_key).await;
+    let r = wa_fresh_invite_round_trip_on(&s, &restarted).await?;
+    restarted.agent.shutdown().await;
+    Ok((
+        format!(
+            "from=keyless_active removal_delivered={deliver_removal} j2_after_removal={after_removal} after_restart={after_restart}"
+        ),
+        r,
+    ))
+}
+
+#[tokio::test]
+async fn wa_keyless_remove_delivered_restart_reinvite_recovers_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (ctx, r) = wa_restart_workaround(dir.path(), true).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wa_keyless_remove_undelivered_restart_reinvite_recovers_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (ctx, r) = wa_restart_workaround(dir.path(), false).await?;
     wa_assert_recovered(&ctx, &r);
     Ok(())
 }
