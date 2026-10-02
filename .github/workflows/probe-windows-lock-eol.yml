@@ -1,0 +1,27 @@
+name: probe windows lock eol (DO NOT MERGE)
+on: pull_request
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [control-no-gitattributes, fix-gitattributes]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Apply variant
+        shell: bash
+        run: |
+          if [ "${{ matrix.variant }}" = control-no-gitattributes ]; then
+            git rm -q --cached .gitattributes 2>/dev/null || true; rm -f .gitattributes
+            git -c core.autocrlf=true checkout -- Cargo.lock 2>/dev/null || true
+            git rm -q --cached -r . >/dev/null && git reset -q --hard HEAD~0 2>/dev/null || true
+          fi
+          git config --get core.autocrlf || echo "autocrlf unset"
+          file Cargo.lock || true
+      - name: Simulate install-lock (copy LF Cargo.lock from git object)
+        shell: bash
+        run: |
+          git show HEAD:Cargo.lock > "$RUNNER_TEMP/lock" && cp "$RUNNER_TEMP/lock" Cargo.lock
+          echo "status after copy:"; git status --porcelain --untracked-files=no
+          test -z "$(git status --porcelain --untracked-files=no)" && echo CLEAN || { echo DIRTY; exit 1; }
