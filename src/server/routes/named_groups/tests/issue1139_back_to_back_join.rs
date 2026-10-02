@@ -27,11 +27,18 @@ async fn seal_home_add(
     owner: &x0x::identity::UserKeypair,
     member_kp: &x0x::identity::AgentKeypair,
     prepared: crate::mls::treekem::PreparedMember,
+    identity_cert: Option<&x0x::identity::AgentCertificate>,
 ) -> Result<SealedAdd> {
     let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
     let member = member_kp.agent_id();
     let member_hex = hex::encode(member.as_bytes());
-    let cert = x0x::identity::AgentCertificate::issue(owner, member_kp)?;
+    // The device's OWN identity certificate when known (production seals the
+    // joiner's own certificate, so a later re-join presents the same digest);
+    // otherwise a fresh owner-issued one.
+    let cert = match identity_cert {
+        Some(cert) => cert.clone(),
+        None => x0x::identity::AgentCertificate::issue(owner, member_kp)?,
+    };
     let kp_b64 = BASE64.encode(prepared.key_package_bytes());
     let now_ms = now_millis_u64();
     let group = state
@@ -263,6 +270,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         owner,
         &x0x::identity::AgentKeypair::from_bytes(&j1_bytes.0, &j1_bytes.1)?,
         j1_prepared,
+        j1.agent.identity().agent_certificate(),
     )
     .await?;
     let add_j2 = seal_home_add(
@@ -273,6 +281,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         owner,
         &x0x::identity::AgentKeypair::from_bytes(&j2_bytes.0, &j2_bytes.1)?,
         j2_prepared,
+        j2.agent.identity().agent_certificate(),
     )
     .await?;
     assert_eq!(add_j1.commit.revision, base.state_revision + 1);
@@ -1376,6 +1385,14 @@ async fn wa_restart_workaround(
     dir: &std::path::Path,
     deliver_removal: bool,
 ) -> Result<(String, WaJoin)> {
+    // Surface the owner device's WARN-only MemberJoined rejections in the
+    // captured test output (nextest prints it for a failing test).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,x0x::server::routes::named_groups=info",
+        ))
+        .with_test_writer()
+        .try_init();
     let s = build_back_to_back(dir).await?;
     let r = wa_stuck_keyless(&s).await?;
     assert!(
