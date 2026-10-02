@@ -1376,6 +1376,14 @@ async fn wa_restart_workaround(
     dir: &std::path::Path,
     deliver_removal: bool,
 ) -> Result<(String, WaJoin)> {
+    // Surface the owner device's WARN-only MemberJoined rejections in the
+    // captured test output (nextest prints it for a failing test).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,x0x::server::routes::named_groups=info",
+        ))
+        .with_test_writer()
+        .try_init();
     let s = build_back_to_back(dir).await?;
     let r = wa_stuck_keyless(&s).await?;
     assert!(
