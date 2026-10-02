@@ -1,0 +1,12 @@
+name: probe windows sha256sum format (DO NOT MERGE)
+on: pull_request
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - shell: bash
+        run: |
+          echo hello > x0x-windows-x64.zip
+          sha256sum x0x-windows-x64.zip | tee out.sha256
+          python3 -c "import sys;f=open('out.sha256',encoding='utf-8').read().split();print('fields',f);print('second_field_is_name', f[1]=='x0x-windows-x64.zip')"
