@@ -987,3 +987,354 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// v0.46 LIMITATION WORKAROUND PROBE (#1150, D39) — DO NOT MERGE.
+// From a stuck Home device (keyless `active`, or carry-stuck `not_member`),
+// the owner removes it (`x0x group remove-member <group> <agent>`) and
+// re-invites it; the device joins and must converge `active` WITH its
+// TreeKEM group. The join is a FAITHFUL round trip: the device's NEW
+// MemberJoined goes through the authority's real apply, and whatever the
+// authority stages is served back as its FetchRequest arm would.
+// ---------------------------------------------------------------------------
+
+async fn wa_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
+    let info = joiner.named_groups.read().await.get(group_key).cloned();
+    match info {
+        Some(info) => {
+            let local = hex::encode(joiner.agent.agent_id().as_bytes());
+            local_join_membership_state(joiner, &info, &local).await
+        }
+        None => "no_row",
+    }
+}
+
+struct WaJoin {
+    status: StatusCode,
+    body: String,
+    new_attempt: bool,
+    authority_accepted: bool,
+    staged: bool,
+    final_state: &'static str,
+    treekem: bool,
+}
+
+impl std::fmt::Display for WaJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "status={} new_attempt={} authority_accepted_member_joined={} staged={} final={} treekem={} body={}",
+            self.status, self.new_attempt, self.authority_accepted, self.staged,
+            self.final_state, self.treekem, self.body
+        )
+    }
+}
+
+/// Mint a fresh invite for J2 (`x0x` home seat / mint), join through the
+/// real route, then the faithful authority round trip.
+async fn wa_fresh_invite_round_trip(s: &BackToBack) -> Result<WaJoin> {
+    let joiner = &s.j2;
+    let j2_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let before: Option<String> = {
+        let key = join_result_key(&s.stable_group_id, &j2_hex);
+        joiner
+            .pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone())
+    };
+    let (_invite, link) = mint_invite_transaction(
+        &s._authority,
+        &s.group_key,
+        3_600,
+        Some(joiner.agent.agent_id()),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("mint fresh invite: {e:?}"))?;
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    let response = join_group_via_invite(
+        State(Arc::clone(joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(owner_pin),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body =
+        String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
+            .to_string();
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    let attempt = joiner
+        .pending_join_attempts
+        .lock()
+        .expect("attempt registry")
+        .get(&key)
+        .filter(|a| Some(&a.attempt_id) != before.as_ref())
+        .map(|a| {
+            (
+                a.attempt_id.clone(),
+                a.stored_resend.as_ref().map(|r| r.event.clone()),
+            )
+        });
+    let mut out = WaJoin {
+        status,
+        body,
+        new_attempt: attempt.is_some(),
+        authority_accepted: false,
+        staged: false,
+        final_state: "unknown",
+        treekem: false,
+    };
+    if let Some((attempt_id, Some(member_joined))) = attempt {
+        s._authority.pending_join_results.write().await.clear();
+        out.authority_accepted = apply_named_group_metadata_event(
+            &s._authority,
+            member_joined,
+            joiner.agent.agent_id(),
+            true,
+            None,
+        )
+        .await
+        .accepted;
+        let staged = s
+            ._authority
+            .pending_join_results
+            .read()
+            .await
+            .get(&key)
+            .map(|p| (p.event.clone(), p.head_attestation.clone()));
+        out.staged = staged.is_some();
+        if let Some((event, head_attestation)) = staged {
+            let from = joiner
+                .named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .map(|i| i.state_revision)
+                .unwrap_or_default();
+            let terminal = named_group_metadata_event_commit(&event).map(|c| c.revision);
+            let info = s
+                ._authority
+                .named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .cloned()
+                .expect("authority group");
+            let (chain, intervening_events) = match terminal {
+                Some(terminal) => (
+                    intervening_chain_from(&info, from, terminal),
+                    super::super::intervening_membership_events(
+                        &s._authority,
+                        std::slice::from_ref(&s.stable_group_id),
+                        from,
+                        terminal,
+                    )
+                    .await,
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            super::super::handle_join_result_message_bound(
+                joiner,
+                &s.authority_id,
+                true,
+                JoinResultMessage::Result {
+                    event: Box::new(event),
+                    chain,
+                    head_attestation: head_attestation.map(Box::new),
+                    roster_certificates_b64: Vec::new(),
+                    intervening_events,
+                },
+                Some(attempt_id.as_str()),
+            )
+            .await;
+        }
+    }
+    out.final_state = wa_state(joiner, &s.group_key).await;
+    out.treekem = joiner
+        .treekem_groups
+        .read()
+        .await
+        .contains_key(&s.group_key);
+    Ok(out)
+}
+
+/// Stuck state A: the carry applied r+1 state-only, J2's own seat never
+/// landed, the attempt timed out → durable `not_member` row.
+async fn wa_stuck_not_member(s: &BackToBack) -> Result<()> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::apply_join_result_intervening_events(
+        &s.j2,
+        &s.authority_id,
+        true,
+        &s.stable_group_id,
+        Some(s.add_j2.commit.revision),
+        Some(s.j2_attempt.as_str()),
+        vec![s.add_j1.event.clone()],
+    )
+    .await;
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "not_member",
+        "stuck precondition"
+    );
+    Ok(())
+}
+
+/// Stuck state B: the timed-out join (no carry) then the documented fresh
+/// invite → keyless `active` (the authority rejects the re-join, #1150).
+async fn wa_stuck_keyless(s: &BackToBack) -> Result<WaJoin> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    wa_fresh_invite_round_trip(s).await
+}
+
+/// The owner removes J2 (`x0x group remove-member <group> <agent>` =
+/// `DELETE /groups/:id/members/:agent_id`); optionally the resulting
+/// MemberRemoved reaches J2. Returns J2's local state afterwards.
+async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<&'static str> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    s._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = remove_named_group_member(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body =
+        String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
+            .to_string();
+    anyhow::ensure!(status.is_success(), "owner remove-member: {status} {body}");
+    if deliver {
+        let removed = s
+            ._authority
+            .named_group_test_recorders
+            .publish_bytes
+            .lock()
+            .expect("publish hook")
+            .iter()
+            .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
+            .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == j2_hex));
+        if let Some(event) = removed {
+            apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
+        }
+    }
+    Ok(wa_state(&s.j2, &s.group_key).await)
+}
+
+/// PROOF of #1150 (ii) on the faithful round trip: after a timed-out join,
+/// the documented fresh invite leaves J2 keyless — the authority REJECTS the
+/// re-join MemberJoined (step 7, J2 already Active) and stages nothing.
+#[tokio::test]
+async fn wa_proof_fresh_invite_alone_is_keyless_on_faithful_round_trip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let r = wa_stuck_keyless(&s).await?;
+    assert!(
+        r.new_attempt
+            && !r.authority_accepted
+            && !r.staged
+            && r.final_state == "active"
+            && !r.treekem,
+        "#1150 (ii) proof: expected keyless active with the re-join rejected: {r}"
+    );
+    Ok(())
+}
+
+async fn wa_workaround(stuck_keyless: bool, deliver_removal: bool) -> Result<(String, WaJoin)> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let pre = if stuck_keyless {
+        let r = wa_stuck_keyless(&s).await?;
+        assert!(
+            r.final_state == "active" && !r.treekem,
+            "keyless precondition: {r}"
+        );
+        "keyless_active"
+    } else {
+        wa_stuck_not_member(&s).await?;
+        "not_member"
+    };
+    let after_removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    Ok((
+        format!("from={pre} removal_delivered={deliver_removal} j2_after_removal={after_removal}"),
+        r,
+    ))
+}
+
+fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
+    assert!(
+        r.new_attempt && r.final_state == "active" && r.treekem,
+        "workaround (remove-member + fresh invite) did NOT recover with keys [{ctx}]: {r}"
+    );
+}
+
+#[tokio::test]
+async fn wa_keyless_owner_removes_delivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_workaround(true, true).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wa_keyless_owner_removes_undelivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_workaround(true, false).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wa_not_member_owner_removes_delivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_workaround(false, true).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wa_not_member_owner_removes_undelivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_workaround(false, false).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
