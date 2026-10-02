@@ -17694,6 +17694,97 @@ pub(in crate::server) const JOIN_HOME_PLACEMENTS_MAX: usize =
     x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES;
 
 /// POST /groups/join — join a group via invite link.
+/// D39(A) (review r1): what a local `not_member` row is, from the joiner's
+/// point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotMemberJoinRow {
+    /// The remnant of THIS device's own join that never seated: the join
+    /// route's lineage marker is present with no `seated_at_revision`, and
+    /// the roster holds no entry at all for the joiner (not Pending, not
+    /// Removed, not Banned). Only this shape may be cleared for a retry.
+    UnseatedJoinRemnant,
+    /// Fork-quarantined (marker or lineage fork evidence): containment is
+    /// kept and the retry is refused.
+    Quarantined,
+    /// Anything else (a removal, a ban, a group never joined by invite):
+    /// left exactly as it is.
+    Other,
+}
+
+fn classify_not_member_join_row(
+    info: &x0x::groups::GroupInfo,
+    joiner_hex: &str,
+) -> NotMemberJoinRow {
+    let lineage = info.invite_lineage.as_ref();
+    if info.is_fork_quarantined() || lineage.is_some_and(|l| l.fork_evidence.is_some()) {
+        return NotMemberJoinRow::Quarantined;
+    }
+    let never_seated = lineage.is_some_and(|l| l.seated_at_revision.is_none());
+    let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
+    if never_seated && no_roster_entry && !info.withdrawn {
+        NotMemberJoinRow::UnseatedJoinRemnant
+    } else {
+        NotMemberJoinRow::Other
+    }
+}
+
+/// D39(A): clear a local row the joining daemon is NOT a member of, so a
+/// fresh invite starts a NEW join attempt instead of returning an
+/// idempotent `already_joined: false, join_state: "not_member"` with no
+/// attempt. The row exists only because an earlier join's state-only
+/// intermediate apply persisted it before the join failed or timed out
+/// (the timeout finalizer removes only a still-pending stub). Only the
+/// in-memory state is cleared, like the finalizer's own stub removal: the
+/// fresh join installs its in-memory stub over the same key, and the
+/// durable record is rewritten when the member's own seat persists. A
+/// leftover TreeKEM group for the key is dropped too — a non-member must
+/// not hold it, and it would falsely satisfy the join poll's
+/// `treekem_groups.contains_key` confirmation. Only an
+/// [`NotMemberJoinRow::UnseatedJoinRemnant`] is cleared (re-checked under the
+/// write lock): seated, removed, banned and quarantined rows are never
+/// touched, and the #446 leave guard is unaffected.
+async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, joiner_hex: &str) {
+    let cleared: Vec<String> = {
+        let mut groups = state.named_groups.write().await;
+        let keys: Vec<String> = groups
+            .iter()
+            .filter(|(key, info)| {
+                (key.as_str() == group_id_hex || info.mls_group_id == group_id_hex)
+                    && classify_not_member_join_row(info, joiner_hex)
+                        == NotMemberJoinRow::UnseatedJoinRemnant
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            groups.remove(key);
+        }
+        keys
+    };
+    if cleared.is_empty() {
+        return;
+    }
+    {
+        let mut treekem = state.treekem_groups.write().await;
+        for key in &cleared {
+            treekem.remove(key);
+        }
+    }
+    {
+        let mut stubs = state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &cleared {
+            stubs.remove(key);
+        }
+    }
+    tracing::info!(
+        group_id = %LogHexId::group(group_id_hex),
+        cleared = cleared.len(),
+        "D39: cleared a not_member local row so a fresh invite starts a new join attempt"
+    );
+}
+
 pub(in crate::server) async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGroupRequest>,
@@ -17979,6 +18070,11 @@ pub(in crate::server) async fn join_group_via_invite(
     if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
         return resp;
     }
+    // D39(A): the provably-unseated remnant of this device's OWN failed
+    // join (see `classify_not_member_join_row`) must not swallow a fresh
+    // invite as an idempotent success. It is cleared below and the join
+    // proceeds as a NEW attempt.
+    let mut stale_not_member_row = false;
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
@@ -18019,74 +18115,101 @@ pub(in crate::server) async fn join_group_via_invite(
                 let joiner_hex = hex::encode(agent_id.as_bytes());
                 let membership_state =
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
-                let still_pending = membership_state == "pending_authority_commit";
-                if still_pending {
-                    let refire_state = Arc::clone(&state);
-                    let refire_group_id = group_id_hex.clone();
-                    let refire_stable = invite_stable_group_id.to_string();
-                    let refire_inviter = invite.inviter.clone();
-                    let refire_secret = invite.invite_secret.clone();
-                    let refire_treekem =
-                        invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
-                    // #477 (r5 item 4 → r7 item 2): when a REGISTERED
-                    // attempt owns the pending join, the refire wrapper is
-                    // attempt-owned — its registry slot is claimed and the
-                    // task spawned in ONE step while the membership guard
-                    // is STILL held (a finalizer cannot interleave), so it
-                    // can never transmit unowned. A post-restart pending
-                    // has no registry entry (empty attempt id): its legacy
-                    // repair wrapper spawns detached (C8's deadline owner).
-                    let owning_attempt_id = {
-                        let attempts = state
-                            .pending_join_attempts
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        attempts
-                            .get(&join_result_key(&refire_stable, &joiner_hex))
-                            .map(|entry| entry.attempt_id.clone())
-                            .unwrap_or_default()
-                    };
-                    drop(groups);
-                    spawn_attempt_task_under_guard(
-                        state.as_ref(),
-                        invite_stable_group_id,
-                        &joiner_hex,
-                        &owning_attempt_id,
-                        AttemptTaskKind::Task,
-                        Some(&membership_guard),
-                        async move {
-                            refire_pending_join_volley(
-                                &refire_state,
-                                &refire_group_id,
-                                refire_stable,
-                                &refire_inviter,
-                                refire_secret,
-                                refire_treekem,
-                            )
-                            .await;
-                        },
+                let not_member_row = (membership_state == "not_member")
+                    .then(|| classify_not_member_join_row(&info, &joiner_hex));
+                if not_member_row == Some(NotMemberJoinRow::Quarantined) {
+                    // Review r1 P1-2: a fork-quarantined row keeps its
+                    // containment; a retry never clears it.
+                    return api_error_with_reason(
+                        StatusCode::CONFLICT,
+                        "this device's earlier join of the group is fork-quarantined, so a new \
+                         invite cannot replace it; an operator clears the marker with \
+                         POST /groups/:id/quarantine/clear, then retries the invite",
+                        "fork_quarantined",
                     );
-                    drop(membership_guard);
                 }
-                let confirmed = membership_state == "active";
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        // #458 (review r2): `already_joined` claims a
-                        // CONFIRMED membership. A stub without the member's
-                        // own MemberAdded in the chain is NOT joined — the
-                        // typed `join_state` says so and the volley refire
-                        // above is already repairing it.
-                        "already_joined": confirmed,
-                        "join_state": membership_state,
-                        "group_id": group_id_hex,
-                        "group_name": info.name,
-                        "chat_topic": info.general_chat_topic(),
-                    })),
-                );
+                if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
+                    stale_not_member_row = true;
+                } else {
+                    let still_pending = membership_state == "pending_authority_commit";
+                    if still_pending {
+                        let refire_state = Arc::clone(&state);
+                        let refire_group_id = group_id_hex.clone();
+                        let refire_stable = invite_stable_group_id.to_string();
+                        let refire_inviter = invite.inviter.clone();
+                        let refire_secret = invite.invite_secret.clone();
+                        let refire_treekem =
+                            invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
+                        // #477 (r5 item 4 → r7 item 2): when a REGISTERED
+                        // attempt owns the pending join, the refire wrapper is
+                        // attempt-owned — its registry slot is claimed and the
+                        // task spawned in ONE step while the membership guard
+                        // is STILL held (a finalizer cannot interleave), so it
+                        // can never transmit unowned. A post-restart pending
+                        // has no registry entry (empty attempt id): its legacy
+                        // repair wrapper spawns detached (C8's deadline owner).
+                        let owning_attempt_id = {
+                            let attempts = state
+                                .pending_join_attempts
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            attempts
+                                .get(&join_result_key(&refire_stable, &joiner_hex))
+                                .map(|entry| entry.attempt_id.clone())
+                                .unwrap_or_default()
+                        };
+                        drop(groups);
+                        spawn_attempt_task_under_guard(
+                            state.as_ref(),
+                            invite_stable_group_id,
+                            &joiner_hex,
+                            &owning_attempt_id,
+                            AttemptTaskKind::Task,
+                            Some(&membership_guard),
+                            async move {
+                                refire_pending_join_volley(
+                                    &refire_state,
+                                    &refire_group_id,
+                                    refire_stable,
+                                    &refire_inviter,
+                                    refire_secret,
+                                    refire_treekem,
+                                )
+                                .await;
+                            },
+                        );
+                        drop(membership_guard);
+                    }
+                    let confirmed = membership_state == "active";
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            // #458 (review r2): `already_joined` claims a
+                            // CONFIRMED membership. A stub without the member's
+                            // own MemberAdded in the chain is NOT joined — the
+                            // typed `join_state` says so and the volley refire
+                            // above is already repairing it.
+                            "already_joined": confirmed,
+                            "join_state": membership_state,
+                            "group_id": group_id_hex,
+                            "group_name": info.name,
+                            "chat_topic": info.general_chat_topic(),
+                        })),
+                    );
+                }
             }
         }
+    }
+    if stale_not_member_row {
+        // Still under the membership guard taken above, so no concurrent
+        // join, apply or finalizer can interleave with the clear.
+        clear_stale_not_member_join_row(
+            state.as_ref(),
+            &group_id_hex,
+            &hex::encode(agent_id.as_bytes()),
+        )
+        .await;
     }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,

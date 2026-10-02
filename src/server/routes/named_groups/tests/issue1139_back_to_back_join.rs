@@ -1359,3 +1359,63 @@ async fn wa_not_member_owner_removes_undelivered_then_reinvite_recovers_keys() -
     wa_assert_recovered(&ctx, &r);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// CHAINED probe (DO NOT MERGE; this branch carries #1148's product diff):
+// carry-stuck `not_member` → #1148 fresh invite (keyless `active`) → that
+// attempt times out → owner `x0x group remove-member` → fresh invite →
+// must end `active` WITH the TreeKEM group.
+// ---------------------------------------------------------------------------
+
+async fn wa_time_out_live_attempt(s: &BackToBack) {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let live =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&join_result_key(&s.stable_group_id, &j2_hex))
+            .map(|a| a.attempt_id.clone());
+    if let Some(attempt_id) = live {
+        super::super::finalize_join_attempt(
+            &s.j2,
+            &s.group_key,
+            &s.stable_group_id,
+            &j2_hex,
+            &attempt_id,
+            super::super::JoinAttemptOutcome::TimedOut,
+            super::super::JoinFinalizeGuard::Unlocked,
+        )
+        .await;
+    }
+}
+
+async fn wa_chained(deliver_removal: bool) -> Result<(String, WaJoin)> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_stuck_not_member(&s).await?;
+    let via_1148 = wa_fresh_invite_round_trip(&s).await?;
+    wa_time_out_live_attempt(&s).await;
+    let after_timeout = wa_state(&s.j2, &s.group_key).await;
+    let after_removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    Ok((
+        format!(
+            "1148_step=[{via_1148}] after_timeout={after_timeout} removal_delivered={deliver_removal} j2_after_removal={after_removal}"
+        ),
+        r,
+    ))
+}
+
+#[tokio::test]
+async fn wa_chained_1148_then_remove_delivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_chained(true).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wa_chained_1148_then_remove_undelivered_then_reinvite_recovers_keys() -> Result<()> {
+    let (ctx, r) = wa_chained(false).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
