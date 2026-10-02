@@ -1135,7 +1135,25 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
             let counters = super::group_counters_for_test(&s._authority, &s.stable_group_id).await;
             out.body = format!("{} authority_counters={counters:?}", out.body);
         }
-        if let Some((event, head_attestation)) = staged {
+        if let Some((mut event, head_attestation)) = staged {
+            // In-process transport stand-in: the owner device sends the
+            // Welcome by reference (control-blob pull over the network);
+            // inline the staged bytes exactly as the R19 tests do.
+            if let NamedGroupMetadataEvent::MemberAdded {
+                treekem_welcome_b64,
+                welcome_ref,
+                ..
+            } = &mut event
+            {
+                if let Some(reference) = welcome_ref.take() {
+                    let welcomes = s._authority.pending_welcomes.read().await;
+                    if let Some(welcome) = welcomes.get(&reference.welcome_id) {
+                        *treekem_welcome_b64 = Some(BASE64.encode(&welcome.bytes));
+                    } else {
+                        *welcome_ref = Some(reference);
+                    }
+                }
+            }
             let from = joiner
                 .named_groups
                 .read()
