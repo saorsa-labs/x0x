@@ -1291,6 +1291,27 @@ async fn wa_workaround(stuck_keyless: bool, deliver_removal: bool) -> Result<(St
             r.final_state == "active" && !r.treekem,
             "keyless precondition: {r}"
         );
+        // The keyless attempt's own await_treekem poll times out (120 s in
+        // production) before the user retries — finalize it as such.
+        let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+        let live =
+            s.j2.pending_join_attempts
+                .lock()
+                .expect("attempt registry")
+                .get(&join_result_key(&s.stable_group_id, &j2_hex))
+                .map(|a| a.attempt_id.clone());
+        if let Some(attempt_id) = live {
+            super::super::finalize_join_attempt(
+                &s.j2,
+                &s.group_key,
+                &s.stable_group_id,
+                &j2_hex,
+                &attempt_id,
+                super::super::JoinAttemptOutcome::TimedOut,
+                super::super::JoinFinalizeGuard::Unlocked,
+            )
+            .await;
+        }
         "keyless_active"
     } else {
         wa_stuck_not_member(&s).await?;
