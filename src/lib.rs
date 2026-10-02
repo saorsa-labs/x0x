@@ -14301,10 +14301,14 @@ impl Agent {
         &self,
         machine_id: &identity::MachineId,
     ) -> error::NetworkResult<streams::PeerStream> {
-        if !self
-            .owner_trust
-            .is_enrolled_owner_machine(&self.revocation_set, machine_id)
-            .await
+        // ROW 3a RED-PROOF (DO NOT MERGE): the #1040 dial-on-enrollment
+        // fallback is neutralised as well.
+        let neutralised = std::hint::black_box(true);
+        if neutralised
+            || !self
+                .owner_trust
+                .is_enrolled_owner_machine(&self.revocation_set, machine_id)
+                .await
         {
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
@@ -14876,14 +14880,10 @@ impl Agent {
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
     ) -> bool {
-        let has_known_agent = {
-            let cache = discovery_cache.read().await;
-            cache.values().any(|agent| agent.machine_id == *machine_id)
-        };
-        !has_known_agent
-            && owner_trust
-                .is_enrolled_owner_machine(revocation_set, machine_id)
-                .await
+        // ROW 3a RED-PROOF (DO NOT MERGE): the #1040 accept-side admission
+        // is neutralised so the restart test runs as on the pre-fix tree.
+        let _ = (discovery_cache, revocation_set, owner_trust, machine_id);
+        false
     }
 
     /// #1040 post-prefix decision for a stream that took the enrolled
