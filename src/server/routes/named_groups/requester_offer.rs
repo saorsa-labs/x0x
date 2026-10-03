@@ -85,7 +85,10 @@ struct RequesterOfferOutboxFile {
 /// Insert (or replace, on a repeated `(group, request_id)`) one
 /// obligation, enforcing the ADR 0028 caps, and persist durably. The
 /// in-memory map changes only after the durable write succeeds; a
-/// non-durable outcome keeps the last durable set in force.
+/// non-durable outcome keeps the last durable set in force — except a
+/// failure AFTER the rename (issue #1101), where the disk already holds
+/// the new set, so memory commits to match it while the error still
+/// reports that durability is unconfirmed.
 pub(in crate::server) async fn insert_requester_offer_obligation(
     state: &AppState,
     obligation: RequesterOfferObligation,
@@ -97,7 +100,21 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     group.retain(|o| o.request_id != obligation.request_id);
     group.push(obligation);
     enforce_caps(&mut next);
-    save_requester_offer_outbox(state, &next).await?;
+    match save_requester_offer_outbox(state, &next).await {
+        Ok(()) => {}
+        Err(e) if e.crossed_rename() => {
+            // #1101: the rename already happened — disk holds `next`.
+            // Commit memory so they agree (a later save from stale memory
+            // would silently drop the durable obligation), and still
+            // report the error: durability is unconfirmed.
+            *state.requester_offer_outbox.write().await = next;
+            return Err(format!(
+                "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                 the change is in effect"
+            ));
+        }
+        Err(e) => return Err(format!("failed to write requester offer outbox: {e}")),
+    }
     *state.requester_offer_outbox.write().await = next;
     Ok(())
 }
@@ -156,20 +173,25 @@ fn enforce_caps(by_group: &mut HashMap<String, Vec<RequesterOfferObligation>>) {
 }
 
 /// Durable sidecar write (temp, fsync, 0600, rename, dir fsync — the
-/// same helper the owner key and the grant store use).
+/// same helper the owner key and the grant store use). The typed error
+/// says whether the rename had already happened when a failure arrived
+/// (issue #1101).
 async fn save_requester_offer_outbox(
     state: &AppState,
     by_group: &HashMap<String, Vec<RequesterOfferObligation>>,
-) -> Result<(), String> {
+) -> Result<(), crate::storage::DurableWriteError> {
     let file = RequesterOfferOutboxFile {
         version: REQUESTER_OFFER_OUTBOX_VERSION,
         by_group: by_group.clone(),
     };
-    let bytes = serde_json::to_vec(&file)
-        .map_err(|e| format!("failed to encode requester offer outbox: {e}"))?;
+    let bytes = serde_json::to_vec(&file).map_err(|e| {
+        crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+            "failed to encode requester offer outbox: {e}"
+        )))
+    })?;
     crate::storage::write_private_bytes_durable(&state.requester_offer_outbox_path, bytes)
         .await
-        .map_err(|e| format!("failed to write requester offer outbox: {e}"))
+        .map_err(|e| e.with_path(&state.requester_offer_outbox_path))
 }
 
 /// Load the outbox at boot. Missing ⇒ empty. Malformed, wrong version, or
@@ -424,23 +446,34 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         }
         next.retain(|_, list| !list.is_empty());
     }
-    if let Err(error) = save_requester_offer_outbox(state, &next).await {
-        tracing::error!(
-            %error,
-            "#908: failed to persist requester offer outbox; rolling back this pass"
-        );
-        // #942 M4: the write helper is temp→fsync→rename→dir-fsync, so an
-        // error arriving AFTER the rename means the disk may already hold
-        // `next` while memory rolls back to `snapshot`. That divergence is
-        // benign for THIS store in both directions: (a) if the disk really
-        // holds `next`, the only entries it can lack versus `snapshot` are
-        // DELIVERED obligations (a crash then loads `next` — correct, they
-        // were ACKed) and undelivered obligations are present in both; (b) if
-        // the rename truly failed, disk and memory agree on `snapshot`. The
-        // worst case is a redundant re-delivery of an ACKed offer, which the
-        // authority's digest-keyed admission dedups — never a lost promise.
-        *state.requester_offer_outbox.write().await = snapshot;
-        return;
+    match save_requester_offer_outbox(state, &next).await {
+        Ok(()) => {}
+        Err(e) if e.crossed_rename() => {
+            // #1101: the rename already happened — disk holds `next`.
+            // Commit `next` so memory agrees with disk, removing the
+            // divergence the old #942 M4 rollback-to-snapshot analysis had
+            // to argue was merely benign (redundant re-delivery of an
+            // ACKed offer). Diagnostics stay uncounted: they advance only
+            // on a confirmed durable write.
+            tracing::error!(
+                error = %e,
+                "#908: requester offer outbox applied, but durability is not confirmed \
+                 (directory fsync failed); the change is in effect — committing the disk \
+                 state to memory"
+            );
+            *state.requester_offer_outbox.write().await = next;
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "#908: failed to persist requester offer outbox; rolling back this pass"
+            );
+            // Before the rename the file still holds the snapshot's bytes:
+            // rolling memory back keeps the two in agreement.
+            *state.requester_offer_outbox.write().await = snapshot;
+            return;
+        }
     }
     *state.requester_offer_outbox.write().await = next;
     // Persist-before-count: diagnostics advance only on a durable store.

@@ -181,6 +181,12 @@ pub enum ShareGrantError {
     /// The store is full, unreadable, or could not be written.
     #[error("share grant store: {0}")]
     Store(String),
+    /// A durable write crossed the atomic rename but could not be synced:
+    /// the new state IS on disk and memory matches it, but the store
+    /// refuses further writes until a fresh load (mirrors
+    /// `OwnerSyncStore`, issue #1101).
+    #[error("share grant store poisoned (state replaced but not durable): {0}")]
+    Poisoned(String),
 }
 
 impl ShareGrant {
@@ -482,6 +488,12 @@ pub struct ShareGrantStore {
     /// Set when the file on disk could not be read: the store then holds
     /// nothing and refuses writes so the file is never silently replaced.
     load_error: Option<String>,
+    /// Set when a durable write crossed the rename but could not be
+    /// synced (issue #1101): memory still matches the advanced disk, but
+    /// the durability contract is broken — the store refuses writes
+    /// until a fresh `load` re-establishes ground truth. Mirrors
+    /// `OwnerSyncStore`'s poison (review R5 finding 2).
+    poisoned: std::sync::Mutex<Option<String>>,
 }
 
 impl ShareGrantStore {
@@ -495,6 +507,7 @@ impl ShareGrantStore {
             state: std::sync::RwLock::new(StoreState::default()),
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
+            poisoned: std::sync::Mutex::new(None),
         }
     }
 
@@ -685,11 +698,18 @@ impl ShareGrantStore {
     /// Verify, classify and durably store a grant.
     ///
     /// Returns `Inserted` or `Duplicate` only once the grant is on disk (or
-    /// the store is in-memory). Every refusal leaves the store unchanged.
+    /// the store is in-memory). Every refusal leaves the store unchanged,
+    /// EXCEPT a post-rename durability failure (issue #1101): the grant is
+    /// then already on disk, so it STAYS in memory and the store is
+    /// poisoned (`Poisoned`) — rolling memory back would leave a restart
+    /// enforcing a grant whose ACK was withheld.
     ///
     /// # Errors
     /// Any [`ShareGrantError`]: invalid/forged ([`ShareGrant::verify`]),
-    /// `Expired` at `now_unix`, `NotForUs`, `Conflict`, or `Store`.
+    /// `Expired` at `now_unix`, `NotForUs`, `Conflict`, `Store` (the write
+    /// failed before the rename — rolled back), or `Poisoned` (the write
+    /// crossed the rename but was not confirmed durable — kept, store
+    /// poisoned until a fresh [`Self::load`]).
     pub async fn accept(
         &self,
         grant: ShareGrant,
@@ -704,6 +724,9 @@ impl ShareGrantStore {
             return Err(ShareGrantError::Store(format!(
                 "store not writable (unreadable file): {e}"
             )));
+        }
+        if let Some(reason) = self.poison_refusal() {
+            return Err(reason);
         }
         let _write = self.write_lock.lock().await;
         {
@@ -724,17 +747,67 @@ impl ShareGrantStore {
             }
             map.insert(grant.grant_id, grant.clone());
         }
-        if let Err(e) = self.persist().await {
-            // Roll back: a grant that is not durable must not be reported
-            // as stored (the durable ACK would be a lie).
-            self.write_state().role_mut(role).remove(&grant.grant_id);
-            return Err(ShareGrantError::Store(e));
+        match self.persist().await {
+            Ok(()) => {}
+            Err(e) if e.crossed_rename() => {
+                // Issue #1101: the rename already happened — the grant IS
+                // in `share-grants.bin`. Keep it (memory matches the
+                // advanced disk) and poison the store instead of rolling
+                // memory back below an advanced disk; a restart must never
+                // enforce a grant that was reported refused. Mirrors
+                // `OwnerSyncStore` (review R5 finding 2).
+                let reason = format!(
+                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect; restart x0xd to clear"
+                );
+                self.poison(reason.clone());
+                return Err(ShareGrantError::Poisoned(reason));
+            }
+            Err(e) => {
+                // Roll back: a grant that is not durable must not be
+                // reported as stored (the durable ACK would be a lie).
+                self.write_state().role_mut(role).remove(&grant.grant_id);
+                return Err(ShareGrantError::Store(format!("write {e}")));
+            }
         }
         Ok(DmTypedPayloadCompletion::Inserted)
     }
 
+    /// Poison the store: a durable write crossed the rename but could not
+    /// be synced, so the durability contract is broken — the store refuses
+    /// writes until a fresh `load` re-establishes ground truth (issue
+    /// #1101; mirrors `OwnerSyncStore`, review R5 finding 2).
+    fn poison(&self, reason: String) {
+        *self
+            .poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    /// Why the store is poisoned, if it is.
+    #[must_use]
+    pub fn poisoned_reason(&self) -> Option<String> {
+        self.poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The typed refusal for a poisoned store. Checked FIRST by every
+    /// state-mutating entry point: after a post-rename durability failure
+    /// no mutation may proceed against state whose durability is
+    /// unconfirmed — even after the fault clears — until an explicit
+    /// reload.
+    fn poison_refusal(&self) -> Option<ShareGrantError> {
+        self.poisoned_reason().map(ShareGrantError::Poisoned)
+    }
+
     /// Write the store atomically (mode 0600). Callers hold `write_lock`.
-    async fn persist(&self) -> Result<(), String> {
+    /// The error says which half of the durable write failed (issue
+    /// #1101): `BeforeRename` leaves the old file in place (callers roll
+    /// back), `AfterRename` means the new file is already there (callers
+    /// keep the mutation and fail-stop).
+    async fn persist(&self) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -745,7 +818,11 @@ impl ShareGrantStore {
                 received: state.received.values().cloned().collect(),
             }
         };
-        let body = bincode::serialize(&file).map_err(|e| format!("encode: {e}"))?;
+        let body = bincode::serialize(&file).map_err(|e| {
+            crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+                "encode: {e}"
+            )))
+        })?;
         let mut bytes = Vec::with_capacity(STORE_MAGIC.len() + body.len());
         bytes.extend_from_slice(STORE_MAGIC);
         bytes.extend_from_slice(&body);
@@ -754,7 +831,7 @@ impl ShareGrantStore {
         // power loss.
         crate::storage::write_private_bytes_durable(path, bytes)
             .await
-            .map_err(|e| format!("write {}: {e}", path.display()))
+            .map_err(|e| e.with_path(path))
     }
 }
 

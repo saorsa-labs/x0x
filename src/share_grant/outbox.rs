@@ -463,7 +463,9 @@ impl GrantRedeliveryOutbox {
     /// # Errors
     /// Not queueable (foreign, forged or expired grant), revoked, a bound
     /// reached, or a store failure. A refused entry leaves the outbox
-    /// unchanged.
+    /// unchanged — except a store failure AFTER the rename (issue #1101):
+    /// the entry is already on disk, so it stays queued and the error says
+    /// the write is not confirmed durable.
     pub async fn enqueue(
         &self,
         grant: &ShareGrant,
@@ -521,11 +523,27 @@ impl GrantRedeliveryOutbox {
                 },
             );
         }
-        if let Err(e) = self.persist().await {
-            // Roll back: an entry that is not durable must not be reported
-            // as queued.
-            self.lock().remove(&key);
-            return Err(OutboxError::Store(e));
+        match self.persist().await {
+            Ok(()) => {}
+            Err(e) if e.crossed_rename() => {
+                // Issue #1101: the rename already happened — the entry IS
+                // in the outbox file. Keep it (memory matches the
+                // advanced disk; `persist` left the outbox dirty so the
+                // next worker pass rewrites and re-syncs it) and still
+                // report failure: durability is unconfirmed, so
+                // `Ok(true)` ("on disk") would overstate what happened.
+                self.wake.notify_one();
+                return Err(OutboxError::Store(format!(
+                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect"
+                )));
+            }
+            Err(e) => {
+                // Roll back: an entry that is not durable must not be
+                // reported as queued.
+                self.lock().remove(&key);
+                return Err(OutboxError::Store(format!("{e}")));
+            }
         }
         self.wake.notify_one();
         Ok(true)
@@ -548,7 +566,9 @@ impl GrantRedeliveryOutbox {
             before - entries.len()
         };
         if removed > 0 || self.dirty.load(Ordering::Acquire) {
-            self.persist().await.map_err(OutboxError::Store)?;
+            self.persist()
+                .await
+                .map_err(|e| OutboxError::Store(format!("{e}")))?;
         }
         Ok(removed)
     }
@@ -717,29 +737,39 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Write the outbox atomically (mode 0600). Callers hold `write_lock`.
-    async fn persist(&self) -> Result<(), String> {
+    /// The error says which half of the durable write failed (issue
+    /// #1101): `BeforeRename` leaves the old file in place (callers may
+    /// roll back), `AfterRename` means the new file is already there
+    /// (callers keep the mutation and fail-stop).
+    async fn persist(&self) -> Result<(), crate::storage::DurableWriteError> {
         let result = self.write_file().await;
         self.dirty.store(result.is_err(), Ordering::Release);
         result
     }
 
-    async fn write_file(&self) -> Result<(), String> {
+    async fn write_file(&self) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         if let Some(e) = &self.load_error {
-            return Err(format!("outbox not writable (unreadable file): {e}"));
+            return Err(crate::storage::DurableWriteError::BeforeRename(
+                std::io::Error::other(format!("outbox not writable (unreadable file): {e}")),
+            ));
         }
         let file = OutboxFile {
             entries: self.pending(),
         };
-        let body = bincode::serialize(&file).map_err(|e| format!("encode: {e}"))?;
+        let body = bincode::serialize(&file).map_err(|e| {
+            crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+                "encode: {e}"
+            )))
+        })?;
         let mut bytes = Vec::with_capacity(OUTBOX_MAGIC.len() + body.len());
         bytes.extend_from_slice(OUTBOX_MAGIC);
         bytes.extend_from_slice(&body);
         crate::storage::write_private_bytes_durable(path, bytes)
             .await
-            .map_err(|e| format!("write {}: {e}", path.display()))
+            .map_err(|e| e.with_path(path))
     }
 }
 
