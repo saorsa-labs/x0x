@@ -563,6 +563,50 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
             }
         })
     }
+
+    /// #1100: plaintext goes out only while the group is STILL signed-public,
+    /// and only under a read permit on the daemon's GSS publication gate —
+    /// the same gate every authoritative group mutation holds exclusively
+    /// while it swaps the live map (`persist_named_group_info_inner`), so a
+    /// `PATCH /groups/:id/policy` flip to `MlsEncrypted` cannot commit
+    /// between this check and the publish. A group that left the public
+    /// plane (or became unresolvable or withdrawn) answers `Stale` and the
+    /// payload re-enters the sealing path — never plaintext.
+    ///
+    /// Called with no lock held (after `seal` returned `None`), and takes
+    /// each lock once, in the same order `confirm_publication`'s GSS arm
+    /// does: the publication gate, then `named_groups`.
+    fn confirm_plaintext_publication<'a>(
+        &'a self,
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::TaskPublication> {
+        Box::pin(async move {
+            let unavailable = |why: &str| {
+                x0x::crdt::CrdtError::Gossip(format!("group task list publication: {why}"))
+            };
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| unavailable("daemon is shutting down"))?;
+            let permit = Arc::clone(&state.gss_publication_gate).read_owned().await;
+            let still_public = {
+                let groups = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&groups, &self.group_id).map(
+                    |(_, info)| {
+                        !info.withdrawn
+                            && info.policy.confidentiality
+                                == x0x::groups::GroupConfidentiality::SignedPublic
+                    },
+                )
+            };
+            Ok(if still_public == Some(true) {
+                x0x::crdt::TaskPublication::Current(x0x::crdt::TaskPublicationPermit::holding(
+                    permit,
+                ))
+            } else {
+                x0x::crdt::TaskPublication::Stale
+            })
+        })
+    }
 }
 
 /// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.
@@ -1760,7 +1804,7 @@ mod tests {
         use x0x::crdt::sealed::{decode_sealed_task_record, SealedTaskRecordBody};
         use x0x::identity::AgentId;
 
-        const BOUND: Duration = Duration::from_secs(20);
+        pub(super) const BOUND: Duration = Duration::from_secs(20);
 
         type Hook = (
             tokio::sync::oneshot::Sender<()>,
@@ -1770,14 +1814,14 @@ mod tests {
         /// Delegates everything to the production protector; the first
         /// `seal` after [`arm`](Self::arm) signals and then waits to be
         /// released before returning its (already sealed) record.
-        struct PauseAfterSeal {
+        pub(super) struct PauseAfterSeal {
             inner: Arc<dyn x0x::crdt::TaskDeltaProtector>,
             hook: std::sync::Mutex<Option<Hook>>,
             seals: AtomicUsize,
         }
 
         impl PauseAfterSeal {
-            fn arm(
+            pub(super) fn arm(
                 &self,
             ) -> (
                 tokio::sync::oneshot::Receiver<()>,
@@ -1789,7 +1833,7 @@ mod tests {
                 (sealed_rx, resume_tx)
             }
 
-            fn seals(&self) -> usize {
+            pub(super) fn seals(&self) -> usize {
                 self.seals.load(Ordering::SeqCst)
             }
         }
@@ -1841,6 +1885,12 @@ mod tests {
             ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::TaskPublication> {
                 self.inner.confirm_publication(body)
             }
+
+            fn confirm_plaintext_publication<'a>(
+                &'a self,
+            ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::TaskPublication> {
+                self.inner.confirm_plaintext_publication()
+            }
         }
 
         fn test_network_config() -> x0x::network::NetworkConfig {
@@ -1853,7 +1903,7 @@ mod tests {
             }
         }
 
-        async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        pub(super) async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
             let dir = tempfile::tempdir().expect("tempdir");
             let data_dir = dir.path().to_path_buf();
             let agent = Arc::new(
@@ -1879,7 +1929,7 @@ mod tests {
 
         /// A sync for `topic` carrying the production protector wrapped in
         /// [`PauseAfterSeal`], and a pubsub the test can subscribe to.
-        async fn sealed_sync(
+        pub(super) async fn sealed_sync(
             state: &Arc<AppState>,
             topic: &str,
         ) -> (
@@ -1915,7 +1965,7 @@ mod tests {
             (Arc::new(sync), pubsub, protector)
         }
 
-        fn spawn_publish(
+        pub(super) fn spawn_publish(
             sync: &Arc<x0x::crdt::TaskListSync>,
         ) -> tokio::task::JoinHandle<x0x::crdt::Result<()>> {
             let sync = Arc::clone(sync);
@@ -2271,6 +2321,194 @@ mod tests {
                 protector.seals(),
                 2,
                 "the stale seal was discarded, not published"
+            );
+        }
+    }
+
+    /// #1100: the plaintext publish branch of `seal_and_publish` must hold a
+    /// publication permit and re-check the plane, so a `PATCH
+    /// /groups/:id/policy` flip to `MlsEncrypted` that commits between the
+    /// check and the publish can never let plaintext out.
+    ///
+    /// Like the #975 module, the interleaving is forced, not slept into:
+    /// [`PauseAfterSeal`] parks the publisher between its public-plane seal
+    /// check and the publish, the test commits the flip through the real
+    /// persistence path (which swaps the live map under the GSS publication
+    /// gate write lock), then releases the publisher. The fixture never joins
+    /// the network: loopback bind, no bootstrap peers, mDNS and port mapping
+    /// off (see `test_network_config`).
+    mod publication_plaintext_1100 {
+        use super::publication_epoch_975::{sealed_sync, spawn_publish, test_state, BOUND};
+        use super::*;
+        use std::time::Duration;
+        use x0x::crdt::sealed::decode_sealed_task_record;
+        use x0x::groups::{GroupConfidentiality, GroupInfo, GroupPolicy};
+
+        /// A signed-public group owned by this node — the plane whose seal
+        /// returns `None` and whose deltas publish as plaintext.
+        async fn seed_public_group(state: &AppState, group_key: &str) -> GroupInfo {
+            let mut info = GroupInfo::with_policy(
+                "board".to_string(),
+                String::new(),
+                state.agent.agent_id(),
+                group_key.to_string(),
+                GroupPolicy {
+                    confidentiality: GroupConfidentiality::SignedPublic,
+                    ..GroupPolicy::default()
+                },
+            );
+            info.migrate_from_v1();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.to_string(), info.clone());
+            info
+        }
+
+        /// `pre` flipped to `MlsEncrypted` with a fresh secret, as a policy
+        /// commit leaves it.
+        fn flip_to_encrypted(pre: &GroupInfo) -> GroupInfo {
+            let mut next = pre.clone();
+            next.policy.confidentiality = GroupConfidentiality::MlsEncrypted;
+            next.policy_revision += 1;
+            let _ = next.rotate_shared_secret();
+            next.recompute_state_hash();
+            next
+        }
+
+        /// THE #1100 race: the flip commits while the publisher sits between
+        /// its public-plane seal check and the publish.
+        ///
+        /// On the unfixed code the paused branch published the bytes its one
+        /// public-plane seal cleared, so the plaintext delta reached the wire
+        /// after the flip — the `decode_sealed_task_record` assertion fails.
+        /// Fixed, the publisher re-checks under the publication permit, sees
+        /// the group left the public plane, and re-enters the sealing path.
+        #[tokio::test]
+        async fn plaintext_delta_never_publishes_after_a_flip_to_encrypted() {
+            let (state, _dir) = test_state().await;
+            let group_key = "11".repeat(16);
+            let pre = seed_public_group(&state, &group_key).await;
+            assert_eq!(
+                pre.policy.confidentiality,
+                GroupConfidentiality::SignedPublic
+            );
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            let (sealed, resume) = protector.arm();
+            let publisher = spawn_publish(&sync);
+            tokio::time::timeout(BOUND, sealed)
+                .await
+                .expect("publisher reached its public-plane seal")
+                .expect("hook");
+
+            let next = flip_to_encrypted(&pre);
+            assert!(next.secret_epoch > pre.secret_epoch);
+            let committed = tokio::time::timeout(
+                BOUND,
+                crate::server::routes::named_groups::persist_named_group_info(
+                    &state, &group_key, next,
+                ),
+            )
+            .await
+            .expect("a parked public-plane seal holds no lock the policy writer needs")
+            .expect("persist flip");
+            assert!(matches!(
+                committed,
+                crate::server::routes::named_groups::AtomicWriteOutcome::Durable
+            ));
+
+            let _ = resume.send(());
+            tokio::time::timeout(BOUND, publisher)
+                .await
+                .expect("publish completes")
+                .expect("join")
+                .expect("publish");
+
+            let msg = tokio::time::timeout(BOUND, sub.recv())
+                .await
+                .expect("a record was published")
+                .expect("subscription open");
+            let Some((_, x0x::crdt::sealed::SealedTaskRecordBody::Gss(record))) =
+                decode_sealed_task_record(&msg.payload)
+            else {
+                panic!(
+                    "no plaintext task delta may reach the wire after the flip to \
+                     MlsEncrypted (#1100)"
+                );
+            };
+            assert_eq!(
+                record.epoch,
+                pre.secret_epoch + 1,
+                "the delta must be sealed under the post-flip epoch"
+            );
+            let current = state.named_groups.read().await[&group_key].clone();
+            x0x::crdt::sealed::open_gss_task_record(&current, &topic, &record)
+                .expect("a current member opens the re-sealed delta");
+            assert_eq!(
+                protector.seals(),
+                2,
+                "the public-plane seal was discarded, not published"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                    .await
+                    .is_err(),
+                "exactly one record reached the wire"
+            );
+        }
+
+        /// The permit really spans the publish: while a policy commit holds
+        /// the GSS publication gate, a still-public group's plaintext publish
+        /// cannot go out; once the commit releases the gate it completes.
+        /// On the unfixed code the publisher finishes under the held gate —
+        /// the `!publisher.is_finished()` assertion fails.
+        #[tokio::test]
+        async fn a_plaintext_publish_holds_the_publication_gate_through_the_publish() {
+            let (state, _dir) = test_state().await;
+            let group_key = "12".repeat(16);
+            seed_public_group(&state, &group_key).await;
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            let writer = state.gss_publication_gate.write().await;
+            let publisher = spawn_publish(&sync);
+            tokio::time::timeout(BOUND, async {
+                while protector.seals() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("sealing does not need the gate");
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !publisher.is_finished(),
+                "a plaintext publish must not go out while a policy commit holds the gate (#1100)"
+            );
+            drop(writer);
+            tokio::time::timeout(BOUND, publisher)
+                .await
+                .expect("publish completes once the commit releases the gate")
+                .expect("join")
+                .expect("publish");
+
+            let msg = tokio::time::timeout(BOUND, sub.recv())
+                .await
+                .expect("the still-public delta was published")
+                .expect("subscription open");
+            assert!(
+                decode_sealed_task_record(&msg.payload).is_none(),
+                "a group that is still signed-public publishes plaintext"
+            );
+            assert!(
+                crate::gossip::wire::decode_delta::<x0x::crdt::TaskListDelta>(&msg.payload).is_ok(),
+                "and that payload is a task delta"
             );
         }
     }

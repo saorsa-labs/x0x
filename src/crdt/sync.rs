@@ -204,15 +204,19 @@ fn publish_err(e: impl std::fmt::Display) -> crate::crdt::CrdtError {
     crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
 }
 
-/// #895/#975: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
+/// #895/#975/#1100: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
 ///
 /// Without a protector, or for a signed-public group, `plain` is published
-/// as is. Otherwise it is sealed, the protector confirms the seal is still
-/// under the group's CURRENT epoch, and the sealed record is published while
-/// the protector's permit holds that epoch fixed. A member removal that
-/// commits after the seal makes the confirmation `Stale` and the payload is
-/// sealed again, so a record under a pre-removal epoch is never published
-/// after the removal. Never falls back to plaintext on a seal error.
+/// as is — for a group, only under the plaintext publication permit, which
+/// re-checks the plane and holds the group's policy commits off through the
+/// publish (#1100), so a flip to `MlsEncrypted` that commits after the seal
+/// sends the payload back through the sealing path instead. Otherwise the
+/// payload is sealed, the protector confirms the seal is still under the
+/// group's CURRENT epoch, and the sealed record is published while the
+/// protector's permit holds that epoch fixed. A member removal that commits
+/// after the seal makes the confirmation `Stale` and the payload is sealed
+/// again, so a record under a pre-removal epoch is never published after the
+/// removal. Never falls back to plaintext on a seal error.
 async fn seal_and_publish(
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
     pubsub: &PubSubManager,
@@ -230,11 +234,36 @@ async fn seal_and_publish(
     for _ in 0..TASK_SEAL_ATTEMPTS {
         // The seal runs with no permit held: the protector's seal may take
         // the same group locks the permit does (not re-entrant).
-        let Some(body) = protector.seal(kind, &plain).await? else {
-            return pubsub
-                .publish(topic.to_string(), bytes::Bytes::from(plain))
-                .await
-                .map_err(publish_err);
+        let sealed = protector.seal(kind, &plain).await?;
+        let Some(body) = sealed else {
+            // #1100: the group was signed-public when sealed. Publish the
+            // plaintext only under the publication permit — if the plane has
+            // since left signed-public, that is `Stale` and the payload
+            // re-enters the loop to be sealed under the now-current key
+            // (the sealed branch's own refusal handling), never plaintext.
+            let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
+                match protector.confirm_plaintext_publication().await? {
+                    TaskPublication::Stale => Ok(false),
+                    TaskPublication::Current(permit) => {
+                        let published = pubsub
+                            .publish(topic.to_string(), bytes::Bytes::copy_from_slice(&plain))
+                            .await
+                            .map_err(publish_err);
+                        drop(permit);
+                        published.map(|()| true)
+                    }
+                }
+            })
+            .await
+            .map_err(|_| publish_err("plaintext publish exceeded its deadline"))?;
+            if guarded? {
+                return Ok(());
+            }
+            tracing::debug!(
+                topic,
+                "group policy left signed-public after a plaintext seal; re-sealing (#1100)"
+            );
+            continue;
         };
         let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
             match protector.confirm_publication(&body).await? {
@@ -261,7 +290,8 @@ async fn seal_and_publish(
         );
     }
     Err(crate::crdt::CrdtError::Gossip(format!(
-        "group epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; task delta not published"
+        "group policy or epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; \
+         task delta not published"
     )))
 }
 
