@@ -97,11 +97,6 @@ pub mod announce_v3;
 /// Storm control: announce-topic forward suppression (replay + flood).
 pub mod storm_control;
 
-/// Bootstrap node discovery and connection.
-///
-/// This module handles initial connection to bootstrap nodes with
-/// exponential backoff retry logic and peer cache integration.
-pub mod bootstrap;
 /// Network transport layer for x0x.
 pub mod network;
 

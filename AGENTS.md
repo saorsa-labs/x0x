@@ -50,7 +50,7 @@ Keys are bincode-serialized via `storage.rs`, not JSON.
 
 Stack, bottom to top:
 1. `network.rs` — wraps `ant_quic::Node`, implements `GossipTransport`. ant-quic owns mDNS, UPnP, bootstrap cache and connection orchestration.
-2. `bootstrap.rs` — retry/backoff for the hard-coded seed hints. `DEFAULT_BOOTSTRAP_PEERS` is defined in `network.rs`; it lists UDP/443 first (preferred, traverses networks that block higher UDP ports) and keeps UDP/5483 for pre-ADR-0011 clients. Seeds are hints only.
+2. Seeds — `DEFAULT_BOOTSTRAP_PEERS` in `network.rs`, dialled address-only by the join path; it lists UDP/443 first (preferred, traverses networks that block higher UDP ports) and keeps UDP/5483 for pre-ADR-0011 clients. Seeds are hints only.
 3. `gossip/` — thin orchestration over `saorsa-gossip-*`; `GossipRuntime` owns `PubSubManager`.
 4. `presence.rs` — beacons on the Bulk stream, phi-accrual failure detection, FOAF discovery with trust-scoped visibility.
 5. `crdt/` (task lists), `kv/` (replicated KV with access policies), `mls/` (group encryption), `groups/` (named groups; DHT-free discovery via social propagation, BLAKE3 tag shards and presence). Deltas of a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) in an `MlsEncrypted` group are sealed with the group's current GSS/TreeKEM key, like group KV stores (`crdt/sealed.rs`, #895); personal lists and `SignedPublic` groups stay plaintext.
