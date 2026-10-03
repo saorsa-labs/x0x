@@ -275,6 +275,19 @@ unchanged:
 
   Short superseding ADRs are proposed alongside this PR.
 
+Notes-store correction, 2026-09-28 (David Irvine; #1029). The ADR file stays
+unchanged:
+
+- **ADR 0081**: §8 says saves over 256 KiB use loro's `update_by_line`. That
+  call deletes and re-inserts every changed line whole, so a concurrent
+  delete of part of that line comes back as duplicated text (#1029, found by
+  a property test; loro 1.16.2 has no option that avoids it). Saves over
+  256 KiB instead compute a line-first, then character-level, Myers edit
+  script with unique-line anchors, and apply it as explicit loro text ops. The
+  256 KiB threshold, the line-first strategy and "no diff crate" are
+  unchanged. A bounded work budget falls back to replacing only the
+  unresolved region. Implementation: `src/notes/text_diff.rs`.
+
 Audit-trim relocations, 2026-08-29. Per the 2026-08-23 ADR audit, the
 mutable mechanics named below were relocated **verbatim** from the
 immutable ADR bodies into maintained design-doc homes (new
