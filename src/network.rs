@@ -4455,6 +4455,65 @@ impl NetworkNode {
         .await
     }
 
+    /// x0x #1150 (ADR 0107; lifecycle note section 2.7): send ONE direct
+    /// message frame (`[0x10][sender_agent_id][payload]`) to `peer_id` on
+    /// its CURRENT authenticated connection generation, admitting it at the
+    /// stream seam. `admit` runs at most once, synchronously, after
+    /// `open_uni` and immediately before `write_all` (ant-quic
+    /// `send_on_generation_with_admission`); `false` writes nothing. One
+    /// physical exchange: no receive ACK, no retry, no reconnect, no
+    /// constrained-transport fallback, and a connection replaced before the
+    /// write refuses. The caller resolves and connects the peer first and
+    /// bounds this call with its deadline; dropping the future before
+    /// `finish()` resets the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if there is no live connection generation,
+    /// the admission refuses, or the write fails.
+    pub(crate) async fn send_direct_pinned<F>(
+        &self,
+        peer_id: &AntPeerId,
+        sender_agent_id: &[u8; 32],
+        payload: &[u8],
+        admit: F,
+    ) -> NetworkResult<()>
+    where
+        F: FnOnce() -> bool + Send,
+    {
+        let mut buf = Vec::with_capacity(1 + 32 + payload.len());
+        buf.push(DIRECT_MESSAGE_STREAM_TYPE);
+        buf.extend_from_slice(sender_agent_id);
+        buf.extend_from_slice(payload);
+        let node = self.require_node().await?;
+        let generation = node
+            .current_connection_generation(peer_id)
+            .filter(|generation| *generation != STALE_GENERATION_SENTINEL)
+            .ok_or_else(|| {
+                NetworkError::ConnectionFailed(
+                    "no live connection generation for a pinned send".to_string(),
+                )
+            })?;
+        node.send_on_generation_with_admission(peer_id, generation, move |actual| {
+            if actual != generation {
+                return Err(ant_quic::EndpointError::Connection(
+                    "connection generation changed before a pinned send".to_string(),
+                ));
+            }
+            if admit() {
+                Ok(buf)
+            } else {
+                Err(ant_quic::EndpointError::Connection(
+                    "pinned send refused at the stream seam".to_string(),
+                ))
+            }
+        })
+        .await
+        .map_err(|e| NetworkError::ConnectionFailed(format!("pinned send failed: {e}")))?;
+        self.note_connection_pool_activity(*peer_id).await;
+        Ok(())
+    }
+
     /// Send a direct stream framed with an arbitrary application
     /// stream-type byte. The wire format is identical to
     /// [`Self::send_direct`] (`[stream_type][sender_agent_id: 32][payload]`),

@@ -7,10 +7,12 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod fair_admission;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
+pub(in crate::server) use fair_admission::FairAdmission;
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
@@ -1914,8 +1916,8 @@ fn build_secure_share_event(
 /// design exists to close.
 #[allow(clippy::too_many_arguments)]
 async fn publish_secure_share(
-    state: &AppState,
-    metadata_topic: &str,
+    state: &Arc<AppState>,
+    _metadata_topic: &str,
     group_id: &str,
     recipient_hex: &str,
     recipient_kem_public_b64: &str,
@@ -1947,13 +1949,255 @@ async fn publish_secure_share(
             return false;
         }
     };
-    publish_named_group_metadata_event(state, metadata_topic, &event).await;
-    spawn_named_group_event_delivery(state, recipient_hex, &event);
-    spawn_named_group_event_delivery_after(
+    spawn_secure_share_delivery(state, &event)
+}
+
+/// ADR 0107 / D60 (r5, G11): how long a class-K share delivery may stay
+/// pending (withheld) before it is dropped.
+const SECURE_SHARE_DELIVERY_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
+
+/// ADR 0107 / D60 (r5, G11): admitted sends per share (the first and the
+/// [`GROUP_BACKGROUND_PUBLISH_DELAY`] resend), each admitted afresh.
+const SECURE_SHARE_SENDS: usize = 2;
+
+/// ADR 0107 / D60 (r5, G11): how soon a withheld share delivery re-checks.
+const SECURE_SHARE_WITHHELD_RETRY: Duration = Duration::from_secs(15);
+
+/// ADR 0107 / D60 (r5, G11): the retry backoff after a share write that
+/// failed in transport (no gossip fallback, so an unreachable recipient is
+/// retried, admitted afresh each time, until the horizon).
+const SECURE_SHARE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// ADR 0107 / D60 (r5, G11): what a class-K share delivery may do now.
+enum SecureShareDeliveryVerdict {
+    Deliver,
+    /// The condition can still clear (quarantine, a non-Clean verdict, a
+    /// missing certificate, contention): keep the share pending.
+    Withhold(&'static str),
+    /// It cannot (removed, banned, agent revoked, certificate invalid,
+    /// group withdrawn or gone, or the epoch moved on): drop the share.
+    Purge(&'static str),
+}
+
+/// ADR 0107 / D60: the share's epoch is the group's CURRENT secret epoch
+/// and this node still holds that secret.
+fn secure_share_epoch_current(info: &x0x::groups::GroupInfo, secret_epoch: u64) -> bool {
+    info.secret_epoch == secret_epoch && info.shared_secret.is_some()
+}
+
+/// ADR 0107 / D60 (r5, G11): the epoch-bound share admission verdict,
+/// under the group's membership lock: the recipient's CURRENT eligibility
+/// (the serving guard: withdrawn, quarantine, ban, agent revocation, Active
+/// seat, certificate and roster verdict) and the CURRENT secret epoch.
+async fn secure_share_delivery_verdict(
+    state: &AppState,
+    group_id: &str,
+    recipient_hex: &str,
+    secret_epoch: u64,
+) -> SecureShareDeliveryVerdict {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return SecureShareDeliveryVerdict::Purge("group_unknown");
+    };
+    let _membership_guard = lock.lock().await;
+    // r6 (P4): terminal facts first. An obsolete share (the epoch moved on,
+    // or its secret is gone) is purged before any eligibility question;
+    // the serving guard then reports every definitive refusal (withdrawn,
+    // banned, revoked, not Active, certificate invalid) before any
+    // withholding one (quarantine, pending evidence, a non-Clean verdict).
+    let current = {
+        let roster = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&roster, group_id)
+            .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+    };
+    if !current {
+        return SecureShareDeliveryVerdict::Purge("secret_epoch_moved");
+    }
+    match join_artifact_serving_check(state, group_id, recipient_hex).await {
+        Ok(_) => SecureShareDeliveryVerdict::Deliver,
+        Err(refusal) if refusal.is_definitive() || refusal == JoinArtifactRefusal::UnknownGroup => {
+            SecureShareDeliveryVerdict::Purge(refusal.reason())
+        }
+        Err(refusal) => SecureShareDeliveryVerdict::Withhold(refusal.reason()),
+    }
+}
+
+/// ADR 0107 / D60 (r5, G11): the epoch-bound admission of one class-K
+/// share write. Pre-phase: under the group's membership lock, the serving
+/// guard (keeping its evidence) and the current epoch. Seam: the same,
+/// synchronously. Unlike the join-result admission it needs no staged
+/// original: survivor and approval shares have none.
+fn secure_share_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient_hex: &str,
+    secret_epoch: u64,
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let recipient_hex = recipient_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let recipient_hex = recipient_hex.clone();
+        async move {
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &recipient_hex)
+                    .await
+                    .ok()?;
+                let current = {
+                    let roster = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&roster, &group_id)
+                        .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+                };
+                if !current {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
+                    && state.named_groups.try_read().is_ok_and(|roster| {
+                        crate::server::resolve_group_entry_locked(&roster, &group_id)
+                            .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+                    })
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// ADR 0107 / D60 (r5, G11): deliver one class-K share
+/// (`SecureShareDelivered`) in a registered egress task. There is no gossip
+/// publish: a published share leaves x0x's control (detached stranded
+/// retry, other peers' caches). Each of the [`SECURE_SHARE_SENDS`] writes
+/// goes through the single-admission transport after a fresh
+/// [`secure_share_delivery_verdict`]: a withheld share stays pending and
+/// re-checks every [`SECURE_SHARE_WITHHELD_RETRY`] until
+/// [`SECURE_SHARE_DELIVERY_HORIZON`]; a purge ends the delivery. A removal,
+/// ban or terminal mutation quiesces it with the recipient's other egress.
+/// Returns whether a delivery was scheduled.
+fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadataEvent) -> bool {
+    let NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id,
+        recipient,
+        secret_epoch,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Ok(recipient_id) = parse_agent_id_hex(recipient) else {
+        tracing::warn!(recipient = %LogHexId::agent(recipient), "secure share for an invalid recipient id");
+        return false;
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(payload) if payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES => payload,
+        Ok(_) => {
+            tracing::warn!(group_id = %LogHexId::group(group_id), "secure share exceeds the direct-message limit");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("failed to serialize a secure share: {e}");
+            return false;
+        }
+    };
+    #[cfg(test)]
+    if let Ok(mut scheduled) = state
+        .named_group_test_recorders
+        .secure_share_scheduled
+        .lock()
+    {
+        scheduled.push((group_id.clone(), recipient.clone(), payload.clone()));
+    }
+    let task_state = Arc::clone(state);
+    let group = group_id.clone();
+    let recipient_hex = recipient.clone();
+    let epoch = *secret_epoch;
+    let deadline = Instant::now() + SECURE_SHARE_DELIVERY_HORIZON;
+    spawn_join_artifact_egress(
         state,
-        recipient_hex,
-        &event,
-        GROUP_BACKGROUND_PUBLISH_DELAY,
+        group_id,
+        recipient,
+        "secure_share",
+        deadline,
+        async move {
+            let mut sent = 0usize;
+            let mut backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
+            while sent < SECURE_SHARE_SENDS {
+                match secure_share_delivery_verdict(&task_state, &group, &recipient_hex, epoch)
+                    .await
+                {
+                    SecureShareDeliveryVerdict::Deliver => {}
+                    SecureShareDeliveryVerdict::Withhold(reason) => {
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share withheld; re-checking later");
+                        tokio::time::sleep(SECURE_SHARE_WITHHELD_RETRY).await;
+                        continue;
+                    }
+                    SecureShareDeliveryVerdict::Purge(reason) => {
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share purged");
+                        return;
+                    }
+                }
+                let admission = secure_share_admission(&task_state, &group, &recipient_hex, epoch);
+                let outcome = send_join_artifact(
+                    &task_state,
+                    &recipient_id,
+                    &payload,
+                    &group,
+                    "secure_share",
+                    admission,
+                    deadline,
+                )
+                .await;
+                let written = match &outcome {
+                    Ok(()) => true,
+                    // The in-process stand-in reports an admitted exchange with
+                    // its marker error (test builds only).
+                    #[cfg(test)]
+                    Err(reason) if reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED) => true,
+                    Err(_) => false,
+                };
+                if written {
+                    sent += 1;
+                    backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
+                    if sent < SECURE_SHARE_SENDS {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                    }
+                    continue;
+                }
+                match outcome {
+                    Err(reason) if reason.contains(x0x::dm::PINNED_ADMISSION_REFUSED) => {
+                        // An invalidation landed between the verdict and the
+                        // write. Classify it now: a purge ends the delivery;
+                        // anything else (including a seam-only refusal such as a
+                        // revoked machine binding) withholds it.
+                        if let SecureShareDeliveryVerdict::Purge(reason) =
+                            secure_share_delivery_verdict(
+                                &task_state,
+                                &group,
+                                &recipient_hex,
+                                epoch,
+                            )
+                            .await
+                        {
+                            tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share purged");
+                            return;
+                        }
+                        tokio::time::sleep(SECURE_SHARE_WITHHELD_RETRY).await;
+                    }
+                    Err(reason) => {
+                        // A transport failure: retry with backoff (each retry is
+                        // admitted afresh) until the horizon.
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), "secure share write failed; retrying: {reason}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, SECURE_SHARE_RETRY_BACKOFF_MAX);
+                    }
+                    Ok(()) => {}
+                }
+            }
+        },
     );
     true
 }
@@ -10823,7 +11067,9 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
 /// #878 r5: drop the per-pair guard entry once its staging task ends —
 /// the map must not grow with the (group, recipient) universe. Removed
 /// only when the stored semaphore is the SAME instance and fully
-/// released (no other task holds a permit on it).
+/// released (no other task holds a permit on it). Production staging
+/// releases through [`JoinResultStagingSlot`]'s drop (r5, G9).
+#[cfg(test)]
 fn release_join_result_staging_guard(state: &AppState, key: &(String, AgentId)) {
     let mut guards = state
         .join_result_staging_guards
@@ -10851,11 +11097,60 @@ fn acquire_join_result_staging_permit(
         .join_result_staging_guards
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // ADR 0107 (review r2): a staging task a removal or ban aborted never
+    // ran `release_join_result_staging_guard`; drop every idle entry here.
+    guards.retain(|_, semaphore| semaphore.available_permits() == 0);
     let semaphore = guards
         .entry((group_id.to_string(), *recipient))
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
         .clone();
     semaphore.try_acquire_owned().ok()
+}
+
+/// ADR 0107 (r5, G9): RAII ownership of one `(group, recipient)` staging
+/// slot. Dropping it (completion, abort, deadline or panic) releases the
+/// permit, then removes the guard-map entry only when it is still THIS
+/// semaphore and idle, so an old slot never removes its replacement's
+/// entry.
+struct JoinResultStagingSlot {
+    state: Arc<AppState>,
+    key: (String, AgentId),
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for JoinResultStagingSlot {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let semaphore = Arc::clone(permit.semaphore());
+        drop(permit);
+        let mut guards = self
+            .state
+            .join_result_staging_guards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guards.get(&self.key).is_some_and(|current| {
+            Arc::ptr_eq(current, &semaphore) && current.available_permits() == 1
+        }) {
+            guards.remove(&self.key);
+        }
+    }
+}
+
+/// ADR 0107 (r5, G9): [`acquire_join_result_staging_permit`] as an RAII
+/// [`JoinResultStagingSlot`].
+fn acquire_join_result_staging_slot(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+) -> Option<JoinResultStagingSlot> {
+    let permit = acquire_join_result_staging_permit(state, group_id, recipient)?;
+    Some(JoinResultStagingSlot {
+        state: Arc::clone(state),
+        key: (group_id.to_string(), *recipient),
+        permit: Some(permit),
+    })
 }
 
 /// #876 r3: the `agent_id` a `MemberRoleUpdated` targets, if the event
@@ -12095,6 +12390,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 drop(mls_groups);
             }
             if removed_self {
+                // ADR 0107 (r5, G5): this node no longer serves the group's
+                // join artifacts — retire them before the group leaves the
+                // roster.
+                let artifact_aliases =
+                    join_artifact_group_aliases(state, &resolved_group_key).await;
+                retire_local_group_join_artifacts(state, &artifact_aliases).await;
                 state
                     .group_card_cache
                     .write()
@@ -12164,10 +12465,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): inside this apply's critical section
+            // (the group membership lock), on every path — gossip, direct,
+            // causal and TreeKEM replay — stop the removed member's in-flight
+            // join-artifact egress BEFORE the removal commits, then drop what
+            // stays staged AFTER it.
+            quiesce_member_join_egress(state, &resolved_group_key, &agent_id).await;
+            let persisted =
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await;
+            purge_join_artifacts_if_ineligible(state, &resolved_group_key, &agent_id).await;
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -12493,10 +12800,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     );
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): inside this apply's critical section, on
+            // every path (gossip, direct, causal and TreeKEM replay), stop
+            // the banned member's in-flight join-artifact egress BEFORE the
+            // ban commits, then drop what stays staged AFTER it.
+            if !banned_self {
+                quiesce_member_join_egress(state, &resolved_group_key, &agent_id).await;
+            }
+            let persisted =
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await;
+            if !banned_self {
+                purge_join_artifacts_if_ineligible(state, &resolved_group_key, &agent_id).await;
+            }
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return banned_reject("persist_not_durable", &resolved_group_key);
             }
             // #531 I4b: the ONLY point at which the ban is durably applied.
@@ -17827,6 +18143,42 @@ fn take_member_joined_sign_failure_for_test(group_id: &str, member_agent_id: &st
         .unwrap_or(false)
 }
 
+/// ADR 0107 Validation ("disabling re-arm reproduces the keyless failure"):
+/// test-only switch, per group, that routes a base-seated carry remnant back
+/// onto the pre-S8 (a) clear + base-seat path.
+#[cfg(test)]
+static JOIN_TEST_DISABLE_REARM: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+struct JoinRearmDisabledGuard(String);
+
+#[cfg(test)]
+impl Drop for JoinRearmDisabledGuard {
+    fn drop(&mut self) {
+        if let Ok(mut groups) = JOIN_TEST_DISABLE_REARM.lock() {
+            groups.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn disable_rearm_for_test(group_id: &str) -> JoinRearmDisabledGuard {
+    if let Ok(mut groups) = JOIN_TEST_DISABLE_REARM.lock() {
+        groups.insert(group_id.to_string());
+    }
+    JoinRearmDisabledGuard(group_id.to_string())
+}
+
+#[cfg(test)]
+fn rearm_disabled_for_test(group_id: &str) -> bool {
+    JOIN_TEST_DISABLE_REARM
+        .lock()
+        .map(|groups| groups.contains(group_id))
+        .unwrap_or(false)
+}
+
 /// r3 (Codex 10): join-time bound on the invite-carried Home metadata's
 /// `primary_agent`. The field names an agent id — 64 hex chars (the
 /// 32-byte `AgentId` encoding); anything longer can never resolve and is
@@ -17930,6 +18282,143 @@ async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, j
         cleared = cleared.len(),
         "D39: cleared a not_member local row so a fresh invite starts a new join attempt"
     );
+}
+
+/// ADR 0107 (0088 S8 (a)): re-arm this device's sealed-but-unconfirmed
+/// join.
+///
+/// Called by the join route with the membership guard held, for an
+/// [`NotMemberJoinRow::UnseatedJoinRemnant`] (a durable carry row with no
+/// own seat) when the VERIFIED invite base seats this device: the
+/// authority sealed the add, but its join result and Welcome never landed.
+/// Neither #1148's clear nor the base-seat shortcut runs. The row keeps its
+/// pre-seat revision and verified chain prefix; a leftover TreeKEM group
+/// for the key is dropped so it cannot satisfy the poll's key-presence
+/// confirmation. A NEW bound attempt then re-fetches the authority's
+/// still-staged ORIGINAL result (own `MemberAdded` + Welcome) through the
+/// ordinary bound apply, with every signature, authority, chain,
+/// owner-certificate, revocation and fork check unchanged. The TreeKEM
+/// identity is re-derived from the agent secret (`agent_treekem_seed`), so
+/// nothing new is stored.
+///
+/// The attempt is fetch-only: it stores and sends no `MemberJoined` volley.
+/// The authority's step 7 would only reject one as an Active replay, and a
+/// re-arm never asks for a new admission. The expected-inviter pin is this
+/// invite's inviter, so only the device that sealed the original add can
+/// complete it. The attempt ends through the ordinary poll: confirmed once
+/// the Welcome installs (TreeKEM) or the roster seats the device, otherwise
+/// the typed `timed_out` outcome, which leaves the remnant for the owner
+/// remove-member + re-invite exit.
+#[allow(clippy::too_many_arguments)]
+async fn rearm_sealed_unconfirmed_join(
+    state: &Arc<AppState>,
+    membership_guard: tokio::sync::MutexGuard<'_, ()>,
+    group_id_hex: &str,
+    remnant: x0x::groups::GroupInfo,
+    invite: &x0x::groups::invite::SignedInvite,
+    invite_link: &str,
+    inviter: AgentId,
+    await_treekem: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let stable = remnant.stable_group_id().to_string();
+    let expected_key = join_result_key(&stable, &joiner_hex);
+    // The remnant's map key, exactly as the route found it (key match
+    // first, else the record whose MLS id is the invite's group id).
+    let remnant_key = {
+        let roster = state.named_groups.read().await;
+        if roster.contains_key(group_id_hex) {
+            group_id_hex.to_string()
+        } else {
+            roster
+                .iter()
+                .find(|(_, info)| info.mls_group_id == group_id_hex)
+                .map_or_else(|| group_id_hex.to_string(), |(key, _)| key.clone())
+        }
+    };
+    // A leftover TreeKEM group must not confirm the poll: confirmation
+    // requires installing the recovered Welcome in THIS attempt.
+    state.treekem_groups.write().await.remove(&remnant_key);
+    let attempt_id = hex::encode(rand::random::<[u8; 32]>());
+    {
+        // The same membership → persistence critical section as a fresh
+        // install, so join-status never observes a torn re-arm.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        record_expected_join_result_inviter(
+            state.as_ref(),
+            expected_key.clone(),
+            invite.inviter.clone(),
+        );
+        state
+            .last_join_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&remnant_key);
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                expected_key,
+                PendingJoinAttempt {
+                    attempt_id: attempt_id.clone(),
+                    local_group_key: remnant_key.clone(),
+                    invite_fingerprint: join_invite_fingerprint(invite_link),
+                    invite_group_id: stable.clone(),
+                    inviter_public_key_b64: invite.inviter_public_key_b64.clone(),
+                    stored_resend: None,
+                    polls: Vec::new(),
+                    tasks: Vec::new(),
+                    listener_token: None,
+                },
+            );
+    }
+    ensure_named_group_listeners(Arc::clone(state), &remnant_key).await;
+    {
+        let poll_state = Arc::clone(state);
+        let poll_group = remnant_key.clone();
+        let poll_event_group = stable.clone();
+        let poll_member = joiner_hex.clone();
+        let poll_attempt = attempt_id.clone();
+        spawn_attempt_task_under_guard(
+            state,
+            &stable,
+            &joiner_hex,
+            &attempt_id,
+            AttemptTaskKind::Poll,
+            Some(&membership_guard),
+            async move {
+                poll_join_result_until_membership_confirmed(
+                    poll_state,
+                    poll_group,
+                    poll_event_group,
+                    inviter,
+                    poll_member,
+                    await_treekem,
+                    None,
+                    poll_attempt,
+                )
+                .await;
+            },
+        );
+    }
+    drop(membership_guard);
+    tracing::info!(
+        group_id = %LogHexId::group(&remnant_key),
+        revision = remnant.state_revision,
+        "ADR 0107: re-armed a sealed-but-unconfirmed join; re-fetching the authority's original join result"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "already_joined": false,
+            "join_state": "pending_authority_commit",
+            "group_id": group_id_hex,
+            "group_name": invite.group_name,
+            "chat_topic": remnant.general_chat_topic(),
+        })),
+    )
 }
 
 pub(in crate::server) async fn join_group_via_invite(
@@ -18220,8 +18709,9 @@ pub(in crate::server) async fn join_group_via_invite(
     // D39(A): the provably-unseated remnant of this device's OWN failed
     // join (see `classify_not_member_join_row`) must not swallow a fresh
     // invite as an idempotent success. It is cleared below and the join
-    // proceeds as a NEW attempt.
+    // proceeds as a NEW attempt — unless ADR 0107 re-arms it instead.
     let mut stale_not_member_row = false;
+    let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
@@ -18276,7 +18766,24 @@ pub(in crate::server) async fn join_group_via_invite(
                     );
                 }
                 if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
-                    stale_not_member_row = true;
+                    // ADR 0107 (0088 S8 (a)): the VERIFIED invite base is
+                    // the discriminator. A base that seats this device
+                    // proves the authority sealed its add, so the remnant
+                    // is re-armed (neither the #1148 clear nor the
+                    // base-seat shortcut runs). Otherwise #1148's clear
+                    // stands.
+                    let base_seats_device = view
+                        .base_roster
+                        .get(&joiner_hex)
+                        .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active);
+                    #[cfg(test)]
+                    let base_seats_device =
+                        base_seats_device && !rearm_disabled_for_test(&group_id_hex);
+                    if base_seats_device {
+                        rearm_remnant = Some(info);
+                    } else {
+                        stale_not_member_row = true;
+                    }
                 } else {
                     let still_pending = membership_state == "pending_authority_commit";
                     if still_pending {
@@ -18295,36 +18802,44 @@ pub(in crate::server) async fn join_group_via_invite(
                         // can never transmit unowned. A post-restart pending
                         // has no registry entry (empty attempt id): its legacy
                         // repair wrapper spawns detached (C8's deadline owner).
-                        let owning_attempt_id = {
+                        let (owning_attempt_id, fetch_only) = {
                             let attempts = state
                                 .pending_join_attempts
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             attempts
                                 .get(&join_result_key(&refire_stable, &joiner_hex))
-                                .map(|entry| entry.attempt_id.clone())
+                                .map(|entry| {
+                                    (entry.attempt_id.clone(), entry.stored_resend.is_none())
+                                })
                                 .unwrap_or_default()
                         };
                         drop(groups);
-                        spawn_attempt_task_under_guard(
-                            state.as_ref(),
-                            invite_stable_group_id,
-                            &joiner_hex,
-                            &owning_attempt_id,
-                            AttemptTaskKind::Task,
-                            Some(&membership_guard),
-                            async move {
-                                refire_pending_join_volley(
-                                    &refire_state,
-                                    &refire_group_id,
-                                    refire_stable,
-                                    &refire_inviter,
-                                    refire_secret,
-                                    refire_treekem,
-                                )
-                                .await;
-                            },
-                        );
+                        // ADR 0107: a REGISTERED attempt without a stored
+                        // volley is a fetch-only S8 (a) re-arm. It keeps
+                        // polling for the original result and never sends
+                        // a `MemberJoined` (no new admission is asked for).
+                        if !fetch_only {
+                            spawn_attempt_task_under_guard(
+                                state.as_ref(),
+                                invite_stable_group_id,
+                                &joiner_hex,
+                                &owning_attempt_id,
+                                AttemptTaskKind::Task,
+                                Some(&membership_guard),
+                                async move {
+                                    refire_pending_join_volley(
+                                        &refire_state,
+                                        &refire_group_id,
+                                        refire_stable,
+                                        &refire_inviter,
+                                        refire_secret,
+                                        refire_treekem,
+                                    )
+                                    .await;
+                                },
+                            );
+                        }
                         drop(membership_guard);
                     }
                     let confirmed = membership_state == "active";
@@ -18347,6 +18862,21 @@ pub(in crate::server) async fn join_group_via_invite(
                 }
             }
         }
+    }
+    if let Some(remnant) = rearm_remnant {
+        // Still under the membership guard taken above: the re-arm installs
+        // its attempt and poll before any apply or finalizer can interleave.
+        return rearm_sealed_unconfirmed_join(
+            &state,
+            membership_guard,
+            &group_id_hex,
+            remnant,
+            &invite,
+            &req.invite,
+            inviter_agent,
+            invite_is_treekem,
+        )
+        .await;
     }
     if stale_not_member_row {
         // Still under the membership guard taken above, so no concurrent
@@ -19773,10 +20303,13 @@ pub(in crate::server) async fn remove_named_group_member(
         let delivery_roster = next.clone();
         drop(named_groups);
 
-        if !matches!(
-            persist_named_group_info(&state, &id, next).await,
-            Ok(AtomicWriteOutcome::Durable)
-        ) {
+        // ADR 0107 (review r2): inside this removal's critical section,
+        // stop every in-flight egress of the member's join artifacts BEFORE
+        // the removal commits, then drop what stays staged AFTER it.
+        quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+        let persisted = persist_named_group_info(&state, &id, next).await;
+        purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+        if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "named-group state is not directory-durable",
@@ -19855,15 +20388,10 @@ pub(in crate::server) async fn remove_named_group_member(
     ); // F1 §5a step 5: publish the buffered survivor envelopes only after the
        // removal is live and persisted. Each is broadcast on the metadata topic
        // plus direct + delayed delivery, mirroring publish_secure_share's shape.
-    for (recipient_hex, ev) in &buffered_survivor_envelopes {
-        publish_named_group_metadata_event(&state, &metadata_topic, ev).await;
-        spawn_named_group_event_delivery(&state, recipient_hex, ev);
-        spawn_named_group_event_delivery_after(
-            &state,
-            recipient_hex,
-            ev,
-            GROUP_BACKGROUND_PUBLISH_DELAY,
-        );
+       // D60 (r5, G11): each survivor share is a class-K delivery with a
+       // fresh epoch-bound admission per write; never a gossip publish.
+    for (_recipient_hex, ev) in &buffered_survivor_envelopes {
+        spawn_secure_share_delivery(&state, ev);
     }
     maybe_publish_group_card_after_state_change(&state, &id).await;
     (
@@ -20470,15 +20998,22 @@ async fn wipe_local_group_crypto_material(
         });
     }
     if !welcome_ids.is_empty() {
-        let mut streams = state.pending_welcome_streams.lock().await;
-        if let Some(streams) = streams.as_mut() {
-            for welcome_id in &welcome_ids {
-                if let Some(stream) = streams.remove(welcome_id) {
-                    stream.abort();
-                }
-            }
+        // r5 (G4): abort, then AWAIT, every stream (outside the map lock).
+        let aborted: Vec<tokio::task::JoinHandle<()>> = {
+            let mut streams = state.pending_welcome_streams.lock().await;
+            streams.as_mut().map_or_else(Vec::new, |streams| {
+                welcome_ids
+                    .iter()
+                    .filter_map(|welcome_id| streams.remove(welcome_id))
+                    .collect()
+            })
+        };
+        for stream in &aborted {
+            stream.abort();
         }
-        drop(streams);
+        for stream in aborted {
+            let _ = stream.await;
+        }
         let mut waiters = state.pending_welcome_waiters.write().await;
         let mut acks = state.pending_welcome_acks.write().await;
         for welcome_id in welcome_ids {
@@ -20524,6 +21059,11 @@ async fn retain_withdrawn_group_tombstone(
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
+    // ADR 0107 (r5, G4): quiesce every in-flight join-artifact egress of
+    // the group, awaited, before the terminal commit.
+    quiesce_group_join_egress(state, group_id).await;
+    #[cfg(test)]
+    record_join_artifact_lifecycle(state, format!("tombstone_persist:{stable_group_id}"));
     let mut aliases = HashSet::new();
     let outcome = persist_named_groups_mutation(state, |groups| {
         aliases = collect_same_stable_group_aliases(groups, group_id, Some(&stable_group_id));
@@ -20556,6 +21096,11 @@ async fn drop_local_named_group_state(
     stable_group_id: Option<&str>,
     reason: &str,
 ) -> bool {
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // (quiesce, awaited, then purge) before the group leaves the roster.
+    let mut artifact_aliases = join_artifact_group_aliases(state, id).await;
+    artifact_aliases.extend(stable_group_id.map(str::to_string));
+    retire_local_group_join_artifacts(state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(state, id).await;
     let stable_group_id = stable_group_id.filter(|stable| *stable != id);
     // #457 r8 items 8.3/8.8 — DELETE ORDERING (reworked from r7):
@@ -20838,6 +21383,10 @@ async fn leave_treekem_group(
         }
     };
 
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // before the group leaves the roster.
+    let artifact_aliases = join_artifact_group_aliases(&state, &id).await;
+    retire_local_group_join_artifacts(&state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
     if !matches!(
         persist_named_groups_mutation(&state, |groups| {
@@ -21013,9 +21562,14 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
-    if let Err(e) =
-        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
-    {
+    // ADR 0107 (review r2): inside this removal's critical section, stop
+    // every in-flight egress of the member's join artifacts BEFORE the
+    // removal commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if let Err(e) = persisted {
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -21591,9 +22145,16 @@ async fn owner_certified_seal_with_eviction(
                 let metadata_topic = next.metadata_topic.clone();
                 let delivery_roster = next.clone();
                 drop(groups);
-                if let Err(e) =
-                    persist_treekem_and_named_groups_atomic_with_info(state, id, next, &guard).await
-                {
+                // ADR 0107 (review r2): an eviction is a removal — stop the
+                // evicted member's join-artifact egress before it commits
+                // and drop what stays staged after it, in this critical
+                // section.
+                quiesce_member_join_egress(state, id, &evict_hex).await;
+                let persisted =
+                    persist_treekem_and_named_groups_atomic_with_info(state, id, next, &guard)
+                        .await;
+                purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
+                if let Err(e) = persisted {
                     tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after eviction: {e}");
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -21706,10 +22267,13 @@ async fn owner_certified_seal_with_eviction(
             let metadata_topic = next.metadata_topic.clone();
             let delivery_roster = next.clone();
             drop(groups);
-            if !matches!(
-                persist_named_group_info(state, id, next).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): an eviction is a removal — stop the
+            // evicted member's join-artifact egress before it commits and
+            // drop what stays staged after it, in this critical section.
+            quiesce_member_join_egress(state, id, &evict_hex).await;
+            let persisted = persist_named_group_info(state, id, next).await;
+            purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return Some(Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "named-group state is not directory-durable",
@@ -21732,15 +22296,10 @@ async fn owner_certified_seal_with_eviction(
                 std::slice::from_ref(&evict_hex),
             );
         }
-        for (recipient_hex, ev) in &buffered_envelopes {
-            publish_named_group_metadata_event(state, &metadata_topic, ev).await;
-            spawn_named_group_event_delivery(state, recipient_hex, ev);
-            spawn_named_group_event_delivery_after(
-                state,
-                recipient_hex,
-                ev,
-                GROUP_BACKGROUND_PUBLISH_DELAY,
-            );
+        // D60 (r5, G11): each survivor share is a class-K delivery with a
+        // fresh epoch-bound admission per write; never a gossip publish.
+        for (_recipient_hex, ev) in &buffered_envelopes {
+            spawn_secure_share_delivery(state, ev);
         }
         evicted_total.push(evict_hex.clone());
         last_commit = Some(commit);
@@ -22140,6 +22699,10 @@ pub(in crate::server) async fn leave_group(
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // before the group leaves the roster.
+    let artifact_aliases = join_artifact_group_aliases(&state, &id).await;
+    retire_local_group_join_artifacts(&state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
     let _ = prune_treekem_cache_groups(&state, &cache_aliases, "leave_group").await;
     if !matches!(
@@ -24022,10 +24585,13 @@ pub(in crate::server) async fn ban_group_member(
     // Roster snapshot for the #344 redelivery below: the persist consumes
     // `next`, and the resend schedule must not read live group state.
     let delivery_roster = next.clone();
-    if !matches!(
-        persist_named_group_info(&state, &id, next).await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
+    // ADR 0107 (review r2): inside this ban's critical section, stop every
+    // in-flight egress of the member's join artifacts BEFORE the ban
+    // commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted = persist_named_group_info(&state, &id, next).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "named-group state is not directory-durable",
@@ -24231,9 +24797,14 @@ async fn ban_treekem_group_member(
             ),
         );
     }
-    if let Err(e) =
-        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
-    {
+    // ADR 0107 (review r2): inside this ban's critical section, stop every
+    // in-flight egress of the member's join artifacts BEFORE the ban
+    // commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if let Err(e) = persisted {
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -34120,6 +34691,13 @@ pub(in crate::server) enum JoinAttemptOutcome {
     TimedOut,
 }
 
+/// ADR 0107: the `timed_out` reason a failed S8 (a) re-arm records on the
+/// join-status surface — the authority's original join result or Welcome
+/// could not be fetched (staging expired or lost, inviter mismatch, or the
+/// device is no longer eligible). The exit for an eligible device is owner
+/// remove-member + re-invite.
+pub(in crate::server) const JOIN_REARM_TIMEOUT_REASON: &str = "rearm_original_result_unavailable";
+
 /// #477 C5 — the SEAT finalizer at the `MemberAdded` apply site (the
 /// caller holds the group's membership guard): whatever attempt is pending
 /// for `(event_group_id, member)` is finalized as `Seated` — its polls and
@@ -34287,6 +34865,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             return JoinFinalizeDisposition::NotApplicable;
         }
     }
+    // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
+    // (a registered attempt with no stored volley).
+    let mut fetch_only = false;
     let (mut polls, mut tasks, listener_token) = {
         let mut attempts = state
             .pending_join_attempts
@@ -34299,6 +34880,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             let Some(mut entry) = attempts.remove(&expected_key) else {
                 return JoinFinalizeDisposition::NotApplicable;
             };
+            fetch_only = entry.stored_resend.is_none();
             (
                 std::mem::take(&mut entry.polls),
                 std::mem::take(&mut entry.tasks),
@@ -34376,6 +34958,16 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(local_group_key);
         }
+        // ADR 0107: a re-arm (fetch-only, over the durable carry remnant)
+        // that times out names its cause on the existing status surface:
+        // the authority's original result or Welcome could not be fetched.
+        // The remnant stays for the owner remove-member + re-invite exit.
+        let reason = match (outcome, reason) {
+            (JoinAttemptOutcome::TimedOut, None) if fetch_only && !stub_is_pending => {
+                Some(JOIN_REARM_TIMEOUT_REASON)
+            }
+            (_, reason) => reason,
+        };
         state
             .last_join_outcomes
             .lock()
@@ -35033,6 +35625,1273 @@ async fn apply_join_result_intervening_events(
     }
 }
 
+/// ADR 0107 (0088 S8 (a)): why the authority must not serve a recipient its
+/// staged join artifacts (join result or Welcome) right now. Historical
+/// invite or seal evidence never counts: only the CURRENT committed roster,
+/// the current revocation set and the current clock do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinArtifactRefusal {
+    /// This node holds no record for the group under either spelling.
+    UnknownGroup,
+    GroupWithdrawn,
+    /// Fork-quarantined: containment holds until an admin acts.
+    GroupQuarantined,
+    Banned,
+    /// No Active seat on the current committed roster (removed or absent).
+    NotActive,
+    /// The recipient's agent key is in the ADR-0018 revocation set.
+    Revoked,
+    /// OwnerCertified: the roster seat commits to a certificate digest but
+    /// holds no bytes, or the recipient's roster verdict is
+    /// `MemberCertStatus::DigestPending`.
+    CertificateDigestPending,
+    /// OwnerCertified: the roster seat holds neither certificate bytes nor
+    /// a digest.
+    CertificateMissing,
+    /// OwnerCertified: the roster-embedded certificate fails
+    /// `verify_cert_against_owner` against the current clock.
+    CertificateInvalid(x0x::groups::owner_cert::OwnerCertFailure),
+    /// OwnerCertified: the recipient's current roster verdict is
+    /// `MemberCertStatus::InGrace` — evidence missing or in flight,
+    /// including a stale embedded certificate during a rotation.
+    CertificateInGrace,
+    /// OwnerCertified: the recipient's current roster verdict is
+    /// `MemberCertStatus::Failed` although its embedded certificate
+    /// verifies (e.g. the announced certificate fails against the owner).
+    CertificateVerdictFailed(x0x::groups::owner_cert::OwnerCertFailure),
+    /// A lock the synchronous stream-seam check needs was contended (r5,
+    /// lifecycle note section 2.7). Retryable: it withholds, never purges.
+    SeamContended,
+}
+
+impl JoinArtifactRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownGroup => "group_unknown",
+            Self::GroupWithdrawn => "group_withdrawn",
+            Self::GroupQuarantined => "group_quarantined",
+            Self::Banned => "member_banned",
+            Self::NotActive => "member_not_active",
+            Self::Revoked => "member_revoked",
+            Self::CertificateDigestPending => "certificate_digest_pending",
+            Self::CertificateMissing => "certificate_missing",
+            Self::CertificateInvalid(_) => "certificate_invalid",
+            Self::CertificateInGrace => "certificate_in_grace",
+            Self::CertificateVerdictFailed(_) => "certificate_verdict_failed",
+            Self::SeamContended => "seam_contended",
+        }
+    }
+
+    /// A definitive refusal invalidates the member's staged artifacts: the
+    /// seat or the embedded certificate is gone, not merely awaiting
+    /// evidence or an operator. A non-Clean roster verdict whose embedded
+    /// certificate still verifies (DigestPending, InGrace, or Failed on the
+    /// current evidence), missing certificate bytes, quarantine and an
+    /// unknown spelling only withhold: the next seal decides eviction.
+    fn is_definitive(self) -> bool {
+        matches!(
+            self,
+            Self::GroupWithdrawn
+                | Self::Banned
+                | Self::NotActive
+                | Self::Revoked
+                | Self::CertificateInvalid(_)
+        )
+    }
+}
+
+/// ADR 0107: the record-local half of the serving guard. `None` means the
+/// seat passes; OwnerCertified groups then also require a Clean roster
+/// verdict ([`join_artifact_serving_refusal`]). OwnerCertified groups verify
+/// the certificate EMBEDDED in the committed roster seat (the one
+/// `MemberJoined` bound into the `MemberAdded` commit) — never a certificate
+/// from the announce/discovery cache, which a #842 inline-certificate first
+/// join may not have reached. Other groups skip the certificate checks only.
+fn join_artifact_serving_refusal_for(
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+    revoked: bool,
+    now_unix: u64,
+) -> Option<JoinArtifactRefusal> {
+    // r6 (P4): every DEFINITIVE refusal is decided before any withholding
+    // one, so a withholding state (quarantine, pending evidence) never
+    // masks a terminal fact and keeps an obsolete artifact pending.
+    if info.withdrawn {
+        return Some(JoinArtifactRefusal::GroupWithdrawn);
+    }
+    if info.is_banned(member_hex) {
+        return Some(JoinArtifactRefusal::Banned);
+    }
+    if revoked {
+        return Some(JoinArtifactRefusal::Revoked);
+    }
+    let Some(seat) = info
+        .members_v2
+        .get(member_hex)
+        .filter(|seat| seat.is_active())
+    else {
+        return Some(JoinArtifactRefusal::NotActive);
+    };
+    let owner = info.policy.admission.owner_certified_user_id();
+    if let (Some(owner), Some(cert)) = (owner, seat.certificate.as_ref()) {
+        if let Err(failure) = x0x::groups::owner_cert::verify_cert_against_owner(
+            owner, member_hex, cert, false, now_unix,
+        ) {
+            return Some(JoinArtifactRefusal::CertificateInvalid(failure));
+        }
+    }
+    // Withholding refusals only after every definitive one.
+    if info.is_fork_quarantined() {
+        return Some(JoinArtifactRefusal::GroupQuarantined);
+    }
+    owner?;
+    match seat.certificate.as_ref() {
+        Some(_) => None,
+        None if seat.certificate_digest.is_some() => {
+            Some(JoinArtifactRefusal::CertificateDigestPending)
+        }
+        None => Some(JoinArtifactRefusal::CertificateMissing),
+    }
+}
+
+/// ADR 0107: the serving guard against the CURRENT local state. Callers on
+/// a serving path hold the group's membership lock, so the check and the
+/// artifact selection are linearized with every membership mutation.
+///
+/// OwnerCertified groups (ADR 0107 line 64) need BOTH a roster-embedded
+/// certificate that verifies against the owner, the current revocation set
+/// and the current clock, AND a Clean roster verdict for the recipient:
+/// `DigestPending`, `InGrace` and `Failed` verdicts fail closed. The verdict
+/// is the seal paths' own ladder (`GroupInfo::owner_cert_verdict`) over the
+/// current evidence. Announce/discovery evidence can therefore only WITHHOLD
+/// (e.g. a stale embedded certificate during a rotation); it is never the
+/// certificate a serve relies on. An #842 inline-certificate first join with
+/// no announce has a Clean verdict and is served.
+async fn join_artifact_serving_refusal(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> Option<JoinArtifactRefusal> {
+    join_artifact_serving_check(state, group_id, member_hex)
+        .await
+        .err()
+}
+
+/// [`join_artifact_serving_refusal`], also returning the owner-certificate
+/// evidence an OwnerCertified verdict was taken over (`Ok(None)` for other
+/// groups), so the stream-seam check can re-take the verdict over the same
+/// snapshot without awaiting (r5, lifecycle note section 2.7).
+async fn join_artifact_serving_check(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
+    let revoked = match parse_agent_id_hex(member_hex) {
+        Ok(member) => state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_agent_revoked(&member),
+        Err(_) => return Err(JoinArtifactRefusal::NotActive),
+    };
+    let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    // The recipient's seat alone, for the verdict below (the per-member
+    // ladder does not depend on other seats).
+    let probe = {
+        let roster = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
+            return Err(JoinArtifactRefusal::UnknownGroup);
+        };
+        match join_artifact_record_probe(info, member_hex, revoked, now_unix) {
+            Ok(Some(probe)) => probe,
+            Ok(None) => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        }
+    };
+    let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
+    join_artifact_verdict_refusal(probe, &evidence, member_hex).map_or(Ok(Some(evidence)), Err)
+}
+
+/// The record-local guard, plus (OwnerCertified groups only) the
+/// recipient's seat alone for the verdict. `Ok(None)`: eligible, no
+/// certificate verdict needed.
+fn join_artifact_record_probe(
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+    revoked: bool,
+    now_unix: u64,
+) -> std::result::Result<Option<x0x::groups::GroupInfo>, JoinArtifactRefusal> {
+    if let Some(refusal) = join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix) {
+        return Err(refusal);
+    }
+    // Non-OwnerCertified groups need no certificate: eligible.
+    if info.policy.admission.owner_certified_user_id().is_none() {
+        return Ok(None);
+    }
+    let mut probe = info.clone();
+    probe.members_v2.retain(|agent, _| agent == member_hex);
+    Ok(Some(probe))
+}
+
+/// ADR 0107 line 64: an OwnerCertified recipient needs a Clean roster
+/// verdict; `DigestPending`, `InGrace` and `Failed` fail closed.
+fn join_artifact_verdict_refusal(
+    mut probe: x0x::groups::GroupInfo,
+    evidence: &x0x::groups::owner_cert::OwnerCertEvidence,
+    member_hex: &str,
+) -> Option<JoinArtifactRefusal> {
+    use x0x::groups::owner_cert::MemberCertStatus;
+    match probe
+        .owner_cert_verdict(evidence)
+        .per_member
+        .remove(member_hex)
+    {
+        Some(MemberCertStatus::Clean) => None,
+        Some(MemberCertStatus::DigestPending) => {
+            Some(JoinArtifactRefusal::CertificateDigestPending)
+        }
+        Some(MemberCertStatus::InGrace { .. }) => Some(JoinArtifactRefusal::CertificateInGrace),
+        Some(MemberCertStatus::Failed { reason }) => {
+            Some(JoinArtifactRefusal::CertificateVerdictFailed(reason))
+        }
+        None => Some(JoinArtifactRefusal::NotActive),
+    }
+}
+
+/// ADR 0107 (r5, lifecycle note section 2.7, G2/G3): the serving guard at
+/// the stream seam, synchronously. Every lock is taken with `try_read`, and
+/// contention returns [`JoinArtifactRefusal::SeamContended`] (withhold,
+/// never purge). It re-reads the current revocation set, roster and clock,
+/// and re-takes an OwnerCertified verdict over the pre-phase `evidence`.
+fn join_artifact_seam_refusal(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    evidence: Option<x0x::groups::owner_cert::OwnerCertEvidence>,
+) -> Option<JoinArtifactRefusal> {
+    let Ok(member) = parse_agent_id_hex(member_hex) else {
+        return Some(JoinArtifactRefusal::NotActive);
+    };
+    let revoked = match state.agent.revocation_set().try_read() {
+        Ok(set) => set.is_agent_revoked(&member),
+        Err(_) => return Some(JoinArtifactRefusal::SeamContended),
+    };
+    let now_unix = join_artifact_seam_now(state);
+    let probe = {
+        let Ok(roster) = state.named_groups.try_read() else {
+            return Some(JoinArtifactRefusal::SeamContended);
+        };
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
+            return Some(JoinArtifactRefusal::UnknownGroup);
+        };
+        match join_artifact_record_probe(info, member_hex, revoked, now_unix) {
+            Ok(Some(probe)) => probe,
+            Ok(None) => return None,
+            Err(refusal) => return Some(refusal),
+        }
+    };
+    let Some(evidence) = evidence else {
+        return Some(JoinArtifactRefusal::SeamContended);
+    };
+    // r6 (P1): the snapshot's certificates at the SEAM's clock, so an
+    // announced certificate that expired since the pre-phase fails here.
+    join_artifact_verdict_refusal(probe, &evidence.at_time(now_unix), member_hex)
+}
+
+/// The wall clock the stream seam evaluates certificates with (unix
+/// seconds). Test builds can skew it per `AppState` to land a certificate
+/// expiry deterministically between the pre-phase and the seam.
+fn join_artifact_seam_now(state: &AppState) -> u64 {
+    let now = x0x::groups::owner_cert::restore_clock_now();
+    #[cfg(test)]
+    let now = now.saturating_add(
+        state
+            .named_group_test_recorders
+            .seam_clock_skew_secs
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    #[cfg(not(test))]
+    let _ = state;
+    now
+}
+
+/// Every spelling (map key, stable id, MLS id) this node holds the group
+/// under, plus the spelling asked for.
+async fn join_artifact_group_aliases(state: &AppState, group_id: &str) -> HashSet<String> {
+    let roster = state.named_groups.read().await;
+    let mut aliases = HashSet::from([group_id.to_string()]);
+    if let Some((key, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) {
+        aliases.insert(key.to_string());
+        aliases.insert(info.stable_group_id().to_string());
+        aliases.insert(info.mls_group_id.clone());
+    }
+    aliases
+}
+
+/// ADR 0107: drop `member_hex`'s staged join result, Welcomes and staged
+/// join-result control blobs for this group (every spelling), and cancel any
+/// Welcome transfer still streaming a copy, so no copied cache entry outlives
+/// the member's eligibility.
+async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_hex: &str) {
+    #[cfg(test)]
+    join_egress_test_barrier::park(member_hex, "purge").await;
+    let aliases = join_artifact_group_aliases(state, group_id).await;
+    let mut dropped_results = 0usize;
+    {
+        let mut results = state.pending_join_results.write().await;
+        for alias in &aliases {
+            if results
+                .remove(&join_result_key(alias, member_hex))
+                .is_some()
+            {
+                dropped_results += 1;
+            }
+        }
+    }
+    let dropped_blobs = state.control_blobs.purge_join_results(&aliases, member_hex);
+    let welcome_ids: Vec<String> = {
+        let mut welcomes = state.pending_welcomes.write().await;
+        let ids: Vec<String> = welcomes
+            .iter()
+            .filter(|(_, pending)| {
+                pending.joiner_agent == member_hex && aliases.contains(&pending.group_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            welcomes.remove(id);
+        }
+        ids
+    };
+    stop_welcome_streams(state, &welcome_ids).await;
+    if dropped_results > 0 || dropped_blobs > 0 || !welcome_ids.is_empty() {
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_hex),
+            dropped_results,
+            dropped_blobs,
+            dropped_welcomes = welcome_ids.len(),
+            "ADR 0107: dropped an ineligible member's staged join artifacts"
+        );
+    }
+}
+
+/// Abort the owner-side streams of these Welcomes and wait until each has
+/// stopped (none may send another frame once this returns).
+async fn stop_welcome_streams(state: &AppState, welcome_ids: &[String]) {
+    for welcome_id in welcome_ids {
+        let stream = state
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        state.pending_welcome_acks.write().await.remove(welcome_id);
+    }
+}
+
+/// ADR 0107: after a membership mutation (removal, ban, a departure event),
+/// drop the member's staged join artifacts when the current roster no longer
+/// makes it eligible. A still-eligible member keeps them. Mutation sites call
+/// this INSIDE their critical section, after the commit.
+async fn purge_join_artifacts_if_ineligible(state: &AppState, group_id: &str, member_hex: &str) {
+    if join_artifact_serving_refusal(state, group_id, member_hex)
+        .await
+        .is_some_and(JoinArtifactRefusal::is_definitive)
+    {
+        purge_member_join_artifacts(state, group_id, member_hex).await;
+    }
+}
+
+/// ADR 0107 (review r2): bound on concurrent Welcome `FetchRequest`
+/// handlers dispatched off the Welcome listener.
+pub(in crate::server) const WELCOME_FETCH_HANDLER_CAP: usize = 16;
+
+/// ADR 0107 (r5, G6): a group's share of [`WELCOME_FETCH_HANDLER_CAP`].
+pub(in crate::server) const WELCOME_FETCH_PER_GROUP_CAP: usize = 2;
+
+/// ADR 0107 (r5, G6): bound on one Welcome fetch handler (lock wait,
+/// checks and stream registration). The stream itself runs under the
+/// staged Welcome's deadline.
+const WELCOME_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0107 (review r2): spawn a join-artifact egress task registered under
+/// `(group_id, recipient)`. Its body runs only AFTER registration, so a
+/// removal or ban that quiesces this recipient can never miss it. Every body
+/// re-checks eligibility under the group's membership lock before it hands
+/// bytes to the transport; receipt waits run outside that lock.
+fn spawn_join_artifact_egress<F>(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &str,
+    kind: &'static str,
+    deadline: Instant,
+    body: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (registered, ready) = oneshot::channel::<()>();
+    let cleanup_state = Arc::clone(state);
+    let registry_key = (group_id.to_string(), recipient.to_string());
+    let handle = tokio::spawn(async move {
+        if ready.await.is_ok() {
+            // r5 (G9): the task leaves the registry itself when it ends —
+            // completion, deadline, abort or panic — by task id, so it never
+            // removes another task's handle.
+            let _cleanup = JoinArtifactEgressCleanup {
+                state: cleanup_state,
+                key: registry_key,
+                kind,
+                task: tokio::task::try_id(),
+            };
+            // r5 (lifecycle note section 2.7 item 6): no egress task
+            // outlives its artifact's deadline. A timeout drops the body
+            // (an unfinished stream resets) and never purges.
+            let _ = tokio::time::timeout_at(deadline.into(), body).await;
+        }
+    });
+    {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, tasks| {
+            tasks.retain(|task| !task.is_finished());
+            !tasks.is_empty()
+        });
+        registry
+            .entry((group_id.to_string(), recipient.to_string()))
+            .or_default()
+            .push(handle);
+    }
+    let _ = registered.send(());
+}
+
+/// ADR 0107 (r5, G9): removes its own task's handle from the egress registry
+/// on drop (see [`spawn_join_artifact_egress`]).
+struct JoinArtifactEgressCleanup {
+    state: Arc<AppState>,
+    key: (String, String),
+    /// What the task egresses (`join_result`, `join_result_stage`,
+    /// `join_result_chunk`, `secure_share`), for diagnostics.
+    kind: &'static str,
+    task: Option<tokio::task::Id>,
+}
+
+impl Drop for JoinArtifactEgressCleanup {
+    fn drop(&mut self) {
+        tracing::trace!(
+            group_id = %LogHexId::group(&self.key.0),
+            recipient = %LogHexId::agent(&self.key.1),
+            kind = self.kind,
+            "join-artifact egress task ended"
+        );
+        #[cfg(test)]
+        record_join_artifact_lifecycle(
+            &self.state,
+            format!("egress_ended:{}:{}:{}", self.key.0, self.key.1, self.kind),
+        );
+        let mut registry = self
+            .state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tasks) = registry.get_mut(&self.key) {
+            tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
+            if tasks.is_empty() {
+                registry.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// ADR 0107 (review r2): stop every in-flight egress of `member_hex`'s join
+/// artifacts for this group — registered result sends, staging and chunk
+/// sends, and the streams of its staged Welcomes — and wait until each has
+/// stopped. Removal and ban call this inside their critical section BEFORE
+/// they commit: every egress either finished before the mutation or never
+/// sends, and no new one can start while the membership lock is held.
+async fn quiesce_member_join_egress(state: &AppState, group_id: &str, member_hex: &str) {
+    let aliases = join_artifact_group_aliases(state, group_id).await;
+    let tasks: Vec<tokio::task::JoinHandle<()>> = {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        aliases
+            .iter()
+            .filter_map(|alias| registry.remove(&(alias.clone(), member_hex.to_string())))
+            .flatten()
+            .collect()
+    };
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    let welcome_ids: Vec<String> = state
+        .pending_welcomes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, pending)| {
+            pending.joiner_agent == member_hex && aliases.contains(&pending.group_id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    stop_welcome_streams(state, &welcome_ids).await;
+}
+
+/// ADR 0107 (r5, G4): stop EVERY in-flight join-artifact egress of the
+/// group — every registered task for every recipient, under every spelling,
+/// and every Welcome stream of the group — and await each one. Terminal
+/// mutations (withdrawal, deletion, local drop) call this BEFORE they
+/// commit, so nothing is still running when the commit lands.
+async fn quiesce_group_join_egress(state: &AppState, group_id: &str) {
+    let aliases = join_artifact_group_aliases(state, group_id).await;
+    quiesce_join_egress_for_aliases(state, &aliases).await;
+}
+
+/// [`quiesce_group_join_egress`] for an alias set captured by the caller
+/// (a local drop captures it before the group leaves the roster).
+async fn quiesce_join_egress_for_aliases(state: &AppState, aliases: &HashSet<String>) {
+    let tasks: Vec<tokio::task::JoinHandle<()>> = {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys: Vec<(String, String)> = registry
+            .keys()
+            .filter(|(group, _)| aliases.contains(group))
+            .cloned()
+            .collect();
+        keys.iter()
+            .filter_map(|key| registry.remove(key))
+            .flatten()
+            .collect()
+    };
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    let welcome_ids: Vec<String> = state
+        .pending_welcomes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, pending)| aliases.contains(&pending.group_id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    stop_welcome_streams(state, &welcome_ids).await;
+}
+
+/// ADR 0107 (r5, G5): a local drop or leave retires the group's
+/// join-artifact serving state: it quiesces every egress (awaited), then
+/// purges the staged originals, Welcomes (with their ACK slots), staged
+/// copies and idle staging guards under every spelling in `aliases`.
+/// Callers capture `aliases` (see [`join_artifact_group_aliases`]) before
+/// the group leaves the roster.
+async fn retire_local_group_join_artifacts(state: &AppState, aliases: &HashSet<String>) {
+    quiesce_join_egress_for_aliases(state, aliases).await;
+    state
+        .pending_join_results
+        .write()
+        .await
+        .retain(|key, pending| {
+            !join_result_key_matches_any_group_alias(key, aliases)
+                && !group_id_matches_any_alias(
+                    named_group_metadata_event_group_id(&pending.event),
+                    aliases,
+                )
+        });
+    let purged_welcomes: Vec<String> = {
+        let mut welcomes = state.pending_welcomes.write().await;
+        let ids: Vec<String> = welcomes
+            .iter()
+            .filter(|(_, pending)| aliases.contains(&pending.group_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            welcomes.remove(id);
+        }
+        ids
+    };
+    if !purged_welcomes.is_empty() {
+        let mut acks = state.pending_welcome_acks.write().await;
+        for id in &purged_welcomes {
+            acks.remove(id);
+        }
+    }
+    state.control_blobs.prune_groups(aliases);
+    state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(group, _), semaphore| {
+            !(aliases.contains(group) && semaphore.available_permits() == 1)
+        });
+}
+
+/// ADR 0107 (review r2): the staged result `staged_at` is still the one to
+/// serve and `member_hex` is still eligible. The caller holds the group's
+/// membership lock.
+async fn join_result_servable_locked(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    if join_artifact_serving_refusal(state, group_id, member_hex)
+        .await
+        .is_some()
+    {
+        return false;
+    }
+    state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(group_id, member_hex))
+        .is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+        })
+}
+
+/// ADR 0107 (review r2): [`join_result_servable_locked`] under the group's
+/// membership lock — the last check before a result's bytes are handed to
+/// the transport.
+async fn join_result_still_servable(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return false;
+    };
+    let _membership_guard = lock.lock().await;
+    join_result_servable_locked(state, group_id, member_hex, staged_at).await
+}
+
+/// ADR 0107 (review r2): stage an oversized result as a control blob only
+/// while it is still servable, atomically under the group's membership lock,
+/// so a staging retry can never recreate a blob a removal or ban purged.
+async fn stage_join_result_blob_if_servable(
+    state: &AppState,
+    group_id: &str,
+    recipient: &AgentId,
+    staged_at: Instant,
+    attempt_id: Option<&str>,
+    payload: &[u8],
+) -> std::result::Result<control_blob::ControlBlobRef, &'static str> {
+    let member_hex = hex::encode(recipient.as_bytes());
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return Err("join-result group is unknown");
+    };
+    let _membership_guard = lock.lock().await;
+    if !join_result_servable_locked(state, group_id, &member_hex, staged_at).await {
+        return Err("join-result recipient is no longer eligible");
+    }
+    // ADR 0107 (review r4 P2): the copy is bound to the ORIGINAL staged
+    // result and dies with its deadline; every chunk re-checks both.
+    control_blob::stage_reference(
+        &state.control_blobs,
+        &state.agent,
+        recipient,
+        control_blob::ControlBlobKind::JoinResult,
+        group_id,
+        attempt_id,
+        payload.to_vec(),
+        Some(control_blob::StagedOrigin {
+            staged_at,
+            deadline: staged_at + PENDING_JOIN_RESULT_TTL,
+        }),
+    )
+}
+
+/// ADR 0107 (review r4 P2): the staged join-result copy `reference` may still
+/// be served: it is bound to an original staged result that is still the one
+/// to serve and unexpired, and its recipient is eligible on the current
+/// roster. The caller holds the group's membership lock.
+async fn join_result_blob_servable_locked(
+    state: &AppState,
+    reference: &control_blob::ControlBlobRef,
+) -> bool {
+    let Some(origin) = state.control_blobs.staged_origin(reference) else {
+        return false;
+    };
+    join_result_servable_locked(
+        state,
+        reference.group_id(),
+        reference.recipient(),
+        origin.staged_at,
+    )
+    .await
+}
+
+/// ADR 0107 (review r4 P2): one chunk of a staged join-result copy, read
+/// under the group's membership lock only while
+/// [`join_result_blob_servable_locked`] holds.
+pub(super) async fn join_result_chunk_if_servable(
+    state: &AppState,
+    reference: &control_blob::ControlBlobRef,
+    sequence: u32,
+) -> Option<Vec<u8>> {
+    let lock = group_membership_lock_for_known_group(state, reference.group_id()).await?;
+    let _membership_guard = lock.lock().await;
+    if !join_result_blob_servable_locked(state, reference).await {
+        return None;
+    }
+    state.control_blobs.staged_chunk(reference, sequence)
+}
+
+/// ADR 0107 (r5): the staged result `staged_at` is still the one to serve
+/// and unexpired, read synchronously at the stream seam (contention
+/// refuses).
+fn join_result_staged_now(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    state.pending_join_results.try_read().is_ok_and(|results| {
+        results
+            .get(&join_result_key(group_id, member_hex))
+            .is_some_and(|pending| {
+                pending.created_at == staged_at
+                    && pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+            })
+    })
+}
+
+/// ADR 0107 (r5): the staged join-result copy `reference` is still bound
+/// to its unexpired original, read synchronously at the stream seam.
+fn join_result_blob_staged_now(state: &AppState, reference: &control_blob::ControlBlobRef) -> bool {
+    // r6 (P2): never block at the seam; contention refuses (withhold).
+    let Ok(origin) = state.control_blobs.try_staged_origin(reference) else {
+        return false;
+    };
+    origin.is_some_and(|origin| {
+        join_result_staged_now(
+            state,
+            reference.group_id(),
+            reference.recipient(),
+            origin.staged_at,
+        )
+    })
+}
+
+/// ADR 0107 (r5): the staged Welcome `welcome_id` (staged at `staged_at`)
+/// still stands, unexpired, for `recipient_hex`, read synchronously at the
+/// stream seam.
+fn welcome_staged_now(
+    state: &AppState,
+    welcome_id: &str,
+    recipient_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    state.pending_welcomes.try_read().is_ok_and(|welcomes| {
+        welcomes.get(welcome_id).is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && pending.joiner_agent == recipient_hex
+        })
+    })
+}
+
+/// ADR 0107 (r5, lifecycle note section 2.7): wrap an async pre-phase as a
+/// recovery-response admission. The pre-phase runs once per physical
+/// exchange and returns the seam check bound to its snapshot.
+fn join_artifact_admission<F, Fut>(pre_phase: F) -> x0x::dm::ArtifactAdmission
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<x0x::dm::SeamAdmission>> + Send + 'static,
+{
+    Arc::new(move || Box::pin(pre_phase()))
+}
+
+/// ADR 0107 (r5): the admission of an inline join result. Pre-phase: under
+/// the group's membership lock, the serving guard (keeping its evidence)
+/// and the staged original. Seam: the same, synchronously.
+fn join_result_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let member_hex = member_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let member_hex = member_hex.clone();
+        async move {
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &member_hex)
+                    .await
+                    .ok()?;
+                if !join_result_servable_locked(&state, &group_id, &member_hex, staged_at).await {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &member_hex, evidence).is_none()
+                    && join_result_staged_now(&state, &group_id, &member_hex, staged_at)
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// ADR 0107 (r5): the admission of one join-result chunk (the copy bound to
+/// its original).
+pub(super) fn join_result_chunk_admission(
+    state: &Arc<AppState>,
+    reference: &control_blob::ControlBlobRef,
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let reference = reference.clone();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let reference = reference.clone();
+        async move {
+            let lock = group_membership_lock_for_known_group(&state, reference.group_id()).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(
+                    &state,
+                    reference.group_id(),
+                    reference.recipient(),
+                )
+                .await
+                .ok()?;
+                if !join_result_blob_servable_locked(&state, &reference).await {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(
+                    &state,
+                    reference.group_id(),
+                    reference.recipient(),
+                    evidence,
+                )
+                .is_none()
+                    && join_result_blob_staged_now(&state, &reference)
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// ADR 0107 (r5): the admission of one Welcome chunk: the staged Welcome
+/// still stands, unexpired, for this recipient, and the recipient is
+/// eligible.
+fn welcome_chunk_admission(
+    state: &Arc<AppState>,
+    welcome_id: &str,
+    recipient_hex: &str,
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let welcome_id = welcome_id.to_string();
+    let recipient_hex = recipient_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let welcome_id = welcome_id.clone();
+        let recipient_hex = recipient_hex.clone();
+        async move {
+            let (group_id, staged_at) = state
+                .pending_welcomes
+                .read()
+                .await
+                .get(&welcome_id)
+                .map(|pending| (pending.group_id.clone(), pending.created_at))?;
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &recipient_hex)
+                    .await
+                    .ok()?;
+                let staged = state
+                    .pending_welcomes
+                    .read()
+                    .await
+                    .get(&welcome_id)
+                    .is_some_and(|pending| {
+                        pending.created_at == staged_at
+                            && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                            && pending.joiner_agent == recipient_hex
+                    });
+                if !staged {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
+                    && welcome_staged_now(&state, &welcome_id, &recipient_hex, staged_at)
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// ADR 0107 (r5, lifecycle note section 2.7 item 6): the bound on one
+/// class-R exchange (resolution, any redial, the pre-phase, stream
+/// allocation and writing), further capped by the artifact's deadline.
+const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0107 (r5, lifecycle note section 2.7): hand one recovery-response
+/// frame (an inline join result, a Welcome chunk or a join-result chunk) to
+/// the transport in ONE admitted physical exchange.
+///
+/// The only path is x0x's pinned single-exchange raw-QUIC send
+/// ([`Agent::send_direct_pinned_admitted`]): never the gossip inbox (whose
+/// stranded-publish retry runs detached), never an ACK-v2 exchange (whose
+/// internal retry and the X0X-0053 reissue write again without admission),
+/// never a retry. A failure never falls back; the joiner's fetch retries and
+/// every resend is admitted afresh. The exchange runs under
+/// `min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline)`: on timeout the
+/// future is dropped, so an unfinished stream resets. The deadline only
+/// cancels; it never purges.
+pub(super) async fn send_join_artifact(
+    state: &AppState,
+    recipient: &AgentId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    let exchange_deadline =
+        std::cmp::min(Instant::now() + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
+    #[cfg(test)]
+    let recipient_hex = hex::encode(recipient.as_bytes());
+    let exchange = async {
+        #[cfg(test)]
+        {
+            join_egress_test_barrier::park(&recipient_hex, kind).await;
+            record_join_artifact_delivery_path(state, &recipient_hex, kind, false);
+            if let Ok(mut transports) = state
+                .named_group_test_recorders
+                .join_artifact_transports
+                .lock()
+            {
+                transports.push((recipient_hex.clone(), kind, "pinned_single_exchange"));
+            }
+        }
+        state
+            .agent
+            .send_direct_pinned_admitted(recipient, payload, &admission)
+            .await
+    };
+    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("{kind} exchange deadline elapsed")),
+    };
+    // Test builds: the in-process stand-in reports an admitted exchange
+    // through its marker error; record the egress witness for it.
+    #[cfg(test)]
+    if outcome
+        .as_ref()
+        .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
+    {
+        if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+            egress.push((recipient_hex, group_id.to_string(), kind));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (group_id, kind);
+    outcome
+}
+
+/// ADR 0107 (review r2): the staged Welcome `welcome_id` (staged at
+/// `staged_at`) may still be streamed to `recipient_hex`. Checked under the
+/// group's membership lock before EVERY frame is handed to the transport.
+async fn welcome_frame_servable(
+    state: &AppState,
+    group_id: &str,
+    recipient_hex: &str,
+    welcome_id: &str,
+    staged_at: Instant,
+) -> std::result::Result<(), String> {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return Err("Welcome group is unknown".to_string());
+    };
+    let _membership_guard = lock.lock().await;
+    if let Some(refusal) = join_artifact_serving_refusal(state, group_id, recipient_hex).await {
+        return Err(format!(
+            "Welcome recipient is no longer eligible ({})",
+            refusal.reason()
+        ));
+    }
+    let staged = state
+        .pending_welcomes
+        .read()
+        .await
+        .get(welcome_id)
+        .is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && pending.joiner_agent == recipient_hex
+        });
+    if staged {
+        Ok(())
+    } else {
+        Err("the staged Welcome was withdrawn".to_string())
+    }
+}
+
+/// ADR 0107 (review r2): test-only, per-(recipient, point) barriers at the
+/// join-artifact egress boundary, so a test can hold an egress after its
+/// eligibility check and land a membership change before the bytes leave.
+/// Unarmed points pass straight through.
+#[cfg(test)]
+pub(in crate::server) mod join_egress_test_barrier {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(in crate::server) struct Gate {
+        reached: AtomicBool,
+        parked: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Gate {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+
+        /// How many egresses are parked at this gate right now.
+        pub(in crate::server) fn parked(&self) -> usize {
+            self.parked.load(Ordering::SeqCst)
+        }
+
+        /// Release every current and future waiter of this gate.
+        pub(in crate::server) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type GateKey = (String, &'static str);
+
+    static GATES: LazyLock<Mutex<HashMap<GateKey, Arc<Gate>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Arm `point` for `recipient`; the returned guard disarms (and releases)
+    /// it on drop.
+    pub(in crate::server) fn arm(recipient: &str, point: &'static str) -> Armed {
+        let gate = Arc::new(Gate {
+            reached: AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((recipient.to_string(), point), Arc::clone(&gate));
+        }
+        Armed {
+            key: (recipient.to_string(), point),
+            gate,
+        }
+    }
+
+    pub(in crate::server) struct Armed {
+        key: GateKey,
+        pub(in crate::server) gate: Arc<Gate>,
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.gate.release();
+            if let Ok(mut gates) = GATES.lock() {
+                gates.remove(&self.key);
+            }
+        }
+    }
+
+    pub(in crate::server) async fn park(recipient: &str, point: &'static str) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(recipient.to_string(), point)).cloned());
+        if let Some(gate) = gate {
+            struct Parked(Arc<Gate>);
+            impl Drop for Parked {
+                fn drop(&mut self) {
+                    self.0.parked.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            gate.parked.fetch_add(1, Ordering::SeqCst);
+            let parked = Parked(Arc::clone(&gate));
+            gate.reached.store(true, Ordering::SeqCst);
+            let _ = gate.release.acquire().await;
+            drop(parked);
+        }
+    }
+}
+
+/// ADR 0107 (review r2 P1-2): test-only witness of the delivery path a
+/// join artifact was handed to.
+#[cfg(test)]
+fn record_join_artifact_delivery_path(
+    state: &AppState,
+    recipient: &str,
+    kind: &'static str,
+    can_reach_gossip: bool,
+) {
+    if let Ok(mut paths) = state
+        .named_group_test_recorders
+        .join_artifact_delivery_paths
+        .lock()
+    {
+        paths.push((recipient.to_string(), kind, can_reach_gossip));
+    }
+}
+
+/// ADR 0107 (r5, G4): test-only ordered lifecycle witness.
+#[cfg(test)]
+fn record_join_artifact_lifecycle(state: &AppState, event: String) {
+    if let Ok(mut events) = state
+        .named_group_test_recorders
+        .join_artifact_lifecycle
+        .lock()
+    {
+        events.push(event);
+    }
+}
+
+/// ADR 0107 (review r2): the test-only egress witness, at the point where
+/// a join artifact's bytes are handed to the transport (after any barrier).
+#[cfg(test)]
+async fn join_egress_test_point(
+    state: &AppState,
+    recipient: &str,
+    group: &str,
+    kind: &'static str,
+) {
+    join_egress_test_barrier::park(recipient, kind).await;
+    if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+        egress.push((recipient.to_string(), group.to_string(), kind));
+    }
+}
+
+/// ADR 0107 (r6, P3): a group's share of the inline join-result egress
+/// tasks.
+pub(in crate::server) const JOIN_RESULT_EGRESS_PER_GROUP_CAP: usize = 8;
+
+/// ADR 0107 (r6, P3): bound on concurrent inline join-result egress tasks.
+pub(in crate::server) const JOIN_RESULT_EGRESS_CAP: usize = 64;
+
+/// ADR 0107 (r5, G8): a group's share of the join-result chunk tasks.
+pub(in crate::server) const JOIN_RESULT_CHUNK_PER_GROUP_CAP: usize = 4;
+
+/// ADR 0107 (r5, G8): bound on concurrent join-result chunk tasks.
+pub(in crate::server) const JOIN_RESULT_CHUNK_TASK_CAP: usize = 16;
+
+/// ADR 0107 (r5, G7): a group's share of the join-result fetch handlers.
+pub(in crate::server) const JOIN_RESULT_FETCH_PER_GROUP_CAP: usize = 4;
+
+/// ADR 0107 (r5, G7): bound on concurrent join-result fetch handlers.
+pub(in crate::server) const JOIN_RESULT_FETCH_HANDLER_CAP: usize = 32;
+
+/// ADR 0107 (r5, G7): bound on one join-result fetch handler (the
+/// owner-certificate retry, the lock wait and the selection). Its egress
+/// runs in registered tasks under the artifact's deadline.
+const JOIN_RESULT_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The join-result listener's entry point (ADR 0107 r5, G7). A
+/// `FetchRequest` can wait on its group's membership lock (and runs the
+/// owner-certificate retry), so it never runs on the shared listener: it is
+/// provisionally validated (the sender is the member asked for, the group is
+/// known), admitted by [`FairAdmission`] (one in-flight handler per
+/// `(group, member)`, a per-group share, a global cap), and handled off the
+/// listener under a timeout. Every other message is handled inline as
+/// before.
+pub(in crate::server) async fn dispatch_join_result_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    msg: JoinResultMessage,
+) {
+    let JoinResultMessage::FetchRequest {
+        group_id,
+        member_agent_id,
+        ..
+    } = &msg
+    else {
+        handle_join_result_message(state, sender, verified, msg).await;
+        return;
+    };
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != *member_agent_id {
+        tracing::warn!(group_id = %LogHexId::group(group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(member_agent_id), "ignoring unauthorized join-result fetch");
+        return;
+    }
+    let stable_group = {
+        let roster = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&roster, group_id)
+            .map(|(_, info)| info.stable_group_id().to_string())
+    };
+    let Some(stable_group) = stable_group else {
+        tracing::debug!(group_id = %LogHexId::group(group_id), "join-result fetch for an unknown group; dropped");
+        return;
+    };
+    let ticket = match state.join_result_fetch_admission.try_admit(
+        &join_result_key(&stable_group, member_agent_id),
+        &stable_group,
+    ) {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                member = %LogHexId::agent(member_agent_id),
+                ?refusal,
+                "join-result fetch not admitted; the joiner retries"
+            );
+            return;
+        }
+    };
+    let task_state = Arc::clone(state);
+    let requester = *sender;
+    let worker = tokio::spawn(async move {
+        tokio::time::timeout(
+            JOIN_RESULT_FETCH_HANDLER_TIMEOUT,
+            handle_join_result_message(&task_state, &requester, verified, msg),
+        )
+        .await
+        .is_err()
+    });
+    // Supervisor: holds the admission ticket until the handler ends and
+    // reports a handler that panicked or timed out.
+    tokio::spawn(async move {
+        let _ticket = ticket;
+        match worker.await {
+            Ok(false) => {}
+            Ok(true) => tracing::warn!("join-result fetch handler timed out; the joiner retries"),
+            Err(e) if e.is_panic() => {
+                tracing::error!("join-result fetch handler panicked: {e}");
+            }
+            Err(_) => {}
+        }
+    });
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -35097,7 +36956,7 @@ async fn handle_join_result_message_bound(
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
-            let (event, head_attestation, pending_count) = {
+            let (event, head_attestation, staged_at, pending_count) = {
                 let mut results = state.pending_join_results.write().await;
                 results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
                 (
@@ -35105,6 +36964,7 @@ async fn handle_join_result_message_bound(
                     results
                         .get(&key)
                         .and_then(|pending| pending.head_attestation.clone()),
+                    results.get(&key).map(|pending| pending.created_at),
                     results.len(),
                 )
             };
@@ -35155,6 +37015,31 @@ async fn handle_join_result_message_bound(
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
+            let Some(staged_at) = staged_at else {
+                return;
+            };
+            // ADR 0107: the staged result is served only while the requester
+            // is eligible on the CURRENT committed roster — checked inside
+            // the same membership critical section as the selection. The
+            // egress itself is a registered task that re-checks under this
+            // lock right before the transport handoff; a removal or ban
+            // cancels it before committing. A definitive refusal invalidates
+            // the staged artifacts too.
+            if let Some(refusal) =
+                join_artifact_serving_refusal(state, &group_id, &member_agent_id).await
+            {
+                if refusal.is_definitive() {
+                    purge_member_join_artifacts(state, &group_id, &member_agent_id).await;
+                }
+                drop(selection_guard);
+                tracing::warn!(
+                    group_id = %LogHexId::group(&group_id),
+                    member = %LogHexId::agent(&member_agent_id),
+                    reason = refusal.reason(),
+                    "ADR 0107: staged join result withheld; the requester is not eligible on the current committed roster"
+                );
+                return;
+            }
             // The linearized result/refusal choice is complete. Network
             // transfer may take the full pull window and must not hold the
             // per-group membership lock needed by the join apply path.
@@ -35257,6 +37142,13 @@ async fn handle_join_result_message_bound(
                     return;
                 }
             };
+            // ADR 0107 (test-only witness): the arm decided to serve these
+            // exact bytes. In-process transport sends fail, so tests read
+            // the serve decision here.
+            #[cfg(test)]
+            if let Ok(mut served) = state.named_group_test_recorders.join_result_serves.lock() {
+                served.push((member_agent_id.clone(), group_id.clone(), payload.clone()));
+            }
             let payload_len = payload.len();
             let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
             tracing::debug!(
@@ -35285,7 +37177,7 @@ async fn handle_join_result_message_bound(
                 // duplicate while a staging runs is DROPPED (the
                 // reference it would stage is byte-identical; the
                 // recipient's retry fetches the live one).
-                let Some(permit) = acquire_join_result_staging_permit(state, &group_id, sender)
+                let Some(staging_slot) = acquire_join_result_staging_slot(state, &group_id, sender)
                 else {
                     tracing::debug!(
                         group_id = %LogHexId::group(&group_id),
@@ -35294,62 +37186,189 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 };
-                let control_blobs = state.control_blobs.clone();
-                let agent = Arc::clone(&state.agent);
+                let task_state = Arc::clone(state);
                 let group_id_for_task = group_id.clone();
                 let attempt = attempt_id.clone();
                 let member_for_log = member_agent_id.clone();
                 let recipient = *sender;
-                let guard_key = (group_id.clone(), *sender);
-                let guard_state = Arc::clone(state);
-                tokio::spawn(async move {
-                    let _staging_permit = permit;
-                    let outcome = control_blob::send_reference(
-                        &control_blobs,
-                        &agent,
-                        &recipient,
-                        control_blob::ControlBlobKind::JoinResult,
-                        &group_id_for_task,
-                        attempt.as_deref(),
-                        payload,
-                    )
-                    .await;
-                    // #878 r5 (review): drop OUR permit BEFORE pruning,
-                    // so the released semaphore is observably idle — the
-                    // prune condition (available == 1) actually holds.
-                    drop(_staging_permit);
-                    release_join_result_staging_guard(&guard_state, &guard_key);
-                    if let Err(e) = outcome {
-                        tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
-                    }
-                });
+                // ADR 0107 (review r2): staging is egress of a copy of the
+                // result. Each (re)staging attempt re-checks eligibility and
+                // stages atomically under the group's membership lock, inside
+                // a registered task a removal or ban cancels before it
+                // commits, so a delayed retry can never recreate a purged
+                // blob. The reference itself carries no artifact bytes.
+                let artifact_deadline = staged_at + PENDING_JOIN_RESULT_TTL;
+                spawn_join_artifact_egress(
+                    state,
+                    &group_id,
+                    &member_agent_id,
+                    "join_result_stage",
+                    artifact_deadline,
+                    async move {
+                        let staging_slot = staging_slot;
+                        let mut retries = 0;
+                        let staged = loop {
+                            #[cfg(test)]
+                            join_egress_test_barrier::park(&member_for_log, "join_result_stage")
+                                .await;
+                            match stage_join_result_blob_if_servable(
+                                &task_state,
+                                &group_id_for_task,
+                                &recipient,
+                                staged_at,
+                                attempt.as_deref(),
+                                &payload,
+                            )
+                            .await
+                            {
+                                Ok(reference) => break Ok(reference),
+                                Err(control_blob::STAGING_BUDGET_EXHAUSTED)
+                                    if retries < control_blob::STAGING_BUDGET_RETRIES =>
+                                {
+                                    tracing::warn!(
+                                        group_id = %LogHexId::group(&group_id_for_task),
+                                        member = %LogHexId::agent(&member_for_log),
+                                        retries,
+                                        "control blob staging budget exhausted; retrying (#876)"
+                                    );
+                                    retries += 1;
+                                    tokio::time::sleep(control_blob::STAGING_BUDGET_RETRY_DELAY)
+                                        .await;
+                                }
+                                Err(reason) => break Err(reason.to_string()),
+                            }
+                        };
+                        let outcome = match staged {
+                            Ok(reference) => {
+                                #[cfg(test)]
+                                join_egress_test_point(
+                                    &task_state,
+                                    &member_for_log,
+                                    &group_id_for_task,
+                                    "join_result_reference",
+                                )
+                                .await;
+                                control_blob::send_reference_message(
+                                    &task_state.agent,
+                                    &recipient,
+                                    reference,
+                                )
+                                .await
+                            }
+                            Err(reason) => Err(reason),
+                        };
+                        // #878 r5 / r5 G9: the slot releases its permit,
+                        // then its own idle guard entry (also on abort or at
+                        // the deadline).
+                        drop(staging_slot);
+                        if let Err(e) = outcome {
+                            tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
+                        }
+                    },
+                );
                 return;
             }
-            if let Err(e) = state
-                .agent
-                .send_direct_with_config(sender, payload, direct_message_send_config())
-                .await
-            {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result response: {e}");
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "join_result_send_err",
-                    group_id = %group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                    error = %e,
-                );
-            } else {
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "join_result_send_ok",
-                    group_id = %group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                );
-            }
+            // ADR 0107 (review r2): the inline send is a registered egress
+            // task. Immediately before handing the bytes to the transport it
+            // re-checks, under the group's membership lock, that the
+            // requester is still eligible and the staged result unchanged; a
+            // removal or ban cancels it before committing. The receipt wait
+            // runs outside the lock.
+            // r6 (P3): one in-flight inline egress per (group, recipient),
+            // with a per-group share of the global cap. The ticket lives in
+            // the egress task (released at completion, deadline or abort),
+            // so duplicate fetches never start overlapping egress; the
+            // in-flight one serves the same staged result, and the joiner
+            // retries.
+            let stable_group = {
+                let roster = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&roster, &group_id).map_or_else(
+                    || group_id.clone(),
+                    |(_, info)| info.stable_group_id().to_string(),
+                )
+            };
+            let egress_ticket = match state.join_result_egress_admission.try_admit(
+                &join_result_key(&stable_group, &member_agent_id),
+                &stable_group,
+            ) {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        ?refusal,
+                        "inline join-result egress already in flight or at capacity; the joiner retries"
+                    );
+                    return;
+                }
+            };
+            let task_state = Arc::clone(state);
+            let recipient = *sender;
+            let group_for_task = group_id.clone();
+            let member_for_task = member_agent_id.clone();
+            let artifact_deadline = staged_at + PENDING_JOIN_RESULT_TTL;
+            spawn_join_artifact_egress(
+                state,
+                &group_id,
+                &member_agent_id,
+                "join_result",
+                artifact_deadline,
+                async move {
+                    let _egress_ticket = egress_ticket;
+                    if !join_result_still_servable(
+                        &task_state,
+                        &group_for_task,
+                        &member_for_task,
+                        staged_at,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&group_for_task),
+                            member = %LogHexId::agent(&member_for_task),
+                            "ADR 0107: join result withheld at egress; the requester is no longer eligible"
+                        );
+                        return;
+                    }
+                    let admission = join_result_admission(
+                        &task_state,
+                        &group_for_task,
+                        &member_for_task,
+                        staged_at,
+                    );
+                    if let Err(e) = send_join_artifact(
+                        &task_state,
+                        &recipient,
+                        &payload,
+                        &group_for_task,
+                        "join_result",
+                        admission,
+                        artifact_deadline,
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "join_result_send_err",
+                            group_id = %group_for_task,
+                            member = %member_for_task,
+                            payload_len,
+                            payload_hash = %payload_hash,
+                            error = %e,
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "join_result_send_ok",
+                            group_id = %group_for_task,
+                            member = %member_for_task,
+                            payload_len,
+                            payload_hash = %payload_hash,
+                        );
+                    }
+                },
+            );
         }
         JoinResultMessage::Result {
             event,
@@ -36321,6 +38340,94 @@ pub(in crate::server) fn decode_welcome_blob_message(
     Some((&message.sender, payload))
 }
 
+/// The Welcome DM listener's dispatch for one verified frame (the single
+/// listener loop in `server::run` awaits this).
+///
+/// ADR 0107 (review r2): a `FetchRequest` is served off the listener, in a
+/// bounded, supervised task, because serving waits on the group's
+/// membership lock. A lock holder may itself be waiting for Offer, Chunk or
+/// Complete frames on this same listener, so handling the fetch inline could
+/// stall every group's frames (a dependency cycle). Receive-side frames stay
+/// inline and never take a membership lock. With every slot busy, the fetch
+/// is dropped; the joiner's bounded retry schedule asks again.
+pub(in crate::server) async fn dispatch_welcome_blob_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: WelcomeBlobMessage,
+) {
+    match msg {
+        WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id,
+        } => {
+            // ADR 0107 (r5, G6): provisional validation without any group
+            // lock — a Welcome staged for this group and this sender — then
+            // fair, coalescing admission. The handler re-checks everything
+            // authoritatively under the group's membership lock.
+            let sender_hex = hex::encode(sender.as_bytes());
+            let staged_group = state
+                .pending_welcomes
+                .read()
+                .await
+                .get(&welcome_id)
+                .filter(|pending| {
+                    pending.group_id == group_id && pending.joiner_agent == sender_hex
+                })
+                .map(|pending| pending.group_id.clone());
+            let Some(staged_group) = staged_group else {
+                tracing::debug!(
+                    welcome_id = %LogHexId::new("welcome", &welcome_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    "Welcome fetch matches no Welcome staged for this sender; dropped"
+                );
+                return;
+            };
+            let ticket = match state
+                .welcome_fetch_admission
+                .try_admit(&welcome_id, &staged_group)
+            {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        welcome_id = %LogHexId::new("welcome", &welcome_id),
+                        ?refusal,
+                        "Welcome fetch not admitted; the joiner retries"
+                    );
+                    return;
+                }
+            };
+            let task_state = Arc::clone(state);
+            let requester = *sender;
+            let log_id = welcome_id.clone();
+            let worker = tokio::spawn(async move {
+                tokio::time::timeout(
+                    WELCOME_FETCH_HANDLER_TIMEOUT,
+                    handle_welcome_fetch_request(&task_state, &requester, group_id, welcome_id),
+                )
+                .await
+                .is_err()
+            });
+            // Supervisor: holds the admission ticket until the handler ends
+            // and reports a handler that panicked or timed out.
+            tokio::spawn(async move {
+                let _ticket = ticket;
+                match worker.await {
+                    Ok(false) => {}
+                    Ok(true) => tracing::warn!(
+                        welcome_id = %LogHexId::new("welcome", &log_id),
+                        "Welcome fetch handler timed out; the joiner retries"
+                    ),
+                    Err(e) if e.is_panic() => {
+                        tracing::error!("Welcome fetch handler panicked: {e}");
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+        other => handle_welcome_blob_message(state, sender, other).await,
+    }
+}
+
 pub(in crate::server) async fn handle_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -36400,7 +38507,86 @@ async fn handle_welcome_fetch_request(
     group_id: String,
     welcome_id: String,
 ) {
+    let send_state = Arc::clone(state);
+    let send_recipient = *sender;
+    let send_group = group_id.clone();
+    handle_welcome_fetch_request_via(
+        state,
+        sender,
+        group_id,
+        welcome_id,
+        move |msg: WelcomeBlobMessage| {
+            let state = Arc::clone(&send_state);
+            let group_id = send_group.clone();
+            async move {
+                match &msg {
+                    // ADR 0107 (review r4 P1): a chunk carries the Welcome's
+                    // bytes, so it takes the owned, admitted raw-QUIC path
+                    // only. Offer and Complete carry no artifact bytes and
+                    // keep their delivery config.
+                    WelcomeBlobMessage::Chunk { welcome_id, .. } => {
+                        let payload = welcome_blob_payload(&msg)?;
+                        let Some(deadline) = state
+                            .pending_welcomes
+                            .read()
+                            .await
+                            .get(welcome_id)
+                            .map(|pending| pending.created_at + PENDING_WELCOME_TTL)
+                        else {
+                            return Err("the staged Welcome was withdrawn".to_string());
+                        };
+                        let admission = welcome_chunk_admission(
+                            &state,
+                            welcome_id,
+                            &hex::encode(send_recipient.as_bytes()),
+                        );
+                        send_join_artifact(
+                            &state,
+                            &send_recipient,
+                            &payload,
+                            &group_id,
+                            "welcome_frame",
+                            admission,
+                            deadline,
+                        )
+                        .await
+                    }
+                    _ => send_welcome_blob_message(&state, &send_recipient, &msg)
+                        .await
+                        .map(|_| ()),
+                }
+            }
+        },
+    )
+    .await;
+}
+
+/// [`handle_welcome_fetch_request`] with an injectable frame transport
+/// (production: [`send_welcome_blob_message`]; tests carry the frames to an
+/// in-process joiner's real receive path).
+async fn handle_welcome_fetch_request_via<S, F>(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: String,
+    welcome_id: String,
+    transport: S,
+) where
+    S: FnMut(WelcomeBlobMessage) -> F + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
     let sender_hex = hex::encode(sender.as_bytes());
+    // ADR 0107: the eligibility check, the staged-Welcome selection and the
+    // stream registration are linearized with membership mutations under the
+    // group's (lookup-gated) membership lock. A removal or ban either lands
+    // first and is refused below, or lands after the stream registered and
+    // stops that stream before it commits; every frame also re-checks under
+    // the lock. This handler runs off the Welcome listener
+    // (`dispatch_welcome_blob_message`), so waiting here never stalls it.
+    let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
+    let _membership_guard = match &membership_arc {
+        Some(arc) => Some(arc.lock().await),
+        None => None,
+    };
     let pending = {
         let welcomes = state.pending_welcomes.read().await;
         welcomes.get(&welcome_id).cloned()
@@ -36435,11 +38621,36 @@ async fn handle_welcome_fetch_request(
         tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
         return;
     }
+    // ADR 0107: key material is streamed only to a recipient that is
+    // eligible on the CURRENT committed roster; staging-time evidence is
+    // not enough. A definitive refusal invalidates the staged artifacts.
+    if let Some(refusal) =
+        join_artifact_serving_refusal(state, &pending.group_id, &sender_hex).await
+    {
+        if refusal.is_definitive() {
+            purge_member_join_artifacts(state, &pending.group_id, &sender_hex).await;
+        }
+        tracing::warn!(
+            welcome_id = %LogHexId::new("welcome", &welcome_id),
+            sender = %LogHexId::agent(&sender_hex),
+            reason = refusal.reason(),
+            "ADR 0107: staged Welcome withheld; the recipient is not eligible on the current committed roster"
+        );
+        return;
+    }
     let stream_state = Arc::clone(state);
     let recipient = *sender;
     let stream_id = welcome_id.clone();
+    // r5 (lifecycle note section 2.7 item 6): the stream never outlives the
+    // staged Welcome's deadline; a timeout drops it (an unfinished stream
+    // resets) and never purges.
+    let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
     replace_welcome_stream(state, &welcome_id, async move {
-        stream_welcome_blob(&stream_state, &recipient, &stream_id, pending).await;
+        let _ = tokio::time::timeout_at(
+            stream_deadline.into(),
+            stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport),
+        )
+        .await;
     })
     .await;
 }
@@ -36459,23 +38670,73 @@ where
     // An aborted sender cannot run its normal ack-slot cleanup. Clear its
     // slot only after it has stopped so the replacement owns every ack.
     state.pending_welcome_acks.write().await.remove(welcome_id);
-    streams.insert(welcome_id.to_string(), tokio::spawn(stream));
+    // r5 (G9): the stream is supervised (a panic is reported, not lost)
+    // and removes its own handle when it ends, by task id, so it never
+    // removes a replacement's.
+    let task_state = Arc::clone(state);
+    let id = welcome_id.to_string();
+    streams.insert(
+        welcome_id.to_string(),
+        tokio::spawn(async move {
+            if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(stream))
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    welcome_id = %LogHexId::new("welcome", &id),
+                    "Welcome stream panicked; its bookkeeping was released"
+                );
+            }
+            let own = tokio::task::try_id();
+            let mut streams = task_state.pending_welcome_streams.lock().await;
+            if let Some(streams) = streams.as_mut() {
+                if streams
+                    .get(&id)
+                    .is_some_and(|handle| Some(handle.id()) == own)
+                {
+                    streams.remove(&id);
+                }
+            }
+        }),
+    );
 }
 
-async fn stream_welcome_blob(
+/// ADR 0107: stream one staged Welcome through `transport`, guarding every
+/// frame. The transport future is built per frame but only polled after the
+/// frame's eligibility check passes, so no frame leaves an ineligible
+/// recipient's stream.
+async fn stream_welcome_blob_guarded<S, F>(
     state: &Arc<AppState>,
     recipient: &AgentId,
     welcome_id: &str,
     pending: PendingWelcome,
-) {
-    let send_state = Arc::clone(state);
-    let send_recipient = *recipient;
+    mut transport: S,
+) where
+    S: FnMut(WelcomeBlobMessage) -> F + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    let check_state = Arc::clone(state);
+    let check_group = pending.group_id.clone();
+    let staged_at = pending.created_at;
+    let check_welcome = welcome_id.to_string();
+    let recipient_hex = hex::encode(recipient.as_bytes());
     stream_welcome_blob_via(state, recipient, welcome_id, pending, move |msg| {
-        let state = Arc::clone(&send_state);
+        let state = Arc::clone(&check_state);
+        let group_id = check_group.clone();
+        let welcome_id = check_welcome.clone();
+        let recipient_hex = recipient_hex.clone();
+        let send = transport(msg);
         async move {
-            send_welcome_blob_message(&state, &send_recipient, &msg)
-                .await
-                .map(|_| ())
+            // ADR 0107: the stream holds a COPY of the staged Welcome, so
+            // before EVERY frame it re-checks, under the group's membership
+            // lock, that the recipient is still eligible and the staged
+            // Welcome still stands (a purge withdraws it). A certificate
+            // revoked or expiring mid-transfer stops the stream at its next
+            // frame; a removal or ban cancels the stream before it commits.
+            // The frame's receipt wait runs outside the lock.
+            welcome_frame_servable(&state, &group_id, &recipient_hex, &welcome_id, staged_at)
+                .await?;
+            send.await
         }
     })
     .await;
@@ -36515,6 +38776,14 @@ async fn stream_welcome_blob_via<S, F>(
         }
         acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
     }
+    // r5 (G9): the ACK slot is released whenever this stream ends —
+    // completion, failure, abort, deadline or panic — and only if it is
+    // still THIS stream's slot.
+    let _ack_slot_guard = WelcomeAckSlotGuard {
+        state: Arc::clone(state),
+        welcome_id: welcome_id.to_string(),
+        slot: Arc::clone(&ack_slot),
+    };
     #[cfg(test)]
     if let Some(gate) = WELCOME_STREAM_TEST_GATES
         .get()
@@ -36560,7 +38829,6 @@ async fn stream_welcome_blob_via<S, F>(
         let sequence = sequence as u64;
         if let Err(e) = wait_for_chunk_window(&ack_slot, sequence).await {
             tracing::warn!(welcome_id, "Welcome blob chunk window failed: {e}");
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         let msg = WelcomeBlobMessage::Chunk {
@@ -36574,7 +38842,6 @@ async fn stream_welcome_blob_via<S, F>(
                 sequence,
                 "failed to send Welcome blob chunk: {e}"
             );
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         tracing::debug!(target: "welcome.trace", stage = "chunk_sent", welcome_id, seq = sequence);
@@ -36585,7 +38852,6 @@ async fn stream_welcome_blob_via<S, F>(
         if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
             tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
             tracing::debug!(target: "welcome.trace", stage = "final_ack_failed", welcome_id, total_chunks, last_acked = ack_slot.highest_acked(), "{e}");
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         tracing::debug!(target: "welcome.trace", stage = "final_ack_ok", welcome_id, total_chunks);
@@ -36596,7 +38862,50 @@ async fn stream_welcome_blob_via<S, F>(
     if let Err(e) = send(complete).await {
         tracing::warn!(welcome_id, "failed to send Welcome blob complete: {e}");
     }
-    state.pending_welcome_acks.write().await.remove(welcome_id);
+}
+
+/// ADR 0107 (r5, G9): releases a Welcome stream's ACK slot on drop, only
+/// while the slot is still that stream's (`Arc::ptr_eq`). A contended map
+/// is released by a short follow-up task.
+struct WelcomeAckSlotGuard {
+    state: Arc<AppState>,
+    welcome_id: String,
+    slot: Arc<FileChunkAckSlot>,
+}
+
+impl Drop for WelcomeAckSlotGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        record_join_artifact_lifecycle(
+            &self.state,
+            format!("welcome_stream_ended:{}", self.welcome_id),
+        );
+        fn release(
+            acks: &mut HashMap<String, Arc<FileChunkAckSlot>>,
+            welcome_id: &str,
+            slot: &Arc<FileChunkAckSlot>,
+        ) {
+            if acks
+                .get(welcome_id)
+                .is_some_and(|current| Arc::ptr_eq(current, slot))
+            {
+                acks.remove(welcome_id);
+            }
+        }
+        if let Ok(mut acks) = self.state.pending_welcome_acks.try_write() {
+            release(&mut acks, &self.welcome_id, &self.slot);
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = Arc::clone(&self.state);
+            let welcome_id = std::mem::take(&mut self.welcome_id);
+            let slot = Arc::clone(&self.slot);
+            runtime.spawn(async move {
+                let mut acks = state.pending_welcome_acks.write().await;
+                release(&mut acks, &welcome_id, &slot);
+            });
+        }
+    }
 }
 
 async fn handle_welcome_blob_chunk(
@@ -36867,6 +39176,7 @@ pub(in crate::server) mod tests {
     mod adr0066_treekem_gates;
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
+    mod adr0107_stuck_join_rearm;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod home_control_payload_size;
@@ -37629,6 +39939,23 @@ pub(in crate::server) mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+            join_artifact_egress: StdMutex::new(HashMap::new()),
+            welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
+                crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+            ),
+            join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+            ),
+            join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
+            ),
+            join_result_egress_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_EGRESS_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_EGRESS_CAP,
+            ),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),
@@ -45423,6 +47750,12 @@ pub(in crate::server) mod tests {
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
+        state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .expect("secure-share recorder poisoned")
+            .clear();
 
         let (status, body) = response_json(
             remove_named_group_member(
@@ -45460,17 +47793,17 @@ pub(in crate::server) mod tests {
         // Core 4c observation: the published recipient set. The recorder now
         // carries `SecureShareDelivered.recipient` alongside topic+group, so
         // the assertion is on the recipient set, not a publish count.
+        // D60 (#1150 r5, G11): survivor envelopes are class-K deliveries
+        // (admitted per write), never gossip publishes.
+        let _ = &metadata_topic;
         let published_recipients: Vec<String> = state
             .named_group_test_recorders
-            .publish_attempts
+            .secure_share_scheduled
             .lock()
-            .expect("publish-attempt recorder poisoned")
+            .expect("secure-share recorder poisoned")
             .iter()
-            .filter_map(|(topic, gid, recipient)| {
-                (topic == &metadata_topic && gid == &stable_group_id)
-                    .then(|| recipient.clone())
-                    .flatten()
-            })
+            .filter(|(gid, _, _)| gid == &stable_group_id)
+            .map(|(_, recipient, _)| recipient.clone())
             .collect();
 
         assert!(
@@ -49324,6 +51657,28 @@ pub(in crate::server) mod tests {
         let joiner_id = joiner.agent.agent_id();
         let stranger_id = stranger.agent.agent_id();
         let group_id = "a1".repeat(32);
+        // ADR 0107: the owner serves a Welcome only to a recipient seated
+        // Active on its current committed roster.
+        {
+            let mut info = x0x::groups::GroupInfo::with_policy(
+                "welcome-handler".to_string(),
+                String::new(),
+                owner.agent.agent_id(),
+                group_id.clone(),
+                x0x::groups::GroupPolicy::default(),
+            );
+            info.add_member(
+                hex::encode(joiner_id.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.agent.agent_id().as_bytes())),
+                None,
+            );
+            owner
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+        }
         let bytes = b"handler authorization and replacement Welcome".to_vec();
         let welcome_id = welcome_id_for_bytes(&bytes);
         owner.pending_welcomes.write().await.insert(
@@ -54466,16 +56821,18 @@ pub(in crate::server) mod tests {
         }
 
         async fn secure_share_publishes_to_joiner(&self) -> bool {
+            // D60 (#1150 r5, G11): a share is a class-K delivery to its
+            // recipient (admitted per write), never a gossip publish.
             let joiner_hex = self.joiner_hex();
-            let attempts = self
+            let scheduled = self
                 .state
                 .named_group_test_recorders
-                .publish_attempts
+                .secure_share_scheduled
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            attempts.iter().any(|(_topic, _group, recipient)| {
-                recipient.as_deref() == Some(joiner_hex.as_str())
-            })
+            scheduled
+                .iter()
+                .any(|(_group, recipient, _payload)| *recipient == joiner_hex)
         }
     }
 

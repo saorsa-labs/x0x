@@ -1305,11 +1305,14 @@ fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
     );
 }
 
-/// Characterization of #1150 (known limitation in v0.46.0, NOT fixed here):
-/// after a timed-out join left the device keyless `active`, a fresh invite
-/// ALONE does not give it keys — the owner device rejects the re-join
+/// Characterization of #1150 (known limitation in v0.46.0): after a
+/// timed-out join left the device keyless `active`, a fresh invite ALONE
+/// does not give it keys — the owner device rejects the re-join
 /// MemberJoined (the device is already an Active member) and stages no
-/// Welcome. Flip when #1150 is fixed.
+/// Welcome. ADR 0107 S8 (a) does NOT flip this test: its round trip clears
+/// the authority's staged results, so it pins the cache-loss limitation.
+/// The cache-preserving recovery is
+/// `adr0107_stuck_join_rearm::s8a_1150_carry_remnant_rearms_and_installs_the_original_welcome`.
 #[tokio::test]
 async fn d39_1150_fresh_invite_alone_leaves_keyless_device_keyless() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1542,17 +1545,139 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
     Ok(())
 }
 
-/// Characterization (Codex r2, #1149): the #1148 recovery routes the stuck
-/// remnant onto exactly that pre-existing path — same input, same `active`.
-/// Flips in ADR 0107 S8 (a): re-arm must end non-active with Refused or a
-/// typed TimedOut outcome. The no-row test above stays unchanged in that slice.
+/// ADR 0107 Validation, Shape B (separate limitation control, never combined
+/// with the carry test): a join that timed out with NO carry leaves no row —
+/// the finalizer removed the stub — so S8 (a) has nothing to re-arm. On one
+/// device, a fresh base-seated invite keeps the known #1150 limitation: the
+/// ordinary (non-re-armed) path reports the snapshot `active`, with no keys
+/// and no key recovery claimed. On another, the operator exit — owner
+/// remove-member + re-invite — restores eligible membership WITH keys.
+#[tokio::test]
+async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(
+        d39_timed_out_without_carry(&s).await,
+        "no_row",
+        "the no-carry timeout removed the stub and row"
+    );
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt
+            && !r.authority_accepted
+            && !r.staged
+            && r.final_state == "active"
+            && !r.treekem,
+        "Shape B keeps the known limitation, with no re-arm and no key recovery: {r}"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
+    let after_removal = wa_owner_removes_j2(&s, true).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    wa_assert_recovered(&format!("shape B, j2_after_removal={after_removal}"), &r);
+    Ok(())
+}
+
+/// FLIPPED in ADR 0107 S8 (a) (was the Codex r2 / #1149 characterization:
+/// the #1148 recovery routed the stuck remnant onto the snapshot-only path
+/// and reported `active`). The authority's ORIGINAL caches for J2's sealed
+/// add stay intact, the invite was minted before the ban, and the ban lands
+/// on the roster alone. The base-seated invite now RE-ARMS the remnant
+/// (`pending_authority_commit`, never the snapshot seat); neither serving
+/// path hands the banned device anything; and the re-arm ends with the
+/// typed `timed_out` outcome, `not_member`, and no keys. The post-seal
+/// removal and certificate-revocation cases are
+/// `adr0107_stuck_join_rearm::s8a_1149_carry_remnant_never_gains_keys_after_post_seal_ineligibility`.
+/// The no-row test above stays unchanged in this slice.
 #[tokio::test]
 async fn d39_r2_recovered_remnant_takes_the_same_seated_invite_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    // The authority holds J2's original result and Welcome exactly as its
+    // live seal stages them: the Welcome by reference.
+    let mut staged_add = s.add_j2.event.clone();
+    let welcome_id = match &mut staged_add {
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } => {
+            let bytes = BASE64.decode(treekem_welcome_b64.take().expect("inline Welcome"))?;
+            let reference = super::super::stage_treekem_welcome(
+                &s._authority,
+                &s.stable_group_id,
+                &j2_hex,
+                bytes,
+            )
+            .await;
+            let id = reference.welcome_id.clone();
+            *welcome_ref = Some(reference);
+            id
+        }
+        _ => anyhow::bail!("J2's sealed add is a MemberAdded"),
+    };
+    super::super::stage_join_result(&s._authority, &s.stable_group_id, &j2_hex, staged_add, None)
+        .await;
     assert_eq!(
         d39_r2_join_with_pre_ban_seated_invite(&s, true).await?,
-        "active"
+        "pending_authority_commit",
+        "the stale base-seated invite re-arms the remnant instead of reporting the snapshot seat"
+    );
+    let attempt =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&join_result_key(&s.stable_group_id, &j2_hex))
+            .map(|a| a.attempt_id.clone())
+            .expect("the re-arm registered an attempt");
+    assert!(
+        super::adr0107_stuck_join_rearm::serve_result(
+            &s._authority,
+            &s.j2,
+            &s.stable_group_id,
+            &attempt,
+            Some(s.add_j1.commit.revision),
+        )
+        .await
+        .is_none(),
+        "no join result is served to the banned device"
+    );
+    assert!(
+        !super::adr0107_stuck_join_rearm::serve_welcome(
+            &s._authority,
+            &s.j2,
+            &s.stable_group_id,
+            &welcome_id,
+        )
+        .await,
+        "no Welcome is streamed to the banned device"
+    );
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(
+        s.j2.last_join_outcomes
+            .lock()
+            .expect("outcomes")
+            .get(&s.group_key)
+            .map(|o| (o.outcome, o.reason)),
+        Some(("timed_out", Some(super::super::JOIN_REARM_TIMEOUT_REASON))),
+        "the failed re-arm names its cause"
+    );
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "not_member");
+    assert!(
+        !s.j2.treekem_groups.read().await.contains_key(&s.group_key),
+        "the banned device never ends keyed"
     );
     Ok(())
 }

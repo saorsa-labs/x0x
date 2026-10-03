@@ -241,6 +241,15 @@ pub use direct::{DirectMessage, DirectMessageReceiver, DirectMessaging};
 // Import Membership trait for HyParView join() method
 use saorsa_gossip_membership::Membership as _;
 
+/// x0x #1150: a raw-QUIC send target after resolution, repair and the B/P
+/// pairing checks (see `Agent::resolve_raw_quic_target`).
+struct RawQuicTarget {
+    machine_id: identity::MachineId,
+    ant_peer_id: ant_quic::PeerId,
+    machine_prefix: String,
+    resolution: &'static str,
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -7691,35 +7700,220 @@ impl Agent {
         }
     }
 
-    async fn send_direct_raw_quic(
+    /// x0x #1150 (ADR 0107; lifecycle note section 2.7): send one
+    /// recovery-response frame to `to` in ONE physical exchange on x0x's
+    /// own raw-QUIC path. It never uses the gossip inbox or a relay, never
+    /// waits for an ACK-v2 receive acknowledgement (whose internal retry
+    /// and the X0X-0053 reissue would write again without admission), and
+    /// never retries: the caller's protocol owns every resend, and each one
+    /// runs both admission phases again.
+    ///
+    /// `admission` runs in two phases. Its async pre-phase runs after
+    /// machine resolution, repair or redial and the B/P pairing checks; it
+    /// is advisory and returns the synchronous seam check bound to its
+    /// snapshot. The seam check runs once inside ant-quic's
+    /// `send_on_generation_with_admission`, after `open_uni` and
+    /// immediately before `write_all`, together with this agent's own
+    /// agent, machine and pairing revocation checks. Any refusal, or lock
+    /// contention at the seam, writes nothing. The caller bounds the whole
+    /// call with its exchange deadline.
+    pub(crate) async fn send_direct_pinned_admitted(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "a pinned recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        // G14: a logical DM send like any other. No phi "likely offline"
+        // short-circuit: these sends answer the recipient's own fetch, and a
+        // stale suspicion must not suppress the recovery.
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_pinned_admitted_inner(to, payload, admission)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::RawQuic),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
+
+    async fn send_direct_pinned_admitted_inner(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if self.network.is_none() {
+            return self.pinned_admission_standin(to, admission).await;
+        }
+        let send_start = std::time::Instant::now();
+        let agent_prefix = network::hex_prefix(&to.0, 4);
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        let target = self
+            .resolve_raw_quic_target(to, network, &agent_prefix, payload.len(), send_start)
+            .await
+            .map_err(Self::map_raw_quic_dm_error)?;
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, target.machine_id, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
+            .send_direct_pinned(
+                &target.ant_peer_id,
+                &self.identity.agent_id().0,
+                payload,
+                seam,
+            )
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "pinned_exchange_written",
+            recipient = %hex::encode(to.as_bytes()),
+            machine_prefix = %crate::logging::LogHexId::new("machine", &target.machine_prefix),
+            resolution = target.resolution,
+            bytes = payload.len(),
+            dur_ms = send_start.elapsed().as_millis() as u64,
+        );
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic))
+    }
+
+    /// The seam check for a pinned send to `(agent, machine)`: this agent's
+    /// own revocation (agent AND resolved machine) and ADR-0043 B/P pairing
+    /// checks, then the caller's. Synchronous; contention refuses.
+    fn pinned_admission_seam(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        caller: dm::SeamAdmission,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let revocation = std::sync::Arc::clone(&self.revocation_set);
+        let moves = std::sync::Arc::clone(&self.move_state);
+        move || {
+            let admitted = {
+                let Ok(revoked) = revocation.try_read() else {
+                    return false;
+                };
+                if revoked.is_agent_revoked(&agent) || revoked.is_machine_revoked(&machine) {
+                    return false;
+                }
+                let Ok(placements) = moves.try_read() else {
+                    return false;
+                };
+                key_move::enforce_pairing(&revoked, placements.placement_view(), &agent, &machine)
+                    .is_none()
+            };
+            admitted && caller()
+        }
+    }
+
+    /// In-process stand-in for the pinned transport (an agent built
+    /// without a network): resolve the machine the way the real path's
+    /// lookups would (no connect), run both admission phases exactly where
+    /// the transport runs them, and report the outcome through a marker
+    /// error. Test builds only.
+    #[cfg(test)]
+    async fn pinned_admission_standin(
+        &self,
+        to: &identity::AgentId,
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cached = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(to)
+            .map(|d| d.machine_id)
+            .filter(|m| m.0 != [0u8; 32]);
+        let machine = match cached {
+            Some(machine) => Some(machine),
+            None => self.direct_messaging.get_machine_id(to).await,
+        };
+        let refused = || {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ))
+        };
+        if let Some(machine) = machine {
+            if self.recipient_pairing_denied(to, &machine).await.is_some() {
+                return refused();
+            }
+        }
+        let Some(seam) = admission().await else {
+            return refused();
+        };
+        let admitted = match machine {
+            Some(machine) => self.pinned_admission_seam(*to, machine, seam)(),
+            None => {
+                let agent_clear = self
+                    .revocation_set
+                    .try_read()
+                    .is_ok_and(|revoked| !revoked.is_agent_revoked(to));
+                agent_clear && seam()
+            }
+        };
+        if admitted {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_STANDIN_ADMITTED.to_string(),
+            ))
+        } else {
+            refused()
+        }
+    }
+
+    /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
+    /// discovery cache, DM registry or peer evidence, any send-readiness
+    /// repair or discovery redial, and the ADR-0043 B/P pairing check before
+    /// AND after resolution. Shared by the general raw path and the x0x
+    /// #1150 pinned single-exchange path.
+    async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
-        payload: &[u8],
-        receive_ack_timeout: Option<std::time::Duration>,
-        prefer_newest_grace: std::time::Duration,
-    ) -> error::NetworkResult<dm::DmPath> {
-        let send_start = std::time::Instant::now();
-        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
-        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
-        let bytes = payload.len();
-        let digest = direct::dm_payload_digest_hex(payload);
-        let target_path_label = if receive_ack_timeout.is_some() {
-            "raw_quic_acked"
-        } else {
-            "raw_quic"
-        };
-
-        let network = self.network.as_ref().ok_or_else(|| {
-            tracing::warn!(
-                target: "x0x::direct",
-                stage = "send",
-                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                outcome = "err_no_network",
-                "network not initialised"
-            );
-            error::NetworkError::NodeCreation("network not initialized".to_string())
-        })?;
-
+        network: &std::sync::Arc<network::NetworkNode>,
+        agent_prefix: &str,
+        bytes: usize,
+        send_start: std::time::Instant,
+    ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
         // the direct-messaging registry when an inbound connection is accepted
@@ -7957,6 +8151,52 @@ impl Agent {
             );
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
+
+        Ok(RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        })
+    }
+
+    async fn send_direct_raw_quic(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let send_start = std::time::Instant::now();
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
+        let bytes = payload.len();
+        let digest = direct::dm_payload_digest_hex(payload);
+        let target_path_label = if receive_ack_timeout.is_some() {
+            "raw_quic_acked"
+        } else {
+            "raw_quic"
+        };
+
+        let network = self.network.as_ref().ok_or_else(|| {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "err_no_network",
+                "network not initialised"
+            );
+            error::NetworkError::NodeCreation("network not initialized".to_string())
+        })?;
+
+        let RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        } = self
+            .resolve_raw_quic_target(agent_id, network, &agent_prefix, bytes, send_start)
+            .await?;
 
         tracing::debug!(
             target: "dm.trace",

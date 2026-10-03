@@ -1110,6 +1110,32 @@ impl Default for DmSendConfig {
 /// X0X-0041: default prefer-newest-connection grace window.
 pub const DEFAULT_PREFER_NEWEST_GRACE_MS: u64 = 250;
 
+/// x0x #1150 (ADR 0107; lifecycle note section 2.7): the synchronous,
+/// authoritative half of a recovery-response admission. It runs once, at
+/// the stream seam (after `open_uni`, immediately before `write_all`), so
+/// it must never block: locks are taken with `try_*`, and contention
+/// refuses (a retryable withhold, never a purge). `true` admits the write.
+pub(crate) type SeamAdmission = Box<dyn FnOnce() -> bool + Send>;
+
+/// x0x #1150: a recovery-response admission. Its async pre-phase runs
+/// before stream allocation, is advisory, and returns the [`SeamAdmission`]
+/// bound to its snapshot (`None` refuses). Called once per physical
+/// exchange, so every resend is admitted afresh.
+pub(crate) type ArtifactAdmission = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SeamAdmission>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// x0x #1150: the error text of a pinned send that its admission refused.
+pub(crate) const PINNED_ADMISSION_REFUSED: &str = "recovery-response admission refused";
+
+/// x0x #1150: the error text the in-process stand-in returns for an
+/// exchange its admission passed (test builds only).
+#[cfg(test)]
+pub(crate) const PINNED_STANDIN_ADMITTED: &str =
+    "in-process stand-in: admitted; no network to write to";
+
 /// Backoff schedule between send attempts.
 #[derive(Debug, Clone, Copy)]
 pub enum BackoffPolicy {

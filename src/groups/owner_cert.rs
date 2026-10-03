@@ -232,6 +232,16 @@ impl OwnerCertEvidence {
     pub fn now_unix(&self) -> u64 {
         self.now_unix
     }
+
+    /// The same evidence evaluated at `now_unix` (a later point in time):
+    /// the certificates, digests and revocations stay as snapshotted, only
+    /// the expiry clock moves. x0x #1150: a stream-seam check re-takes a
+    /// pre-phase snapshot's verdict at the seam's own clock.
+    #[must_use]
+    pub fn at_time(mut self, now_unix: u64) -> Self {
+        self.now_unix = now_unix;
+        self
+    }
 }
 
 /// Why a member failed OwnerCertified verification. Ordered by the sequence

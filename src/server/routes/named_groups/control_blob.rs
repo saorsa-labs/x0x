@@ -41,6 +41,18 @@ pub(in crate::server) struct ControlBlobRef {
     join_attempt_id: Option<String>,
 }
 
+impl ControlBlobRef {
+    /// The group this staged copy belongs to.
+    pub(super) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// The hex agent id this staged copy is addressed to.
+    pub(super) fn recipient(&self) -> &str {
+        &self.recipient
+    }
+}
+
 /// Distinct `type` names prevent older Welcome/file listeners from treating
 /// a control chunk as their own. Legacy small event/result JSON is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +82,20 @@ pub(in crate::server) enum ControlBlobMessage {
 struct StagedBlob {
     bytes: Arc<Vec<u8>>,
     created_at: Instant,
+    /// ADR 0107 (review r2 P2-4): a join-result copy is bound to its
+    /// ORIGINAL artifact: it expires no later than the original's deadline,
+    /// and a re-stage never extends that bound.
+    bound: Option<StagedOrigin>,
+}
+
+/// ADR 0107 (review r2 P2-4): the original staged artifact a blob copies.
+#[derive(Clone, Copy)]
+pub(super) struct StagedOrigin {
+    /// The original artifact's own staging instant (its identity: a purge or
+    /// re-seal replaces it).
+    pub(super) staged_at: Instant,
+    /// The original artifact's deadline.
+    pub(super) deadline: Instant,
 }
 
 struct IncomingBlob {
@@ -103,8 +129,11 @@ struct Registry {
 
 impl Registry {
     fn prune_expired(&mut self) {
-        self.staged
-            .retain(|_, entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        let now = Instant::now();
+        self.staged.retain(|_, entry| {
+            entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+                && entry.bound.is_none_or(|bound| now < bound.deadline)
+        });
         // Expiry removes routing only; the owning lease keeps the declared
         // bytes accounted until its task actually ends.
         self.incoming
@@ -150,11 +179,29 @@ impl ControlBlobState {
         f(&mut guard)
     }
 
+    /// An unbound stage (test fixtures); production copies of join
+    /// artifacts always stage through [`Self::stage_with_origin`].
+    #[cfg(test)]
     pub(super) fn stage(
         &self,
         reference: ControlBlobRef,
         bytes: Vec<u8>,
     ) -> Result<(), &'static str> {
+        self.stage_with_origin(reference, bytes, None)
+    }
+
+    /// [`Self::stage`] for a copy of an original artifact: the entry expires
+    /// with the original (`origin.deadline`), and re-staging the identical
+    /// copy never moves that bound later.
+    pub(super) fn stage_with_origin(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+        origin: Option<StagedOrigin>,
+    ) -> Result<(), &'static str> {
+        if origin.is_some_and(|origin| Instant::now() >= origin.deadline) {
+            return Err("the original artifact has expired");
+        }
         if bytes.len() as u64 != reference.byte_len
             || reference.byte_len <= x0x::dm::MAX_PAYLOAD_BYTES as u64
             || reference.byte_len > MAX_BLOB_BYTES
@@ -168,6 +215,13 @@ impl ControlBlobState {
                     return Err("conflicting control blob digest");
                 }
                 existing.created_at = Instant::now();
+                existing.bound = match (existing.bound, origin) {
+                    (Some(old), Some(new)) => Some(StagedOrigin {
+                        staged_at: new.staged_at,
+                        deadline: old.deadline.min(new.deadline),
+                    }),
+                    (old, new) => new.or(old),
+                };
                 return Ok(());
             }
             let peer_count = registry
@@ -195,13 +249,65 @@ impl ControlBlobState {
                 StagedBlob {
                     bytes: Arc::new(bytes),
                     created_at: Instant::now(),
+                    bound: origin,
                 },
             );
             Ok(())
         })
     }
 
-    fn staged_chunk(&self, reference: &ControlBlobRef, sequence: u32) -> Option<Vec<u8>> {
+    /// ADR 0107 (review r2 P2-4): the original artifact a staged copy is
+    /// bound to, while the copy is still staged.
+    pub(super) fn staged_origin(&self, reference: &ControlBlobRef) -> Option<StagedOrigin> {
+        self.with_registry(|registry| registry.staged.get(reference).and_then(|entry| entry.bound))
+    }
+
+    /// ADR 0107 (r6, P2): [`Self::staged_origin`] for the synchronous stream
+    /// seam: it never blocks and never prunes. `Err(())` when the registry
+    /// is contended (the caller withholds and retries); `Ok(None)` when the
+    /// copy is absent, unbound or past its original's deadline or its own
+    /// TTL.
+    pub(super) fn try_staged_origin(
+        &self,
+        reference: &ControlBlobRef,
+    ) -> Result<Option<StagedOrigin>, ()> {
+        let registry = match self.0.registry.try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+        };
+        let now = Instant::now();
+        Ok(registry
+            .staged
+            .get(reference)
+            .filter(|entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+            .and_then(|entry| entry.bound)
+            .filter(|origin| now < origin.deadline))
+    }
+
+    /// ADR 0107 (r6, test only): hold the staging registry's lock on
+    /// another thread for `hold`; the receiver fires once it is held.
+    #[cfg(test)]
+    pub(super) fn hold_registry_for_test(&self, hold: Duration) -> std::sync::mpsc::Receiver<()> {
+        let store = self.clone();
+        let (held, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = store
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = held.send(());
+            std::thread::sleep(hold);
+        });
+        rx
+    }
+
+    pub(super) fn staged_chunk(
+        &self,
+        reference: &ControlBlobRef,
+        sequence: u32,
+    ) -> Option<Vec<u8>> {
         self.with_registry(|registry| {
             let bytes = &registry.staged.get(reference)?.bytes;
             let start = (sequence as usize).checked_mul(CHUNK_BYTES)?;
@@ -368,6 +474,45 @@ impl ControlBlobState {
         self.with_registry(|registry| registry.staged.len())
     }
 
+    /// ADR 0107 (review r2): test inspection — the staged JoinResult
+    /// references addressed to `recipient`.
+    #[cfg(test)]
+    pub(in crate::server) fn staged_join_result_refs_for_test(
+        &self,
+        recipient: &str,
+    ) -> Vec<ControlBlobRef> {
+        self.with_registry(|registry| {
+            registry
+                .staged
+                .keys()
+                .filter(|reference| {
+                    reference.kind == ControlBlobKind::JoinResult
+                        && reference.recipient == recipient
+                })
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// ADR 0107: drop every staged JoinResult blob addressed to `recipient`
+    /// for any spelling of the group (a removed, banned or otherwise
+    /// ineligible member). Returns how many were dropped.
+    pub(super) fn purge_join_results(
+        &self,
+        group_aliases: &HashSet<String>,
+        recipient: &str,
+    ) -> usize {
+        self.with_registry(|registry| {
+            let before = registry.staged.len();
+            registry.staged.retain(|reference, _| {
+                !(reference.kind == ControlBlobKind::JoinResult
+                    && reference.recipient == recipient
+                    && group_aliases.contains(&reference.group_id))
+            });
+            before - registry.staged.len()
+        })
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -440,15 +585,22 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
     }
 }
 
+/// One control-blob frame's wire bytes, refusing a frame over the
+/// direct-message limit.
+pub(super) fn encode_message(message: &ControlBlobMessage) -> std::result::Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
+    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return Err("control blob frame exceeds direct-message limit".to_string());
+    }
+    Ok(bytes)
+}
+
 async fn send_message(
     agent: &Agent,
     recipient: &AgentId,
     message: &ControlBlobMessage,
 ) -> std::result::Result<(), String> {
-    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
-    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        return Err("control blob frame exceeds direct-message limit".to_string());
-    }
+    let bytes = encode_message(message)?;
     agent
         .send_direct_with_config(recipient, bytes, control_config(message))
         .await
@@ -476,6 +628,61 @@ pub(super) async fn send_reference(
     join_attempt_id: Option<&str>,
     bytes: Vec<u8>,
 ) -> std::result::Result<(), String> {
+    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
+    // recipients release their completed pulls — retry it briefly before
+    // giving up, instead of dropping the event on the floor. Any other
+    // refusal (invalid blob, digest conflict) returns immediately.
+    let mut attempt = 0;
+    let reference = loop {
+        match stage_reference(
+            store,
+            agent,
+            recipient,
+            kind,
+            group_id,
+            join_attempt_id,
+            bytes.clone(),
+            None,
+        ) {
+            Ok(reference) => break reference,
+            Err(STAGING_BUDGET_EXHAUSTED) if attempt < STAGING_BUDGET_RETRIES => {
+                tracing::warn!(
+                    kind = ?kind,
+                    group_id = %group_id,
+                    recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+                    attempt,
+                    "control blob staging budget exhausted; retrying (#876)"
+                );
+                attempt += 1;
+                tokio::time::sleep(STAGING_BUDGET_RETRY_DELAY).await;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    };
+    send_reference_message(agent, recipient, reference).await
+}
+
+/// The refusal [`ControlBlobState::stage`] returns while the staging budget
+/// is exhausted (transient: recipients release completed pulls).
+pub(super) const STAGING_BUDGET_EXHAUSTED: &str = "control blob staging budget exhausted";
+/// #876: bounded retries of a budget-exhausted staging.
+pub(super) const STAGING_BUDGET_RETRIES: usize = 6;
+pub(super) const STAGING_BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Stage the exact original JSON once and return its bounded reference
+/// (no retry, no send). ADR 0107 (review r2): join-result staging calls
+/// this under the group's membership lock, after the eligibility check.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_reference(
+    store: &ControlBlobState,
+    agent: &Agent,
+    recipient: &AgentId,
+    kind: ControlBlobKind,
+    group_id: &str,
+    join_attempt_id: Option<&str>,
+    bytes: Vec<u8>,
+    origin: Option<StagedOrigin>,
+) -> std::result::Result<ControlBlobRef, &'static str> {
     let reference = ControlBlobRef {
         kind,
         group_id: group_id.to_string(),
@@ -485,28 +692,17 @@ pub(super) async fn send_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
-    // recipients release their completed pulls — retry it briefly before
-    // giving up, instead of dropping the event on the floor. Any other
-    // refusal (invalid blob, digest conflict) returns immediately.
-    const BUDGET_RETRIES: usize = 6;
-    const BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
-    for attempt in 0..=BUDGET_RETRIES {
-        match store.stage(reference.clone(), bytes.clone()) {
-            Ok(()) => break,
-            Err("control blob staging budget exhausted") if attempt < BUDGET_RETRIES => {
-                tracing::warn!(
-                    kind = ?reference.kind,
-                    group_id = %reference.group_id,
-                    recipient = %LogHexId::agent(&reference.recipient),
-                    attempt,
-                    "control blob staging budget exhausted; retrying (#876)"
-                );
-                tokio::time::sleep(BUDGET_RETRY_DELAY).await;
-            }
-            Err(other) => return Err(other.to_string()),
-        }
-    }
+    store.stage_with_origin(reference.clone(), bytes, origin)?;
+    Ok(reference)
+}
+
+/// Send a staged blob's bounded reference (metadata only; the bytes are
+/// pulled chunk by chunk).
+pub(super) async fn send_reference_message(
+    agent: &Agent,
+    recipient: &AgentId,
+    reference: ControlBlobRef,
+) -> std::result::Result<(), String> {
     send_message(
         agent,
         recipient,
@@ -635,6 +831,107 @@ pub(in crate::server) async fn handle_control_blob_message(
             sequence,
         } => {
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
+                return;
+            }
+            if reference.kind == ControlBlobKind::JoinResult {
+                // ADR 0107 (review r2): a staged join result is a COPY of a
+                // join artifact, so each chunk is a serve. The chunk is read
+                // only while the recipient is eligible, under the group's
+                // membership lock, inside a registered egress task (a
+                // removal or ban cancels it before committing). The lock is
+                // taken in the task, never on this listener.
+                // r5 (G8): validate before taking any capacity — the copy
+                // is staged and bound to an original, and the sequence
+                // exists — then fair admission: one in-flight task per
+                // chunk (duplicates coalesce) and a per-group share of the
+                // global cap. The authoritative checks run in the task.
+                let Some(origin) = state.control_blobs.staged_origin(&reference) else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        "join-result chunk fetch for no staged copy; dropped"
+                    );
+                    return;
+                };
+                if u64::from(sequence) >= reference.byte_len.div_ceil(CHUNK_BYTES as u64) {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        sequence,
+                        "join-result chunk fetch past the copy's last chunk; dropped"
+                    );
+                    return;
+                }
+                let admission_key =
+                    format!("{}:{}:{sequence}", reference.digest, reference.recipient);
+                let ticket = match state
+                    .join_result_chunk_admission
+                    .try_admit(&admission_key, &reference.group_id)
+                {
+                    Ok(ticket) => ticket,
+                    Err(refusal) => {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&reference.group_id),
+                            sequence,
+                            ?refusal,
+                            "join-result chunk fetch not admitted; the joiner retries"
+                        );
+                        return;
+                    }
+                };
+                let task_state = Arc::clone(state);
+                let recipient = *sender;
+                let group_id = reference.group_id.clone();
+                let member_hex = reference.recipient.clone();
+                // r5: the task, like the copy, dies at the original's
+                // deadline.
+                let deadline = origin.deadline;
+                super::spawn_join_artifact_egress(
+                    state,
+                    &group_id,
+                    &member_hex,
+                    "join_result_chunk",
+                    deadline,
+                    async move {
+                        let _ticket = ticket;
+                        let Some(chunk) =
+                            super::join_result_chunk_if_servable(&task_state, &reference, sequence)
+                                .await
+                        else {
+                            tracing::debug!(
+                                group_id = %LogHexId::group(&reference.group_id),
+                                recipient = %LogHexId::agent(&reference.recipient),
+                                "ADR 0107: join-result chunk withheld; the recipient is not eligible, or the blob or its original expired or was purged"
+                            );
+                            return;
+                        };
+                        let admission = super::join_result_chunk_admission(&task_state, &reference);
+                        let group = reference.group_id.clone();
+                        let message = ControlBlobMessage::Chunk {
+                            reference,
+                            sequence,
+                            data_b64: BASE64.encode(chunk),
+                        };
+                        let payload = match encode_message(&message) {
+                            Ok(payload) => payload,
+                            Err(reason) => {
+                                tracing::warn!(reason, "control blob chunk encode failed");
+                                return;
+                            }
+                        };
+                        if let Err(reason) = super::send_join_artifact(
+                            &task_state,
+                            &recipient,
+                            &payload,
+                            &group,
+                            "join_result_chunk",
+                            admission,
+                            deadline,
+                        )
+                        .await
+                        {
+                            tracing::warn!(reason, "control blob chunk send failed");
+                        }
+                    },
+                );
                 return;
             }
             let Some(chunk) = state.control_blobs.staged_chunk(&reference, sequence) else {
@@ -972,6 +1269,86 @@ mod tests {
             byte_len: bytes.len() as u64,
             join_attempt_id: None,
         }
+    }
+
+    /// ADR 0107 (r6 boundary): the seam's non-blocking staged-copy lookup
+    /// agrees with the locked (pruning) one on every TTL and deadline case,
+    /// and reports contention instead of blocking.
+    #[test]
+    fn try_staged_origin_matches_the_locked_lookup() {
+        let store = ControlBlobState::default();
+        let bytes = |fill: u8| vec![fill; x0x::dm::MAX_PAYLOAD_BYTES + 64];
+        let join_ref = |data: &[u8]| ControlBlobRef {
+            kind: ControlBlobKind::JoinResult,
+            join_attempt_id: Some("attempt".to_string()),
+            ..reference(data)
+        };
+        let now = Instant::now();
+        let far = StagedOrigin {
+            staged_at: now,
+            deadline: now + Duration::from_secs(60),
+        };
+        // Bound and current.
+        let live = join_ref(&bytes(1));
+        store
+            .stage_with_origin(live.clone(), bytes(1), Some(far))
+            .expect("stage live copy");
+        // Bound to an original whose deadline is about to pass.
+        let near = join_ref(&bytes(2));
+        store
+            .stage_with_origin(
+                near.clone(),
+                bytes(2),
+                Some(StagedOrigin {
+                    staged_at: now,
+                    deadline: Instant::now() + Duration::from_millis(30),
+                }),
+            )
+            .expect("stage near-deadline copy");
+        // The copy's own TTL has elapsed (its original is still current).
+        let stale = join_ref(&bytes(3));
+        store
+            .stage_with_origin(stale.clone(), bytes(3), Some(far))
+            .expect("stage stale copy");
+        store.with_registry(|registry| {
+            if let Some(entry) = registry.staged.get_mut(&stale) {
+                entry.created_at = Instant::now()
+                    .checked_sub(PENDING_JOIN_RESULT_TTL + Duration::from_secs(1))
+                    .expect("monotonic clock far enough from boot");
+            }
+        });
+        // Unbound (no original).
+        let unbound = join_ref(&bytes(4));
+        store
+            .stage(unbound.clone(), bytes(4))
+            .expect("stage unbound copy");
+        std::thread::sleep(Duration::from_millis(60));
+        let deadline_of = |origin: Option<StagedOrigin>| origin.map(|o| (o.staged_at, o.deadline));
+        for (case, reference, present) in [
+            ("live", &live, true),
+            ("past the original's deadline", &near, false),
+            ("past the copy's own TTL", &stale, false),
+            ("unbound", &unbound, false),
+        ] {
+            // Non-blocking first: the locked lookup prunes.
+            let seam = store
+                .try_staged_origin(reference)
+                .expect("uncontended registry");
+            let locked = store.staged_origin(reference);
+            assert_eq!(seam.is_some(), present, "[{case}] seam lookup");
+            assert_eq!(
+                deadline_of(seam),
+                deadline_of(locked),
+                "[{case}] the seam and locked lookups disagree"
+            );
+        }
+        let held = store.hold_registry_for_test(Duration::from_millis(500));
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the holder took the lock");
+        assert!(
+            store.try_staged_origin(&live).is_err(),
+            "contention is reported, not waited out"
+        );
     }
 
     /// The Home oversize fixture fails unless it parses this exact line, and the

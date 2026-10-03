@@ -50,24 +50,24 @@ use routes::{
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
-    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
-    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
+    dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
-    history_list, history_message, history_purge, history_scopes, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
-    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
-    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
-    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
-    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler,
+    handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
+    history_diagnostics, history_list, history_message, history_purge, history_scopes,
+    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
+    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
+    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
+    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
+    list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
+    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
     now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
@@ -1108,6 +1108,23 @@ pub async fn serve_with_options(
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+        join_artifact_egress: StdMutex::new(HashMap::new()),
+        welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
+            crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+        ),
+        join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+        ),
+        join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
+        ),
+        join_result_egress_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_CAP,
+        ),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
@@ -1886,8 +1903,13 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_join_result_message(&join_result_state, &msg.sender, msg.verified, join_msg)
-                    .await;
+                dispatch_join_result_message(
+                    &join_result_state,
+                    &msg.sender,
+                    msg.verified,
+                    join_msg,
+                )
+                .await;
             }
         }));
     }
@@ -1912,7 +1934,7 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
+                dispatch_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
             }
         }));
     }

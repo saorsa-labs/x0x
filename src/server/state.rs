@@ -952,6 +952,30 @@ pub(super) struct AppState {
     /// One cancellable owner-side stream per staged Welcome.
     /// `None` closes admission during shutdown under the same lock as replacement.
     pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// ADR 0107 (review r2): every in-flight join-artifact egress task
+    /// (join-result send, control-blob staging and chunk sends), keyed by
+    /// `(group id, recipient hex)`. Registered under the group's membership
+    /// lock before it runs; a removal or ban aborts and awaits them inside
+    /// its critical section, before it commits.
+    pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
+    /// ADR 0107 (review r2; r5 G6): fair, coalescing admission for Welcome
+    /// `FetchRequest` handlers, which run off the single Welcome listener
+    /// loop (they can wait on a group membership lock): one in-flight
+    /// handler per Welcome, a per-group share and a global cap.
+    pub(super) welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r5 G7): fair, coalescing admission for join-result
+    /// `FetchRequest` handlers, which run off the shared join-result
+    /// listener: one in-flight handler per `(group, member)`, a per-group
+    /// share and a global cap.
+    pub(super) join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r5 G8): fair, coalescing admission for join-result chunk
+    /// tasks: one in-flight task per chunk, a per-group share and a global
+    /// cap. A fetch is validated (staged copy, existing sequence) first.
+    pub(super) join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r6 P3): fair, coalescing admission for inline join-result
+    /// egress tasks: one in flight per `(group, recipient)` (the ticket
+    /// lives in the task), a per-group share and a global cap.
+    pub(super) join_result_egress_admission: crate::server::routes::named_groups::FairAdmission,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,
@@ -1252,12 +1276,47 @@ pub(super) struct AppState {
     pub(super) named_group_test_recorders: NamedGroupTestRecorders,
 }
 
+/// ADR 0107 (review r2): in-flight join-artifact egress tasks keyed by
+/// `(group id, recipient hex)` (see `AppState::join_artifact_egress`).
+pub(super) type JoinArtifactEgressRegistry =
+    HashMap<(String, String), Vec<tokio::task::JoinHandle<()>>>;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct NamedGroupTestRecorders {
     pub(super) publish_attempts: StdMutex<Vec<(String, String, Option<String>)>>,
     pub(super) publish_bytes: StdMutex<Vec<(String, Vec<u8>)>>,
     pub(super) direct_deliveries: StdMutex<Vec<(String, String, &'static str, &'static str)>>,
+    /// ADR 0107: every join result the `FetchRequest` arm decided to serve,
+    /// as `(recipient, group, exact payload)`, recorded at the serve
+    /// DECISION (before any egress task runs). Tests read the payload here.
+    pub(super) join_result_serves: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (review r2): every join-artifact EGRESS handoff, as
+    /// `(recipient, group, kind)`, recorded immediately before the bytes
+    /// are handed to the transport (`join_result`, `join_result_reference`,
+    /// `join_result_chunk`, `welcome_frame`).
+    pub(super) join_artifact_egress: StdMutex<Vec<(String, String, &'static str)>>,
+    /// ADR 0107 (review r2 P1-2): the delivery path every join-artifact
+    /// egress was handed to, as `(recipient, kind, can_reach_gossip)`. A
+    /// path that can reach the gossip inbox can leave the bytes with a
+    /// detached stranded-publish retry.
+    pub(super) join_artifact_delivery_paths: StdMutex<Vec<(String, &'static str, bool)>>,
+    /// ADR 0107 (r5, G3): the transport discipline every class-R exchange
+    /// was handed to, as `(recipient, kind, transport)`. Only
+    /// `pinned_single_exchange` admits every physical write.
+    pub(super) join_artifact_transports: StdMutex<Vec<(String, &'static str, &'static str)>>,
+    /// ADR 0107 (r5, G4): ordered lifecycle events — an egress task or
+    /// Welcome stream ending (`egress_ended:<group>:<recipient>`,
+    /// `welcome_stream_ended:<welcome id>`) and a terminal commit
+    /// (`tombstone_persist:<group>`) — so tests can check quiesce-then-commit
+    /// ordering.
+    pub(super) join_artifact_lifecycle: StdMutex<Vec<String>>,
+    /// ADR 0107 / D60 (r5, G11): every class-K share delivery scheduled, as
+    /// `(group, recipient, exact payload)`.
+    pub(super) secure_share_scheduled: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (r6): seconds added to the stream seam's clock, to land a
+    /// certificate expiry between the pre-phase and the seam.
+    pub(super) seam_clock_skew_secs: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
