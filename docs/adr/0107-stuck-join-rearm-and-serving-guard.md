@@ -1,6 +1,7 @@
 # ADR 0107: Stuck Join Re-arm and Current-Roster Serving Guard (0088 S8 (a))
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-03 19:02Z by David Irvine (D57, as written: the Proposed text merged by #1180, commit 0532395; relayed by Root and recorded in the charter). The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-03
 - **Decision owners:** David Irvine
 - **Author:** Codex
