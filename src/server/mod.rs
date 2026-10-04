@@ -1671,6 +1671,7 @@ pub async fn serve_with_options(
         let startup_api_addr = state.api_address;
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
+        let startup_shutdown_watch = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             let data_dir = startup_check_config.data_dir.clone();
             if let Err(e) = run_startup_update_check(
@@ -1683,6 +1684,7 @@ pub async fn serve_with_options(
                         startup_shutdown,
                     ),
                     upgrade_apply_lock: startup_apply_lock,
+                    shutdown_watch: startup_shutdown_watch,
                 }),
             )
             .await

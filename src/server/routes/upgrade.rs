@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use x0x::upgrade::apply::{AutoApplyUpgrader, RestartContext};
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
+use x0x::upgrade::restart::RestartOwnershipError;
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::Agent;
 
@@ -134,6 +136,9 @@ pub(in crate::server) struct StartupUpdateCheckRuntime {
     pub restart_context: RestartContext,
     /// Serializes destructive binary replacement with the other apply paths.
     pub upgrade_apply_lock: Arc<Mutex<()>>,
+    /// Daemon shutdown watch; cancels the #1196 start-rate window wait so
+    /// shutdown is never held up by a time-bound refusal.
+    pub shutdown_watch: watch::Receiver<bool>,
 }
 
 /// Background-listener context (gossip + fallback poll): the running daemon's
@@ -158,6 +163,84 @@ fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> 
         .with_restart_context(context)
 }
 
+/// Margin added to the readback's remaining start-rate window before the
+/// startup check's single retry (#1196): it covers the gap between the
+/// readback's monotonic sample and the retry's fresh sample — error
+/// propagation, apply-lock re-acquisition and scheduling jitter.
+const START_RATE_RETRY_MARGIN: Duration = Duration::from_secs(2);
+
+/// The wait owed before a start-rate refusal may be retried (#1196): set
+/// only when the refusal carries the readback's remaining window, i.e. the
+/// guard refused ONLY because the unit's activation had not outlived
+/// `StartLimitIntervalUSec` while every other guarantee was confirmed.
+/// Every other refusal returns `None` and keeps today's
+/// skip-until-the-fallback-poll behaviour.
+fn start_rate_retry_wait(error: &x0x::upgrade::UpgradeError) -> Option<Duration> {
+    match error {
+        x0x::upgrade::UpgradeError::RestartOwnership(
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                retry_after: Some(remaining),
+                ..
+            },
+        ) => Some(*remaining + START_RATE_RETRY_MARGIN),
+        _ => None,
+    }
+}
+
+/// One apply attempt under the shared apply lock and — when it refused ONLY
+/// because the systemd start-rate window had not aged out — exactly one
+/// retry after waiting out the window plus [`START_RATE_RETRY_MARGIN`]
+/// (#1196).
+///
+/// The wait is bounded by the readback's own numbers (never a hard-coded
+/// interval), releases the apply lock for its duration so the gossip release
+/// listener, the fallback poll and `/upgrade/apply` are not starved behind
+/// it, and is cancelled by daemon shutdown (the original refusal is then
+/// returned — no bytes were replaced, nothing was skipped silently).
+async fn apply_with_start_rate_retry<F, Fut>(
+    apply_lock: Option<&Arc<Mutex<()>>>,
+    mut attempt: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>>,
+{
+    let first = {
+        let _guard = match apply_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        attempt().await
+        // Guard dropped here on purpose: the window wait below must not
+        // hold the shared apply lock.
+    };
+    let wait = match &first {
+        Err(e) => match start_rate_retry_wait(e) {
+            Some(wait) => wait,
+            None => return first,
+        },
+        Ok(_) => return first,
+    };
+    tracing::info!(
+        wait_ms = wait.as_millis() as u64,
+        "Startup check: activation has not outlived StartLimitIntervalUSec yet; \
+         waiting out the start-rate window, then retrying the apply once"
+    );
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => {}
+        _ = shutdown.changed() => {
+            tracing::info!("Startup check: start-rate window wait cancelled by shutdown");
+            return first;
+        }
+    }
+    let _guard = match apply_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    attempt().await
+}
+
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
 /// `runtime` distinguishes the two callers: the daemon's startup check —
@@ -165,10 +248,13 @@ fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> 
 /// listener is bound (#1086: a firewalled update endpoint must never gate
 /// API readiness on its ~30 s HTTP timeout) — hands the restart to the #261
 /// planner because a daemon process must come back up, and serializes its
-/// apply against the gossip release listener and the fallback poll. The CLI
-/// `--check-updates` print-and-exit mode passes `None` — there is no daemon
-/// to keep alive, and a handoff respawn of `x0xd --check-updates` could
-/// never serve `/health`, so it would spuriously roll a good update back.
+/// apply against the gossip release listener and the fallback poll. On a
+/// systemd host whose activation has not yet outlived
+/// `StartLimitIntervalUSec`, it waits out the window and retries the apply
+/// once (#1196) instead of skipping the version. The CLI `--check-updates`
+/// print-and-exit mode passes `None` — there is no daemon to keep alive,
+/// and a handoff respawn of `x0xd --check-updates` could never serve
+/// `/health`, so it would spuriously roll a good update back.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
     agent: Option<&Arc<Agent>>,
@@ -205,15 +291,17 @@ pub(in crate::server) async fn run_startup_update_check(
     }
 
     // The startup check runs beside the gossip release listener and the
-    // fallback poll now that it no longer gates startup (#1086); take the
-    // shared apply lock before touching the binary, exactly as they do.
+    // fallback poll now that it no longer gates startup (#1086); each apply
+    // attempt takes the shared apply lock before touching the binary,
+    // exactly as they do. The lock is taken per attempt (not held across
+    // the #1196 start-rate window wait) so concurrent apply paths are not
+    // starved behind a time-bound refusal.
     let apply_lock = runtime
         .as_ref()
         .map(|runtime| Arc::clone(&runtime.upgrade_apply_lock));
-    let _upgrade_guard = match &apply_lock {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
-    };
+    let mut shutdown_watch = runtime
+        .as_ref()
+        .map(|runtime| runtime.shutdown_watch.clone());
 
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
         .with_stop_on_upgrade(config.update.stop_on_upgrade);
@@ -233,10 +321,19 @@ pub(in crate::server) async fn run_startup_update_check(
             }),
     };
 
-    match upgrader
-        .apply_upgrade_from_manifest(&verified.manifest)
-        .await
-    {
+    let attempt = || upgrader.apply_upgrade_from_manifest(&verified.manifest);
+    let result = match shutdown_watch.as_mut() {
+        // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
+        // aged-out systemd start-rate window is waited out (bounded by the
+        // readback's own remaining window) and retried once, instead of
+        // skipping the version until the 6-hourly fallback poll.
+        Some(shutdown) => apply_with_start_rate_retry(apply_lock.as_ref(), attempt, shutdown).await,
+        // CLI `--check-updates`: no daemon, no shutdown watch — a single
+        // apply attempt, exactly as before #1196.
+        None => attempt().await,
+    };
+
+    match result {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => Ok(Some(version)),
         Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
             tracing::warn!(%reason, "Startup upgrade rolled back");
@@ -1152,5 +1249,200 @@ mod tests {
             conflicted.restart_mode_with(&systemd),
             Err(restart::RestartOwnershipError::SupervisedRestartConflict { .. })
         ));
+    }
+    // ------------------------------------------------------------------
+    // #1196: startup check waits out an unaged systemd start-rate window
+    // and retries the apply once (inert: injected attempts, no network).
+    // ------------------------------------------------------------------
+
+    /// A `SupervisedSystemdPolicyNotGuaranteed` refusal with the given
+    /// retry hint — the shape the systemd readback produces for a fresh
+    /// activation with a live start-rate limit.
+    fn systemd_refusal(retry_after: Option<Duration>) -> x0x::upgrade::UpgradeError {
+        x0x::upgrade::UpgradeError::RestartOwnership(
+            restart::RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                signal: "INVOCATION_ID".to_string(),
+                exit_code: 0,
+                detail: "the unit's current activation has not outlived StartLimitIntervalUSec"
+                    .to_string(),
+                retry_after,
+            },
+        )
+    }
+
+    /// The fresh-activation, default-unit scenario from the issue: the first
+    /// readback refuses with the not-outlived reason, a later one succeeds.
+    /// The startup check must attempt the apply a second time after the
+    /// readback's own remaining window (+ margin), and that retry applies.
+    #[tokio::test(start_paused = true)]
+    async fn startup_check_retries_once_after_start_rate_window_elapses() {
+        const WINDOW: Duration = Duration::from_secs(10);
+        let attempts = Arc::new(AtomicU64::new(0));
+        let lock_acquired_during_wait = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lock = Arc::new(Mutex::new(()));
+        let (_notify, mut shutdown) = watch::channel(false);
+
+        let attempts_in_attempt = Arc::clone(&attempts);
+        let flag = Arc::clone(&lock_acquired_during_wait);
+        let lock_for_watcher = Arc::clone(&lock);
+        let started = tokio::time::Instant::now();
+        let result = apply_with_start_rate_retry(
+            Some(&lock),
+            move || {
+                let attempts = Arc::clone(&attempts_in_attempt);
+                let lock = Arc::clone(&lock_for_watcher);
+                let flag = Arc::clone(&flag);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A concurrent apply path parking on the shared lock
+                        // behind this attempt: it may only get through while
+                        // the helper WAITS (the guard is dropped for the
+                        // window wait, not held).
+                        tokio::spawn(async move {
+                            let _guard = lock.lock().await;
+                            flag.store(true, Ordering::SeqCst);
+                        });
+                        Err(systemd_refusal(Some(WINDOW)))
+                    } else {
+                        // The later readback succeeded: the activation has
+                        // now outlived the window.
+                        Ok(x0x::upgrade::UpgradeResult::Success {
+                            version: "9.9.9".to_string(),
+                        })
+                    }
+                }
+            },
+            &mut shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "exactly one retry, not a loop"
+        );
+        assert!(
+            matches!(
+                &result,
+                Ok(x0x::upgrade::UpgradeResult::Success { version }) if version == "9.9.9"
+            ),
+            "the retry applies the version instead of skipping it: {result:?}"
+        );
+        assert!(
+            lock_acquired_during_wait.load(Ordering::SeqCst),
+            "the apply lock is released for the window wait"
+        );
+        assert!(
+            started.elapsed() >= WINDOW + START_RATE_RETRY_MARGIN,
+            "the wait is the readback's remaining window plus the margin, \
+             not a hard-coded interval"
+        );
+    }
+
+    /// Daemon shutdown during the window wait cancels the retry and returns
+    /// the original refusal — no bytes were replaced, and shutdown is never
+    /// held up by the wait.
+    #[tokio::test(start_paused = true)]
+    async fn startup_check_start_rate_wait_is_cancelled_by_shutdown() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let (notify, mut shutdown) = watch::channel(false);
+        let notifier = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = notify.send(true);
+        });
+        let attempts_in_attempt = Arc::clone(&attempts);
+        let started = tokio::time::Instant::now();
+        let result = apply_with_start_rate_retry(
+            None,
+            move || {
+                let attempts = Arc::clone(&attempts_in_attempt);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(systemd_refusal(Some(Duration::from_secs(10))))
+                }
+            },
+            &mut shutdown,
+        )
+        .await;
+        notifier.await.expect("notifier ran");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no retry after shutdown"
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(x0x::upgrade::UpgradeError::RestartOwnership(
+                    restart::RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed { .. }
+                ))
+            ),
+            "the original refusal is returned: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "cancelled far short of the full window wait"
+        );
+    }
+
+    /// Every refusal that is not ONLY the not-yet-aged-out start-rate window
+    /// keeps today's behaviour: one attempt, no wait, the error returned.
+    #[tokio::test(start_paused = true)]
+    async fn startup_check_does_not_wait_or_retry_other_refusals() {
+        #[derive(Debug, Clone, Copy)]
+        enum Refusal {
+            SystemdWithoutWindow,
+            SupervisedRestartConflict,
+            HashMismatch,
+        }
+        let mk = |kind: Refusal| match kind {
+            // Same error shape but without a retry hint: a policy defect,
+            // not a time-bound window.
+            Refusal::SystemdWithoutWindow => systemd_refusal(None),
+            Refusal::SupervisedRestartConflict => x0x::upgrade::UpgradeError::RestartOwnership(
+                restart::RestartOwnershipError::SupervisedRestartConflict {
+                    signal: "INVOCATION_ID".to_string(),
+                    exit_code: 0,
+                },
+            ),
+            Refusal::HashMismatch => x0x::upgrade::UpgradeError::HashMismatch,
+        };
+
+        for kind in [
+            Refusal::SystemdWithoutWindow,
+            Refusal::SupervisedRestartConflict,
+            Refusal::HashMismatch,
+        ] {
+            let attempts = Arc::new(AtomicU64::new(0));
+            let (_notify, mut shutdown) = watch::channel(false);
+            let before = tokio::time::Instant::now();
+
+            let attempts_in_attempt = Arc::clone(&attempts);
+            let result = apply_with_start_rate_retry(
+                None,
+                move || {
+                    let attempts = Arc::clone(&attempts_in_attempt);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(mk(kind))
+                    }
+                },
+                &mut shutdown,
+            )
+            .await;
+
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "{kind:?}: exactly one attempt, no retry"
+            );
+            assert!(result.is_err(), "{kind:?}: the refusal is returned");
+            assert_eq!(
+                before.elapsed(),
+                Duration::ZERO,
+                "{kind:?}: no wait before giving up"
+            );
+        }
     }
 }

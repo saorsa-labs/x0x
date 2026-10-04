@@ -98,6 +98,17 @@ fn run() -> io::Result<()> {
         SystemdPolicyReadback::NotGuaranteed { detail } => {
             ("not_guaranteed", None, None, None, None, Some(detail))
         }
+        SystemdPolicyReadback::StartRateWindowPending {
+            detail,
+            retry_after,
+        } => (
+            "start_rate_window_pending",
+            None,
+            None,
+            None,
+            None,
+            Some(format!("{detail} (retry_after {retry_after:?})")),
+        ),
         SystemdPolicyReadback::NotApplicable => (
             "not_applicable",
             None,

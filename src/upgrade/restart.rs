@@ -665,6 +665,22 @@ pub enum SystemdPolicyReadback {
     /// `SupervisedExit` on any of these is the silent-service-disappearance
     /// failure §3 exists to prevent.
     NotGuaranteed { detail: String },
+    /// Every guarantee EXCEPT the start-rate window was confirmed: the
+    /// unit's current activation has not yet outlived
+    /// `StartLimitIntervalUSec`, so a restart now could still hit the
+    /// start limit. Distinct from `NotGuaranteed` because the refusal is
+    /// time-bound, not a policy defect — the daemon's startup check waits
+    /// out `retry_after` and retries the apply once instead of skipping the
+    /// version (#1196); every other apply path keeps refusing on contact.
+    StartRateWindowPending {
+        /// Why the window has not aged out (the guard's own refusal text).
+        detail: String,
+        /// How long — from the readback's own
+        /// `ActiveEnterTimestampMonotonic`/`StartLimitIntervalUSec` sample —
+        /// until the activation has outlived the interval. Never a
+        /// hard-coded default interval.
+        retry_after: Duration,
+    },
 }
 
 /// Whether the recognized supervision signal names a systemd unit (either
@@ -1219,16 +1235,27 @@ fn readback_systemd_policy_in(
             );
         };
         match monotonic_now_us {
-            Some(now_us) if now_us > active_enter_us && now_us - active_enter_us > interval_us => {
-                // Stable old service: the window has aged out completely.
-            }
-            Some(_) => {
-                return refuse(
-                    "the unit's current activation has not outlived StartLimitIntervalUSec; \
-                     a restart now could hit the start-rate limit and leave the service \
-                     down (man systemd.service)"
-                        .to_string(),
-                );
+            Some(now_us) => {
+                let elapsed_us = now_us.saturating_sub(active_enter_us);
+                if elapsed_us > interval_us {
+                    // Stable old service: the window has aged out completely.
+                } else {
+                    // #1196: this is the LAST check in the readback, so a
+                    // refusal here means every other guarantee above WAS
+                    // confirmed — the only problem is that the window has
+                    // not aged out yet. Report it as time-bound (with the
+                    // readback's own remaining window, never a hard-coded
+                    // interval) so the daemon's startup check can wait it
+                    // out and retry once; other callers keep refusing.
+                    return SystemdPolicyReadback::StartRateWindowPending {
+                        detail: "the unit's current activation has not outlived \
+                                 StartLimitIntervalUSec; a restart now could hit the \
+                                 start-rate limit and leave the service down (man \
+                                 systemd.service)"
+                            .to_string(),
+                        retry_after: Duration::from_micros(interval_us - elapsed_us),
+                    };
+                }
             }
             None => {
                 return refuse(
@@ -1940,6 +1967,15 @@ pub enum RestartOwnershipError {
         exit_code: i32,
         /// Why the loaded policy could not be confirmed.
         detail: String,
+        /// Present only when the single unconfirmed guarantee is the
+        /// start-rate window: how long (per the readback's own sample)
+        /// until the activation outlives `StartLimitIntervalUSec`. The
+        /// daemon's startup check waits it out and retries the apply once
+        /// instead of skipping the version (#1196); `None` on every other
+        /// refusal, which keeps today's refuse-and-skip behaviour. Not
+        /// interpolated into the message above — the `detail` already
+        /// carries the specifics.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -2071,16 +2107,29 @@ pub fn resolve_restart_plan(
     if mode == RestartMode::SupervisedExit {
         if let Some(signal) = systemd_signal_name(signals) {
             if !matches!(systemd_readback, SystemdPolicyReadback::Verified(_)) {
-                let detail = match systemd_readback {
-                SystemdPolicyReadback::NotGuaranteed { detail } => detail.clone(),
-                _ => "the systemd readback did not run for a systemd-signalled                       instance"
-                    .to_string(),
-            };
+                let (detail, retry_after) = match systemd_readback {
+                    SystemdPolicyReadback::NotGuaranteed { detail } => (detail.clone(), None),
+                    // #1196: the start-rate window is the single unmet
+                    // guarantee, and it is time-bound — carry the readback's
+                    // remaining window so the startup check can wait and
+                    // retry once. Still an error: nothing may be replaced
+                    // until the window has aged out.
+                    SystemdPolicyReadback::StartRateWindowPending {
+                        detail,
+                        retry_after,
+                    } => (detail.clone(), Some(*retry_after)),
+                    _ => (
+                        "the systemd readback did not run for a systemd-signalled instance"
+                            .to_string(),
+                        None,
+                    ),
+                };
                 return Err(
                     RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
                         signal: signal.to_string(),
                         exit_code: supervised_exit_code(),
                         detail,
+                        retry_after,
                     },
                 );
             }
@@ -5078,8 +5127,11 @@ mod tests {
             matches!(v, SystemdPolicyReadback::Verified(_)),
             "aged-out window"
         );
-        // Fresh activation (2 s ago < 10 s): refuse — the window may still
-        // count prior attempts.
+        // Fresh activation (2 s ago < 10 s): refused as time-bound, not a
+        // policy defect — the #1196 contract. Every other guarantee in the
+        // same show output WAS confirmed, and the remaining window (8 s) is
+        // read from the readback's own ActiveEnterTimestampMonotonic +
+        // StartLimitIntervalUSec sample, never hard-coded.
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
@@ -5089,8 +5141,30 @@ mod tests {
             Some(3_000_000),
         );
         assert!(
-            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("start-rate")),
-            "fresh activation refuses"
+            matches!(
+                &v,
+                SystemdPolicyReadback::StartRateWindowPending { detail, retry_after }
+                    if detail.contains("start-rate") && *retry_after == Duration::from_secs(8)
+            ),
+            "fresh activation is a retryable start-rate refusal: {v:?}"
+        );
+        // Boundary: elapsed == interval is NOT outlived (the guard requires
+        // strictly greater), so the pending refusal carries a zero wait.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "5", "1000000"))),
+            Some(11_000_000),
+        );
+        assert!(
+            matches!(
+                &v,
+                SystemdPolicyReadback::StartRateWindowPending { retry_after, .. }
+                    if *retry_after == Duration::ZERO
+            ),
+            "elapsed == interval is still inside the window: {v:?}"
         );
         // Ambiguous: no monotonic clock with a live limit.
         let v = run_readback(
@@ -5224,14 +5298,34 @@ mod tests {
         let unit = plan.systemd_verified.expect("plan carries the unit");
         assert_eq!(unit.unit, "x0xd.service");
         assert_eq!(unit.restart, "always");
-        // NotGuaranteed → refusal naming the systemd policy.
+        // NotGuaranteed → refusal naming the systemd policy, with NO retry
+        // wait: a permanent policy defect is not waited out (#1196 keeps
+        // today's behaviour for every refusal except the start-rate window).
         let err = mk(SystemdPolicyReadback::NotGuaranteed {
             detail: "unit `x0xd.service` has Restart=\"no\"".into(),
         })
         .expect_err("not-guaranteed readback refuses");
         assert!(matches!(
-            err,
-            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed { .. }
+            &err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                retry_after: None,
+                ..
+            }
+        ));
+        // StartRateWindowPending (#1196): still a refusal — nothing may be
+        // replaced inside the window — but the error carries the readback's
+        // remaining window so the startup check can wait and retry once.
+        let err = mk(SystemdPolicyReadback::StartRateWindowPending {
+            detail: "the unit's current activation has not outlived StartLimitIntervalUSec".into(),
+            retry_after: Duration::from_secs(7),
+        })
+        .expect_err("pending window still refuses");
+        assert!(matches!(
+            &err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                retry_after: Some(wait),
+                ..
+            } if *wait == Duration::from_secs(7)
         ));
         // NotApplicable while the signal IS systemd → refusal.
         let err = mk(SystemdPolicyReadback::NotApplicable).expect_err("missing readback refuses");
