@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod restart;
 pub mod rollout;
 pub mod signature;
+pub mod verification_probe;
 
 use std::path::{Path, PathBuf};
 

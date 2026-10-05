@@ -64,8 +64,15 @@ fn resolve_instance_startup(
     Ok((instance_name, connect_acl_path))
 }
 
+fn main() -> anyhow::Result<()> {
+    if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
+        return result;
+    }
+    run_daemon()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_daemon() -> anyhow::Result<()> {
     // dhat heap profiler. Each daemon writes its own file so multi-daemon
     // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
     #[cfg(feature = "profile-heap")]

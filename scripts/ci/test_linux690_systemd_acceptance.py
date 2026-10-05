@@ -48,7 +48,10 @@ def record(number, pid, invocation_id):
  value={"schema":1,"invocation":number,"pid":pid,"invocation_id":invocation_id,
  "argv":["fixture"],"unix_ms":1,"exit_intent":"clean_exit_after_release" if number==1 else "wait_for_manager_stop",
  "verdict":verdict,"unit":unit if verdict=="verified" else None,"user_manager":True if verdict=="verified" else None,
- "restart":"always" if verdict=="verified" else None,"template_version":1 if verdict=="verified" else None,"detail":detail}
+ "restart":"always" if verdict=="verified" else None,"template_version":1 if verdict=="verified" else None,"detail":detail,
+ "isolation":{"namespace":"net:[101]","namespace_changed":True,"links":[{"ifname":"lo"}],
+ "routes":{"-4":[],"-6":[]},"uid":65534,"gid":65534,
+ "capabilities":{k:"0000000000000000" for k in ("CapInh","CapPrm","CapEff","CapBnd","CapAmb")},"no_new_privs":1}}
  (artifact/f"invocation-{number}.json").write_text(json.dumps(value)+"\n")
 record(1,111,"inv-1")
 (pathlib.Path(os.environ["FAKE_STATE"])/f"unit-{unit}").touch()
@@ -165,7 +168,7 @@ class M2IsolationControls(unittest.TestCase):
             "no_new_privs": 1,
         }
 
-    def run_with_admission(self, receipt: dict) -> subprocess.CompletedProcess[str]:
+    def run_with_admission(self, receipt: dict, respawn_receipt=None) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="m2-systemd-admission-") as scratch:
             root = Path(scratch)
             env, probe = RunnerControls().fixture(root)
@@ -179,6 +182,13 @@ class M2IsolationControls(unittest.TestCase):
                 marker,
                 ' value["isolation"] = json.loads(os.environ["FAKE_M2_ADMISSION"])\n' + marker,
             )
+            if respawn_receipt is not None:
+                # The second invocation must be validated independently.
+                source = source.replace(
+                    'v=json.loads((p/"invocation-1.json").read_text());',
+                    'v=json.loads((p/"invocation-1.json").read_text()); '
+                    f'v["isolation"]={respawn_receipt!r};',
+                )
             fake_run.write_text(source, encoding="utf-8")
             env["FAKE_M2_ADMISSION"] = json.dumps(receipt)
             result = subprocess.run(
@@ -220,6 +230,20 @@ class M2IsolationControls(unittest.TestCase):
         result = self.run_with_admission(self.isolated_unprivileged_receipt())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS artifact_root=", result.stdout)
+
+    def test_m2_runner_rejects_unsafe_respawn(self) -> None:
+        respawn = self.isolated_unprivileged_receipt()
+        respawn["capabilities"]["CapBnd"] = "0000000000000001"
+        result = self.run_with_admission(self.isolated_unprivileged_receipt(), respawn)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_m2_runner_rejects_missing_observations(self) -> None:
+        for field in ("namespace_changed", "routes", "capabilities", "no_new_privs"):
+            receipt = self.isolated_unprivileged_receipt()
+            del receipt[field]
+            with self.subTest(field=field):
+                result = self.run_with_admission(receipt)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

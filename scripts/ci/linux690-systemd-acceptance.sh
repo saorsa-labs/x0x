@@ -37,6 +37,16 @@ probe=$(cd "$(dirname "$probe")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$p
 printf '%s\n' "$probe" >"$artifact_root/probe-path.txt"
 sha256sum "$probe" >"$artifact_root/probe-sha256.txt"
 status_log="$artifact_root/command-statuses.txt"
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+fixture_uid=$(id -u)
+fixture_gid=$(id -g)
+if [ "$manager" = system ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "--manager system requires an already-root shell on a disposable host" >&2; exit 77; }
+  fixture_uid=65534
+  fixture_gid=65534
+  chown "$fixture_uid:$fixture_gid" "$artifact_root"
+fi
+parent_netns=$(readlink /proc/self/ns/net)
 
 record_status() {
   label=$1 status=$2
@@ -148,11 +158,14 @@ wait_file() {
 
 assert_verdict() {
   file=$1 invocation=$2 expected=$3 expected_unit=$4 expected_manager=$5 expected_reason=$6
-  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" <<'PY'
+  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" "$script_dir" <<'PY'
 import json, sys
-p, invocation, expected, unit, manager, reason = sys.argv[1:]
+p, invocation, expected, unit, manager, reason, script_dir = sys.argv[1:]
+sys.path.insert(0, script_dir)
+from systemd_isolation import validate
 with open(p, encoding="utf-8") as f:
     value = json.load(f)
+validate(value.get("isolation"))
 assert value["schema"] == 1
 assert value["invocation"] == int(invocation)
 assert isinstance(value["pid"], int) and value["pid"] > 1
@@ -178,6 +191,12 @@ run_case() {
   unit="$run_id-$case_name.service"
   case_dir="$artifact_root/$case_name"
   mkdir -m 700 "$case_dir"
+  if [ "$manager" = system ]; then
+    chown "$fixture_uid:$fixture_gid" "$case_dir"
+    set -- "--property=User=$fixture_uid" "--property=Group=$fixture_gid"
+  else
+    set --
+  fi
   units="$unit $units"
   systemd_run_bounded "run-$case_name" "$case_dir/systemd-run.out" "$case_dir/systemd-run.err" \
     --unit="$unit" --collect \
@@ -186,7 +205,13 @@ run_case() {
     --property="RestartPreventExitStatus=$prevent" \
     --property="RemainAfterExit=$remain" \
     --property="StartLimitIntervalSec=0" \
+    --property=PrivateNetwork=yes \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property=NoNewPrivileges=yes \
+    "$@" \
     --setenv=X0X_TEMPLATE_VERSION=1 \
+    "--setenv=X0X_FIXTURE_PARENT_NETNS=$parent_netns" \
     "$probe" --artifact "$case_dir"
   wait_file "$case_dir/invocation-1.json" 20
   systemctl_bounded "show-first-$case_name" "$case_dir/systemctl-show-first.txt" "$case_dir/systemctl-show-first.err" show "$unit" \

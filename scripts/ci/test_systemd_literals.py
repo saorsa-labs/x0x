@@ -2,6 +2,7 @@
 """Run #729 readback against disposable systemd units; requires root Linux."""
 import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
+from systemd_isolation import validate
 
 TIMEOUT = 12
 UNIT_ROOT = Path("/run/systemd/system")
@@ -45,6 +46,7 @@ def wait_json(path, bound=30):
     raise TimeoutError(str(path))
 
 def assert_first(case_name, first, expected, unit, literal, artifact):
+    validate(first.get("isolation"))
     if first["verdict"] != expected:
         raise AssertionError((case_name, first))
     if case_name == "positive":
@@ -77,7 +79,7 @@ def unit_text(probe, artifact, *, explicit, restart):
     else:
         cmd=q(str(probe),path=True)
     cmd += ' '+q('--artifact')+' '+q(str(artifact))
-    return f'''[Unit]\nDescription=x0x #729 disposable literal acceptance\nStartLimitIntervalSec=0\n[Service]\nType=simple\nExecStart={cmd}\nEnvironment=X0X_TEMPLATE_VERSION=1\nRestart={restart}\nRestartSec=1\n'''
+    return f'''[Unit]\nDescription=x0x #729 disposable literal acceptance\nStartLimitIntervalSec=0\n[Service]\nType=simple\nExecStart={cmd}\nEnvironment=X0X_TEMPLATE_VERSION=1\nRestart={restart}\nRestartSec=1\nUser=65534\nGroup=65534\nPrivateNetwork=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nNoNewPrivileges=yes\nEnvironment="X0X_FIXTURE_PARENT_NETNS={os.readlink('/proc/self/ns/net')}"\n'''
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--probe',required=True); ap.add_argument('--artifact-root')
@@ -85,16 +87,17 @@ def main():
     if sys.platform != 'linux' or os.geteuid()!=0: raise SystemExit('requires root on disposable Linux systemd host')
     if not probe.is_file() or not os.access(probe,os.X_OK): raise SystemExit('--probe must be an executable absolute file')
     root=Path(a.artifact_root or tempfile.mkdtemp(prefix='x0x-729-')).resolve(); root.mkdir(mode=0o700, parents=True, exist_ok=False) if not root.exists() else os.chmod(root, 0o700)
+    os.chown(root, 65534, 65534)
     state={"schema":1,"artifact":str(root),"probe_source":str(probe),"probe_sha256":hashlib.sha256(probe.read_bytes()).hexdigest(),"commands":[],"cases":{},"cleanup":{}}
     save(state); units=[]
     try:
         run(state,'manager',['systemctl','show','--property=Version','--value'])
         token=f"x0x-729-{os.getpid()}-{int(time.time())}"
-        literal=root/'probe % $ ${FOO} $$ space'; shutil.copy2(probe,literal); literal.chmod(0o700)
+        literal=root/'probe % $ ${FOO} $$ space'; shutil.copy2(probe,literal); literal.chmod(0o700); os.chown(literal, 65534, 65534)
         state['literal_probe_sha256']=hashlib.sha256(literal.read_bytes()).hexdigest(); save(state)
         cases=[('positive',True,'always','verified'),('unresolved-argv0',False,'always','not_guaranteed'),('bad-policy',True,'on-failure','not_guaranteed')]
         for name,explicit,restart,expected in cases:
-            unit=f"{token}-{name}.service"; units.append(unit); case=root/name; case.mkdir(mode=0o700)
+            unit=f"{token}-{name}.service"; units.append(unit); case=root/name; case.mkdir(mode=0o700); os.chown(case, 65534, 65534)
             unit_path=UNIT_ROOT/unit; unit_path.write_text(unit_text(literal,case,explicit=explicit,restart=restart)); os.chmod(unit_path, 0o600)
             run(state,f'reload-{name}',['systemctl','daemon-reload']); run(state,f'start-{name}',['systemctl','start',unit])
             first=wait_json(case/'invocation-1.json'); state['cases'][name]={"unit":unit,"first":first,"expected":expected}; save(state)
@@ -103,6 +106,7 @@ def main():
             (case/'systemctl-show.txt').write_text(show['stdout'])
             if name=='positive':
                 (case/'release-first').touch(); second=wait_json(case/'invocation-2.json',35)
+                validate(second.get('isolation'))
                 if second['verdict']!='verified' or second['pid']==first['pid'] or second['invocation_id']==first['invocation_id']: raise AssertionError('respawn proof')
                 state['cases'][name]['second']=second; save(state)
             cleanup_unit(state, unit)
@@ -130,6 +134,7 @@ def self_test():
     """Exercise main success and failure cleanup using an inert fake manager."""
     global UNIT_ROOT, run, wait_json
     original_run, original_wait, original_platform, original_geteuid = run, wait_json, sys.platform, os.geteuid
+    original_chown, original_readlink = os.chown, os.readlink
     with tempfile.TemporaryDirectory(prefix="x0x-729-stub-") as temp:
         base = Path(temp); UNIT_ROOT = base / "units"; UNIT_ROOT.mkdir()
         probe = base / "probe"; probe.write_text("stub"); probe.chmod(0o700)
@@ -148,8 +153,10 @@ def self_test():
                 literal = path.parent.parent / "probe % $ ${FOO} $$ space"
                 expected = "verified" if case == "positive" else "not_guaranteed"
                 detail = None if expected == "verified" else ("ExecStart unresolved" if case == "unresolved-argv0" else "Restart=on-failure")
-                return {"schema":1,"invocation":invocation,"pid":100+invocation,"invocation_id":f"i{invocation}","argv":[str(literal),"--artifact",str(path.parent)],"exit_intent":"clean_exit_after_release" if invocation==1 else "wait_for_manager_stop","verdict":expected,"unit":unit if expected=="verified" else None,"user_manager":False if expected=="verified" else None,"restart":"always" if expected=="verified" else None,"template_version":1 if expected=="verified" else None,"detail":detail}
+                return {"schema":1,"invocation":invocation,"pid":100+invocation,"invocation_id":f"i{invocation}","argv":[str(literal),"--artifact",str(path.parent)],"exit_intent":"clean_exit_after_release" if invocation==1 else "wait_for_manager_stop","verdict":expected,"unit":unit if expected=="verified" else None,"user_manager":False if expected=="verified" else None,"restart":"always" if expected=="verified" else None,"template_version":1 if expected=="verified" else None,"detail":detail,"isolation":{"namespace":"net:[101]","namespace_changed":True,"links":[{"ifname":"lo"}],"routes":{"-4":[],"-6":[]},"uid":65534,"gid":65534,"capabilities":{k:"0000000000000000" for k in ("CapInh","CapPrm","CapEff","CapBnd","CapAmb")},"no_new_privs":1}}
             run, wait_json, sys.platform, os.geteuid = fake_run, fake_wait, "linux", lambda: 0
+            os.chown = lambda *args: None
+            os.readlink = lambda path: "net:[100]"
             sys.argv = [sys.argv[0], "--probe", str(probe), "--artifact-root", str(artifact)]
             failed = False
             try: main()
@@ -157,6 +164,7 @@ def self_test():
             assert failed is (failure is not None), (failure, commands)
             assert any(label.startswith("cleanup-") for label in commands), commands
     run, wait_json, sys.platform, os.geteuid = original_run, original_wait, original_platform, original_geteuid
+    os.chown, os.readlink = original_chown, original_readlink
 
 if __name__=='__main__':
     if sys.argv[1:] == ["--self-test"]: self_test()

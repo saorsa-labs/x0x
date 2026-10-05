@@ -51,10 +51,10 @@ adr-gates-f1-live:
     python3 scripts/dev/test-isolated.py nextest -p x0x --all-features -- --no-fail-fast --test-threads=1 --run-ignored all -E 'test(/(^|::)f1_.*_live/)'
 
 build:
-    cargo build --all-features
+    cargo build --features jemalloc,profile-heap,voice
 
 build-release:
-    cargo build --release --all-features
+    cargo build --release --features jemalloc,profile-heap,voice
 
 doc:
     cargo doc --all-features --no-deps
