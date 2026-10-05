@@ -6394,21 +6394,16 @@ async fn s8b_1207_a_zero_wait_send_finds_an_attested_binding_without_waiting() -
 /// reads of the discovery redial that follows a failed repair. A writer
 /// holding the DM registry while the repair runs (after the first reads)
 /// must end the send by the deadline, not hold it in the redial's registry
-/// read.
+/// read. (Codex r4: the recipient is a known one, whose send redials; a
+/// cold-recipient binding is never redialled.)
 #[tokio::test]
 async fn s8b_1207_a_held_registry_during_the_redial_ends_the_send_by_the_deadline(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let g = build_gss(dir.path(), false).await?;
     restart_cold(&g.authority, &g.joiner, &g.stable).await;
-    pin_recipient_machine(&g.authority, &g.joiner).await;
+    announce_fresh(&g.authority, &g.joiner).await;
     let joiner_id = g.joiner.agent.agent_id();
-    g.authority
-        .agent
-        .identity_discovery_cache()
-        .write()
-        .await
-        .remove(&joiner_id);
     let repair = x0x::PinnedRepairGate::new();
     // The repair fails, so the production redial runs.
     g.authority
@@ -6457,5 +6452,150 @@ async fn s8b_1207_a_held_registry_during_the_redial_ends_the_send_by_the_deadlin
         matches!(outcome, Some(Err(_))) && !delivered,
         "a send past a held registry must fail, not deliver: {outcome:?}"
     );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r4 (ii)): under a lock (a ZERO cold wait) a binding the
+/// read-once found for a cold recipient is used only while its machine is
+/// connected. The send must not repair or redial it (a wait, and the
+/// redial's reads, newly on this path), and fails at once, retryably.
+#[tokio::test]
+async fn s8b_1207_a_zero_wait_send_never_repairs_or_redials_a_cold_binding() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .record_authenticated_binding_with_expiry_for_testing(
+            joiner_id,
+            g.joiner.agent.machine_id(),
+            now,
+            Some(now + 86_400),
+        )
+        .await;
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-zero-wait-cold-unconnected".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    Duration::ZERO,
+                )
+                .await
+        })
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
+    let ended_after = started.elapsed();
+    let repaired = repair.reached.available_permits();
+    repair.release();
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    assert_eq!(repaired, 0, "the zero-wait send repaired a cold binding");
+    assert!(
+        matches!(
+            outcome,
+            Some(Err(x0x::dm::DmError::RecipientUndiscovered(_)))
+        ),
+        "a zero-wait send to an unconnected cold binding must fail at once, retryably \
+         ({ended_after:?}): {outcome:?}"
+    );
+    assert!(!general_deliveries(&g.authority, &g.joiner).contains(&payload));
+    Ok(())
+}
+
+/// WHY (#1207, Codex r4 P3): the cooldown map for pre-lock Welcome waits has
+/// an aggregate bound (256 sources). While it is full of sources still in
+/// their cooldown, a new source gets no wait; once their cooldowns expire,
+/// they are evicted and a new source waits again.
+#[tokio::test]
+async fn s8b_1207_the_cold_wait_map_is_capped() -> anyhow::Result<()> {
+    const BOUND: usize = 256;
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let rejected = |attempt: u64| -> anyhow::Result<NamedGroupMetadataEvent> {
+        let mut event = j2_add_from_source(&s, &hex_of(&s.authority))?;
+        if let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } = &mut event
+        {
+            commit.committed_at = commit.committed_at.saturating_add(attempt + 1);
+        }
+        Ok(event)
+    };
+    let fill = |at: std::time::Instant| -> anyhow::Result<()> {
+        let mut waits =
+            s.j2.cold_welcome_waits
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cold wait map"))?;
+        waits.clear();
+        for _ in 0..BOUND {
+            waits.insert(
+                x0x::identity::AgentKeypair::generate()?.agent_id(),
+                Some(at),
+            );
+        }
+        Ok(())
+    };
+    let j2_id = s.j2.agent.agent_id();
+    // Full of sources still cooling: no wait for a new source.
+    fill(std::time::Instant::now())?;
+    let gate = x0x::general_cold_barrier::arm(
+        j2_id,
+        s.authority_id,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let started = std::time::Instant::now();
+    let _ = apply_named_group_metadata_event(&s.j2, rejected(0)?, s.authority_id, true, None).await;
+    let full_took = started.elapsed();
+    let waits_when_full = gate.reached.available_permits();
+    let len_when_full = s.j2.cold_welcome_waits.lock().map(|w| w.len()).unwrap_or(0);
+    // Full of expired cooldowns: they are evicted, and the new source waits.
+    let expired = std::time::Instant::now().checked_sub(Duration::from_secs(61));
+    let mut waits_when_expired = None;
+    if let Some(expired) = expired {
+        fill(expired)?;
+        let _ =
+            apply_named_group_metadata_event(&s.j2, rejected(1)?, s.authority_id, true, None).await;
+        waits_when_expired = Some(gate.reached.available_permits() - waits_when_full);
+    }
+    let len_after = s.j2.cold_welcome_waits.lock().map(|w| w.len()).unwrap_or(0);
+    x0x::general_cold_barrier::disarm(j2_id, s.authority_id);
+    assert_eq!(
+        waits_when_full, 0,
+        "a full cooldown map still admitted a wait ({full_took:?})"
+    );
+    assert!(
+        len_when_full <= BOUND,
+        "the map grew past its bound: {len_when_full}"
+    );
+    if let Some(waits) = waits_when_expired {
+        assert_eq!(
+            waits, 1,
+            "expired cooldowns were not evicted for a new wait"
+        );
+        assert!(len_after <= 1, "expired cooldowns were kept: {len_after}");
+    }
     Ok(())
 }
