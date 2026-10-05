@@ -38198,17 +38198,17 @@ async fn poll_join_result_until_membership_confirmed(
         // #1207: the membership guard was dropped above; one send. Its cold
         // wait for an inviter nothing names yet never outlives this poll's
         // own window (CI on cabd95e: a short window expired inside a full
-        // 5 s wait, so the timeout finalize ran late). A spent window reads
-        // the verified sources once (a zero wait).
-        let cold_wait = COLD_RECIPIENT_WAIT
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        // 5 s wait, so the timeout finalize ran late). The poll's ABSOLUTE
+        // deadline caps it, applied when raw resolution starts, after the
+        // send's preflight (Codex review of dd414ca).
         if let Err(e) = state
             .agent
-            .send_direct_with_config_cold_wait(
+            .send_direct_with_config_cold_wait_until(
                 &inviter,
                 payload,
                 direct_message_send_config(),
-                cold_wait,
+                COLD_RECIPIENT_WAIT,
+                deadline,
             )
             .await
         {

@@ -425,6 +425,15 @@ impl RawQuicTransport<'_> {
     }
 }
 
+/// x0x #1207, #1217: a crate-internal opt-in's cold-recipient wait: up to
+/// `wait` from the start of the raw attempt, and never past `not_after`
+/// (a caller's own absolute window, when it has one).
+#[derive(Debug, Clone, Copy)]
+struct ColdWait {
+    wait: std::time::Duration,
+    not_after: Option<tokio::time::Instant>,
+}
+
 /// x0x #1207, #1217: how a raw-QUIC send treats a recipient that no
 /// discovery-cache or DM-registry entry names, as after a restart.
 #[derive(Debug, Clone, Copy)]
@@ -444,12 +453,16 @@ enum ColdResolution {
 
 impl ColdResolution {
     /// The handling for an opted-in `cold_wait` (`None`: not opted in),
-    /// with the deadline starting now.
-    fn starting_now(cold_wait: Option<std::time::Duration>) -> Self {
+    /// with the deadline starting now: `min(now + wait, not_after)`. A
+    /// deadline already past waits for nothing (each read is polled once).
+    fn starting_now(cold_wait: Option<ColdWait>) -> Self {
         match cold_wait {
             None => Self::Off,
-            Some(wait) if wait.is_zero() => Self::ReadOnce,
-            Some(wait) => Self::Until(tokio::time::Instant::now() + wait),
+            Some(cold) if cold.wait.is_zero() => Self::ReadOnce,
+            Some(cold) => {
+                let deadline = tokio::time::Instant::now() + cold.wait;
+                Self::Until(cold.not_after.map_or(deadline, |cap| deadline.min(cap)))
+            }
         }
     }
 
@@ -7558,6 +7571,32 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cold_wait = ColdWait {
+            wait: cold_wait,
+            not_after: None,
+        };
+        self.send_direct_with_history(to, payload, config, Some(cold_wait))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// x0x #1207 (crate-internal): [`Self::send_direct_with_config_cold_wait`]
+    /// for a caller with its own absolute window (`not_after`). The cold
+    /// deadline is computed when raw resolution starts, after the send's
+    /// preflight: `min(raw-attempt start + cold_wait, not_after)`. A window
+    /// already spent by then waits for nothing.
+    pub(crate) async fn send_direct_with_config_cold_wait_until(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+        not_after: tokio::time::Instant,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cold_wait = ColdWait {
+            wait: cold_wait,
+            not_after: Some(not_after),
+        };
         self.send_direct_with_history(to, payload, config, Some(cold_wait))
             .await
             .map(|(receipt, _ingress)| receipt)
@@ -7571,7 +7610,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
-        cold_wait: Option<std::time::Duration>,
+        cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -7640,7 +7679,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
-        cold_wait: Option<std::time::Duration>,
+        cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -7713,7 +7752,7 @@ impl Agent {
         // blocks synchronously) and takes no blocking evidence check, here or
         // in raw resolution. Contention reads as no evidence: it fails
         // retryably, and the caller's own retries resend.
-        let under_lock = cold_wait.is_some_and(|wait| wait.is_zero());
+        let under_lock = cold_wait.is_some_and(|cold| cold.wait.is_zero());
         let usable_agent_now = |agent: &identity::AgentId| {
             let now = dm_capability::now_unix_ms();
             if under_lock {
@@ -9826,7 +9865,7 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
-        cold_wait: Option<std::time::Duration>,
+        cold_wait: Option<ColdWait>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
