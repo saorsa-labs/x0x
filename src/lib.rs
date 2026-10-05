@@ -7710,6 +7710,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
+        // x0x #1207, #1217: the bounded wait for a restart-cold recipient's
+        // verified binding. It sits inside this send's per-attempt timeout and
+        // is at most `dm::PINNED_RESOLUTION_WAIT`. It applies only where raw
+        // QUIC is the path that delivers (no gossip-inbox capability), so a
+        // gossip-capable send still falls back to gossip at once, as before.
+        let resolve_within = std::cmp::min(dm::PINNED_RESOLUTION_WAIT, config.timeout_per_attempt);
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -7722,6 +7728,11 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    if gossip_ok {
+                        std::time::Duration::ZERO
+                    } else {
+                        resolve_within
+                    },
                 )
                 .await
             {
@@ -7804,6 +7815,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        resolve_within,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -8567,7 +8579,7 @@ impl Agent {
                     agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
                     outcome = "err_recipient_undiscovered",
                     waited_ms,
-                    "pinned send: no verified source named the recipient's machine within the bound; the caller resends"
+                    "no verified source named the recipient's machine within the bound; the caller resends"
                 );
                 Err(dm::DmError::RecipientUndiscovered(format!(
                     "no verified machine for the recipient after {waited_ms} ms \
@@ -8821,6 +8833,7 @@ impl Agent {
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
+        resolve_within: std::time::Duration,
     ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
@@ -8874,12 +8887,65 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
+                let wait_until = tokio::time::Instant::now() + resolve_within;
                 let _ = self.connect_to_agent(agent_id).await;
-                let id = self
-                    .direct_messaging
-                    .get_machine_id(agent_id)
-                    .await
-                    .ok_or_else(|| {
+                match self.direct_messaging.get_machine_id(agent_id).await {
+                    Some(id) => (id, "post_connect"),
+                    // x0x #1207, #1217: a restart leaves the discovery cache and
+                    // the DM registry cold, and this used to fail at once
+                    // (`err_agent_not_found`). Instead, wait at most
+                    // `resolve_within` (measured from this branch) for a VERIFIED
+                    // binding. The sources and their order are the pinned path's
+                    // (`select_pinned_binding`): the announced-binding store, the
+                    // ADR-0021 attestation, the DM registry, then peer evidence,
+                    // with one EvidenceV1 Lookup. The machine then gets the same
+                    // repair, redial and B/P checks as any other. A zero bound
+                    // keeps the instant failure (a gossip fallback follows).
+                    None if !resolve_within.is_zero() => {
+                        match self
+                            .await_pinned_recipient_binding(agent_id, wait_until)
+                            .await
+                        {
+                            Ok(binding) => {
+                                // These retained bindings survive revocation
+                                // eviction, so a revoked agent or machine is
+                                // refused here; the B/P checks below follow.
+                                let revoked = {
+                                    let revoked = self.revocation_set.read().await;
+                                    revoked.is_agent_revoked(agent_id)
+                                        || revoked.is_machine_revoked(&binding.machine)
+                                };
+                                if revoked {
+                                    tracing::info!(
+                                        target: "x0x::direct",
+                                        stage = "send",
+                                        agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                        outcome = "drop_revoked",
+                                        "raw-QUIC send refused: the awaited binding names a revoked agent or machine"
+                                    );
+                                    return Err(error::NetworkError::PeerNotVerified {
+                                        agent_id: agent_id.0,
+                                    });
+                                }
+                                if binding.source == PinnedMachineSource::PeerEvidence {
+                                    let _ = self.connect_from_evidence(*agent_id).await;
+                                }
+                                (binding.machine, binding.source.label())
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no verified machine for the recipient within the resolution bound"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                    None => {
                         tracing::warn!(
                             target: "x0x::direct",
                             stage = "send",
@@ -8888,9 +8954,9 @@ impl Agent {
                             dur_ms = send_start.elapsed().as_millis() as u64,
                             "no machine_id after connect_to_agent"
                         );
-                        error::NetworkError::AgentNotFound(agent_id.0)
-                    })?;
-                (id, "post_connect")
+                        return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                    }
+                }
             }
         };
 
@@ -9076,6 +9142,7 @@ impl Agent {
         payload: &[u8],
         agent_prefix: &str,
         send_start: std::time::Instant,
+        resolve_within: std::time::Duration,
     ) -> error::NetworkResult<dm::DmPath> {
         let transport =
             RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
@@ -9086,6 +9153,7 @@ impl Agent {
                 agent_prefix,
                 payload.len(),
                 send_start,
+                resolve_within,
             )
             .await?;
         if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
@@ -9124,6 +9192,7 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        resolve_within: std::time::Duration,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -9139,7 +9208,7 @@ impl Agent {
         #[cfg(test)]
         if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
             return self
-                .general_raw_standin(agent_id, payload, &agent_prefix, send_start)
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start, resolve_within)
                 .await;
         }
         let network = self.network.as_ref().ok_or_else(|| {
@@ -9165,6 +9234,7 @@ impl Agent {
                 &agent_prefix,
                 bytes,
                 send_start,
+                resolve_within,
             )
             .await?;
 
