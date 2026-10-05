@@ -9269,6 +9269,14 @@ impl Agent {
             .map_err(Self::map_raw_quic_dm_error)
     }
 
+    /// x0x #1207 (Codex r5, crate-internal): start a background Lookup for
+    /// `to`'s relationship evidence (permit-bounded; nothing waits on it),
+    /// for a caller that declines a cold wait but must not starve a
+    /// recipient that only pull-based discovery can find.
+    pub(crate) fn start_recipient_lookup(&self, to: &identity::AgentId) {
+        self.peer_evidence().spawn_agent_lookup(*to);
+    }
+
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
     /// discovery cache, DM registry or peer evidence, any send-readiness
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
@@ -9313,8 +9321,15 @@ impl Agent {
 
         let evidence_machine = if cached_machine_id.is_none()
             && registry_machine_id.is_none()
-            && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
-        {
+            && match cold {
+                // x0x #1207 (Codex r5): a send under a lock never waits on the
+                // evidence load barrier.
+                ColdResolution::ReadOnce => self.peer_evidence().ready_now(),
+                ColdResolution::Off | ColdResolution::Until(_) => {
+                    Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0))
+                        .await?
+                }
+            } {
             let now = dm_capability::now_unix_ms();
             // x0x #1207 (P2): an opted-in send never blocks on the evidence
             // store (contention reads as no evidence).
@@ -9535,8 +9550,15 @@ impl Agent {
         let may_repair = !(awaited && matches!(cold, ColdResolution::ReadOnce));
         if !connected && resolution != "post_connect" && may_repair {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let outcome = match tokio::time::timeout(
-                REPAIR_TIMEOUT,
+            // x0x #1207 (Codex r5): the repair of a cold binding is newly
+            // reachable, so it ends at the send's absolute deadline too.
+            let repair_until = tokio::time::Instant::now() + REPAIR_TIMEOUT;
+            let repair_until = match (awaited, cold.deadline()) {
+                (true, Some(deadline)) => deadline.min(repair_until),
+                _ => repair_until,
+            };
+            let outcome = match tokio::time::timeout_at(
+                repair_until,
                 transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await

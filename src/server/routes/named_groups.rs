@@ -443,8 +443,9 @@ const COLD_WELCOME_WAIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// x0x #1207 (Codex r4 P3): the most Welcome sources tracked at once (in
 /// flight or cooling down). Expired cooldowns are evicted first; while the
-/// map is still full, a new source gets no wait (its FetchRequest still
-/// reads the verified sources once, and the Welcome fetch retries).
+/// map is still full, a new source gets no wait, only a background Lookup
+/// (Codex r5), and its FetchRequest still reads the verified sources once
+/// on each retry of the Welcome fetch.
 const COLD_WELCOME_WAITS_MAX: usize = 256;
 
 /// x0x #1207 (Codex r3 P2-2(b), r4 P3): one cold wait per Welcome source at
@@ -457,9 +458,21 @@ struct ColdWelcomeWaitSlot<'a> {
     resolved: bool,
 }
 
+/// Why a pre-lock Welcome wait was not admitted.
+enum ColdWelcomeRefusal {
+    /// A wait for this source is in flight or cooling down.
+    Busy,
+    /// The map holds [`COLD_WELCOME_WAITS_MAX`] sources still in flight or
+    /// cooling down.
+    Full,
+}
+
 impl<'a> ColdWelcomeWaitSlot<'a> {
-    fn claim(state: &'a AppState, source: AgentId) -> Option<Self> {
-        let mut waits = state.cold_welcome_waits.lock().ok()?;
+    fn claim(state: &'a AppState, source: AgentId) -> Result<Self, ColdWelcomeRefusal> {
+        let mut waits = state
+            .cold_welcome_waits
+            .lock()
+            .map_err(|_| ColdWelcomeRefusal::Busy)?;
         let now = std::time::Instant::now();
         waits.retain(|_, failed_at| {
             failed_at.is_none_or(|at| now.duration_since(at) < COLD_WELCOME_WAIT_COOLDOWN)
@@ -467,11 +480,14 @@ impl<'a> ColdWelcomeWaitSlot<'a> {
         if waits.len().saturating_mul(4) < waits.capacity() {
             waits.shrink_to_fit();
         }
-        if waits.contains_key(&source) || waits.len() >= COLD_WELCOME_WAITS_MAX {
-            return None;
+        if waits.contains_key(&source) {
+            return Err(ColdWelcomeRefusal::Busy);
+        }
+        if waits.len() >= COLD_WELCOME_WAITS_MAX {
+            return Err(ColdWelcomeRefusal::Full);
         }
         waits.insert(source, None);
-        Some(Self {
+        Ok(Self {
             waits: &state.cold_welcome_waits,
             source,
             resolved: false,
@@ -505,12 +521,26 @@ impl Drop for ColdWelcomeWaitSlot<'_> {
 /// this agent's roster), a stream of events costs at most one wait per
 /// admin per cooldown.
 async fn await_cold_welcome_authority(state: &AppState, authority: &AgentId) {
-    let Some(mut slot) = ColdWelcomeWaitSlot::claim(state, *authority) else {
-        tracing::debug!(
-            authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
-            "a cold wait for this Welcome authority is in flight or cooling down; the FetchRequest reads once"
-        );
-        return;
+    let mut slot = match ColdWelcomeWaitSlot::claim(state, *authority) {
+        Ok(slot) => slot,
+        Err(ColdWelcomeRefusal::Busy) => {
+            tracing::debug!(
+                authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+                "a cold wait for this Welcome authority is in flight or cooling down; the FetchRequest reads once"
+            );
+            return;
+        }
+        Err(ColdWelcomeRefusal::Full) => {
+            // Codex r5 P3: no wait, but progress. A background Lookup
+            // (permit-bounded; nothing waits on it) lets a zero-wait
+            // FetchRequest retry find the authority's evidence.
+            state.agent.start_recipient_lookup(authority);
+            tracing::debug!(
+                authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+                "the cold-wait map is full; started a background Lookup, the FetchRequest reads once"
+            );
+            return;
+        }
     };
     match state
         .agent
