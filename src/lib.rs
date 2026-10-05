@@ -433,7 +433,41 @@ pub(crate) struct PinnedTransportScript {
     only_listed_connected: bool,
     repair_connects: bool,
     repair_delay: std::time::Duration,
+    repair_gate: Option<std::sync::Arc<PinnedRepairGate>>,
     connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+/// Test seam (x0x #1207, P3): parks the scripted send-readiness repair on
+/// entry until the test releases it, so a test can change state while a
+/// repair is under way without assuming scheduler timing.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PinnedRepairGate {
+    /// One permit each time a repair enters.
+    pub(crate) reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PinnedRepairGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Let every current and future repair through.
+    pub(crate) fn release(&self) {
+        self.release.close();
+    }
+
+    async fn park(&self) {
+        self.reached.add_permits(1);
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,8 +480,15 @@ impl PinnedTransportScript {
             only_listed_connected: true,
             repair_connects,
             repair_delay: std::time::Duration::ZERO,
+            repair_gate: None,
             connected: std::sync::Mutex::new(machines.iter().copied().collect()),
         }
+    }
+
+    /// The send-readiness repair parks on entry at `gate` until released.
+    pub(crate) fn with_repair_gate(mut self, gate: std::sync::Arc<PinnedRepairGate>) -> Self {
+        self.repair_gate = Some(gate);
+        self
     }
 
     /// The send-readiness repair takes `delay` before it reports.
@@ -476,6 +517,9 @@ impl PinnedTransportScript {
     }
 
     async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if let Some(gate) = &self.repair_gate {
+            gate.park().await;
+        }
         tokio::time::sleep(self.repair_delay).await;
         if !self.repair_connects {
             return Err(error::NetworkError::ConnectionFailed(
@@ -3157,6 +3201,10 @@ pub(crate) mod general_cold_barrier {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
+    /// The payload length a resolve-only warm-up (no payload) parks with.
+    /// Every armed gate matches it, whatever payload length it selects.
+    pub(crate) const WARM_UP: usize = 0;
+
     pub(crate) struct Gate {
         pub(crate) reached: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
@@ -3207,7 +3255,7 @@ pub(crate) mod general_cold_barrier {
             .lock()
             .ok()
             .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
-            .filter(|gate| gate.bytes.is_none_or(|selected| selected == bytes));
+            .filter(|gate| bytes == WARM_UP || gate.bytes.is_none_or(|selected| selected == bytes));
         if let Some(gate) = gate {
             gate.reached.add_permits(1);
             if let Ok(permit) = gate.release.acquire().await {

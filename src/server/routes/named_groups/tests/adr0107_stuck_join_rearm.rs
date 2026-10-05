@@ -5453,45 +5453,246 @@ async fn entered_cold_wait(gate: &x0x::general_cold_barrier::Gate, what: &str) {
     }
 }
 
+/// Wait (bounded, generously) for the scripted send-readiness repair to
+/// enter (and park at) `gate`.
+async fn repair_entered(gate: &x0x::PinnedRepairGate, what: &str) {
+    let entered = tokio::time::timeout(Duration::from_secs(20), gate.reached.acquire()).await;
+    match entered {
+        Ok(Ok(permit)) => permit.forget(),
+        _ => panic!("{what}: the send never reached the send-readiness repair"),
+    }
+}
+
+/// J2's own Welcome `FetchRequest` for its sealed add (the exact payload the
+/// apply sends).
+fn j2_welcome_fetch_request(s: &Fixture) -> anyhow::Result<Vec<u8>> {
+    let NamedGroupMetadataEvent::MemberAdded { group_id, .. } = &s.j2_add else {
+        anyhow::bail!("J2's add is a MemberAdded");
+    };
+    let welcome_id =
+        welcome_id_of(&s.j2_add).ok_or_else(|| anyhow::anyhow!("J2's Welcome by reference"))?;
+    Ok(serde_json::to_vec(&WelcomeBlobMessage::FetchRequest {
+        group_id: group_id.clone(),
+        welcome_id,
+    })?)
+}
+
+/// A restarted J2, cold to the authority, applies its own sealed add
+/// (Welcome by reference, with the ADR 0106 carry) through the REAL
+/// join-result path in a task, so the apply fetches the Welcome from the
+/// authority. `gate` must already be armed for the fetch's cold wait. The
+/// authority never answers the stand-in's FetchRequest, so the caller
+/// aborts the task when done.
+async fn apply_with_cold_welcome_fetch(s: &Fixture) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("the authority serves J2's result"))?;
+    let (j2, authority_id, attempt) = (Arc::clone(&s.j2), s.authority_id, s.j2_attempt.clone());
+    Ok(tokio::spawn(async move {
+        deliver(&j2, &authority_id, served, &attempt).await;
+    }))
+}
+
+/// Wait (bounded, generously) until `from`'s stand-in delivered `payload`
+/// to `to`.
+async fn delivered_within(from: &AppState, to: &AppState, payload: &[u8], bound: Duration) -> bool {
+    tokio::time::timeout(bound, async {
+        while !general_deliveries(from, to).iter().any(|p| p == payload) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 /// WHY (#1207): a joiner that restarted recently has a cold view of the
-/// authority. Its Welcome FetchRequest goes through the general direct path,
-/// opted in. It used to fail at once (`err_agent_not_found`), and the retries
-/// stalled (`fetch_retry_stalled`). The authority's announcement is injected
-/// only after the send entered the cold wait; the send must then reach the
-/// authority.
+/// authority. The Welcome FetchRequest of its own sealed add used to fail at
+/// once (`err_agent_not_found`), and the retries stalled
+/// (`fetch_retry_stalled`). Driven through the real join-result apply: the
+/// authority's announcement is injected only after the fetch's cold wait
+/// began; the FetchRequest must then reach the authority.
 #[tokio::test]
 async fn s8b_1207_restarted_joiner_fetch_request_reaches_the_authority_within_the_bound(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build(dir.path()).await?;
     restart_cold(&s.j2, &s.authority, &s.stable).await;
-    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
-    let request = WelcomeBlobMessage::FetchRequest {
-        group_id: s.stable.clone(),
-        welcome_id,
-    };
-    let expected = serde_json::to_vec(&request)?;
-    // Only THIS FetchRequest (selected by its payload length) is parked.
+    let expected = j2_welcome_fetch_request(&s)?;
+    // Only the cold wait for THIS FetchRequest parks (its payload length, or
+    // the resolve-only warm-up for it).
     let gate =
         x0x::general_cold_barrier::arm(s.j2.agent.agent_id(), s.authority_id, Some(expected.len()));
-    let send = {
-        let (j2, authority_id, request) = (Arc::clone(&s.j2), s.authority_id, request.clone());
-        tokio::spawn(async move {
-            super::super::send_welcome_fetch_request(&j2, &authority_id, &request).await
-        })
-    };
-    entered_cold_wait(&gate, "FetchRequest").await;
+    let apply = apply_with_cold_welcome_fetch(&s).await?;
+    entered_cold_wait(&gate, "the Welcome fetch").await;
     announce_fresh(&s.j2, &s.authority).await;
     gate.release();
-    let outcome = send.await?;
+    let delivered = delivered_within(&s.j2, &s.authority, &expected, Duration::from_secs(10)).await;
     x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    apply.abort();
+    assert!(delivered, "the FetchRequest never reached the authority");
+    Ok(())
+}
+
+/// WHY (#1207, lock rule): a cold wait must never run under a lock. The
+/// Welcome fetch runs inside the apply, under the group's membership lock,
+/// so the wait for a restart-cold authority's binding must happen before
+/// any guard is taken; the FetchRequest under the lock then waits for
+/// nothing. While the fetch's cold wait is in progress: the group's
+/// membership lock, the global roster-persistence lock and the
+/// GSS-publication gate are free, and a mutation on another group
+/// completes. The FetchRequest still reaches the authority afterwards.
+#[tokio::test]
+async fn s8b_1207_cold_welcome_fetch_waits_outside_the_membership_lock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let expected = j2_welcome_fetch_request(&s)?;
+    let gate =
+        x0x::general_cold_barrier::arm(s.j2.agent.agent_id(), s.authority_id, Some(expected.len()));
+    let apply = apply_with_cold_welcome_fetch(&s).await?;
+    entered_cold_wait(&gate, "the Welcome fetch").await;
+
+    let membership = super::super::group_membership_lock(&s.j2, &s.group_key).await;
+    let membership_held = membership.try_lock().is_err();
+    let roster_held = s.j2.named_groups_persistence_lock.try_lock().is_err();
+    let gss_held = s.j2.gss_publication_gate.try_write().is_err();
+    let other_group = tokio::time::timeout(
+        Duration::from_secs(10),
+        create_named_group(
+            State(Arc::clone(&s.j2)),
+            Json(CreateGroupRequest {
+                name: "concurrent".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: None,
+                policy: None,
+            }),
+        ),
+    )
+    .await
+    .map(|response| response.into_response().status());
+
+    announce_fresh(&s.j2, &s.authority).await;
+    gate.release();
+    let delivered = delivered_within(&s.j2, &s.authority, &expected, Duration::from_secs(10)).await;
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    apply.abort();
     assert!(
-        outcome.is_ok(),
-        "the restarted joiner's FetchRequest failed: {outcome:?}"
+        !membership_held,
+        "the group's membership lock was held during the cold wait"
     );
     assert!(
-        general_deliveries(&s.j2, &s.authority).contains(&expected),
-        "the FetchRequest never reached the authority"
+        !roster_held,
+        "the roster-persistence lock was held during the cold wait"
+    );
+    assert!(
+        !gss_held,
+        "the GSS-publication gate was held during the cold wait"
+    );
+    assert!(
+        matches!(other_group, Ok(status) if status == StatusCode::CREATED),
+        "a mutation on another group did not complete during the cold wait: {other_group:?}"
+    );
+    assert!(delivered, "the FetchRequest never reached the authority");
+    Ok(())
+}
+
+/// WHY (#1207, lock rule, causal replay): the ADR 0028 replay applies a
+/// queued `JoinRequestApproved` under the group's membership lock, the
+/// queue-persistence lock, the global roster-persistence lock and the
+/// GSS-publication gate. An approval that seats THIS agent with a Welcome by
+/// reference makes it fetch the Welcome from a possibly cold authority, so
+/// that wait must happen before the replay takes any guard. (The queued
+/// approval here is a stand-in: the replay rejects it after the wait.)
+#[tokio::test]
+async fn s8b_1207_causal_replay_waits_for_a_cold_welcome_authority_before_its_guards(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let j2_hex = hex_of(&s.j2);
+    let request_id = "adr0107-1207-replay".to_string();
+    let revision = s.base + 9;
+    let now_ms = now_millis_u64();
+    let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: s.stable.clone(),
+        request_id: request_id.clone(),
+        revision,
+        actor: hex_of(&s.authority),
+        requester_agent_id: j2_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: Some(WelcomeRef {
+            welcome_id: "adr0107-1207-replay-welcome".to_string(),
+            byte_len: 64,
+            source: hex_of(&s.authority),
+        }),
+        treekem_key_package_hash: None,
+        treekem_epoch: None,
+        commit: None,
+    };
+    s.j2.causal_approval_queue
+        .write()
+        .await
+        .entry(s.group_key.clone())
+        .or_default()
+        .push_back(PendingCausalApproval {
+            envelope_bytes: Vec::new(),
+            digest: [0x5a; 32],
+            byte_size: 0,
+            event: approval,
+            sender: s.authority_id,
+            first_seen_ms: now_ms,
+            expires_at_ms: now_ms + 600_000,
+            request_id,
+            requester_agent_id: j2_hex,
+            revision,
+            conflicted: false,
+            conflicted_with: None,
+        });
+    let gate = x0x::general_cold_barrier::arm(
+        s.j2.agent.agent_id(),
+        s.authority_id,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    let replay = {
+        let (j2, group_key) = (Arc::clone(&s.j2), s.group_key.clone());
+        tokio::spawn(async move {
+            let mut cleared = std::collections::BTreeSet::new();
+            super::super::replay_pending_causal_approvals(&j2, &group_key, &mut cleared).await;
+        })
+    };
+    entered_cold_wait(&gate, "the replay's Welcome authority").await;
+    let membership = super::super::group_membership_lock(&s.j2, &s.group_key).await;
+    let membership_held = membership.try_lock().is_err();
+    let queue_held =
+        s.j2.causal_approval_queue_persistence_lock
+            .try_lock()
+            .is_err();
+    let roster_held = s.j2.named_groups_persistence_lock.try_lock().is_err();
+    let gss_held = s.j2.gss_publication_gate.try_write().is_err();
+    gate.release();
+    let finished = tokio::time::timeout(Duration::from_secs(20), replay).await;
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    assert!(
+        !membership_held,
+        "the replay held the membership lock during the wait"
+    );
+    assert!(
+        !queue_held,
+        "the replay held the queue-persistence lock during the wait"
+    );
+    assert!(
+        !roster_held,
+        "the replay held the roster-persistence lock during the wait"
+    );
+    assert!(
+        !gss_held,
+        "the replay held the GSS-publication gate during the wait"
+    );
+    assert!(
+        matches!(finished, Ok(Ok(()))),
+        "the replay did not finish: {finished:?}"
     );
     Ok(())
 }
@@ -5747,6 +5948,7 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
             .await
             .remove(&joiner_id);
         let substitute = x0x::identity::MachineId([0xa9; 32]);
+        let repair = x0x::PinnedRepairGate::new();
         let during_repair = matches!(
             case,
             ColdBindingChange::MachineRevokedDuringRepair
@@ -5754,16 +5956,16 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
                 | ColdBindingChange::SubstitutedDuringRepair
         );
         if during_repair {
-            // B is not connected; the repair takes 1.5 s. It connects B,
-            // except in the substitution case, where it fails so that the
-            // production redial runs and switches to the connected
-            // substitute.
+            // B is not connected; the repair parks on entry until the
+            // change below has landed. It connects B, except in the
+            // substitution case, where it fails so that the production
+            // redial runs and switches to the connected substitute.
             let repair_connects = case != ColdBindingChange::SubstitutedDuringRepair;
             g.authority
                 .agent
                 .script_pinned_standin_transport_for_testing(
                     x0x::PinnedTransportScript::connected_only(&[substitute], repair_connects)
-                        .with_repair_delay(Duration::from_millis(1_500)),
+                        .with_repair_gate(Arc::clone(&repair)),
                 );
         }
         match case {
@@ -5795,8 +5997,8 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
         entered_cold_wait(&gate, &format!("{case:?}")).await;
         gate.release();
         if during_repair {
-            // The binding resolves at once; the repair is under way.
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // The binding resolved; the repair is under way (parked).
+            repair_entered(&repair, &format!("{case:?}")).await;
             match case {
                 ColdBindingChange::MachineRevokedDuringRepair => {
                     revoke_machine(&g.authority, &g.joiner).await?;
@@ -5822,6 +6024,7 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
                 }
                 _ => {}
             }
+            repair.release();
         }
         let outcome = send.await?;
         x0x::general_cold_barrier::disarm(authority_id, joiner_id);
@@ -5832,6 +6035,76 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
     assert!(
         wrong.is_empty(),
         "a send was delivered past a revoked, expired, changed or substituted binding: {wrong:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, P2): ONE absolute deadline bounds every resolution read of an
+/// opted-in send, including the ADR-0043 B/P check after re-validation,
+/// which reads the move-state store. A writer holding that store must end
+/// the send by the deadline (a typed, retryable error), never hold it on
+/// indefinitely. The store is taken while the repair is parked, after the
+/// first B/P check passed.
+#[tokio::test]
+async fn s8b_1207_a_held_pairing_store_ends_the_send_by_the_deadline() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-held-pairing-store".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    super::super::COLD_RECIPIENT_WAIT,
+                )
+                .await
+        })
+    };
+    repair_entered(&repair, "held pairing store").await;
+    let move_state = g.authority.agent.move_state();
+    let held = move_state.write().await;
+    repair.release();
+    // The deadline, plus generous slack for a loaded runner.
+    let bound = super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(3);
+    let ended = tokio::time::timeout(bound.saturating_sub(started.elapsed()), &mut send).await;
+    let ended_after = started.elapsed();
+    drop(held);
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    let delivered = general_deliveries(&g.authority, &g.joiner).contains(&payload);
+    assert!(
+        outcome.is_some(),
+        "the send was still waiting on the held store {ended_after:?} after it started"
+    );
+    assert!(
+        matches!(outcome, Some(Err(_))) && !delivered,
+        "a send past a held pairing store must fail, not deliver: {outcome:?}"
     );
     Ok(())
 }
