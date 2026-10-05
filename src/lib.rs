@@ -7781,12 +7781,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
-        // x0x #1207, #1217: the bounded wait for a restart-cold recipient's
-        // verified binding. It sits inside this send's per-attempt timeout and
-        // is at most `dm::PINNED_RESOLUTION_WAIT`. It applies only where raw
+        // x0x #1207, #1217: the OPT-IN bounded wait for a restart-cold
+        // recipient's verified binding (`DmSendConfig::cold_recipient_wait`,
+        // zero by default: today's instant failure). It applies only where raw
         // QUIC is the path that delivers (no gossip-inbox capability), so a
         // gossip-capable send still falls back to gossip at once, as before.
-        let resolve_within = std::cmp::min(dm::PINNED_RESOLUTION_WAIT, config.timeout_per_attempt);
+        let cold_wait = config.cold_recipient_wait;
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -7802,7 +7802,7 @@ impl Agent {
                     if gossip_ok {
                         std::time::Duration::ZERO
                     } else {
-                        resolve_within
+                        cold_wait
                     },
                 )
                 .await
@@ -7886,7 +7886,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
-                        resolve_within,
+                        cold_wait,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -8897,6 +8897,23 @@ impl Agent {
     ///
     /// `transport` supplies connection state, repair and redial (r7b). The
     /// pinned path resolves its target with [`Self::resolve_pinned_target`].
+    /// x0x #1207: whether `agent` or `machine` is revoked, read within the
+    /// resolution `deadline` (a held revocation lock past it is
+    /// `AgentNotFound`, the typed retryable outcome).
+    async fn pinned_awaited_binding_revoked(
+        &self,
+        agent: &identity::AgentId,
+        machine: identity::MachineId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<bool> {
+        Self::pinned_bounded(deadline, "revocation", async {
+            let revoked = self.revocation_set.read().await;
+            revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(&machine)
+        })
+        .await
+        .map_err(|_| error::NetworkError::AgentNotFound(agent.0))
+    }
+
     async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
@@ -8904,7 +8921,7 @@ impl Agent {
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
-        resolve_within: std::time::Duration,
+        resolution_deadline: Option<tokio::time::Instant>,
     ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
@@ -8929,6 +8946,9 @@ impl Agent {
         } else {
             None
         };
+        // x0x #1207: whether the machine came from the opted-in cold wait
+        // (re-validated against the final machine after repair).
+        let mut awaited = false;
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
@@ -8958,38 +8978,54 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
-                let wait_until = tokio::time::Instant::now() + resolve_within;
-                let _ = self.connect_to_agent(agent_id).await;
-                match self.direct_messaging.get_machine_id(agent_id).await {
-                    Some(id) => (id, "post_connect"),
-                    // x0x #1207, #1217: a restart leaves the discovery cache and
-                    // the DM registry cold, and this used to fail at once
-                    // (`err_agent_not_found`). Instead, wait at most
-                    // `resolve_within` (measured from this branch) for a VERIFIED
-                    // binding. The sources and their order are the pinned path's
+                match resolution_deadline {
+                    // Not opted in: today's behaviour, an instant failure
+                    // (a gossip fallback, if any, follows).
+                    None => {
+                        let _ = self.connect_to_agent(agent_id).await;
+                        match self.direct_messaging.get_machine_id(agent_id).await {
+                            Some(id) => (id, "post_connect"),
+                            None => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no machine_id after connect_to_agent"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                    // x0x #1207, #1217 (opt-in, `DmSendConfig::cold_recipient_wait`):
+                    // a restart leaves the discovery cache and the DM registry
+                    // cold. Wait, within the ONE absolute `resolution_deadline`
+                    // (from the start of this raw attempt), for a VERIFIED
+                    // binding. The sources and order are the pinned path's
                     // (`select_pinned_binding`): the announced-binding store, the
                     // ADR-0021 attestation, the DM registry, then peer evidence,
-                    // with one EvidenceV1 Lookup. The machine then gets the same
-                    // repair, redial and B/P checks as any other. A zero bound
-                    // keeps the instant failure (a gossip fallback follows).
-                    None if !resolve_within.is_zero() => {
+                    // with one EvidenceV1 Lookup. The binding is re-validated
+                    // against the FINAL machine after repair (below).
+                    Some(deadline) => {
                         #[cfg(test)]
                         general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes)
                             .await;
+                        let _ = tokio::time::timeout_at(deadline, self.connect_to_agent(agent_id))
+                            .await;
                         match self
-                            .await_pinned_recipient_binding(agent_id, wait_until)
+                            .await_pinned_recipient_binding(agent_id, deadline)
                             .await
                         {
                             Ok(binding) => {
-                                // These retained bindings survive revocation
-                                // eviction, so a revoked agent or machine is
-                                // refused here; the B/P checks below follow.
-                                let revoked = {
-                                    let revoked = self.revocation_set.read().await;
-                                    revoked.is_agent_revoked(agent_id)
-                                        || revoked.is_machine_revoked(&binding.machine)
-                                };
-                                if revoked {
+                                if self
+                                    .pinned_awaited_binding_revoked(
+                                        agent_id,
+                                        binding.machine,
+                                        deadline,
+                                    )
+                                    .await?
+                                {
                                     tracing::info!(
                                         target: "x0x::direct",
                                         stage = "send",
@@ -9004,6 +9040,7 @@ impl Agent {
                                 if binding.source == PinnedMachineSource::PeerEvidence {
                                     let _ = self.connect_from_evidence(*agent_id).await;
                                 }
+                                awaited = true;
                                 (binding.machine, binding.source.label())
                             }
                             Err(_) => {
@@ -9013,22 +9050,11 @@ impl Agent {
                                     agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
                                     outcome = "err_agent_not_found",
                                     dur_ms = send_start.elapsed().as_millis() as u64,
-                                    "no verified machine for the recipient within the resolution bound"
+                                    "no verified machine for the recipient within the resolution deadline"
                                 );
                                 return Err(error::NetworkError::AgentNotFound(agent_id.0));
                             }
                         }
-                    }
-                    None => {
-                        tracing::warn!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                            outcome = "err_agent_not_found",
-                            dur_ms = send_start.elapsed().as_millis() as u64,
-                            "no machine_id after connect_to_agent"
-                        );
-                        return Err(error::NetworkError::AgentNotFound(agent_id.0));
                     }
                 }
             }
@@ -9117,6 +9143,50 @@ impl Agent {
                 .is_none()
         {
             return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        }
+
+        // x0x #1207 (P1): an awaited binding is re-validated against the
+        // FINAL machine (repair or redial may have replaced it), inside the
+        // same resolution deadline: the current verified binding (expiry
+        // included) must still name it, and neither the agent nor the
+        // machine may be revoked.
+        if awaited {
+            if let Some(deadline) = resolution_deadline {
+                let current = Self::pinned_bounded(
+                    deadline,
+                    "general revalidation",
+                    self.pinned_binding_now(agent_id),
+                )
+                .await
+                .map_err(|_| error::NetworkError::AgentNotFound(agent_id.0))?;
+                if current.map(|binding| binding.machine) != Some(machine_id) {
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "send",
+                        agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                        resolution,
+                        outcome = "drop_binding_changed",
+                        "raw-QUIC send refused: the recipient's verified binding no longer names the final machine"
+                    );
+                    return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                }
+                if self
+                    .pinned_awaited_binding_revoked(agent_id, machine_id, deadline)
+                    .await?
+                {
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "send",
+                        agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                        resolution,
+                        outcome = "drop_revoked_post_resolution",
+                        "raw-QUIC send refused: the agent or the final machine is revoked"
+                    );
+                    return Err(error::NetworkError::PeerNotVerified {
+                        agent_id: agent_id.0,
+                    });
+                }
+            }
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -9216,7 +9286,7 @@ impl Agent {
         payload: &[u8],
         agent_prefix: &str,
         send_start: std::time::Instant,
-        resolve_within: std::time::Duration,
+        resolution_deadline: Option<tokio::time::Instant>,
     ) -> error::NetworkResult<dm::DmPath> {
         let transport =
             RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
@@ -9227,7 +9297,7 @@ impl Agent {
                 agent_prefix,
                 payload.len(),
                 send_start,
-                resolve_within,
+                resolution_deadline,
             )
             .await?;
         if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
@@ -9266,9 +9336,15 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
-        resolve_within: std::time::Duration,
+        cold_wait: std::time::Duration,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
+        // x0x #1207 (P2): ONE absolute deadline for resolving a cold
+        // recipient and re-validating its binding, from the start of this
+        // raw attempt. The transport budget (repair, redial, the ACK wait)
+        // is separate and unchanged.
+        let resolution_deadline =
+            (!cold_wait.is_zero()).then(|| tokio::time::Instant::now() + cold_wait);
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
         let bytes = payload.len();
@@ -9282,7 +9358,13 @@ impl Agent {
         #[cfg(test)]
         if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
             return self
-                .general_raw_standin(agent_id, payload, &agent_prefix, send_start, resolve_within)
+                .general_raw_standin(
+                    agent_id,
+                    payload,
+                    &agent_prefix,
+                    send_start,
+                    resolution_deadline,
+                )
                 .await;
         }
         let network = self.network.as_ref().ok_or_else(|| {
@@ -9308,7 +9390,7 @@ impl Agent {
                 &agent_prefix,
                 bytes,
                 send_start,
-                resolve_within,
+                resolution_deadline,
             )
             .await?;
 

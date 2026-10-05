@@ -600,9 +600,18 @@ async fn send_message(
     recipient: &AgentId,
     message: &ControlBlobMessage,
 ) -> std::result::Result<(), String> {
+    send_message_with_config(agent, recipient, message, control_config(message)).await
+}
+
+async fn send_message_with_config(
+    agent: &Agent,
+    recipient: &AgentId,
+    message: &ControlBlobMessage,
+    config: x0x::dm::DmSendConfig,
+) -> std::result::Result<(), String> {
     let bytes = encode_message(message)?;
     agent
-        .send_direct_with_config(recipient, bytes, control_config(message))
+        .send_direct_with_config(recipient, bytes, config)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -698,17 +707,19 @@ pub(super) fn stage_reference(
 
 /// Send a staged blob's bounded reference (metadata only; the bytes are
 /// pulled chunk by chunk).
+///
+/// x0x #1217: its only sender is [`send_reference`], whose only caller is a
+/// spawned class-D named-group event delivery (one recipient, no lock). So
+/// it opts in to the bounded wait for a restart-cold recipient
+/// (`DmSendConfig::cold_recipient_wait`), like the inline delivery.
 pub(super) async fn send_reference_message(
     agent: &Agent,
     recipient: &AgentId,
     reference: ControlBlobRef,
 ) -> std::result::Result<(), String> {
-    send_message(
-        agent,
-        recipient,
-        &ControlBlobMessage::Reference { reference },
-    )
-    .await
+    let message = ControlBlobMessage::Reference { reference };
+    let config = super::with_cold_recipient_wait(control_config(&message));
+    send_message_with_config(agent, recipient, &message, config).await
 }
 
 fn basic_reference_valid(reference: &ControlBlobRef) -> bool {
