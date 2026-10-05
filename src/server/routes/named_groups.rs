@@ -38195,14 +38195,20 @@ async fn poll_join_result_until_membership_confirmed(
                 None => sent.push((group_id.clone(), 1)),
             }
         }
+        // #1207: the membership guard was dropped above; one send. Its cold
+        // wait for an inviter nothing names yet never outlives this poll's
+        // own window (CI on cabd95e: a short window expired inside a full
+        // 5 s wait, so the timeout finalize ran late). A spent window reads
+        // the verified sources once (a zero wait).
+        let cold_wait = COLD_RECIPIENT_WAIT
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
         if let Err(e) = state
             .agent
             .send_direct_with_config_cold_wait(
                 &inviter,
                 payload,
                 direct_message_send_config(),
-                // #1207: the membership guard was dropped above; one send.
-                COLD_RECIPIENT_WAIT,
+                cold_wait,
             )
             .await
         {
@@ -44047,7 +44053,8 @@ pub(in crate::server) mod tests {
         /// x0x #1207 (regression guard, CI on cabd95e): the join-result
         /// poll's opted-in cold wait for an unknown inviter is bounded by
         /// the poll's own window. An expiring 150 ms window must finalize
-        /// on time, not after a full 5 s cold wait.
+        /// on time, not after a full 5 s cold wait. (As at v0.46.3, the poll
+        /// still sleeps one 2 s poll interval after its send.)
         #[tokio::test]
         async fn wp_b_t7c_poll_cold_wait_never_outlives_its_window() {
             let (state, _keep) = fresh_state().await;
@@ -44070,7 +44077,7 @@ pub(in crate::server) mod tests {
             .await;
             let took = started.elapsed();
             assert!(
-                took < std::time::Duration::from_secs(2),
+                took < std::time::Duration::from_millis(3_500),
                 "the poll outlived its 150 ms window by its cold wait: {took:?}"
             );
             assert_eq!(
