@@ -339,9 +339,78 @@ fn apply_withdrawn_group_card_to_group_info(
 
 /// x0x #1207, #1217: the bounded wait for a restart-cold recipient's
 /// verified binding, for the crate-internal opt-in
-/// (`Agent::send_direct_with_config_cold_wait`). Only for sends that hold no
-/// lock and do not fan out serially.
+/// (`Agent::send_direct_with_config_cold_wait`, and the resolve-only
+/// `Agent::await_cold_recipient_binding`). Only where the caller holds no
+/// lock and does not fan out serially; a send under a lock passes ZERO.
 pub(in crate::server) const COLD_RECIPIENT_WAIT: Duration = x0x::dm::PINNED_RESOLUTION_WAIT;
+
+/// x0x #1207 (lock rule): the authority whose Welcome blob `event` makes
+/// this agent fetch, when the event can reach that fetch: a `MemberAdded`
+/// or `JoinRequestApproved` that seats THIS agent with a Welcome by
+/// reference, whose actor is its authenticated `sender` and an admin of the
+/// local group (the apply's own authorization, checked again under its
+/// lock). Reads `named_groups` briefly and holds nothing after, so a forged
+/// event cannot make the caller wait.
+async fn cold_welcome_authority(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+    sender: &AgentId,
+) -> Option<AgentId> {
+    let (member, actor, inline, welcome_ref) = match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            agent_id,
+            actor,
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } => (agent_id, actor, treekem_welcome_b64, welcome_ref),
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            requester_agent_id,
+            actor,
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } => (requester_agent_id, actor, treekem_welcome_b64, welcome_ref),
+        _ => return None,
+    };
+    let welcome_ref = welcome_ref.as_ref()?;
+    if inline.is_some()
+        || *member != hex::encode(state.agent.agent_id().as_bytes())
+        || *actor != hex::encode(sender.as_bytes())
+    {
+        return None;
+    }
+    let actor_is_admin = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .and_then(|info| info.caller_role(actor))
+        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
+    if !actor_is_admin {
+        return None;
+    }
+    parse_agent_id_hex(&welcome_ref.source).ok()
+}
+
+/// x0x #1207 (lock rule): wait, up to [`COLD_RECIPIENT_WAIT`] and BEFORE any
+/// guard is taken, for the verified binding of a Welcome `authority`
+/// (resolve only; nothing is sent). The FetchRequest, sent later under the
+/// membership lock with a zero cold wait, then waits for nothing and finds
+/// the binding. An authority the node already resolves returns at once.
+async fn await_cold_welcome_authority(state: &AppState, authority: &AgentId) {
+    if let Err(error) = state
+        .agent
+        .await_cold_recipient_binding(authority, COLD_RECIPIENT_WAIT)
+        .await
+    {
+        tracing::debug!(
+            authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+            "no verified binding for the Welcome authority before the apply; the FetchRequest reads once: {error}"
+        );
+    }
+}
 
 pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // Named-group metadata applies require `DirectMessage::verified == true`.
@@ -9934,6 +10003,33 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     group_id: &str,
     cleared_quarantine: &mut std::collections::BTreeSet<String>,
 ) {
+    // x0x #1207 (lock rule): a queued approval that seats this agent with a
+    // Welcome by reference makes the replay fetch the Welcome under the
+    // guards below (membership, queue persistence, roster persistence, GSS
+    // publication). Wait for each restart-cold authority's binding HERE,
+    // before any of them is taken; the queue is only read (and released).
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let seating: Vec<(NamedGroupMetadataEvent, AgentId)> = state
+        .causal_approval_queue
+        .read()
+        .await
+        .get(group_id)
+        .map(|queue| {
+            queue
+                .iter()
+                .filter(|pending| !pending.conflicted && pending.requester_agent_id == local_hex)
+                .map(|pending| (pending.event.clone(), pending.sender))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut awaited_authorities = std::collections::HashSet::new();
+    for (event, sender) in &seating {
+        if let Some(authority) = cold_welcome_authority(state, group_id, event, sender).await {
+            if awaited_authorities.insert(authority) {
+                await_cold_welcome_authority(state, &authority).await;
+            }
+        }
+    }
     // Global lock order M→P→Q: admission already holds the per-group
     // membership lock before it enters the causal queue writer, so replay
     // must acquire that same membership lock BEFORE queue persistence. This
@@ -11404,6 +11500,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             return ApplyMetadataResult::REJECTED;
         }
     };
+    // x0x #1207 (lock rule): a cold wait never runs under a lock. An event
+    // that seats this agent with a Welcome by reference makes the apply fetch
+    // the Welcome under the membership lock taken below, so wait for a
+    // restart-cold authority's binding HERE, before any guard. A caller that
+    // already holds the lock (causal replay) waited before taking it.
+    if verified && !lock_already_held {
+        if let Some(authority) =
+            cold_welcome_authority(state, &resolved_group_key, &event, &sender).await
+        {
+            await_cold_welcome_authority(state, &authority).await;
+        }
+    }
     // Serialize every membership apply for this group across the concurrent
     // gossip metadata listener and direct-channel listener. Held for the rest
     // of the apply so the load-mutate-commit sequence below cannot interleave
@@ -38156,15 +38264,19 @@ async fn send_welcome_fetch_request(
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
     state
         .agent
-        // #1207: the joiner's own FetchRequest waits boundedly for a
-        // restart-cold authority's verified binding (no lock; one send per
-        // retry attempt). Its ChunkAck does NOT opt in: it is awaited on the
-        // shared Welcome listener, and the chunk's sender was just verified.
+        // #1207: this runs inside the apply, under the group's membership
+        // lock (and, in causal replay, the global roster-persistence and
+        // GSS-publication guards), so it waits for NOTHING (a zero cold
+        // wait). The bounded wait for a restart-cold authority ran before
+        // any guard was taken (`await_cold_welcome_authority`); this send
+        // reads the verified sources once and finds that binding. The
+        // ChunkAck does not opt in at all: it is awaited on the shared
+        // Welcome listener, and the chunk's sender was just verified.
         .send_direct_with_config_cold_wait(
             agent_id,
             payload,
             welcome_blob_send_config(request),
-            COLD_RECIPIENT_WAIT,
+            Duration::ZERO,
         )
         .await
         .map(|_| ())
