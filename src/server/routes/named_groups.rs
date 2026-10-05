@@ -344,54 +344,141 @@ fn apply_withdrawn_group_card_to_group_info(
 /// lock and does not fan out serially; a send under a lock passes ZERO.
 pub(in crate::server) const COLD_RECIPIENT_WAIT: Duration = x0x::dm::PINNED_RESOLUTION_WAIT;
 
-/// x0x #1207 (lock rule): the authority whose Welcome blob `event` makes
-/// this agent fetch, when the event can reach that fetch: a `MemberAdded`
-/// or `JoinRequestApproved` that seats THIS agent with a Welcome by
-/// reference, whose actor is its authenticated `sender` and an admin of the
-/// local group (the apply's own authorization, checked again under its
-/// lock). Reads `named_groups` briefly and holds nothing after, so a forged
-/// event cannot make the caller wait.
+/// x0x #1207 (lock rule; Codex r3 P2-2(a)): the authority whose Welcome
+/// blob `event` makes this agent fetch, when the event can reach that fetch.
+/// Every check is cheap and runs before any wait, so an event that cannot
+/// lead to a Welcome fetch never waits:
+/// - a `MemberAdded` or `JoinRequestApproved` that seats THIS agent with a
+///   Welcome by reference and carries the commit and the TreeKEM fields the
+///   apply requires (a `JoinRequestApproved` also needs this agent's
+///   pending request);
+/// - in a local TreeKEM group, whose actor is the authenticated `sender`
+///   and an admin;
+/// - whose Welcome source is a plausible authority: an admin of that group
+///   on this agent's roster.
+///
+/// The apply checks all of this again under its lock. Reads `named_groups`
+/// briefly and holds nothing after.
 async fn cold_welcome_authority(
     state: &AppState,
     group_key: &str,
     event: &NamedGroupMetadataEvent,
     sender: &AgentId,
 ) -> Option<AgentId> {
-    let (member, actor, inline, welcome_ref) = match event {
+    let (member, actor, complete, inline, welcome_ref, request_id) = match event {
         NamedGroupMetadataEvent::MemberAdded {
             agent_id,
             actor,
+            commit,
+            treekem_commit_b64,
+            treekem_epoch,
             treekem_welcome_b64,
             welcome_ref,
             ..
-        } => (agent_id, actor, treekem_welcome_b64, welcome_ref),
+        } => (
+            agent_id,
+            actor,
+            commit.is_some() && treekem_commit_b64.is_some() && treekem_epoch.is_some(),
+            treekem_welcome_b64,
+            welcome_ref,
+            None,
+        ),
         NamedGroupMetadataEvent::JoinRequestApproved {
             requester_agent_id,
             actor,
+            commit,
+            treekem_commit_b64,
+            treekem_epoch,
+            treekem_key_package_hash,
             treekem_welcome_b64,
             welcome_ref,
+            request_id,
             ..
-        } => (requester_agent_id, actor, treekem_welcome_b64, welcome_ref),
+        } => (
+            requester_agent_id,
+            actor,
+            commit.is_some()
+                && treekem_commit_b64.is_some()
+                && treekem_epoch.is_some()
+                && treekem_key_package_hash.is_some(),
+            treekem_welcome_b64,
+            welcome_ref,
+            Some(request_id),
+        ),
         _ => return None,
     };
     let welcome_ref = welcome_ref.as_ref()?;
-    if inline.is_some()
-        || *member != hex::encode(state.agent.agent_id().as_bytes())
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !complete
+        || inline.is_some()
+        || *member != local_hex
         || *actor != hex::encode(sender.as_bytes())
     {
         return None;
     }
-    let actor_is_admin = state
-        .named_groups
-        .read()
-        .await
-        .get(group_key)
-        .and_then(|info| info.caller_role(actor))
-        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
-    if !actor_is_admin {
-        return None;
+    let source = parse_agent_id_hex(&welcome_ref.source).ok()?;
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_key)?;
+    let is_admin = |agent: &str| {
+        info.caller_role(agent)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+    };
+    let request_pending = request_id.is_none_or(|id| {
+        info.join_requests
+            .get(id)
+            .is_some_and(|request| request.is_pending() && request.requester_agent_id == local_hex)
+    });
+    let plausible = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && is_admin(actor)
+        && is_admin(&welcome_ref.source)
+        && request_pending;
+    plausible.then_some(source)
+}
+
+/// x0x #1207 (Codex r3 P2-2(b)): after a cold wait for a Welcome source
+/// ends without a binding, no further wait for that source runs for this
+/// long. The in-lock FetchRequest still reads the verified sources once, and
+/// the Welcome fetch's own retries cover the window.
+const COLD_WELCOME_WAIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// x0x #1207 (Codex r3 P2-2(b)): one cold wait per Welcome source at a time,
+/// and none during the cooldown after a wait that found nothing. Dropped
+/// unresolved (a failed or cancelled wait), it starts the cooldown.
+struct ColdWelcomeWaitSlot<'a> {
+    waits: &'a std::sync::Mutex<HashMap<AgentId, Option<std::time::Instant>>>,
+    source: AgentId,
+    resolved: bool,
+}
+
+impl<'a> ColdWelcomeWaitSlot<'a> {
+    fn claim(state: &'a AppState, source: AgentId) -> Option<Self> {
+        let mut waits = state.cold_welcome_waits.lock().ok()?;
+        let now = std::time::Instant::now();
+        waits.retain(|_, failed_at| {
+            failed_at.is_none_or(|at| now.duration_since(at) < COLD_WELCOME_WAIT_COOLDOWN)
+        });
+        if waits.contains_key(&source) {
+            return None;
+        }
+        waits.insert(source, None);
+        Some(Self {
+            waits: &state.cold_welcome_waits,
+            source,
+            resolved: false,
+        })
     }
-    parse_agent_id_hex(&welcome_ref.source).ok()
+}
+
+impl Drop for ColdWelcomeWaitSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut waits) = self.waits.lock() {
+            if self.resolved {
+                waits.remove(&self.source);
+            } else {
+                waits.insert(self.source, Some(std::time::Instant::now()));
+            }
+        }
+    }
 }
 
 /// x0x #1207 (lock rule): wait, up to [`COLD_RECIPIENT_WAIT`] and BEFORE any
@@ -399,16 +486,32 @@ async fn cold_welcome_authority(
 /// (resolve only; nothing is sent). The FetchRequest, sent later under the
 /// membership lock with a zero cold wait, then waits for nothing and finds
 /// the binding. An authority the node already resolves returns at once.
+///
+/// Codex r3 P2-2(b): the shared direct listener applies events inline, so
+/// the total wait is capped. One wait per source runs at a time, and a
+/// source whose wait found nothing is not waited for again for
+/// [`COLD_WELCOME_WAIT_COOLDOWN`]. With the cheap checks of
+/// [`cold_welcome_authority`] (the source must be an admin of the group on
+/// this agent's roster), a stream of events costs at most one wait per
+/// admin per cooldown.
 async fn await_cold_welcome_authority(state: &AppState, authority: &AgentId) {
-    if let Err(error) = state
+    let Some(mut slot) = ColdWelcomeWaitSlot::claim(state, *authority) else {
+        tracing::debug!(
+            authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+            "a cold wait for this Welcome authority is in flight or cooling down; the FetchRequest reads once"
+        );
+        return;
+    };
+    match state
         .agent
         .await_cold_recipient_binding(authority, COLD_RECIPIENT_WAIT)
         .await
     {
-        tracing::debug!(
+        Ok(()) => slot.resolved = true,
+        Err(error) => tracing::debug!(
             authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
             "no verified binding for the Welcome authority before the apply; the FetchRequest reads once: {error}"
-        );
+        ),
     }
 }
 
@@ -40147,6 +40250,7 @@ pub(in crate::server) mod tests {
             pending_adoption_chains: StdMutex::new(HashMap::new()),
             pending_head_attestations: StdMutex::new(HashMap::new()),
             pending_join_result_processing: StdMutex::new(HashMap::new()),
+            cold_welcome_waits: StdMutex::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),

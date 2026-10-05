@@ -415,11 +415,12 @@ impl RawQuicTransport<'_> {
         &self,
         agent: &Agent,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
         // Scripted too: the production redial over the script's connection
         // state (r7c).
         agent
-            .redial_direct_machine_from_discovery(agent_id, self)
+            .redial_direct_machine_from_discovery(agent_id, self, cold)
             .await
     }
 }
@@ -433,7 +434,8 @@ enum ColdResolution {
     Off,
     /// The crate-internal opt-in with a ZERO wait, for a send under a lock
     /// whose wait ran before the lock was taken: today's connect attempt,
-    /// then one read of the verified sources that does not wait.
+    /// then one read of the verified sources that does not wait. Its
+    /// peer-evidence checks are the non-blocking ones.
     ReadOnce,
     /// The crate-internal opt-in: wait for a verified binding until this ONE
     /// absolute deadline, which every resolution read also ends at.
@@ -449,6 +451,12 @@ impl ColdResolution {
             Some(wait) if wait.is_zero() => Self::ReadOnce,
             Some(wait) => Self::Until(tokio::time::Instant::now() + wait),
         }
+    }
+
+    /// Whether the send opted in: its peer-evidence checks are then the
+    /// non-blocking ones, so no synchronous evidence lock can hold it.
+    fn opted_in(self) -> bool {
+        !matches!(self, Self::Off)
     }
 
     /// The resolution deadline of a waiting send.
@@ -5812,7 +5820,21 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
-        let outcome = self.connect_to_agent_inner(agent_id).await?;
+        self.connect_to_agent_with(agent_id, false).await
+    }
+
+    /// [`Self::connect_to_agent`]; with `nonblocking_evidence` (x0x #1207,
+    /// an opted-in send's bounded resolution) every peer-evidence check is
+    /// the non-blocking one, so no synchronous evidence lock can hold the
+    /// caller (contention reads as no evidence).
+    async fn connect_to_agent_with(
+        &self,
+        agent_id: &identity::AgentId,
+        nonblocking_evidence: bool,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self
+            .connect_to_agent_inner(agent_id, nonblocking_evidence)
+            .await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
         }
@@ -5825,13 +5847,39 @@ impl Agent {
         &self,
         agent: identity::AgentId,
     ) -> Option<connectivity::ConnectOutcome> {
+        self.connect_from_evidence_with(agent, false).await
+    }
+
+    /// [`Self::connect_from_evidence`]; with `nonblocking` (x0x #1207, an
+    /// opted-in send's bounded resolution) the Lookup's pre-check and both
+    /// point-of-use checks are the non-blocking ones (contention: no dial).
+    async fn connect_from_evidence_with(
+        &self,
+        agent: identity::AgentId,
+        nonblocking: bool,
+    ) -> Option<connectivity::ConnectOutcome> {
         if !self.peer_evidence().wait(0).await {
             return None;
         }
-        self.peer_evidence().lookup(agent, None).await;
-        let view = self
-            .peer_evidence()
-            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let usable_agent = || {
+            let now = dm_capability::now_unix_ms();
+            if nonblocking {
+                self.peer_evidence()
+                    .try_usable_agent(agent, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(agent, now)
+            }
+        };
+        if nonblocking {
+            self.peer_evidence()
+                .lookup_without_blocking(agent, None)
+                .await;
+        } else {
+            self.peer_evidence().lookup(agent, None).await;
+        }
+        let view = usable_agent()?;
         let machine = view.announcement.machine_id;
         if self
             .recipient_pairing_denied(&agent, &machine)
@@ -5854,8 +5902,15 @@ impl Agent {
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
-        self.peer_evidence()
-            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        if nonblocking {
+            self.peer_evidence()
+                .try_usable(agent, machine, now)
+                .ok()
+                .flatten()?;
+        } else {
+            self.peer_evidence().usable(agent, machine, now)?;
+        }
         Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
                 connectivity::ConnectOutcome::Direct(addr)
@@ -5867,6 +5922,7 @@ impl Agent {
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
+        nonblocking_evidence: bool,
     ) -> error::Result<connectivity::ConnectOutcome> {
         let call_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -5891,11 +5947,17 @@ impl Agent {
             && self.peer_evidence().wait(0).await
         {
             if let Some(entry) = discovered.as_mut() {
-                if let Some(view) = self.peer_evidence().usable(
-                    *agent_id,
-                    entry.machine_id,
-                    dm_capability::now_unix_ms(),
-                ) {
+                let now = dm_capability::now_unix_ms();
+                let view = if nonblocking_evidence {
+                    self.peer_evidence()
+                        .try_usable(*agent_id, entry.machine_id, now)
+                        .ok()
+                        .flatten()
+                } else {
+                    self.peer_evidence()
+                        .usable(*agent_id, entry.machine_id, now)
+                };
+                if let Some(view) = view {
                     let local_scope = self
                         .network
                         .as_ref()
@@ -5911,7 +5973,10 @@ impl Agent {
         let agent = match discovered {
             Some(a) => a,
             None => {
-                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                if let Some(outcome) = self
+                    .connect_from_evidence_with(*agent_id, nonblocking_evidence)
+                    .await
+                {
                     return Ok(outcome);
                 }
 
@@ -8230,18 +8295,25 @@ impl Agent {
     /// repair. Discovery can lag the direct-messaging registry during a
     /// machine transition, so prefer whichever mapping ant-quic reports as
     /// connected and reconcile the discovery entry when the registry wins.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`), every read here ends at
+    /// its resolution deadline (a read still waiting there finds no machine)
+    /// and the evidence check never blocks.
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        let cached_machine_id = {
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "redial discovery", async {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|entry| entry.machine_id)
                 .filter(|machine_id| machine_id.0 != [0_u8; 32])
-        };
+        })
+        .await
+        .ok()?;
         if let Some(machine_id) = cached_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
@@ -8251,16 +8323,33 @@ impl Agent {
             }
         }
 
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "redial registry",
+            self.direct_messaging.get_machine_id(agent_id),
+        )
+        .await
+        .ok()?;
         if let Some(machine_id) = registry_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
                 .await
             {
                 if cached_machine_id != Some(machine_id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = machine_id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = machine_id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 return Some(machine_id);
@@ -8268,10 +8357,16 @@ impl Agent {
         }
 
         if cached_machine_id.is_none() && registry_machine_id.is_none() {
-            if let Some(view) = self
-                .peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-            {
+            let now = dm_capability::now_unix_ms();
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            if let Some(view) = view {
                 if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
@@ -8286,12 +8381,18 @@ impl Agent {
     /// Re-run the complete identity-discovery dial after the narrow
     /// bootstrap-cache repair path fails. A fresh presence card can contain
     /// usable addresses even when no cached transport route exists.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`) the dial's evidence
+    /// checks are the non-blocking ones and the resolution reads that follow
+    /// end at its deadline ([`Self::connected_direct_machine`]). The dial
+    /// itself is transport, with its own per-address timeouts.
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        if let Err(error) = self.connect_to_agent(agent_id).await {
+        if let Err(error) = self.connect_to_agent_with(agent_id, cold.opted_in()).await {
             tracing::debug!(
                 target: "x0x::direct",
                 stage = "send",
@@ -8302,7 +8403,8 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, transport).await
+        self.connected_direct_machine(agent_id, transport, cold)
+            .await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -8736,7 +8838,9 @@ impl Agent {
             let evidence = self.peer_evidence();
             let lookup = async {
                 if evidence.wait(0).await {
-                    evidence.lookup(*to, None).await;
+                    // x0x #1207: a bounded wait never blocks on the evidence
+                    // store, not even in the Lookup's pre-check.
+                    evidence.lookup_without_blocking(*to, None).await;
                 }
             };
             tokio::pin!(lookup);
@@ -9089,8 +9193,11 @@ impl Agent {
         }
         if binding.source == PinnedMachineSource::PeerEvidence {
             if let ColdResolution::Until(deadline) = cold {
-                let _ =
-                    tokio::time::timeout_at(deadline, self.connect_from_evidence(*agent_id)).await;
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    self.connect_from_evidence_with(*agent_id, true),
+                )
+                .await;
             }
         }
         Ok(())
@@ -9133,7 +9240,7 @@ impl Agent {
         #[cfg(test)]
         general_cold_barrier::park(&self.identity.agent_id(), to, general_cold_barrier::WARM_UP)
             .await;
-        let _ = tokio::time::timeout_at(deadline, self.connect_to_agent(to)).await;
+        let _ = tokio::time::timeout_at(deadline, self.connect_to_agent_with(to, true)).await;
         let binding = self.await_pinned_recipient_binding(to, deadline).await?;
         self.accept_cold_binding(to, &network::hex_prefix(&to.0, 4), binding, cold)
             .await
@@ -9186,9 +9293,18 @@ impl Agent {
             && registry_machine_id.is_none()
             && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
         {
-            self.peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-                .map(|v| v.announcement.machine_id)
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store (contention reads as no evidence).
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            view.map(|v| v.announcement.machine_id)
         } else {
             None
         };
@@ -9223,16 +9339,13 @@ impl Agent {
             (None, Some(id)) => (id, "registry_not_connected"),
             (None, None) if evidence_machine.is_some() => {
                 let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+                let dial = self.connect_from_evidence_with(*agent_id, cold.opted_in());
                 match cold.deadline() {
                     Some(deadline) => {
-                        let _ = tokio::time::timeout_at(
-                            deadline,
-                            self.connect_from_evidence(*agent_id),
-                        )
-                        .await;
+                        let _ = tokio::time::timeout_at(deadline, dial).await;
                     }
                     None => {
-                        let _ = self.connect_from_evidence(*agent_id).await;
+                        let _ = dial.await;
                     }
                 }
                 (id, "peer_evidence")
@@ -9272,7 +9385,7 @@ impl Agent {
                     // verified sources that does not wait (a held source
                     // reads as unknown), never a wait.
                     ColdResolution::ReadOnce => {
-                        let _ = self.connect_to_agent(agent_id).await;
+                        let _ = self.connect_to_agent_with(agent_id, true).await;
                         match self.direct_messaging.get_machine_id(agent_id).await {
                             Some(id) => (id, "post_connect"),
                             None => {
@@ -9315,8 +9428,11 @@ impl Agent {
                         #[cfg(test)]
                         general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes)
                             .await;
-                        let _ = tokio::time::timeout_at(deadline, self.connect_to_agent(agent_id))
-                            .await;
+                        let _ = tokio::time::timeout_at(
+                            deadline,
+                            self.connect_to_agent_with(agent_id, true),
+                        )
+                        .await;
                         match self
                             .await_pinned_recipient_binding(agent_id, deadline)
                             .await
@@ -9417,7 +9533,7 @@ impl Agent {
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
             if !connected {
-                if let Some(redialed_machine_id) = transport.redial(self, agent_id).await {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id, cold).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -9427,13 +9543,23 @@ impl Agent {
             }
         }
 
-        if resolution == "peer_evidence"
-            && self
-                .peer_evidence()
-                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
-                .is_none()
-        {
-            return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        if resolution == "peer_evidence" {
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store; contention fails closed (typed, retryable).
+            let usable = if cold.opted_in() {
+                matches!(
+                    self.peer_evidence().try_usable(*agent_id, machine_id, now),
+                    Ok(Some(_))
+                )
+            } else {
+                self.peer_evidence()
+                    .usable(*agent_id, machine_id, now)
+                    .is_some()
+            };
+            if !usable {
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
         }
 
         // x0x #1207 (P1): a cold-recipient binding is re-validated against

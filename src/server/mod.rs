@@ -1139,6 +1139,7 @@ pub async fn serve_with_options(
         pending_adoption_chains: StdMutex::new(HashMap::new()),
         pending_head_attestations: StdMutex::new(HashMap::new()),
         pending_join_result_processing: StdMutex::new(HashMap::new()),
+        cold_welcome_waits: StdMutex::new(HashMap::new()),
         causal_approval_queue: RwLock::new(HashMap::new()),
         predecessor_relay_outbox: RwLock::new(HashMap::new()),
         requester_offer_outbox: RwLock::new(HashMap::new()),

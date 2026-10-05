@@ -194,7 +194,17 @@ impl EvidenceRuntime {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
-        self.lookup_with_permit(agent, machine, permit).await;
+        self.lookup_with_permit(agent, machine, permit, false).await;
+    }
+
+    /// [`Self::lookup`] whose "already usable" pre-check never blocks on the
+    /// store or a policy read (x0x #1207), for bounded resolution: while a
+    /// lock is contended the Lookup simply runs.
+    pub(crate) async fn lookup_without_blocking(&self, agent: AgentId, machine: Option<MachineId>) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        self.lookup_with_permit(agent, machine, permit, true).await;
     }
 
     /// Reserve before spawning: raw frames never wait for a Lookup or queue
@@ -206,7 +216,7 @@ impl EvidenceRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime
-                .lookup_with_permit(agent, Some(machine), permit)
+                .lookup_with_permit(agent, Some(machine), permit, false)
                 .await;
         });
     }
@@ -224,6 +234,7 @@ impl EvidenceRuntime {
         agent: AgentId,
         machine: Option<MachineId>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        nonblocking: bool,
     ) {
         // Only the raw receive path supplies a transport-authenticated machine.
         // Its claimed agent is a routing hint, never evidence authority.
@@ -231,11 +242,13 @@ impl EvidenceRuntime {
             self.lookup_hints.record(agent, machine);
         }
         let now = crate::dm_capability::now_unix_ms();
-        let usable = match machine {
-            Some(machine) => self.usable(agent, machine, now),
-            None => self.usable_agent(agent, now),
+        let usable = match (machine, nonblocking) {
+            (Some(machine), false) => self.usable(agent, machine, now).is_some(),
+            (None, false) => self.usable_agent(agent, now).is_some(),
+            (Some(machine), true) => matches!(self.try_usable(agent, machine, now), Ok(Some(_))),
+            (None, true) => matches!(self.try_usable_agent(agent, now), Ok(Some(_))),
         };
-        if usable.is_some() {
+        if usable {
             return;
         }
         #[cfg(test)]
@@ -330,6 +343,22 @@ impl EvidenceRuntime {
             return None;
         }
         self.store.get()?.usable(agent, machine, now)
+    }
+    /// [`Self::usable`] without blocking on the store lock or a policy read
+    /// (x0x #1207); `Err(())` while a lock is contended.
+    pub(crate) fn try_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        if !self.ready.is_cancelled() {
+            return Ok(None);
+        }
+        match self.store.get() {
+            Some(store) => store.try_usable(agent, machine, now),
+            None => Ok(None),
+        }
     }
     /// Resolve a recipient when its live sources are empty.
     pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {

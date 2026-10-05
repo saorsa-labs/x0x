@@ -773,6 +773,22 @@ impl PeerEvidenceStore {
             Err(_) => Ok(None),
         }
     }
+    /// [`Self::usable`] without blocking on the store lock or a policy read
+    /// (x0x #1207), for bounded resolution: the same point-of-use authority
+    /// check, or `Err(())` while a lock is contended. Diagnostic counters
+    /// are not updated.
+    pub(crate) fn try_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        match self.check_usable_with(agent, machine, now, false) {
+            Ok(view) => Ok(Some(view)),
+            Err(STORE_BUSY) => Err(()),
+            Err(_) => Ok(None),
+        }
+    }
     /// Indexed candidates only; never substitutes for `usable` checks.
     pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
         self.state
