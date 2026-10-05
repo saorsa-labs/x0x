@@ -441,9 +441,16 @@ async fn cold_welcome_authority(
 /// the Welcome fetch's own retries cover the window.
 const COLD_WELCOME_WAIT_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// x0x #1207 (Codex r3 P2-2(b)): one cold wait per Welcome source at a time,
-/// and none during the cooldown after a wait that found nothing. Dropped
-/// unresolved (a failed or cancelled wait), it starts the cooldown.
+/// x0x #1207 (Codex r4 P3): the most Welcome sources tracked at once (in
+/// flight or cooling down). Expired cooldowns are evicted first; while the
+/// map is still full, a new source gets no wait (its FetchRequest still
+/// reads the verified sources once, and the Welcome fetch retries).
+const COLD_WELCOME_WAITS_MAX: usize = 256;
+
+/// x0x #1207 (Codex r3 P2-2(b), r4 P3): one cold wait per Welcome source at
+/// a time, none during the cooldown after a wait that found nothing, and at
+/// most [`COLD_WELCOME_WAITS_MAX`] sources tracked. Dropped unresolved (a
+/// failed or cancelled wait), it starts the cooldown.
 struct ColdWelcomeWaitSlot<'a> {
     waits: &'a std::sync::Mutex<HashMap<AgentId, Option<std::time::Instant>>>,
     source: AgentId,
@@ -457,7 +464,10 @@ impl<'a> ColdWelcomeWaitSlot<'a> {
         waits.retain(|_, failed_at| {
             failed_at.is_none_or(|at| now.duration_since(at) < COLD_WELCOME_WAIT_COOLDOWN)
         });
-        if waits.contains_key(&source) {
+        if waits.len().saturating_mul(4) < waits.capacity() {
+            waits.shrink_to_fit();
+        }
+        if waits.contains_key(&source) || waits.len() >= COLD_WELCOME_WAITS_MAX {
             return None;
         }
         waits.insert(source, None);

@@ -194,17 +194,31 @@ impl EvidenceRuntime {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
-        self.lookup_with_permit(agent, machine, permit, false).await;
+        self.lookup_with_permit(agent, machine, permit).await;
     }
 
-    /// [`Self::lookup`] whose "already usable" pre-check never blocks on the
-    /// store or a policy read (x0x #1207), for bounded resolution: while a
-    /// lock is contended the Lookup simply runs.
-    pub(crate) async fn lookup_without_blocking(&self, agent: AgentId, machine: Option<MachineId>) {
+    /// x0x #1207: start a Lookup for `agent` in the background (the permit
+    /// is reserved first, as in [`Self::spawn_lookup`]). The caller never
+    /// runs the Lookup's load barrier or its responder selection, whose
+    /// evidence and policy reads block synchronously, so a bounded wait can
+    /// start one. It re-reads its sources afterwards, as after
+    /// [`Self::lookup`].
+    pub(crate) fn spawn_agent_lookup(self: &Arc<Self>, agent: AgentId) {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
-        self.lookup_with_permit(agent, machine, permit, true).await;
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if runtime.wait(0).await {
+                runtime.lookup_with_permit(agent, None, permit).await;
+            }
+        });
+    }
+
+    /// x0x #1207: [`Self::wait`] without waiting: whether the evidence is
+    /// loaded (or the store never started) right now.
+    pub(crate) fn ready_now(&self) -> bool {
+        !self.started.load(Ordering::Acquire) || self.ready.is_cancelled()
     }
 
     /// Reserve before spawning: raw frames never wait for a Lookup or queue
@@ -216,7 +230,7 @@ impl EvidenceRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime
-                .lookup_with_permit(agent, Some(machine), permit, false)
+                .lookup_with_permit(agent, Some(machine), permit)
                 .await;
         });
     }
@@ -234,7 +248,6 @@ impl EvidenceRuntime {
         agent: AgentId,
         machine: Option<MachineId>,
         permit: tokio::sync::OwnedSemaphorePermit,
-        nonblocking: bool,
     ) {
         // Only the raw receive path supplies a transport-authenticated machine.
         // Its claimed agent is a routing hint, never evidence authority.
@@ -242,13 +255,11 @@ impl EvidenceRuntime {
             self.lookup_hints.record(agent, machine);
         }
         let now = crate::dm_capability::now_unix_ms();
-        let usable = match (machine, nonblocking) {
-            (Some(machine), false) => self.usable(agent, machine, now).is_some(),
-            (None, false) => self.usable_agent(agent, now).is_some(),
-            (Some(machine), true) => matches!(self.try_usable(agent, machine, now), Ok(Some(_))),
-            (None, true) => matches!(self.try_usable_agent(agent, now), Ok(Some(_))),
+        let usable = match machine {
+            Some(machine) => self.usable(agent, machine, now),
+            None => self.usable_agent(agent, now),
         };
-        if usable {
+        if usable.is_some() {
             return;
         }
         #[cfg(test)]
