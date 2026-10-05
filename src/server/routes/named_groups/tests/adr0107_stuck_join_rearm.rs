@@ -6108,3 +6108,76 @@ async fn s8b_1207_a_held_pairing_store_ends_the_send_by_the_deadline() -> anyhow
     );
     Ok(())
 }
+
+/// WHY (#1207, lock rule): a send under a lock opts in with a ZERO cold
+/// wait. It must wait for nothing, yet find a verified binding that the
+/// pre-lock wait learned, including one that only an ADR-0021 attestation
+/// holds (no discovery-cache or DM-registry entry), which an ordinary send
+/// cannot use. A truly unknown recipient still fails at once.
+#[tokio::test]
+async fn s8b_1207_a_zero_wait_send_finds_an_attested_binding_without_waiting() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .record_authenticated_binding_with_expiry_for_testing(
+            joiner_id,
+            g.joiner.agent.machine_id(),
+            now,
+            Some(now + 86_400),
+        )
+        .await;
+    let payload = b"adr0107-1207-zero-wait-attested".to_vec();
+    let started = std::time::Instant::now();
+    let attested = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            Duration::ZERO,
+        )
+        .await;
+    let attested_took = started.elapsed();
+    let unknown = x0x::identity::AgentId([0x7c; 32]);
+    let started = std::time::Instant::now();
+    let unknown_outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &unknown,
+            b"adr0107-1207-zero-wait-unknown".to_vec(),
+            direct_message_send_config(),
+            Duration::ZERO,
+        )
+        .await;
+    let unknown_took = started.elapsed();
+    // No wait at all; the limit is loose for loaded runners, and far below
+    // the 5 s cold wait.
+    let no_wait = Duration::from_millis(2_500);
+    assert!(
+        attested.is_ok() && general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "a zero-wait send did not use the attested binding: {attested:?}"
+    );
+    assert!(
+        attested_took < no_wait,
+        "the zero-wait send waited {attested_took:?}"
+    );
+    assert!(
+        matches!(
+            unknown_outcome,
+            Err(x0x::dm::DmError::RecipientUndiscovered(_))
+        ),
+        "an unknown recipient: {unknown_outcome:?}"
+    );
+    assert!(
+        unknown_took < no_wait,
+        "a zero-wait send to an unknown recipient waited {unknown_took:?}"
+    );
+    Ok(())
+}
