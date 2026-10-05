@@ -357,6 +357,36 @@ async fn corrupt_outbox_fails_closed() {
     assert_eq!(std::fs::read(world.outbox_path()).unwrap(), b"X0GOgarbage");
 }
 
+/// WHY (#1101): when the durable outbox write fails AFTER the atomic
+/// rename, the entry is already in `share-grant-outbox.bin`. The outbox
+/// must keep it in memory (memory == disk, so a later persist cannot
+/// silently drop a queued delivery) and still report the failure — the
+/// write is not confirmed durable.
+#[tokio::test]
+async fn enqueue_post_rename_failure_keeps_entry_and_reload_agrees() {
+    let world = World::new().await;
+    let outbox = world.outbox(world.now).await;
+    let grant = world.grant(0x7F, 3_600);
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&world.outbox_path());
+    let err = outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OutboxError::Store(_)), "{err:?}");
+
+    // Memory keeps the entry: it matches the advanced disk.
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 1, "the entry stays queued in memory");
+    assert_eq!(pending[0].grant, grant);
+    assert_eq!(pending[0].recipient, world.a1);
+
+    // A reload from disk agrees with memory.
+    let reloaded = world.outbox(world.now).await;
+    assert_eq!(reloaded.pending().len(), 1, "the entry is on disk");
+    assert_eq!(reloaded.pending()[0].grant, grant);
+}
+
 /// WHY (#926 test c): revoking a queued grant removes the entry and nothing
 /// is ever delivered — including after a restart.
 #[tokio::test]

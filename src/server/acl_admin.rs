@@ -263,24 +263,31 @@ async fn read_overlay<P: Plane>(path: &Path) -> Result<Vec<OverlayRecord<P::Spec
 async fn write_overlay<S: Serialize + Clone>(
     path: &Path,
     entries: &[OverlayRecord<S>],
-) -> Result<(), String> {
+) -> Result<(), x0x::storage::DurableWriteError> {
     let file = OverlayFile {
         version: OVERLAY_VERSION,
         entries: entries.to_vec(),
     };
-    let mut bytes = serde_json::to_vec_pretty(&file)
-        .map_err(|e| format!("failed to encode {}: {e}", path.display()))?;
+    let mut bytes = serde_json::to_vec_pretty(&file).map_err(|e| {
+        x0x::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+            "failed to encode {}: {e}",
+            path.display()
+        )))
+    })?;
     bytes.push(b'\n');
     if let Some(dir) = path.parent() {
-        ensure_private_dir(dir).await?;
+        ensure_private_dir(dir)
+            .await
+            .map_err(|e| x0x::storage::DurableWriteError::BeforeRename(std::io::Error::other(e)))?;
     }
     // Same helper as the owner key/journal files: temp file in the same
     // directory, fsync, chmod 0600, atomic rename, fsync the directory. An
     // interrupted write leaves only a stray `.<name>.*.tmp`, never a torn
-    // overlay.
+    // overlay. The typed error says whether the rename had already
+    // happened when a failure arrived (issue #1101).
     x0x::storage::write_private_bytes_durable(path, bytes)
         .await
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+        .map_err(|e| e.with_path(path))
 }
 
 /// Create the overlay directory and restrict it to the daemon user (0700
@@ -466,15 +473,31 @@ impl AclAdmin {
         let mut state = self.connect.lock().await;
         let (value, next) = prepare_add::<ConnectPlane>(&state, spec, install_has_owner)?;
         if let Some((overlay, effective)) = next {
-            write_overlay(&state.overlay_path, &overlay)
-                .await
-                .map_err(AclAdminError::Internal)?;
+            if let Err(e) = write_overlay(&state.overlay_path, &overlay).await {
+                // #1101: after the rename the file already holds the new
+                // overlay — commit it so memory agrees with disk (a
+                // restart would otherwise enforce an entry this daemon
+                // denied and omitted from its listing), then still fail:
+                // the write is not confirmed durable.
+                if e.crossed_rename() {
+                    commit_edit(&mut state, overlay, effective);
+                    self.publish_connect(&state);
+                    // Operator honesty (#1101 round 2): the entry IS applied
+                    // (disk and memory both hold it, and this daemon already
+                    // enforces it) — the API must not report a generic write
+                    // failure for an installed privilege.
+                    return Err(AclAdminError::Internal(format!(
+                        "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect"
+                    )));
+                }
+                return Err(AclAdminError::Internal(format!("failed to write {e}")));
+            }
             commit_edit(&mut state, overlay, effective);
             self.publish_connect(&state);
         }
         Ok(value)
     }
-
     /// `POST /acl/exec`.
     pub(super) async fn add_exec(
         &self,
@@ -484,9 +507,33 @@ impl AclAdmin {
         let mut state = self.exec.lock().await;
         let (value, next) = prepare_add::<ExecPlane>(&state, spec, install_has_owner)?;
         if let Some((overlay, effective)) = next {
-            write_overlay(&state.overlay_path, &overlay)
-                .await
-                .map_err(AclAdminError::Internal)?;
+            if let Err(e) = write_overlay(&state.overlay_path, &overlay).await {
+                // #1101: after the rename the file already holds the new
+                // overlay — commit it (and install the effective policy)
+                // so memory agrees with disk, then still fail: the write
+                // is not confirmed durable.
+                if e.crossed_rename() {
+                    // P3-3 (round 2): install failing here mirrors the
+                    // pre-existing success-path ordering below (write OK,
+                    // install fails => not committed); the on-disk overlay
+                    // applies at next start.
+                    if let Err(install) = self.install_exec(&effective) {
+                        return Err(AclAdminError::Internal(install));
+                    }
+                    commit_edit(&mut state, overlay, effective);
+                    self.publish_exec_status(&state);
+                    // Operator honesty (#1101 round 2): the entry IS
+                    // applied (disk and memory both hold it, and the exec
+                    // service already enforces it) — the API must not
+                    // report a generic write failure for an installed
+                    // privilege.
+                    return Err(AclAdminError::Internal(format!(
+                        "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                         the change is in effect"
+                    )));
+                }
+                return Err(AclAdminError::Internal(format!("failed to write {e}")));
+            }
             self.install_exec(&effective)
                 .map_err(AclAdminError::Internal)?;
             commit_edit(&mut state, overlay, effective);
@@ -502,9 +549,24 @@ impl AclAdmin {
     ) -> Result<serde_json::Value, AclAdminError> {
         let mut state = self.connect.lock().await;
         let (overlay, effective) = prepare_remove::<ConnectPlane>(&state, id)?;
-        write_overlay(&state.overlay_path, &overlay)
-            .await
-            .map_err(AclAdminError::Internal)?;
+        if let Err(e) = write_overlay(&state.overlay_path, &overlay).await {
+            // #1101: after the rename the file already holds the pruned
+            // overlay — commit it so memory agrees with disk, then still
+            // fail: the write is not confirmed durable.
+            if e.crossed_rename() {
+                commit_edit(&mut state, overlay, effective);
+                self.publish_connect(&state);
+                // Operator honesty (#1101 round 2): the removal IS applied
+                // (disk and memory both hold the pruned overlay, and this
+                // daemon already enforces it) — the API must not report a
+                // generic write failure for an effective change.
+                return Err(AclAdminError::Internal(format!(
+                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect"
+                )));
+            }
+            return Err(AclAdminError::Internal(format!("failed to write {e}")));
+        }
         commit_edit(&mut state, overlay, effective);
         self.publish_connect(&state);
         Ok(serde_json::json!({ "ok": true, "id": id, "removed": true }))
@@ -514,9 +576,31 @@ impl AclAdmin {
     pub(super) async fn remove_exec(&self, id: &str) -> Result<serde_json::Value, AclAdminError> {
         let mut state = self.exec.lock().await;
         let (overlay, effective) = prepare_remove::<ExecPlane>(&state, id)?;
-        write_overlay(&state.overlay_path, &overlay)
-            .await
-            .map_err(AclAdminError::Internal)?;
+        if let Err(e) = write_overlay(&state.overlay_path, &overlay).await {
+            // #1101: after the rename the file already holds the pruned
+            // overlay — commit it (and install the effective policy) so
+            // memory agrees with disk, then still fail: the write is not
+            // confirmed durable.
+            if e.crossed_rename() {
+                // Same ordering as the success path below (write OK,
+                // install fails => not committed); the on-disk overlay
+                // applies at next start.
+                if let Err(install) = self.install_exec(&effective) {
+                    return Err(AclAdminError::Internal(install));
+                }
+                commit_edit(&mut state, overlay, effective);
+                self.publish_exec_status(&state);
+                // Operator honesty (#1101 round 2): the removal IS applied
+                // (disk and memory both hold the pruned overlay, and the
+                // exec service already enforces it) — the API must not
+                // report a generic write failure for an effective change.
+                return Err(AclAdminError::Internal(format!(
+                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect"
+                )));
+            }
+            return Err(AclAdminError::Internal(format!("failed to write {e}")));
+        }
         self.install_exec(&effective)
             .map_err(AclAdminError::Internal)?;
         commit_edit(&mut state, overlay, effective);

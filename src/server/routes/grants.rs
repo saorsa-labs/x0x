@@ -50,7 +50,7 @@ fn grant_error(err: &ShareGrantError) -> Response {
         | ShareGrantError::Malformed(_)
         | ShareGrantError::Expired => StatusCode::BAD_REQUEST,
         ShareGrantError::NotForUs | ShareGrantError::Conflict => StatusCode::CONFLICT,
-        ShareGrantError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ShareGrantError::Store(_) | ShareGrantError::Poisoned(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     api_error(status, err.to_string()).into_response()
 }
