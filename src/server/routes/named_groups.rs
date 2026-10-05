@@ -44050,6 +44050,60 @@ pub(in crate::server) mod tests {
         /// poll + refire poll) both expire — exactly ONE timeout is
         /// counted (the owning finalizer's), and the finalizer never aborts
         /// its own task mid-cleanup (r7 item 3): the owner completes.
+        /// x0x #1207 (Codex review of dd414ca): the poll's cold wait ends at
+        /// the poll's ABSOLUTE deadline, even when the send's preflight (here
+        /// its Lookup before raw resolution, held for 3 s) uses up the rest
+        /// of a 2 s window. Raw resolution must then not wait at all: the
+        /// poll finalizes after its preflight plus one 2 s poll interval
+        /// (about 5 s), not after a further cold wait (about 7 s).
+        #[tokio::test]
+        async fn wp_b_t7d_a_delayed_preflight_never_extends_the_poll_past_its_window() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fe".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            let inviter = crate::identity::AgentId([7; 32]);
+            seed_pending_attempt(&state, &group, &event_group, &member, "a7d", String::new()).await;
+            let _poll_window = set_join_poll_window_override(&group, "a7d", 2_000);
+            let responder = std::sync::Arc::new(
+                move |agent: crate::identity::AgentId| -> futures::future::BoxFuture<'static, ()> {
+                    Box::pin(async move {
+                        if agent == inviter {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                    })
+                },
+            );
+            assert!(state
+                .agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok());
+            let started = std::time::Instant::now();
+            poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                event_group.clone(),
+                inviter,
+                member.clone(),
+                false,
+                None,
+                "a7d".into(),
+            )
+            .await;
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(6),
+                "the poll's cold wait outlived its window after a delayed preflight: {took:?}"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                1,
+                "the expiring window was finalized as a timeout"
+            );
+        }
+
         /// x0x #1207 (regression guard, CI on cabd95e): the join-result
         /// poll's opted-in cold wait for an unknown inviter is bounded by
         /// the poll's own window. An expiring 150 ms window must finalize
