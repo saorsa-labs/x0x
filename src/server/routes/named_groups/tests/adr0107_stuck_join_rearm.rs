@@ -6599,3 +6599,149 @@ async fn s8b_1207_the_cold_wait_map_is_capped() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// WHY (#1207, Codex r5 P2-2): a binding that the wait found for a cold
+/// recipient is newly repaired (unreachable at v0.46.3). That repair must
+/// end at the same absolute deadline, not with a fresh three-second budget.
+/// The repair never completes here; the send uses a 1 s wait.
+#[tokio::test]
+async fn s8b_1207_a_cold_binding_repair_ends_at_the_deadline() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-cold-binding-repair".to_vec();
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            Duration::from_secs(1),
+        )
+        .await;
+    let took = started.elapsed();
+    let repaired = repair.reached.available_permits();
+    repair.release();
+    assert!(
+        repaired >= 1,
+        "control: the send repaired the bound machine"
+    );
+    assert!(
+        took < Duration::from_millis(2_200),
+        "the cold binding's repair ran past the 1 s deadline: {took:?}"
+    );
+    assert!(
+        matches!(outcome, Err(x0x::dm::DmError::RecipientUndiscovered(_))),
+        "{outcome:?}"
+    );
+    assert!(!general_deliveries(&g.authority, &g.joiner).contains(&payload));
+    Ok(())
+}
+
+/// WHY (#1207, Codex r5 P3): while the cooldown map is full, a new Welcome
+/// source gets no wait, but it must still make progress: the node starts a
+/// background Lookup for it (permit-bounded, nothing waits on it), so a
+/// zero-wait FetchRequest retry can find the evidence later. The source is
+/// a second admin of the group, which nothing else on the node contacts.
+#[tokio::test]
+async fn s8b_1207_a_full_cold_wait_map_still_starts_a_lookup() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let authority_id = s.authority_id;
+    let source = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let source_hex = hex::encode(source.as_bytes());
+    s.j2.named_groups
+        .write()
+        .await
+        .get_mut(&s.group_key)
+        .ok_or_else(|| anyhow::anyhow!("J2's group row"))?
+        .add_member(
+            source_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(hex_of(&s.authority)),
+            None,
+        );
+    let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let lookups = Arc::clone(&lookups);
+        let responder = Arc::new(
+            move |agent: x0x::identity::AgentId| -> futures::future::BoxFuture<'static, ()> {
+                if agent == source {
+                    lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Box::pin(async {})
+            },
+        );
+        anyhow::ensure!(
+            s.j2.agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok(),
+            "lookup responder"
+        );
+    }
+    {
+        let mut waits =
+            s.j2.cold_welcome_waits
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cold wait map"))?;
+        let now = std::time::Instant::now();
+        for _ in 0..256 {
+            waits.insert(
+                x0x::identity::AgentKeypair::generate()?.agent_id(),
+                Some(now),
+            );
+        }
+    }
+    let mut event = j2_add_from_source(&s, &source_hex)?;
+    if let NamedGroupMetadataEvent::MemberAdded {
+        commit: Some(commit),
+        ..
+    } = &mut event
+    {
+        commit.committed_at = commit.committed_at.saturating_add(1);
+    }
+    let gate = x0x::general_cold_barrier::arm(
+        s.j2.agent.agent_id(),
+        source,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let started = std::time::Instant::now();
+    let _ = apply_named_group_metadata_event(&s.j2, event, authority_id, true, None).await;
+    let took = started.elapsed();
+    let waits = gate.reached.available_permits();
+    let kicked = tokio::time::timeout(Duration::from_secs(5), async {
+        while lookups.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), source);
+    assert_eq!(waits, 0, "a full cooldown map admitted a wait ({took:?})");
+    assert!(
+        kicked,
+        "a source refused by a full cooldown map got no Lookup: no progress"
+    );
+    Ok(())
+}

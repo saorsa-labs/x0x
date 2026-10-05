@@ -3715,6 +3715,46 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// WHY (x0x #1207, Codex r5 P2-1, mandatory): a ZERO-wait send (the
+    /// in-lock Welcome FetchRequest) must never wait on the evidence load
+    /// barrier, not even in raw resolution. A current capability advert
+    /// skips the barrier before raw resolution, and the evidence store is
+    /// still loading. The send must end at once, retryably.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s8b_1207_a_zero_wait_send_never_waits_on_evidence_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = s8b_1207_agent(dir.path()).await;
+        let peer = AgentKeypair::generate().unwrap().agent_id();
+        let machine = MachineKeypair::generate().unwrap().machine_id();
+        assert!(agent.capability_store().insert(
+            peer,
+            machine,
+            DmCapabilities::pending(),
+            crate::dm_capability::now_unix_ms(),
+        ));
+        agent.peer_evidence().hold_load_barrier_for_testing();
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        let started = std::time::Instant::now();
+        let outcome = agent
+            .send_direct_with_config_cold_wait(
+                &peer,
+                b"adr0107-1207-zero-wait-evidence-loading".to_vec(),
+                crate::dm::DmSendConfig::default(),
+                std::time::Duration::ZERO,
+            )
+            .await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the zero-wait send waited {took:?} on evidence loading"
+        );
+        assert!(
+            matches!(outcome, Err(crate::dm::DmError::RecipientUndiscovered(_))),
+            "{outcome:?}"
+        );
+        agent.shutdown().await;
+    }
+
     #[tokio::test]
     async fn s2_cold_send_resolves_kem_and_strict_ack_without_an_announcement() {
         let p = Peer::new();

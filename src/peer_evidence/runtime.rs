@@ -215,6 +215,14 @@ impl EvidenceRuntime {
         });
     }
 
+    /// Test seam (x0x #1207): mark the store started without completing its
+    /// load, so every load-barrier wait waits (up to its five-second bound).
+    /// Test builds only.
+    #[cfg(test)]
+    pub(crate) fn hold_load_barrier_for_testing(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
     /// x0x #1207: [`Self::wait`] without waiting: whether the evidence is
     /// loaded (or the store never started) right now.
     pub(crate) fn ready_now(&self) -> bool {
