@@ -5591,3 +5591,38 @@ async fn s8b_1207_known_agent_send_latency_is_unchanged() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// WHY (#1207 control): the bounded wait reads retained verified bindings
+/// (the announced-binding store and ADR-0021 attestations), and revocation
+/// does not evict them. A recipient whose machine is revoked must still be
+/// refused on the general path: nothing is delivered.
+#[tokio::test]
+async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    revoke_machine(&g.authority, &g.joiner).await?;
+    let payload = b"adr0107-1207-revoked".to_vec();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config(&joiner_id, payload.clone(), direct_message_send_config())
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a revoked machine was sent to: {outcome:?}"
+    );
+    assert!(
+        !general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "the DM reached a revoked machine"
+    );
+    Ok(())
+}
