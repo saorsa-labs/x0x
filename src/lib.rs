@@ -7381,6 +7381,42 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_history(to, payload, config, std::time::Duration::ZERO)
+            .await
+    }
+
+    /// x0x #1207, #1217 (crate-internal opt-in; the public API is
+    /// unchanged): [`Self::send_direct_with_config`] that may wait up to
+    /// `cold_wait` for a VERIFIED binding of a recipient no discovery-cache
+    /// or DM-registry entry knows, as after a restart. The sources are the
+    /// announced identity, an ADR-0021 attestation, the DM registry and
+    /// peer evidence. The wait is one absolute deadline from the start of
+    /// the raw attempt, covering resolution and re-validation against the
+    /// final machine; the transport's repair and ACK budget is separate. It
+    /// applies only where raw QUIC is the delivering path. Use it only where
+    /// the sender holds no lock and does not fan out serially.
+    pub(crate) async fn send_direct_with_config_cold_wait(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, cold_wait)
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// The single DM egress funnel with its ADR-0023 history wiring;
+    /// `cold_wait` is zero for every caller except the crate-internal
+    /// opt-in above.
+    async fn send_direct_with_history(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -7395,7 +7431,7 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -7448,6 +7484,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -7781,12 +7818,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
-        // x0x #1207, #1217: the OPT-IN bounded wait for a restart-cold
-        // recipient's verified binding (`DmSendConfig::cold_recipient_wait`,
-        // zero by default: today's instant failure). It applies only where raw
-        // QUIC is the path that delivers (no gossip-inbox capability), so a
+        // x0x #1207, #1217: `cold_wait` is the OPT-IN bounded wait for a
+        // restart-cold recipient's verified binding
+        // (`send_direct_with_config_cold_wait`; zero for every other caller:
+        // today's instant failure). It applies only where raw QUIC is the
+        // path that delivers (no gossip-inbox capability), so a
         // gossip-capable send still falls back to gossip at once, as before.
-        let cold_wait = config.cold_recipient_wait;
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -8998,7 +9035,7 @@ impl Agent {
                             }
                         }
                     }
-                    // x0x #1207, #1217 (opt-in, `DmSendConfig::cold_recipient_wait`):
+                    // x0x #1207, #1217 (opt-in, `send_direct_with_config_cold_wait`):
                     // a restart leaves the discovery cache and the DM registry
                     // cold. Wait, within the ONE absolute `resolution_deadline`
                     // (from the start of this raw attempt), for a VERIFIED

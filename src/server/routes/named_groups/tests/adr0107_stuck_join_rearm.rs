@@ -5377,7 +5377,7 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
 // ---------------------------------------------------------------------------
 // #1207 / #1217 (v0.46.4): the GENERAL direct-send path failed at once with
 // `err_agent_not_found` when a restart left the discovery cache cold. Opted-in
-// sends (`DmSendConfig::cold_recipient_wait`) now wait, within one absolute
+// sends (`Agent::send_direct_with_config_cold_wait`) now wait, within one absolute
 // deadline, for a verified binding, as the pinned path does, and re-validate it
 // against the final machine. Every other send still fails at once. The strict
 // stand-in runs the general path's production resolution in process; the
@@ -5568,10 +5568,11 @@ async fn s8b_1207_unknown_agent_ends_in_the_typed_error_within_the_bound() -> an
     let outcome = g
         .authority
         .agent
-        .send_direct_with_config(
+        .send_direct_with_config_cold_wait(
             &unknown,
             b"adr0107-1207-unknown".to_vec(),
-            super::super::with_cold_recipient_wait(direct_message_send_config()),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
         )
         .await;
     let elapsed = started.elapsed();
@@ -5677,10 +5678,11 @@ async fn s8b_1207_known_agent_send_latency_is_unchanged() -> anyhow::Result<()> 
     let outcome = g
         .authority
         .agent
-        .send_direct_with_config(
+        .send_direct_with_config_cold_wait(
             &g.joiner.agent.agent_id(),
             payload.clone(),
-            super::super::with_cold_recipient_wait(direct_message_send_config()),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
         )
         .await;
     let elapsed = started.elapsed();
@@ -5781,10 +5783,11 @@ async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::
             tokio::spawn(async move {
                 authority
                     .agent
-                    .send_direct_with_config(
+                    .send_direct_with_config_cold_wait(
                         &joiner_id,
                         payload,
-                        super::super::with_cold_recipient_wait(direct_message_send_config()),
+                        direct_message_send_config(),
+                        super::super::COLD_RECIPIENT_WAIT,
                     )
                     .await
             })

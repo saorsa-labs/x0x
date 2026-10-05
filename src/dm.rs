@@ -1080,17 +1080,6 @@ pub struct DmSendConfig {
     /// than declaring the peer disconnected. Default 250ms. Setting to 0
     /// disables the grace and reverts to legacy behaviour.
     pub prefer_newest_grace_ms: u64,
-    /// x0x #1207, #1217 (opt-in): how long a raw-QUIC send may wait for a
-    /// VERIFIED binding of a recipient that no discovery-cache or DM-registry
-    /// entry knows, as after a restart. The sources are the announced
-    /// identity, an ADR-0021 attestation, the DM registry and peer evidence.
-    /// The wait is one absolute deadline from the start of the raw attempt,
-    /// covering resolution and its re-validation; it does not include the
-    /// transport's repair or ACK budget. It applies only where raw QUIC is
-    /// the delivering path. Default zero: an unknown recipient fails at once,
-    /// as before. Set it only where the sender holds no lock and does not
-    /// fan out serially.
-    pub cold_recipient_wait: Duration,
 }
 
 impl Default for DmSendConfig {
@@ -1114,7 +1103,6 @@ impl Default for DmSendConfig {
             logical_request_id: None,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
-            cold_recipient_wait: Duration::ZERO,
         }
     }
 }
