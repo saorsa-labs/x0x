@@ -3410,6 +3410,114 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// WHY (x0x #1207, Codex r3 P2-1): an opted-in send's resolution never
+    /// blocks on the evidence store's synchronous lock. The recipient
+    /// resolves from peer evidence. While the send-readiness repair runs, a
+    /// writer takes the store's state. The post-repair evidence check must
+    /// not wait on it: a blocking point-of-use check would hold the send (and
+    /// its worker thread, which no deadline can interrupt) until the writer
+    /// lets go. It fails closed at once instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s8b_1207_an_opted_in_send_never_blocks_on_a_held_evidence_store() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, _, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let agent = crate::Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key_path(dir.path().join("user.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        let peer = p.a();
+        agent
+            .start_peer_evidence(
+                dir.path().to_owned(),
+                EvidenceConfig::default(),
+                Arc::new(move |a| Some(a == peer)),
+            )
+            .unwrap();
+        assert!(agent.peer_evidence().wait(0).await);
+        assert!(
+            agent.peer_evidence().usable_agent(peer, now).is_some(),
+            "control: the recipient resolves from peer evidence"
+        );
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        let repair = crate::PinnedRepairGate::new();
+        agent.script_pinned_standin_transport_for_testing(
+            crate::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+        let agent = Arc::new(agent);
+        let mut send = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_direct_with_config_cold_wait(
+                        &peer,
+                        b"adr0107-1207-held-evidence-policy".to_vec(),
+                        crate::dm::DmSendConfig::default(),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        let entered =
+            tokio::time::timeout(std::time::Duration::from_secs(20), repair.reached.acquire())
+                .await;
+        assert!(
+            matches!(entered, Ok(Ok(_))),
+            "the send never reached the send-readiness repair"
+        );
+        // A writer takes the evidence store's state, in its own thread,
+        // until told to let go.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = agent.peer_evidence().store().unwrap();
+            std::thread::spawn(move || {
+                let _held = store.lock().unwrap();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            })
+        };
+        assert!(held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok());
+        // Wall-clock: a blocked worker thread also stalls the runtime's
+        // timers, so a tokio timeout cannot be trusted to fire here.
+        let released = std::time::Instant::now();
+        repair.release();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(4), &mut send).await;
+        let ended_after = released.elapsed();
+        let _ = release_tx.send(());
+        let _ = tokio::task::spawn_blocking(move || holder.join()).await;
+        let outcome = match ended {
+            Ok(joined) => Some(joined.unwrap()),
+            Err(_) => {
+                let _ = send.await;
+                None
+            }
+        };
+        assert!(
+            outcome.is_some() && ended_after < std::time::Duration::from_secs(3),
+            "the opted-in send waited {ended_after:?} on the held evidence store"
+        );
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "a send past a held evidence store must fail closed: {outcome:?}"
+        );
+        agent.shutdown().await;
+    }
+
     #[tokio::test]
     async fn s2_cold_send_resolves_kem_and_strict_ack_without_an_announcement() {
         let p = Peer::new();

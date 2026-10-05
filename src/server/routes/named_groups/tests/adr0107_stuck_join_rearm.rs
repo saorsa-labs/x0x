@@ -5597,83 +5597,142 @@ async fn s8b_1207_cold_welcome_fetch_waits_outside_the_membership_lock() -> anyh
     Ok(())
 }
 
-/// WHY (#1207, lock rule, causal replay): the ADR 0028 replay applies a
-/// queued `JoinRequestApproved` under the group's membership lock, the
-/// queue-persistence lock, the global roster-persistence lock and the
-/// GSS-publication gate. An approval that seats THIS agent with a Welcome by
-/// reference makes it fetch the Welcome from a possibly cold authority, so
-/// that wait must happen before the replay takes any guard. (The queued
-/// approval here is a stand-in: the replay rejects it after the wait.)
+/// WHY (#1207, lock rule, causal replay; Codex r3 P3): the ADR 0028 replay
+/// applies a queued `JoinRequestApproved` under the group's membership lock,
+/// the queue-persistence lock, the global roster-persistence lock and the
+/// GSS-publication gate. A VALID approval that seats THIS agent in a TreeKEM
+/// group (the real authority approval, with its Welcome by reference) makes
+/// the replay fetch the Welcome from the authority, cold to this agent. That
+/// wait must run before the replay takes any guard; the FetchRequest must
+/// then reach the authority. (The ADR 0028 queue writer admits only
+/// non-TreeKEM approvals today, so the entry stands for a sidecar entry.)
 #[tokio::test]
 async fn s8b_1207_causal_replay_waits_for_a_cold_welcome_authority_before_its_guards(
 ) -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let s = build(dir.path()).await?;
-    restart_cold(&s.j2, &s.authority, &s.stable).await;
-    let j2_hex = hex_of(&s.j2);
-    let request_id = "adr0107-1207-replay".to_string();
-    let revision = s.base + 9;
-    let now_ms = now_millis_u64();
-    let approval = NamedGroupMetadataEvent::JoinRequestApproved {
-        group_id: s.stable.clone(),
-        request_id: request_id.clone(),
-        revision,
-        actor: hex_of(&s.authority),
-        requester_agent_id: j2_hex.clone(),
-        treekem_commit_b64: None,
-        treekem_welcome_b64: None,
-        welcome_ref: Some(WelcomeRef {
-            welcome_id: "adr0107-1207-replay-welcome".to_string(),
-            byte_len: 64,
-            source: hex_of(&s.authority),
-        }),
-        treekem_key_package_hash: None,
-        treekem_epoch: None,
-        commit: None,
+    let fixture = super::member_joined_treekem_fixture(0xd1, 0xd2).await?;
+    let authority = Arc::clone(&fixture.state);
+    let authority_id = authority.agent.agent_id();
+    let authority_hex = hex::encode(authority_id.as_bytes());
+    let (requester, _requester_dir) = super::secure_endpoint_test_state().await?;
+    let requester_id = requester.agent.agent_id();
+    let requester_hex = hex::encode(requester_id.as_bytes());
+    requester
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    // R's pending request (with R's own TreeKEM KeyPackage) at the authority;
+    // R holds the same pre-approval state.
+    let group_bytes = hex::decode(&fixture.group_id)?;
+    let seed = agent_treekem_seed(requester.agent.as_ref(), &group_bytes);
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(requester_id, &seed)?;
+    let mut request = x0x::groups::JoinRequest::new(
+        fixture.group_id.clone(),
+        requester_hex.clone(),
+        None,
+        now_millis_u64(),
+    );
+    request.treekem_key_package_b64 = Some(BASE64.encode(prepared.key_package_bytes()));
+    let request_id = request.request_id.clone();
+    let pre_approval = {
+        let mut groups = authority.named_groups.write().await;
+        let info = groups
+            .get_mut(&fixture.group_id)
+            .ok_or_else(|| anyhow::anyhow!("the authority's group"))?;
+        info.join_requests.insert(request_id.clone(), request);
+        info.clone()
     };
-    s.j2.causal_approval_queue
+    requester
+        .named_groups
         .write()
         .await
-        .entry(s.group_key.clone())
+        .insert(fixture.group_id.clone(), pre_approval);
+    let (status, _) = super::super::approve_treekem_join_request(
+        Arc::clone(&authority),
+        fixture.group_id.clone(),
+        request_id.clone(),
+        authority_hex,
+    )
+    .await;
+    anyhow::ensure!(status == StatusCode::OK, "the authority approves: {status}");
+    let approval = authority
+        .treekem_event_log
+        .read()
+        .await
+        .get(&fixture.stable_group_id)
+        .and_then(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|event| {
+                    matches!(
+                        event,
+                        NamedGroupMetadataEvent::JoinRequestApproved {
+                            requester_agent_id, ..
+                        } if *requester_agent_id == requester_hex
+                    )
+                })
+                .cloned()
+        })
+        .ok_or_else(|| anyhow::anyhow!("the authority logged the approval"))?;
+    let NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: event_group_id,
+        revision,
+        welcome_ref: Some(welcome_ref),
+        ..
+    } = &approval
+    else {
+        anyhow::bail!("a TreeKEM approval with a Welcome by reference");
+    };
+    let expected = serde_json::to_vec(&WelcomeBlobMessage::FetchRequest {
+        group_id: event_group_id.clone(),
+        welcome_id: welcome_ref.welcome_id.clone(),
+    })?;
+    let now_ms = now_millis_u64();
+    let revision = *revision;
+    requester
+        .causal_approval_queue
+        .write()
+        .await
+        .entry(fixture.group_id.clone())
         .or_default()
         .push_back(PendingCausalApproval {
             envelope_bytes: Vec::new(),
             digest: [0x5a; 32],
             byte_size: 0,
             event: approval,
-            sender: s.authority_id,
+            sender: authority_id,
             first_seen_ms: now_ms,
             expires_at_ms: now_ms + 600_000,
             request_id,
-            requester_agent_id: j2_hex,
+            requester_agent_id: requester_hex,
             revision,
             conflicted: false,
             conflicted_with: None,
         });
-    let gate = x0x::general_cold_barrier::arm(
-        s.j2.agent.agent_id(),
-        s.authority_id,
-        Some(x0x::general_cold_barrier::WARM_UP),
-    );
+    // The cold wait for THIS FetchRequest parks here, wherever it runs.
+    let gate = x0x::general_cold_barrier::arm(requester_id, authority_id, Some(expected.len()));
     let replay = {
-        let (j2, group_key) = (Arc::clone(&s.j2), s.group_key.clone());
+        let (requester, group_key) = (Arc::clone(&requester), fixture.group_id.clone());
         tokio::spawn(async move {
             let mut cleared = std::collections::BTreeSet::new();
-            super::super::replay_pending_causal_approvals(&j2, &group_key, &mut cleared).await;
+            super::super::replay_pending_causal_approvals(&requester, &group_key, &mut cleared)
+                .await;
         })
     };
-    entered_cold_wait(&gate, "the replay's Welcome authority").await;
-    let membership = super::super::group_membership_lock(&s.j2, &s.group_key).await;
+    entered_cold_wait(&gate, "the replay's Welcome fetch").await;
+    let membership = super::super::group_membership_lock(&requester, &fixture.group_id).await;
     let membership_held = membership.try_lock().is_err();
-    let queue_held =
-        s.j2.causal_approval_queue_persistence_lock
-            .try_lock()
-            .is_err();
-    let roster_held = s.j2.named_groups_persistence_lock.try_lock().is_err();
-    let gss_held = s.j2.gss_publication_gate.try_write().is_err();
+    let queue_held = requester
+        .causal_approval_queue_persistence_lock
+        .try_lock()
+        .is_err();
+    let roster_held = requester.named_groups_persistence_lock.try_lock().is_err();
+    let gss_held = requester.gss_publication_gate.try_write().is_err();
+    announce_fresh(&requester, &authority).await;
     gate.release();
-    let finished = tokio::time::timeout(Duration::from_secs(20), replay).await;
-    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    let delivered =
+        delivered_within(&requester, &authority, &expected, Duration::from_secs(10)).await;
+    x0x::general_cold_barrier::disarm(requester_id, authority_id);
+    replay.abort();
     assert!(
         !membership_held,
         "the replay held the membership lock during the wait"
@@ -5691,8 +5750,157 @@ async fn s8b_1207_causal_replay_waits_for_a_cold_welcome_authority_before_its_gu
         "the replay held the GSS-publication gate during the wait"
     );
     assert!(
-        matches!(finished, Ok(Ok(()))),
-        "the replay did not finish: {finished:?}"
+        delivered,
+        "the replay's FetchRequest never reached the authority"
+    );
+    Ok(())
+}
+
+/// J2's sealed add, with its Welcome reference naming `source`.
+fn j2_add_from_source(s: &Fixture, source: &str) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let mut event = s.j2_add.clone();
+    let NamedGroupMetadataEvent::MemberAdded {
+        welcome_ref: Some(welcome_ref),
+        ..
+    } = &mut event
+    else {
+        anyhow::bail!("J2's add carries a Welcome by reference");
+    };
+    welcome_ref.source = source.to_string();
+    Ok(event)
+}
+
+/// An event for a group of J2's own, unrelated to the Home group, as the
+/// shared listener would next apply it.
+async fn unrelated_group_event(s: &Fixture) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let created = create_named_group(
+        State(Arc::clone(&s.j2)),
+        Json(CreateGroupRequest {
+            name: "unrelated".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = created.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await?)?;
+    anyhow::ensure!(status == StatusCode::CREATED, "create: {status} {body}");
+    let key = body["group_id"].as_str().unwrap_or_default().to_string();
+    let stable =
+        s.j2.named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(|info| info.stable_group_id().to_string())
+            .ok_or_else(|| anyhow::anyhow!("the unrelated group"))?;
+    let mut event = s.j1_add.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { group_id, .. } = &mut event {
+        *group_id = stable;
+    }
+    Ok(event)
+}
+
+/// Apply `events` one after another, as the shared direct metadata listener
+/// does (inline), then `next`. Returns when `next` was applied, measured
+/// from the start.
+async fn listener_reaches(
+    s: &Fixture,
+    events: Vec<NamedGroupMetadataEvent>,
+    next: NamedGroupMetadataEvent,
+) -> Duration {
+    let started = std::time::Instant::now();
+    for event in events {
+        let _ = apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
+    }
+    let _ = apply_named_group_metadata_event(&s.j2, next, s.authority_id, true, None).await;
+    started.elapsed()
+}
+
+/// WHY (#1207, Codex r3 P2-2(a)): an authenticated admin can send
+/// self-seating events whose Welcome reference names a source that cannot
+/// be the group's authority. The node must reject them before any wait, so
+/// they cannot hold up the shared listener and, with it, an unrelated
+/// group's event.
+#[tokio::test]
+async fn s8b_1207_bogus_self_seating_events_do_not_delay_an_unrelated_group() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let j2_id = s.j2.agent.agent_id();
+    let mut bogus = Vec::new();
+    let mut gates = Vec::new();
+    for _ in 0..4 {
+        let unknown = x0x::identity::AgentKeypair::generate()?.agent_id();
+        bogus.push(j2_add_from_source(&s, &hex::encode(unknown.as_bytes()))?);
+        // Count the cold waits (a released gate counts each and lets it pass).
+        let gate = x0x::general_cold_barrier::arm(
+            j2_id,
+            unknown,
+            Some(x0x::general_cold_barrier::WARM_UP),
+        );
+        gate.release();
+        gates.push((unknown, gate));
+    }
+    let next = unrelated_group_event(&s).await?;
+    let reached = listener_reaches(&s, bogus, next).await;
+    let waits: usize = gates
+        .iter()
+        .map(|(_, gate)| gate.reached.available_permits())
+        .sum();
+    for (unknown, _) in &gates {
+        x0x::general_cold_barrier::disarm(j2_id, *unknown);
+    }
+    assert_eq!(waits, 0, "bogus Welcome sources were waited for");
+    assert!(
+        reached < Duration::from_secs(3),
+        "an unrelated group's event waited {reached:?} behind bogus self-seating events"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r3 P2-2(b)): repeated self-seating events that name a
+/// real admin of the group as the Welcome source, but are rejected by the
+/// apply (here: a tampered commit), must not each cost a cold wait on the
+/// shared listener. At most one wait per source runs within the cap.
+#[tokio::test]
+async fn s8b_1207_waits_for_one_cold_admin_source_are_capped() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let mut rejected = Vec::new();
+    for attempt in 0..4u64 {
+        let mut event = j2_add_from_source(&s, &hex_of(&s.authority))?;
+        if let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } = &mut event
+        {
+            commit.committed_at = commit.committed_at.saturating_add(attempt + 1);
+        }
+        rejected.push(event);
+    }
+    let next = unrelated_group_event(&s).await?;
+    let gate = x0x::general_cold_barrier::arm(
+        s.j2.agent.agent_id(),
+        s.authority_id,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let reached = listener_reaches(&s, rejected, next).await;
+    let waits = gate.reached.available_permits();
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    assert!(
+        waits <= 1,
+        "{waits} cold waits ran for one cold admin source (listener reached the next event after {reached:?})"
+    );
+    assert!(
+        reached < super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(4),
+        "the listener reached the next event only after {reached:?}"
     );
     Ok(())
 }
@@ -6178,6 +6386,76 @@ async fn s8b_1207_a_zero_wait_send_finds_an_attested_binding_without_waiting() -
     assert!(
         unknown_took < no_wait,
         "a zero-wait send to an unknown recipient waited {unknown_took:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r3 P2-1): the one deadline also bounds the resolution
+/// reads of the discovery redial that follows a failed repair. A writer
+/// holding the DM registry while the repair runs (after the first reads)
+/// must end the send by the deadline, not hold it in the redial's registry
+/// read.
+#[tokio::test]
+async fn s8b_1207_a_held_registry_during_the_redial_ends_the_send_by_the_deadline(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    let repair = x0x::PinnedRepairGate::new();
+    // The repair fails, so the production redial runs.
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], false)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-held-registry-redial".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    super::super::COLD_RECIPIENT_WAIT,
+                )
+                .await
+        })
+    };
+    repair_entered(&repair, "held registry").await;
+    let registry = Arc::clone(g.authority.agent.direct_messaging());
+    let held = registry.hold_registry_for_testing().await;
+    repair.release();
+    let bound = super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(3);
+    let ended = tokio::time::timeout(bound.saturating_sub(started.elapsed()), &mut send).await;
+    let ended_after = started.elapsed();
+    drop(held);
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    let delivered = general_deliveries(&g.authority, &g.joiner).contains(&payload);
+    assert!(
+        outcome.is_some(),
+        "the send was still waiting on the held registry {ended_after:?} after it started"
+    );
+    assert!(
+        matches!(outcome, Some(Err(_))) && !delivered,
+        "a send past a held registry must fail, not deliver: {outcome:?}"
     );
     Ok(())
 }
