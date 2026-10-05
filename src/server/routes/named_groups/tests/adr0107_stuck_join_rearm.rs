@@ -6745,3 +6745,46 @@ async fn s8b_1207_a_full_cold_wait_map_still_starts_a_lookup() -> anyhow::Result
     );
     Ok(())
 }
+
+/// WHY (#1207, #1217, Codex r5 P2-2 control): why a cold binding's repair is
+/// bounded by the deadline rather than skipped. The wait finds the
+/// recipient's binding (here at once, from its announced identity) but its
+/// machine is not connected: the wait's own connect attempt ran before the
+/// binding was known. The repair, inside the deadline, is the step that
+/// connects it, so the send must deliver.
+#[tokio::test]
+async fn s8b_1207_a_cold_binding_whose_repair_connects_is_delivered() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(x0x::PinnedTransportScript::connected_only(
+            &[],
+            true,
+        ));
+    let payload = b"adr0107-1207-cold-binding-repaired".to_vec();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
+        )
+        .await;
+    assert!(
+        outcome.is_ok() && general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "a cold binding whose repair connects was not delivered: {outcome:?}"
+    );
+    Ok(())
+}
