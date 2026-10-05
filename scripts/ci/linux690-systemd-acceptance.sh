@@ -158,14 +158,14 @@ wait_file() {
 
 assert_verdict() {
   file=$1 invocation=$2 expected=$3 expected_unit=$4 expected_manager=$5 expected_reason=$6
-  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" "$script_dir" <<'PY'
+  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" "$script_dir" "$parent_netns" <<'PY'
 import json, sys
-p, invocation, expected, unit, manager, reason, script_dir = sys.argv[1:]
+p, invocation, expected, unit, manager, reason, script_dir, parent_netns = sys.argv[1:]
 sys.path.insert(0, script_dir)
 from systemd_isolation import validate
 with open(p, encoding="utf-8") as f:
     value = json.load(f)
-validate(value.get("isolation"))
+validate(value.get("isolation"), parent_netns)
 assert value["schema"] == 1
 assert value["invocation"] == int(invocation)
 assert isinstance(value["pid"], int) and value["pid"] > 1

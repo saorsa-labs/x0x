@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from systemd_isolation import validate
 
 RUNNER = Path(__file__).with_name("linux690-systemd-acceptance.sh")
 
@@ -236,6 +237,15 @@ class M2IsolationControls(unittest.TestCase):
         respawn["capabilities"]["CapBnd"] = "0000000000000001"
         result = self.run_with_admission(self.isolated_unprivileged_receipt(), respawn)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_m2_namespace_claim_must_differ_from_runner_parent(self) -> None:
+        receipt = self.isolated_unprivileged_receipt()
+        validate(receipt, "net:[100]")
+        with self.assertRaisesRegex(ValueError, "matches parent"):
+            validate(receipt, "net:[101]")
+        for parent in (None, "", "net:[invalid]"):
+            with self.assertRaisesRegex(ValueError, "missing parent"):
+                validate(receipt, parent)
 
     def test_m2_runner_rejects_missing_observations(self) -> None:
         for field in ("namespace_changed", "routes", "capabilities", "no_new_privs"):

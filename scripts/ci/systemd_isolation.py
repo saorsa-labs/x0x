@@ -1,14 +1,19 @@
 """Validate observations sampled inside a systemd fixture child, fail closed."""
+import re
 
 
-def validate(receipt):
+def validate(receipt, parent_netns):
     if not isinstance(receipt, dict):
         raise ValueError("missing child isolation receipt")
     if receipt.get("namespace_changed") is not True:
         raise ValueError("child network namespace did not change")
     namespace = receipt.get("namespace")
-    if not isinstance(namespace, str) or not namespace.startswith("net:["):
+    if not isinstance(namespace, str) or not re.fullmatch(r"net:\[\d+\]", namespace):
         raise ValueError("missing child network namespace")
+    if not isinstance(parent_netns, str) or not re.fullmatch(r"net:\[\d+\]", parent_netns):
+        raise ValueError("missing parent network namespace")
+    if namespace == parent_netns:
+        raise ValueError("child network namespace matches parent")
     if [row.get("ifname") for row in receipt.get("links", [])] != ["lo"]:
         raise ValueError("child interfaces are not loopback-only")
     routes = receipt.get("routes")

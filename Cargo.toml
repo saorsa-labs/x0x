@@ -111,7 +111,7 @@ optional = true
 
 [features]
 # Private debug fixtures only; never permitted in a non-debug build.
-upgrade-test-signing = []
+upgrade-test-signing = ["dep:fips204"]
 # jemalloc with aggressive purge — eliminates the 50 MB heap-to-RSS
 # amplification glibc was producing. Opt-in (not default) so library
 # consumers aren't forced into a particular allocator. The daemon binary
@@ -126,7 +126,7 @@ voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
 
 [build-dependencies]
 # Reuse the existing fips204 graph; no keypair is retained or committed.
-fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+fips204 = { version = "0.4.6", optional = true, default-features = false, features = ["ml-dsa-65", "default-rng"] }
 
 [dev-dependencies]
 # `start_paused` virtual-clock tests for the state-request bootstrap tail

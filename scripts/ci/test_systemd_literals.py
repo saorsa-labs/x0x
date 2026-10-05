@@ -45,8 +45,8 @@ def wait_json(path, bound=30):
         except (FileNotFoundError,json.JSONDecodeError): time.sleep(.05)
     raise TimeoutError(str(path))
 
-def assert_first(case_name, first, expected, unit, literal, artifact):
-    validate(first.get("isolation"))
+def assert_first(case_name, first, expected, unit, literal, artifact, parent_netns):
+    validate(first.get("isolation"), parent_netns)
     if first["verdict"] != expected:
         raise AssertionError((case_name, first))
     if case_name == "positive":
@@ -73,19 +73,20 @@ def cleanup_unit(state, unit):
     state["cleanup"][unit] = {"load_state": load}
     save(state)
 
-def unit_text(probe, artifact, *, explicit, restart):
+def unit_text(probe, artifact, *, explicit, restart, parent_netns):
     if explicit:
         cmd='@'+q(str(probe),path=True)+' '+q(str(probe))
     else:
         cmd=q(str(probe),path=True)
     cmd += ' '+q('--artifact')+' '+q(str(artifact))
-    return f'''[Unit]\nDescription=x0x #729 disposable literal acceptance\nStartLimitIntervalSec=0\n[Service]\nType=simple\nExecStart={cmd}\nEnvironment=X0X_TEMPLATE_VERSION=1\nRestart={restart}\nRestartSec=1\nUser=65534\nGroup=65534\nPrivateNetwork=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nNoNewPrivileges=yes\nEnvironment="X0X_FIXTURE_PARENT_NETNS={os.readlink('/proc/self/ns/net')}"\n'''
+    return f'''[Unit]\nDescription=x0x #729 disposable literal acceptance\nStartLimitIntervalSec=0\n[Service]\nType=simple\nExecStart={cmd}\nEnvironment=X0X_TEMPLATE_VERSION=1\nRestart={restart}\nRestartSec=1\nUser=65534\nGroup=65534\nPrivateNetwork=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nNoNewPrivileges=yes\nEnvironment="X0X_FIXTURE_PARENT_NETNS={parent_netns}"\n'''
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--probe',required=True); ap.add_argument('--artifact-root')
     a=ap.parse_args(); probe=Path(a.probe).resolve()
     if sys.platform != 'linux' or os.geteuid()!=0: raise SystemExit('requires root on disposable Linux systemd host')
     if not probe.is_file() or not os.access(probe,os.X_OK): raise SystemExit('--probe must be an executable absolute file')
+    parent_netns = os.readlink('/proc/self/ns/net')
     root=Path(a.artifact_root or tempfile.mkdtemp(prefix='x0x-729-')).resolve(); root.mkdir(mode=0o700, parents=True, exist_ok=False) if not root.exists() else os.chmod(root, 0o700)
     os.chown(root, 65534, 65534)
     state={"schema":1,"artifact":str(root),"probe_source":str(probe),"probe_sha256":hashlib.sha256(probe.read_bytes()).hexdigest(),"commands":[],"cases":{},"cleanup":{}}
@@ -98,15 +99,15 @@ def main():
         cases=[('positive',True,'always','verified'),('unresolved-argv0',False,'always','not_guaranteed'),('bad-policy',True,'on-failure','not_guaranteed')]
         for name,explicit,restart,expected in cases:
             unit=f"{token}-{name}.service"; units.append(unit); case=root/name; case.mkdir(mode=0o700); os.chown(case, 65534, 65534)
-            unit_path=UNIT_ROOT/unit; unit_path.write_text(unit_text(literal,case,explicit=explicit,restart=restart)); os.chmod(unit_path, 0o600)
+            unit_path=UNIT_ROOT/unit; unit_path.write_text(unit_text(literal,case,explicit=explicit,restart=restart,parent_netns=parent_netns)); os.chmod(unit_path, 0o600)
             run(state,f'reload-{name}',['systemctl','daemon-reload']); run(state,f'start-{name}',['systemctl','start',unit])
             first=wait_json(case/'invocation-1.json'); state['cases'][name]={"unit":unit,"first":first,"expected":expected}; save(state)
-            assert_first(name, first, expected, unit, literal, case)
+            assert_first(name, first, expected, unit, literal, case, parent_netns)
             show=run(state,f'show-{name}',['systemctl','show',unit,'-p','MainPID','-p','InvocationID','-p','ExecStart','-p','Restart','-p','NRestarts'])
             (case/'systemctl-show.txt').write_text(show['stdout'])
             if name=='positive':
                 (case/'release-first').touch(); second=wait_json(case/'invocation-2.json',35)
-                validate(second.get('isolation'))
+                validate(second.get('isolation'), parent_netns)
                 if second['verdict']!='verified' or second['pid']==first['pid'] or second['invocation_id']==first['invocation_id']: raise AssertionError('respawn proof')
                 state['cases'][name]['second']=second; save(state)
             cleanup_unit(state, unit)

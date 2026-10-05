@@ -44,6 +44,69 @@ fn throwaway_manifest_is_rejected_by_default() {
     );
 }
 
+#[test]
+fn packaged_probes_trust_only_the_compiled_signing_key() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/upgrade/v0.46.3");
+    let manifest_path = fixture.join("release-manifest.json");
+    let production_signature = fixture.join("release-manifest.json.sig");
+    let manifest = std::fs::read(&manifest_path).expect("public production manifest");
+    let (public, secret) = ml_dsa_65()
+        .generate_keypair()
+        .expect("throwaway probe keypair");
+    let foreign = sign_with_context(&secret.to_bytes(), &manifest).expect("throwaway signature");
+    verify_bytes_signature_with_key(&manifest, &foreign, &public.to_bytes())
+        .expect("positive control: throwaway signature verifies under its own key");
+    let scratch = TempDir::new().expect("inert probe sandbox");
+    let foreign_path = scratch.path().join("throwaway.sig");
+    std::fs::write(&foreign_path, foreign).expect("throwaway signature file");
+    let cwd = scratch.path().join("cwd");
+    let home = scratch.path().join("home");
+    std::fs::create_dir(&cwd).expect("empty working directory");
+    std::fs::create_dir(&home).expect("empty application home");
+    for binary in [env!("CARGO_BIN_EXE_x0xd"), env!("CARGO_BIN_EXE_x0x")] {
+        for (signature, expected) in [
+            (
+                &production_signature,
+                i32::from(cfg!(feature = "upgrade-test-signing")),
+            ),
+            (&foreign_path, 1),
+        ] {
+            let output = Command::new(binary)
+                .arg("--verify-release-manifest")
+                .arg(&manifest_path)
+                .arg(signature)
+                .current_dir(&cwd)
+                .env("HOME", &home)
+                .env("X0X_HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("APPDATA", &home)
+                .env("LOCALAPPDATA", &home)
+                .env("XDG_DATA_HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .env("XDG_CACHE_HOME", &home)
+                // Coverage instrumentation may write a profile on exit. Keep
+                // that harness output outside the application HOME and cwd.
+                .env(
+                    "LLVM_PROFILE_FILE",
+                    scratch.path().join("probe-%p-%m.profraw"),
+                )
+                .output()
+                .expect("run inert packaged probe");
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{binary} signature={signature:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if expected == 1 {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("signature is invalid"));
+            }
+            assert_eq!(std::fs::read_dir(&cwd).expect("probe cwd").count(), 0);
+            assert_eq!(std::fs::read_dir(&home).expect("probe home").count(), 0);
+        }
+    }
+}
+
 /// Compile the real verifier source with a per-run, compile-time fixture key.
 /// Phase 2's debug seam must read this OUT_DIR file, replacing the production
 /// key. A runtime argument or environment variable never selects a trusted key.
@@ -112,6 +175,9 @@ fn compile_verifier(root: &Path, test_feature: bool) -> PathBuf {
         .arg(root.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(&target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
+        .env_remove("CARGO_BUILD_TARGET")
         .current_dir(root);
     if test_feature {
         cargo.args(["--features", "upgrade-test-signing"]);
@@ -188,6 +254,9 @@ fn release_build_with_test_signing_feature_is_refused() {
         .arg(scratch.path().join("Cargo.toml"))
         .arg("--target-dir")
         .arg(scratch.path().join("target"))
+        .env_remove("RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
+        .env_remove("CARGO_BUILD_TARGET")
         .current_dir(scratch.path())
         .output()
         .expect("check release feature prohibition");
