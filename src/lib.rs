@@ -3146,6 +3146,77 @@ async fn record_announced_machine_binding(
 /// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
 /// before the binding's expiry update). Unarmed points pass straight
 /// through.
+/// x0x #1207 (test builds): a barrier at the entry of the general path's
+/// cold-recipient wait, keyed by (sender, recipient), so a test can inject
+/// the recipient's binding only after the send has entered the wait. An
+/// optional payload length selects one send among others to the same
+/// recipient. `reached` counts arrivals; `release` (closed) lets every
+/// current and future arrival through. Other sends pass straight through.
+#[cfg(test)]
+pub(crate) mod general_cold_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        bytes: Option<usize>,
+    }
+
+    impl Gate {
+        /// Let every current and future arrival through.
+        pub(crate) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type Key = (crate::identity::AgentId, crate::identity::AgentId);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        sender: crate::identity::AgentId,
+        recipient: crate::identity::AgentId,
+        payload_len: Option<usize>,
+    ) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            bytes: payload_len,
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((sender, recipient), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(sender: crate::identity::AgentId, recipient: crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            if let Some(gate) = gates.remove(&(sender, recipient)) {
+                gate.release();
+            }
+        }
+    }
+
+    pub(crate) async fn park(
+        sender: &crate::identity::AgentId,
+        recipient: &crate::identity::AgentId,
+        bytes: usize,
+    ) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
+            .filter(|gate| gate.bytes.is_none_or(|selected| selected == bytes));
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
@@ -8902,6 +8973,9 @@ impl Agent {
                     // repair, redial and B/P checks as any other. A zero bound
                     // keeps the instant failure (a gossip fallback follows).
                     None if !resolve_within.is_zero() => {
+                        #[cfg(test)]
+                        general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes)
+                            .await;
                         match self
                             .await_pinned_recipient_binding(agent_id, wait_until)
                             .await
