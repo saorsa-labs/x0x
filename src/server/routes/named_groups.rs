@@ -44044,6 +44044,42 @@ pub(in crate::server) mod tests {
         /// poll + refire poll) both expire — exactly ONE timeout is
         /// counted (the owning finalizer's), and the finalizer never aborts
         /// its own task mid-cleanup (r7 item 3): the owner completes.
+        /// x0x #1207 (regression guard, CI on cabd95e): the join-result
+        /// poll's opted-in cold wait for an unknown inviter is bounded by
+        /// the poll's own window. An expiring 150 ms window must finalize
+        /// on time, not after a full 5 s cold wait.
+        #[tokio::test]
+        async fn wp_b_t7c_poll_cold_wait_never_outlives_its_window() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fd".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            seed_pending_attempt(&state, &group, &event_group, &member, "a7c", String::new()).await;
+            let _poll_window = set_join_poll_window_override(&group, "a7c", 150);
+            let started = std::time::Instant::now();
+            poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                event_group.clone(),
+                crate::identity::AgentId([7; 32]),
+                member.clone(),
+                false,
+                None,
+                "a7c".into(),
+            )
+            .await;
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(2),
+                "the poll outlived its 150 ms window by its cold wait: {took:?}"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                1,
+                "the expiring window was finalized as a timeout"
+            );
+        }
+
         #[tokio::test]
         async fn wp_b_t7b_two_polls_one_timeout_count() {
             let (state, _keep) = fresh_state().await;
