@@ -497,6 +497,21 @@ static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            identity::AgentId,
+            identity::AgentId,
+            identity::MachineId,
+            Vec<u8>,
+        )>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
 #[cfg(test)]
 fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedTransportScript> {
     PINNED_STANDIN_TRANSPORT
@@ -9050,6 +9065,59 @@ impl Agent {
         })
     }
 
+    /// In-process stand-in for the GENERAL raw-QUIC send (x0x #1207,
+    /// #1217): the production target resolution (`resolve_raw_quic_target`,
+    /// over the strict stand-in's scripted transport), with the network
+    /// write replaced by a delivery witness. Strict test agents only.
+    #[cfg(test)]
+    async fn general_raw_standin(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        agent_prefix: &str,
+        send_start: std::time::Instant,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let transport =
+            RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+        let target = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &transport,
+                agent_prefix,
+                payload.len(),
+                send_start,
+            )
+            .await?;
+        if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
+            deliveries.push((
+                self.identity.agent_id(),
+                *agent_id,
+                target.machine_id,
+                payload.to_vec(),
+            ));
+        }
+        Ok(dm::DmPath::RawQuic)
+    }
+
+    /// Test seam (x0x #1207): the general raw-QUIC deliveries this agent's
+    /// strict stand-in made, as `(recipient, machine, payload)`.
+    #[cfg(test)]
+    pub(crate) fn general_raw_standin_deliveries_for_testing(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::MachineId, Vec<u8>)> {
+        let me = self.identity.agent_id();
+        GENERAL_RAW_STANDIN_DELIVERIES
+            .lock()
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter(|(from, ..)| *from == me)
+                    .map(|(_, to, machine, payload)| (*to, *machine, payload.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
@@ -9068,6 +9136,12 @@ impl Agent {
             "raw_quic"
         };
 
+        #[cfg(test)]
+        if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            return self
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start)
+                .await;
+        }
         let network = self.network.as_ref().ok_or_else(|| {
             tracing::warn!(
                 target: "x0x::direct",

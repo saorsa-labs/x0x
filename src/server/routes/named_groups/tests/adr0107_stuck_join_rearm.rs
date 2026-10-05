@@ -5373,3 +5373,221 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
     assert!(wrong_transport.is_empty(), "{wrong_transport:?}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #1207 / #1217 (v0.46.4): the GENERAL direct-send path failed at once with
+// `err_agent_not_found` when a restart left the discovery cache cold. It now
+// waits a bounded time for a verified binding, as the pinned path does. The
+// strict stand-in runs the general path's production resolution in process.
+// ---------------------------------------------------------------------------
+
+/// The general raw-QUIC payloads `from`'s strict stand-in delivered to `to`.
+fn general_deliveries(from: &AppState, to: &AppState) -> Vec<Vec<u8>> {
+    let to_id = to.agent.agent_id();
+    from.agent
+        .general_raw_standin_deliveries_for_testing()
+        .into_iter()
+        .filter(|(recipient, ..)| *recipient == to_id)
+        .map(|(_, _, payload)| payload)
+        .collect()
+}
+
+/// WHY (#1207): a joiner that restarted recently has a cold view of the
+/// authority. Its Welcome FetchRequest goes through the general direct path.
+/// It used to fail at once (`err_agent_not_found`), and the retries stalled
+/// (`fetch_retry_stalled`). The authority's announcement lands 300 ms in,
+/// within the bound, so that same send must reach the authority.
+#[tokio::test]
+async fn s8b_1207_restarted_joiner_fetch_request_reaches_the_authority_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: s.stable.clone(),
+        welcome_id,
+    };
+    let expected = serde_json::to_vec(&request)?;
+    let announce = {
+        let (j2, authority) = (Arc::clone(&s.j2), Arc::clone(&s.authority));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pin_recipient_machine(&j2, &authority).await;
+        })
+    };
+    let started = std::time::Instant::now();
+    let outcome = super::super::send_welcome_fetch_request(&s.j2, &s.authority_id, &request).await;
+    let elapsed = started.elapsed();
+    announce.await?;
+    assert!(
+        outcome.is_ok(),
+        "the restarted joiner's FetchRequest failed: {outcome:?} after {elapsed:?}"
+    );
+    assert!(
+        general_deliveries(&s.j2, &s.authority).contains(&expected),
+        "the FetchRequest never reached the authority"
+    );
+    assert!(
+        elapsed < Duration::from_millis(4_500),
+        "the FetchRequest overran the resolution bound: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1217): after an owner restart, the class-D `MemberRemoved` notice
+/// to a member removed just after it joined goes through the general
+/// direct path (plus gossip). Its direct leg failed `recipient_undiscovered`
+/// at once, and the next attempt is not due for 6 s (redelivery) or 8 s
+/// (delayed leg). The member's announcement lands 300 ms in, so the initial
+/// direct leg must deliver the notice within the bound.
+#[tokio::test]
+async fn s8b_1217_restarted_owner_member_removed_direct_delivers_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.authority, &s.j2, &s.stable).await;
+    let announce = {
+        let (authority, j2) = (Arc::clone(&s.authority), Arc::clone(&s.j2));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pin_recipient_machine(&authority, &j2).await;
+        })
+    };
+    let started = std::time::Instant::now();
+    let removed = remove_named_group_member(
+        State(Arc::clone(&s.authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), hex_of(&s.j2))),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(
+        removed.status().is_success(),
+        "owner remove-member: {}",
+        removed.status()
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if general_deliveries(&s.authority, &s.j2)
+                .iter()
+                .any(|payload| {
+                    matches!(
+                        serde_json::from_slice::<NamedGroupMetadataEvent>(payload),
+                        Ok(NamedGroupMetadataEvent::MemberRemoved { .. })
+                    )
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let elapsed = started.elapsed();
+    announce.await?;
+    assert!(
+        delivered,
+        "MemberRemoved never direct-delivered to the removed member within 4 s ({elapsed:?})"
+    );
+    Ok(())
+}
+
+/// WHY (#1207 control): a truly unknown agent gets the bounded wait (the
+/// general bound, min(5 s, the per-attempt timeout) = 5 s here), then the
+/// typed, retryable `RecipientUndiscovered`. The added latency is the
+/// bound, not more.
+#[tokio::test]
+async fn s8b_1207_unknown_agent_ends_in_the_typed_error_within_the_bound() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    g.authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    let unknown = x0x::identity::AgentId([0x3c; 32]);
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config(
+            &unknown,
+            b"adr0107-1207-unknown".to_vec(),
+            direct_message_send_config(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(outcome, Err(x0x::dm::DmError::RecipientUndiscovered(_))),
+        "a typed, retryable error: {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "the unknown recipient got no bounded wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(6_500),
+        "the wait overran its bound: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207 control): a DM to a KNOWN agent resolves at once. The
+/// bounded wait applies only when no verified source knows the recipient,
+/// so known-agent latency is unchanged.
+#[tokio::test]
+async fn s8b_1207_known_agent_send_latency_is_unchanged() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    g.authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    // A freshly seen, announced peer (a stale `last_seen` would trip the
+    // likely-offline gate, which is not under test here).
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: g.joiner.agent.agent_id(),
+            machine_id: g.joiner.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    let payload = b"adr0107-1207-known".to_vec();
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config(
+            &g.joiner.agent.agent_id(),
+            payload.clone(),
+            direct_message_send_config(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert!(outcome.is_ok(), "the known agent's DM failed: {outcome:?}");
+    assert!(
+        general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "the known agent's DM never reached it"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "known-agent latency changed: {elapsed:?}"
+    );
+    Ok(())
+}
