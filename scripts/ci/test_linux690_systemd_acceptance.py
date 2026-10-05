@@ -146,5 +146,81 @@ raise SystemExit(3)
             self.fail(f"detached fake worker {worker_pid} survived fixture cleanup")
 
 
+# ADR 0094 slice H: separate red admission controls, with no real systemd calls.
+class M2IsolationControls(unittest.TestCase):
+    @staticmethod
+    def isolated_unprivileged_receipt() -> dict:
+        """Shape of the existing isolated-runtime.py admission evidence."""
+        return {
+            "namespace": "net:[101]",
+            "namespace_changed": True,
+            "links": [{"ifname": "lo"}],
+            "routes": {"-4": [{"dev": "lo", "dst": "127.0.0.0/8"}], "-6": []},
+            "uid": 65534,
+            "gid": 65534,
+            "capabilities": {
+                name: "0000000000000000"
+                for name in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+            },
+            "no_new_privs": 1,
+        }
+
+    def run_with_admission(self, receipt: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory(prefix="m2-systemd-admission-") as scratch:
+            root = Path(scratch)
+            env, probe = RunnerControls().fixture(root)
+            fake_run = root / "bin" / "systemd-run"
+            source = fake_run.read_text(encoding="utf-8")
+            marker = ' (artifact/f"invocation-{number}.json").write_text'
+            self.assertEqual(source.count(marker), 1, "fixture insertion must be unique")
+            # Simulate facts sampled INSIDE each fixture child, not host facts or
+            # a claim inferred from requested systemd properties. Respawns copy it.
+            source = source.replace(
+                marker,
+                ' value["isolation"] = json.loads(os.environ["FAKE_M2_ADMISSION"])\n' + marker,
+            )
+            fake_run.write_text(source, encoding="utf-8")
+            env["FAKE_M2_ADMISSION"] = json.dumps(receipt)
+            result = subprocess.run(
+                [str(RUNNER), "--probe", str(probe), "--manager", "user",
+                 "--artifact-root", str(root / "artifacts")],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=20, check=False,
+            )
+            first = root / "artifacts" / "positive" / "invocation-1.json"
+            self.assertTrue(first.is_file(), result.stdout + result.stderr)
+            self.assertEqual(json.loads(first.read_text())["isolation"], receipt)
+            return result
+
+    def test_m2_runner_rejects_non_loopback_fixture(self) -> None:
+        receipt = self.isolated_unprivileged_receipt()
+        receipt["links"].append({"ifname": "eth0"})
+        receipt["routes"]["-4"].append({
+            "dev": "eth0", "dst": "default", "gateway": "192.0.2.1",
+        })
+        result = self.run_with_admission(receipt)
+        self.assertNotEqual(
+            result.returncode, 0,
+            "runner accepted a fixture with an external interface/default route:\n"
+            + result.stdout + result.stderr,
+        )
+
+    def test_m2_runner_rejects_privileged_fixture(self) -> None:
+        receipt = self.isolated_unprivileged_receipt()
+        receipt.update(uid=0, gid=0, no_new_privs=0)
+        receipt["capabilities"]["CapEff"] = "0000000000000001"
+        result = self.run_with_admission(receipt)
+        self.assertNotEqual(
+            result.returncode, 0,
+            "runner accepted a root fixture with capabilities and no_new_privs unset:\n"
+            + result.stdout + result.stderr,
+        )
+
+    def test_m2_runner_accepts_isolated_unprivileged_fixture(self) -> None:
+        result = self.run_with_admission(self.isolated_unprivileged_receipt())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS artifact_root=", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
