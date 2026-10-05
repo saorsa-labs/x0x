@@ -337,6 +337,16 @@ fn apply_withdrawn_group_card_to_group_info(
 // Request / response types
 // ---------------------------------------------------------------------------
 
+/// x0x #1207, #1217: `config` opted in to a bounded wait for a restart-cold
+/// recipient's verified binding (`DmSendConfig::cold_recipient_wait`). Only
+/// for sends that hold no lock and do not fan out serially.
+pub(in crate::server) fn with_cold_recipient_wait(
+    mut config: x0x::dm::DmSendConfig,
+) -> x0x::dm::DmSendConfig {
+    config.cold_recipient_wait = x0x::dm::PINNED_RESOLUTION_WAIT;
+    config
+}
+
 pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // Named-group metadata applies require `DirectMessage::verified == true`.
     // The gossip-inbox DM path verifies the signed DM envelope and marks the
@@ -3367,7 +3377,12 @@ fn named_group_event_delivery_future(
             .await
         } else {
             agent
-                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+                .send_direct_with_config(
+                    &recipient,
+                    payload,
+                    // #1217 / #1207: one recipient per spawned task, no lock.
+                    with_cold_recipient_wait(named_group_direct_delivery_config()),
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -37934,7 +37949,12 @@ async fn poll_join_result_until_membership_confirmed(
         }
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&inviter, payload, direct_message_send_config())
+            .send_direct_with_config(
+                &inviter,
+                payload,
+                // #1207: the membership guard was dropped above; one send.
+                with_cold_recipient_wait(direct_message_send_config()),
+            )
             .await
         {
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
@@ -38072,17 +38092,24 @@ async fn stage_treekem_welcome(
 fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
     match msg {
         WelcomeBlobMessage::Chunk { .. } => file_transfer_send_config(),
-        WelcomeBlobMessage::FetchRequest { .. }
-        | WelcomeBlobMessage::Offer { .. }
-        | WelcomeBlobMessage::ChunkAck { .. }
-        | WelcomeBlobMessage::Complete { .. } => x0x::dm::DmSendConfig {
-            // Welcome-blob control messages must keep the gossip-inbox path
-            // preferred: the raw-preferred default for user DMs does not
-            // apply here, because a welcome fetch races the very connection
-            // establishment that raw delivery depends on.
-            prefer_raw_quic_if_connected: false,
-            ..direct_message_send_config()
-        },
+        // #1207: the joiner's own FetchRequest and ChunkAck to the authority
+        // wait boundedly for a restart-cold authority's verified binding.
+        WelcomeBlobMessage::FetchRequest { .. } | WelcomeBlobMessage::ChunkAck { .. } => {
+            with_cold_recipient_wait(x0x::dm::DmSendConfig {
+                prefer_raw_quic_if_connected: false,
+                ..direct_message_send_config()
+            })
+        }
+        WelcomeBlobMessage::Offer { .. } | WelcomeBlobMessage::Complete { .. } => {
+            x0x::dm::DmSendConfig {
+                // Welcome-blob control messages must keep the gossip-inbox
+                // path preferred: the raw-preferred default for user DMs does
+                // not apply here, because a welcome fetch races the very
+                // connection establishment that raw delivery depends on.
+                prefer_raw_quic_if_connected: false,
+                ..direct_message_send_config()
+            }
+        }
     }
 }
 
