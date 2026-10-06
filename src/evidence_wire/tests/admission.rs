@@ -1082,12 +1082,33 @@ async fn issue1207_late_readiness_preserves_denials() {
 #[tokio::test]
 async fn issue1207_unrelated_machine_never_sends() {
     let f = Fixture::new(false, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    Arc::clone(&f.context).connect(machine, None, None).await;
+    assert!(!f
+        .context
+        .runtime
+        .wire_limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .contains_key(&machine));
     f.ready_wire(true, true, true).await;
     for _ in 0..1000 {
         f.publish_ready();
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(f.sent(), 0);
+    assert!(!f
+        .context
+        .runtime
+        .wire_limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .contains_key(&machine));
     f.initiator.shutdown_token.cancel();
     f.responder.shutdown_token.cancel();
     f.shutdown().await;
@@ -1495,3 +1516,172 @@ async fn issue1207_s1b_red_default_off_reply_after_remote_restart_carries_hello(
     f.shutdown().await;
 }
 // END #1207 S1b RED tests and controls.
+
+// Review round 1: control the real outgoing job at the stream-open boundary.
+#[tokio::test]
+async fn issue1207_s1b_default_off_replacement_around_open_does_not_spend_unsent_attempt() {
+    for after_open in [false, true] {
+        let mut f = Fixture::new_with_transport(true, true, true, true).await;
+        f.publish_ready();
+        let machine = f.initiator.machine_id();
+        let old = f.s1b_generation();
+        let pause = Arc::new(HelloOpenPause {
+            after_open,
+            ..Default::default()
+        });
+        *f.context
+            .runtime
+            .wire_limits
+            .hello_open_pause
+            .lock()
+            .unwrap() = Some(Arc::clone(&pause));
+        let job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+        tokio::time::timeout(DEADLINE, pause.reached.notified())
+            .await
+            .expect("g1 job must reach the real open boundary");
+        assert_eq!(f.sent(), 0);
+        assert_eq!(f.s1b_generation(), old);
+        // In the reviewed fix the g1 job had already consumed here. No bytes
+        // were sent, so superseding it must leave g2's attempt and rate free.
+        f.s1b_restart_remote().await;
+        *f.context
+            .runtime
+            .wire_limits
+            .hello_open_pause
+            .lock()
+            .unwrap() = None;
+        pause.resume.notify_one();
+        tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap();
+        {
+            let state = f.context.runtime.wire_limits.state.lock().unwrap();
+            let budget = &state.machines[&machine];
+            assert!(!budget.attempted, "unsent g1 must not consume an attempt");
+            assert!(
+                budget.hello_out.is_none(),
+                "unsent g1 must not start 60 s gate"
+            );
+        }
+        assert_eq!(f.sent(), 0);
+        // No clock advance, marker edit, scheduler or retry can rescue g2.
+        let ((), ()) = tokio::join!(
+            Arc::clone(&f.context).connect(machine, None, None),
+            f.s1b_read_hello(S1bReply::Ack),
+        );
+        assert_eq!(f.sent(), 1, "g2 receives exactly one verified Hello");
+        f.s1b_expire_rate_gate();
+        Arc::clone(&f.context).connect(machine, None, None).await;
+        f.s1b_no_more_hellos().await;
+        assert_eq!(f.sent(), 1);
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
+    let f = Fixture::new_with_transport(true, true, true, true).await;
+    f.s1b_first_attempt(S1bReply::Ack).await;
+    let machine = f.initiator.machine_id();
+    let generation = f.s1b_generation();
+    let limits = &f.context.runtime.wire_limits;
+    limits.need_certificate(machine, f.initiator.agent_id(), [9; 32]);
+    limits.disconnect(machine); // A delayed local event has no generation.
+    assert!(limits.state.lock().unwrap().machines[&machine]
+        .certificate
+        .is_none());
+    f.s1b_expire_rate_gate();
+    Arc::clone(&f.context).connect(machine, None, None).await;
+    f.s1b_no_more_hellos().await;
+    assert_eq!(f.s1b_generation(), generation);
+    assert_eq!(f.sent(), 1);
+    f.shutdown().await;
+}
+
+#[test]
+fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget() {
+    let limits = Limits::default();
+    let machine = MachineId([19; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    let aged = Instant::now() - HELLO_INTERVAL;
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(aged);
+    limits.hello_connection(machine, 1);
+    assert!(!limits.hello_candidate(machine, 1));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_generation, Some(2));
+        assert!(budget.attempted);
+        assert_eq!(budget.hello_out, Some(aged));
+    }
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+}
+
+#[test]
+fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budgets() {
+    let limits = Arc::new(Limits::default());
+    let machine = |id: usize| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&(id as u64).to_le_bytes());
+        MachineId(bytes)
+    };
+    for id in 0..MACHINE_CAP {
+        assert!(limits.begin_hello_on_connection(machine(id), true, Some(100)));
+    }
+    let lease = limits.admit(machine(0), true).unwrap();
+    let job = limits.pin_machine(machine(1)).unwrap();
+    let prefix = limits.admit_prefix(machine(2)).unwrap();
+    assert!(limits.request(machine(4), true));
+    {
+        let now = Instant::now();
+        let stale = now - HELLO_INTERVAL - Duration::from_secs(1);
+        let mut state = limits.state.lock().unwrap();
+        for budget in state.machines.values_mut() {
+            budget.hello_out = Some(stale);
+            budget.touched = Some(stale);
+        }
+        // Independent controls: outbound cooldown, inbound cooldown, and
+        // recent non-Hello traffic must each survive table pressure.
+        state.machines.get_mut(&machine(3)).unwrap().hello_out = Some(now);
+        state.machines.get_mut(&machine(5)).unwrap().touched = Some(now);
+        assert_eq!(state.machines.len(), MACHINE_CAP);
+    }
+    // The readiness pass observes the same live generation without evidence traffic.
+    limits.hello_connection(machine(6), 100);
+    // This untracked machine's connection is gone; its idle marker may be evicted.
+    limits.disconnect(machine(7));
+    let newcomer = machine(MACHINE_CAP);
+    let new_lease = limits
+        .admit(newcomer, true)
+        .expect("stale attempts evicted");
+    assert!(limits.begin_hello_on_connection(newcomer, true, Some(1)));
+    {
+        let state = limits.state.lock().unwrap();
+        assert_eq!(state.machines.len(), 8);
+        for id in 0..7 {
+            let budget = &state.machines[&machine(id)];
+            assert!(budget.attempted);
+            assert_eq!(budget.hello_generation, Some(100));
+        }
+        assert!(!state.machines.contains_key(&machine(7)));
+    }
+    assert!(!limits.hello_pending(machine(6)));
+    assert!(!limits.begin_hello_on_connection(machine(6), true, Some(100)));
+    assert!(!limits.request(machine(4), true), "inbound gate retained");
+    assert!(!limits.begin_hello_on_connection(machine(3), true, Some(101)));
+    // Eviction forgets the old high-water marker. One new attempt is allowed,
+    // but the shared 60-second gate still blocks even a newer generation.
+    assert!(limits.begin_hello_on_connection(machine(7), true, Some(1)));
+    assert!(!limits.begin_hello_on_connection(machine(7), true, Some(2)));
+    drop((lease, job, prefix, new_lease));
+    let state = limits.state.lock().unwrap();
+    assert_eq!(state.machines[&machine(0)].open, 0);
+    assert_eq!(state.machines[&machine(1)].jobs, 0);
+    assert_eq!(state.machines[&machine(2)].jobs, 0);
+}
