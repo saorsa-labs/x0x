@@ -456,8 +456,24 @@ jobs:
           --require w3h_red_1143_promoted_admin_admits_with_owner_offline
           --require w3h_s4_control_evidence_hello_over_sim_streams
           --require w3h_s4_control_owner_sync_over_sim_streams
+          --require w3h_1207_red_baseline_roster_then_discovery_hello_never_sent
+          --require w3h_1207_discovery_then_roster_recovers_through_the_commit_push
+          --require w3h_1207_red_baseline_no_mapping_on_either_side
+          --require w3h_1207_control_admin_knows_joiner
+          --require w3h_1207_control_intact_persisted_evidence
+          --require w3h_1207_control_authorized_third_holder
+          --require w3h_red_1207_ready_hello_roster_then_discovery
+          --require w3h_red_1207_ready_hello_no_mapping_stays_red
           --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
           --expect w3h_red_1143_promoted_admin_admits_with_owner_offline=GREEN
+          --expect w3h_1207_red_baseline_roster_then_discovery_hello_never_sent=RED
+          --expect w3h_1207_discovery_then_roster_recovers_through_the_commit_push=GREEN
+          --expect w3h_1207_red_baseline_no_mapping_on_either_side=RED
+          --expect w3h_1207_control_admin_knows_joiner=GREEN
+          --expect w3h_1207_control_intact_persisted_evidence=GREEN
+          --expect w3h_1207_control_authorized_third_holder=GREEN
+          --expect w3h_red_1207_ready_hello_roster_then_discovery=GREEN
+          --expect w3h_red_1207_ready_hello_no_mapping_stays_red=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

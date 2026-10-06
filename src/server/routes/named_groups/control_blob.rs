@@ -618,6 +618,7 @@ async fn send_message(
 /// refusal is retried briefly before this returns an error (the caller
 /// still logs on final failure). The bounds above (entry cap, global and
 /// per-recipient byte budgets, per-blob maximum) keep retention finite.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_reference(
     store: &ControlBlobState,
     agent: &Agent,
@@ -627,6 +628,7 @@ pub(super) async fn send_reference(
     group_id: &str,
     join_attempt_id: Option<&str>,
     bytes: Vec<u8>,
+    cold_removal: bool,
 ) -> std::result::Result<(), String> {
     // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
     // recipients release their completed pulls — retry it briefly before
@@ -659,7 +661,24 @@ pub(super) async fn send_reference(
             Err(other) => return Err(other.to_string()),
         }
     };
-    send_reference_message(agent, recipient, reference).await
+    if cold_removal {
+        // #1217: only the owner's spawned removal notice opts in, including
+        // an oversized notice carried by reference. Chunk and join senders
+        // still use the ordinary send_reference_message/send_message paths.
+        let message = ControlBlobMessage::Reference { reference };
+        agent
+            .send_direct_with_config_cold_wait(
+                recipient,
+                encode_message(&message)?,
+                control_config(&message),
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        send_reference_message(agent, recipient, reference).await
+    }
 }
 
 /// The refusal [`ControlBlobState::stage`] returns while the staging budget

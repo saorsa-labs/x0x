@@ -5376,3 +5376,6 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
     assert!(wrong_transport.is_empty(), "{wrong_transport:?}");
     Ok(())
 }
+
+// D204 / #1217: main-compatible owner-removal regression and controls.
+include!("issue1217_owner_removal.rs");

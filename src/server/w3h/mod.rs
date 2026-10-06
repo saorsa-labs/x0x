@@ -31,6 +31,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod case_1143;
+mod case_1207;
 mod control;
 mod home;
 mod receipt;
@@ -938,6 +939,25 @@ impl Sim {
     /// The node's agent id, hex.
     pub(crate) fn agent_hex(&self, label: &str) -> Result<String> {
         Ok(self.node(label)?.agent_hex.clone())
+    }
+
+    /// A label's agent and machine ids: from its pre-generated keys before
+    /// its daemon starts ([`Self::empty`]), so a case can install fault
+    /// rules about a node before it sends anything; from the node after.
+    pub(crate) fn ids(
+        &self,
+        label: &str,
+    ) -> Result<(crate::identity::AgentId, crate::identity::MachineId)> {
+        if let Some((machine, agent)) = self.keys.get(label) {
+            return Ok((agent.agent_id(), machine.machine_id()));
+        }
+        let node = self.node(label)?;
+        let agent = <[u8; 32]>::try_from(hex::decode(&node.agent_hex)?.as_slice())
+            .map_err(|_| anyhow!("{label}: malformed agent id"))?;
+        Ok((
+            crate::identity::AgentId(agent),
+            crate::identity::MachineId(node.peer.0),
+        ))
     }
 
     /// Read-only access to a running daemon's state.

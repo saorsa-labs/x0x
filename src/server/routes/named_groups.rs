@@ -3351,6 +3351,14 @@ fn named_group_event_delivery_future(
             return None;
         }
     };
+    // D204 / #1217: every recipient of this authority's removal notice opts in,
+    // including the removed member and survivors. Self-leave, relayed events,
+    // join traffic and every other metadata event keep their existing send path.
+    // The future runs in one spawned task per recipient, with no membership,
+    // roster or publication guard.
+    let cold_removal = matches!(event,
+        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
+            if actor == &hex::encode(state.agent.agent_id().as_bytes()) && actor != agent_id);
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
@@ -3365,8 +3373,20 @@ fn named_group_event_delivery_future(
                 &group_id,
                 None,
                 payload,
+                cold_removal,
             )
             .await
+        } else if cold_removal {
+            agent
+                .send_direct_with_config_cold_wait(
+                    &recipient,
+                    payload,
+                    named_group_direct_delivery_config(),
+                    x0x::dm::PINNED_RESOLUTION_WAIT,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         } else {
             agent
                 .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
