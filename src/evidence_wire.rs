@@ -109,13 +109,31 @@ impl Window {
 #[derive(Default)]
 struct MachineBudget {
     open: usize,
+    jobs: usize,
     bytes: Window,
     lookup: Option<Instant>,
     hello_in: Option<Instant>,
     hello_out: Option<Instant>,
     attempted: bool,
+    hello_generation: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
+}
+impl MachineBudget {
+    // Generation IDs are allocated in increasing order, but ant-quic can
+    // promote an older superseded connection back to Live. Keep a high-water
+    // mark: that promotion fails closed for Hello until a newer generation
+    // arrives. A delayed job must not re-arm a previously used connection.
+    fn observe_hello_generation(&mut self, generation: u64) -> bool {
+        if self.hello_generation.is_some_and(|old| old > generation) {
+            return false;
+        }
+        if self.hello_generation != Some(generation) {
+            self.attempted = false;
+            self.hello_generation = Some(generation);
+        }
+        true
+    }
 }
 #[derive(Default)]
 struct State {
@@ -173,6 +191,8 @@ impl WireCounters {
 pub(crate) struct Limits {
     pub(crate) ready_hello: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
+    #[cfg(test)]
+    hello_open_pause: Mutex<Option<Arc<HelloOpenPause>>>,
     allocations: Arc<tokio::sync::Semaphore>,
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
@@ -181,11 +201,21 @@ pub(crate) struct Limits {
     pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
     pub(crate) counters: WireCounters,
 }
+// Per-fixture synchronization at the real open boundary; absent in production.
+#[cfg(test)]
+#[derive(Default)]
+struct HelloOpenPause {
+    after_open: bool,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
 impl Default for Limits {
     fn default() -> Self {
         Self {
             ready_hello: Default::default(),
             state: Mutex::new(State::default()),
+            #[cfg(test)]
+            hello_open_pause: Mutex::new(None),
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
@@ -199,10 +229,14 @@ impl State {
     fn machine(&mut self, machine: MachineId, now: Instant) -> Option<&mut MachineBudget> {
         if !self.machines.contains_key(&machine) && self.machines.len() >= MACHINE_CAP {
             self.machines.retain(|_, m| {
+                // Idle markers may be forgotten after the cooldown. Keep
+                // leases/jobs and every recent rate entry, including inbound.
                 m.open != 0
-                    || m.attempted
-                    || m.touched
-                        .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
+                    || m.jobs != 0
+                    || [m.touched, m.hello_out, m.hello_in]
+                        .into_iter()
+                        .flatten()
+                        .any(|t| now.duration_since(t) < HELLO_INTERVAL)
             });
         }
         if !self.machines.contains_key(&machine) && self.machines.len() >= MACHINE_CAP {
@@ -214,6 +248,17 @@ impl State {
     }
 }
 impl Limits {
+    // Pin the budget across work that has not yet acquired a stream lease.
+    // The guard also survives awaits and releases on task cancellation.
+    fn pin_machine(self: &Arc<Self>, machine: MachineId) -> Option<MachineJob> {
+        let mut state = self.state.lock().ok()?;
+        state.machine(machine, Instant::now())?.jobs += 1;
+        Some(MachineJob {
+            limits: Arc::clone(self),
+            machine,
+        })
+    }
+
     /// Strangers and Unknown relationship peers share this bounded prefix pool.
     /// Entries exist only while a lease is alive, across all connections.
     pub(crate) fn admit_prefix(self: &Arc<Self>, machine: MachineId) -> Option<PrefixLease> {
@@ -222,10 +267,12 @@ impl Limits {
             {
                 return None;
             }
+            let job = self.pin_machine(machine)?;
             *slots.entry(machine).or_default() += 1;
             Some(PrefixLease {
                 limits: Arc::clone(self),
                 machine,
+                _job: job,
             })
         });
         if admitted.is_none() {
@@ -322,7 +369,7 @@ impl Limits {
         true
     }
     /// A cheap, non-blocking scheduler filter. The final atomic decision is
-    /// still begin_hello, shared with replies and unchanged below.
+    /// still begin_hello_on_connection, shared with replies.
     fn hello_pending(&self, machine: MachineId) -> bool {
         let Ok(state) = self.state.try_lock() else {
             return false;
@@ -333,7 +380,29 @@ impl Limits {
                     .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
         })
     }
+    // Read-only filter for default-off jobs. The authoritative consume still
+    // runs after open, so a replacement or busy read cannot charge an unsent job.
+    fn hello_candidate(&self, machine: MachineId, generation: u64) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.machines.get(&machine).is_none_or(|m| {
+            m.hello_generation
+                .is_none_or(|old| old < generation || (old == generation && !m.attempted))
+                && m.hello_out
+                    .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
+        })
+    }
+    #[cfg(test)]
     fn begin_hello(&self, machine: MachineId, related: bool) -> bool {
+        self.begin_hello_on_connection(machine, related, None)
+    }
+    fn begin_hello_on_connection(
+        &self,
+        machine: MachineId,
+        related: bool,
+        generation: Option<u64>,
+    ) -> bool {
         if !related {
             return false;
         }
@@ -344,22 +413,43 @@ impl Limits {
         let Some(m) = s.machine(machine, now) else {
             return false;
         };
+        // Requests and replies consume the same generation marker under the
+        // same lock as the machine rate gate. A remote close need not emit a
+        // local PeerDisconnected event. Keep hello_out across replacements.
+        if generation.is_some_and(|id| !m.observe_hello_generation(id)) {
+            return false;
+        }
         if m.attempted
             || m.hello_out
                 .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
         {
             return false;
         }
-        // Attempted is set before open/write/read. A reset or refusal never
+        // Attempted is set before the first byte. A reset or refusal never
         // schedules a retry. Reconnect clears only this connection marker.
         m.attempted = true;
         m.hello_out = Some(now);
         true
     }
+    fn hello_connection(&self, machine: MachineId, generation: u64) {
+        if let Ok(mut s) = self.state.lock() {
+            if let Some(m) = s.machines.get_mut(&machine) {
+                // Each readiness pass keeps tracked live markers out of idle eviction.
+                m.touched = Some(Instant::now());
+                let replaced = m.hello_generation.is_none_or(|old| old < generation);
+                if m.observe_hello_generation(generation) && replaced {
+                    m.certificate = None;
+                }
+            }
+        }
+    }
     fn disconnect(&self, machine: MachineId) {
         if let Ok(mut s) = self.state.lock() {
             if let Some(m) = s.machines.get_mut(&machine) {
-                m.attempted = false;
+                // Events carry no generation. A delayed disconnect must not
+                // release the current connection's attempt or machine cooldown.
+                // While retained, only a newer generation re-arms the marker;
+                // an idle entry can be evicted after its cooldown.
                 m.certificate = None;
             }
         }
@@ -380,9 +470,24 @@ impl Limits {
     }
 }
 
+struct MachineJob {
+    limits: Arc<Limits>,
+    machine: MachineId,
+}
+impl Drop for MachineJob {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.limits.state.lock() {
+            if let Some(budget) = state.machines.get_mut(&self.machine) {
+                budget.jobs = budget.jobs.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub(crate) struct PrefixLease {
     limits: Arc<Limits>,
     machine: MachineId,
+    _job: MachineJob,
 }
 impl Drop for PrefixLease {
     fn drop(&mut self) {
@@ -888,10 +993,9 @@ impl Context {
                     // our Hello. Replies and requests share its 60-second gate.
                     if !crate::dm_capability_service::advert_is_publishable(
                         &self.capabilities.borrow(),
-                    ) || !self
-                        .runtime
-                        .wire_limits
-                        .begin_hello(machine, self.related(machine).await)
+                    ) || self
+                        .begin_hello_current(machine, self.related(machine).await)
+                        .is_none()
                     {
                         let body = codec().serialize(&have_peer).map_err(io::Error::other)?;
                         return write_message(
@@ -918,6 +1022,50 @@ impl Context {
             tracing::debug!(?machine, "evidence stream refused/reset");
         }
     }
+    fn begin_hello_current(&self, machine: MachineId, related: bool) -> Option<u64> {
+        let Ok(Some(generation)) = self
+            .network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+        else {
+            // Busy or absent is not evidence of a replacement. Do not clear
+            // a consumed marker or start an attempt with unknown ownership.
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_gate_closed",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        };
+        if !self
+            .runtime
+            .wire_limits
+            .begin_hello_on_connection(machine, related, Some(generation))
+        {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_attempt_unavailable",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        }
+        Some(generation)
+    }
+
+    #[cfg(test)]
+    async fn pause_hello_open(&self, after_open: bool) {
+        let pause = self
+            .runtime
+            .wire_limits
+            .hello_open_pause
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(pause) = pause.filter(|p| p.after_open == after_open) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
     fn same_connection(&self, machine: MachineId, generation: u64) -> bool {
         self.network
             .try_connection_generation(&ant_quic::PeerId(machine.0))
@@ -968,7 +1116,16 @@ impl Context {
             .admit(machine, reserved)
             .ok_or_else(|| invalid("evidence stream budget"))?;
         let (kind, body) = tokio::time::timeout_at(lease.deadline, async {
+            #[cfg(test)]
+            if kind == HELLO {
+                self.pause_hello_open(false).await;
+            }
             if generation.is_some_and(|g| !self.same_connection(machine, g)) {
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_generation_changed_before_open",
+                    "evidence Hello connection check failed"
+                );
                 return Err(invalid("Hello connection replaced"));
             }
             let (mut send, mut recv) = self
@@ -976,7 +1133,11 @@ impl Context {
                 .open_bi(&ant_quic::PeerId(machine.0))
                 .await
                 .map_err(io::Error::other)?;
-            if let Some(generation) = generation {
+            #[cfg(test)]
+            if kind == HELLO {
+                self.pause_hello_open(true).await;
+            }
+            if let Some(generation) = generation.filter(|_| policy.is_some()) {
                 // Open may yield. A busy Hello defers to the next pass. Its
                 // certificate continuation has no later pass, so retry busy
                 // reads on this empty stream within the same lease deadline.
@@ -988,19 +1149,43 @@ impl Context {
                     if eligible == Some(false)
                         || matches!(current, Ok(value) if value != Some(generation))
                     {
+                        tracing::debug!(
+                            %machine,
+                            outcome = "hello_generation_or_policy_changed_after_open",
+                            "evidence Hello connection or policy check failed"
+                        );
                         return Err(invalid("Hello no longer eligible"));
                     }
                     if eligible == Some(true) && current == Ok(Some(generation)) {
                         break;
                     }
                     if kind != CERTIFICATE {
+                        tracing::debug!(
+                            %machine,
+                            outcome = "hello_generation_or_policy_unreadable_after_open",
+                            "evidence Hello connection or policy check unavailable"
+                        );
                         return Err(invalid("Hello no longer eligible"));
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if kind == HELLO && !self.runtime.wire_limits.begin_hello(machine, true) {
-                    return Err(invalid("Hello already attempted"));
-                }
+            } else if generation.is_some_and(|g| !self.same_connection(machine, g)) {
+                // Open may yield across a replacement. Drop the empty stream
+                // without consuming the marker or starting the rate window.
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_generation_changed_after_open",
+                    "evidence Hello connection check failed"
+                );
+                return Err(invalid("Hello connection replaced"));
+            }
+            if kind == HELLO
+                && !self
+                    .runtime
+                    .wire_limits
+                    .begin_hello_on_connection(machine, true, generation)
+            {
+                return Err(invalid("Hello already attempted"));
             }
             send.write_u8(StreamProtocol::EvidenceV1.as_u8()).await?;
             // Preserve the default-off serialization point and deadline.
@@ -1017,7 +1202,7 @@ impl Context {
     async fn connect(
         self: Arc<Self>,
         machine: MachineId,
-        generation: Option<u64>,
+        mut generation: Option<u64>,
         policy: Option<Arc<ReadyPolicy>>,
     ) {
         if let Some(policy) = &policy {
@@ -1050,14 +1235,44 @@ impl Context {
             {
                 return;
             }
-            if !self.runtime.wait(0).await
-                || !self
-                    .runtime
-                    .wire_limits
-                    .begin_hello(machine, self.related(machine).await)
-            {
+            if !self.runtime.wait(0).await {
                 return;
             }
+            if !self.related(machine).await {
+                return;
+            }
+        }
+        let Some(_job) = self.runtime.wire_limits.pin_machine(machine) else {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_machine_budget_unavailable",
+                "evidence Hello connect skipped"
+            );
+            return;
+        };
+        if policy.is_none() {
+            let Ok(Some(current)) = self
+                .network
+                .try_connection_generation(&ant_quic::PeerId(machine.0))
+            else {
+                // Unknown ownership cannot authorize an attempt. Leave both
+                // the marker and rate timestamp untouched; no default-off retry.
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_connect_generation_unreadable",
+                    "evidence Hello connect skipped"
+                );
+                return;
+            };
+            if !self.runtime.wire_limits.hello_candidate(machine, current) {
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_connect_not_candidate",
+                    "evidence Hello connect skipped"
+                );
+                return;
+            }
+            generation = Some(current);
         }
         if self
             .send_hello(machine, generation, policy.as_deref())
@@ -1362,8 +1577,10 @@ impl ReadyConnections {
         if let Some(previous) = self.generations.get_mut(&machine) {
             if previous.is_some_and(|old| old != id) {
                 jobs.cancel(machine);
-                limits.disconnect(machine);
             }
+            // A reply may already have consumed this generation before the
+            // readiness pass observes it. Never clear that new marker.
+            limits.hello_connection(machine, id);
             *previous = Some(id);
         }
     }
@@ -1461,7 +1678,7 @@ impl crate::Agent {
             let mut tick = tokio::time::interval(READY_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The immediate first tick includes startup connections. Only an
-            // authoritative absent generation clears a marker, never a snapshot.
+            // authoritative absent generation removes tracking, never a snapshot.
             'wire: loop {
                 tokio::select! {
                     _ = token.cancelled() => break,
@@ -1627,8 +1844,8 @@ mod tests {
         assert!(!connections.generations.contains_key(&overflow));
         connections.remove(overflow, &jobs, &limits);
         assert!(
-            !limits.state.lock().unwrap().machines[&overflow].attempted,
-            "disconnect clears an untracked peer's inbound attempt too"
+            limits.state.lock().unwrap().machines[&overflow].attempted,
+            "generation-blind disconnect must retain an inbound attempt"
         );
     }
 
@@ -1973,7 +2190,7 @@ mod tests {
             .unwrap();
         assert!(result.unwrap_err().is_cancelled());
         assert!(!jobs.outgoing(machine));
-        assert!(!context.runtime.wire_limits.state.lock().unwrap().machines[&machine].attempted);
+        assert!(context.runtime.wire_limits.state.lock().unwrap().machines[&machine].attempted);
         context.network.disconnect(&peer).await.unwrap();
         // Keep the reply stream alive until after the cancellation assertion.
         let _ = &mut recv;
@@ -2378,10 +2595,14 @@ mod tests {
         tokio::time::advance(HELLO_INTERVAL).await;
         assert!(!limits.begin_hello(m, true), "no retry until reconnect");
         limits.disconnect(m);
-        assert!(limits.begin_hello(m, true));
-        limits.disconnect(m);
         assert!(
             !limits.begin_hello(m, true),
+            "disconnect alone cannot re-arm"
+        );
+        assert!(limits.begin_hello_on_connection(m, true, Some(1)));
+        limits.disconnect(m);
+        assert!(
+            !limits.begin_hello_on_connection(m, true, Some(2)),
             "reconnect churn retains cooldown"
         );
     }
