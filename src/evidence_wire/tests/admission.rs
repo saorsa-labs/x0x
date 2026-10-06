@@ -1196,3 +1196,302 @@ async fn issue1207_reset_and_ready_flood_never_repeat_attempt() {
     f.responder.shutdown_token.cancel();
     f.shutdown().await;
 }
+
+// BEGIN #1207 S1b RED tests and controls. Commit this block before the fix.
+// The peer uses the real Sim transport and production EvidenceV1 bytes. It
+// never runs an outgoing Hello scheduler, including after its cold restart.
+#[derive(Clone, Copy)]
+enum S1bReply {
+    Ack,
+    Reset,
+    Refuse,
+}
+
+impl Fixture {
+    fn s1b_generation(&self) -> u64 {
+        self.responder
+            .network()
+            .unwrap()
+            .try_connection_generation(&ant_quic::PeerId(self.initiator.machine_id().0))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn s1b_expire_rate_gate(&self) {
+        // Advance only the rate timestamp, never the attempted marker. This
+        // avoids a minute of wall time without pausing durable-store workers.
+        self.context
+            .runtime
+            .wire_limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&self.initiator.machine_id())
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    }
+
+    async fn s1b_read_hello(&self, reply: S1bReply) {
+        let (peer, mut send, mut recv) = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.initiator.network().unwrap().accept_bi(),
+        )
+        .await
+        .expect("new connection must receive a Hello")
+        .unwrap();
+        assert_eq!(peer.0, self.responder.machine_id().0);
+        assert_eq!(
+            recv.read_u8().await.unwrap(),
+            StreamProtocol::EvidenceV1.as_u8()
+        );
+        let limits = Limits::default();
+        let (kind, body) = read_message(&mut recv, &limits).await.unwrap();
+        assert_eq!(kind, HELLO);
+        let record = decode::hello(&body).unwrap().into_record();
+        let verified = record.verify(dm_capability::now_unix_ms(), W_MS).unwrap();
+        assert_eq!(verified.announcement.agent_id, self.responder.agent_id());
+        assert_eq!(
+            verified.announcement.machine_id,
+            self.responder.machine_id()
+        );
+        match reply {
+            S1bReply::Reset => {} // Drop the real reply stream.
+            S1bReply::Ack | S1bReply::Refuse => {
+                let (kind, body) = match reply {
+                    S1bReply::Ack => (ACK, codec().serialize(&Option::<[u8; 32]>::None).unwrap()),
+                    _ => (NOT_FOUND, Vec::new()),
+                };
+                write_message(&mut send, &limits, self.responder.machine_id(), kind, &body)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn s1b_first_attempt(&self, reply: S1bReply) {
+        self.publish_ready();
+        assert!(!self
+            .context
+            .runtime
+            .wire_limits
+            .ready_hello
+            .load(std::sync::atomic::Ordering::Acquire));
+        let ((), ()) = tokio::join!(
+            Arc::clone(&self.context).connect(self.initiator.machine_id(), None, None),
+            self.s1b_read_hello(reply),
+        );
+        assert_eq!(self.sent(), 1);
+    }
+
+    async fn s1b_restart_remote(&mut self) {
+        let machine = self.initiator.machine_id();
+        let agent = self.initiator.agent_id();
+        let old_generation = self.s1b_generation();
+        let network = self.initiator.network().unwrap();
+        let config = network.config().clone();
+        let mut events = self.responder.network().unwrap().subscribe();
+        // Only B stops. A never calls disconnect and must not depend on a
+        // synthetic PeerDisconnected event to release its old attempt.
+        network.shutdown().await;
+        assert_eq!(
+            self.responder
+                .network()
+                .unwrap()
+                .try_connection_generation(&ant_quic::PeerId(machine.0)),
+            Ok(None)
+        );
+        let path = self._dir.path().join("initiator");
+        self.initiator = Agent::builder()
+            .with_identity_dir(&path)
+            .with_machine_key(path.join("machine.key"))
+            .with_agent_key_path(path.join("agent.key"))
+            .with_user_key_path(path.join("user.key"))
+            .with_agent_cert_path(path.join("agent.cert"))
+            .with_contact_store_path(path.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(config)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(self.initiator.machine_id(), machine);
+        assert_eq!(self.initiator.agent_id(), agent);
+        self.initiator
+            .network()
+            .unwrap()
+            .connect_addr(
+                self.responder
+                    .network()
+                    .unwrap()
+                    .bound_addr()
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(self.s1b_generation() > old_generation);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    crate::network::NetworkEvent::PeerDisconnected { peer_id, .. }
+                        if peer_id == machine.0 =>
+                    {
+                        panic!("remote restart must not emit A's local disconnect event");
+                    }
+                    crate::network::NetworkEvent::PeerConnected { peer_id, .. }
+                        if peer_id == machine.0 =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn s1b_no_more_hellos(&self) {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                self.initiator.network().unwrap().accept_bi(),
+            )
+            .await
+            .is_err(),
+            "same connection must not send another Hello"
+        );
+    }
+}
+
+async fn s1b_restart_sends_once(enabled: bool) {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    f.s1b_first_attempt(S1bReply::Ack).await;
+    f.s1b_expire_rate_gate();
+    start_ready_wire(&f.responder, enabled);
+    if enabled {
+        // Let S1 track the old generation before the remote replacement.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+    f.s1b_restart_remote().await;
+    f.s1b_read_hello(S1bReply::Ack).await;
+    assert_eq!(f.sent(), 2);
+    // Remove the cooldown as a possible explanation of the no-retry result.
+    f.s1b_expire_rate_gate();
+    for _ in 0..3 {
+        Arc::clone(&f.context)
+            .connect(f.initiator.machine_id(), None, None)
+            .await;
+    }
+    f.s1b_no_more_hellos().await;
+    assert_eq!(f.sent(), 2);
+    f.responder.shutdown_token.cancel();
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue1207_s1b_red_default_off_remote_restart_sends_one_new_hello() {
+    s1b_restart_sends_once(false).await;
+}
+
+#[tokio::test]
+async fn issue1207_s1b_ready_enabled_remote_restart_sends_one_new_hello() {
+    s1b_restart_sends_once(true).await;
+}
+
+#[tokio::test]
+async fn issue1207_s1b_default_off_reset_or_refusal_never_retries_same_connection() {
+    for reply in [S1bReply::Reset, S1bReply::Refuse] {
+        let f = Fixture::new_with_transport(true, true, true, true).await;
+        let generation = f.s1b_generation();
+        f.s1b_first_attempt(reply).await;
+        f.s1b_expire_rate_gate();
+        for _ in 0..3 {
+            Arc::clone(&f.context)
+                .connect(f.initiator.machine_id(), None, None)
+                .await;
+        }
+        f.s1b_no_more_hellos().await;
+        assert_eq!(f.s1b_generation(), generation);
+        assert_eq!(f.sent(), 1);
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn issue1207_s1b_default_off_reconnect_keeps_machine_rate_gate_and_shares_replies() {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    f.s1b_first_attempt(S1bReply::Ack).await;
+    start_ready_wire(&f.responder, false);
+    f.s1b_restart_remote().await;
+    f.s1b_no_more_hellos().await;
+    assert_eq!(
+        f.sent(),
+        1,
+        "two connections inside 60 s share one Hello budget"
+    );
+    let hello = f.hello();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(
+        f.sent(),
+        1,
+        "reply must be ACK inside the same machine rate window"
+    );
+    f.s1b_expire_rate_gate();
+    // No flag-off timer may turn the unsent connect into a deferred attempt.
+    f.s1b_no_more_hellos().await;
+    assert_eq!(f.sent(), 1);
+    f.responder.shutdown_token.cancel();
+    f.shutdown().await;
+}
+#[tokio::test]
+async fn issue1207_s1b_red_default_off_reply_after_remote_restart_carries_hello() {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    f.s1b_first_attempt(S1bReply::Ack).await;
+    f.s1b_expire_rate_gate();
+    // Model S1 observing the old connection, then receiving a new-generation
+    // reply before its next readiness pass.
+    let mut connections = ReadyConnections::new(1);
+    let jobs = WireJobs::default();
+    let machine = f.initiator.machine_id();
+    assert!(connections.insert(machine));
+    connections.generation(
+        machine,
+        f.s1b_generation(),
+        &jobs,
+        &f.context.runtime.wire_limits,
+    );
+    // No scheduler: exercise the reply arriving before any connect job.
+    f.s1b_restart_remote().await;
+    let hello = f.hello();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(
+        f.sent(),
+        2,
+        "new-generation reply must carry our Hello, not only ACK"
+    );
+    connections.generation(
+        machine,
+        f.s1b_generation(),
+        &jobs,
+        &f.context.runtime.wire_limits,
+    );
+    f.s1b_expire_rate_gate();
+    Arc::clone(&f.context)
+        .connect(f.initiator.machine_id(), None, None)
+        .await;
+    f.s1b_no_more_hellos().await;
+    assert_eq!(
+        f.sent(),
+        2,
+        "reply and connect share the connection attempt"
+    );
+    f.shutdown().await;
+}
+// END #1207 S1b RED tests and controls.
