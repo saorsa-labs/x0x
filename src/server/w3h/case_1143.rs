@@ -270,18 +270,98 @@ fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
 /// and whose body is `{"type":"fetch_request","group_id":gid,
 /// "member_agent_id":joiner,…}`.
 fn join_fetch_request(bytes: &[u8], gid: &str, joiner: &AgentId) -> bool {
-    if bytes.get(1..33) != Some(joiner.as_bytes().as_slice()) {
-        return false;
+    bytes.get(1..33) == Some(joiner.as_bytes().as_slice())
+        && bytes
+            .get(33..)
+            .is_some_and(|body| fetch_request_body(body, gid, joiner))
+}
+
+/// Whether `payload`, an application DM payload, is `joiner`'s join
+/// `fetch_request` for `gid` naming itself.
+fn fetch_request_body(payload: &[u8], gid: &str, joiner: &AgentId) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload).is_ok_and(|body| {
+        body["type"] == "fetch_request"
+            && body["group_id"] == gid
+            && body["member_agent_id"] == hex::encode(joiner.as_bytes())
+    })
+}
+
+/// One join `fetch_request` from J that A's DM layer handed to its
+/// consumers (A's join-result listener among them).
+struct RequestSeen {
+    /// Trace position of the mark recorded on receipt.
+    position: usize,
+    at: Duration,
+    verified: bool,
+}
+
+/// Aborts the watcher when the scenario ends, however it ends.
+struct Watcher(tokio::task::JoinHandle<()>);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    let Some(Ok(body)) = bytes
-        .get(33..)
-        .map(serde_json::from_slice::<serde_json::Value>)
-    else {
-        return false;
-    };
-    body["type"] == "fetch_request"
-        && body["group_id"] == gid
-        && body["member_agent_id"] == hex::encode(joiner.as_bytes())
+}
+
+/// Watch A's DM layer for J's join `fetch_request` for `gid`, from now on.
+///
+/// The x0x DM layer carries a request on either transport: a raw-QUIC
+/// direct frame, or (when the raw send cannot be used) the recipient's
+/// gossip DM inbox, end-to-end encrypted. Both end in A's `DirectMessaging`
+/// fan-out (`DirectMessaging::handle_incoming`), which A's join-result
+/// listener reads; this watcher is one more subscriber there, with its own
+/// queue, so it sees exactly what that listener sees and takes nothing from
+/// it. Each receipt is marked in the trace, so its trace position orders it
+/// against the join call and the fabric's deliveries.
+fn watch_join_requests(
+    sim: &Sim,
+    gid: &str,
+) -> Result<(Watcher, Arc<std::sync::Mutex<Vec<RequestSeen>>>)> {
+    let joiner = sim.state("J")?.agent.agent_id();
+    let mut inbox = sim.state("A")?.agent.subscribe_direct();
+    let fabric = Arc::clone(sim.fabric());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let gid = gid.to_string();
+    let task = tokio::spawn(async move {
+        while let Some(msg) = inbox.recv().await {
+            if msg.sender != joiner || !fetch_request_body(&msg.payload, &gid, &joiner) {
+                continue;
+            }
+            let position = fabric.mark_indexed(format!(
+                "A's DM layer received J's join fetch_request (verified={})",
+                msg.verified
+            ));
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RequestSeen {
+                    position,
+                    at: fabric.now(),
+                    verified: msg.verified,
+                });
+        }
+    });
+    Ok((Watcher(task), seen))
+}
+
+/// The transport that carried each received request, by trace position:
+/// `direct` when a direct-lane J->A join `fetch_request` frame was
+/// delivered after the previous received request and before this one,
+/// otherwise the gossip DM inbox. A frame and its hand-off can share a
+/// virtual instant, so this compares positions, never timestamps.
+fn request_transports(received: &[RequestSeen], direct_frames: &[usize]) -> Vec<&'static str> {
+    let mut frames = direct_frames.iter().copied().peekable();
+    received
+        .iter()
+        .map(|seen| {
+            let mut via = "dm_inbox";
+            while frames.next_if(|frame| *frame < seen.position).is_some() {
+                via = "direct";
+            }
+            via
+        })
+        .collect()
 }
 
 async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> Result<()> {
@@ -360,31 +440,53 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
     let invite = sim.home_seat("A", "J", &home).await?;
     sim.set_online("O", false)?;
 
-    // t2: J redeems A's invite with O offline.
-    let join_from = sim.fabric().now();
-    let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
-    // The request: J's join `fetch_request` for this group, naming J,
-    // delivered to A after the join call.
-    let j_agent = sim.state("J")?.agent.agent_id();
-    let requests: Vec<Duration> = sim
+    // t2: J redeems A's invite with O offline. From this trace position on,
+    // A's DM layer is watched for J's request (`watch_join_requests`).
+    let join_position = sim
         .fabric()
-        .delivered_writes_since(&sim.peer("J")?, &sim.peer("A")?, join_from)
+        .mark_indexed("t2: J redeems A's invite with O offline");
+    let (watcher, received) = watch_join_requests(sim, &home.gid)?;
+    let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
+    drop(watcher);
+    // The request: J's join `fetch_request` for this group, naming J, that
+    // A's DM layer received after the join call, on either DM transport.
+    // A JoinResult answers a request, so this is the request A served (or,
+    // before ADR 0108 S2-1, refused to seal for).
+    let received = std::mem::take(
+        &mut *received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let j_agent = sim.state("J")?.agent.agent_id();
+    let direct_frames: Vec<usize> = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer("J")?, &sim.peer("A")?, join_position)
         .into_iter()
         .filter(|(write, _)| {
             write.lane.class == crate::network::sim::LaneClass::Direct
                 && join_fetch_request(&write.bytes, &home.gid, &j_agent)
         })
-        .map(|(_, delivered_at)| delivered_at)
+        .map(|(_, position)| position)
         .collect();
-    let first_request = requests.iter().min().copied();
+    let transports = request_transports(&received, &direct_frames);
+    let via_direct = transports.iter().filter(|via| **via == "direct").count();
+    let first = received
+        .first()
+        .filter(|seen| seen.position > join_position);
+    let first_request = first.map(|seen| seen.at);
     receipt.request_delivered(
         "j_join_fetch_request_reached_a",
-        first_request.is_some(),
+        first.is_some(),
         format!(
-            "{} J->A fetch_request messages for this group naming J delivered after the \
-             join call; first at {:?}us",
-            requests.len(),
-            first_request.map(|t| t.as_micros())
+            "{} join fetch_requests from J for this group naming J reached A's DM layer after \
+             the join call (trace #{join_position}): {via_direct} via direct frames, {} via the \
+             gossip DM inbox; first at trace #{} ({:?}us, via {}, verified={})",
+            received.len(),
+            received.len().saturating_sub(via_direct),
+            first.map_or("none".to_string(), |seen| seen.position.to_string()),
+            first_request.map(|t| t.as_micros()),
+            transports.first().copied().unwrap_or("none"),
+            first.is_some_and(|seen| seen.verified),
         ),
         at(sim),
     );
@@ -511,4 +613,41 @@ async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
         receipt.verdict()
     );
     Ok(())
+}
+
+/// The request stage's transport attribution compares trace positions: a
+/// direct frame delivered before a receipt (and after the previous one)
+/// carried it; a receipt with no such frame came over the gossip DM inbox.
+#[test]
+fn w3h_1143_request_transport_follows_trace_position() {
+    let seen = |position| RequestSeen {
+        position,
+        at: Duration::ZERO,
+        verified: true,
+    };
+    let received = [seen(10), seen(20), seen(30)];
+    assert_eq!(
+        request_transports(&received, &[5, 25]),
+        ["direct", "dm_inbox", "direct"]
+    );
+    assert_eq!(
+        request_transports(&received, &[]),
+        ["dm_inbox", "dm_inbox", "dm_inbox"]
+    );
+    // A frame delivered after the last receipt carried none of them.
+    assert_eq!(request_transports(&received[..1], &[11]), ["dm_inbox"]);
+    let joiner = AgentId([7; 32]);
+    let body = json!({
+        "type": "fetch_request",
+        "group_id": "g",
+        "member_agent_id": hex::encode(joiner.as_bytes()),
+    })
+    .to_string();
+    assert!(fetch_request_body(body.as_bytes(), "g", &joiner));
+    assert!(!fetch_request_body(body.as_bytes(), "other", &joiner));
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(joiner.as_bytes());
+    frame.extend_from_slice(body.as_bytes());
+    assert!(join_fetch_request(&frame, "g", &joiner));
+    assert!(!join_fetch_request(&frame, "g", &AgentId([8; 32])));
 }

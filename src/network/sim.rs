@@ -433,35 +433,51 @@ impl SimFabric {
         });
     }
 
-    /// Writes from `src` to `dst` made at or after `since` that were
-    /// delivered, each with its delivery time.
-    pub(crate) fn delivered_writes_since(
+    /// [`Self::mark`], returning the mark's trace position. A trace
+    /// position orders events that share one virtual instant, which their
+    /// timestamps cannot.
+    pub(crate) fn mark_indexed(&self, text: impl Into<String>) -> usize {
+        let at = self.now();
+        let mut state = self.lock();
+        state.trace.push(TraceEvent::Mark {
+            at,
+            text: text.into(),
+        });
+        state.trace.len().saturating_sub(1)
+    }
+
+    /// Writes from `src` to `dst` whose delivery comes after trace position
+    /// `after`, in delivery order, each with its delivery's trace position.
+    /// A delivery is recorded when the bytes reach the destination's
+    /// inbound queue, so it precedes everything the destination does with
+    /// them.
+    pub(crate) fn delivered_writes_after(
         &self,
         src: &PeerId,
         dst: &PeerId,
-        since: Duration,
-    ) -> Vec<(Write, Duration)> {
+        after: usize,
+    ) -> Vec<(Write, usize)> {
         let state = self.lock();
-        let delivered: BTreeMap<(LaneKey, u64), Duration> = state
+        let writes: BTreeMap<(LaneKey, u64), &Write> = state
+            .writes
+            .iter()
+            .filter(|write| write.lane.src == src.0 && write.lane.dst == dst.0)
+            .map(|write| ((write.lane, write.seq), write))
+            .collect();
+        state
             .trace
             .iter()
-            .filter_map(|event| match event {
+            .enumerate()
+            .skip(after.saturating_add(1))
+            .filter_map(|(position, event)| match event {
                 TraceEvent::Fate {
                     lane,
                     seq,
-                    fate: Fate::Delivered { at },
-                } => Some(((*lane, *seq), *at)),
+                    fate: Fate::Delivered { .. },
+                } => writes
+                    .get(&(*lane, *seq))
+                    .map(|write| ((*write).clone(), position)),
                 _ => None,
-            })
-            .collect();
-        state
-            .writes
-            .iter()
-            .filter(|write| write.lane.src == src.0 && write.lane.dst == dst.0 && write.at >= since)
-            .filter_map(|write| {
-                delivered
-                    .get(&(write.lane, write.seq))
-                    .map(|at| (write.clone(), *at))
             })
             .collect()
     }
