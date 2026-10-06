@@ -773,6 +773,22 @@ impl PeerEvidenceStore {
             Err(_) => Ok(None),
         }
     }
+    /// [`Self::usable`] without blocking on the store lock or a policy read
+    /// (x0x #1207), for bounded resolution: the same point-of-use authority
+    /// check, or `Err(())` while a lock is contended. Diagnostic counters
+    /// are not updated.
+    pub(crate) fn try_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        match self.check_usable_with(agent, machine, now, false) {
+            Ok(view) => Ok(Some(view)),
+            Err(STORE_BUSY) => Err(()),
+            Err(_) => Ok(None),
+        }
+    }
     /// Indexed candidates only; never substitutes for `usable` checks.
     pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
         self.state
@@ -3407,6 +3423,335 @@ mod tests {
         assert!(agent.peer_evidence().usable_agent(peer, now).is_none());
         store.maintain(now + 60_000).unwrap();
         assert!(store.lock().unwrap().file.records.is_empty());
+        agent.shutdown().await;
+    }
+
+    /// WHY (x0x #1207, Codex r3 P2-1): an opted-in send's resolution never
+    /// blocks on the evidence store's synchronous lock. The recipient
+    /// resolves from peer evidence. While the send-readiness repair runs, a
+    /// writer takes the store's state. The post-repair evidence check must
+    /// not wait on it: a blocking point-of-use check would hold the send (and
+    /// its worker thread, which no deadline can interrupt) until the writer
+    /// lets go. It fails closed at once instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s8b_1207_an_opted_in_send_never_blocks_on_a_held_evidence_store() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, _, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let agent = crate::Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key_path(dir.path().join("user.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        let peer = p.a();
+        agent
+            .start_peer_evidence(
+                dir.path().to_owned(),
+                EvidenceConfig::default(),
+                Arc::new(move |a| Some(a == peer)),
+            )
+            .unwrap();
+        assert!(agent.peer_evidence().wait(0).await);
+        assert!(
+            agent.peer_evidence().usable_agent(peer, now).is_some(),
+            "control: the recipient resolves from peer evidence"
+        );
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        let repair = crate::PinnedRepairGate::new();
+        agent.script_pinned_standin_transport_for_testing(
+            crate::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+        let agent = Arc::new(agent);
+        let mut send = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_direct_with_config_cold_wait(
+                        &peer,
+                        b"adr0107-1207-held-evidence-policy".to_vec(),
+                        crate::dm::DmSendConfig::default(),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        let entered =
+            tokio::time::timeout(std::time::Duration::from_secs(20), repair.reached.acquire())
+                .await;
+        assert!(
+            matches!(entered, Ok(Ok(_))),
+            "the send never reached the send-readiness repair"
+        );
+        // A writer takes the evidence store's state, in its own thread,
+        // until told to let go.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = agent.peer_evidence().store().unwrap();
+            std::thread::spawn(move || {
+                let _held = store.lock().unwrap();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            })
+        };
+        assert!(held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok());
+        // Wall-clock: a blocked worker thread also stalls the runtime's
+        // timers, so a tokio timeout cannot be trusted to fire here.
+        let released = std::time::Instant::now();
+        repair.release();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(4), &mut send).await;
+        let ended_after = released.elapsed();
+        let _ = release_tx.send(());
+        let _ = tokio::task::spawn_blocking(move || holder.join()).await;
+        let outcome = match ended {
+            Ok(joined) => Some(joined.unwrap()),
+            Err(_) => {
+                let _ = send.await;
+                None
+            }
+        };
+        assert!(
+            outcome.is_some() && ended_after < std::time::Duration::from_secs(3),
+            "the opted-in send waited {ended_after:?} on the held evidence store"
+        );
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "a send past a held evidence store must fail closed: {outcome:?}"
+        );
+        agent.shutdown().await;
+    }
+
+    /// An inert agent for the x0x #1207 tests, built over `dir`.
+    async fn s8b_1207_agent(dir: &std::path::Path) -> crate::Agent {
+        crate::Agent::builder()
+            .with_identity_dir(dir)
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key_path(dir.join("agent.key"))
+            .with_user_key_path(dir.join("user.key"))
+            .with_agent_cert_path(dir.join("agent.cert"))
+            .with_contact_store_path(dir.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// WHY (x0x #1207, Codex r4, mandatory): a send under a lock (the in-lock
+    /// Welcome FetchRequest, a ZERO cold wait) must not run ANY blocking
+    /// evidence check or any Lookup, not even before raw resolution. The
+    /// recipient is known only from peer evidence, and a writer holds the
+    /// evidence store for the whole send. The send must end at once (fail
+    /// closed, retryably) and start no Lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn s8b_1207_a_zero_wait_send_runs_no_lookup_and_never_blocks_on_evidence() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, _, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let agent = s8b_1207_agent(dir.path()).await;
+        let peer = p.a();
+        agent
+            .start_peer_evidence(
+                dir.path().to_owned(),
+                EvidenceConfig::default(),
+                Arc::new(move |a| Some(a == peer)),
+            )
+            .unwrap();
+        assert!(agent.peer_evidence().wait(0).await);
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let lookups = Arc::clone(&lookups);
+            let responder = Arc::new(
+                move |agent: AgentId| -> futures::future::BoxFuture<'static, ()> {
+                    if agent == peer {
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Box::pin(async {})
+                },
+            );
+            assert!(agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok());
+        }
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        // A writer holds the evidence store, in its own thread, for 10 s.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = agent.peer_evidence().store().unwrap();
+            std::thread::spawn(move || {
+                let _held = store.lock().unwrap();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            })
+        };
+        assert!(held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok());
+        let agent = Arc::new(agent);
+        let started = std::time::Instant::now();
+        let mut send = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_direct_with_config_cold_wait(
+                        &peer,
+                        b"adr0107-1207-zero-wait-under-a-lock".to_vec(),
+                        crate::dm::DmSendConfig::default(),
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+            })
+        };
+        // Wall-clock: a blocked worker thread can also stall the timers.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(4), &mut send).await;
+        let ended_after = started.elapsed();
+        let _ = release_tx.send(());
+        let _ = tokio::task::spawn_blocking(move || holder.join()).await;
+        let outcome = match ended {
+            Ok(joined) => Some(joined.unwrap()),
+            Err(_) => {
+                let _ = send.await;
+                None
+            }
+        };
+        let started_lookups = lookups.load(Ordering::SeqCst);
+        assert!(
+            outcome.is_some() && ended_after < std::time::Duration::from_secs(3),
+            "the zero-wait send waited {ended_after:?} on the held evidence store"
+        );
+        assert_eq!(started_lookups, 0, "the zero-wait send started a Lookup");
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "a zero-wait send past a held evidence store must fail closed: {outcome:?}"
+        );
+        agent.shutdown().await;
+    }
+
+    /// WHY (x0x #1207, Codex r4 (i)): the opted-in send's bounded wait is new
+    /// on the general path. Its EvidenceV1 Lookup selects responders with
+    /// blocking evidence and policy reads, which no deadline can interrupt,
+    /// so it must never run on the waiting send. The Lookup here blocks its
+    /// thread for 9 s (after the first one, before raw resolution, which is
+    /// pre-existing and out of scope). The send must still end at its 5 s
+    /// deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn s8b_1207_the_bounded_wait_never_runs_the_lookup_on_the_waiting_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = s8b_1207_agent(dir.path()).await;
+        let peer = AgentKeypair::generate().unwrap().agent_id();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            let responder = Arc::new(
+                move |agent: AgentId| -> futures::future::BoxFuture<'static, ()> {
+                    let call = if agent == peer {
+                        calls.fetch_add(1, Ordering::SeqCst)
+                    } else {
+                        0
+                    };
+                    Box::pin(async move {
+                        if call > 0 {
+                            std::thread::sleep(std::time::Duration::from_secs(9));
+                        }
+                    })
+                },
+            );
+            assert!(agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok());
+        }
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        let agent = Arc::new(agent);
+        let started = std::time::Instant::now();
+        let outcome = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_direct_with_config_cold_wait(
+                        &peer,
+                        b"adr0107-1207-lookup-off-the-wait".to_vec(),
+                        crate::dm::DmSendConfig::default(),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+            .await
+            .unwrap()
+        };
+        let ended_after = started.elapsed();
+        assert!(
+            ended_after < std::time::Duration::from_millis(7_500),
+            "the opted-in send ended {ended_after:?} after it started (a Lookup ran on it)"
+        );
+        assert!(
+            matches!(outcome, Err(crate::dm::DmError::RecipientUndiscovered(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "control: the bounded wait started a Lookup"
+        );
+        agent.shutdown().await;
+    }
+
+    /// WHY (x0x #1207, Codex r5 P2-1, mandatory): a ZERO-wait send (the
+    /// in-lock Welcome FetchRequest) must never wait on the evidence load
+    /// barrier, not even in raw resolution. A current capability advert
+    /// skips the barrier before raw resolution, and the evidence store is
+    /// still loading. The send must end at once, retryably.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s8b_1207_a_zero_wait_send_never_waits_on_evidence_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = s8b_1207_agent(dir.path()).await;
+        let peer = AgentKeypair::generate().unwrap().agent_id();
+        let machine = MachineKeypair::generate().unwrap().machine_id();
+        assert!(agent.capability_store().insert(
+            peer,
+            machine,
+            DmCapabilities::pending(),
+            crate::dm_capability::now_unix_ms(),
+        ));
+        agent.peer_evidence().hold_load_barrier_for_testing();
+        agent.set_pinned_standin_strict_resolution_for_testing(true);
+        let started = std::time::Instant::now();
+        let outcome = agent
+            .send_direct_with_config_cold_wait(
+                &peer,
+                b"adr0107-1207-zero-wait-evidence-loading".to_vec(),
+                crate::dm::DmSendConfig::default(),
+                std::time::Duration::ZERO,
+            )
+            .await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the zero-wait send waited {took:?} on evidence loading"
+        );
+        assert!(
+            matches!(outcome, Err(crate::dm::DmError::RecipientUndiscovered(_))),
+            "{outcome:?}"
+        );
         agent.shutdown().await;
     }
 

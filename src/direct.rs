@@ -935,6 +935,16 @@ impl DirectMessaging {
         connected.get(agent_id).copied()
     }
 
+    /// Test seam (x0x #1207): hold the DM registry as a writer does, until
+    /// the returned guard drops, so a test can prove a read of it is
+    /// bounded. Test builds only.
+    #[cfg(test)]
+    pub(crate) async fn hold_registry_for_testing(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<AgentId, MachineId>> {
+        self.connected_agents.write().await
+    }
+
     /// [`Self::get_machine_id`] without waiting for the registry lock, for
     /// synchronous admission seams (x0x #1150 r7b). `None`: the lock is
     /// held right now.

@@ -338,6 +338,224 @@ fn apply_withdrawn_group_card_to_group_info(
 // Request / response types
 // ---------------------------------------------------------------------------
 
+/// x0x #1207, #1217: the bounded wait for a restart-cold recipient's
+/// verified binding, for the crate-internal opt-in
+/// (`Agent::send_direct_with_config_cold_wait`, and the resolve-only
+/// `Agent::await_cold_recipient_binding`). Only where the caller holds no
+/// lock and does not fan out serially; a send under a lock passes ZERO.
+pub(in crate::server) const COLD_RECIPIENT_WAIT: Duration = x0x::dm::PINNED_RESOLUTION_WAIT;
+
+/// x0x #1207 (lock rule; Codex r3 P2-2(a)): the authority whose Welcome
+/// blob `event` makes this agent fetch, when the event can reach that fetch.
+/// Every check is cheap and runs before any wait, so an event that cannot
+/// lead to a Welcome fetch never waits:
+/// - a `MemberAdded` or `JoinRequestApproved` that seats THIS agent with a
+///   Welcome by reference and carries the commit and the TreeKEM fields the
+///   apply requires (a `JoinRequestApproved` also needs this agent's
+///   pending request);
+/// - in a local TreeKEM group, whose actor is the authenticated `sender`
+///   and an admin;
+/// - whose Welcome source is a plausible authority: an admin of that group
+///   on this agent's roster.
+///
+/// The apply checks all of this again under its lock. Reads `named_groups`
+/// briefly and holds nothing after.
+async fn cold_welcome_authority(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+    sender: &AgentId,
+) -> Option<AgentId> {
+    let (member, actor, complete, inline, welcome_ref, request_id) = match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            agent_id,
+            actor,
+            commit,
+            treekem_commit_b64,
+            treekem_epoch,
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } => (
+            agent_id,
+            actor,
+            commit.is_some() && treekem_commit_b64.is_some() && treekem_epoch.is_some(),
+            treekem_welcome_b64,
+            welcome_ref,
+            None,
+        ),
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            requester_agent_id,
+            actor,
+            commit,
+            treekem_commit_b64,
+            treekem_epoch,
+            treekem_key_package_hash,
+            treekem_welcome_b64,
+            welcome_ref,
+            request_id,
+            ..
+        } => (
+            requester_agent_id,
+            actor,
+            commit.is_some()
+                && treekem_commit_b64.is_some()
+                && treekem_epoch.is_some()
+                && treekem_key_package_hash.is_some(),
+            treekem_welcome_b64,
+            welcome_ref,
+            Some(request_id),
+        ),
+        _ => return None,
+    };
+    let welcome_ref = welcome_ref.as_ref()?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !complete
+        || inline.is_some()
+        || *member != local_hex
+        || *actor != hex::encode(sender.as_bytes())
+    {
+        return None;
+    }
+    let source = parse_agent_id_hex(&welcome_ref.source).ok()?;
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_key)?;
+    let is_admin = |agent: &str| {
+        info.caller_role(agent)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+    };
+    let request_pending = request_id.is_none_or(|id| {
+        info.join_requests
+            .get(id)
+            .is_some_and(|request| request.is_pending() && request.requester_agent_id == local_hex)
+    });
+    let plausible = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && is_admin(actor)
+        && is_admin(&welcome_ref.source)
+        && request_pending;
+    plausible.then_some(source)
+}
+
+/// x0x #1207 (Codex r3 P2-2(b)): after a cold wait for a Welcome source
+/// ends without a binding, no further wait for that source runs for this
+/// long. The in-lock FetchRequest still reads the verified sources once, and
+/// the Welcome fetch's own retries cover the window.
+const COLD_WELCOME_WAIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// x0x #1207 (Codex r4 P3): the most Welcome sources tracked at once (in
+/// flight or cooling down). Expired cooldowns are evicted first; while the
+/// map is still full, a new source gets no wait, only a background Lookup
+/// (Codex r5), and its FetchRequest still reads the verified sources once
+/// on each retry of the Welcome fetch.
+const COLD_WELCOME_WAITS_MAX: usize = 256;
+
+/// x0x #1207 (Codex r3 P2-2(b), r4 P3): one cold wait per Welcome source at
+/// a time, none during the cooldown after a wait that found nothing, and at
+/// most [`COLD_WELCOME_WAITS_MAX`] sources tracked. Dropped unresolved (a
+/// failed or cancelled wait), it starts the cooldown.
+struct ColdWelcomeWaitSlot<'a> {
+    waits: &'a std::sync::Mutex<HashMap<AgentId, Option<std::time::Instant>>>,
+    source: AgentId,
+    resolved: bool,
+}
+
+/// Why a pre-lock Welcome wait was not admitted.
+enum ColdWelcomeRefusal {
+    /// A wait for this source is in flight or cooling down.
+    Busy,
+    /// The map holds [`COLD_WELCOME_WAITS_MAX`] sources still in flight or
+    /// cooling down.
+    Full,
+}
+
+impl<'a> ColdWelcomeWaitSlot<'a> {
+    fn claim(state: &'a AppState, source: AgentId) -> Result<Self, ColdWelcomeRefusal> {
+        let mut waits = state
+            .cold_welcome_waits
+            .lock()
+            .map_err(|_| ColdWelcomeRefusal::Busy)?;
+        let now = std::time::Instant::now();
+        waits.retain(|_, failed_at| {
+            failed_at.is_none_or(|at| now.duration_since(at) < COLD_WELCOME_WAIT_COOLDOWN)
+        });
+        if waits.len().saturating_mul(4) < waits.capacity() {
+            waits.shrink_to_fit();
+        }
+        if waits.contains_key(&source) {
+            return Err(ColdWelcomeRefusal::Busy);
+        }
+        if waits.len() >= COLD_WELCOME_WAITS_MAX {
+            return Err(ColdWelcomeRefusal::Full);
+        }
+        waits.insert(source, None);
+        Ok(Self {
+            waits: &state.cold_welcome_waits,
+            source,
+            resolved: false,
+        })
+    }
+}
+
+impl Drop for ColdWelcomeWaitSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut waits) = self.waits.lock() {
+            if self.resolved {
+                waits.remove(&self.source);
+            } else {
+                waits.insert(self.source, Some(std::time::Instant::now()));
+            }
+        }
+    }
+}
+
+/// x0x #1207 (lock rule): wait, up to [`COLD_RECIPIENT_WAIT`] and BEFORE any
+/// guard is taken, for the verified binding of a Welcome `authority`
+/// (resolve only; nothing is sent). The FetchRequest, sent later under the
+/// membership lock with a zero cold wait, then waits for nothing and finds
+/// the binding. An authority the node already resolves returns at once.
+///
+/// Codex r3 P2-2(b): the shared direct listener applies events inline, so
+/// the total wait is capped. One wait per source runs at a time, and a
+/// source whose wait found nothing is not waited for again for
+/// [`COLD_WELCOME_WAIT_COOLDOWN`]. With the cheap checks of
+/// [`cold_welcome_authority`] (the source must be an admin of the group on
+/// this agent's roster), a stream of events costs at most one wait per
+/// admin per cooldown.
+async fn await_cold_welcome_authority(state: &AppState, authority: &AgentId) {
+    let mut slot = match ColdWelcomeWaitSlot::claim(state, *authority) {
+        Ok(slot) => slot,
+        Err(ColdWelcomeRefusal::Busy) => {
+            tracing::debug!(
+                authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+                "a cold wait for this Welcome authority is in flight or cooling down; the FetchRequest reads once"
+            );
+            return;
+        }
+        Err(ColdWelcomeRefusal::Full) => {
+            // Codex r5 P3: no wait, but progress. A background Lookup
+            // (permit-bounded; nothing waits on it) lets a zero-wait
+            // FetchRequest retry find the authority's evidence.
+            state.agent.start_recipient_lookup(authority);
+            tracing::debug!(
+                authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+                "the cold-wait map is full; started a background Lookup, the FetchRequest reads once"
+            );
+            return;
+        }
+    };
+    match state
+        .agent
+        .await_cold_recipient_binding(authority, COLD_RECIPIENT_WAIT)
+        .await
+    {
+        Ok(()) => slot.resolved = true,
+        Err(error) => tracing::debug!(
+            authority = %LogHexId::agent(&hex::encode(authority.as_bytes())),
+            "no verified binding for the Welcome authority before the apply; the FetchRequest reads once: {error}"
+        ),
+    }
+}
+
 pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // Named-group metadata applies require `DirectMessage::verified == true`.
     // The gossip-inbox DM path verifies the signed DM envelope and marks the
@@ -3368,7 +3586,13 @@ fn named_group_event_delivery_future(
             .await
         } else {
             agent
-                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+                .send_direct_with_config_cold_wait(
+                    &recipient,
+                    payload,
+                    named_group_direct_delivery_config(),
+                    // #1217 / #1207: one recipient per spawned task, no lock.
+                    COLD_RECIPIENT_WAIT,
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -9923,6 +10147,33 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     group_id: &str,
     cleared_quarantine: &mut std::collections::BTreeSet<String>,
 ) {
+    // x0x #1207 (lock rule): a queued approval that seats this agent with a
+    // Welcome by reference makes the replay fetch the Welcome under the
+    // guards below (membership, queue persistence, roster persistence, GSS
+    // publication). Wait for each restart-cold authority's binding HERE,
+    // before any of them is taken; the queue is only read (and released).
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let seating: Vec<(NamedGroupMetadataEvent, AgentId)> = state
+        .causal_approval_queue
+        .read()
+        .await
+        .get(group_id)
+        .map(|queue| {
+            queue
+                .iter()
+                .filter(|pending| !pending.conflicted && pending.requester_agent_id == local_hex)
+                .map(|pending| (pending.event.clone(), pending.sender))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut awaited_authorities = std::collections::HashSet::new();
+    for (event, sender) in &seating {
+        if let Some(authority) = cold_welcome_authority(state, group_id, event, sender).await {
+            if awaited_authorities.insert(authority) {
+                await_cold_welcome_authority(state, &authority).await;
+            }
+        }
+    }
     // Global lock order M→P→Q: admission already holds the per-group
     // membership lock before it enters the causal queue writer, so replay
     // must acquire that same membership lock BEFORE queue persistence. This
@@ -11393,6 +11644,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             return ApplyMetadataResult::REJECTED;
         }
     };
+    // x0x #1207 (lock rule): a cold wait never runs under a lock. An event
+    // that seats this agent with a Welcome by reference makes the apply fetch
+    // the Welcome under the membership lock taken below, so wait for a
+    // restart-cold authority's binding HERE, before any guard. A caller that
+    // already holds the lock (causal replay) waited before taking it.
+    if verified && !lock_already_held {
+        if let Some(authority) =
+            cold_welcome_authority(state, &resolved_group_key, &event, &sender).await
+        {
+            await_cold_welcome_authority(state, &authority).await;
+        }
+    }
     // Serialize every membership apply for this group across the concurrent
     // gossip metadata listener and direct-channel listener. Held for the rest
     // of the apply so the load-mutate-commit sequence below cannot interleave
@@ -38005,9 +38268,21 @@ async fn poll_join_result_until_membership_confirmed(
                 None => sent.push((group_id.clone(), 1)),
             }
         }
+        // #1207: the membership guard was dropped above; one send. Its cold
+        // wait for an inviter nothing names yet never outlives this poll's
+        // own window (CI on cabd95e: a short window expired inside a full
+        // 5 s wait, so the timeout finalize ran late). The poll's ABSOLUTE
+        // deadline caps it, applied when raw resolution starts, after the
+        // send's preflight (Codex review of dd414ca).
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&inviter, payload, direct_message_send_config())
+            .send_direct_with_config_cold_wait_until(
+                &inviter,
+                payload,
+                direct_message_send_config(),
+                COLD_RECIPIENT_WAIT,
+                deadline,
+            )
             .await
         {
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
@@ -38211,7 +38486,20 @@ async fn send_welcome_fetch_request(
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
     state
         .agent
-        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
+        // #1207: this runs inside the apply, under the group's membership
+        // lock (and, in causal replay, the global roster-persistence and
+        // GSS-publication guards), so it waits for NOTHING (a zero cold
+        // wait). The bounded wait for a restart-cold authority ran before
+        // any guard was taken (`await_cold_welcome_authority`); this send
+        // reads the verified sources once and finds that binding. The
+        // ChunkAck does not opt in at all: it is awaited on the shared
+        // Welcome listener, and the chunk's sender was just verified.
+        .send_direct_with_config_cold_wait(
+            agent_id,
+            payload,
+            welcome_blob_send_config(request),
+            Duration::ZERO,
+        )
         .await
         .map(|_| ())
         .map_err(classify_welcome_fetch_send_error)
@@ -40081,6 +40369,7 @@ pub(in crate::server) mod tests {
             pending_adoption_chains: StdMutex::new(HashMap::new()),
             pending_head_attestations: StdMutex::new(HashMap::new()),
             pending_join_result_processing: StdMutex::new(HashMap::new()),
+            cold_welcome_waits: StdMutex::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
@@ -43834,6 +44123,97 @@ pub(in crate::server) mod tests {
         /// poll + refire poll) both expire — exactly ONE timeout is
         /// counted (the owning finalizer's), and the finalizer never aborts
         /// its own task mid-cleanup (r7 item 3): the owner completes.
+        /// x0x #1207 (Codex review of dd414ca): the poll's cold wait ends at
+        /// the poll's ABSOLUTE deadline, even when the send's preflight (here
+        /// its Lookup before raw resolution, held for 3 s) uses up the rest
+        /// of a 2 s window. Raw resolution must then not wait at all: the
+        /// poll finalizes after its preflight plus one 2 s poll interval
+        /// (about 5 s), not after a further cold wait (about 7 s).
+        #[tokio::test]
+        async fn wp_b_t7d_a_delayed_preflight_never_extends_the_poll_past_its_window() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fe".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            let inviter = crate::identity::AgentId([7; 32]);
+            seed_pending_attempt(&state, &group, &event_group, &member, "a7d", String::new()).await;
+            let _poll_window = set_join_poll_window_override(&group, "a7d", 2_000);
+            let responder = std::sync::Arc::new(
+                move |agent: crate::identity::AgentId| -> futures::future::BoxFuture<'static, ()> {
+                    Box::pin(async move {
+                        if agent == inviter {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                    })
+                },
+            );
+            assert!(state
+                .agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok());
+            let started = std::time::Instant::now();
+            poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                event_group.clone(),
+                inviter,
+                member.clone(),
+                false,
+                None,
+                "a7d".into(),
+            )
+            .await;
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(6),
+                "the poll's cold wait outlived its window after a delayed preflight: {took:?}"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                1,
+                "the expiring window was finalized as a timeout"
+            );
+        }
+
+        /// x0x #1207 (regression guard, CI on cabd95e): the join-result
+        /// poll's opted-in cold wait for an unknown inviter is bounded by
+        /// the poll's own window. An expiring 150 ms window must finalize
+        /// on time, not after a full 5 s cold wait. (As at v0.46.3, the poll
+        /// still sleeps one 2 s poll interval after its send.)
+        #[tokio::test]
+        async fn wp_b_t7c_poll_cold_wait_never_outlives_its_window() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fd".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            seed_pending_attempt(&state, &group, &event_group, &member, "a7c", String::new()).await;
+            let _poll_window = set_join_poll_window_override(&group, "a7c", 150);
+            let started = std::time::Instant::now();
+            poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                event_group.clone(),
+                crate::identity::AgentId([7; 32]),
+                member.clone(),
+                false,
+                None,
+                "a7c".into(),
+            )
+            .await;
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(3_500),
+                "the poll outlived its 150 ms window by its cold wait: {took:?}"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                1,
+                "the expiring window was finalized as a timeout"
+            );
+        }
+
         #[tokio::test]
         async fn wp_b_t7b_two_polls_one_timeout_count() {
             let (state, _keep) = fresh_state().await;

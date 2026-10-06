@@ -698,17 +698,28 @@ pub(super) fn stage_reference(
 
 /// Send a staged blob's bounded reference (metadata only; the bytes are
 /// pulled chunk by chunk).
+///
+/// x0x #1217: its only sender is [`send_reference`], whose only caller is a
+/// spawned class-D named-group event delivery (one recipient, no lock). So
+/// it opts in to the bounded wait for a restart-cold recipient
+/// (`Agent::send_direct_with_config_cold_wait`), like the inline delivery.
 pub(super) async fn send_reference_message(
     agent: &Agent,
     recipient: &AgentId,
     reference: ControlBlobRef,
 ) -> std::result::Result<(), String> {
-    send_message(
-        agent,
-        recipient,
-        &ControlBlobMessage::Reference { reference },
-    )
-    .await
+    let message = ControlBlobMessage::Reference { reference };
+    let bytes = encode_message(&message)?;
+    agent
+        .send_direct_with_config_cold_wait(
+            recipient,
+            bytes,
+            control_config(&message),
+            super::COLD_RECIPIENT_WAIT,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn basic_reference_valid(reference: &ControlBlobRef) -> bool {

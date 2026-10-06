@@ -5376,3 +5376,1418 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
     assert!(wrong_transport.is_empty(), "{wrong_transport:?}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #1207 / #1217 (v0.46.4): the GENERAL direct-send path failed at once with
+// `err_agent_not_found` when a restart left the discovery cache cold. Opted-in
+// sends (`Agent::send_direct_with_config_cold_wait`) now wait, within one absolute
+// deadline, for a verified binding, as the pinned path does, and re-validate it
+// against the final machine. Every other send still fails at once. The strict
+// stand-in runs the general path's production resolution in process; the
+// `general_cold_barrier` synchronises a test with the send's entry into the
+// cold wait.
+// ---------------------------------------------------------------------------
+
+/// The general raw-QUIC payloads `from`'s strict stand-in delivered to `to`.
+fn general_deliveries(from: &AppState, to: &AppState) -> Vec<Vec<u8>> {
+    let to_id = to.agent.agent_id();
+    from.agent
+        .general_raw_standin_deliveries_for_testing()
+        .into_iter()
+        .filter(|(recipient, ..)| *recipient == to_id)
+        .map(|(_, _, payload)| payload)
+        .collect()
+}
+
+/// `holder` ingests `of`'s verified announcement, freshly seen (a stale
+/// `last_seen` would trip the likely-offline gate, which is not under test).
+async fn announce_fresh(holder: &AppState, of: &AppState) {
+    let now = unix_secs_now();
+    holder
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: of.agent.agent_id(),
+            machine_id: of.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+/// Whether a general delivery carries `MemberRemoved`: inline, or (an
+/// oversized event) as a control-blob reference to the staged event.
+fn carries_member_removed(state: &AppState, payload: &[u8]) -> bool {
+    if matches!(
+        serde_json::from_slice::<NamedGroupMetadataEvent>(payload),
+        Ok(NamedGroupMetadataEvent::MemberRemoved { .. })
+    ) {
+        return true;
+    }
+    match serde_json::from_slice::<super::super::control_blob::ControlBlobMessage>(payload) {
+        Ok(super::super::control_blob::ControlBlobMessage::Reference { reference }) => state
+            .control_blobs
+            .staged_chunk(&reference, 0)
+            .is_some_and(|chunk| chunk.starts_with(br#"{"event":"member_removed""#)),
+        _ => false,
+    }
+}
+
+/// Wait (bounded, generously) for a send from `sender` to `recipient` to
+/// enter the general path's cold-recipient wait.
+async fn entered_cold_wait(gate: &x0x::general_cold_barrier::Gate, what: &str) {
+    let entered = tokio::time::timeout(Duration::from_secs(20), gate.reached.acquire()).await;
+    match entered {
+        Ok(Ok(permit)) => permit.forget(),
+        _ => panic!("{what}: the send never entered the cold-recipient wait"),
+    }
+}
+
+/// Wait (bounded, generously) for the scripted send-readiness repair to
+/// enter (and park at) `gate`.
+async fn repair_entered(gate: &x0x::PinnedRepairGate, what: &str) {
+    let entered = tokio::time::timeout(Duration::from_secs(20), gate.reached.acquire()).await;
+    match entered {
+        Ok(Ok(permit)) => permit.forget(),
+        _ => panic!("{what}: the send never reached the send-readiness repair"),
+    }
+}
+
+/// J2's own Welcome `FetchRequest` for its sealed add (the exact payload the
+/// apply sends).
+fn j2_welcome_fetch_request(s: &Fixture) -> anyhow::Result<Vec<u8>> {
+    let NamedGroupMetadataEvent::MemberAdded { group_id, .. } = &s.j2_add else {
+        anyhow::bail!("J2's add is a MemberAdded");
+    };
+    let welcome_id =
+        welcome_id_of(&s.j2_add).ok_or_else(|| anyhow::anyhow!("J2's Welcome by reference"))?;
+    Ok(serde_json::to_vec(&WelcomeBlobMessage::FetchRequest {
+        group_id: group_id.clone(),
+        welcome_id,
+    })?)
+}
+
+/// A restarted J2, cold to the authority, applies its own sealed add
+/// (Welcome by reference, with the ADR 0106 carry) through the REAL
+/// join-result path in a task, so the apply fetches the Welcome from the
+/// authority. `gate` must already be armed for the fetch's cold wait. The
+/// authority never answers the stand-in's FetchRequest, so the caller
+/// aborts the task when done.
+async fn apply_with_cold_welcome_fetch(s: &Fixture) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("the authority serves J2's result"))?;
+    let (j2, authority_id, attempt) = (Arc::clone(&s.j2), s.authority_id, s.j2_attempt.clone());
+    Ok(tokio::spawn(async move {
+        deliver(&j2, &authority_id, served, &attempt).await;
+    }))
+}
+
+/// Wait (bounded, generously) until `from`'s stand-in delivered `payload`
+/// to `to`.
+async fn delivered_within(from: &AppState, to: &AppState, payload: &[u8], bound: Duration) -> bool {
+    tokio::time::timeout(bound, async {
+        while !general_deliveries(from, to).iter().any(|p| p == payload) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// WHY (#1207): a joiner that restarted recently has a cold view of the
+/// authority. The Welcome FetchRequest of its own sealed add used to fail at
+/// once (`err_agent_not_found`), and the retries stalled
+/// (`fetch_retry_stalled`). Driven through the real join-result apply: the
+/// authority's announcement is injected only after the fetch's cold wait
+/// began; the FetchRequest must then reach the authority.
+#[tokio::test]
+async fn s8b_1207_restarted_joiner_fetch_request_reaches_the_authority_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let expected = j2_welcome_fetch_request(&s)?;
+    // Only the cold wait for THIS FetchRequest parks (its payload length, or
+    // the resolve-only warm-up for it).
+    let gate =
+        x0x::general_cold_barrier::arm(s.j2.agent.agent_id(), s.authority_id, Some(expected.len()));
+    let apply = apply_with_cold_welcome_fetch(&s).await?;
+    entered_cold_wait(&gate, "the Welcome fetch").await;
+    announce_fresh(&s.j2, &s.authority).await;
+    gate.release();
+    let delivered = delivered_within(&s.j2, &s.authority, &expected, Duration::from_secs(10)).await;
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    apply.abort();
+    assert!(delivered, "the FetchRequest never reached the authority");
+    Ok(())
+}
+
+/// WHY (#1207, lock rule): a cold wait must never run under a lock. The
+/// Welcome fetch runs inside the apply, under the group's membership lock,
+/// so the wait for a restart-cold authority's binding must happen before
+/// any guard is taken; the FetchRequest under the lock then waits for
+/// nothing. While the fetch's cold wait is in progress: the group's
+/// membership lock, the global roster-persistence lock and the
+/// GSS-publication gate are free, and a mutation on another group
+/// completes. The FetchRequest still reaches the authority afterwards.
+#[tokio::test]
+async fn s8b_1207_cold_welcome_fetch_waits_outside_the_membership_lock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let expected = j2_welcome_fetch_request(&s)?;
+    let gate =
+        x0x::general_cold_barrier::arm(s.j2.agent.agent_id(), s.authority_id, Some(expected.len()));
+    let apply = apply_with_cold_welcome_fetch(&s).await?;
+    entered_cold_wait(&gate, "the Welcome fetch").await;
+
+    let membership = super::super::group_membership_lock(&s.j2, &s.group_key).await;
+    let membership_held = membership.try_lock().is_err();
+    let roster_held = s.j2.named_groups_persistence_lock.try_lock().is_err();
+    let gss_held = s.j2.gss_publication_gate.try_write().is_err();
+    let other_group = tokio::time::timeout(
+        Duration::from_secs(10),
+        create_named_group(
+            State(Arc::clone(&s.j2)),
+            Json(CreateGroupRequest {
+                name: "concurrent".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: None,
+                policy: None,
+            }),
+        ),
+    )
+    .await
+    .map(|response| response.into_response().status());
+
+    announce_fresh(&s.j2, &s.authority).await;
+    gate.release();
+    let delivered = delivered_within(&s.j2, &s.authority, &expected, Duration::from_secs(10)).await;
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    apply.abort();
+    assert!(
+        !membership_held,
+        "the group's membership lock was held during the cold wait"
+    );
+    assert!(
+        !roster_held,
+        "the roster-persistence lock was held during the cold wait"
+    );
+    assert!(
+        !gss_held,
+        "the GSS-publication gate was held during the cold wait"
+    );
+    assert!(
+        matches!(other_group, Ok(status) if status == StatusCode::CREATED),
+        "a mutation on another group did not complete during the cold wait: {other_group:?}"
+    );
+    assert!(delivered, "the FetchRequest never reached the authority");
+    Ok(())
+}
+
+/// WHY (#1207, lock rule, causal replay; Codex r3 P3): the ADR 0028 replay
+/// applies a queued `JoinRequestApproved` under the group's membership lock,
+/// the queue-persistence lock, the global roster-persistence lock and the
+/// GSS-publication gate. A VALID approval that seats THIS agent in a TreeKEM
+/// group (the real authority approval, with its Welcome by reference) makes
+/// the replay fetch the Welcome from the authority, cold to this agent. That
+/// wait must run before the replay takes any guard; the FetchRequest must
+/// then reach the authority. (The ADR 0028 queue writer admits only
+/// non-TreeKEM approvals today, so the entry stands for a sidecar entry.)
+#[tokio::test]
+async fn s8b_1207_causal_replay_waits_for_a_cold_welcome_authority_before_its_guards(
+) -> anyhow::Result<()> {
+    let fixture = super::member_joined_treekem_fixture(0xd1, 0xd2).await?;
+    let authority = Arc::clone(&fixture.state);
+    let authority_id = authority.agent.agent_id();
+    let authority_hex = hex::encode(authority_id.as_bytes());
+    let (requester, _requester_dir) = super::secure_endpoint_test_state().await?;
+    let requester_id = requester.agent.agent_id();
+    let requester_hex = hex::encode(requester_id.as_bytes());
+    requester
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    // R's pending request (with R's own TreeKEM KeyPackage) at the authority;
+    // R holds the same pre-approval state.
+    let group_bytes = hex::decode(&fixture.group_id)?;
+    let seed = agent_treekem_seed(requester.agent.as_ref(), &group_bytes);
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(requester_id, &seed)?;
+    let mut request = x0x::groups::JoinRequest::new(
+        fixture.group_id.clone(),
+        requester_hex.clone(),
+        None,
+        now_millis_u64(),
+    );
+    request.treekem_key_package_b64 = Some(BASE64.encode(prepared.key_package_bytes()));
+    let request_id = request.request_id.clone();
+    let pre_approval = {
+        let mut groups = authority.named_groups.write().await;
+        let info = groups
+            .get_mut(&fixture.group_id)
+            .ok_or_else(|| anyhow::anyhow!("the authority's group"))?;
+        info.join_requests.insert(request_id.clone(), request);
+        info.clone()
+    };
+    requester
+        .named_groups
+        .write()
+        .await
+        .insert(fixture.group_id.clone(), pre_approval);
+    let (status, _) = super::super::approve_treekem_join_request(
+        Arc::clone(&authority),
+        fixture.group_id.clone(),
+        request_id.clone(),
+        authority_hex,
+    )
+    .await;
+    anyhow::ensure!(status == StatusCode::OK, "the authority approves: {status}");
+    let approval = authority
+        .treekem_event_log
+        .read()
+        .await
+        .get(&fixture.stable_group_id)
+        .and_then(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|event| {
+                    matches!(
+                        event,
+                        NamedGroupMetadataEvent::JoinRequestApproved {
+                            requester_agent_id, ..
+                        } if *requester_agent_id == requester_hex
+                    )
+                })
+                .cloned()
+        })
+        .ok_or_else(|| anyhow::anyhow!("the authority logged the approval"))?;
+    let NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: event_group_id,
+        revision,
+        welcome_ref: Some(welcome_ref),
+        ..
+    } = &approval
+    else {
+        anyhow::bail!("a TreeKEM approval with a Welcome by reference");
+    };
+    let expected = serde_json::to_vec(&WelcomeBlobMessage::FetchRequest {
+        group_id: event_group_id.clone(),
+        welcome_id: welcome_ref.welcome_id.clone(),
+    })?;
+    let now_ms = now_millis_u64();
+    let revision = *revision;
+    requester
+        .causal_approval_queue
+        .write()
+        .await
+        .entry(fixture.group_id.clone())
+        .or_default()
+        .push_back(PendingCausalApproval {
+            envelope_bytes: Vec::new(),
+            digest: [0x5a; 32],
+            byte_size: 0,
+            event: approval,
+            sender: authority_id,
+            first_seen_ms: now_ms,
+            expires_at_ms: now_ms + 600_000,
+            request_id,
+            requester_agent_id: requester_hex,
+            revision,
+            conflicted: false,
+            conflicted_with: None,
+        });
+    // The cold wait for THIS FetchRequest parks here, wherever it runs.
+    let gate = x0x::general_cold_barrier::arm(requester_id, authority_id, Some(expected.len()));
+    let replay = {
+        let (requester, group_key) = (Arc::clone(&requester), fixture.group_id.clone());
+        tokio::spawn(async move {
+            let mut cleared = std::collections::BTreeSet::new();
+            super::super::replay_pending_causal_approvals(&requester, &group_key, &mut cleared)
+                .await;
+        })
+    };
+    entered_cold_wait(&gate, "the replay's Welcome fetch").await;
+    let membership = super::super::group_membership_lock(&requester, &fixture.group_id).await;
+    let membership_held = membership.try_lock().is_err();
+    let queue_held = requester
+        .causal_approval_queue_persistence_lock
+        .try_lock()
+        .is_err();
+    let roster_held = requester.named_groups_persistence_lock.try_lock().is_err();
+    let gss_held = requester.gss_publication_gate.try_write().is_err();
+    announce_fresh(&requester, &authority).await;
+    gate.release();
+    let delivered =
+        delivered_within(&requester, &authority, &expected, Duration::from_secs(10)).await;
+    x0x::general_cold_barrier::disarm(requester_id, authority_id);
+    replay.abort();
+    assert!(
+        !membership_held,
+        "the replay held the membership lock during the wait"
+    );
+    assert!(
+        !queue_held,
+        "the replay held the queue-persistence lock during the wait"
+    );
+    assert!(
+        !roster_held,
+        "the replay held the roster-persistence lock during the wait"
+    );
+    assert!(
+        !gss_held,
+        "the replay held the GSS-publication gate during the wait"
+    );
+    assert!(
+        delivered,
+        "the replay's FetchRequest never reached the authority"
+    );
+    Ok(())
+}
+
+/// J2's sealed add, with its Welcome reference naming `source`.
+fn j2_add_from_source(s: &Fixture, source: &str) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let mut event = s.j2_add.clone();
+    let NamedGroupMetadataEvent::MemberAdded {
+        welcome_ref: Some(welcome_ref),
+        ..
+    } = &mut event
+    else {
+        anyhow::bail!("J2's add carries a Welcome by reference");
+    };
+    welcome_ref.source = source.to_string();
+    Ok(event)
+}
+
+/// An event for a group of J2's own, unrelated to the Home group, as the
+/// shared listener would next apply it.
+async fn unrelated_group_event(s: &Fixture) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let created = create_named_group(
+        State(Arc::clone(&s.j2)),
+        Json(CreateGroupRequest {
+            name: "unrelated".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = created.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await?)?;
+    anyhow::ensure!(status == StatusCode::CREATED, "create: {status} {body}");
+    let key = body["group_id"].as_str().unwrap_or_default().to_string();
+    let stable =
+        s.j2.named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(|info| info.stable_group_id().to_string())
+            .ok_or_else(|| anyhow::anyhow!("the unrelated group"))?;
+    let mut event = s.j1_add.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { group_id, .. } = &mut event {
+        *group_id = stable;
+    }
+    Ok(event)
+}
+
+/// Apply `events` one after another, as the shared direct metadata listener
+/// does (inline), then `next`. Returns when `next` was applied, measured
+/// from the start.
+async fn listener_reaches(
+    s: &Fixture,
+    events: Vec<NamedGroupMetadataEvent>,
+    next: NamedGroupMetadataEvent,
+) -> Duration {
+    let started = std::time::Instant::now();
+    for event in events {
+        let _ = apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
+    }
+    let _ = apply_named_group_metadata_event(&s.j2, next, s.authority_id, true, None).await;
+    started.elapsed()
+}
+
+/// WHY (#1207, Codex r3 P2-2(a)): an authenticated admin can send
+/// self-seating events whose Welcome reference names a source that cannot
+/// be the group's authority. The node must reject them before any wait, so
+/// they cannot hold up the shared listener and, with it, an unrelated
+/// group's event.
+#[tokio::test]
+async fn s8b_1207_bogus_self_seating_events_do_not_delay_an_unrelated_group() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let j2_id = s.j2.agent.agent_id();
+    let mut bogus = Vec::new();
+    let mut gates = Vec::new();
+    for _ in 0..4 {
+        let unknown = x0x::identity::AgentKeypair::generate()?.agent_id();
+        bogus.push(j2_add_from_source(&s, &hex::encode(unknown.as_bytes()))?);
+        // Count the cold waits (a released gate counts each and lets it pass).
+        let gate = x0x::general_cold_barrier::arm(
+            j2_id,
+            unknown,
+            Some(x0x::general_cold_barrier::WARM_UP),
+        );
+        gate.release();
+        gates.push((unknown, gate));
+    }
+    let next = unrelated_group_event(&s).await?;
+    let reached = listener_reaches(&s, bogus, next).await;
+    let waits: usize = gates
+        .iter()
+        .map(|(_, gate)| gate.reached.available_permits())
+        .sum();
+    for (unknown, _) in &gates {
+        x0x::general_cold_barrier::disarm(j2_id, *unknown);
+    }
+    assert_eq!(waits, 0, "bogus Welcome sources were waited for");
+    assert!(
+        reached < Duration::from_secs(3),
+        "an unrelated group's event waited {reached:?} behind bogus self-seating events"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r3 P2-2(b)): repeated self-seating events that name a
+/// real admin of the group as the Welcome source, but are rejected by the
+/// apply (here: a tampered commit), must not each cost a cold wait on the
+/// shared listener. At most one wait per source runs within the cap.
+#[tokio::test]
+async fn s8b_1207_waits_for_one_cold_admin_source_are_capped() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let mut rejected = Vec::new();
+    for attempt in 0..4u64 {
+        let mut event = j2_add_from_source(&s, &hex_of(&s.authority))?;
+        if let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } = &mut event
+        {
+            commit.committed_at = commit.committed_at.saturating_add(attempt + 1);
+        }
+        rejected.push(event);
+    }
+    let next = unrelated_group_event(&s).await?;
+    let gate = x0x::general_cold_barrier::arm(
+        s.j2.agent.agent_id(),
+        s.authority_id,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let reached = listener_reaches(&s, rejected, next).await;
+    let waits = gate.reached.available_permits();
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), s.authority_id);
+    assert!(
+        waits <= 1,
+        "{waits} cold waits ran for one cold admin source (listener reached the next event after {reached:?})"
+    );
+    assert!(
+        reached < super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(4),
+        "the listener reached the next event only after {reached:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1217): after an owner restart, the class-D `MemberRemoved` notice
+/// to a member removed just after it joined goes through the general direct
+/// path (opted in) plus gossip. Its direct leg failed `recipient_undiscovered`
+/// at once, and the next attempts are due at +6 s and +8 s. The member's
+/// announcement is injected after the initial leg entered the cold wait, so
+/// that leg must deliver the notice.
+#[tokio::test]
+async fn s8b_1217_restarted_owner_member_removed_direct_delivers_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.authority, &s.j2, &s.stable).await;
+    // Every cold send to J2 parks while armed, so none can deliver before
+    // the announcement; MemberRemoved's initial leg is among them.
+    let gate = x0x::general_cold_barrier::arm(s.authority_id, s.j2.agent.agent_id(), None);
+    let removed = remove_named_group_member(
+        State(Arc::clone(&s.authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), hex_of(&s.j2))),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(
+        removed.status().is_success(),
+        "owner remove-member: {}",
+        removed.status()
+    );
+    entered_cold_wait(&gate, "MemberRemoved").await;
+    // The removal spawned its initial leg before it returned; let every
+    // spawned leg reach the barrier (it cannot pass while armed).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    announce_fresh(&s.authority, &s.j2).await;
+    let released = std::time::Instant::now();
+    gate.release();
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if general_deliveries(&s.authority, &s.j2)
+                .iter()
+                .any(|payload| carries_member_removed(&s.authority, payload))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    x0x::general_cold_barrier::disarm(s.authority_id, s.j2.agent.agent_id());
+    assert!(
+        delivered,
+        "the parked MemberRemoved leg never delivered ({:?} after release)",
+        released.elapsed()
+    );
+    Ok(())
+}
+
+/// WHY (#1207 control): an OPTED-IN send to a truly unknown agent gets its
+/// bounded wait (5 s), then the typed, retryable `RecipientUndiscovered`.
+/// It must wait at least the bound and then complete; the upper limit is
+/// deliberately loose for loaded runners.
+#[tokio::test]
+async fn s8b_1207_unknown_agent_ends_in_the_typed_error_within_the_bound() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    g.authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    let unknown = x0x::identity::AgentId([0x3c; 32]);
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &unknown,
+            b"adr0107-1207-unknown".to_vec(),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(outcome, Err(x0x::dm::DmError::RecipientUndiscovered(_))),
+        "a typed, retryable error: {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "the unknown recipient got no bounded wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the wait did not complete: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207 control, opt-in): a send that does NOT opt in keeps today's
+/// behaviour for an unknown recipient: the typed error at once, never
+/// entering the cold wait.
+#[tokio::test]
+async fn s8b_1207_a_send_that_does_not_opt_in_still_fails_at_once() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    g.authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    let unknown = x0x::identity::AgentId([0x3d; 32]);
+    let gate = x0x::general_cold_barrier::arm(g.authority.agent.agent_id(), unknown, None);
+    gate.release();
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config(
+            &unknown,
+            b"adr0107-1207-not-opted-in".to_vec(),
+            direct_message_send_config(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = gate.reached.available_permits();
+    x0x::general_cold_barrier::disarm(g.authority.agent.agent_id(), unknown);
+    assert!(
+        matches!(outcome, Err(x0x::dm::DmError::RecipientUndiscovered(_))),
+        "a typed, retryable error: {outcome:?}"
+    );
+    assert_eq!(
+        entered, 0,
+        "a send that did not opt in entered the cold wait"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a send that did not opt in waited: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207 control): an opted-in DM to a KNOWN agent never enters the
+/// cold wait, so its latency is unchanged.
+#[tokio::test]
+async fn s8b_1207_known_agent_send_latency_is_unchanged() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    g.authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    // A freshly seen, announced peer (a stale `last_seen` would trip the
+    // likely-offline gate, which is not under test here).
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: g.joiner.agent.agent_id(),
+            machine_id: g.joiner.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    let gate = x0x::general_cold_barrier::arm(
+        g.authority.agent.agent_id(),
+        g.joiner.agent.agent_id(),
+        None,
+    );
+    gate.release();
+    let payload = b"adr0107-1207-known".to_vec();
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &g.joiner.agent.agent_id(),
+            payload.clone(),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = gate.reached.available_permits();
+    x0x::general_cold_barrier::disarm(g.authority.agent.agent_id(), g.joiner.agent.agent_id());
+    assert!(outcome.is_ok(), "the known agent's DM failed: {outcome:?}");
+    assert!(
+        general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "the known agent's DM never reached it"
+    );
+    assert_eq!(entered, 0, "a known agent's send entered the cold wait");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "known-agent latency changed: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// How the binding or the machine changes during the general path's repair
+/// (or before it), for the re-validation control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdBindingChange {
+    /// The retained machine was revoked before the send.
+    MachineRevokedBefore,
+    /// The recipient's agent was revoked before the send.
+    AgentRevokedBefore,
+    /// The machine is revoked while the send-readiness repair runs.
+    MachineRevokedDuringRepair,
+    /// A newer attestation with an expired certificate lands during repair.
+    ExpiredDuringRepair,
+    /// A connected DM-registry machine appears during repair, and the
+    /// production redial switches to it (final-machine substitution).
+    SubstitutedDuringRepair,
+}
+
+/// WHY (#1207 control, P1): the bounded wait reads retained verified bindings
+/// (the announced-binding store, ADR-0021 attestations), which revocation
+/// does not evict, and further awaits (repair, redial) follow it. The
+/// binding must be re-validated against the FINAL machine before
+/// transmission: agent and machine revocation, certificate expiry, a changed
+/// binding, a substituted machine. In every case nothing is delivered.
+#[tokio::test]
+async fn s8b_1207_a_revoked_machine_learned_by_the_wait_is_refused() -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    for case in [
+        ColdBindingChange::MachineRevokedBefore,
+        ColdBindingChange::AgentRevokedBefore,
+        ColdBindingChange::MachineRevokedDuringRepair,
+        ColdBindingChange::ExpiredDuringRepair,
+        ColdBindingChange::SubstitutedDuringRepair,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        restart_cold(&g.authority, &g.joiner, &g.stable).await;
+        pin_recipient_machine(&g.authority, &g.joiner).await;
+        let joiner_id = g.joiner.agent.agent_id();
+        let authority_id = g.authority.agent.agent_id();
+        g.authority
+            .agent
+            .identity_discovery_cache()
+            .write()
+            .await
+            .remove(&joiner_id);
+        let substitute = x0x::identity::MachineId([0xa9; 32]);
+        let repair = x0x::PinnedRepairGate::new();
+        let during_repair = matches!(
+            case,
+            ColdBindingChange::MachineRevokedDuringRepair
+                | ColdBindingChange::ExpiredDuringRepair
+                | ColdBindingChange::SubstitutedDuringRepair
+        );
+        if during_repair {
+            // B is not connected; the repair parks on entry until the
+            // change below has landed. It connects B, except in the
+            // substitution case, where it fails so that the production
+            // redial runs and switches to the connected substitute.
+            let repair_connects = case != ColdBindingChange::SubstitutedDuringRepair;
+            g.authority
+                .agent
+                .script_pinned_standin_transport_for_testing(
+                    x0x::PinnedTransportScript::connected_only(&[substitute], repair_connects)
+                        .with_repair_gate(Arc::clone(&repair)),
+                );
+        }
+        match case {
+            ColdBindingChange::MachineRevokedBefore => {
+                revoke_machine(&g.authority, &g.joiner).await?;
+            }
+            ColdBindingChange::AgentRevokedBefore => {
+                let kp = g.joiner.agent.identity().agent_keypair().to_bytes();
+                revoke_agent(&g.authority, &kp).await?;
+            }
+            _ => {}
+        }
+        let gate = x0x::general_cold_barrier::arm(authority_id, joiner_id, None);
+        let payload = format!("adr0107-1207-{case:?}").into_bytes();
+        let send = {
+            let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+            tokio::spawn(async move {
+                authority
+                    .agent
+                    .send_direct_with_config_cold_wait(
+                        &joiner_id,
+                        payload,
+                        direct_message_send_config(),
+                        super::super::COLD_RECIPIENT_WAIT,
+                    )
+                    .await
+            })
+        };
+        entered_cold_wait(&gate, &format!("{case:?}")).await;
+        gate.release();
+        if during_repair {
+            // The binding resolved; the repair is under way (parked).
+            repair_entered(&repair, &format!("{case:?}")).await;
+            match case {
+                ColdBindingChange::MachineRevokedDuringRepair => {
+                    revoke_machine(&g.authority, &g.joiner).await?;
+                }
+                ColdBindingChange::ExpiredDuringRepair => {
+                    let now = unix_secs_now();
+                    g.authority
+                        .agent
+                        .record_authenticated_binding_with_expiry_for_testing(
+                            joiner_id,
+                            g.joiner.agent.machine_id(),
+                            now,
+                            Some(now - 86_400),
+                        )
+                        .await;
+                }
+                ColdBindingChange::SubstitutedDuringRepair => {
+                    g.authority
+                        .agent
+                        .direct_messaging()
+                        .mark_connected(joiner_id, substitute)
+                        .await;
+                }
+                _ => {}
+            }
+            repair.release();
+        }
+        let outcome = send.await?;
+        x0x::general_cold_barrier::disarm(authority_id, joiner_id);
+        if outcome.is_ok() || general_deliveries(&g.authority, &g.joiner).contains(&payload) {
+            wrong.push(format!("[{case:?}] delivered: {outcome:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a send was delivered past a revoked, expired, changed or substituted binding: {wrong:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, P2): ONE absolute deadline bounds every resolution read of an
+/// opted-in send, including the ADR-0043 B/P check after re-validation,
+/// which reads the move-state store. A writer holding that store must end
+/// the send by the deadline (a typed, retryable error), never hold it on
+/// indefinitely. The store is taken while the repair is parked, after the
+/// first B/P check passed.
+#[tokio::test]
+async fn s8b_1207_a_held_pairing_store_ends_the_send_by_the_deadline() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-held-pairing-store".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    super::super::COLD_RECIPIENT_WAIT,
+                )
+                .await
+        })
+    };
+    repair_entered(&repair, "held pairing store").await;
+    let move_state = g.authority.agent.move_state();
+    let held = move_state.write().await;
+    repair.release();
+    // The deadline, plus generous slack for a loaded runner.
+    let bound = super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(3);
+    let ended = tokio::time::timeout(bound.saturating_sub(started.elapsed()), &mut send).await;
+    let ended_after = started.elapsed();
+    drop(held);
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    let delivered = general_deliveries(&g.authority, &g.joiner).contains(&payload);
+    assert!(
+        outcome.is_some(),
+        "the send was still waiting on the held store {ended_after:?} after it started"
+    );
+    assert!(
+        matches!(outcome, Some(Err(_))) && !delivered,
+        "a send past a held pairing store must fail, not deliver: {outcome:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, lock rule): a send under a lock opts in with a ZERO cold
+/// wait. It must wait for nothing, yet find a verified binding that the
+/// pre-lock wait learned, including one that only an ADR-0021 attestation
+/// holds (no discovery-cache or DM-registry entry), which an ordinary send
+/// cannot use. A truly unknown recipient still fails at once.
+#[tokio::test]
+async fn s8b_1207_a_zero_wait_send_finds_an_attested_binding_without_waiting() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .record_authenticated_binding_with_expiry_for_testing(
+            joiner_id,
+            g.joiner.agent.machine_id(),
+            now,
+            Some(now + 86_400),
+        )
+        .await;
+    let payload = b"adr0107-1207-zero-wait-attested".to_vec();
+    let started = std::time::Instant::now();
+    let attested = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            Duration::ZERO,
+        )
+        .await;
+    let attested_took = started.elapsed();
+    let unknown = x0x::identity::AgentId([0x7c; 32]);
+    let started = std::time::Instant::now();
+    let unknown_outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &unknown,
+            b"adr0107-1207-zero-wait-unknown".to_vec(),
+            direct_message_send_config(),
+            Duration::ZERO,
+        )
+        .await;
+    let unknown_took = started.elapsed();
+    // No wait at all; the limit is loose for loaded runners, and far below
+    // the 5 s cold wait.
+    let no_wait = Duration::from_millis(2_500);
+    assert!(
+        attested.is_ok() && general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "a zero-wait send did not use the attested binding: {attested:?}"
+    );
+    assert!(
+        attested_took < no_wait,
+        "the zero-wait send waited {attested_took:?}"
+    );
+    assert!(
+        matches!(
+            unknown_outcome,
+            Err(x0x::dm::DmError::RecipientUndiscovered(_))
+        ),
+        "an unknown recipient: {unknown_outcome:?}"
+    );
+    assert!(
+        unknown_took < no_wait,
+        "a zero-wait send to an unknown recipient waited {unknown_took:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r3 P2-1): the one deadline also bounds the resolution
+/// reads of the discovery redial that follows a failed repair. A writer
+/// holding the DM registry while the repair runs (after the first reads)
+/// must end the send by the deadline, not hold it in the redial's registry
+/// read. (Codex r4: the recipient is a known one, whose send redials; a
+/// cold-recipient binding is never redialled.)
+#[tokio::test]
+async fn s8b_1207_a_held_registry_during_the_redial_ends_the_send_by_the_deadline(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    announce_fresh(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    let repair = x0x::PinnedRepairGate::new();
+    // The repair fails, so the production redial runs.
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], false)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-held-registry-redial".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    super::super::COLD_RECIPIENT_WAIT,
+                )
+                .await
+        })
+    };
+    repair_entered(&repair, "held registry").await;
+    let registry = Arc::clone(g.authority.agent.direct_messaging());
+    let held = registry.hold_registry_for_testing().await;
+    repair.release();
+    let bound = super::super::COLD_RECIPIENT_WAIT + Duration::from_secs(3);
+    let ended = tokio::time::timeout(bound.saturating_sub(started.elapsed()), &mut send).await;
+    let ended_after = started.elapsed();
+    drop(held);
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    let delivered = general_deliveries(&g.authority, &g.joiner).contains(&payload);
+    assert!(
+        outcome.is_some(),
+        "the send was still waiting on the held registry {ended_after:?} after it started"
+    );
+    assert!(
+        matches!(outcome, Some(Err(_))) && !delivered,
+        "a send past a held registry must fail, not deliver: {outcome:?}"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, Codex r4 (ii)): under a lock (a ZERO cold wait) a binding the
+/// read-once found for a cold recipient is used only while its machine is
+/// connected. The send must not repair or redial it (a wait, and the
+/// redial's reads, newly on this path), and fails at once, retryably.
+#[tokio::test]
+async fn s8b_1207_a_zero_wait_send_never_repairs_or_redials_a_cold_binding() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    let now = unix_secs_now();
+    g.authority
+        .agent
+        .record_authenticated_binding_with_expiry_for_testing(
+            joiner_id,
+            g.joiner.agent.machine_id(),
+            now,
+            Some(now + 86_400),
+        )
+        .await;
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-zero-wait-cold-unconnected".to_vec();
+    let started = std::time::Instant::now();
+    let mut send = {
+        let (authority, payload) = (Arc::clone(&g.authority), payload.clone());
+        tokio::spawn(async move {
+            authority
+                .agent
+                .send_direct_with_config_cold_wait(
+                    &joiner_id,
+                    payload,
+                    direct_message_send_config(),
+                    Duration::ZERO,
+                )
+                .await
+        })
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
+    let ended_after = started.elapsed();
+    let repaired = repair.reached.available_permits();
+    repair.release();
+    let outcome = match ended {
+        Ok(joined) => Some(joined?),
+        Err(_) => {
+            let _ = send.await;
+            None
+        }
+    };
+    assert_eq!(repaired, 0, "the zero-wait send repaired a cold binding");
+    assert!(
+        matches!(
+            outcome,
+            Some(Err(x0x::dm::DmError::RecipientUndiscovered(_)))
+        ),
+        "a zero-wait send to an unconnected cold binding must fail at once, retryably \
+         ({ended_after:?}): {outcome:?}"
+    );
+    assert!(!general_deliveries(&g.authority, &g.joiner).contains(&payload));
+    Ok(())
+}
+
+/// WHY (#1207, Codex r4 P3): the cooldown map for pre-lock Welcome waits has
+/// an aggregate bound (256 sources). While it is full of sources still in
+/// their cooldown, a new source gets no wait; once their cooldowns expire,
+/// they are evicted and a new source waits again.
+#[tokio::test]
+async fn s8b_1207_the_cold_wait_map_is_capped() -> anyhow::Result<()> {
+    const BOUND: usize = 256;
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let rejected = |attempt: u64| -> anyhow::Result<NamedGroupMetadataEvent> {
+        let mut event = j2_add_from_source(&s, &hex_of(&s.authority))?;
+        if let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } = &mut event
+        {
+            commit.committed_at = commit.committed_at.saturating_add(attempt + 1);
+        }
+        Ok(event)
+    };
+    let fill = |at: std::time::Instant| -> anyhow::Result<()> {
+        let mut waits =
+            s.j2.cold_welcome_waits
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cold wait map"))?;
+        waits.clear();
+        for _ in 0..BOUND {
+            waits.insert(
+                x0x::identity::AgentKeypair::generate()?.agent_id(),
+                Some(at),
+            );
+        }
+        Ok(())
+    };
+    let j2_id = s.j2.agent.agent_id();
+    // Full of sources still cooling: no wait for a new source.
+    fill(std::time::Instant::now())?;
+    let gate = x0x::general_cold_barrier::arm(
+        j2_id,
+        s.authority_id,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let started = std::time::Instant::now();
+    let _ = apply_named_group_metadata_event(&s.j2, rejected(0)?, s.authority_id, true, None).await;
+    let full_took = started.elapsed();
+    let waits_when_full = gate.reached.available_permits();
+    let len_when_full = s.j2.cold_welcome_waits.lock().map(|w| w.len()).unwrap_or(0);
+    // Full of expired cooldowns: they are evicted, and the new source waits.
+    let expired = std::time::Instant::now().checked_sub(Duration::from_secs(61));
+    let mut waits_when_expired = None;
+    if let Some(expired) = expired {
+        fill(expired)?;
+        let _ =
+            apply_named_group_metadata_event(&s.j2, rejected(1)?, s.authority_id, true, None).await;
+        waits_when_expired = Some(gate.reached.available_permits() - waits_when_full);
+    }
+    let len_after = s.j2.cold_welcome_waits.lock().map(|w| w.len()).unwrap_or(0);
+    x0x::general_cold_barrier::disarm(j2_id, s.authority_id);
+    assert_eq!(
+        waits_when_full, 0,
+        "a full cooldown map still admitted a wait ({full_took:?})"
+    );
+    assert!(
+        len_when_full <= BOUND,
+        "the map grew past its bound: {len_when_full}"
+    );
+    if let Some(waits) = waits_when_expired {
+        assert_eq!(
+            waits, 1,
+            "expired cooldowns were not evicted for a new wait"
+        );
+        assert!(len_after <= 1, "expired cooldowns were kept: {len_after}");
+    }
+    Ok(())
+}
+
+/// WHY (#1207, Codex r5 P2-2): a binding that the wait found for a cold
+/// recipient is newly repaired (unreachable at v0.46.3). That repair must
+/// end at the same absolute deadline, not with a fresh three-second budget.
+/// The repair never completes here; the send uses a 1 s wait.
+#[tokio::test]
+async fn s8b_1207_a_cold_binding_repair_ends_at_the_deadline() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    let repair = x0x::PinnedRepairGate::new();
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_gate(Arc::clone(&repair)),
+        );
+    let payload = b"adr0107-1207-cold-binding-repair".to_vec();
+    let started = std::time::Instant::now();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            Duration::from_secs(1),
+        )
+        .await;
+    let took = started.elapsed();
+    let repaired = repair.reached.available_permits();
+    repair.release();
+    assert!(
+        repaired >= 1,
+        "control: the send repaired the bound machine"
+    );
+    assert!(
+        took < Duration::from_millis(2_200),
+        "the cold binding's repair ran past the 1 s deadline: {took:?}"
+    );
+    assert!(
+        matches!(outcome, Err(x0x::dm::DmError::RecipientUndiscovered(_))),
+        "{outcome:?}"
+    );
+    assert!(!general_deliveries(&g.authority, &g.joiner).contains(&payload));
+    Ok(())
+}
+
+/// WHY (#1207, Codex r5 P3): while the cooldown map is full, a new Welcome
+/// source gets no wait, but it must still make progress: the node starts a
+/// background Lookup for it (permit-bounded, nothing waits on it), so a
+/// zero-wait FetchRequest retry can find the evidence later. The source is
+/// a second admin of the group, which nothing else on the node contacts.
+#[tokio::test]
+async fn s8b_1207_a_full_cold_wait_map_still_starts_a_lookup() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    restart_cold(&s.j2, &s.authority, &s.stable).await;
+    let authority_id = s.authority_id;
+    let source = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let source_hex = hex::encode(source.as_bytes());
+    s.j2.named_groups
+        .write()
+        .await
+        .get_mut(&s.group_key)
+        .ok_or_else(|| anyhow::anyhow!("J2's group row"))?
+        .add_member(
+            source_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(hex_of(&s.authority)),
+            None,
+        );
+    let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let lookups = Arc::clone(&lookups);
+        let responder = Arc::new(
+            move |agent: x0x::identity::AgentId| -> futures::future::BoxFuture<'static, ()> {
+                if agent == source {
+                    lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Box::pin(async {})
+            },
+        );
+        anyhow::ensure!(
+            s.j2.agent
+                .peer_evidence()
+                .lookup_responder
+                .set(responder)
+                .is_ok(),
+            "lookup responder"
+        );
+    }
+    {
+        let mut waits =
+            s.j2.cold_welcome_waits
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cold wait map"))?;
+        let now = std::time::Instant::now();
+        for _ in 0..256 {
+            waits.insert(
+                x0x::identity::AgentKeypair::generate()?.agent_id(),
+                Some(now),
+            );
+        }
+    }
+    let mut event = j2_add_from_source(&s, &source_hex)?;
+    if let NamedGroupMetadataEvent::MemberAdded {
+        commit: Some(commit),
+        ..
+    } = &mut event
+    {
+        commit.committed_at = commit.committed_at.saturating_add(1);
+    }
+    let gate = x0x::general_cold_barrier::arm(
+        s.j2.agent.agent_id(),
+        source,
+        Some(x0x::general_cold_barrier::WARM_UP),
+    );
+    gate.release();
+    let started = std::time::Instant::now();
+    let _ = apply_named_group_metadata_event(&s.j2, event, authority_id, true, None).await;
+    let took = started.elapsed();
+    let waits = gate.reached.available_permits();
+    let kicked = tokio::time::timeout(Duration::from_secs(5), async {
+        while lookups.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    x0x::general_cold_barrier::disarm(s.j2.agent.agent_id(), source);
+    assert_eq!(waits, 0, "a full cooldown map admitted a wait ({took:?})");
+    assert!(
+        kicked,
+        "a source refused by a full cooldown map got no Lookup: no progress"
+    );
+    Ok(())
+}
+
+/// WHY (#1207, #1217, Codex r5 P2-2 control): why a cold binding's repair is
+/// bounded by the deadline rather than skipped. The wait finds the
+/// recipient's binding (here at once, from its announced identity) but its
+/// machine is not connected: the wait's own connect attempt ran before the
+/// binding was known. The repair, inside the deadline, is the step that
+/// connects it, so the send must deliver.
+#[tokio::test]
+async fn s8b_1207_a_cold_binding_whose_repair_connects_is_delivered() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let joiner_id = g.joiner.agent.agent_id();
+    g.authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&joiner_id);
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(x0x::PinnedTransportScript::connected_only(
+            &[],
+            true,
+        ));
+    let payload = b"adr0107-1207-cold-binding-repaired".to_vec();
+    let outcome = g
+        .authority
+        .agent
+        .send_direct_with_config_cold_wait(
+            &joiner_id,
+            payload.clone(),
+            direct_message_send_config(),
+            super::super::COLD_RECIPIENT_WAIT,
+        )
+        .await;
+    assert!(
+        outcome.is_ok() && general_deliveries(&g.authority, &g.joiner).contains(&payload),
+        "a cold binding whose repair connects was not delivered: {outcome:?}"
+    );
+    Ok(())
+}

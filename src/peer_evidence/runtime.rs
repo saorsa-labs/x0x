@@ -197,6 +197,38 @@ impl EvidenceRuntime {
         self.lookup_with_permit(agent, machine, permit).await;
     }
 
+    /// x0x #1207: start a Lookup for `agent` in the background (the permit
+    /// is reserved first, as in [`Self::spawn_lookup`]). The caller never
+    /// runs the Lookup's load barrier or its responder selection, whose
+    /// evidence and policy reads block synchronously, so a bounded wait can
+    /// start one. It re-reads its sources afterwards, as after
+    /// [`Self::lookup`].
+    pub(crate) fn spawn_agent_lookup(self: &Arc<Self>, agent: AgentId) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if runtime.wait(0).await {
+                runtime.lookup_with_permit(agent, None, permit).await;
+            }
+        });
+    }
+
+    /// Test seam (x0x #1207): mark the store started without completing its
+    /// load, so every load-barrier wait waits (up to its five-second bound).
+    /// Test builds only.
+    #[cfg(test)]
+    pub(crate) fn hold_load_barrier_for_testing(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    /// x0x #1207: [`Self::wait`] without waiting: whether the evidence is
+    /// loaded (or the store never started) right now.
+    pub(crate) fn ready_now(&self) -> bool {
+        !self.started.load(Ordering::Acquire) || self.ready.is_cancelled()
+    }
+
     /// Reserve before spawning: raw frames never wait for a Lookup or queue
     /// unbounded tasks behind the shared outstanding-Lookup limit.
     pub(crate) fn spawn_lookup(self: &Arc<Self>, agent: AgentId, machine: MachineId) {
@@ -330,6 +362,22 @@ impl EvidenceRuntime {
             return None;
         }
         self.store.get()?.usable(agent, machine, now)
+    }
+    /// [`Self::usable`] without blocking on the store lock or a policy read
+    /// (x0x #1207); `Err(())` while a lock is contended.
+    pub(crate) fn try_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        if !self.ready.is_cancelled() {
+            return Ok(None);
+        }
+        match self.store.get() {
+            Some(store) => store.try_usable(agent, machine, now),
+            None => Ok(None),
+        }
     }
     /// Resolve a recipient when its live sources are empty.
     pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {

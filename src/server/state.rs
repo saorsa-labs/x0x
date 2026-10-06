@@ -1056,6 +1056,10 @@ pub(super) struct AppState {
     /// while holding the membership lock.
     pub(super) pending_join_result_processing:
         StdMutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// x0x #1207 (Codex r3 P2-2(b)): the pre-lock cold waits for Welcome
+    /// sources: `None` while one is in flight, the failure time while its
+    /// cooldown runs. Holds only in-flight and cooling sources.
+    pub(super) cold_welcome_waits: StdMutex<HashMap<crate::identity::AgentId, Option<Instant>>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

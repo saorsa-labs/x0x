@@ -415,12 +415,69 @@ impl RawQuicTransport<'_> {
         &self,
         agent: &Agent,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
         // Scripted too: the production redial over the script's connection
         // state (r7c).
         agent
-            .redial_direct_machine_from_discovery(agent_id, self)
+            .redial_direct_machine_from_discovery(agent_id, self, cold)
             .await
+    }
+}
+
+/// x0x #1207, #1217: a crate-internal opt-in's cold-recipient wait: up to
+/// `wait` from the start of the raw attempt, and never past `not_after`
+/// (a caller's own absolute window, when it has one).
+#[derive(Debug, Clone, Copy)]
+struct ColdWait {
+    wait: std::time::Duration,
+    not_after: Option<tokio::time::Instant>,
+}
+
+/// x0x #1207, #1217: how a raw-QUIC send treats a recipient that no
+/// discovery-cache or DM-registry entry names, as after a restart.
+#[derive(Debug, Clone, Copy)]
+enum ColdResolution {
+    /// Every public send: today's instant failure (a gossip fallback, if
+    /// any, follows).
+    Off,
+    /// The crate-internal opt-in with a ZERO wait, for a send under a lock
+    /// whose wait ran before the lock was taken: today's connect attempt,
+    /// then one read of the verified sources that does not wait. Its
+    /// peer-evidence checks are the non-blocking ones.
+    ReadOnce,
+    /// The crate-internal opt-in: wait for a verified binding until this ONE
+    /// absolute deadline, which every resolution read also ends at.
+    Until(tokio::time::Instant),
+}
+
+impl ColdResolution {
+    /// The handling for an opted-in `cold_wait` (`None`: not opted in),
+    /// with the deadline starting now: `min(now + wait, not_after)`. A
+    /// deadline already past waits for nothing (each read is polled once).
+    fn starting_now(cold_wait: Option<ColdWait>) -> Self {
+        match cold_wait {
+            None => Self::Off,
+            Some(cold) if cold.wait.is_zero() => Self::ReadOnce,
+            Some(cold) => {
+                let deadline = tokio::time::Instant::now() + cold.wait;
+                Self::Until(cold.not_after.map_or(deadline, |cap| deadline.min(cap)))
+            }
+        }
+    }
+
+    /// Whether the send opted in: its peer-evidence checks are then the
+    /// non-blocking ones, so no synchronous evidence lock can hold it.
+    fn opted_in(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The resolution deadline of a waiting send.
+    fn deadline(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Off | Self::ReadOnce => None,
+        }
     }
 }
 
@@ -433,7 +490,41 @@ pub(crate) struct PinnedTransportScript {
     only_listed_connected: bool,
     repair_connects: bool,
     repair_delay: std::time::Duration,
+    repair_gate: Option<std::sync::Arc<PinnedRepairGate>>,
     connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+/// Test seam (x0x #1207, P3): parks the scripted send-readiness repair on
+/// entry until the test releases it, so a test can change state while a
+/// repair is under way without assuming scheduler timing.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PinnedRepairGate {
+    /// One permit each time a repair enters.
+    pub(crate) reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PinnedRepairGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Let every current and future repair through.
+    pub(crate) fn release(&self) {
+        self.release.close();
+    }
+
+    async fn park(&self) {
+        self.reached.add_permits(1);
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,8 +537,15 @@ impl PinnedTransportScript {
             only_listed_connected: true,
             repair_connects,
             repair_delay: std::time::Duration::ZERO,
+            repair_gate: None,
             connected: std::sync::Mutex::new(machines.iter().copied().collect()),
         }
+    }
+
+    /// The send-readiness repair parks on entry at `gate` until released.
+    pub(crate) fn with_repair_gate(mut self, gate: std::sync::Arc<PinnedRepairGate>) -> Self {
+        self.repair_gate = Some(gate);
+        self
     }
 
     /// The send-readiness repair takes `delay` before it reports.
@@ -476,6 +574,9 @@ impl PinnedTransportScript {
     }
 
     async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if let Some(gate) = &self.repair_gate {
+            gate.park().await;
+        }
         tokio::time::sleep(self.repair_delay).await;
         if !self.repair_connects {
             return Err(error::NetworkError::ConnectionFailed(
@@ -494,6 +595,21 @@ impl PinnedTransportScript {
 static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            identity::AgentId,
+            identity::AgentId,
+            identity::MachineId,
+            Vec<u8>,
+        )>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
@@ -3131,6 +3247,81 @@ async fn record_announced_machine_binding(
 /// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
 /// before the binding's expiry update). Unarmed points pass straight
 /// through.
+/// x0x #1207 (test builds): a barrier at the entry of the general path's
+/// cold-recipient wait, keyed by (sender, recipient), so a test can inject
+/// the recipient's binding only after the send has entered the wait. An
+/// optional payload length selects one send among others to the same
+/// recipient. `reached` counts arrivals; `release` (closed) lets every
+/// current and future arrival through. Other sends pass straight through.
+#[cfg(test)]
+pub(crate) mod general_cold_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    /// The payload length a resolve-only warm-up (no payload) parks with.
+    /// Every armed gate matches it, whatever payload length it selects.
+    pub(crate) const WARM_UP: usize = 0;
+
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        bytes: Option<usize>,
+    }
+
+    impl Gate {
+        /// Let every current and future arrival through.
+        pub(crate) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type Key = (crate::identity::AgentId, crate::identity::AgentId);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        sender: crate::identity::AgentId,
+        recipient: crate::identity::AgentId,
+        payload_len: Option<usize>,
+    ) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            bytes: payload_len,
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((sender, recipient), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(sender: crate::identity::AgentId, recipient: crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            if let Some(gate) = gates.remove(&(sender, recipient)) {
+                gate.release();
+            }
+        }
+    }
+
+    pub(crate) async fn park(
+        sender: &crate::identity::AgentId,
+        recipient: &crate::identity::AgentId,
+        bytes: usize,
+    ) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
+            .filter(|gate| bytes == WARM_UP || gate.bytes.is_none_or(|selected| selected == bytes));
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
@@ -5643,7 +5834,20 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
-        let outcome = self.connect_to_agent_inner(agent_id).await?;
+        self.connect_to_agent_with(agent_id, ColdResolution::Off)
+            .await
+    }
+
+    /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
+    /// is `cold` (x0x #1207). An opted-in send never takes a blocking
+    /// peer-evidence check or runs a Lookup on itself
+    /// ([`Self::connect_from_evidence_with`]); `Off` is today's connector.
+    async fn connect_to_agent_with(
+        &self,
+        agent_id: &identity::AgentId,
+        cold: ColdResolution,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self.connect_to_agent_inner(agent_id, cold).await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
         }
@@ -5652,17 +5856,42 @@ impl Agent {
 
     /// Dial from a freshly checked evidence view, without creating any agent
     /// binding or discovery entry. ant-quic authenticates the expected machine.
-    async fn connect_from_evidence(
+    ///
+    /// `cold` is the sending side's cold-recipient handling (x0x #1207;
+    /// `Off` for every ordinary caller). An opted-in send never waits on the
+    /// evidence load barrier, never takes a blocking point-of-use check
+    /// (contention: no dial), and never runs a Lookup on itself: the
+    /// Lookup's responder selection blocks synchronously. A waiting send
+    /// (`Until`) starts the Lookup in the background; a send under a lock
+    /// (`ReadOnce`) starts none.
+    async fn connect_from_evidence_with(
         &self,
         agent: identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
-        if !self.peer_evidence().wait(0).await {
-            return None;
+        let nonblocking = cold.opted_in();
+        if nonblocking {
+            if !self.peer_evidence().ready_now() {
+                return None;
+            }
+            if let ColdResolution::Until(_) = cold {
+                self.peer_evidence().spawn_agent_lookup(agent);
+            }
+        } else {
+            if !self.peer_evidence().wait(0).await {
+                return None;
+            }
+            self.peer_evidence().lookup(agent, None).await;
         }
-        self.peer_evidence().lookup(agent, None).await;
-        let view = self
-            .peer_evidence()
-            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        let view = if nonblocking {
+            self.peer_evidence()
+                .try_usable_agent(agent, now)
+                .ok()
+                .flatten()
+        } else {
+            self.peer_evidence().usable_agent(agent, now)
+        }?;
         let machine = view.announcement.machine_id;
         if self
             .recipient_pairing_denied(&agent, &machine)
@@ -5685,8 +5914,15 @@ impl Agent {
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
-        self.peer_evidence()
-            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        if nonblocking {
+            self.peer_evidence()
+                .try_usable(agent, machine, now)
+                .ok()
+                .flatten()?;
+        } else {
+            self.peer_evidence().usable(agent, machine, now)?;
+        }
         Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
                 connectivity::ConnectOutcome::Direct(addr)
@@ -5698,7 +5934,10 @@ impl Agent {
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> error::Result<connectivity::ConnectOutcome> {
+        // x0x #1207: an opted-in send never takes a blocking evidence check.
+        let nonblocking_evidence = cold.opted_in();
         let call_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         tracing::debug!(
@@ -5719,14 +5958,24 @@ impl Agent {
         if discovered
             .as_ref()
             .is_some_and(|entry| entry.addresses.is_empty())
-            && self.peer_evidence().wait(0).await
+            && if nonblocking_evidence {
+                self.peer_evidence().ready_now()
+            } else {
+                self.peer_evidence().wait(0).await
+            }
         {
             if let Some(entry) = discovered.as_mut() {
-                if let Some(view) = self.peer_evidence().usable(
-                    *agent_id,
-                    entry.machine_id,
-                    dm_capability::now_unix_ms(),
-                ) {
+                let now = dm_capability::now_unix_ms();
+                let view = if nonblocking_evidence {
+                    self.peer_evidence()
+                        .try_usable(*agent_id, entry.machine_id, now)
+                        .ok()
+                        .flatten()
+                } else {
+                    self.peer_evidence()
+                        .usable(*agent_id, entry.machine_id, now)
+                };
+                if let Some(view) = view {
                     let local_scope = self
                         .network
                         .as_ref()
@@ -5742,7 +5991,7 @@ impl Agent {
         let agent = match discovered {
             Some(a) => a,
             None => {
-                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                if let Some(outcome) = self.connect_from_evidence_with(*agent_id, cold).await {
                     return Ok(outcome);
                 }
 
@@ -7296,6 +7545,74 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None)
+            .await
+    }
+
+    /// x0x #1207, #1217 (crate-internal opt-in; the public API is
+    /// unchanged): [`Self::send_direct_with_config`] that may wait up to
+    /// `cold_wait` for a VERIFIED binding of a recipient no discovery-cache
+    /// or DM-registry entry knows, as after a restart. The sources are the
+    /// announced identity, an ADR-0021 attestation, the DM registry and
+    /// peer evidence. The wait is one absolute deadline from the start of
+    /// the raw attempt, and every resolution read (re-validation against the
+    /// final machine and the ADR-0043 B/P checks included) ends at it; the
+    /// transport's repair, redial and ACK budget is separate. It applies
+    /// only where raw QUIC is the delivering path.
+    ///
+    /// A non-zero `cold_wait` only where the sender holds no lock and does
+    /// not fan out serially. A sender under a lock passes ZERO: it waits for
+    /// nothing and reads the verified sources once, without waiting, so it
+    /// finds a binding that [`Self::await_cold_recipient_binding`] awaited
+    /// before the lock was taken.
+    pub(crate) async fn send_direct_with_config_cold_wait(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cold_wait = ColdWait {
+            wait: cold_wait,
+            not_after: None,
+        };
+        self.send_direct_with_history(to, payload, config, Some(cold_wait))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// x0x #1207 (crate-internal): [`Self::send_direct_with_config_cold_wait`]
+    /// for a caller with its own absolute window (`not_after`). The cold
+    /// deadline is computed when raw resolution starts, after the send's
+    /// preflight: `min(raw-attempt start + cold_wait, not_after)`. A window
+    /// already spent by then waits for nothing.
+    pub(crate) async fn send_direct_with_config_cold_wait_until(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+        not_after: tokio::time::Instant,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let cold_wait = ColdWait {
+            wait: cold_wait,
+            not_after: Some(not_after),
+        };
+        self.send_direct_with_history(to, payload, config, Some(cold_wait))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// The single DM egress funnel with its ADR-0023 history wiring;
+    /// `cold_wait` is `None` (not opted in) for every caller except the
+    /// crate-internal opt-in above.
+    async fn send_direct_with_history(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -7310,7 +7627,7 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -7363,6 +7680,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -7429,9 +7747,31 @@ impl Agent {
 
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
+        // x0x #1207 (Codex r4, mandatory): a ZERO cold wait is a send under a
+        // lock (the in-lock Welcome FetchRequest). It never waits on the
+        // evidence load barrier, runs no Lookup (whose responder selection
+        // blocks synchronously) and takes no blocking evidence check, here or
+        // in raw resolution. Contention reads as no evidence: it fails
+        // retryably, and the caller's own retries resend.
+        let under_lock = cold_wait.is_some_and(|cold| cold.wait.is_zero());
+        let usable_agent_now = |agent: &identity::AgentId| {
+            let now = dm_capability::now_unix_ms();
+            if under_lock {
+                self.peer_evidence()
+                    .try_usable_agent(*agent, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent, now)
+            }
+        };
         let mut advert_binding = self.capability_store.lookup_binding(to);
         let evidence_ready = if advert_binding.is_none() {
-            self.peer_evidence().wait(payload.len()).await
+            if under_lock {
+                self.peer_evidence().ready_now()
+            } else {
+                self.peer_evidence().wait(payload.len()).await
+            }
         } else {
             true
         };
@@ -7440,13 +7780,12 @@ impl Agent {
                 "peer evidence startup barrier unavailable".into(),
             ));
         }
-        if advert_binding.is_none() {
+        if advert_binding.is_none() && !under_lock {
             self.peer_evidence().lookup(*to, None).await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
         let stored_cap = if advert_binding.is_none() {
-            self.peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
+            usable_agent_now(to)
         } else {
             None
         };
@@ -7490,10 +7829,7 @@ impl Agent {
             (advert_cap, advert_machine, "advert_cache")
         } else if advert_cap.is_none() && stored_cap.is_some() {
             // Re-check after the refresh await; never retain authority across it.
-            match self
-                .peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
-            {
+            match usable_agent_now(to) {
                 Some(view) => (
                     Some(view.advert.capabilities.clone()),
                     Some(view.announcement.machine_id),
@@ -7682,10 +8018,19 @@ impl Agent {
         }
 
         if cap_source == "peer_evidence" {
-            let _ = self.connect_from_evidence(*to).await;
+            let evidence_access = if under_lock {
+                ColdResolution::ReadOnce
+            } else {
+                ColdResolution::Off
+            };
+            let _ = self.connect_from_evidence_with(*to, evidence_access).await;
             let still_usable = cap_machine.and_then(|m| {
-                self.peer_evidence()
-                    .usable(*to, m, dm_capability::now_unix_ms())
+                let now = dm_capability::now_unix_ms();
+                if under_lock {
+                    self.peer_evidence().try_usable(*to, m, now).ok().flatten()
+                } else {
+                    self.peer_evidence().usable(*to, m, now)
+                }
             });
             if still_usable.is_none() {
                 return Err(dm::DmError::RecipientUndiscovered(
@@ -7696,6 +8041,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
+        // x0x #1207, #1217: `cold_wait` is the OPT-IN handling of a
+        // restart-cold recipient (`send_direct_with_config_cold_wait`;
+        // `None` for every other caller: today's instant failure). It
+        // applies only where raw QUIC is the path that delivers (no
+        // gossip-inbox capability), so a gossip-capable send still falls
+        // back to gossip at once, as before.
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -7708,6 +8059,7 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    if gossip_ok { None } else { cold_wait },
                 )
                 .await
             {
@@ -7790,6 +8142,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        cold_wait,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -8010,18 +8363,25 @@ impl Agent {
     /// repair. Discovery can lag the direct-messaging registry during a
     /// machine transition, so prefer whichever mapping ant-quic reports as
     /// connected and reconcile the discovery entry when the registry wins.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`), every read here ends at
+    /// its resolution deadline (a read still waiting there finds no machine)
+    /// and the evidence check never blocks.
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        let cached_machine_id = {
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "redial discovery", async {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|entry| entry.machine_id)
                 .filter(|machine_id| machine_id.0 != [0_u8; 32])
-        };
+        })
+        .await
+        .ok()?;
         if let Some(machine_id) = cached_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
@@ -8031,16 +8391,33 @@ impl Agent {
             }
         }
 
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "redial registry",
+            self.direct_messaging.get_machine_id(agent_id),
+        )
+        .await
+        .ok()?;
         if let Some(machine_id) = registry_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
                 .await
             {
                 if cached_machine_id != Some(machine_id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = machine_id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = machine_id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 return Some(machine_id);
@@ -8048,10 +8425,16 @@ impl Agent {
         }
 
         if cached_machine_id.is_none() && registry_machine_id.is_none() {
-            if let Some(view) = self
-                .peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-            {
+            let now = dm_capability::now_unix_ms();
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            if let Some(view) = view {
                 if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
@@ -8066,12 +8449,18 @@ impl Agent {
     /// Re-run the complete identity-discovery dial after the narrow
     /// bootstrap-cache repair path fails. A fresh presence card can contain
     /// usable addresses even when no cached transport route exists.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`) the dial's evidence
+    /// checks are the non-blocking ones and the resolution reads that follow
+    /// end at its deadline ([`Self::connected_direct_machine`]). The dial
+    /// itself is transport, with its own per-address timeouts.
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        if let Err(error) = self.connect_to_agent(agent_id).await {
+        if let Err(error) = self.connect_to_agent_with(agent_id, cold).await {
             tracing::debug!(
                 target: "x0x::direct",
                 stage = "send",
@@ -8082,7 +8471,8 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, transport).await
+        self.connected_direct_machine(agent_id, transport, cold)
+            .await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -8492,12 +8882,13 @@ impl Agent {
     /// registry and peer evidence, and the gossip fallback that used to hide
     /// that is gone (single admission, no hidden resend). So: read the
     /// verified sources ([`Self::pinned_binding_now`]). While none names the
-    /// recipient, let the evidence store finish loading, ask once for the
-    /// recipient's relationship evidence (an EvidenceV1 Lookup over
-    /// connected peers), and re-read the sources until one learns the
-    /// recipient (an identity announcement, an attested DM, the Lookup's
-    /// answer). `deadline` is absolute and bounds everything here, including
-    /// each lock wait. [`Self::resolve_pinned_target`] carries the same
+    /// recipient, ask once, in the background, for the recipient's
+    /// relationship evidence (an EvidenceV1 Lookup over connected peers,
+    /// after the evidence store has loaded; x0x #1207: its responder
+    /// selection blocks synchronously, so it never runs on this wait), and
+    /// re-read the sources until one learns the recipient (an identity
+    /// announcement, an attested DM, the Lookup's answer). `deadline` is
+    /// absolute and bounds everything here, including each lock wait. [`Self::resolve_pinned_target`] carries the same
     /// deadline through its re-checks. It holds no lock between reads,
     /// writes nothing and runs before any admission. An unresolved recipient,
     /// or one whose sources stay locked past the deadline, is the typed,
@@ -8513,17 +8904,12 @@ impl Agent {
             if let Some(binding) = self.pinned_binding_now(to).await {
                 return Some(binding);
             }
-            let evidence = self.peer_evidence();
-            let lookup = async {
-                if evidence.wait(0).await {
-                    evidence.lookup(*to, None).await;
-                }
-            };
-            tokio::pin!(lookup);
-            let mut lookup_done = false;
+            // x0x #1207: the Lookup runs in the background. Its load
+            // barrier and responder selection block synchronously, which no
+            // deadline can interrupt, so the waiting send never runs them.
+            self.peer_evidence().spawn_agent_lookup(*to);
             loop {
                 tokio::select! {
-                    () = &mut lookup, if !lookup_done => lookup_done = true,
                     () = tokio::time::sleep(PINNED_RESOLUTION_POLL) => {}
                     () = self.shutdown_token.cancelled() => return None,
                 }
@@ -8553,7 +8939,7 @@ impl Agent {
                     agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
                     outcome = "err_recipient_undiscovered",
                     waited_ms,
-                    "pinned send: no verified source named the recipient's machine within the bound; the caller resends"
+                    "no verified source named the recipient's machine within the bound; the caller resends"
                 );
                 Err(dm::DmError::RecipientUndiscovered(format!(
                     "no verified machine for the recipient after {waited_ms} ms \
@@ -8792,6 +9178,145 @@ impl Agent {
         }
     }
 
+    /// x0x #1207: whether `agent` or `machine` is revoked, read within the
+    /// resolution `deadline` (a held revocation lock past it is
+    /// `AgentNotFound`, the typed retryable outcome).
+    async fn pinned_awaited_binding_revoked(
+        &self,
+        agent: &identity::AgentId,
+        machine: identity::MachineId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<bool> {
+        Self::pinned_bounded(deadline, "revocation", async {
+            let revoked = self.revocation_set.read().await;
+            revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(&machine)
+        })
+        .await
+        .map_err(|_| error::NetworkError::AgentNotFound(agent.0))
+    }
+
+    /// x0x #1207 (P2): `read`, bounded by an opted-in send's ONE resolution
+    /// deadline ([`ColdResolution::Until`]); every other send reads as
+    /// before. A read still waiting at the deadline is `AgentNotFound`, the
+    /// typed, retryable outcome.
+    async fn cold_bounded<T>(
+        cold: ColdResolution,
+        agent_id: &identity::AgentId,
+        stage: &'static str,
+        read: impl std::future::Future<Output = T>,
+    ) -> error::NetworkResult<T> {
+        let Some(deadline) = cold.deadline() else {
+            return Ok(read.await);
+        };
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&agent_id.0, 4)),
+                    read = stage,
+                    outcome = "err_agent_not_found",
+                    "a resolution read was still waiting at the deadline"
+                );
+                Err(error::NetworkError::AgentNotFound(agent_id.0))
+            }
+        }
+    }
+
+    /// x0x #1207: accept a verified binding of a cold recipient that the
+    /// wait (or, for a zero wait, the one read) found: neither the agent nor
+    /// the machine may be revoked, and an evidence binding is dialled. Every
+    /// read ends at the deadline (`Until`) or does not wait at all
+    /// (`ReadOnce`); a zero wait does not dial from evidence (the repair and
+    /// redial that follow are the transport's).
+    async fn accept_cold_binding(
+        &self,
+        agent_id: &identity::AgentId,
+        agent_prefix: &str,
+        binding: PinnedBinding,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<()> {
+        let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+        if self
+            .pinned_awaited_binding_revoked(agent_id, binding.machine, deadline)
+            .await?
+        {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(agent_prefix),
+                outcome = "drop_revoked",
+                "raw-QUIC send refused: the awaited binding names a revoked agent or machine"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
+        if binding.source == PinnedMachineSource::PeerEvidence {
+            if let ColdResolution::Until(deadline) = cold {
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    self.connect_from_evidence_with(*agent_id, cold),
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// x0x #1207 (lock rule; crate-internal): wait, up to `wait` and holding
+    /// no lock, for a VERIFIED binding of `to`, as an opted-in send would,
+    /// and send nothing. For a caller that will send to `to` under a lock
+    /// with a ZERO cold wait ([`Self::send_direct_with_config_cold_wait`]):
+    /// that send waits for nothing and finds the binding awaited here.
+    ///
+    /// A recipient an ordinary send already resolves (a discovery-cache or
+    /// DM-registry entry) needs no wait. Otherwise the sources and rules are
+    /// the opted-in send's: the announced identity, an ADR-0021
+    /// attestation, the DM registry, then peer evidence (one EvidenceV1
+    /// Lookup); a revoked agent or machine is refused; an evidence binding
+    /// is dialled. One absolute deadline bounds everything, each read
+    /// included.
+    pub(crate) async fn await_cold_recipient_binding(
+        &self,
+        to: &identity::AgentId,
+        wait: std::time::Duration,
+    ) -> Result<(), dm::DmError> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let cold = ColdResolution::Until(deadline);
+        let known = Self::cold_bounded(cold, to, "warm-up", async {
+            let cached = self
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(to)
+                .is_some_and(|d| d.machine_id.0 != [0u8; 32]);
+            cached || self.direct_messaging.get_machine_id(to).await.is_some()
+        })
+        .await
+        .map_err(Self::map_raw_quic_dm_error)?;
+        if known {
+            return Ok(());
+        }
+        #[cfg(test)]
+        general_cold_barrier::park(&self.identity.agent_id(), to, general_cold_barrier::WARM_UP)
+            .await;
+        let _ = tokio::time::timeout_at(deadline, self.connect_to_agent_with(to, cold)).await;
+        let binding = self.await_pinned_recipient_binding(to, deadline).await?;
+        self.accept_cold_binding(to, &network::hex_prefix(&to.0, 4), binding, cold)
+            .await
+            .map_err(Self::map_raw_quic_dm_error)
+    }
+
+    /// x0x #1207 (Codex r5, crate-internal): start a background Lookup for
+    /// `to`'s relationship evidence (permit-bounded; nothing waits on it),
+    /// for a caller that declines a cold wait but must not starve a
+    /// recipient that only pull-based discovery can find.
+    pub(crate) fn start_recipient_lookup(&self, to: &identity::AgentId) {
+        self.peer_evidence().spawn_agent_lookup(*to);
+    }
+
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
     /// discovery cache, DM registry or peer evidence, any send-readiness
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
@@ -8800,6 +9325,8 @@ impl Agent {
     ///
     /// `transport` supplies connection state, repair and redial (r7b). The
     /// pinned path resolves its target with [`Self::resolve_pinned_target`].
+    /// `cold` is the opted-in handling of a restart-cold recipient (x0x
+    /// #1207, #1217; [`ColdResolution`]).
     async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
@@ -8807,39 +9334,79 @@ impl Agent {
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
+        cold: ColdResolution,
     ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
         // the direct-messaging registry when an inbound connection is accepted
         // and later reconciled from transport events.
-        let cached_machine_id = {
+        //
+        // x0x #1207 (P2): for an opted-in send, every resolution read below
+        // ends at the one deadline (`cold_bounded`).
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "discovery", async {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|d| d.machine_id)
                 .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
-        };
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        })
+        .await?;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "registry",
+            self.direct_messaging.get_machine_id(agent_id),
+        )
+        .await?;
 
         let evidence_machine = if cached_machine_id.is_none()
             && registry_machine_id.is_none()
-            && self.peer_evidence().wait(0).await
-        {
-            self.peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-                .map(|v| v.announcement.machine_id)
+            && match cold {
+                // x0x #1207 (Codex r5): a send under a lock never waits on the
+                // evidence load barrier.
+                ColdResolution::ReadOnce => self.peer_evidence().ready_now(),
+                ColdResolution::Off | ColdResolution::Until(_) => {
+                    Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0))
+                        .await?
+                }
+            } {
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store (contention reads as no evidence).
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            view.map(|v| v.announcement.machine_id)
         } else {
             None
         };
+        // x0x #1207: whether the machine came from a cold-recipient binding
+        // (re-validated against the final machine after repair).
+        let mut awaited = false;
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
             (_, Some(id)) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 (id, "registry_connected")
@@ -8849,7 +9416,15 @@ impl Agent {
             (None, Some(id)) => (id, "registry_not_connected"),
             (None, None) if evidence_machine.is_some() => {
                 let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
-                let _ = self.connect_from_evidence(*agent_id).await;
+                let dial = self.connect_from_evidence_with(*agent_id, cold);
+                match cold.deadline() {
+                    Some(deadline) => {
+                        let _ = tokio::time::timeout_at(deadline, dial).await;
+                    }
+                    None => {
+                        let _ = dial.await;
+                    }
+                }
                 (id, "peer_evidence")
             }
             (None, None) => {
@@ -8860,23 +9435,105 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
-                let _ = self.connect_to_agent(agent_id).await;
-                let id = self
-                    .direct_messaging
-                    .get_machine_id(agent_id)
-                    .await
-                    .ok_or_else(|| {
-                        tracing::warn!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                            outcome = "err_agent_not_found",
-                            dur_ms = send_start.elapsed().as_millis() as u64,
-                            "no machine_id after connect_to_agent"
-                        );
-                        error::NetworkError::AgentNotFound(agent_id.0)
-                    })?;
-                (id, "post_connect")
+                match cold {
+                    // Not opted in: today's behaviour, an instant failure
+                    // (a gossip fallback, if any, follows).
+                    ColdResolution::Off => {
+                        let _ = self.connect_to_agent(agent_id).await;
+                        match self.direct_messaging.get_machine_id(agent_id).await {
+                            Some(id) => (id, "post_connect"),
+                            None => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no machine_id after connect_to_agent"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                    // x0x #1207 (opt-in, zero wait): a send under a lock,
+                    // whose wait ran before the lock was taken
+                    // (`await_cold_recipient_binding`). Today's connect
+                    // attempt and registry read, then ONE read of the
+                    // verified sources that does not wait (a held source
+                    // reads as unknown), never a wait.
+                    ColdResolution::ReadOnce => {
+                        let _ = self.connect_to_agent_with(agent_id, cold).await;
+                        match self.direct_messaging.get_machine_id(agent_id).await {
+                            Some(id) => (id, "post_connect"),
+                            None => {
+                                let binding = Self::pinned_bounded(
+                                    tokio::time::Instant::now(),
+                                    "read once",
+                                    self.pinned_binding_now(agent_id),
+                                )
+                                .await
+                                .ok()
+                                .flatten();
+                                let Some(binding) = binding else {
+                                    tracing::warn!(
+                                        target: "x0x::direct",
+                                        stage = "send",
+                                        agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                        outcome = "err_agent_not_found",
+                                        dur_ms = send_start.elapsed().as_millis() as u64,
+                                        "no machine_id after connect_to_agent, and no verified binding (zero wait)"
+                                    );
+                                    return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                                };
+                                self.accept_cold_binding(agent_id, agent_prefix, binding, cold)
+                                    .await?;
+                                awaited = true;
+                                (binding.machine, binding.source.label())
+                            }
+                        }
+                    }
+                    // x0x #1207, #1217 (opt-in, `send_direct_with_config_cold_wait`):
+                    // a restart leaves the discovery cache and the DM registry
+                    // cold. Wait, within the ONE absolute deadline (from the
+                    // start of this raw attempt), for a VERIFIED binding. The
+                    // sources and order are the pinned path's
+                    // (`select_pinned_binding`): the announced-binding store, the
+                    // ADR-0021 attestation, the DM registry, then peer evidence,
+                    // with one EvidenceV1 Lookup. The binding is re-validated
+                    // against the FINAL machine after repair (below).
+                    ColdResolution::Until(deadline) => {
+                        #[cfg(test)]
+                        general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes)
+                            .await;
+                        let _ = tokio::time::timeout_at(
+                            deadline,
+                            self.connect_to_agent_with(agent_id, cold),
+                        )
+                        .await;
+                        match self
+                            .await_pinned_recipient_binding(agent_id, deadline)
+                            .await
+                        {
+                            Ok(binding) => {
+                                self.accept_cold_binding(agent_id, agent_prefix, binding, cold)
+                                    .await?;
+                                awaited = true;
+                                (binding.machine, binding.source.label())
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no verified machine for the recipient within the resolution deadline"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -8884,7 +9541,14 @@ impl Agent {
         // resolve a machine the discovery cache never saw (raw-QUIC
         // fallback) — evaluate B+P for whatever machine was resolved so a
         // DM cannot reach a retired old-source binding through it.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 stage = "send",
@@ -8917,10 +9581,24 @@ impl Agent {
         // Skip when resolution == "post_connect" (last-resort branch already
         // invoked connect_to_agent above).
         let mut repair_outcome: Option<&'static str> = None;
-        if !connected && resolution != "post_connect" {
+        // x0x #1207 (Codex r4): a cold-recipient binding (`awaited`) newly
+        // reaches this point. Under a lock (`ReadOnce`) it is not repaired
+        // (a wait); no cold binding is redialled (the redial reconciles to
+        // whatever machine discovery names, and its connection-setup reads
+        // would be new on this path). An unconnected one fails below,
+        // retryably.
+        let may_repair = !(awaited && matches!(cold, ColdResolution::ReadOnce));
+        if !connected && resolution != "post_connect" && may_repair {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let outcome = match tokio::time::timeout(
-                REPAIR_TIMEOUT,
+            // x0x #1207 (Codex r5): the repair of a cold binding is newly
+            // reachable, so it ends at the send's absolute deadline too.
+            let repair_until = tokio::time::Instant::now() + REPAIR_TIMEOUT;
+            let repair_until = match (awaited, cold.deadline()) {
+                (true, Some(deadline)) => deadline.min(repair_until),
+                _ => repair_until,
+            };
+            let outcome = match tokio::time::timeout_at(
+                repair_until,
                 transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await
@@ -8945,8 +9623,8 @@ impl Agent {
             // separate. If the fast bootstrap-cache repair cannot recover a
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
-            if !connected {
-                if let Some(redialed_machine_id) = transport.redial(self, agent_id).await {
+            if !connected && !awaited {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id, cold).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -8956,13 +9634,81 @@ impl Agent {
             }
         }
 
-        if resolution == "peer_evidence"
-            && self
-                .peer_evidence()
-                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
-                .is_none()
-        {
+        if awaited && !connected {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                resolution,
+                ?repair_outcome,
+                outcome = "err_agent_not_found",
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "raw-QUIC send: the cold recipient's bound machine is not connected; the caller retries"
+            );
             return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        }
+
+        if resolution == "peer_evidence" {
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store; contention fails closed (typed, retryable).
+            let usable = if cold.opted_in() {
+                matches!(
+                    self.peer_evidence().try_usable(*agent_id, machine_id, now),
+                    Ok(Some(_))
+                )
+            } else {
+                self.peer_evidence()
+                    .usable(*agent_id, machine_id, now)
+                    .is_some()
+            };
+            if !usable {
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+        }
+
+        // x0x #1207 (P1): a cold-recipient binding is re-validated against
+        // the FINAL machine (repair or redial may have replaced it): the
+        // current verified binding (expiry included) must still name it, and
+        // neither the agent nor the machine may be revoked. The reads end at
+        // the resolution deadline (`Until`) or do not wait at all
+        // (`ReadOnce`, a send under a lock).
+        if awaited {
+            let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+            let current = Self::pinned_bounded(
+                deadline,
+                "general revalidation",
+                self.pinned_binding_now(agent_id),
+            )
+            .await
+            .map_err(|_| error::NetworkError::AgentNotFound(agent_id.0))?;
+            if current.map(|binding| binding.machine) != Some(machine_id) {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_binding_changed",
+                    "raw-QUIC send refused: the recipient's verified binding no longer names the final machine"
+                );
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+            if self
+                .pinned_awaited_binding_revoked(agent_id, machine_id, deadline)
+                .await?
+            {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_revoked_post_resolution",
+                    "raw-QUIC send refused: the agent or the final machine is revoked"
+                );
+                return Err(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                });
+            }
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -8970,8 +9716,16 @@ impl Agent {
         // check never saw — re-run B/P against the FINAL machine
         // immediately before transmission, so a retired or
         // pinned-elsewhere binding reached through the repair path is
-        // refused here regardless of how it was resolved.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        // refused here regardless of how it was resolved. x0x #1207 (P2):
+        // for an opted-in send this read too ends at the deadline.
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing after resolution",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
@@ -9051,14 +9805,75 @@ impl Agent {
         })
     }
 
+    /// In-process stand-in for the GENERAL raw-QUIC send (x0x #1207,
+    /// #1217): the production target resolution (`resolve_raw_quic_target`,
+    /// over the strict stand-in's scripted transport), with the network
+    /// write replaced by a delivery witness. Strict test agents only.
+    #[cfg(test)]
+    async fn general_raw_standin(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        agent_prefix: &str,
+        send_start: std::time::Instant,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let transport =
+            RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+        let target = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &transport,
+                agent_prefix,
+                payload.len(),
+                send_start,
+                cold,
+            )
+            .await?;
+        if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
+            deliveries.push((
+                self.identity.agent_id(),
+                *agent_id,
+                target.machine_id,
+                payload.to_vec(),
+            ));
+        }
+        Ok(dm::DmPath::RawQuic)
+    }
+
+    /// Test seam (x0x #1207): the general raw-QUIC deliveries this agent's
+    /// strict stand-in made, as `(recipient, machine, payload)`.
+    #[cfg(test)]
+    pub(crate) fn general_raw_standin_deliveries_for_testing(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::MachineId, Vec<u8>)> {
+        let me = self.identity.agent_id();
+        GENERAL_RAW_STANDIN_DELIVERIES
+            .lock()
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter(|(from, ..)| *from == me)
+                    .map(|(_, to, machine, payload)| (*to, *machine, payload.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        cold_wait: Option<ColdWait>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
+        // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
+        // attempt, for every resolution read of an opted-in send. The
+        // transport budget (repair, redial, the ACK wait) is separate and
+        // unchanged.
+        let cold = ColdResolution::starting_now(cold_wait);
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
         let bytes = payload.len();
@@ -9069,6 +9884,12 @@ impl Agent {
             "raw_quic"
         };
 
+        #[cfg(test)]
+        if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            return self
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start, cold)
+                .await;
+        }
         let network = self.network.as_ref().ok_or_else(|| {
             tracing::warn!(
                 target: "x0x::direct",
@@ -9092,6 +9913,7 @@ impl Agent {
                 &agent_prefix,
                 bytes,
                 send_start,
+                cold,
             )
             .await?;
 
