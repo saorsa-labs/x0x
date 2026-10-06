@@ -1069,8 +1069,9 @@ const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP *
 pub(in crate::server) struct ApplyMetadataResult {
     /// `true` when the event was accepted and durably persisted.
     pub accepted: bool,
-    /// `true` when the subscriber loop should exit (e.g. self-removal,
-    /// group deletion, membership change requiring re-subscription).
+    /// `true` when the subscriber must re-check local membership (e.g.
+    /// self-removal, group deletion, or a roster change). A still-active
+    /// member keeps its subscription to the unchanged metadata topic.
     pub should_exit: bool,
     /// ADR 0028 Finding B: pre-mutation group state for rollback. Set by
     /// JoinRequestCreated so the relay listener can restore the pre-apply
@@ -1087,8 +1088,8 @@ impl ApplyMetadataResult {
         pre_mutation_group: None,
     };
 
-    /// Event accepted and persisted; subscriber should exit (membership
-    /// roster changed, requiring re-subscription).
+    /// Event accepted and persisted; re-check whether the subscriber
+    /// should exit. Roster changes do not rotate the metadata topic.
     pub const ACCEPTED_EXIT: Self = Self {
         accepted: true,
         should_exit: true,
@@ -14497,12 +14498,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
 }
 
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
-    if state
-        .group_metadata_tasks
-        .read()
-        .await
-        .contains_key(group_id)
-    {
+    // Serialize check, subscription and install. A read/check followed by
+    // a later insert lets concurrent ensures spawn two live receivers.
+    let mut tasks = state.group_metadata_tasks.write().await;
+    if tasks.contains_key(group_id) {
         return;
     }
 
@@ -14574,14 +14573,27 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         msg.raw_envelope.as_deref(),
                     )
                     .await;
-                    if apply_result.should_exit { break; }
+                    if apply_result.should_exit {
+                        let groups = state_for_task.named_groups.read().await;
+                        let local_agent = hex::encode(state_for_task.agent.agent_id().as_bytes());
+                        if !groups.get(&task_group_id).is_some_and(|group| {
+                            !group.withdrawn && group.has_active_member(&local_agent)
+                        }) {
+                            break;
+                        }
+                        // #1256: all exiting roster events keep this topic.
+                        // Apply already refreshed gossip roster preferences;
+                        // neither the receiver nor the topic is epoch-keyed.
+                        // Retain the receiver AND its queued events, with the
+                        // same #477 J2 token and no re-subscription gap.
+                    }
                 }
             }
         }
         remove_listener_if_token(&state_for_task, &task_group_id, registration_token).await;
     });
 
-    state.group_metadata_tasks.write().await.insert(
+    tasks.insert(
         group_id,
         ListenerRegistration {
             token: registration_token,
@@ -39330,6 +39342,7 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
+    mod issue1256_metadata_listener;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;

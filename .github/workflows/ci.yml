@@ -445,6 +445,12 @@ jobs:
         run: >-
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
           --require w3h_s1_control_group_invite_join_over_public_api
+          --require w3h_red_1256_gossip_only_event_after_a_gossip_member_added
+          --require w3h_1256_control_second_event_also_by_dm
+          --require w3h_1256_control_member_restarted_after_the_first_event
+          --expect w3h_red_1256_gossip_only_event_after_a_gossip_member_added=GREEN
+          --expect w3h_1256_control_second_event_also_by_dm=GREEN
+          --expect w3h_1256_control_member_restarted_after_the_first_event=GREEN
           --require w3h_s1_negative_control_offline_joiner_is_not_admitted
           --require w3h_1143_positive_control_consented_owner_announce_admits
           --require w3h_red_1143_promoted_admin_admits_with_owner_offline
