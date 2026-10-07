@@ -435,3 +435,35 @@ caveats from #448/#450 still recommend short mixed-fleet windows.
 ## CI Integration
 
 `release.yml` generates `release-manifest.json` and `release-manifest.json.sig` via `x0x-keygen manifest` during the release signing job.
+
+### Contributor fixtures (ADR 0094)
+
+`upgrade-test-signing` is a test-only feature, off by default. It replaces the
+compiled release public key in debug builds and is a compile error without
+`debug_assertions`. It never adds a second trusted key or accepts a runtime key
+override. The signing context, gossip framing and verification of the original
+manifest/archive bytes remain unchanged.
+
+For each private rehearsal, generate a fresh throwaway keypair with
+`x0x-keygen generate` on the isolated Linux test plane. Set
+`X0X_UPGRADE_TEST_PUBLIC_KEY` to its public-key file **at build time**, and build
+the debug candidate and companion with `--features upgrade-test-signing`.
+The build script validates and copies that public key into `OUT_DIR`; compiled
+binaries do not read this environment variable. Without a supplied public key,
+an all-features lint/doc build generates a fresh key and discards its secret.
+`--all-features` explicitly enables the seam; ordinary `just build` and
+`just build-release` list the existing application features and keep the
+production key.
+Keep private keys and fixture binaries on the isolated test plane; never
+publish them or gossip their manifests to production.
+
+Both `x0xd` and `x0x` support the inert contributor check
+`--verify-release-manifest MANIFEST SIGNATURE`. It reads the two files and
+verifies their original bytes with the compiled key, before runtime, identity,
+configuration, logging or network initialization. Success exits 0; rejection
+exits nonzero. It neither installs an update nor selects a different key.
+
+Systemd acceptance fixtures require a private loopback-only network namespace,
+non-root identity, empty capability sets and `no_new_privs`. Each child and
+respawn samples and validates these facts before fixture work; runners also
+validate each child's receipt. A missing or unsafe observation fails the gate.

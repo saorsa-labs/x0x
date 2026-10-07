@@ -20,6 +20,97 @@ struct VerdictRecord {
     restart: Option<String>,
     template_version: Option<u32>,
     detail: Option<String>,
+    isolation: serde_json::Value,
+}
+
+#[cfg(target_os = "linux")]
+fn sample_isolation() -> io::Result<serde_json::Value> {
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::process::Command;
+
+    let parent = std::env::var("X0X_FIXTURE_PARENT_NETNS").map_err(io::Error::other)?;
+    let namespace = fs::read_link("/proc/self/ns/net")?
+        .to_string_lossy()
+        .into_owned();
+    if namespace == parent || !parent.starts_with("net:[") {
+        return Err(io::Error::other("fixture network namespace did not change"));
+    }
+    let ip = |args: &[&str]| -> io::Result<serde_json::Value> {
+        let output = Command::new("/usr/sbin/ip").args(args).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("fixture ip observation failed"));
+        }
+        serde_json::from_slice(&output.stdout).map_err(io::Error::other)
+    };
+    let links = ip(&["-j", "link"])?;
+    let routes = json!({
+        "-4": ip(&["-4", "-j", "route", "show", "table", "all"] )?,
+        "-6": ip(&["-6", "-j", "route", "show", "table", "all"] )?,
+    });
+    if links
+        .as_array()
+        .is_none_or(|rows| rows.len() != 1 || rows[0]["ifname"] != "lo")
+        || ["-4", "-6"].iter().any(|family| {
+            routes[family].as_array().is_none_or(|rows| {
+                rows.iter().any(|row| {
+                    row["dev"] != "lo" || row["dst"] == "default" || row.get("gateway").is_some()
+                })
+            })
+        })
+    {
+        return Err(io::Error::other("fixture is not loopback-only"));
+    }
+    let status = fs::read_to_string("/proc/self/status")?;
+    let fields: BTreeMap<_, _> = status
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name, value.trim()))
+        .collect();
+    let field = |name| {
+        fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| io::Error::other("missing process status field"))
+    };
+    let identity = |name| -> io::Result<u32> {
+        let ids = field(name)?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
+        if ids.len() != 4 || ids.iter().any(|id| *id == 0 || *id != ids[0]) {
+            return Err(io::Error::other("fixture identity was not dropped"));
+        }
+        Ok(ids[0])
+    };
+    let uid = identity("Uid")?;
+    let gid = identity("Gid")?;
+    if field("Groups")?
+        .split_whitespace()
+        .any(|group| group == "0")
+        || field("NoNewPrivs")? != "1"
+    {
+        return Err(io::Error::other("fixture groups or no_new_privs unsafe"));
+    }
+    let mut capabilities = BTreeMap::new();
+    for name in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        let value = field(name)?;
+        if u64::from_str_radix(value, 16).map_err(io::Error::other)? != 0 {
+            return Err(io::Error::other("fixture capabilities were not dropped"));
+        }
+        capabilities.insert(name, value);
+    }
+    Ok(
+        json!({"namespace": namespace, "namespace_changed": true, "links": links,
+        "routes": routes, "uid": uid, "gid": gid, "capabilities": capabilities,
+        "no_new_privs": 1}),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_isolation() -> io::Result<serde_json::Value> {
+    Err(io::Error::other("systemd fixtures require isolated Linux"))
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -79,6 +170,8 @@ fn parse_args() -> io::Result<PathBuf> {
 }
 
 fn run() -> io::Result<()> {
+    // Every invocation, including respawns, admits itself before fixture work.
+    let isolation = sample_isolation()?;
     let artifact = parse_args()?;
     fs::create_dir_all(&artifact)?;
     let invocation = claim_invocation(&artifact)?;
@@ -144,6 +237,7 @@ fn run() -> io::Result<()> {
             restart,
             template_version,
             detail,
+            isolation,
         },
     )?;
     if invocation == 1 {

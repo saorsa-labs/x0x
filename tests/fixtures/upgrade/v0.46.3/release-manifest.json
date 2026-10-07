@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "version": "0.46.3",
+  "timestamp": 1791191361,
+  "assets": [
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-x64-gnu.tar.gz",
+      "archive_sha256": "d0faeb16b07e7c86a32c450f0e172e5060787b2c9734e89f61f96ce52391ef33",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-x64-gnu.tar.gz.sig"
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-x64-musl.tar.gz",
+      "archive_sha256": "c068ab2e1622b769656c34964efeb90c11c43b3bfe78707c079fa677cf6ad0e9",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-x64-musl.tar.gz.sig"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-arm64-gnu.tar.gz",
+      "archive_sha256": "3dba486557d77fd1b386186c9bd1e29d5b80b482dc525b6b00ba9d1bfdcd94b5",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-linux-arm64-gnu.tar.gz.sig"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-macos-x64.tar.gz",
+      "archive_sha256": "5ec3e4d1f2ba244d1d63b8e99878a7f73782bf80a6fd9b72776aed241ff411f3",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-macos-x64.tar.gz.sig"
+    },
+    {
+      "target": "aarch64-apple-darwin",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-macos-arm64.tar.gz",
+      "archive_sha256": "3bd49e49ce08107f5ae6a4dda69ea2eccbc3982cc96979c38c932c28437b6425",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-macos-arm64.tar.gz.sig"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "archive_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-windows-x64.zip",
+      "archive_sha256": "5363c353364b5dca261208c81bfda0e14964e22c0908686eba36a40c0444d6a8",
+      "signature_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/x0x-windows-x64.zip.sig"
+    }
+  ],
+  "skill_url": "https://github.com/saorsa-labs/x0x/releases/download/v0.46.3/SKILL.md",
+  "skill_sha256": "f03b2a28fd99d53c5af9272fb57783a432eee06bc877bf3b6c796b7046332b10"
+}

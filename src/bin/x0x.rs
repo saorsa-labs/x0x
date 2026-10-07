@@ -2010,8 +2010,21 @@ fn reset_sigpipe_to_default() {
     }
 }
 
+fn main() -> ExitCode {
+    if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("manifest verification failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    run_cli()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn run_cli() -> ExitCode {
     #[cfg(unix)]
     reset_sigpipe_to_default();
 

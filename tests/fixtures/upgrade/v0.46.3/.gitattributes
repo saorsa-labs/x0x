@@ -1,0 +1,3 @@
+# Signature verification requires the original bytes on every checkout platform.
+release-manifest.json -text
+release-manifest.json.sig -text
