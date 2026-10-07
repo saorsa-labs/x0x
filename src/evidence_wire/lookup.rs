@@ -136,12 +136,30 @@ impl Relations {
         let now = dm_capability::now_unix_ms();
         let binding =
             crate::dm_inbox::authenticated_machine_binding_evidence(&self.bindings, &agent).await;
+        // ADR 0115 §2: the authenticated binding names the
+        // machine whenever it exists, and a routing entry stands for the
+        // peer only when an authority store confirms its machine. The
+        // stores are read before the discovery cache (r7g lock order).
+        let routing = self
+            .discovery
+            .read()
+            .await
+            .get(&agent)
+            .map(|d| d.machine_id);
+        let routing_confirmed = match routing {
+            Some(machine) => {
+                binding.is_some_and(|b| b.machine_id == machine)
+                    || self.owner.announced_machine(&agent).await == Some(machine)
+                    || self.runtime.confirms_pairing(agent, machine, now)
+            }
+            None => false,
+        };
         let cache = self.discovery.read().await;
-        let cached = cache.get(&agent);
+        let cached = cache
+            .get(&agent)
+            .filter(|d| routing_confirmed && Some(d.machine_id) == routing);
         let stored = self.runtime.usable_agent(agent, now);
-        let machine = if let Some(b) =
-            binding.filter(|b| cached.is_none_or(|d| b.announced_at > d.announced_at))
-        {
+        let machine = if let Some(b) = binding {
             b.machine_id
         } else if let Some(d) = cached {
             d.machine_id
@@ -1169,13 +1187,30 @@ mod tests {
             .write()
             .await
             .insert(requester.a(), discovered.clone());
+        // ADR 0115 §2: a discovery entry alone confirms nothing.
+        assert!(
+            !responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await,
+            "an unconfirmed discovery machine must not authorize"
+        );
+        responder.know(&requester).await;
         assert!(
             responder
                 .relations
                 .authorized(requester.m(), responder.a())
                 .await
         );
-        // An obsolete reverse pointer cannot override a move in discovery.
+        // An obsolete reverse pointer cannot override a move: the agent's
+        // authority moves it, and discovery follows.
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &responder.relations.bindings,
+            requester.a(),
+            MachineId([99; 32]),
+            dm_capability::now_unix_ms() / 1000 + 1,
+        )
+        .await;
         discovered.machine_id = MachineId([99; 32]);
         responder
             .relations

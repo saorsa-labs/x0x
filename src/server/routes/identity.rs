@@ -1035,9 +1035,11 @@ pub(in crate::server) async fn import_agent_card(
     );
 
     if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
+        // ADR 0115: a card the local user imports is a
+        // local-user pin, an authority source for this (agent, machine).
         state
             .agent
-            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            .pin_card_binding(x0x::DiscoveredAgent {
                 self_name: None,
                 agent_id,
                 machine_id: x0x::identity::MachineId(machine_id_bytes),

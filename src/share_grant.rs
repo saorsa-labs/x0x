@@ -1637,10 +1637,12 @@ pub async fn record_local_share_grant_revocation(
         Some(outbox) => Some(outbox.revocation_barrier().await),
         None => None,
     };
+    // ADR 0115 §5: the same future bound as every carrier,
+    // so a fast clock cannot store a record the next load would drop.
     revocation_set
         .write()
         .await
-        .verify_and_insert(record, None)
+        .verify_and_insert_at(record, None, crate::Agent::unix_timestamp_secs())
         .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
     let mut failures = Vec::new();
     if let Err(e) =

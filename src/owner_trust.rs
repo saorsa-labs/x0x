@@ -6,8 +6,9 @@
 //!    owner device set has been installed ([`crate::Agent::install_owner_device_store`]);
 //! 2. the agent's **authenticated** machine binding
 //!    ([`crate::dm_inbox::AuthenticatedMachineBindings`], written only from the
-//!    agent's own fresh identity announcement or a valid ADR-0021 DM
-//!    attestation) names exactly the transport-authenticated peer machine —
+//!    agent's own fresh identity announcement, a valid ADR-0021 DM
+//!    attestation, or the local user's card import (ADR 0115 local pin,
+//!    `Agent::pin_card_binding`)) names exactly the transport-authenticated peer machine —
 //!    no binding (never learned, or LRU-evicted) means not owner-trusted. The
 //!    mutable `DiscoveredAgent::machine_id` is never used for the pairing;
 //! 3. the `AgentCertificate` cached for the agent (looked up by agent only —
@@ -56,6 +57,10 @@ pub struct OwnerTrust {
     /// The agent's authenticated agent→machine bindings (#890). The default
     /// is an empty cache, which owner-trusts nothing.
     bindings: AuthenticatedMachineBindings,
+    /// ADR 0115 §2: the announced-binding store (class A and B
+    /// announcements only). Shared slot like `devices`; installed at daemon
+    /// start.
+    announced: Arc<std::sync::RwLock<Option<AuthenticatedMachineBindings>>>,
     /// ADR-0070 §2 share-grant store (slice 3). Shared slot like `devices`:
     /// until the daemon installs it, no pair holds any grant.
     grants: Arc<std::sync::RwLock<Option<Arc<crate::share_grant::ShareGrantStore>>>>,
@@ -95,8 +100,85 @@ impl OwnerTrust {
             evidence: Default::default(),
             devices: Arc::new(std::sync::RwLock::new(None)),
             bindings,
+            announced: Arc::new(std::sync::RwLock::new(None)),
             grants: Arc::new(std::sync::RwLock::new(None)),
             grant_outbox: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// ADR 0115 §2: install the announced-binding store.
+    pub(crate) fn install_announced_bindings(&self, store: AuthenticatedMachineBindings) {
+        if let Ok(mut slot) = self.announced.write() {
+            *slot = Some(store);
+        }
+    }
+
+    fn announced_bindings(&self) -> Option<AuthenticatedMachineBindings> {
+        self.announced.read().ok().and_then(|slot| slot.clone())
+    }
+
+    /// ADR 0115 §2: the machine `agent`'s announced-binding
+    /// record names, when the store is installed.
+    pub(crate) async fn announced_machine(&self, agent: &AgentId) -> Option<MachineId> {
+        let store = self.announced_bindings()?;
+        let binding = store.read().await.peek(agent);
+        binding.map(|binding| binding.machine_id)
+    }
+
+    /// ADR 0115 §2: whether an authority store confirms that
+    /// `agent` lives on `machine`: the authenticated binding, the announced
+    /// binding, or a usable ADR 0089 evidence record. Each lock is taken
+    /// alone.
+    pub(crate) async fn authority_confirms(&self, agent: &AgentId, machine: &MachineId) -> bool {
+        self.authority_confirms_with(agent, machine, false).await
+    }
+
+    /// [`Self::authority_confirms`]; with `nonblocking_evidence` the ADR
+    /// 0089 check never blocks (x0x #1207: a contended evidence store reads
+    /// as no evidence, fail closed).
+    pub(crate) async fn authority_confirms_with(
+        &self,
+        agent: &AgentId,
+        machine: &MachineId,
+        nonblocking_evidence: bool,
+    ) -> bool {
+        let attested = self.bindings.read().await.peek(agent);
+        let announced = match self.announced_bindings() {
+            Some(store) => store.read().await.peek(agent),
+            None => None,
+        };
+        crate::identity_authority::confirms(*machine, announced, attested, || {
+            let now = crate::dm_capability::now_unix_ms();
+            self.evidence().is_some_and(|runtime| {
+                if nonblocking_evidence {
+                    runtime.try_confirms_pairing(*agent, *machine, now) == Some(true)
+                } else {
+                    runtime.confirms_pairing(*agent, *machine, now)
+                }
+            })
+        })
+    }
+
+    /// [`Self::authority_confirms`] for synchronous seams: `None` while a
+    /// lock is contended (callers fail closed).
+    pub(crate) fn try_authority_confirms(
+        &self,
+        agent: &AgentId,
+        machine: &MachineId,
+    ) -> Option<bool> {
+        let attested = self.bindings.try_read().ok()?.peek(agent);
+        let announced = match self.announced_bindings() {
+            Some(store) => store.try_read().ok()?.peek(agent),
+            None => None,
+        };
+        if crate::identity_authority::confirms(*machine, announced, attested, || false) {
+            return Some(true);
+        }
+        match self.evidence() {
+            Some(runtime) => {
+                runtime.try_confirms_pairing(*agent, *machine, crate::dm_capability::now_unix_ms())
+            }
+            None => Some(false),
         }
     }
 

@@ -104,8 +104,15 @@ impl Fixture {
         let peer = initiator.agent_id();
         let local = responder.agent_id();
         if discovered {
-            let mut entry =
-                crate::discovered_agent_fixture(1, dm_capability::now_unix_ms() / 1000, &[], None);
+            let announced_at = dm_capability::now_unix_ms() / 1000;
+            // ADR 0115 §2: a discovered peer's class A announcement records
+            // its announced binding (never the authenticated store).
+            responder
+                .announced_machine_bindings
+                .write()
+                .await
+                .record_announcement(peer, initiator.machine_id(), announced_at, None, None);
+            let mut entry = crate::discovered_agent_fixture(1, announced_at, &[], None);
             entry.agent_id = peer;
             entry.machine_id = initiator.machine_id();
             entry.agent_public_key = initiator

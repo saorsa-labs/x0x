@@ -2607,15 +2607,26 @@ impl OwnerSyncService {
         }
         // Resolve the deterministic first agent on the target machine —
         // open_peer_stream authorizes per agent, sessions are per machine.
-        let target_agent = self
+        // ADR 0115 §2: a candidate counts only when an
+        // authority store confirms it on `machine`; a routing entry alone
+        // does not.
+        let mut candidates: Vec<crate::identity::AgentId> = self
             .agent
             .discovered_agents()
             .await
             .map_err(|e| ("discovery", e.to_string()))?
             .into_iter()
             .filter(|d| d.machine_id == *machine)
-            .min_by_key(|d| d.agent_id.as_bytes().to_vec())
-            .map(|d| d.agent_id);
+            .map(|d| d.agent_id)
+            .collect();
+        candidates.sort_by_key(|agent| agent.0);
+        let mut target_agent = None;
+        for candidate in candidates {
+            if self.agent.authority_confirms(&candidate, machine).await {
+                target_agent = Some(candidate);
+                break;
+            }
+        }
         let stream = match target_agent {
             Some(target_agent) => self
                 .agent

@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.5] - 2026-10-07
+
+### Security
+
+- **Identity discovery accepts authority only from authenticated evidence (ADR 0115).**
+  A peer's machine, certificate, user and name in the discovery cache now change
+  only through an announcement authenticated by the agent itself, or by its
+  current authenticated machine. Security decisions (raw message verification,
+  delivery resolution, stream gates, evidence lookup) use only these
+  authenticated records. Revocations need a certificate with authenticated
+  provenance, a revocation's own timestamp may be at most 300 s ahead, and a
+  key-move bundle needs the subject's authenticated owner. Upgrade promptly; an
+  advisory follows.
+
+### Changed
+
+- **An agent found only through rendezvous is addresses only** until its own
+  authenticated announcement or evidence arrives; sends to it fail with
+  `AgentNotFound` until then.
+- **One authenticated machine per agent at a time.** For an agent active on two
+  machines, the older machine is unconfirmed until its next announcement (up to
+  600 s).
+- **Revocations and key-move tombstones stored before this upgrade are
+  quarantined** until authenticated evidence confirms their issuer; unconfirmed
+  records lapse after 7 days. A contact blocked by such a revocation is
+  unblocked meanwhile, including one also blocked by hand.
+- `/diagnostics/gossip` reports `identity_authority` counters and the quarantine
+  summary.
+
+### Fixed
+
+- **A restarted peer gets a fresh evidence Hello (#1207 S1b).** The one-attempt
+  rule is now per connection, so a node re-sends one Hello on a peer's new
+  connection after the peer restarts. The 60 s per-machine rate limit is
+  unchanged.
+
+### Added
+
+- ADR 0094 M2 slice H: a debug-only test-signing seam and isolated systemd
+  fixtures for self-update validation (no release-build behaviour change).
+
 ## [v0.46.4] - 2026-10-06
 
 ### Changed

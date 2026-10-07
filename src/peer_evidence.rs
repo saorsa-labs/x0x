@@ -663,6 +663,42 @@ impl PeerEvidenceStore {
     ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
         self.check_usable_with(agent, machine, now, true)
     }
+    /// ADR 0115 §2: whether a usable record exists for exactly
+    /// (agent, machine). The same check as [`Self::usable`], without its
+    /// use counters, for security readers that only need the answer.
+    pub(crate) fn confirms_pairing(&self, agent: AgentId, machine: MachineId, now: u64) -> bool {
+        self.check_usable(agent, machine, now).is_ok()
+    }
+    /// [`Self::confirms_pairing`] for synchronous seams: `None` when the
+    /// store or its policy is busy.
+    pub(crate) fn try_confirms_pairing(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> Option<bool> {
+        match self.check_usable_with(agent, machine, now, false) {
+            Ok(_) => Some(true),
+            Err(reason) if reason == STORE_BUSY => None,
+            Err(_) => Some(false),
+        }
+    }
+    /// ADR 0115 §3: the owner certificate of `agent`'s usable
+    /// record, if it carries one, without the use counters.
+    pub(crate) fn usable_certificate(&self, agent: AgentId, now: u64) -> Option<AgentCertificate> {
+        let machine = self
+            .state
+            .lock()
+            .ok()?
+            .verified
+            .get(&agent)?
+            .announcement
+            .machine_id;
+        self.check_usable(agent, machine, now)
+            .ok()?
+            .certificate
+            .clone()
+    }
     /// The state lock, taken blocking, or without blocking (`STORE_BUSY`
     /// on contention) for synchronous seams.
     fn state_for_check(
