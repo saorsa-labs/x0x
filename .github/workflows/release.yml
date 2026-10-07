@@ -439,7 +439,7 @@ jobs:
         if: matrix.platform == 'linux-arm64-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user libc6-arm64-cross
+          sudo apt-get install -y qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
 
       - name: Download public signing controls
         uses: actions/download-artifact@v5
