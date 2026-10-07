@@ -57,6 +57,11 @@ pub(crate) const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
 /// between the owner and the enforcing daemons.
 pub const SHARE_GRANT_REVOCATION_GC_SLACK_SECS: u64 = 3_600;
 
+/// ADR 0115 §5 (D213): the most a record's `revoked_at` may lie
+/// ahead of local time. Beyond it the record is rejected at ingress and
+/// dropped at load: a far-future `revoked_at` would never expire.
+pub(crate) const REVOCATION_MAX_FUTURE_SKEW_SECS: u64 = 300;
+
 /// An ADR-0070 §2 share-grant revocation: the grant id plus the owner that
 /// signed the grant. Carrying the owner makes authority verifiable from the
 /// record alone (the issuer key must hash to `owner`), and scopes the
@@ -353,6 +358,33 @@ impl RevocationRecord {
         ))
     }
 
+    /// ADR 0115 D214: the user whose key issued this record, read as a
+    /// `UserId` (the derivation [`Self::verify_authority`] compares with
+    /// a certificate's user). `None` for an unreadable key.
+    #[must_use]
+    pub(crate) fn issuer_user_id(&self) -> Option<UserId> {
+        let key = MlDsaPublicKey::from_bytes(&self.issuer_public_key).ok()?;
+        Some(UserId(derive_peer_id_from_public_key(&key).0))
+    }
+
+    /// ADR 0115 D214: whether this record's authority comes from a subject
+    /// certificate: an issuer revocation of an agent, or a binding tombstone.
+    #[must_use]
+    pub(crate) fn needs_certificate_authority(&self) -> Option<AgentId> {
+        match &self.subject {
+            RevokedSubject::Agent(agent) if !self.is_self_revocation() => Some(*agent),
+            RevokedSubject::AgentMachineBinding(binding) => Some(binding.agent),
+            _ => None,
+        }
+    }
+
+    /// ADR 0115 §5: whether `revoked_at` is within
+    /// [`REVOCATION_MAX_FUTURE_SKEW_SECS`] of `now_unix`.
+    #[must_use]
+    pub(crate) fn revoked_at_is_credible(&self, now_unix: u64) -> bool {
+        self.revoked_at <= now_unix.saturating_add(REVOCATION_MAX_FUTURE_SKEW_SECS)
+    }
+
     /// Whether this is a self-revocation — the issuer key hashes to the
     /// subject id.
     ///
@@ -609,10 +641,97 @@ impl RevocationSet {
         }))
     }
 
-    /// Raw insert of an already-verified record. Performs NO cryptographic
-    /// checks — it is module-private and reachable ONLY through
-    /// [`verify_and_insert`](Self::verify_and_insert), which is the sole path a
-    /// record can enter the set. Returns `true` if new.
+    /// ADR 0115 §5: [`verify_and_insert`](Self::verify_and_insert) for a
+    /// record from any ingress carrier. A `revoked_at` beyond the
+    /// future-skew bound at `now_unix` is rejected and counted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Revocation`] for a far-future `revoked_at`,
+    /// an invalid signature or a missing authority.
+    pub(crate) fn verify_and_insert_at(
+        &mut self,
+        record: RevocationRecord,
+        subject_cert: Option<&AgentCertificate>,
+        now_unix: u64,
+    ) -> Result<bool, IdentityError> {
+        if !record.revoked_at_is_credible(now_unix) {
+            crate::identity_authority::note_revocation_future_dropped(1);
+            return Err(IdentityError::Revocation(format!(
+                "revoked_at {} is more than {REVOCATION_MAX_FUTURE_SKEW_SECS} s ahead of local time {now_unix}",
+                record.revoked_at
+            )));
+        }
+        self.verify_and_insert(record, subject_cert)
+    }
+
+    /// ADR 0115 §5: drop every record whose `revoked_at` is beyond the
+    /// future-skew bound at `now_unix` (a load-time check). Returns the
+    /// number dropped and counts them.
+    pub(crate) fn drop_future_records(&mut self, now_unix: u64) -> usize {
+        let dropped = self
+            .take_records_where(|record, _| !record.revoked_at_is_credible(now_unix))
+            .len();
+        if dropped > 0 {
+            crate::identity_authority::note_revocation_future_dropped(dropped as u64);
+        }
+        dropped
+    }
+
+    /// ADR 0115 D214: every record with its retained certificate.
+    pub(crate) fn records_with_certs(
+        &self,
+    ) -> impl Iterator<Item = (&RevocationRecord, Option<&AgentCertificate>)> {
+        self.records_by_hash
+            .values()
+            .map(|persisted| (&persisted.record, persisted.subject_cert.as_ref()))
+    }
+
+    /// ADR 0115 D214: replace the bundle-derived tombstones with exactly
+    /// `tombstones` (recomputed from the bundles that remain held).
+    pub(crate) fn reset_bundle_retired(&mut self, tombstones: &[AgentMachineBinding]) {
+        self.bundle_retired_epochs.clear();
+        self.union_bundle_retired(tombstones);
+        self.change_generation = self.change_generation.saturating_add(1);
+    }
+
+    /// Remove every record matching `take` and return it with its retained
+    /// certificate. The record-derived indices are rebuilt from the records
+    /// that remain; bundle-derived tombstones are untouched.
+    pub(crate) fn take_records_where(
+        &mut self,
+        mut take: impl FnMut(&RevocationRecord, Option<&AgentCertificate>) -> bool,
+    ) -> Vec<(RevocationRecord, Option<AgentCertificate>)> {
+        let hashes: Vec<[u8; 32]> = self
+            .records_by_hash
+            .iter()
+            .filter(|(_, persisted)| take(&persisted.record, persisted.subject_cert.as_ref()))
+            .map(|(hash, _)| *hash)
+            .collect();
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let taken: Vec<(RevocationRecord, Option<AgentCertificate>)> = hashes
+            .iter()
+            .filter_map(|hash| self.records_by_hash.remove(hash))
+            .map(|persisted| (persisted.record, persisted.subject_cert))
+            .collect();
+        self.revoked_agents.clear();
+        self.revoked_machines.clear();
+        self.binding_epochs.clear();
+        self.revoked_share_grants.clear();
+        let remaining: Vec<PersistedRevocation> = self
+            .records_by_hash
+            .drain()
+            .map(|(_, persisted)| persisted)
+            .collect();
+        for persisted in remaining {
+            self.insert_verified(persisted);
+        }
+        self.change_generation = self.change_generation.saturating_add(1);
+        taken
+    }
+
     /// Monotonic generation counter — changes on every insert or expiry.
     /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
     /// the publish (except the periodic fallback).
@@ -686,6 +805,13 @@ impl RevocationSet {
         expired.len()
     }
 
+    /// Raw insert of an already-verified record. Performs NO cryptographic
+    /// checks. It is module-private and reachable only through
+    /// [`verify_and_insert`](Self::verify_and_insert) (the sole path a new
+    /// record enters the set) and
+    /// [`take_records_where`](Self::take_records_where), which re-inserts
+    /// records that were already in the set while it rebuilds the indices.
+    /// Returns `true` if new.
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
         let hash = persisted.record.record_hash();
         if self.records_by_hash.contains_key(&hash) {
@@ -1148,6 +1274,54 @@ mod tests {
                 None,
             )
             .expect("self-revocation signs")
+        }
+
+        /// ADR 0115 §5: ingress rejects a far-future
+        /// `revoked_at`, and the load-time drop removes one while the
+        /// other records of the same subject keep enforcing.
+        #[test]
+        fn far_future_revoked_at_is_rejected_and_dropped_at_load() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let other = AgentKeypair::generate().expect("other keypair");
+            let now = 1_800_000_000u64;
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert_at(
+                    self_revocation(&kp, now + REVOCATION_MAX_FUTURE_SKEW_SECS + 1),
+                    None,
+                    now
+                )
+                .is_err());
+            assert!(set
+                .verify_and_insert_at(
+                    self_revocation(&kp, now + REVOCATION_MAX_FUTURE_SKEW_SECS),
+                    None,
+                    now
+                )
+                .expect("at the bound is credible"));
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+
+            // A persisted far-future record, as an earlier build may hold.
+            let mut loaded = RevocationSet::new();
+            loaded
+                .verify_and_insert(self_revocation(&kp, u64::MAX), None)
+                .expect("legacy insert has no bound");
+            loaded
+                .verify_and_insert(self_revocation(&kp, now), None)
+                .expect("current record");
+            loaded
+                .verify_and_insert(self_revocation(&other, u64::MAX), None)
+                .expect("legacy far-future record");
+            assert_eq!(loaded.drop_future_records(now), 2);
+            assert_eq!(loaded.len(), 1);
+            assert!(
+                loaded.is_agent_revoked(&kp.agent_id()),
+                "the current record still revokes its subject"
+            );
+            assert!(
+                !loaded.is_agent_revoked(&other.agent_id()),
+                "a subject revoked only by a dropped record is no longer revoked"
+            );
         }
 
         /// #380 cadence: the TTL expiry kills the 2 stale July testnet

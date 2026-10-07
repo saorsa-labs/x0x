@@ -2193,6 +2193,18 @@ mod tests {
         Arc::new(tokio::sync::RwLock::new(cache))
     }
 
+    /// Owner-trust source whose authenticated bindings record each
+    /// (agent, machine) pair, as an accepted class A announcement would
+    /// (ADR 0115 §2: the shared inbound gate admits only confirmed agents).
+    async fn bound_owner_trust(pairs: &[(AgentId, MachineId)]) -> crate::owner_trust::OwnerTrust {
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        for (agent, machine) in pairs {
+            crate::dm_inbox::record_authenticated_machine_binding(&bindings, *agent, *machine, 1)
+                .await;
+        }
+        crate::owner_trust::OwnerTrust::new(None, bindings)
+    }
+
     /// Build a contact store with the agent at Trusted (Accept).
     fn trusted_store(agent: AgentId) -> Arc<tokio::sync::RwLock<ContactStore>> {
         let dir = tempfile::tempdir().unwrap();
@@ -2693,7 +2705,7 @@ mod tests {
             &revoked,
             &moves,
             &shared_policy,
-            &crate::owner_trust::OwnerTrust::default(),
+            &bound_owner_trust(&[(a.agent_id(), machine), (b.agent_id(), machine)]).await,
             &machine,
         )
         .await
@@ -2748,7 +2760,7 @@ mod tests {
                 &ctx.revocation_set,
                 &ctx.move_state,
                 &shared_policy,
-                &crate::owner_trust::OwnerTrust::default(),
+                &bound_owner_trust(&[(kp.agent_id(), machine)]).await,
                 &machine
             )
             .await

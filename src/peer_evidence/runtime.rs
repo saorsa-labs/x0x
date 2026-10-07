@@ -372,6 +372,43 @@ impl EvidenceRuntime {
         }
         self.store.get()?.usable(agent, machine, now)
     }
+    /// ADR 0115 §2: whether a usable record exists for exactly
+    /// (agent, machine), without the store's use counters.
+    pub(crate) fn confirms_pairing(&self, agent: AgentId, machine: MachineId, now: u64) -> bool {
+        self.ready.is_cancelled()
+            && self
+                .store
+                .get()
+                .is_some_and(|store| store.confirms_pairing(agent, machine, now))
+    }
+    /// [`Self::confirms_pairing`] for synchronous seams: `None` while a lock
+    /// is contended.
+    pub(crate) fn try_confirms_pairing(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> Option<bool> {
+        if !self.ready.is_cancelled() {
+            return Some(false);
+        }
+        match self.store.get() {
+            Some(store) => store.try_confirms_pairing(agent, machine, now),
+            None => Some(false),
+        }
+    }
+    /// ADR 0115 §3: the owner certificate of `agent`'s usable
+    /// record, if any, without the store's use counters.
+    pub(crate) fn usable_certificate(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> Option<crate::identity::AgentCertificate> {
+        if !self.ready.is_cancelled() {
+            return None;
+        }
+        self.store.get()?.usable_certificate(agent, now)
+    }
     /// [`Self::usable`] without blocking on the store lock or a policy read
     /// (x0x #1207); `Err(())` while a lock is contended.
     pub(crate) fn try_usable(

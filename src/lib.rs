@@ -161,6 +161,8 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 mod evidence_wire;
+/// ADR 0115: identity discovery authority rules.
+mod identity_authority;
 /// Relationship-peer evidence store and point-of-use runtime (ADR 0089).
 pub mod peer_evidence;
 
@@ -688,6 +690,11 @@ pub struct Agent {
     /// authority from here. A bounded in-memory LRU, like
     /// `authenticated_machine_bindings`.
     announced_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
+    /// ADR 0115 D214: pre-upgrade issuer revocations and bundle
+    /// tombstones held unenforced until authenticated evidence confirms
+    /// their issuer (7-day lapse).
+    revocation_quarantine:
+        std::sync::Arc<tokio::sync::Mutex<identity_authority::quarantine::Quarantine>>,
     /// Cache of discovered machine endpoints from machine announcements and
     /// agent→machine identity links.
     machine_discovery_cache: std::sync::Arc<
@@ -2632,26 +2639,107 @@ pub struct DiscoveredMachine {
     pub user_ids: Vec<identity::UserId>,
 }
 
-/// Build a `subject AgentId → AgentCertificate` lookup from the discovery
-/// cache, used to authority-verify gossiped **issuer-revocations** (a user
-/// un-vouching a certified agent) on receipt (issue #191).
+/// ADR 0115 §3: where a subject certificate may come from to
+/// count as issuer-revocation or bundle authority (issue #191 resolves a
+/// gossiped record's subject certificate here).
+struct ProvenanceSources<'a> {
+    /// The discovery cache.
+    cache: &'a std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+    /// The announced-binding store (written only by class A and B
+    /// announcements); it keeps the digest each committed to.
+    announced: &'a dm_inbox::AuthenticatedMachineBindingCache,
+    /// ADR 0089 evidence: a usable record's certificate counts.
+    evidence: Option<&'a peer_evidence::EvidenceRuntime>,
+    /// The local user: a certificate it issued counts (the local
+    /// certificate journal rule).
+    local_user: Option<identity::UserId>,
+    /// Certificates read from the local certificate journal.
+    journal: &'a [identity::AgentCertificate],
+}
+
+/// ADR 0115 §3: every certificate for `subject` with authenticated
+/// provenance:
+/// - the cached certificate, when its digest is the one a class A or B
+///   announcement committed to (the announced-binding record);
+/// - the certificate of a usable ADR 0089 evidence record;
+/// - any certificate the local user issued (the cached one or one from the
+///   local certificate journal).
 ///
-/// `verify_authority` for an issuer-revocation requires the subject agent's
-/// certificate; self-revocations and machine-revocations need none. Only
-/// entries that actually carry a cert contribute; entries without one
-/// (pre-#130 peers, machine/rendezvous-only entries) are absent, so an
-/// issuer-revocation for such a subject is rejected fail-closed by the
-/// caller — the cert must have been announced first (EP1).
+/// Each certificate is still verified by `verify_authority` at use. An
+/// issuer-revocation whose subject has none is rejected, fail closed.
+fn subject_certs_with_provenance(
+    sources: &ProvenanceSources<'_>,
+    subject: &identity::AgentId,
+) -> Vec<identity::AgentCertificate> {
+    let local_issued = |cert: &identity::AgentCertificate| {
+        sources.local_user.is_some() && cert.user_id().ok() == sources.local_user
+    };
+    let mut certs: Vec<identity::AgentCertificate> = Vec::new();
+    let mut push = |cert: identity::AgentCertificate| {
+        if !certs.contains(&cert) {
+            certs.push(cert);
+        }
+    };
+    if let Some(cert) = sources
+        .cache
+        .get(subject)
+        .and_then(|entry| entry.agent_certificate.as_ref())
+    {
+        if identity_authority::has_authenticated_provenance(cert, sources.announced.peek(subject))
+            || local_issued(cert)
+        {
+            push(cert.clone());
+        }
+    }
+    if let Some(cert) = sources
+        .evidence
+        .and_then(|runtime| runtime.usable_certificate(*subject, dm_capability::now_unix_ms()))
+    {
+        push(cert);
+    }
+    for cert in sources.journal {
+        if cert.agent_id().is_ok_and(|agent| agent == *subject) && local_issued(cert) {
+            push(cert.clone());
+        }
+    }
+    certs
+}
+
+/// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
 fn collect_subject_certs(
-    cache: &std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
-) -> std::collections::HashMap<identity::AgentId, identity::AgentCertificate> {
-    cache
-        .values()
-        .filter_map(|a| {
-            a.agent_certificate
-                .as_ref()
-                .map(|c| (a.agent_id, c.clone()))
-        })
+    sources: &ProvenanceSources<'_>,
+    subjects: impl IntoIterator<Item = identity::AgentId>,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    subjects
+        .into_iter()
+        .map(|subject| (subject, subject_certs_with_provenance(sources, &subject)))
+        .filter(|(_, certs)| !certs.is_empty())
+        .collect()
+}
+
+/// The provenance certificate that can authorize `record`: one owned by
+/// the record's issuer, else any (which `verify_authority` then rejects).
+fn pick_subject_cert<'a>(
+    certs: Option<&'a Vec<identity::AgentCertificate>>,
+    record: &revocation::RevocationRecord,
+) -> Option<&'a identity::AgentCertificate> {
+    let certs = certs?;
+    let issuer = record.issuer_user_id();
+    certs
+        .iter()
+        .find(|cert| issuer.is_some() && cert.user_id().ok() == issuer)
+        .or_else(|| certs.first())
+}
+
+/// The certificates of the local certificate journal (ADR 0115 §3).
+async fn load_journal_certs(path: Option<&std::path::Path>) -> Vec<identity::AgentCertificate> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    profile::IssuedCertRecord::load(path)
+        .await
+        .iter()
+        .filter_map(decode_journal_cert)
         .collect()
 }
 
@@ -4251,7 +4339,8 @@ impl HeartbeatContext {
         //    July testnet records die here).
         // 2. Publish the full set only when the change_generation advanced
         //    since our last broadcast (a record was inserted or expired).
-        // 3. Every 12th heartbeat (300 s × 12 = 1 h), republish regardless
+        // 3. Every 12th heartbeat (12 × 600 s = 2 h at the default
+        //    IDENTITY_HEARTBEAT_INTERVAL_SECS), republish regardless
         //    — the partition-tolerance fallback for nodes that joined or
         //    recovered mid-partition.
         //
@@ -4432,7 +4521,7 @@ pub(crate) async fn ingest_share_grant_revocations(
             {
                 continue;
             }
-            match set.verify_and_insert(record, None) {
+            match set.verify_and_insert_at(record, None, Agent::unix_timestamp_secs()) {
                 Ok(true) => inserted = true,
                 Ok(false) => {}
                 Err(e) => tracing::debug!("v3 share-grant revocation rejected: {e}"),
@@ -5898,6 +5987,41 @@ impl Agent {
         })
     }
 
+    /// ADR 0115 §2: a dial result becomes routing state only
+    /// when an authority store confirms that `agent_id` lives on the machine
+    /// that answered. Otherwise the connection serves this call as an
+    /// unverified hint: the discovery entry keeps its machine and the DM
+    /// registry learns nothing, so no binding is ever manufactured from an
+    /// address (for example a rendezvous summary).
+    async fn record_dialed_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: identity::MachineId,
+        nonblocking_evidence: bool,
+    ) {
+        if !self
+            .authority_confirms_with(agent_id, &machine_id, nonblocking_evidence)
+            .await
+        {
+            tracing::debug!(
+                target: "x0x::connect",
+                agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                "dialed machine has no authority record; not binding it (ADR 0115 §2)"
+            );
+            return;
+        }
+        {
+            let mut cache = self.identity_discovery_cache.write().await;
+            if let Some(entry) = cache.get_mut(agent_id) {
+                entry.machine_id = machine_id;
+            }
+        }
+        self.direct_messaging
+            .mark_connected(*agent_id, machine_id)
+            .await;
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
@@ -6041,14 +6165,7 @@ impl Agent {
             }
         };
         if let Some(machine_id) = connected_machine_id {
-            if machine_id != agent.machine_id {
-                let mut cache = self.identity_discovery_cache.write().await;
-                if let Some(entry) = cache.get_mut(agent_id) {
-                    entry.machine_id = machine_id;
-                }
-            }
-            self.direct_messaging
-                .mark_connected(agent.agent_id, machine_id)
+            self.record_dialed_machine(agent_id, machine_id, nonblocking_evidence)
                 .await;
             let dur_ms = call_start.elapsed().as_millis() as u64;
             return if let Some(addr) = info.addresses.first() {
@@ -6119,14 +6236,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![selected_addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -6182,14 +6292,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -6244,14 +6347,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -6316,14 +6412,7 @@ impl Agent {
                             .await;
                         bc.record_success(&verified_peer_id, 0).await;
                     }
-                    {
-                        let mut cache = self.identity_discovery_cache.write().await;
-                        if let Some(entry) = cache.get_mut(agent_id) {
-                            entry.machine_id = verified_machine_id;
-                        }
-                    }
-                    self.direct_messaging
-                        .mark_connected(agent.agent_id, verified_machine_id)
+                    self.record_dialed_machine(agent_id, verified_machine_id, nonblocking_evidence)
                         .await;
                     let family = if addr.is_ipv4() { "v4" } else { "v6" };
                     tracing::info!(
@@ -6403,15 +6492,8 @@ impl Agent {
                                 .await;
                         }
                         // Update discovery cache with real machine_id
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
                         // Register agent mapping for direct messaging
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         let family = if addr.is_ipv4() { "v4" } else { "v6" };
                         tracing::info!(
@@ -6536,12 +6618,6 @@ impl Agent {
                                 .await;
                             bc.record_success(&verified_peer_id, 0).await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = verified_machine_id;
-                            }
-                        }
                     }
 
                     // Only register for direct messaging and update caches when the hint
@@ -6551,9 +6627,12 @@ impl Agent {
                     // agent_id could corrupt the direct-messaging registry with the
                     // wrong peer's identity.
                     if !hint_was_zeroed {
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, verified_machine_id)
-                            .await;
+                        self.record_dialed_machine(
+                            agent_id,
+                            verified_machine_id,
+                            nonblocking_evidence,
+                        )
+                        .await;
                     }
                     let family = if addr.is_ipv4() { "v4" } else { "v6" };
                     tracing::info!(
@@ -8278,11 +8357,17 @@ impl Agent {
         cold: ColdResolution,
     ) -> Option<identity::MachineId> {
         let cached_machine_id = Self::cold_bounded(cold, agent_id, "redial discovery", async {
-            let cache = self.identity_discovery_cache.read().await;
-            cache
-                .get(agent_id)
-                .map(|entry| entry.machine_id)
-                .filter(|machine_id| machine_id.0 != [0_u8; 32])
+            let routing = {
+                let cache = self.identity_discovery_cache.read().await;
+                cache
+                    .get(agent_id)
+                    .map(|entry| entry.machine_id)
+                    .filter(|machine_id| machine_id.0 != [0_u8; 32])
+            };
+            // ADR 0115 §2: a route counts only when an
+            // authority store confirms it.
+            self.authorized_routing_machine_with(agent_id, routing, cold.opted_in())
+                .await
         })
         .await
         .ok()?;
@@ -8299,7 +8384,7 @@ impl Agent {
             cold,
             agent_id,
             "redial registry",
-            self.direct_messaging.get_machine_id(agent_id),
+            self.authorized_registry_machine(agent_id, cold.opted_in()),
         )
         .await
         .ok()?;
@@ -8739,8 +8824,20 @@ impl Agent {
     async fn pinned_binding_now(&self, to: &identity::AgentId) -> Option<PinnedBinding> {
         let announced = self.announced_machine_bindings.read().await.peek(to);
         let attested = self.authenticated_machine_bindings.read().await.peek(to);
-        let registry = self.direct_messaging.get_machine_id(to).await;
         let now_ms = dm_capability::now_unix_ms();
+        // ADR 0115 §2: the DM registry names the machine only
+        // when an authority store confirms it, never alone.
+        let registry = self
+            .direct_messaging
+            .get_machine_id(to)
+            .await
+            .filter(|machine| {
+                identity_authority::confirms(*machine, announced, attested, || {
+                    self.peer_evidence()
+                        .try_confirms_pairing(*to, *machine, now_ms)
+                        == Some(true)
+                })
+            });
         select_pinned_binding(
             announced,
             attested,
@@ -9069,9 +9166,23 @@ impl Agent {
                 return false;
             };
             let mut evidence_busy = false;
+            let (announced, attested) = (announced.peek(&agent), attested.peek(&agent));
+            // ADR 0115 §2: as `pinned_binding_now`, the
+            // registry counts only when an authority store confirms it.
+            let registry = registry.filter(|machine| {
+                identity_authority::confirms(*machine, announced, attested, || {
+                    match evidence.try_confirms_pairing(agent, *machine, now_ms) {
+                        Some(confirmed) => confirmed,
+                        None => {
+                            evidence_busy = true;
+                            false
+                        }
+                    }
+                })
+            });
             let selected = select_pinned_binding(
-                announced.peek(&agent),
-                attested.peek(&agent),
+                announced,
+                attested,
                 registry,
                 || match evidence.try_usable_agent(agent, now_ms) {
                     Ok(view) => view.map(|view| view.announcement.machine_id),
@@ -9233,18 +9344,24 @@ impl Agent {
         // x0x #1207 (P2): for an opted-in send, every resolution read below
         // ends at the one deadline (`cold_bounded`).
         let cached_machine_id = Self::cold_bounded(cold, agent_id, "discovery", async {
-            let cache = self.identity_discovery_cache.read().await;
-            cache
-                .get(agent_id)
-                .map(|d| d.machine_id)
-                .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
+            let routing = {
+                let cache = self.identity_discovery_cache.read().await;
+                cache
+                    .get(agent_id)
+                    .map(|d| d.machine_id)
+                    .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
+            };
+            // ADR 0115 §2: a route counts only when an
+            // authority store confirms it.
+            self.authorized_routing_machine_with(agent_id, routing, cold.opted_in())
+                .await
         })
         .await?;
         let registry_machine_id = Self::cold_bounded(
             cold,
             agent_id,
             "registry",
-            self.direct_messaging.get_machine_id(agent_id),
+            self.authorized_registry_machine(agent_id, cold.opted_in()),
         )
         .await?;
 
@@ -9324,7 +9441,7 @@ impl Agent {
                     // (a gossip fallback, if any, follows).
                     ColdResolution::Off => {
                         let _ = self.connect_to_agent(agent_id).await;
-                        match self.direct_messaging.get_machine_id(agent_id).await {
+                        match self.authorized_registry_machine(agent_id, false).await {
                             Some(id) => (id, "post_connect"),
                             None => {
                                 tracing::warn!(
@@ -11195,6 +11312,28 @@ impl Agent {
         let move_state_for_listener = std::sync::Arc::clone(&self.move_state);
 
         let own_peer_id_for_cache_exclude = ant_quic::PeerId(self.machine_id().0);
+        // ADR 0115 §1: a usable ADR 0089 record also authenticates a pairing.
+        let evidence_for_listener = std::sync::Arc::clone(self.peer_evidence());
+        // ADR 0115 §3: the local certificate journal is a provenance source.
+        let journal_path_for_listener = self.cert_journal_path.clone();
+        // ADR 0115 D214: confirm or lapse quarantined
+        // pre-upgrade records while the listener feeds discovery.
+        self.spawn_tracked(identity_authority::quarantine::run(
+            identity_authority::quarantine::TickInputs {
+                quarantine: std::sync::Arc::clone(&self.revocation_quarantine),
+                discovery: std::sync::Arc::clone(&self.identity_discovery_cache),
+                machines: std::sync::Arc::clone(&self.machine_discovery_cache),
+                announced: std::sync::Arc::clone(&self.announced_machine_bindings),
+                revoked: std::sync::Arc::clone(&self.revocation_set),
+                moves: std::sync::Arc::clone(&self.move_state),
+                contacts: std::sync::Arc::clone(&self.contact_store),
+                identity_dir: self.identity_dir.clone(),
+                evidence: std::sync::Arc::clone(self.peer_evidence()),
+                local_user: self.user_id(),
+                journal_path: self.cert_journal_path.clone(),
+                shutdown: self.shutdown_token.clone(),
+            },
+        ));
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
@@ -11464,7 +11603,24 @@ impl Agent {
                         // — the cert must have been announced first (EP1).
                         // Built before taking the revocation-set write lock so
                         // no two identity locks are held at once.
-                        let subject_certs = collect_subject_certs(&*cache.read().await);
+                        let subject_certs = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            collect_subject_certs(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
+                            )
+                        };
                         {
                             let _share_grant_barrier = owner_trust_for_listener
                                 .share_grant_revocation_barrier(&records, &revocation_set)
@@ -11476,11 +11632,15 @@ impl Agent {
                                 }
                                 let subject_cert = match &record.subject {
                                     revocation::RevokedSubject::Agent(agent_id) => {
-                                        subject_certs.get(agent_id)
+                                        pick_subject_cert(subject_certs.get(agent_id), &record)
                                     }
                                     _ => None,
                                 };
-                                match set.verify_and_insert(record.clone(), subject_cert) {
+                                match set.verify_and_insert_at(
+                                    record.clone(),
+                                    subject_cert,
+                                    Agent::unix_timestamp_secs(),
+                                ) {
                                     Ok(true) => newly_inserted.push(record),
                                     Ok(false) => {} // dup
                                     Err(e) => {
@@ -11644,7 +11804,24 @@ impl Agent {
                         else {
                             continue;
                         };
-                        let subject_certs = collect_subject_certs(&*cache.read().await);
+                        let subject_certs = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            collect_subject_certs(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
+                            )
+                        };
                         let mut inserted = false;
                         let mut share_grant_inserted = false;
                         {
@@ -11658,7 +11835,7 @@ impl Agent {
                                 }
                                 let subject_cert = match &record.subject {
                                     revocation::RevokedSubject::AgentMachineBinding(binding) => {
-                                        subject_certs.get(&binding.agent)
+                                        pick_subject_cert(subject_certs.get(&binding.agent), &record)
                                     }
                                     _ => None,
                                 };
@@ -11666,7 +11843,11 @@ impl Agent {
                                     record.subject,
                                     revocation::RevokedSubject::ShareGrant(_)
                                 );
-                                match set.verify_and_insert(record, subject_cert) {
+                                match set.verify_and_insert_at(
+                                    record,
+                                    subject_cert,
+                                    Agent::unix_timestamp_secs(),
+                                ) {
                                     Ok(true) => {
                                         inserted = true;
                                         share_grant_inserted |= is_share_grant;
@@ -11732,10 +11913,12 @@ impl Agent {
                         else {
                             continue;
                         };
-                        let agent = match &record.record {
+                        let (agent, bundle_cert) = match &record.record {
                             key_move::MoveRecord::ActivationBundle {
-                                authorization, ..
-                            } => authorization.agent_id,
+                                authorization,
+                                agent_certificate,
+                                ..
+                            } => (authorization.agent_id, agent_certificate.clone()),
                             _ => {
                                 tracing::debug!(
                                     "ignoring non-bundle payload on activation topic"
@@ -11743,6 +11926,37 @@ impl Agent {
                                 continue;
                             }
                         };
+                        // ADR 0115 §4: the bundle owner must be
+                        // the subject's authenticated owner (a certificate
+                        // with §3 provenance). Otherwise reject; the owner's
+                        // republication brings it back later (D215).
+                        let authenticated = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            subject_certs_with_provenance(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                &agent,
+                            )
+                        };
+                        if !authenticated
+                            .iter()
+                            .any(|cert| identity_authority::same_owner(cert, &bundle_cert))
+                        {
+                            identity_authority::note_bundle_owner_unauthenticated();
+                            tracing::debug!(
+                                agent = %hex::encode(agent.as_bytes()),
+                                "activation bundle rejected: owner is not the subject's authenticated owner (ADR 0115 §4)"
+                            );
+                            continue;
+                        }
                         let changed = {
                             let mut state = move_state_for_listener.write().await;
                             let mut revoked = revocation_set.write().await;
@@ -12028,6 +12242,29 @@ impl Agent {
                         );
                         continue;
                     }
+                }
+
+                // ADR 0115 §1: only an agent-authenticated
+                // announcement (class A) or one from the agent's
+                // authenticated machine (class B) may set authority fields
+                // or write an authority store. Any other one (class C)
+                // changes nothing for the agent.
+                let announcement_class = identity_authority::classify_announcement(
+                    &msg,
+                    &announcement,
+                    &revocation_set,
+                    &authenticated_machine_bindings,
+                    &evidence_for_listener,
+                )
+                .await;
+                if !announcement_class.grants_authority() {
+                    identity_authority::note_unauthenticated_announce();
+                    tracing::debug!(
+                        agent = %hex::encode(&announcement.agent_id.0[..8]),
+                        machine = %hex::encode(&announcement.machine_id.0[..8]),
+                        "ignoring unauthenticated identity announcement (ADR 0115 class C)"
+                    );
+                    continue;
                 }
 
                 // Update machine records in the contact store.
@@ -13361,11 +13598,155 @@ impl Agent {
         self.identity_discovery_cache.read().await.get(id).cloned()
     }
 
+    /// ADR 0115 §1: the identity listener's ingest gates for a
+    /// beat read from an agent's shard topic in `find_agent`: timestamp,
+    /// trust (Blocked, machine pin), revocation, the ADR-0043 pairing and
+    /// certificate expiry. Each lock is taken alone except the
+    /// revocation-then-placement pair, in the listener's order.
+    async fn shard_announcement_passes_listener_gates(&self, ann: &IdentityAnnouncement) -> bool {
+        let now = Self::unix_timestamp_secs();
+        if !identity_announcement_timestamp_is_acceptable(ann.announced_at, now) {
+            return false;
+        }
+        if ann
+            .agent_certificate
+            .as_ref()
+            .is_some_and(|cert| identity::is_expired(cert.not_after(), now))
+        {
+            return false;
+        }
+        let decision = {
+            let store = self.contact_store.read().await;
+            trust::TrustEvaluator::new(&store).evaluate(&trust::TrustContext {
+                agent_id: &ann.agent_id,
+                machine_id: &ann.machine_id,
+            })
+        };
+        if matches!(
+            decision,
+            trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch
+        ) {
+            return false;
+        }
+        let revoked = self.revocation_set.read().await;
+        if revoked.is_agent_revoked(&ann.agent_id) || revoked.is_machine_revoked(&ann.machine_id) {
+            return false;
+        }
+        let placements = self.move_state.read().await;
+        key_move::enforce_pairing(
+            &revoked,
+            placements.placement_view(),
+            &ann.agent_id,
+            &ann.machine_id,
+        )
+        .is_none()
+    }
+
+    /// ADR 0115 diagnostics: the identity-authority counters
+    /// and the D214 quarantine summary.
+    pub(crate) async fn identity_authority_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = identity_authority::counters_json();
+        diagnostics["quarantine"] = self.revocation_quarantine.lock().await.summary();
+        diagnostics
+    }
+
+    /// ADR 0115 §2: whether an authority store confirms that
+    /// `agent_id` lives on `machine_id` (the announced binding, the
+    /// authenticated binding or a usable ADR 0089 record). The local agent
+    /// lives on the local machine.
+    async fn authority_confirms(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        self.authority_confirms_with(agent_id, machine_id, false)
+            .await
+    }
+
+    /// [`Self::authority_confirms`]; with `nonblocking_evidence` (an
+    /// opted-in cold send, x0x #1207) the evidence check never blocks.
+    async fn authority_confirms_with(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+        nonblocking_evidence: bool,
+    ) -> bool {
+        if *agent_id == self.agent_id() {
+            return *machine_id == self.machine_id();
+        }
+        self.owner_trust
+            .authority_confirms_with(agent_id, machine_id, nonblocking_evidence)
+            .await
+    }
+
+    /// ADR 0115 §2 (strict): the machine a security reader may
+    /// use for `agent_id`, whose discovery entry routes to `routing`. The
+    /// route counts only when [`Self::authority_confirms`] says so;
+    /// otherwise the authority stores' machine is used. With no discovery
+    /// entry the reader keeps its own fallbacks.
+    async fn authorized_routing_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        routing: Option<identity::MachineId>,
+    ) -> Option<identity::MachineId> {
+        self.authorized_routing_machine_with(agent_id, routing, false)
+            .await
+    }
+
+    /// [`Self::authorized_routing_machine`] with the non-blocking evidence
+    /// option of [`Self::authority_confirms_with`].
+    async fn authorized_routing_machine_with(
+        &self,
+        agent_id: &identity::AgentId,
+        routing: Option<identity::MachineId>,
+        nonblocking_evidence: bool,
+    ) -> Option<identity::MachineId> {
+        let routing = routing.filter(|machine| machine.0 != [0u8; 32])?;
+        let confirmed = self
+            .authority_confirms_with(agent_id, &routing, nonblocking_evidence)
+            .await;
+        identity_authority::authorized_machine(
+            Some(routing),
+            confirmed,
+            self.authority_machine(agent_id).await,
+        )
+    }
+
+    /// ADR 0115 §2: the DM registry's machine for `agent_id`.
+    /// It counts only when an authority store confirms it; the registry
+    /// alone never names a machine.
+    async fn authorized_registry_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        nonblocking_evidence: bool,
+    ) -> Option<identity::MachineId> {
+        let machine = self.direct_messaging.get_machine_id(agent_id).await?;
+        self.authority_confirms_with(agent_id, &machine, nonblocking_evidence)
+            .await
+            .then_some(machine)
+    }
+
+    /// ADR 0115 §2: the machine `agent_id`'s authority stores
+    /// name (announced-binding and authenticated-binding records; each lock
+    /// is taken alone).
+    async fn authority_machine(&self, agent_id: &identity::AgentId) -> Option<identity::MachineId> {
+        let announced = self.announced_machine_bindings.read().await.peek(agent_id);
+        let attested = self
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .peek(agent_id);
+        identity_authority::authority_machine(announced, attested)
+    }
+
     /// Check whether a claimed `AgentId` is verified as belonging to the
     /// given `MachineId` in the identity discovery cache.
     ///
     /// Returns `true` if the cache contains a signed identity announcement
-    /// binding this agent to this machine.  Returns `false` if:
+    /// binding this agent to this machine, and the agent's authority
+    /// stores do not name another machine (ADR 0115 §2: only an
+    /// agent-authenticated announcement, or one from the agent's
+    /// authenticated machine, sets the binding).  Returns `false` if:
     /// - the agent is unknown or bound to a different machine, OR
     /// - the agent or its bound machine has been revoked, OR
     /// - the cached agent certificate has expired (past `not_after` + 300 s
@@ -13390,6 +13771,11 @@ impl Agent {
             }
         }
 
+        // ADR 0115 §2: only an authority store (or the local
+        // identity) confirms a binding; the routing entry alone never does.
+        if !self.authority_confirms(agent_id, machine_id).await {
+            return false;
+        }
         let cache = self.identity_discovery_cache.read().await;
         let Some(entry) = cache.get(agent_id) else {
             return false;
@@ -13556,7 +13942,9 @@ impl Agent {
                 .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
                 .await;
             let mut set = self.revocation_set.write().await;
-            if let Err(e) = set.verify_and_insert(record.clone(), subject_cert) {
+            if let Err(e) =
+                set.verify_and_insert_at(record.clone(), subject_cert, Self::unix_timestamp_secs())
+            {
                 return Err(error::IdentityError::CertificateVerification(format!(
                     "revocation rejected: {e}"
                 )));
@@ -13798,7 +14186,11 @@ impl Agent {
                 }
             }
             let is_local = agent_id == local_agent;
-            let known_machine = machine_of.get(&agent_id).copied();
+            // ADR 0115 §2: an owner-signed placement names a
+            // machine only when an authority store confirms it.
+            let known_machine = self
+                .authorized_routing_machine(&agent_id, machine_of.get(&agent_id).copied())
+                .await;
             let placement = if is_local {
                 key_move::Placement::Roaming
             } else if record.mode == profile::CertMode::Acp {
@@ -15103,7 +15495,25 @@ impl Agent {
             tokio::select! {
                 Some(msg) = sub.recv() => {
                     if let Ok(ann) = deserialize_identity_announcement(&msg.payload) {
-                        if ann.verify().is_ok() && ann.agent_id == agent_id {
+                        // ADR 0115 §1: only class A or B may write the cache,
+                        // and only past the identity listener's gates
+                        // (timestamp, trust, revocation, ADR-0043 pairing,
+                        // certificate expiry).
+                        let class = if ann.verify().is_ok() && ann.agent_id == agent_id {
+                            identity_authority::classify_announcement(
+                                &msg,
+                                &ann,
+                                &self.revocation_set,
+                                &self.authenticated_machine_bindings,
+                                self.peer_evidence(),
+                            )
+                            .await
+                        } else {
+                            identity_authority::AnnouncementClass::Unauthenticated
+                        };
+                        if class.grants_authority()
+                            && self.shard_announcement_passes_listener_gates(&ann).await
+                        {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
@@ -15112,6 +15522,11 @@ impl Agent {
                                 allow_local_scope,
                             );
                             let addrs = filtered.clone();
+                            let cert_not_after =
+                                ann.agent_certificate.as_ref().and_then(|c| c.not_after());
+                            let cert_digest = ann.agent_certificate.as_ref().map(|_| {
+                                announce_v3::cert_digest(&ann.user_id, &ann.agent_certificate)
+                            });
                             let discovered_agent = DiscoveredAgent {
                                 agent_id: ann.agent_id,
                                 machine_id: ann.machine_id,
@@ -15126,23 +15541,32 @@ impl Agent {
                                 is_coordinator: ann.is_coordinator,
                                 reachable_via: ann.reachable_via.clone(),
                                 relay_candidates: ann.relay_candidates.clone(),
-                                cert_not_after: ann
-                                    .agent_certificate
-                                    .as_ref()
-                                    .and_then(|c| c.not_after()),
+                                cert_not_after,
                                 agent_certificate: ann.agent_certificate.clone(),
                                 agent_public_key: ann.agent_public_key.clone(),
                                 self_name: ann.self_name.clone(),
-                                cert_digest: None,
+                                cert_digest,
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
-                            // x0x #1150 (r7d): no announced-binding write
-                            // here. This lookup skips the listener's
-                            // timestamp, freshness, trust, revocation and
-                            // pairing gates, so only the gated listener
-                            // ingest (`cache_verified_announcement`) records
-                            // pinned authority.
+                            // ADR 0115 §3: an agent-authenticated
+                            // shard beat, past the listener's gates above,
+                            // records the announced binding and its digest,
+                            // so a shard-only subject keeps issuer-revocation
+                            // provenance. The store registration comes before
+                            // the discovery merge (x0x #1150 r7f).
+                            if class == identity_authority::AnnouncementClass::AgentAuthenticated {
+                                record_announced_machine_binding(
+                                    &self.announced_machine_bindings,
+                                    Some(&self.announce_blob_cache),
+                                    ann.agent_id,
+                                    ann.machine_id,
+                                    ann.announced_at,
+                                    cert_digest,
+                                    cert_not_after,
+                                )
+                                .await;
+                            }
                             upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
@@ -15167,7 +15591,9 @@ impl Agent {
                     machine_id: identity::MachineId([0u8; 32]),
                     user_id: None,
                     addresses: addrs.clone(),
-                    announced_at: now,
+                    // ADR 0115 §1: an unsigned rendezvous hint never
+                    // out-ranks a signed beat. Liveness reads `last_seen`.
+                    announced_at: 0,
                     last_seen: now,
                     machine_public_key: Vec::new(),
                     nat_type: None,
@@ -15839,6 +16265,7 @@ impl Agent {
         let dm_inbox_service = std::sync::Arc::clone(&self.dm_inbox_service);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let announced_for_direct = std::sync::Arc::clone(&self.announced_machine_bindings);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -15912,9 +16339,22 @@ impl Agent {
                     &sender,
                 )
                 .await;
+                // ADR 0115 §2: the routing entry stands for the
+                // sender only when an authority store confirms its machine.
+                let announced = announced_for_direct.read().await.peek(&sender);
                 let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    raw_delivery_from_ingress(cache.get(&sender), registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
+                    let entry = cache.get(&sender).filter(|entry| {
+                        identity_authority::confirms(entry.machine_id, announced, registry, || {
+                            evidence_ready
+                                && evidence.confirms_pairing(
+                                    sender,
+                                    entry.machine_id,
+                                    dm_capability::now_unix_ms(),
+                                )
+                        })
+                    });
+                    raw_delivery_from_ingress(entry, registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
@@ -16285,7 +16725,7 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::NetworkResult<identity::MachineId> {
-        let (machine_id, cert_not_after) = {
+        let (routing, cert_not_after) = {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
@@ -16294,6 +16734,14 @@ impl Agent {
                     agent_id: agent_id.0,
                 })?
         };
+        // ADR 0115 §2: a route counts only when an authority
+        // store confirms it.
+        let machine_id = self
+            .authorized_routing_machine(agent_id, Some(routing))
+            .await
+            .ok_or(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            })?;
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
@@ -16602,8 +17050,30 @@ impl Agent {
             });
         }
 
-        // Gate cleared — keep the ordered surviving agent list for the
-        // stream/lane handle.
+        // ADR 0115 §2: a routing entry alone never makes an
+        // agent occupy this machine. Every routed agent above can still
+        // deny (fail-closed, #192); only an agent that an authority store
+        // confirms on this machine is admitted.
+        let mut confirmed: Vec<identity::AgentId> = Vec::with_capacity(surviving.len());
+        for agent_id in &surviving {
+            if owner_trust.authority_confirms(agent_id, machine_id).await {
+                confirmed.push(*agent_id);
+            }
+        }
+        if confirmed.is_empty() {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                outcome = "deny_not_verified",
+                "inbound traffic denied — no agent on the machine has an authenticated pairing"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
+        }
+
+        // Connect-ACL gate input: every surviving routed agent stays listed
+        // (fail-closed second layer below).
         let agents: Vec<identity::AgentId> = surviving;
 
         // Connect-ACL gate (#131 × #132): with an Enabled policy every
@@ -16636,7 +17106,9 @@ impl Agent {
             );
             return Err(e);
         }
-        Ok(agents)
+        // Gate cleared — the ordered, authority-confirmed agent list for
+        // the stream/lane handle.
+        Ok(confirmed)
     }
 
     /// Open the unreliable datagram lane to a verified, trusted peer
@@ -17478,6 +17950,72 @@ impl Agent {
         .await;
     }
 
+    /// ADR 0115: the LOCAL-USER PIN authority source.
+    ///
+    /// `POST /agent/card/import` (local, token-authenticated) calls this for
+    /// a card the local user chose to import. It writes the routing entry
+    /// (discovery and machine caches), the DM registry and, for a non-zero
+    /// machine, the authenticated binding (agent, machine), so the strict
+    /// §2 readers accept the pinned pair. The binding is newest-wins: a
+    /// stale card never rolls back a fresher binding.
+    ///
+    /// Besides class A announcements and ADR 0021 origin attestations, this
+    /// is the only writer of the authenticated-binding store. No network
+    /// input reaches it; only the local user's card import calls it.
+    pub(crate) async fn pin_card_binding(&self, agent: DiscoveredAgent) {
+        let (agent_id, machine_id, pinned_at) =
+            (agent.agent_id, agent.machine_id, agent.announced_at);
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
+        upsert_discovered_agent(
+            &self.identity_discovery_cache,
+            &self.verified_cert_tx,
+            agent,
+        )
+        .await;
+        self.record_pinned_pairing(agent_id, machine_id, pinned_at)
+            .await;
+    }
+
+    /// The authenticated binding and DM-registry writes of
+    /// [`Self::pin_card_binding`] and the test seed. A zero machine writes
+    /// nothing.
+    async fn record_pinned_pairing(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+        pinned_at: u64,
+    ) {
+        if machine_id.0 == [0u8; 32] {
+            return;
+        }
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent_id,
+            machine_id,
+            pinned_at,
+        )
+        .await;
+        self.direct_messaging
+            .register_agent(agent_id, machine_id)
+            .await;
+        if let Some(ref network) = self.network {
+            let ant_peer_id = ant_quic::PeerId(machine_id.0);
+            if network.is_connected(&ant_peer_id).await {
+                self.direct_messaging
+                    .mark_connected(agent_id, machine_id)
+                    .await;
+            }
+        }
+    }
+
+    /// Test-only seed: insert `agent` as if a class A announcement had
+    /// delivered it. It writes what [`Self::pin_card_binding`] writes
+    /// (routing, DM registry and the authenticated binding for a non-zero
+    /// machine), and under `cfg(test)` also the announced-binding record.
+    /// Integration tests (built without `cfg(test)`) rely on the
+    /// authenticated binding. Production code calls
+    /// [`Self::pin_card_binding`], never this seam.
+    ///
     /// # Arguments
     ///
     /// * `agent` - The agent entry to insert.
@@ -17485,9 +18023,20 @@ impl Agent {
     pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
+        let seeded_at = agent.announced_at;
+        // ADR 0115 §3: like V2 ingest, a seeded certificate commits to its
+        // own digest when the seed names none (test-only class A seed).
         #[cfg(test)]
-        let (announced_at, cert_digest, inline_not_after) =
-            (agent.announced_at, agent.cert_digest, agent.cert_not_after);
+        let (announced_at, cert_digest, inline_not_after) = (
+            agent.announced_at,
+            agent.cert_digest.or_else(|| {
+                agent
+                    .agent_certificate
+                    .as_ref()
+                    .map(identity_authority::certificate_digest)
+            }),
+            agent.cert_not_after,
+        );
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
         upsert_discovered_agent(
             &self.identity_discovery_cache,
@@ -17509,19 +18058,8 @@ impl Agent {
         )
         .await;
 
-        if machine_id.0 != [0u8; 32] {
-            self.direct_messaging
-                .register_agent(agent_id, machine_id)
-                .await;
-            if let Some(ref network) = self.network {
-                let ant_peer_id = ant_quic::PeerId(machine_id.0);
-                if network.is_connected(&ant_peer_id).await {
-                    self.direct_messaging
-                        .mark_connected(agent_id, machine_id)
-                        .await;
-                }
-            }
-        }
+        self.record_pinned_pairing(agent_id, machine_id, seeded_at)
+            .await;
     }
 
     /// Test-only: mark `agent_id` as a `Trusted` contact so
@@ -19032,6 +19570,20 @@ impl AgentBuilder {
             }
             (state, logs_corrupt)
         };
+        // ADR 0115 §5: a persisted record whose `revoked_at`
+        // is beyond the future-skew bound never expires; drop it at load.
+        {
+            let dropped = revocation_set
+                .write()
+                .await
+                .drop_future_records(Agent::unix_timestamp_secs());
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "dropped persisted revocations with a far-future revoked_at (ADR 0115 §5)"
+                );
+            }
+        }
         let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
         let move_state_load_failed =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
@@ -19047,6 +19599,19 @@ impl AgentBuilder {
         });
         let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
             contacts::ContactStore::new(contacts_path),
+        ));
+        // ADR 0115 D214: quarantine pre-upgrade issuer
+        // revocations and bundle tombstones before anything reads them.
+        let revocation_quarantine = std::sync::Arc::new(tokio::sync::Mutex::new(
+            identity_authority::quarantine::start(
+                identity_dir_or_home.as_deref(),
+                identity.user_id(),
+                &revocation_set,
+                &move_state,
+                &contact_store,
+                Agent::unix_timestamp_secs(),
+            )
+            .await,
         ));
 
         // X0X-0070b: spawn the inbound RelayedDm listener so this Agent can
@@ -19112,6 +19677,12 @@ impl AgentBuilder {
             identity.user_id(),
             std::sync::Arc::clone(&authenticated_machine_bindings),
         );
+        // ADR 0115 §2: the announced-binding store is an
+        // authority store for every OwnerTrust-held reader.
+        let announced_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        owner_trust.install_announced_bindings(std::sync::Arc::clone(&announced_machine_bindings));
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
@@ -19209,9 +19780,8 @@ impl AgentBuilder {
             machine_kem,
             identity_discovery_cache,
             authenticated_machine_bindings,
-            announced_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
-                dm_inbox::AuthenticatedMachineBindingCache::default(),
-            )),
+            announced_machine_bindings,
+            revocation_quarantine,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -27495,6 +28065,11 @@ mod tests {
         }
         assert!(alice_network.is_connected(&bob_peer).await);
 
+        // ADR 0115 §2: the DM registry names Bob's machine only with an
+        // authority record (Bob's class A announcement in production).
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -27656,6 +28231,11 @@ mod tests {
         // Phase 4: verify a subsequent DM succeeds over the recovered
         // connection. Mark connected (the PeerConnected handler does this
         // in production, but may race with our assertion in the test).
+        // ADR 0115 §2: the registry entry counts only with an authority
+        // record (Bob's class A announcement in production).
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -27830,7 +28410,11 @@ mod tests {
              even with allow_local_scope=FALSE"
         );
 
-        // Verify DM succeeds over the recovered connection.
+        // Verify DM succeeds over the recovered connection. ADR 0115 §2:
+        // the registry entry counts only with an authority record.
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -30999,10 +31583,46 @@ mod tests {
             },
         );
 
+        // ADR 0115 §3: without authenticated provenance the cached cert is
+        // not revocation authority.
+        let mut announced = dm_inbox::AuthenticatedMachineBindingCache::default();
+        let sources = |announced: &dm_inbox::AuthenticatedMachineBindingCache,
+                       local_user: Option<identity::UserId>| {
+            collect_subject_certs(
+                &ProvenanceSources {
+                    cache: &cache,
+                    announced,
+                    evidence: None,
+                    local_user,
+                    journal: &[],
+                },
+                [agent_id],
+            )
+        };
+        assert!(
+            !sources(&announced, None).contains_key(&agent_id),
+            "a cert no class A or B announcement committed to must not count"
+        );
+        // The local certificate journal rule: a cert the local user issued
+        // counts without any announcement.
+        assert!(
+            sources(&announced, Some(user.user_id())).contains_key(&agent_id),
+            "a cert the local user issued has provenance"
+        );
+        // A class A or B announcement records the digest it committed to.
+        announced.record_announcement(
+            agent_id,
+            identity::MachineId([1u8; 32]),
+            1,
+            Some(identity_authority::certificate_digest(&cert)),
+            cert.not_after(),
+        );
+
         // The gossip-receive path resolves subject certs from the cache.
-        let subject_certs = collect_subject_certs(&cache);
+        let subject_certs = sources(&announced, None);
         let looked_up = subject_certs
             .get(&agent_id)
+            .and_then(|certs| certs.first())
             .expect("the cache lookup must find the subject cert");
 
         let now = std::time::SystemTime::now()
@@ -31752,23 +32372,34 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         announcement
     }
 
-    async fn publish(receiver: &Agent, announcement: &IdentityAnnouncement) {
-        // A verified relay envelope is valid for discovery; the listener still
-        // verifies the subject's machine attestation and owner certificate.
-        let fanout = receiver
-            .gossip_runtime
-            .as_ref()
-            .expect("private runtime")
-            .pubsub()
-            .publish_with_fanout(
-                IDENTITY_ANNOUNCE_TOPIC.to_string(),
-                serialize_identity_announcement(announcement)
-                    .expect("wire announcement")
-                    .into(),
+    async fn publish(
+        receiver: &Agent,
+        author: &identity::AgentKeypair,
+        announcement: &IdentityAnnouncement,
+    ) {
+        // ADR 0115 §1: the subject signs its own pubsub envelope
+        // (class A), as a real daemon does; a relay envelope no longer sets
+        // discovery authority. The signed frame enters the receiver's real
+        // PubSub and listener; nothing is sent to a remote peer.
+        use crate::gossip::pubsub::test_support::{outer_v2_frame, signed_inner_v2};
+        let inner = signed_inner_v2(
+            &gossip::SigningContext::from_keypair(author),
+            IDENTITY_ANNOUNCE_TOPIC,
+            &bytes::Bytes::from(
+                serialize_identity_announcement(announcement).expect("wire announcement"),
+            ),
+        );
+        let msg_id = *blake3::hash(&inner).as_bytes();
+        receiver
+            .handle_gossip_incoming_for_test(
+                saorsa_gossip_types::PeerId::new([0x51; 32]),
+                outer_v2_frame(
+                    saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC),
+                    inner,
+                    msg_id,
+                ),
             )
-            .await
-            .expect("publish through real PubSub");
-        assert_eq!(fanout, 0, "fixture must never send to remote peers");
+            .await;
     }
 
     async fn await_certificate(
@@ -31800,6 +32431,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         .expect("sentinel certificate");
         publish(
             receiver,
+            &sentinel,
             &certified_announcement(&sentinel, machine, &cert, now),
         )
         .await;
@@ -31893,7 +32525,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
     // First prove the asynchronously installed subscription is ready.
     listener_barrier(&receiver, &pinned, &mut events, now).await;
     let denied = certified_announcement(&subject, &third, &cert, now);
-    publish(&receiver, &denied).await;
+    publish(&receiver, &subject, &denied).await;
     // FIFO delivery on one subscribed topic plus a fresh accepted sentinel
     // proves the preceding rejected announce reached the listener (no sleep).
     listener_barrier(&receiver, &pinned, &mut events, now).await;
@@ -31912,7 +32544,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         .contains_key(&third.machine_id()));
 
     let accepted = certified_announcement(&subject, &pinned, &cert, now);
-    publish(&receiver, &accepted).await;
+    publish(&receiver, &subject, &accepted).await;
     await_certificate(&mut events, subject.agent_id()).await;
     assert_eq!(
         receiver
@@ -31988,6 +32620,11 @@ async fn placement_mint_acp_waits_for_discovery_and_never_rewrites_existing_pin(
 
     let harness_machine = identity::MachineId([0x22; 32]);
     assert_ne!(harness_machine, agent.machine_id());
+    // ADR 0115 §2: the harness's class A announcement records its binding;
+    // a routing entry alone never names a pinned machine.
+    agent
+        .record_authenticated_binding_for_testing(harness.agent_id(), harness_machine, 1)
+        .await;
     discovered.machine_id = harness_machine;
     agent
         .identity_discovery_cache

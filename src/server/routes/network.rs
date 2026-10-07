@@ -578,11 +578,16 @@ pub(in crate::server) async fn gossip_diagnostics(
             let participation_snapshot = state.agent.gossip_participation();
             let egress = state.agent.gossip_egress_diagnostics().unwrap_or_default();
             let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
+            let identity_authority = state.agent.identity_authority_diagnostics().await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                 "ok": true,
                 "uptime_secs": state.start_time.elapsed().as_secs(),
+                // ADR 0115: class C announcements dropped,
+                // bundles without an authenticated owner, far-future
+                // revocations, and the D214 quarantine.
+                "identity_authority": identity_authority,
                 // #1135: publishes that reached zero eager peers — an
                 // absent-message stall, not a slow one.
                 "zero_fanout_publishes": state.agent.gossip_zero_fanout_publishes(),

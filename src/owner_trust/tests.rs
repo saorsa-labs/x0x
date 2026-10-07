@@ -498,6 +498,7 @@ struct UnknownMachine {
     move_state: Arc<RwLock<MoveState>>,
     connect_policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
     devices: Arc<OwnerSyncStore>,
+    bindings: AuthenticatedMachineBindings,
     trust: OwnerTrust,
 }
 
@@ -527,10 +528,8 @@ impl UnknownMachine {
             devices.enroll(enrolled).await.expect("enroll");
         }
         let devices = Arc::new(devices);
-        let trust = OwnerTrust::new(
-            Some(local_owner.user_id()),
-            AuthenticatedMachineBindings::default(),
-        );
+        let bindings = AuthenticatedMachineBindings::default();
+        let trust = OwnerTrust::new(Some(local_owner.user_id()), Arc::clone(&bindings));
         trust.install_device_store(Arc::clone(&devices));
         Self {
             machine_kp,
@@ -543,6 +542,7 @@ impl UnknownMachine {
             move_state: Arc::new(RwLock::new(MoveState::default())),
             connect_policy: Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default()))),
             devices,
+            bindings,
             trust,
             _dir: dir,
         }
@@ -590,10 +590,18 @@ impl UnknownMachine {
     }
 
     /// Make an agent KNOWN on this machine (as a delivered announcement
-    /// would), returning its id.
+    /// would), returning its id. A class A announcement also records the
+    /// authenticated binding (ADR 0115 §1).
     async fn learn_agent(&self) -> AgentId {
         let agent_kp = AgentKeypair::generate().expect("agent keygen");
         let agent_id = agent_kp.agent_id();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &self.bindings,
+            agent_id,
+            self.machine_id,
+            unix_now_secs(),
+        )
+        .await;
         self.cache.write().await.insert(
             agent_id,
             DiscoveredAgent {

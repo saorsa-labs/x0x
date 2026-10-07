@@ -1541,6 +1541,56 @@ impl MoveState {
         self.bundles.get(agent)
     }
 
+    /// ADR 0115 D214: every held mesh bundle (load-time quarantine).
+    pub(crate) fn held_bundles(&self) -> impl Iterator<Item = &ChainedRecord> {
+        self.bundles.values()
+    }
+
+    /// ADR 0115 D214: remove every held bundle matching `take`, with the
+    /// placement it signed for its agent, and return the bundles. The
+    /// caller recomputes the bundle tombstones from the bundles that remain
+    /// ([`Self::bundle_tombstones`]).
+    pub(crate) fn take_bundles_where(
+        &mut self,
+        mut take: impl FnMut(&ChainedRecord) -> bool,
+    ) -> Vec<ChainedRecord> {
+        let agents: Vec<AgentId> = self
+            .bundles
+            .iter()
+            .filter(|(_, chained)| take(chained))
+            .map(|(agent, _)| *agent)
+            .collect();
+        let mut taken = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let Some(chained) = self.bundles.remove(&agent) else {
+                continue;
+            };
+            if self
+                .placements
+                .get(&agent)
+                .is_some_and(|placement| placement.owner_public_key == chained.owner_public_key)
+            {
+                self.placements.remove(&agent);
+            }
+            taken.push(chained);
+        }
+        taken
+    }
+
+    /// ADR 0115 D214: the cumulative tombstones of every held bundle.
+    pub(crate) fn bundle_tombstones(&self) -> Vec<AgentMachineBinding> {
+        self.bundles
+            .values()
+            .filter_map(|chained| match &chained.record {
+                MoveRecord::ActivationBundle {
+                    retired_bindings, ..
+                } => Some(retired_bindings.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// All agents this daemon holds ANY move state for (REST view).
     #[must_use]
     pub fn known_agents(&self) -> Vec<AgentId> {
@@ -3109,6 +3159,11 @@ mod r5_registry_tests {
         // funnel-head check never fired; the post-resolution check must
         // refuse.
         let stale_machine = crate::identity::MachineId([0x0D; 32]);
+        // ADR 0115 §2: the registry names a machine only with an authority
+        // record, as the prior connection's verified announcement left.
+        sender
+            .record_authenticated_binding_for_testing(peer.agent_id(), stale_machine, 1)
+            .await;
         sender
             .direct_messaging()
             .mark_connected(peer.agent_id(), stale_machine)

@@ -715,6 +715,11 @@ pub(crate) async fn unknown_relationship(
     let Some(certificate) = certificate else {
         return false;
     };
+    // ADR 0115 §2: the routing entry stands for the agent only
+    // when an authority store confirms its machine.
+    if !owner.authority_confirms(agent, machine).await {
+        return false;
+    }
     owner
         .evidence()
         .and_then(|runtime| runtime.store())
@@ -783,6 +788,9 @@ impl Context {
                     .as_ref()
                     .is_some_and(|c| c.is_expired(now / 1000))
                 && store.related(d.agent_id, machine, d.agent_certificate.as_ref(), now)
+                // ADR 0115 §2: only a machine an authority store
+                // confirms; a busy store reads as unconfirmed.
+                && self.owner.try_authority_confirms(&d.agent_id, &machine) == Some(true)
         })
     }
     fn own(&self, have: Option<[u8; 32]>, include_cert: bool) -> io::Result<Hello> {
@@ -1447,9 +1455,13 @@ impl ReadyPolicy {
                 continue;
             }
             if let Some(d) = discovery {
+                // ADR 0115 §2: a routing entry establishes a
+                // relationship only when an authority store confirms its
+                // machine (co-resident denials above still apply to it).
                 if now / 1000
                     <= d.announced_at
                         .saturating_add(dm_capability::ADVERT_CACHE_TTL_SECS)
+                    && context.owner.try_authority_confirms(&agent, &machine)?
                 {
                     related |=
                         store.try_related(agent, machine, d.agent_certificate.as_ref(), now)?;

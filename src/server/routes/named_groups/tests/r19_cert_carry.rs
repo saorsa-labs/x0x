@@ -198,24 +198,16 @@ async fn install_anonymous_discovery(
     Ok(machine)
 }
 
-/// An anonymous V3 announce naming `subject`, signed by `machine`, through
-/// `state`'s real identity listener; returns once discovery shows it.
+/// An anonymous V3 announce naming `subject`, signed by `machine`, as wire
+/// bytes, with its `announced_at`.
 ///
 /// A V3 announce is signed by a machine key alone (`announce_v3` `verify`:
 /// machine key ↔ machine id, agent key ↔ agent id, machine signature), so
-/// `machine` need not be the subject's: any machine can sign one. It is
-/// published on `state`'s own pubsub, so the pubsub sender is `state`'s
-/// agent, never `subject`. The listener therefore refuses it as a binding
-/// source (`record_authenticated_machine_binding_from_message`: not
-/// direct-origin) and still caches it for discovery, exactly as for a
-/// forged or relayed announce from the mesh.
-async fn relayed_anonymous_announce_lands(
-    state: &AppState,
+/// `machine` need not be the subject's: any machine can sign one.
+fn anonymous_announce_payload(
     subject: &x0x::identity::AgentKeypair,
     machine: &x0x::identity::MachineKeypair,
-) -> Result<()> {
-    // Starts the identity listener; it subscribes before this returns.
-    state.agent.discovered_agents().await?;
+) -> Result<(Vec<u8>, u64)> {
     let announced_at = x0x::groups::owner_cert::restore_clock_now();
     let v2 = x0x::IdentityAnnouncement {
         self_name: None,
@@ -237,19 +229,62 @@ async fn relayed_anonymous_announce_lands(
     };
     let v3 = x0x::announce_v3::IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0)?;
     v3.verify()?;
-    let anonymous = x0x::announce_v3::anonymous_cert_digest();
-    anyhow::ensure!(v3.cert_digest == anonymous, "fixture: an anonymous V3");
+    anyhow::ensure!(
+        v3.cert_digest == x0x::announce_v3::anonymous_cert_digest(),
+        "fixture: an anonymous V3"
+    );
     let payload = x0x::announce_v3::serialize_v3(&v3)
         .map_err(|error| anyhow::anyhow!("serialize v3: {error}"))?;
+    Ok((payload, announced_at))
+}
+
+/// Feed one identity-topic frame into `state`'s real PubSub, with `author`
+/// as the signed pubsub sender. Every frame takes the same path, so the
+/// listener sees them in order.
+async fn inject_identity_frame(
+    state: &AppState,
+    author: &x0x::identity::AgentKeypair,
+    payload: Vec<u8>,
+) -> Result<()> {
+    use x0x::gossip::pubsub::test_support::{outer_v2_frame, signed_inner_v2};
+    // Starts the identity listener; it subscribes before this returns.
+    state.agent.discovered_agents().await?;
+    let topic = x0x::IDENTITY_ANNOUNCE_TOPIC;
+    let inner = signed_inner_v2(
+        &x0x::gossip::SigningContext::from_keypair(author),
+        topic,
+        &bytes::Bytes::from(payload),
+    );
+    let msg_id = *blake3::hash(&inner).as_bytes();
     state
         .agent
-        .pubsub()
-        .context("gossip runtime")?
-        .publish(
-            x0x::IDENTITY_ANNOUNCE_TOPIC.to_string(),
-            bytes::Bytes::from(payload),
+        .handle_gossip_incoming_for_test(
+            saorsa_gossip_types::PeerId::new([0x19; 32]),
+            outer_v2_frame(
+                saorsa_gossip_types::TopicId::from_entity(topic),
+                inner,
+                msg_id,
+            ),
         )
-        .await?;
+        .await;
+    Ok(())
+}
+
+/// An anonymous V3 announce naming `subject`, signed by `machine`, through
+/// `state`'s real identity listener, relayed under `state`'s own agent as
+/// the pubsub sender (never `subject`); returns once discovery shows it.
+///
+/// ADR 0115 §1: such a relayed announce reaches discovery only
+/// as class B, so `machine` must be the subject's current authenticated
+/// machine. Otherwise use [`relayed_anonymous_announce_is_ignored`].
+async fn relayed_anonymous_announce_lands(
+    state: &AppState,
+    subject: &x0x::identity::AgentKeypair,
+    machine: &x0x::identity::MachineKeypair,
+) -> Result<()> {
+    let (payload, announced_at) = anonymous_announce_payload(subject, machine)?;
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    inject_identity_frame(state, state.agent.identity().agent_keypair(), payload).await?;
     let key = machine.public_key().as_bytes().to_vec();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -271,6 +306,55 @@ async fn relayed_anonymous_announce_lands(
     })
     .await
     .context("the relayed anonymous announce must land in discovery")?;
+    Ok(())
+}
+
+/// ADR 0115 §1: the same relayed announce, from a machine that
+/// is not the subject's current authenticated machine, is class C. It
+/// never reaches discovery. A fresh agent's own (class A) announce, fed
+/// after it on the same path, proves the listener decided it.
+async fn relayed_anonymous_announce_is_ignored(
+    state: &AppState,
+    subject: &x0x::identity::AgentKeypair,
+    machine: &x0x::identity::MachineKeypair,
+) -> Result<()> {
+    let before = state
+        .agent
+        .discovered_agent_for_testing(&subject.agent_id())
+        .await;
+    let (payload, _) = anonymous_announce_payload(subject, machine)?;
+    inject_identity_frame(state, state.agent.identity().agent_keypair(), payload).await?;
+    let sentinel = x0x::identity::AgentKeypair::generate()?;
+    let sentinel_machine = x0x::identity::MachineKeypair::generate()?;
+    let (sentinel_payload, _) = anonymous_announce_payload(&sentinel, &sentinel_machine)?;
+    inject_identity_frame(state, &sentinel, sentinel_payload).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state
+            .agent
+            .discovered_agent_for_testing(&sentinel.agent_id())
+            .await
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the class A sentinel announce must land in discovery")?;
+    let after = state
+        .agent
+        .discovered_agent_for_testing(&subject.agent_id())
+        .await;
+    anyhow::ensure!(
+        after
+            .as_ref()
+            .map(|entry| (entry.machine_id, entry.cert_digest, entry.announced_at))
+            == before.as_ref().map(|entry| (
+                entry.machine_id,
+                entry.cert_digest,
+                entry.announced_at
+            )),
+        "an unauthenticated relayed announce must not change discovery"
+    );
     Ok(())
 }
 
@@ -470,10 +554,11 @@ async fn serving_guard_serves_an_anonymous_home_joiner_and_withholds_the_ordinar
 // ADR 0108 §4's premise (Codex P2 on #1247): "Only the subject agent's
 // authenticated bound machine can sign its announce; an arbitrary third
 // party cannot manufacture this absence signal." A V3 announce is signed by
-// a machine key alone, and the identity listener caches one for discovery
-// even when it refuses it as a binding source. Every anonymous announce
-// below goes through that real listener
-// ([`relayed_anonymous_announce_lands`]).
+// a machine key alone. Since ADR 0115 only a class A or B announce
+// reaches discovery. Every anonymous
+// announce below goes through that real listener
+// ([`relayed_anonymous_announce_lands`],
+// [`relayed_anonymous_announce_is_ignored`]).
 // ---------------------------------------------------------------------------
 
 /// A Home member that is not this daemon: its agent keys and the machine
@@ -700,11 +785,12 @@ async fn eviction_path_keeps(
 /// THE FINDING, ingress to eviction. A renewing Home member (expired seat
 /// bytes, renewal in flight) is InGrace. A third machine signs an anonymous
 /// announce naming it; the real listener refuses it as a binding source
-/// (the binding still names the member's machine) and caches it for
-/// discovery. It is no absence signal: the member stays InGrace (today's
-/// fetch-in-flight rule) and the eviction path keeps it seated. With the
-/// S2-1 rule unguarded the forged digest read as no disclosure, so the
-/// member was Failed(Expired) and the next seal evicted it.
+/// (the binding still names the member's machine) and, since ADR 0115,
+/// also keeps it out of discovery (class C). The member stays
+/// InGrace (today's fetch-in-flight rule) and the eviction path keeps it
+/// seated. With the S2-1 rule unguarded the forged digest read as no
+/// disclosure, so the member was Failed(Expired) and the next seal evicted
+/// it.
 ///
 /// Then routing reconciles the entry's machine id to the member's bound
 /// machine (the connector rewrites `machine_id` to whatever machine is
@@ -725,18 +811,21 @@ async fn forged_anonymous_announce_keeps_a_renewing_home_member_in_grace() -> Re
         )
     };
 
+    // ADR 0115 §1: the forger is not the member's
+    // authenticated machine, so its relayed announce is class C and never
+    // reaches discovery or the seal evidence.
     let forger = x0x::identity::MachineKeypair::generate()?;
-    relayed_anonymous_announce_lands(&state, &member.kp, &forger).await?;
+    relayed_anonymous_announce_is_ignored(&state, &member.kp, &forger).await?;
     assert_eq!(
         bound_machine(&state, member.kp.agent_id()).await,
         Some(member.machine.machine_id()),
         "the listener did not take the forged announce as a binding"
     );
     let evidence = owner_cert_seal_evidence(&state, &info).await;
-    assert_eq!(
+    assert_ne!(
         evidence.digest_for(&member.hex),
         Some(x0x::announce_v3::anonymous_cert_digest()),
-        "the forged anonymous digest reached the seal evidence"
+        "the forged anonymous digest must not reach the seal evidence"
     );
     assert!(evidence.cert_for(&member.hex).is_none());
     let status = member_status(&state, &info, &member.hex).await;
@@ -773,13 +862,16 @@ async fn forged_anonymous_announce_keeps_a_renewing_home_member_in_grace() -> Re
 }
 
 /// The Home rule needs the announce's machine to be the subject's CURRENT
-/// authenticated bound machine. Each state below has an anonymous announce
-/// signed by the member's machine M in discovery and valid embedded bytes:
-/// - no binding at all, a binding whose certificate expiry has passed, a
-///   binding that has moved to another machine, an entry whose machine id
-///   routing has rewritten to another machine, or M revoked: today's rule
-///   (InGrace), so the seal refuses with `OwnerCertMemberPending` and the
-///   ADR 0107 serving guard withholds;
+/// authenticated bound machine. The member's seat embeds valid bytes:
+/// - no binding at all: since ADR 0115 the relayed announce
+///   from M is class C and never reaches discovery, so nothing contradicts
+///   the embedded bytes (Clean);
+/// - once an anonymous announce signed by M is in discovery: a binding
+///   whose certificate expiry has passed, a binding that has moved to
+///   another machine, an entry whose machine id routing has rewritten to
+///   another machine, or M revoked: today's rule (InGrace), so the seal
+///   refuses with `OwnerCertMemberPending` and the ADR 0107 serving guard
+///   withholds;
 /// - a current binding to M: the Home rule (Clean), so the seal succeeds
 ///   and the guard serves.
 ///
@@ -796,7 +888,9 @@ async fn anonymous_announce_needs_a_current_bound_machine() -> Result<()> {
         .write()
         .await
         .insert(home_key.clone(), info);
-    relayed_anonymous_announce_lands(&state, &member.kp, &member.machine).await?;
+    // ADR 0115 §1: with no authenticated binding the relayed
+    // announce is class C and never reaches discovery.
+    relayed_anonymous_announce_is_ignored(&state, &member.kp, &member.machine).await?;
     let now = x0x::groups::owner_cert::restore_clock_now();
     let m = member.machine.machine_id();
 
@@ -847,13 +941,18 @@ async fn anonymous_announce_needs_a_current_bound_machine() -> Result<()> {
     };
 
     assert_eq!(bound_machine(&state, member.kp.agent_id()).await, None);
-    sites("no binding", false).await?;
-    member.bind(&state, m, now + 1, Some(1)).await;
+    // Nothing landed, so nothing contradicts the valid embedded bytes.
+    sites("no binding: the relayed announce is ignored", true).await?;
+    // With a current binding the same announce is class B and lands.
+    member.bind(&state, m, now + 1, None).await;
+    relayed_anonymous_announce_lands(&state, &member.kp, &member.machine).await?;
+    sites("current binding, announce landed", true).await?;
+    member.bind(&state, m, now + 2, Some(1)).await;
     sites("binding certificate expired", false).await?;
     let other = x0x::identity::MachineKeypair::generate()?;
-    member.bind(&state, other.machine_id(), now + 2, None).await;
+    member.bind(&state, other.machine_id(), now + 3, None).await;
     sites("binding moved to another machine", false).await?;
-    member.bind(&state, m, now + 3, None).await;
+    member.bind(&state, m, now + 4, None).await;
     sites("current binding", true).await?;
     let entry_machine = async |machine: x0x::identity::MachineId| {
         if let Some(entry) = state
