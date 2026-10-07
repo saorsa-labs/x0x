@@ -174,7 +174,9 @@ def require_control(result, expected, name, label):
     if result.returncode != expected or (
         expected == 1 and b"signature is invalid" not in result.stderr
     ):
-        raise ValueError(f"packaged {name} {label} control failed")
+        tail = result.stderr[-2048:].decode("utf-8", "replace")
+        raise ValueError(f"packaged {name} {label} control failed: "
+                         f"exit {result.returncode}, stderr tail: {tail!r}")
 
 
 def packaged(args, receipt):
