@@ -42,8 +42,17 @@ fixture_uid=$(id -u)
 fixture_gid=$(id -g)
 if [ "$manager" = system ]; then
   [ "$(id -u)" -eq 0 ] || { echo "--manager system requires an already-root shell on a disposable host" >&2; exit 77; }
-  fixture_uid=65534
-  fixture_gid=65534
+  # The probe and artifacts may be below the sudo caller's private home.
+  # Chowning only the leaf directories cannot admit a different uid there.
+  fixture_identity=$(python3 -B - "$script_dir" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from systemd_isolation import fixture_identity
+print(*fixture_identity(os.environ))
+PY
+  )
+  fixture_uid=${fixture_identity% *}
+  fixture_gid=${fixture_identity#* }
   chown "$fixture_uid:$fixture_gid" "$artifact_root"
 fi
 parent_netns=$(readlink /proc/self/ns/net)
@@ -134,6 +143,11 @@ cleanup() {
   for unit in $units; do
     safe=$(printf '%s' "$unit" | tr -c 'A-Za-z0-9._-' '_')
     [ ! -e "$artifact_root/.cleaned-$safe" ] || continue
+    # Admission/exec failures happen before invocation-1.json exists. Preserve
+    # their journal and loaded state before stop/reset discards the unit.
+    journal_bounded "trap-journal-$safe" "$unit" "$artifact_root/trap-journal-$safe.txt" "$artifact_root/trap-journal-$safe.err" || true
+    systemctl_bounded "trap-show-$safe" "$artifact_root/trap-show-$safe.txt" "$artifact_root/trap-show-$safe.err" show "$unit" \
+      -p User -p Group -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts || true
     systemctl_bounded "trap-stop-$safe" "$artifact_root/trap-stop-$safe.out" "$artifact_root/trap-stop-$safe.err" stop "$unit" || true
     systemctl_bounded "trap-reset-$safe" "$artifact_root/trap-reset-$safe.out" "$artifact_root/trap-reset-$safe.err" reset-failed "$unit" || true
     if ! wait_unit_absent "$unit" "$artifact_root/cleanup.log" 10; then final_status=1; fi
