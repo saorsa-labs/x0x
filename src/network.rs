@@ -27,6 +27,14 @@ use crate::error::{NetworkError, NetworkResult};
 mod churn;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
+mod link;
+use self::link::LinkNode;
+mod stream;
+pub use self::stream::{StreamRecv, StreamSend};
+// W3-H (#1164): deterministic in-memory transport for the simulation
+// harness. Test builds only (`#![cfg(test)]` inside the file); production
+// `NetworkNode`s always run on QUIC.
+pub(crate) mod sim;
 
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
@@ -114,10 +122,39 @@ struct GossipPayload {
 /// aliased by a replacement connection for the same peer: a new connection
 /// has a different stable id and therefore must mint a new token.
 struct SessionEntry {
-    connection: ant_quic::high_level::Connection,
+    connection: SessionConnection,
     ant_generation: u64,
     token: AuthenticatedSession,
     last_used: Instant,
+}
+
+/// The backend connection a session token is bound to: the live QUIC
+/// connection in production, or a W3-H simulated link generation in test
+/// builds. The registry rules (reuse while the same live connection is
+/// current, mint on replacement, evict closed then LRU) are identical for
+/// both.
+enum SessionConnection {
+    Quic(ant_quic::high_level::Connection),
+    #[cfg(test)]
+    Sim(sim::SimConnection),
+}
+
+impl SessionConnection {
+    fn stable_id(&self) -> usize {
+        match self {
+            Self::Quic(connection) => connection.stable_id(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.stable_id(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Quic(connection) => connection.close_reason().is_some(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.is_closed(),
+        }
+    }
 }
 
 /// Bounded per-peer registry of live authenticated sessions.
@@ -1876,7 +1913,7 @@ async fn forward_gossip_payload(
 }
 
 async fn disconnect_pool_candidates(
-    node: &Node,
+    node: &LinkNode,
     event_sender: &broadcast::Sender<NetworkEvent>,
     connection_pool: &ConnectionPool,
     reconnect_suppressions: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
@@ -1930,7 +1967,7 @@ async fn disconnect_pool_candidates(
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
-    node: Arc<RwLock<Option<Node>>>,
+    node: Arc<RwLock<Option<LinkNode>>>,
     /// Configuration for this node.
     config: NetworkConfig,
     /// Sender for broadcasting network events.
@@ -2036,6 +2073,10 @@ pub struct NetworkNode {
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+    /// W3-H (#1164): the simulated link this node runs on, if any, so the
+    /// pub-sub publish funnel can record attempts before mesh fan-out.
+    #[cfg(test)]
+    sim_link: Option<Arc<sim::SimLink>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2248,6 +2289,20 @@ impl NetworkNode {
             builder = builder.mdns_namespace(id.clone());
         }
 
+        // W3-H (#1164): a test-build node whose plane has a registered
+        // simulation fabric runs on it instead of binding a QUIC socket.
+        #[cfg(test)]
+        if let Some(link) = sim::claim(&config, expected_peer_id) {
+            return Ok(Self::assemble(
+                config,
+                LinkNode::Sim(link),
+                expected_peer_id,
+                transport_signing_key,
+                None,
+            )
+            .await);
+        }
+
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
@@ -2262,6 +2317,32 @@ impl NetworkNode {
         // Share the endpoint's cache instance (never a second handle on the
         // same file). The endpoint runs cache maintenance itself.
         let bootstrap_cache = Some(node.bootstrap_cache());
+        Ok(Self::assemble(
+            config,
+            LinkNode::Quic(node),
+            peer_id,
+            transport_signing_key,
+            bootstrap_cache,
+        )
+        .await)
+    }
+
+    /// Everything in [`Self::new`] after the transport backend exists:
+    /// channels, pools, the receive pump and the other background tasks.
+    /// Split out (behaviour unchanged) so the W3-H simulation backend
+    /// (#1164) is assembled by exactly the production code.
+    async fn assemble(
+        config: NetworkConfig,
+        node: LinkNode,
+        peer_id: AntPeerId,
+        transport_signing_key: TransportSigningKey,
+        bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    ) -> Self {
+        #[cfg(test)]
+        let sim_link = match &node {
+            LinkNode::Sim(link) => Some(Arc::clone(link)),
+            LinkNode::Quic(_) => None,
+        };
         let (event_sender, _event_receiver) = broadcast::channel(32);
         // Inbound gossip buffers are split by stream type so PubSub back-pressure
         // cannot block Bulk presence beacons or Membership/SWIM control traffic.
@@ -2323,6 +2404,8 @@ impl NetworkNode {
             shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            sim_link,
         };
 
         let receiver = network_node.spawn_receiver();
@@ -2346,11 +2429,26 @@ impl NetworkNode {
         // #368 gate 2: pure-observation churn counters over ant-quic's
         // event streams (connect direction, redials-of-connected,
         // generation replace/close lifecycle). Zero behaviour change.
-        if let Some(node) = network_node.node.read().await.as_ref() {
+        if let Some(node) = network_node
+            .node
+            .read()
+            .await
+            .as_ref()
+            .and_then(LinkNode::quic)
+        {
             Arc::clone(&network_node.churn).spawn_observer(node);
         }
 
-        Ok(network_node)
+        network_node
+    }
+
+    /// W3-H (#1164): record a pub-sub publish attempt on the simulated
+    /// fabric's trace before any mesh fan-out (no-op on QUIC).
+    #[cfg(test)]
+    pub(crate) fn sim_note_publish(&self, topic: &str, payload: &[u8]) {
+        if let Some(link) = &self.sim_link {
+            link.note_publish(topic, payload);
+        }
     }
 
     /// Get the configuration for this node.
@@ -2436,13 +2534,13 @@ impl NetworkNode {
     /// external addresses, connection stats, and relay/coordinator state.
     pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.status().await)
+        Some(node.quic()?.status().await)
     }
 
     /// Snapshot ACK-v2 per-stage latency and outcome diagnostics.
     pub async fn ack_diagnostics(&self) -> Option<ant_quic::AckDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.ack_diagnostics())
+        Some(node.quic()?.ack_diagnostics())
     }
 
     /// Snapshot `data_tx` channel saturation diagnostics (X0X-0039).
@@ -2454,7 +2552,7 @@ impl NetworkNode {
         &self,
     ) -> Option<ant_quic::DataChannelDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.data_channel_diagnostics())
+        Some(node.quic()?.data_channel_diagnostics())
     }
 
     /// Snapshot GSO bundle send diagnostics (X0X-0043).
@@ -2464,7 +2562,7 @@ impl NetworkNode {
     /// Returns `None` when the network node is not yet initialised.
     pub async fn gso_diagnostics(&self) -> Option<ant_quic::GsoDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.gso_diagnostics())
+        Some(node.quic()?.gso_diagnostics())
     }
 
     /// Active liveness probe for a peer (ant-quic 0.27.2 #173).
@@ -2500,7 +2598,7 @@ impl NetworkNode {
         peer_id: AntPeerId,
     ) -> Option<ant_quic::ConnectionTransportStats> {
         let node = self.node.read().await.as_ref().cloned()?;
-        node.connection_transport_stats(&peer_id).await
+        node.quic()?.connection_transport_stats(&peer_id).await
     }
 
     /// Send data and wait for the remote receive pipeline to acknowledge
@@ -2541,7 +2639,10 @@ impl NetworkNode {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return NetworkStats::default();
         };
-        let status = node.status().await;
+        let Some(quic) = node.quic() else {
+            return NetworkStats::default();
+        };
+        let status = quic.status().await;
         NetworkStats {
             total_connections: status.direct_connections + status.relayed_connections,
             active_connections: status.active_connections as u32,
@@ -2565,7 +2666,7 @@ impl NetworkNode {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return 0;
         };
-        node.status().await.connected_peers
+        node.connection_count().await
     }
 
     /// Subscribe to network events.
@@ -2628,7 +2729,7 @@ impl NetworkNode {
     /// and after the registry lock. Eviction is LRU over closed connections
     /// first, then oldest-used, bounded by `max_peers`.
     fn current_session_for_peer(
-        node: &Node,
+        node: &LinkNode,
         registry: &Arc<Mutex<AuthenticatedSessions>>,
         max_peers: usize,
         ant_peer: &AntPeerId,
@@ -2640,12 +2741,8 @@ impl NetworkNode {
         if ant_generation == STALE_GENERATION_SENTINEL {
             return None;
         }
-        let connection = node
-            .inner_endpoint()
-            .get_quic_connection(ant_peer)
-            .ok()
-            .flatten()?;
-        if connection.close_reason().is_some()
+        let connection = node.session_connection(ant_peer)?;
+        if connection.is_closed()
             || node.current_connection_generation(ant_peer) != Some(ant_generation)
         {
             return None;
@@ -2662,7 +2759,7 @@ impl NetworkNode {
         let next = sessions.next.checked_add(1)?;
         sessions
             .peers
-            .retain(|_, entry| entry.connection.close_reason().is_none());
+            .retain(|_, entry| !entry.connection.is_closed());
         if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(ant_peer) {
             let oldest = sessions
                 .peers
@@ -3760,7 +3857,7 @@ impl NetworkNode {
     /// `suppress_reconnect` would refresh the tombstone (invariant F).
     async fn dial_gated_answered(
         &self,
-        node: &Node,
+        node: &LinkNode,
         answered: &AntPeerId,
         origin: &'static str,
     ) -> NetworkResult<()> {
@@ -4186,7 +4283,10 @@ impl NetworkNode {
         let Some(node) = node else {
             return TransportDiagnosticsSnapshot::default();
         };
-        let endpoint = node.inner_endpoint();
+        let Some(quic) = node.quic() else {
+            return TransportDiagnosticsSnapshot::default();
+        };
+        let endpoint = quic.inner_endpoint();
         let stats = endpoint.stats().await;
         let conns = endpoint.connected_peers().await;
         let mut snap = TransportDiagnosticsSnapshot::from_parts(&stats, &conns);
@@ -4299,7 +4399,7 @@ impl NetworkNode {
     ///
     /// This helper reduces boilerplate in methods that need exclusive
     /// access to the node after releasing the read lock.
-    async fn require_node(&self) -> NetworkResult<Node> {
+    async fn require_node(&self) -> NetworkResult<LinkNode> {
         self.node
             .read()
             .await
@@ -4333,7 +4433,7 @@ impl NetworkNode {
     pub(crate) async fn open_bi(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4346,6 +4446,19 @@ impl NetworkNode {
             .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
     }
 
+    /// Current transport generation for readiness fencing (QUIC and Sim).
+    /// Busy/uninitialized state is distinct from an absent connection, so a
+    /// transient read failure cannot clear a live connection's Hello marker.
+    /// The outer node read uses try_read; the inner generation lookup briefly
+    /// takes the ant-quic lifecycle lock or the Sim fabric lock.
+    pub(crate) fn try_connection_generation(&self, peer_id: &AntPeerId) -> Result<Option<u64>, ()> {
+        let node = self.node.try_read().map_err(|_| ())?;
+        let node = node.as_ref().ok_or(())?;
+        Ok(node
+            .current_connection_generation(peer_id)
+            .filter(|generation| *generation != STALE_GENERATION_SENTINEL))
+    }
+
     /// Test-only: open a raw application byte-stream WITHOUT writing the
     /// protocol prefix. Used by the FIX 1 regression to simulate a peer that
     /// opens a QUIC stream and never sends the prefix (the accept-loop
@@ -4355,7 +4468,7 @@ impl NetworkNode {
     pub async fn open_bi_raw_for_testing(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         self.open_bi(peer_id).await
     }
 
@@ -4367,13 +4480,7 @@ impl NetworkNode {
     /// the accept loop never surfaces an internal stream. The identity gate +
     /// protocol handshake run in the Agent's single accept loop, the sole
     /// consumer of this method.
-    pub(crate) async fn accept_bi(
-        &self,
-    ) -> NetworkResult<(
-        AntPeerId,
-        ant_quic::HighLevelSendStream,
-        ant_quic::HighLevelRecvStream,
-    )> {
+    pub(crate) async fn accept_bi(&self) -> NetworkResult<(AntPeerId, StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4416,6 +4523,8 @@ impl NetworkNode {
             .cloned()
             .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
         let conn = node
+            .quic()
+            .ok_or(NetworkError::NotConnected(peer_id.0))?
             .inner_endpoint()
             .get_quic_connection(peer_id)
             .map_err(|e| NetworkError::NodeError(format!("get_quic_connection: {e}")))?
@@ -5879,7 +5988,7 @@ async fn plane_note_connected(
     plane_id: &str,
     plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
     plane_cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
-    node: &Arc<RwLock<Option<Node>>>,
+    node: &Arc<RwLock<Option<LinkNode>>>,
     peer_id: [u8; 32],
     reset: bool,
 ) {
@@ -6413,7 +6522,7 @@ fn reconnect_suppression_is_live_locked(
 ///
 /// Never calls [`NetworkNode::suppress_reconnect`]: a refused accept must
 /// not refresh an existing tombstone (invariant F).
-async fn close_suppressed_inbound(node: &Node, peer_id: &AntPeerId) {
+async fn close_suppressed_inbound(node: &LinkNode, peer_id: &AntPeerId) {
     tracing::warn!(
         target: "x0x::connect",
         origin = "accept",

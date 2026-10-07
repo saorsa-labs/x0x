@@ -415,12 +415,43 @@ impl RawQuicTransport<'_> {
         &self,
         agent: &Agent,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
         // Scripted too: the production redial over the script's connection
         // state (r7c).
         agent
-            .redial_direct_machine_from_discovery(agent_id, self)
+            .redial_direct_machine_from_discovery(agent_id, self, cold)
             .await
+    }
+}
+
+/// Crate-private opt-in budget for the owner removal notice (#1217).
+#[derive(Debug, Clone, Copy)]
+struct ColdWait(std::time::Duration);
+
+/// Public sends keep the existing path. Removal sends use one deadline.
+#[derive(Debug, Clone, Copy)]
+enum ColdResolution {
+    Off,
+    Until(tokio::time::Instant),
+}
+
+impl ColdResolution {
+    fn starting_now(cold_wait: Option<ColdWait>) -> Self {
+        cold_wait.map_or(Self::Off, |cold| {
+            Self::Until(tokio::time::Instant::now() + cold.0)
+        })
+    }
+
+    fn opted_in(self) -> bool {
+        matches!(self, Self::Until(_))
+    }
+
+    fn deadline(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Off => None,
+        }
     }
 }
 
@@ -433,7 +464,41 @@ pub(crate) struct PinnedTransportScript {
     only_listed_connected: bool,
     repair_connects: bool,
     repair_delay: std::time::Duration,
+    repair_gate: Option<std::sync::Arc<PinnedRepairGate>>,
     connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+/// Test seam (x0x #1207, P3): parks the scripted send-readiness repair on
+/// entry until the test releases it, so a test can change state while a
+/// repair is under way without assuming scheduler timing.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PinnedRepairGate {
+    /// One permit each time a repair enters.
+    pub(crate) reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PinnedRepairGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Let every current and future repair through.
+    pub(crate) fn release(&self) {
+        self.release.close();
+    }
+
+    async fn park(&self) {
+        self.reached.add_permits(1);
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,8 +511,15 @@ impl PinnedTransportScript {
             only_listed_connected: true,
             repair_connects,
             repair_delay: std::time::Duration::ZERO,
+            repair_gate: None,
             connected: std::sync::Mutex::new(machines.iter().copied().collect()),
         }
+    }
+
+    /// The send-readiness repair parks on entry at `gate` until released.
+    pub(crate) fn with_repair_gate(mut self, gate: std::sync::Arc<PinnedRepairGate>) -> Self {
+        self.repair_gate = Some(gate);
+        self
     }
 
     /// The send-readiness repair takes `delay` before it reports.
@@ -476,6 +548,9 @@ impl PinnedTransportScript {
     }
 
     async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if let Some(gate) = &self.repair_gate {
+            gate.park().await;
+        }
         tokio::time::sleep(self.repair_delay).await;
         if !self.repair_connects {
             return Err(error::NetworkError::ConnectionFailed(
@@ -494,6 +569,21 @@ impl PinnedTransportScript {
 static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            identity::AgentId,
+            identity::AgentId,
+            identity::MachineId,
+            Vec<u8>,
+        )>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
@@ -3131,6 +3221,77 @@ async fn record_announced_machine_binding(
 /// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
 /// before the binding's expiry update). Unarmed points pass straight
 /// through.
+/// x0x #1207 (test builds): a barrier at the entry of the general path's
+/// cold-recipient wait, keyed by (sender, recipient), so a test can inject
+/// the recipient's binding only after the send has entered the wait. An
+/// optional payload length selects one send among others to the same
+/// recipient. `reached` counts arrivals; `release` (closed) lets every
+/// current and future arrival through. Other sends pass straight through.
+#[cfg(test)]
+pub(crate) mod general_cold_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        bytes: Option<usize>,
+    }
+
+    impl Gate {
+        /// Let every current and future arrival through.
+        pub(crate) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type Key = (crate::identity::AgentId, crate::identity::AgentId);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        sender: crate::identity::AgentId,
+        recipient: crate::identity::AgentId,
+        payload_len: Option<usize>,
+    ) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            bytes: payload_len,
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((sender, recipient), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(sender: crate::identity::AgentId, recipient: crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            if let Some(gate) = gates.remove(&(sender, recipient)) {
+                gate.release();
+            }
+        }
+    }
+
+    pub(crate) async fn park(
+        sender: &crate::identity::AgentId,
+        recipient: &crate::identity::AgentId,
+        bytes: usize,
+    ) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
+            .filter(|gate| gate.bytes.is_none_or(|selected| selected == bytes));
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
@@ -4292,7 +4453,9 @@ pub(crate) async fn persist_share_grant_revocations(
     identity_dir: Option<&std::path::Path>,
 ) {
     if let Err(e) = persist_share_grant_revocations_durable(revocation_set, identity_dir).await {
-        tracing::warn!("revocations-v3 persist failed: {e}");
+        if !storage::revocation_persistence_is_blocked(&e) {
+            tracing::warn!("revocations-v3 persist failed: {e}");
+        }
     }
 }
 
@@ -4322,18 +4485,16 @@ const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
 pub(crate) async fn persist_share_grant_revocations_durable(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
-) -> std::result::Result<(), String> {
+) -> error::Result<()> {
     let Some(dir) = identity_dir
         .map(std::path::Path::to_path_buf)
         .or_else(storage::x0x_home_dir)
     else {
         return Ok(());
     };
-    let live = revocation_set
-        .read()
-        .await
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let live = revocation_set.read().await.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
     let _in_process = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
     merge_write_share_grant_revocations(
         &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
@@ -4369,15 +4530,18 @@ pub(crate) async fn merge_write_share_grant_revocations<A, AF>(
     now_unix: u64,
     on_contended: impl Fn(),
     after_read: A,
-) -> std::result::Result<(), String>
+) -> error::Result<()>
 where
     A: FnOnce() -> AF,
     AF: std::future::Future<Output = ()>,
 {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "revocations-v3 dir {}: {e}",
+                parent.display()
+            )))
+        })?;
     }
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -4388,28 +4552,26 @@ where
         on_contended,
     )
     .await
-    .map_err(|e| format!("revocations-v3 lock: {e}"))?;
-    let mut merged = match tokio::fs::read(path).await {
-        Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
-            revocation::RevocationSet::new()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
-        Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
-    };
+    .map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 lock: {e}")))
+    })?;
+    let (disk, guard) =
+        storage::read_revocation_store_for_write(path, storage::RevocationStore::V3).await?;
+    let mut merged = disk.unwrap_or_default();
     after_read().await;
-    let live = revocation::RevocationSet::from_bytes_v3(live_v3)
-        .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    let live = revocation::RevocationSet::from_bytes_v3(live_v3).map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!(
+            "revocations-v3 re-decode: {e}"
+        )))
+    })?;
     merged.merge_v3(live);
     if now_unix != 0 {
         merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
     }
-    let bytes = merged
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    storage::write_private_bytes_durable(path, bytes)
-        .await
-        .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
+    let bytes = merged.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
+    storage::write_revocation_bytes_durable(bytes, guard).await
 }
 
 struct RawDirectDelivery {
@@ -5642,7 +5804,20 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
-        let outcome = self.connect_to_agent_inner(agent_id).await?;
+        self.connect_to_agent_with(agent_id, ColdResolution::Off)
+            .await
+    }
+
+    /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
+    /// is `cold` (x0x #1207). An opted-in send never takes a blocking
+    /// peer-evidence check or runs a Lookup on itself
+    /// ([`Self::connect_from_evidence_with`]); `Off` is today's connector.
+    async fn connect_to_agent_with(
+        &self,
+        agent_id: &identity::AgentId,
+        cold: ColdResolution,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self.connect_to_agent_inner(agent_id, cold).await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
         }
@@ -5651,17 +5826,39 @@ impl Agent {
 
     /// Dial from a freshly checked evidence view, without creating any agent
     /// binding or discovery entry. ant-quic authenticates the expected machine.
-    async fn connect_from_evidence(
+    ///
+    /// `cold` is the sending side's cold-recipient handling (x0x #1207;
+    /// `Off` for every ordinary caller). An opted-in send never waits on the
+    /// evidence load barrier, never takes a blocking point-of-use check
+    /// (contention: no dial), and never runs a Lookup on itself: the
+    /// Lookup's responder selection blocks synchronously. An opted-in send
+    /// starts the Lookup in the background.
+    async fn connect_from_evidence_with(
         &self,
         agent: identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
-        if !self.peer_evidence().wait(0).await {
-            return None;
+        let nonblocking = cold.opted_in();
+        if nonblocking {
+            if !self.peer_evidence().ready_now() {
+                return None;
+            }
+            self.peer_evidence().spawn_agent_lookup(agent);
+        } else {
+            if !self.peer_evidence().wait(0).await {
+                return None;
+            }
+            self.peer_evidence().lookup(agent, None).await;
         }
-        self.peer_evidence().lookup(agent, None).await;
-        let view = self
-            .peer_evidence()
-            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        let view = if nonblocking {
+            self.peer_evidence()
+                .try_usable_agent(agent, now)
+                .ok()
+                .flatten()
+        } else {
+            self.peer_evidence().usable_agent(agent, now)
+        }?;
         let machine = view.announcement.machine_id;
         if self
             .recipient_pairing_denied(&agent, &machine)
@@ -5684,8 +5881,15 @@ impl Agent {
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
-        self.peer_evidence()
-            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        if nonblocking {
+            self.peer_evidence()
+                .try_usable(agent, machine, now)
+                .ok()
+                .flatten()?;
+        } else {
+            self.peer_evidence().usable(agent, machine, now)?;
+        }
         Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
                 connectivity::ConnectOutcome::Direct(addr)
@@ -5697,7 +5901,10 @@ impl Agent {
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> error::Result<connectivity::ConnectOutcome> {
+        // x0x #1207: an opted-in send never takes a blocking evidence check.
+        let nonblocking_evidence = cold.opted_in();
         let call_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         tracing::debug!(
@@ -5718,14 +5925,24 @@ impl Agent {
         if discovered
             .as_ref()
             .is_some_and(|entry| entry.addresses.is_empty())
-            && self.peer_evidence().wait(0).await
+            && if nonblocking_evidence {
+                self.peer_evidence().ready_now()
+            } else {
+                self.peer_evidence().wait(0).await
+            }
         {
             if let Some(entry) = discovered.as_mut() {
-                if let Some(view) = self.peer_evidence().usable(
-                    *agent_id,
-                    entry.machine_id,
-                    dm_capability::now_unix_ms(),
-                ) {
+                let now = dm_capability::now_unix_ms();
+                let view = if nonblocking_evidence {
+                    self.peer_evidence()
+                        .try_usable(*agent_id, entry.machine_id, now)
+                        .ok()
+                        .flatten()
+                } else {
+                    self.peer_evidence()
+                        .usable(*agent_id, entry.machine_id, now)
+                };
+                if let Some(view) = view {
                     let local_scope = self
                         .network
                         .as_ref()
@@ -5741,7 +5958,7 @@ impl Agent {
         let agent = match discovered {
             Some(a) => a,
             None => {
-                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                if let Some(outcome) = self.connect_from_evidence_with(*agent_id, cold).await {
                     return Ok(outcome);
                 }
 
@@ -7295,6 +7512,36 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None)
+            .await
+    }
+
+    /// Owner removal notices may wait for a verified cold recipient (#1217).
+    /// Call only from one spawned delivery per recipient, holding no lock.
+    /// The budget starts at raw resolution and bounds its reads and cold
+    /// repair. Preflight and the existing transport ACK budget are separate.
+    pub(crate) async fn send_direct_with_config_cold_wait(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// The single DM egress funnel with its ADR-0023 history wiring;
+    /// `cold_wait` is `None` (not opted in) for every caller except the
+    /// crate-internal opt-in above.
+    async fn send_direct_with_history(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -7309,7 +7556,7 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -7362,6 +7609,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -7681,7 +7929,9 @@ impl Agent {
         }
 
         if cap_source == "peer_evidence" {
-            let _ = self.connect_from_evidence(*to).await;
+            let _ = self
+                .connect_from_evidence_with(*to, ColdResolution::Off)
+                .await;
             let still_usable = cap_machine.and_then(|m| {
                 self.peer_evidence()
                     .usable(*to, m, dm_capability::now_unix_ms())
@@ -7695,6 +7945,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
+        // x0x #1207, #1217: `cold_wait` is the OPT-IN handling of a
+        // restart-cold recipient (`send_direct_with_config_cold_wait`;
+        // `None` for every other caller: today's instant failure). It
+        // applies only where raw QUIC is the path that delivers (no
+        // gossip-inbox capability), so a gossip-capable send still falls
+        // back to gossip at once, as before.
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -7707,6 +7963,7 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    if gossip_ok { None } else { cold_wait },
                 )
                 .await
             {
@@ -7789,6 +8046,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        cold_wait,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -8009,18 +8267,25 @@ impl Agent {
     /// repair. Discovery can lag the direct-messaging registry during a
     /// machine transition, so prefer whichever mapping ant-quic reports as
     /// connected and reconcile the discovery entry when the registry wins.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`), every read here ends at
+    /// its resolution deadline (a read still waiting there finds no machine)
+    /// and the evidence check never blocks.
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        let cached_machine_id = {
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "redial discovery", async {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|entry| entry.machine_id)
                 .filter(|machine_id| machine_id.0 != [0_u8; 32])
-        };
+        })
+        .await
+        .ok()?;
         if let Some(machine_id) = cached_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
@@ -8030,16 +8295,33 @@ impl Agent {
             }
         }
 
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "redial registry",
+            self.direct_messaging.get_machine_id(agent_id),
+        )
+        .await
+        .ok()?;
         if let Some(machine_id) = registry_machine_id {
             if transport
                 .is_connected(&ant_quic::PeerId(machine_id.0))
                 .await
             {
                 if cached_machine_id != Some(machine_id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = machine_id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = machine_id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 return Some(machine_id);
@@ -8047,10 +8329,16 @@ impl Agent {
         }
 
         if cached_machine_id.is_none() && registry_machine_id.is_none() {
-            if let Some(view) = self
-                .peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-            {
+            let now = dm_capability::now_unix_ms();
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            if let Some(view) = view {
                 if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
@@ -8065,12 +8353,18 @@ impl Agent {
     /// Re-run the complete identity-discovery dial after the narrow
     /// bootstrap-cache repair path fails. A fresh presence card can contain
     /// usable addresses even when no cached transport route exists.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`) the dial's evidence
+    /// checks are the non-blocking ones and the resolution reads that follow
+    /// end at its deadline ([`Self::connected_direct_machine`]). The dial
+    /// itself is transport, with its own per-address timeouts.
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
         transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        if let Err(error) = self.connect_to_agent(agent_id).await {
+        if let Err(error) = self.connect_to_agent_with(agent_id, cold).await {
             tracing::debug!(
                 target: "x0x::direct",
                 stage = "send",
@@ -8081,7 +8375,8 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, transport).await
+        self.connected_direct_machine(agent_id, transport, cold)
+            .await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -8791,6 +9086,126 @@ impl Agent {
         }
     }
 
+    /// x0x #1207: whether `agent` or `machine` is revoked, read within the
+    /// resolution `deadline` (a held revocation lock past it is
+    /// `AgentNotFound`, the typed retryable outcome).
+    async fn pinned_awaited_binding_revoked(
+        &self,
+        agent: &identity::AgentId,
+        machine: identity::MachineId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<bool> {
+        Self::pinned_bounded(deadline, "revocation", async {
+            let revoked = self.revocation_set.read().await;
+            revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(&machine)
+        })
+        .await
+        .map_err(|_| error::NetworkError::AgentNotFound(agent.0))
+    }
+
+    /// x0x #1207 (P2): `read`, bounded by an opted-in send's ONE resolution
+    /// deadline ([`ColdResolution::Until`]); every other send reads as
+    /// before. A read still waiting at the deadline is `AgentNotFound`, the
+    /// typed, retryable outcome.
+    async fn cold_bounded<T>(
+        cold: ColdResolution,
+        agent_id: &identity::AgentId,
+        stage: &'static str,
+        read: impl std::future::Future<Output = T>,
+    ) -> error::NetworkResult<T> {
+        let Some(deadline) = cold.deadline() else {
+            return Ok(read.await);
+        };
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&agent_id.0, 4)),
+                    read = stage,
+                    outcome = "err_agent_not_found",
+                    "a resolution read was still waiting at the deadline"
+                );
+                Err(error::NetworkError::AgentNotFound(agent_id.0))
+            }
+        }
+    }
+
+    /// Accept a verified cold-recipient binding (#1217). Neither the agent
+    /// nor its machine may be revoked. An evidence binding is dialled within
+    /// the same resolution deadline.
+    async fn accept_cold_binding(
+        &self,
+        agent_id: &identity::AgentId,
+        agent_prefix: &str,
+        binding: PinnedBinding,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<()> {
+        let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+        if self
+            .pinned_awaited_binding_revoked(agent_id, binding.machine, deadline)
+            .await?
+        {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(agent_prefix),
+                outcome = "drop_revoked",
+                "raw-QUIC send refused: the awaited binding names a revoked agent or machine"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
+        if binding.source == PinnedMachineSource::PeerEvidence && cold.opted_in() {
+            let _ =
+                tokio::time::timeout_at(deadline, self.connect_from_evidence_with(*agent_id, cold))
+                    .await;
+        }
+        Ok(())
+    }
+
+    /// Cold removal resolution shares the pinned verified sources, but runs
+    /// Lookup in the background so synchronous evidence locks cannot hold
+    /// this wait past its deadline. No lock survives a source read.
+    async fn await_removal_recipient_binding(
+        &self,
+        to: &identity::AgentId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<PinnedBinding> {
+        let started = std::time::Instant::now();
+        let wait = async {
+            if let Some(binding) = self.pinned_binding_now(to).await {
+                return Some(binding);
+            }
+            self.peer_evidence().spawn_agent_lookup(*to);
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(PINNED_RESOLUTION_POLL) => {}
+                    () = self.shutdown_token.cancelled() => return None,
+                }
+                if let Some(binding) = self.pinned_binding_now(to).await {
+                    return Some(binding);
+                }
+            }
+        };
+        let binding = tokio::time::timeout_at(deadline, wait)
+            .await
+            .ok()
+            .flatten()
+            .ok_or(error::NetworkError::AgentNotFound(to.0))?;
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "send",
+            agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
+            source = binding.source.label(),
+            waited_ms = started.elapsed().as_millis() as u64,
+            "removal recipient resolved"
+        );
+        Ok(binding)
+    }
+
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
     /// discovery cache, DM registry or peer evidence, any send-readiness
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
@@ -8799,6 +9214,8 @@ impl Agent {
     ///
     /// `transport` supplies connection state, repair and redial (r7b). The
     /// pinned path resolves its target with [`Self::resolve_pinned_target`].
+    /// `cold` is the opted-in handling of a restart-cold recipient (x0x
+    /// #1207, #1217; [`ColdResolution`]).
     async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
@@ -8806,39 +9223,72 @@ impl Agent {
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
+        cold: ColdResolution,
     ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
         // the direct-messaging registry when an inbound connection is accepted
         // and later reconciled from transport events.
-        let cached_machine_id = {
+        //
+        // x0x #1207 (P2): for an opted-in send, every resolution read below
+        // ends at the one deadline (`cold_bounded`).
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "discovery", async {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|d| d.machine_id)
                 .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
-        };
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        })
+        .await?;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "registry",
+            self.direct_messaging.get_machine_id(agent_id),
+        )
+        .await?;
 
         let evidence_machine = if cached_machine_id.is_none()
             && registry_machine_id.is_none()
-            && self.peer_evidence().wait(0).await
+            && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
         {
-            self.peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-                .map(|v| v.announcement.machine_id)
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store (contention reads as no evidence).
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            view.map(|v| v.announcement.machine_id)
         } else {
             None
         };
+        // x0x #1207: whether the machine came from a cold-recipient binding
+        // (re-validated against the final machine after repair).
+        let mut awaited = false;
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
             (_, Some(id)) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 (id, "registry_connected")
@@ -8848,7 +9298,15 @@ impl Agent {
             (None, Some(id)) => (id, "registry_not_connected"),
             (None, None) if evidence_machine.is_some() => {
                 let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
-                let _ = self.connect_from_evidence(*agent_id).await;
+                let dial = self.connect_from_evidence_with(*agent_id, cold);
+                match cold.deadline() {
+                    Some(deadline) => {
+                        let _ = tokio::time::timeout_at(deadline, dial).await;
+                    }
+                    None => {
+                        let _ = dial.await;
+                    }
+                }
                 (id, "peer_evidence")
             }
             (None, None) => {
@@ -8859,23 +9317,67 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
-                let _ = self.connect_to_agent(agent_id).await;
-                let id = self
-                    .direct_messaging
-                    .get_machine_id(agent_id)
-                    .await
-                    .ok_or_else(|| {
-                        tracing::warn!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                            outcome = "err_agent_not_found",
-                            dur_ms = send_start.elapsed().as_millis() as u64,
-                            "no machine_id after connect_to_agent"
-                        );
-                        error::NetworkError::AgentNotFound(agent_id.0)
-                    })?;
-                (id, "post_connect")
+                #[cfg(test)]
+                general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes).await;
+                match cold {
+                    // Not opted in: today's behaviour, an instant failure
+                    // (a gossip fallback, if any, follows).
+                    ColdResolution::Off => {
+                        let _ = self.connect_to_agent(agent_id).await;
+                        match self.direct_messaging.get_machine_id(agent_id).await {
+                            Some(id) => (id, "post_connect"),
+                            None => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no machine_id after connect_to_agent"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                    // x0x #1207, #1217 (opt-in, `send_direct_with_config_cold_wait`):
+                    // a restart leaves the discovery cache and the DM registry
+                    // cold. Wait, within the ONE absolute deadline (from the
+                    // start of this raw attempt), for a VERIFIED binding. The
+                    // sources and order are the pinned path's
+                    // (`select_pinned_binding`): the announced-binding store, the
+                    // ADR-0021 attestation, the DM registry, then peer evidence,
+                    // with one EvidenceV1 Lookup. The binding is re-validated
+                    // against the FINAL machine after repair (below).
+                    ColdResolution::Until(deadline) => {
+                        let _ = tokio::time::timeout_at(
+                            deadline,
+                            self.connect_to_agent_with(agent_id, cold),
+                        )
+                        .await;
+                        match self
+                            .await_removal_recipient_binding(agent_id, deadline)
+                            .await
+                        {
+                            Ok(binding) => {
+                                self.accept_cold_binding(agent_id, agent_prefix, binding, cold)
+                                    .await?;
+                                awaited = true;
+                                (binding.machine, binding.source.label())
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no verified machine for the recipient within the resolution deadline"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -8883,7 +9385,14 @@ impl Agent {
         // resolve a machine the discovery cache never saw (raw-QUIC
         // fallback) — evaluate B+P for whatever machine was resolved so a
         // DM cannot reach a retired old-source binding through it.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 stage = "send",
@@ -8916,10 +9425,19 @@ impl Agent {
         // Skip when resolution == "post_connect" (last-resort branch already
         // invoked connect_to_agent above).
         let mut repair_outcome: Option<&'static str> = None;
+        // A cold binding may be repaired, but never redialled to another
+        // discovery machine. Its repair shares the resolution deadline.
         if !connected && resolution != "post_connect" {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let outcome = match tokio::time::timeout(
-                REPAIR_TIMEOUT,
+            // x0x #1207 (Codex r5): the repair of a cold binding is newly
+            // reachable, so it ends at the send's absolute deadline too.
+            let repair_until = tokio::time::Instant::now() + REPAIR_TIMEOUT;
+            let repair_until = match (awaited, cold.deadline()) {
+                (true, Some(deadline)) => deadline.min(repair_until),
+                _ => repair_until,
+            };
+            let outcome = match tokio::time::timeout_at(
+                repair_until,
                 transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await
@@ -8944,8 +9462,8 @@ impl Agent {
             // separate. If the fast bootstrap-cache repair cannot recover a
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
-            if !connected {
-                if let Some(redialed_machine_id) = transport.redial(self, agent_id).await {
+            if !connected && !awaited {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id, cold).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -8955,13 +9473,80 @@ impl Agent {
             }
         }
 
-        if resolution == "peer_evidence"
-            && self
-                .peer_evidence()
-                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
-                .is_none()
-        {
+        if awaited && !connected {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                resolution,
+                ?repair_outcome,
+                outcome = "err_agent_not_found",
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "raw-QUIC send: the cold recipient's bound machine is not connected; the caller retries"
+            );
             return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        }
+
+        if resolution == "peer_evidence" {
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store; contention fails closed (typed, retryable).
+            let usable = if cold.opted_in() {
+                matches!(
+                    self.peer_evidence().try_usable(*agent_id, machine_id, now),
+                    Ok(Some(_))
+                )
+            } else {
+                self.peer_evidence()
+                    .usable(*agent_id, machine_id, now)
+                    .is_some()
+            };
+            if !usable {
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+        }
+
+        // x0x #1207 (P1): a cold-recipient binding is re-validated against
+        // the FINAL machine (repair or redial may have replaced it): the
+        // current verified binding (expiry included) must still name it, and
+        // neither the agent nor the machine may be revoked. Every read ends
+        // at the same resolution deadline.
+        if awaited {
+            let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+            let current = Self::pinned_bounded(
+                deadline,
+                "general revalidation",
+                self.pinned_binding_now(agent_id),
+            )
+            .await
+            .map_err(|_| error::NetworkError::AgentNotFound(agent_id.0))?;
+            if current.map(|binding| binding.machine) != Some(machine_id) {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_binding_changed",
+                    "raw-QUIC send refused: the recipient's verified binding no longer names the final machine"
+                );
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+            if self
+                .pinned_awaited_binding_revoked(agent_id, machine_id, deadline)
+                .await?
+            {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_revoked_post_resolution",
+                    "raw-QUIC send refused: the agent or the final machine is revoked"
+                );
+                return Err(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                });
+            }
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -8969,8 +9554,16 @@ impl Agent {
         // check never saw — re-run B/P against the FINAL machine
         // immediately before transmission, so a retired or
         // pinned-elsewhere binding reached through the repair path is
-        // refused here regardless of how it was resolved.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        // refused here regardless of how it was resolved. x0x #1207 (P2):
+        // for an opted-in send this read too ends at the deadline.
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing after resolution",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
@@ -9050,14 +9643,75 @@ impl Agent {
         })
     }
 
+    /// In-process stand-in for the GENERAL raw-QUIC send (x0x #1207,
+    /// #1217): the production target resolution (`resolve_raw_quic_target`,
+    /// over the strict stand-in's scripted transport), with the network
+    /// write replaced by a delivery witness. Strict test agents only.
+    #[cfg(test)]
+    async fn general_raw_standin(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        agent_prefix: &str,
+        send_start: std::time::Instant,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let transport =
+            RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+        let target = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &transport,
+                agent_prefix,
+                payload.len(),
+                send_start,
+                cold,
+            )
+            .await?;
+        if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
+            deliveries.push((
+                self.identity.agent_id(),
+                *agent_id,
+                target.machine_id,
+                payload.to_vec(),
+            ));
+        }
+        Ok(dm::DmPath::RawQuic)
+    }
+
+    /// Test seam (x0x #1207): the general raw-QUIC deliveries this agent's
+    /// strict stand-in made, as `(recipient, machine, payload)`.
+    #[cfg(test)]
+    pub(crate) fn general_raw_standin_deliveries_for_testing(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::MachineId, Vec<u8>)> {
+        let me = self.identity.agent_id();
+        GENERAL_RAW_STANDIN_DELIVERIES
+            .lock()
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter(|(from, ..)| *from == me)
+                    .map(|(_, to, machine, payload)| (*to, *machine, payload.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        cold_wait: Option<ColdWait>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
+        // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
+        // attempt, for every resolution read of an opted-in send. The
+        // existing warm-recipient transport and ACK budgets are unchanged;
+        // a newly learned cold binding's repair also ends at this deadline.
+        let cold = ColdResolution::starting_now(cold_wait);
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
         let bytes = payload.len();
@@ -9068,6 +9722,12 @@ impl Agent {
             "raw_quic"
         };
 
+        #[cfg(test)]
+        if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            return self
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start, cold)
+                .await;
+        }
         let network = self.network.as_ref().ok_or_else(|| {
             tracing::warn!(
                 target: "x0x::direct",
@@ -9091,6 +9751,7 @@ impl Agent {
                 &agent_prefix,
                 bytes,
                 send_start,
+                cold,
             )
             .await?;
 
@@ -10863,9 +11524,11 @@ impl Agent {
                                         )
                                         .await
                                         {
-                                            tracing::warn!(
-                                                "failed to persist revocation set: {e}"
-                                            );
+                                            if !storage::revocation_persistence_is_blocked(&e) {
+                                                tracing::warn!(
+                                                    "failed to persist revocation set: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => tracing::warn!(
@@ -12761,6 +13424,21 @@ impl Agent {
         std::sync::Arc::clone(&self.identity_discovery_cache)
     }
 
+    /// `agent_id`'s current authenticated bound machine: the retained
+    /// binding from its latest direct-origin identity announcement or fresh
+    /// origin attestation, read without touching its recency. ADR 0108 §4:
+    /// the OwnerCertified evidence builder reads an anonymous announce as
+    /// absence of disclosure only when this machine signed it.
+    pub(crate) async fn authenticated_bound_machine(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<dm_inbox::AuthenticatedMachineBinding> {
+        self.authenticated_machine_bindings
+            .read()
+            .await
+            .peek(agent_id)
+    }
+
     /// Return the shared contact store (`pub(crate)` — used by the forwarder
     /// to evaluate trust for ForwardV2 attestation, #204 must-fix 3).
     pub(crate) fn contact_store(
@@ -12785,14 +13463,15 @@ impl Agent {
     /// - **Issuer-revocation**: the issuer is the user who signed the subject
     ///   agent's certificate (the certificate must be passed as `subject_cert`).
     ///
-    /// On success, the record is inserted into the local revocation set,
-    /// persisted to `revocations.bin`, published on [`REVOCATION_TOPIC`], and
-    /// the subject is evicted from all discovery caches.
+    /// The record is inserted into the local revocation set, persisted to
+    /// its subject's v1/v2/v3 store, published on the matching revocation
+    /// topic, and the subject is evicted from all discovery caches.
     ///
     /// # Errors
     ///
     /// Returns an error if signing fails, the authority check fails, or the
-    /// gossip publish fails.
+    /// gossip publish fails. A [`error::IdentityError::Storage`] error can
+    /// be returned after the record was applied and published: it is not durable.
     pub async fn revoke(
         &self,
         issuer_keypair: &identity::AgentKeypair,
@@ -12834,7 +13513,9 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error when no owner key is loaded, signing fails, or
-    /// the authority check rejects the record.
+    /// the authority check rejects the record. A [`error::IdentityError::Storage`]
+    /// error can be returned after the record was applied and published:
+    /// it is not durable.
     pub async fn revoke_as_owner(
         &self,
         subject_cert: &identity::AgentCertificate,
@@ -12882,20 +13563,44 @@ impl Agent {
             }
         }
 
-        // 2. Persist. The legacy file filters share-grant records out
-        //    (#926 r3), so those also go to `revocations-v3.bin`.
-        storage::save_revocation_set(
-            &*self.revocation_set.read().await,
-            self.identity_dir.as_deref(),
-        )
-        .await?;
-        if matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)) {
-            persist_share_grant_revocations_durable(
-                &self.revocation_set,
-                self.identity_dir.as_deref(),
-            )
-            .await
-            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(e)))?;
+        // 2. Return only the subject's own store result. V1 does not
+        //    change for binding/share-grant subjects; its unreadability
+        //    must not turn their successful v2/v3 save into a failure.
+        let persisted = match &record.subject {
+            revocation::RevokedSubject::ShareGrant(_) => {
+                persist_share_grant_revocations_durable(
+                    &self.revocation_set,
+                    self.identity_dir.as_deref(),
+                )
+                .await
+            }
+            revocation::RevokedSubject::AgentMachineBinding(_) => {
+                match self.revocation_set.read().await.to_bytes_v2() {
+                    Ok(bytes) => match self.move_file_path("revocations-v2.bin") {
+                        Some(path) => storage::save_private_bytes_to(&path, bytes).await,
+                        None => Ok(()),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            _ => {
+                storage::save_revocation_set(
+                    &*self.revocation_set.read().await,
+                    self.identity_dir.as_deref(),
+                )
+                .await
+            }
+        };
+        if matches!(
+            record.subject,
+            revocation::RevokedSubject::AgentMachineBinding(_)
+                | revocation::RevokedSubject::ShareGrant(_)
+        ) {
+            // Structural probe logs a blocked legacy store at the same
+            // rate limit, without rewriting its unchanged record set.
+            if let Some(path) = storage::revocation_path(self.identity_dir.as_deref()) {
+                let _ = storage::probe_revocation_store(&path, storage::RevocationStore::V1).await;
+            }
         }
 
         // 3. Evict from caches.
@@ -12903,19 +13608,30 @@ impl Agent {
 
         // 4. Publish on gossip (best-effort — local enforcement happens regardless).
         if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.all_records();
+            let (topic, records) = {
+                let set = self.revocation_set.read().await;
+                match &record.subject {
+                    revocation::RevokedSubject::AgentMachineBinding(_) => {
+                        (REVOCATION_V2_TOPIC, set.binding_records())
+                    }
+                    revocation::RevokedSubject::ShareGrant(_) => {
+                        (REVOCATION_V3_TOPIC, set.share_grant_records())
+                    }
+                    _ => (REVOCATION_TOPIC, set.all_records()),
+                }
+            };
             match bincode::serialize(&records) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = rt
                         .pubsub()
-                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .publish(topic.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
                 _ => {}
             }
         }
 
-        Ok(())
+        persisted
     }
 
     // === ADR-0043: agent key-move ceremony ===
@@ -12999,7 +13715,9 @@ impl Agent {
     /// step calls this and propagates the failure; the in-memory append
     /// that preceded it is idempotent on retry (identical bytes →
     /// identical fold), so the operator re-runs the command and the
-    /// persist retries. `Ok(())` means every file encoded AND wrote.
+    /// persist retries. An unreadable v2 revocation file is logged and
+    /// preserved without failing the ceremony: bundle tombstones rebuild
+    /// from `move-bundles.bin`. The three move-state files remain required.
     ///
     /// # Errors
     ///
@@ -13023,7 +13741,15 @@ impl Agent {
         ] {
             let bytes = bytes?;
             if let Some(path) = self.move_file_path(name) {
-                storage::save_private_bytes_to(&path, bytes).await?;
+                if let Err(e) = storage::save_private_bytes_to(&path, bytes).await {
+                    if name != "revocations-v2.bin"
+                        || !storage::revocation_persistence_is_blocked(&e)
+                    {
+                        return Err(e);
+                    }
+                    // The guard already emitted the rate-limited
+                    // persistence_blocked WARN for this v2 write.
+                }
             }
         }
         Ok(())
@@ -13988,7 +14714,8 @@ impl Agent {
     ///
     /// # Errors
     /// Returns an error when no owner key is loaded or the authority
-    /// check rejects the record.
+    /// check rejects the record. A [`error::IdentityError::Storage`] error can
+    /// be returned after the record was applied and published: it is not durable.
     pub async fn revoke_binding(
         &self,
         agent: &identity::AgentId,
@@ -14065,25 +14792,6 @@ impl Agent {
         )?;
         self.apply_and_publish_revocation(record.clone(), Some(&cert))
             .await?;
-        // v2 carrier: binding records ride their own topic + file.
-        if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.binding_records();
-            if let Ok(bytes) = bincode::serialize(&records) {
-                if !bytes.is_empty() {
-                    let _ = rt
-                        .pubsub()
-                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
-                }
-            }
-        }
-        if let Ok(v2) = self.revocation_set.read().await.to_bytes_v2() {
-            if let Some(path) = self.move_file_path("revocations-v2.bin") {
-                if let Err(e) = storage::save_private_bytes_to(&path, v2).await {
-                    tracing::warn!("revocations-v2 persist failed: {e}");
-                }
-            }
-        }
         Ok(record)
     }
 
@@ -15711,6 +16419,36 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            call_caller,
+            false,
+        )
+        .await
+    }
+
+    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
+    /// peers gain evidence admission; every other check remains unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_peer_machine_inbound_for_evidence(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        call_caller: Option<&identity::AgentId>,
+        evidence_only: bool,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -15788,9 +16526,18 @@ impl Agent {
                     grant_only.push(*agent_id);
                 }
             }
+            let evidence_relationship = evidence_only
+                && pair.decision == trust::TrustDecision::Unknown
+                && evidence_wire::unknown_relationship(
+                    discovery_cache,
+                    owner_trust,
+                    agent_id,
+                    machine_id,
+                )
+                .await;
             let trust_decision = Some(
                 pair.decision
-                    .with_owner_trust(has_connect_grant || has_call_grant),
+                    .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
             );
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
@@ -16096,7 +16843,8 @@ impl Agent {
     }
 
     /// Keep the main gate-first path independent of strangers' prefix reads.
-    /// Known denials never get a pre-identity exception, including EvidenceV1.
+    /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
+    /// All other denials remain on the shared gate.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -16125,11 +16873,35 @@ impl Agent {
                 owner_trust,
                 machine_id,
             )
-            .await
-            .ok()?;
+            .await;
+            let agents = match agents {
+                Ok(agents) => agents,
+                Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                    Self::gate_peer_machine_inbound_for_evidence(
+                        discovery_cache,
+                        contact_store,
+                        revocation_set,
+                        move_state,
+                        connect_policy,
+                        owner_trust,
+                        machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .ok()?;
+                    return Some(streams::InboundAdmission {
+                        agents: None,
+                        prefix: Some(limits.admit_prefix(*machine_id)?),
+                        evidence_only: true,
+                    });
+                }
+                Err(_) => return None,
+            };
             return Some(streams::InboundAdmission {
                 agents: Some(agents),
                 prefix: None,
+                evidence_only: false,
             });
         }
         if owner_trust
@@ -16139,11 +16911,13 @@ impl Agent {
             return Some(streams::InboundAdmission {
                 agents: None,
                 prefix: None,
+                evidence_only: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
+            evidence_only: false,
         })
     }
 
@@ -16174,8 +16948,8 @@ impl Agent {
         evidence: std::sync::Arc<peer_evidence::EvidenceRuntime>,
         admission: streams::InboundAdmission,
         machine_id: identity::MachineId,
-        send: ant_quic::HighLevelSendStream,
-        mut recv: ant_quic::HighLevelRecvStream,
+        send: network::StreamSend,
+        mut recv: network::StreamRecv,
     ) {
         let protocol = match tokio::time::timeout(
             streams::PREFIX_READ_TIMEOUT,
@@ -16213,6 +16987,33 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
+            // Recheck live denials and relationships after the prefix wait.
+            // A previously known machine cannot turn into a stranger bypass
+            // if its discovery entries disappear during that wait.
+            let known = discovery_cache
+                .read()
+                .await
+                .values()
+                .any(|a| a.machine_id == machine_id);
+            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
+            if machine_revoked
+                || ((known || admission.agents.is_some() || admission.evidence_only)
+                    && Self::gate_peer_machine_inbound_for_evidence(
+                        &discovery_cache,
+                        &contact_store,
+                        &revocation_set,
+                        &move_state,
+                        &connect_policy,
+                        &owner_trust,
+                        &machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .is_err())
+            {
+                return;
+            }
             if let (Some(sender), Some(lease)) = (
                 incoming.registered_sender(protocol),
                 evidence_limits.admit(
@@ -16318,7 +17119,8 @@ impl Agent {
     /// Called automatically by [`Agent::join_network`]. The loop is the sole
     /// transport acceptor. Known peers clear the identity and ACL gates before
     /// any prefix read. Verified enrollment bypasses the pre-identity pool;
-    /// strangers alone use its two-per-machine, 32-total slots. Body bytes
+    /// strangers and Unknown relationship peers use its two-per-machine,
+    /// 32-total slots. Body bytes
     /// reach only the selected acceptor after protocol admission.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
@@ -18208,18 +19010,24 @@ impl AgentBuilder {
             }
             // Ad-hoc binding records (v2 file) merge into the same set.
             if let Some(dir) = dir {
-                if let Ok(bytes) = tokio::fs::read(dir.join("revocations-v2.bin")).await {
-                    match revocation::RevocationSet::from_bytes_v2(&bytes) {
-                        Ok(v2) => revoked_for_load.merge_v2(v2),
-                        Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v2)) = storage::read_revocation_store(
+                    &dir.join("revocations-v2.bin"),
+                    storage::RevocationStore::V2,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v2(v2);
                 }
                 // ADR-0070: share-grant revocations (v3 file).
-                if let Ok(bytes) = tokio::fs::read(dir.join(SHARE_GRANT_REVOCATIONS_FILE)).await {
-                    match revocation::RevocationSet::from_bytes_v3(&bytes) {
-                        Ok(v3) => revoked_for_load.merge_v3(v3),
-                        Err(e) => tracing::warn!("revocations-v3.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v3)) = storage::read_revocation_store(
+                    &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
+                    storage::RevocationStore::V3,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v3(v3);
                 }
             }
             (state, logs_corrupt)
@@ -21855,6 +22663,404 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+
+    mod unreadable_revocation_files_1116 {
+        use super::*;
+
+        fn agent_builder(dir: &std::path::Path) -> AgentBuilder {
+            Agent::builder()
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_identity_dir(dir)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_user_key(identity::UserKeypair::generate().expect("owner key"))
+                .with_peer_cache_disabled()
+        }
+
+        async fn load_agent(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
+                .build()
+                .await
+                .expect("fail-open agent load")
+        }
+
+        async fn load_agent_with_gossip(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("fail-open agent load with loopback gossip")
+        }
+
+        /// A local durability refusal must still enforce, evict and hand
+        /// the revocation to its gossip carrier before returning the error.
+        #[tokio::test]
+        async fn blocked_local_revocations_still_enforce_and_publish_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                tokio::fs::write(dir.path().join(name), b"unreadable")
+                    .await
+                    .unwrap();
+            }
+            let agent = load_agent_with_gossip(dir.path()).await;
+            let owner = agent.identity.user_keypair().unwrap();
+            let cert = agent.identity.agent_certificate().unwrap();
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
+            let subjects = [
+                (
+                    revocation::RevokedSubject::Agent(agent.agent_id()),
+                    REVOCATION_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::AgentMachineBinding(
+                        revocation::AgentMachineBinding {
+                            agent: agent.agent_id(),
+                            machine: agent.machine_id(),
+                            move_epoch: 1,
+                        },
+                    ),
+                    REVOCATION_V2_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                        grant_id: [0x33; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: u64::MAX,
+                    }),
+                    REVOCATION_V3_TOPIC,
+                ),
+            ];
+            for (subject, topic) in subjects {
+                let _subscription = pubsub.subscribe(topic.to_string()).await;
+                let before = pubsub.stats().publish_total;
+                let record = revocation::RevocationRecord::sign(
+                    subject,
+                    owner.public_key(),
+                    owner.secret_key(),
+                    Agent::unix_timestamp_secs(),
+                    None,
+                )
+                .unwrap();
+                let hash = record.record_hash();
+                let err = agent
+                    .apply_and_publish_revocation(record, Some(cert))
+                    .await
+                    .unwrap_err();
+                assert!(storage::revocation_persistence_is_blocked(&err));
+                assert!(agent.revocation_set.read().await.contains_hash(&hash));
+                assert_eq!(
+                    pubsub.stats().publish_total,
+                    before + 1,
+                    "blocked revoke must still publish"
+                );
+            }
+            assert!(agent
+                .contact_store
+                .read()
+                .await
+                .is_blocked(&agent.agent_id()));
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                    b"unreadable"
+                );
+            }
+            agent.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn unchanged_v1_does_not_fail_binding_or_share_grant_revokes_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("revocations.bin");
+            tokio::fs::write(&path, b"unreadable v1").await.unwrap();
+            let agent = load_agent_with_gossip(dir.path()).await;
+            let owner = agent.identity.user_keypair().unwrap();
+            let cert = agent.identity.agent_certificate().unwrap();
+            let subjects = [
+                (
+                    revocation::RevokedSubject::AgentMachineBinding(
+                        revocation::AgentMachineBinding {
+                            agent: agent.agent_id(),
+                            machine: agent.machine_id(),
+                            move_epoch: 1,
+                        },
+                    ),
+                    REVOCATION_V2_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                        grant_id: [0x44; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: u64::MAX,
+                    }),
+                    REVOCATION_V3_TOPIC,
+                ),
+            ];
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
+            for (subject, topic) in subjects {
+                let mut subscription = pubsub.subscribe(topic.to_string()).await;
+                let before = pubsub.stats().publish_total;
+                let record = revocation::RevocationRecord::sign(
+                    subject.clone(),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    Agent::unix_timestamp_secs(),
+                    None,
+                )
+                .unwrap();
+                let mut hash = record.record_hash();
+                if matches!(subject, revocation::RevokedSubject::ShareGrant(_)) {
+                    let issuer = identity::AgentKeypair::from_bytes(
+                        owner.public_key().as_bytes(),
+                        owner.secret_key().as_bytes(),
+                    )
+                    .unwrap();
+                    let published = agent
+                        .revoke(&issuer, subject.clone(), None, None)
+                        .await
+                        .unwrap();
+                    hash = published.record_hash();
+                } else {
+                    agent
+                        .apply_and_publish_revocation(record, Some(cert))
+                        .await
+                        .unwrap();
+                }
+                assert!(agent.revocation_set.read().await.contains_hash(&hash));
+                assert_eq!(pubsub.stats().publish_total, before + 1);
+                let message = tokio::time::timeout(
+                    std::time::Duration::from_secs(5 * u64::from(test_time_multiplier())),
+                    subscription.recv(),
+                )
+                .await
+                .expect("revocation must reach its own local topic subscription")
+                .expect("topic subscription remains open");
+                assert_eq!(message.topic, topic);
+                let published: Vec<revocation::RevocationRecord> =
+                    bincode::deserialize(&message.payload)
+                        .expect("decode revocation topic payload");
+                assert_eq!(published.len(), 1, "only this topic's subject is published");
+                assert_eq!(published[0].record_hash(), hash);
+                let (name, restored) = match subject {
+                    revocation::RevokedSubject::AgentMachineBinding(_) => {
+                        let name = "revocations-v2.bin";
+                        (
+                            name,
+                            revocation::RevocationSet::from_bytes_v2(
+                                &tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => {
+                        let name = SHARE_GRANT_REVOCATIONS_FILE;
+                        (
+                            name,
+                            revocation::RevocationSet::from_bytes_v3(
+                                &tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                };
+                assert!(restored.contains_hash(&hash), "subject persisted in {name}");
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v1");
+            agent.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn key_move_step_succeeds_with_unreadable_v2_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("revocations-v2.bin");
+            tokio::fs::write(&path, b"unreadable v2").await.unwrap();
+            let agent = load_agent(dir.path()).await;
+            assert_eq!(agent.move_mint_placements().await.unwrap(), 1);
+            assert!(agent
+                .move_state
+                .read()
+                .await
+                .placement(&agent.agent_id())
+                .is_some());
+            let restored = key_move::MoveState::logs_from_bytes(
+                &tokio::fs::read(dir.path().join("moves.bin")).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored.log(&agent.agent_id()).len(), 1);
+            for name in ["move-bundles.bin", "placement-blobs.bin"] {
+                assert!(tokio::fs::read(dir.path().join(name)).await.is_ok());
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v2");
+
+            // Only a blocked v2 is tolerated; required move journals still fail.
+            tokio::fs::remove_file(dir.path().join("moves.bin"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir(dir.path().join("moves.bin"))
+                .await
+                .unwrap();
+            assert!(agent.persist_move_state().await.is_err());
+            agent.shutdown().await;
+        }
+
+        /// #1116 / ADR 0085 rule 4: the real startup load and local binding
+        /// revocation writer must preserve an unreadable v2 binding-tombstone file.
+        #[tokio::test]
+        async fn unreadable_v2_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("revocations-v2.bin");
+            let garbage = b"unreadable v2 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v2 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let cert = agent.identity().agent_certificate().expect("agent cert");
+            let own = agent.agent_id();
+            let machine = agent.machine_id();
+            let placement = key_move::PlacementRecord::sign(
+                own,
+                owner.public_key().as_bytes(),
+                key_move::Placement::Roaming,
+                1,
+                1,
+                owner.secret_key(),
+            )
+            .expect("sign placement");
+            let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+            agent
+                .move_state
+                .write()
+                .await
+                .cache_placement(placement, authority)
+                .expect("cache placement for revocation epoch");
+
+            // Drive the real v2 writer on both 6544555 and the fixed tree.
+            // Check byte preservation BEFORE the result: old revoke_binding
+            // returns Ok after replacing the corrupt file with a v2 set.
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_binding_revoked(&own, &machine));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v2.bin byte-identical"
+            );
+            let refused = outcome.expect_err("v2 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v2().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            agent
+                .revoke_binding(&own, &machine, 1, None)
+                .await
+                .expect("repair unblocks v2");
+            let restored =
+                revocation::RevocationSet::from_bytes_v2(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_binding_revoked(&own, &machine));
+            agent.shutdown().await;
+        }
+
+        /// #1116 / ADR 0085 rule 4: startup ignores an unreadable v3 file,
+        /// but the real gossip ingestion/merge writer must not replace it.
+        #[tokio::test]
+        async fn unreadable_v3_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(SHARE_GRANT_REVOCATIONS_FILE);
+            let garbage = b"unreadable v3 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v3 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let grant_id = [0x11; 32];
+            let record = revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                    grant_id,
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                Agent::unix_timestamp_secs(),
+                None,
+            )
+            .expect("sign share-grant revocation");
+            let payload = bincode::serialize(&vec![record]).expect("encode v3 carrier");
+            assert!(
+                ingest_share_grant_revocations(
+                    &agent.owner_trust,
+                    &agent.revocation_set,
+                    Some(dir.path().to_path_buf()),
+                    &payload,
+                )
+                .await,
+                "real v3 ingestion must accept the new revocation"
+            );
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v3.bin byte-identical"
+            );
+            let refused =
+                persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                    .await
+                    .expect_err("v3 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v3().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                .await
+                .expect("repair unblocks v3");
+            let restored =
+                revocation::RevocationSet::from_bytes_v3(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+        }
+    }
 
     /// #1135: a gossip publish that reaches zero eager peers is counted
     /// (`publish_with_fanout` == 0 on a solo node), so

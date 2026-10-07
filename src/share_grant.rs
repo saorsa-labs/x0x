@@ -1646,7 +1646,7 @@ pub async fn record_local_share_grant_revocation(
     if let Err(e) =
         crate::persist_share_grant_revocations_durable(revocation_set, identity_dir).await
     {
-        failures.push(e);
+        failures.push(e.to_string());
     }
     if let (Some(outbox), Some(grant_id)) = (outbox, grant_id) {
         if let Err(e) = outbox.remove_grant(&grant_id).await {

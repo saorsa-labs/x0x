@@ -42,6 +42,7 @@ use super::public_group_bootstrap_outbox::{
 };
 use crate as x0x;
 use crate::groups::aad::secure_share_aad;
+use crate::server::group_access::{self, AccessLevel, MemberState};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -1068,8 +1069,9 @@ const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP *
 pub(in crate::server) struct ApplyMetadataResult {
     /// `true` when the event was accepted and durably persisted.
     pub accepted: bool,
-    /// `true` when the subscriber loop should exit (e.g. self-removal,
-    /// group deletion, membership change requiring re-subscription).
+    /// `true` when the subscriber must re-check local membership (e.g.
+    /// self-removal, group deletion, or a roster change). A still-active
+    /// member keeps its subscription to the unchanged metadata topic.
     pub should_exit: bool,
     /// ADR 0028 Finding B: pre-mutation group state for rollback. Set by
     /// JoinRequestCreated so the relay listener can restore the pre-apply
@@ -1086,8 +1088,8 @@ impl ApplyMetadataResult {
         pre_mutation_group: None,
     };
 
-    /// Event accepted and persisted; subscriber should exit (membership
-    /// roster changed, requiring re-subscription).
+    /// Event accepted and persisted; re-check whether the subscriber
+    /// should exit. Roster changes do not rotate the metadata topic.
     pub const ACCEPTED_EXIT: Self = Self {
         accepted: true,
         should_exit: true,
@@ -3349,6 +3351,14 @@ fn named_group_event_delivery_future(
             return None;
         }
     };
+    // D204 / #1217: every recipient of this authority's removal notice opts in,
+    // including the removed member and survivors. Self-leave, relayed events,
+    // join traffic and every other metadata event keep their existing send path.
+    // The future runs in one spawned task per recipient, with no membership,
+    // roster or publication guard.
+    let cold_removal = matches!(event,
+        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
+            if actor == &hex::encode(state.agent.agent_id().as_bytes()) && actor != agent_id);
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
@@ -3363,8 +3373,20 @@ fn named_group_event_delivery_future(
                 &group_id,
                 None,
                 payload,
+                cold_removal,
             )
             .await
+        } else if cold_removal {
+            agent
+                .send_direct_with_config_cold_wait(
+                    &recipient,
+                    payload,
+                    named_group_direct_delivery_config(),
+                    x0x::dm::PINNED_RESOLUTION_WAIT,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         } else {
             agent
                 .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
@@ -14496,12 +14518,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
 }
 
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
-    if state
-        .group_metadata_tasks
-        .read()
-        .await
-        .contains_key(group_id)
-    {
+    // Serialize check, subscription and install. A read/check followed by
+    // a later insert lets concurrent ensures spawn two live receivers.
+    let mut tasks = state.group_metadata_tasks.write().await;
+    if tasks.contains_key(group_id) {
         return;
     }
 
@@ -14573,14 +14593,27 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         msg.raw_envelope.as_deref(),
                     )
                     .await;
-                    if apply_result.should_exit { break; }
+                    if apply_result.should_exit {
+                        let groups = state_for_task.named_groups.read().await;
+                        let local_agent = hex::encode(state_for_task.agent.agent_id().as_bytes());
+                        if !groups.get(&task_group_id).is_some_and(|group| {
+                            !group.withdrawn && group.has_active_member(&local_agent)
+                        }) {
+                            break;
+                        }
+                        // #1256: all exiting roster events keep this topic.
+                        // Apply already refreshed gossip roster preferences;
+                        // neither the receiver nor the topic is epoch-keyed.
+                        // Retain the receiver AND its queued events, with the
+                        // same #477 J2 token and no re-subscription gap.
+                    }
                 }
             }
         }
         remove_listener_if_token(&state_for_task, &task_group_id, registration_token).await;
     });
 
-    state.group_metadata_tasks.write().await.insert(
+    tasks.insert(
         group_id,
         ListenerRegistration {
             token: registration_token,
@@ -15040,6 +15073,9 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
                     .find(|info| info.stable_group_id() == id || info.mls_group_id == id)
                     .map(|info| (info.stable_group_id().to_string(), info))
             });
+        // #1166 S5 ceiling: the join-status BODY field (`join_state`),
+        // not route admission — the PublicRead row never refuses.
+        #[allow(clippy::disallowed_methods)]
         let pending = match resolved.as_ref() {
             Some((_, info)) => {
                 let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -15091,42 +15127,40 @@ pub(in crate::server) async fn get_named_group(
     Path(id): Path<String>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #447/#458: typed LOCAL membership state so a joiner in limbo (local
     // stub persisted, authority never committed its MemberAdded) can see
     // "pending_authority_commit" instead of a bare 200 that reads as full
     // membership.
-    let (info, membership_state) = {
+    let (info, membership_state, level) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         let info = info.clone();
-        let state_label =
-            local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
-        (info, state_label)
+        // #1166 S1: admission moved to the group-access chokepoint. This
+        // handler keeps its (State, Path, Extension) signature — the
+        // withdrawn-tombstone regression test calls it directly with
+        // positional extractor arguments — so it runs the shared decision
+        // core with the seat label resolved under the same lock read
+        // (S5: inside `admit_named_group_details_of_state`, which also
+        // returns the label — the 200 body below embeds it).
+        let (membership_state, level) =
+            group_access::admit_named_group_details_of_state(state.as_ref(), &info, &actor).await;
+        (info, membership_state, level)
     };
-    if !actor.is_durable_owner() {
-        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
-            return forbidden("rider tokens cannot read named-group details");
-        }
-        if membership_state == "pending_authority_commit" {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "group_id": info.mls_group_id,
-                    "membership_state": "pending_authority_commit",
-                })),
-            );
-        }
-        if membership_state != "active" {
-            return api_error_with_reason(
-                StatusCode::FORBIDDEN,
-                "active local group membership required",
-                "group_membership_required",
-            );
-        }
+    let level = match level {
+        Ok(level) => level,
+        Err(resp) => return resp,
+    };
+    if level == AccessLevel::Member(MemberState::PendingAuthorityCommit) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "group_id": info.mls_group_id,
+                "membership_state": "pending_authority_commit",
+            })),
+        );
     }
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
@@ -15387,7 +15421,7 @@ pub(in crate::server) async fn clear_group_quarantine(
 /// authority's own roster lists us; `pending_authority_commit` means we hold
 /// a join stub and an expected-inviter pin but our own roster seat never
 /// landed — the limbo state that used to read as `already_joined: true`.
-async fn local_join_membership_state(
+pub(in crate::server) async fn local_join_membership_state(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
     local_agent_hex: &str,
@@ -15407,27 +15441,34 @@ async fn local_join_membership_state(
 }
 
 /// GET /groups/:id/members — list local named-group members.
+///
+/// #1166 S1: admission (unknown-group 404, rider 403, session seat gate —
+/// a pending seat of either kind refuses) lives in the `GroupAccess`
+/// extractor. The roster below is served from this handler's OWN lock
+/// read, so the admission core runs AGAIN on that same snapshot
+/// (r2/P2-1): a seat removed between the extractor's read and this one
+/// is refused here, exactly as the pre-extractor single-lock code
+/// refused it. The `Extension` argument keeps its pre-S1 position — a
+/// missing actor stays axum's Extension 500, and it runs before the
+/// extractor.
 pub(in crate::server) async fn get_named_group_members(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-    if !actor.is_durable_owner() {
-        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
-            return forbidden("rider tokens cannot read named-group members");
-        }
-        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-        if local_join_membership_state(state.as_ref(), info, &local_agent_hex).await != "active" {
-            return api_error_with_reason(
-                StatusCode::FORBIDDEN,
-                "active local group membership required",
-                "group_membership_required",
-            );
-        }
+    // Re-run the pure core on THIS lock's roster (r2/P2-1). The label is
+    // only read for session bearers; the other actor arms ignore it —
+    // both inside `admit_named_group_members_of_state` (S5
+    // single-sourced the arm the extractor runs too).
+    let admission =
+        group_access::admit_named_group_members_of_state(state.as_ref(), info, &actor).await;
+    if let Err(resp) = admission {
+        return resp;
     }
     let members = named_group_member_values(info);
     (
@@ -15996,18 +16037,22 @@ pub(in crate::server) async fn send_group_public_message(
     // concurrent role changes can't race the check.
     let (msg, direct_recipients, captured_epoch) = {
         let groups = state.named_groups.read().await;
-        // ADR0066-LOOKUP-WAIVER: the route's own group lookup (404 on a miss, so no contested roster is
-        // ever served); the §3 gate two lines down consumes the `info` it found.
-        // Widening the route's id semantics is out of #732's scope.
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S2: the entry admission (raw-id lookup 404 with the
+        // ADR0066-LOOKUP-WAIVER — no contested roster is ever served,
+        // and widening the route's id semantics is out of #732's scope;
+        // withdrawn 409; the #877 fork-quarantine-for-actor gate with
+        // its session-seat decision before any marker body) runs in the
+        // group-access core under this same read lock, in today's order.
+        let (info, access) = match crate::server::group_access::admit_group_send(
+            state.as_ref(),
+            &id,
+            &groups,
+            &actor,
+            &local_hex,
+        ) {
+            Ok(admitted) => admitted,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
-        if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-            return resp;
-        }
         // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
         // under the SAME read guard as the gate above, so nothing can move
         // between the authorization and the capture. It is re-checked
@@ -16026,24 +16071,19 @@ pub(in crate::server) async fn send_group_public_message(
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
         // Review fix #1 (CRITICAL): authorization uses the ACTING
-        // PRINCIPAL's identity. For the owner that is the daemon's own
-        // agent; for a rider it is the SUB-AGENT on whose behalf the
-        // daemon signs — ban state, membership, and role are checked
-        // against the sub-agent, so a rider can never inherit the
+        // PRINCIPAL's identity — ban state, membership, and role are
+        // checked against it, so a rider can never inherit the
         // daemon-admin's privileges and the provenance envelope is the
-        // authorization subject, not decoration.
-        let acting_hex = match &actor {
-            crate::server::rider_auth::ActorContext::Owner { .. } => local_hex.clone(),
-            crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
-                sub_agent_id.clone()
-            }
-        };
-        if info.is_banned(&acting_hex) {
+        // authorization subject, not decoration. #1166 S2: the principal
+        // now comes from the admission snapshot (`acting_hex`), which
+        // applies the same owner→daemon-agent / rider→sub-agent rule.
+        let acting_hex = access.acting_hex();
+        if info.is_banned(acting_hex) {
             return forbidden("you are banned");
         }
         // Endpoint-side write-access enforcement. Mirror the ingest
         // validator so we reject locally rather than trust receivers.
-        let caller_role = info.caller_role(&acting_hex);
+        let caller_role = info.caller_role(acting_hex);
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
@@ -16329,44 +16369,21 @@ pub(in crate::server) struct GetMessagesQuery {
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
-    Path(id): Path<String>,
+    // Pre-S1 position: `Path` rejected a bad `:id` escape before `Query`
+    // ran — keep it so a request with both a bad path and a bad query
+    // still gets the Path 400 first. The id itself comes from the
+    // GroupAccess snapshot now, hence `_id`.
+    Path(_id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
+    access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // Resolve the stable_group_id — the public-message cache and topic
-    // are keyed on it, while the URL `:id` is typically the
-    // mls_group_id for a locally-owned group.
-    let (read_access, confidentiality, is_member, stable_id) = {
-        let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(&id) {
-            if let Some(resp) = reject_withdrawn_group(info) {
-                return resp;
-            }
-            (
-                info.policy.read_access,
-                info.policy.confidentiality,
-                info.has_active_member(&local_hex),
-                info.stable_group_id().to_string(),
-            )
-        } else {
-            // Unknown locally — fall through to cache lookup by the
-            // supplied id; this supports non-members reading a
-            // discovered Public group whose mls_group_id == stable.
-            drop(groups);
-            (
-                x0x::groups::GroupReadAccess::Public,
-                x0x::groups::GroupConfidentiality::SignedPublic,
-                false,
-                id.clone(),
-            )
-        }
-    };
-    if confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
-        return bad_request("MlsEncrypted groups do not publish a plaintext message history");
-    }
-    if read_access == x0x::groups::GroupReadAccess::MembersOnly && !is_member {
-        return forbidden("members-only read policy");
-    }
+    // #1166 S1: the admission gates (withdrawn 409, MlsEncrypted 400,
+    // members-only 403) and the stable-id resolution — including the
+    // unknown-group fail-open to the public cache, where the supplied
+    // `:id` doubles as the stable id — moved into the `GroupAccess`
+    // extractor. The actor stays: the ADR-0066 §3a annotation below is
+    // actor-scoped and must not drift from `GET /history`.
+    let stable_id = access.stable_id().to_string();
 
     // Ensure the listener is live on the stable-id topic.
     spawn_public_message_listener(Arc::clone(&state), stable_id.clone()).await;
@@ -17772,20 +17789,12 @@ pub(in crate::server) async fn create_group_invite(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     {
+        // #1166 S3: the admin trio (raw-id lookup 404 → seat 403 →
+        // withdrawn 409) runs in the group-access core under this same
+        // lock take.
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            )
-                .into_response();
-        };
-        let agent_id = state.agent.agent_id();
-        let inviter_hex = hex::encode(agent_id.as_bytes());
-        if let Err(e) = require_admin_or_above(info, &inviter_hex) {
-            return e.into_response();
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &inviter_hex) {
             return resp.into_response();
         }
     }
@@ -18766,6 +18775,8 @@ pub(in crate::server) async fn join_group_via_invite(
                 .cloned();
             if let Some(info) = info {
                 let joiner_hex = hex::encode(agent_id.as_bytes());
+                #[allow(clippy::disallowed_methods)]
+                // #1166 S5: join-flow classification, not route admission
                 let membership_state =
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
                 let not_member_row = (membership_state == "not_member")
@@ -19621,12 +19632,12 @@ pub(in crate::server) async fn set_group_display_name(
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let next = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take.
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         next.set_display_name(&agent_hex, req.name.clone());
         next
@@ -19682,15 +19693,12 @@ pub(in crate::server) async fn add_named_group_member(
 
     let (metadata_topic, event, members, epoch, bootstrap_group) = {
         let named_groups = state.named_groups.read().await;
-        let Some(info) = named_groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take, before the TreeKEM delegation below.
+        let info = match group_access::admit_admin_group_route(&named_groups, &id, &actor_hex) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Err(e) = require_admin_or_above(info, &actor_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
             return add_treekem_named_group_member(state, id, agent_id, req).await;
@@ -19902,11 +19910,9 @@ async fn add_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &actor_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &actor_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if info.has_member(&agent_hex) {
             return (
@@ -20213,16 +20219,13 @@ pub(in crate::server) async fn remove_named_group_member(
 
     let (metadata_topic, event, members, epoch, buffered_survivor_envelopes, delivery_roster) = {
         let named_groups = state.named_groups.read().await;
-        let Some(info) = named_groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take (after the TreeKEM pre-dispatch above).
+        let info = match group_access::admit_admin_group_route(&named_groups, &id, &local_agent_hex)
+        {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-
-        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
         }
@@ -21483,11 +21486,9 @@ async fn remove_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &local_agent_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if !info.has_member(&agent_id_hex) {
             return (
@@ -21668,6 +21669,9 @@ async fn remove_treekem_named_group_member(
 pub(in crate::server) async fn get_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    // #1166 S1: the unknown-group 404 lives in the `GroupAccess`
+    // extractor; this surface never had an actor check.
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
@@ -21728,6 +21732,10 @@ pub(in crate::server) async fn get_group_state_commits(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<StateCommitsQuery>,
+    // #1166 S1: early admission (unknown-group 404, live-member gate)
+    // lives in the `GroupAccess` extractor; the core runs AGAIN below
+    // under this handler's own lock (r2/P2-1).
+    _access: crate::server::group_access::GroupAccess,
 ) -> (StatusCode, Json<serde_json::Value>) {
     const STATE_COMMITS_DEFAULT_LIMIT: usize = 100;
     const STATE_COMMITS_MAX_LIMIT: usize = 500;
@@ -21736,21 +21744,17 @@ pub(in crate::server) async fn get_group_state_commits(
         .unwrap_or(STATE_COMMITS_DEFAULT_LIMIT)
         .clamp(1, STATE_COMMITS_MAX_LIMIT);
 
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-
-    // Live groups gate retained roster projections to active members. A
-    // withdrawn local shell is intentionally keyless but still keeps #111
-    // audit history after terminal delete, so keep that history
-    // readable from the local daemon after terminality.
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    if !info.withdrawn && !info.has_active_member(&local_agent_hex) {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "members only: retained state-commit history is member content",
-        );
+    // Re-run the live-member core (withdrawn shells exempt — see the doc
+    // comment above) on THIS lock's roster (r2/P2-1): a seat removed
+    // between the extractor's read and this one is refused here, exactly
+    // as the pre-extractor single-lock code refused it.
+    if let Err(resp) = crate::server::group_access::admit_state_commits(info, &local_hex) {
+        return resp;
     }
 
     let matched = info
@@ -21872,6 +21876,10 @@ async fn owner_certified_seal_with_eviction(
             return Some(Err(resp));
         }
         let evidence = owner_cert_seal_evidence(state, info).await;
+        // ADR 0108 §4 (#1143): on the live record, so in a committed Home
+        // an anonymous announce from a member's own bound machine neither
+        // graces nor evicts a member whose embedded certificate verifies
+        // (`mark_bound_machine_anonymous_announces`).
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
@@ -22342,18 +22350,11 @@ pub(in crate::server) async fn seal_group_state(
     }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
+        // #1166 S3: the admin trio (the inlined caller_role gate and
+        // this withdrawn check) runs in the group-access core, under
+        // this lock take.
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
-        };
-        let role = info.caller_role(&local_hex);
-        if !role
-            .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
-            .unwrap_or(false)
-        {
-            return forbidden("admin role required");
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
     }
@@ -22467,6 +22468,11 @@ async fn withdraw_named_group_terminal(
         let Some(info) = groups.get(id) else {
             return Err(not_found("group not found"));
         };
+        // #1166 S5 ceiling: the admin leg is CONDITIONAL — the
+        // sole-member leave path passes `require_admin = false` (the
+        // #446 waived leg) — so it is not the chokepoint's
+        // unconditional admin pair.
+        #[allow(clippy::disallowed_methods)]
         if require_admin {
             require_admin_or_above(info, &local_hex)?;
         }
@@ -22584,14 +22590,11 @@ pub(in crate::server) async fn leave_group(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
-
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
+    // #1166 S3: lookup 404 → withdrawn 409 → the ACTIVE-seat gate run
+    // in the group-access core (`admit_self_leave`), under this lock
+    // take.
+    //
     // Issue #446 (review round 5): self-leave requires the caller to be
     // an ACTIVE MEMBER. `leave_disposition` returns Proceed for a
     // non-member (`remove_member` is a no-op on them), which previously
@@ -22602,12 +22605,10 @@ pub(in crate::server) async fn leave_group(
     // PendingJoinBlocked exist for exactly that flow), while the admin
     // gate continues to guard the shared terminal-withdrawal flow
     // (POST /groups/:id/state/withdraw).
-    if info.caller_role(&local_agent_hex).is_none() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "leaving a group requires active membership in it",
-        );
-    }
+    let info = match group_access::admit_self_leave(&groups, &id, &local_agent_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
+    };
 
     // #369 / PR #370 review item 4: the ONE self-leave routing decision,
     // computed before the plane dispatch so GSS and TreeKEM groups share it.
@@ -22965,6 +22966,8 @@ pub(in crate::server) async fn owner_cert_evidence_for(
     // ingest-time binding rule: the cached pair was verified against the
     // agent that triggered the fetch, and the digest is attacker-choosable,
     // so the certificate must bind THIS entry's agent id before it counts.
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    let mut anonymous_entries: Vec<AnonymousDiscoveryEntry> = Vec::new();
     {
         let cache = state.agent.identity_discovery_cache();
         let cache = cache.read().await;
@@ -22972,6 +22975,14 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             let entry_hex = hex::encode(entry.agent_id.as_bytes());
             if !wanted.contains(&entry_hex) {
                 continue;
+            }
+            if entry.cert_digest == Some(anonymous) {
+                anonymous_entries.push(AnonymousDiscoveryEntry {
+                    agent_hex: entry_hex.clone(),
+                    agent_id: entry.agent_id,
+                    machine_id: entry.machine_id,
+                    machine_public_key: entry.machine_public_key.clone(),
+                });
             }
             match entry.agent_certificate.as_ref() {
                 Some(cert) => {
@@ -23009,7 +23020,81 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             }
         }
     }
+    mark_bound_machine_anonymous_announces(state, &mut evidence, anonymous_entries, now_unix).await;
     evidence
+}
+
+/// A wanted agent's discovery entry that holds the canonical anonymous
+/// digest, as read under the discovery lock.
+struct AnonymousDiscoveryEntry {
+    agent_hex: String,
+    agent_id: x0x::identity::AgentId,
+    /// The entry's machine id. Routing state: the connector rewrites it to
+    /// whatever machine is connected.
+    machine_id: x0x::identity::MachineId,
+    /// The machine key the entry's latest key-bearing announce carried.
+    /// Only verified announces write it (V3: key ↔ machine id).
+    machine_public_key: Vec<u8>,
+}
+
+/// ADR 0108 §4 (#1143; Codex P2 on #1247): mark each anonymous digest that
+/// the subject's own authenticated bound machine announced.
+///
+/// The Home rule reads an anonymous digest as absence of disclosure because
+/// "only the subject agent's authenticated bound machine can sign its
+/// announce". That needs checking here: a V3 announce is signed by a
+/// machine key alone, and the identity listener caches one for discovery
+/// even when it refuses it as a binding source (not direct-origin), so any
+/// machine can put an anonymous digest for any agent into discovery. An
+/// entry counts only when all of these hold:
+/// - the agent has a retained authenticated binding (its latest
+///   direct-origin identity announce or origin attestation;
+///   `Agent::authenticated_bound_machine`) whose known certificate expiry
+///   has not passed;
+/// - the entry's machine id is that machine, and so is the machine the
+///   entry's machine key derives. The key is the one that verified the
+///   announce; the id alone is routing state the connector can rewrite;
+/// - neither that machine nor the agent's binding to it is revoked.
+///
+/// Any other anonymous digest keeps today's reading (stale against the
+/// embedded certificate, fetch in flight). Each lock is taken alone.
+async fn mark_bound_machine_anonymous_announces(
+    state: &AppState,
+    evidence: &mut x0x::groups::owner_cert::OwnerCertEvidence,
+    entries: Vec<AnonymousDiscoveryEntry>,
+    now_unix: u64,
+) {
+    let mut bound = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(binding) = state
+            .agent
+            .authenticated_bound_machine(&entry.agent_id)
+            .await
+        else {
+            continue;
+        };
+        if x0x::identity::is_expired(binding.cert_not_after, now_unix) {
+            continue;
+        }
+        let signer = ant_quic::MlDsaPublicKey::from_bytes(&entry.machine_public_key)
+            .ok()
+            .map(|key| x0x::identity::MachineId::from_public_key(&key));
+        if entry.machine_id == binding.machine_id && signer == Some(binding.machine_id) {
+            bound.push((entry, binding.machine_id));
+        }
+    }
+    if bound.is_empty() {
+        return;
+    }
+    let revocation_set = state.agent.revocation_set();
+    let revoked = revocation_set.read().await;
+    for (entry, machine) in bound {
+        if !revoked.is_machine_revoked(&machine)
+            && !revoked.is_binding_revoked(&entry.agent_id, &machine)
+        {
+            evidence.observe_bound_machine_anonymous(entry.agent_hex);
+        }
+    }
 }
 
 /// r3 (Codex 8) → r4 (hs-FU-A round 4, Codex r3 addendum item 9): the
@@ -23214,6 +23299,11 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
+    // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
+    // already holds the seat write. Its Home scope is read from metadata,
+    // policy and `commit_log` (`GroupInfo::is_home_scope`), never from the
+    // state hash, so an anonymous announce from a member's own bound
+    // machine does not block this seal.
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
@@ -23512,7 +23602,10 @@ pub(in crate::server) fn require_admin_or_above(
     }
 }
 
-fn reject_withdrawn_group(
+/// Canonical terminal-withdrawal 409 (`group is withdrawn`) — shared
+/// with the group-access admission cores (`server/group_access.rs`),
+/// which call it instead of copying the body.
+pub(in crate::server) fn reject_withdrawn_group(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.withdrawn
@@ -23524,7 +23617,7 @@ fn reject_withdrawn_group(
 /// seal re-verifies the roster. Secure crypto operations refuse with a
 /// typed, retryable error meanwhile — restored GSS/TreeKEM key material
 /// must not serve a stale membership.
-fn reject_unverified_owner_certified_restore(
+pub(in crate::server) fn reject_unverified_owner_certified_restore(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.owner_cert_reverify_required.then(|| {
@@ -24055,7 +24148,7 @@ fn active_same_stable_keyed_alias_exists(
         })
 }
 
-fn open_envelope_withdrawn_group_conflict(
+pub(in crate::server) fn open_envelope_withdrawn_group_conflict(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -24163,10 +24256,9 @@ async fn home_mutation_requires_durable(
         .await
         .get(group_id)
         // r1 (design A1b): the fence keys on the POLICY OWNER AXIS —
-        // any OwnerCertified-capable group is an owner act to mutate.
-        .is_some_and(|info| {
-            info.home.is_some() || info.policy.admission.owner_certified_user_id().is_some()
-        });
+        // any OwnerCertified-capable group is an owner act to mutate
+        // (shared predicate; one definition with the S3 cores).
+        .is_some_and(group_access::is_home_or_owner_certified);
     if is_home && !actor.is_durable_owner() {
         return Some(api_error(
             StatusCode::FORBIDDEN,
@@ -24202,15 +24294,12 @@ pub(in crate::server) async fn update_named_group(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     let name_update = req.name.clone();
     let desc_update = req.description.clone();
     let mut next = info.clone();
@@ -24294,15 +24383,12 @@ pub(in crate::server) async fn update_group_policy(
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     // (Home fence applied at entry via `home_mutation_requires_durable`.)
 
     let mut new_policy = info.policy.clone();
@@ -24460,10 +24546,9 @@ pub(in crate::server) async fn update_member_role(
         );
     }
 
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
+    // #1166 S3: the admin gate pair runs in the group-access core —
+    // after the target-entry checks above, exactly today's order.
+    if let Err(resp) = group_access::admin_route_gate(info, &caller_hex) {
         return resp;
     }
 
@@ -24544,15 +24629,12 @@ pub(in crate::server) async fn ban_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take, before the TreeKEM delegation below.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);
         return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
@@ -24729,11 +24811,9 @@ async fn ban_treekem_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
@@ -24891,15 +24971,12 @@ pub(in crate::server) async fn unban_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     if !info.is_banned(&agent_id_hex) {
         return bad_request("member is not banned");
     }
@@ -24955,18 +25032,24 @@ pub(in crate::server) async fn unban_group_member(
 }
 
 /// GET /groups/:id/requests — list join requests (admin+).
+///
+/// #1166 S3: admission (unknown-group 404, the local-seat admin gate —
+/// and NO withdrawn check, today's shape) lives in the `GroupAccess`
+/// extractor; the list below is served from this handler's OWN lock
+/// read, so the admission core runs AGAIN on that same snapshot
+/// (r2/P2-1). The route never read an actor and still does not — the
+/// seat gate evaluates the local daemon.
 pub(in crate::server) async fn list_join_requests(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    let info = match group_access::admit_join_request_listing(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
     let mut requests: Vec<&x0x::groups::JoinRequest> = info.join_requests.values().collect();
     requests.sort_by_key(|r| r.created_at);
     let list: Vec<serde_json::Value> = requests
@@ -25000,12 +25083,13 @@ pub(in crate::server) async fn create_join_request(
 
     let (metadata_topic, event_group_id, request, creator_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take; the
+        // data gates below are unchanged.
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
             return forbidden("group admission is not request_access");
         }
@@ -25432,10 +25516,9 @@ pub(in crate::server) async fn approve_join_request(
         };
         // B8: snapshot before mutation for rollback on outbox-persist failure.
         let pre_mutation_snapshot = info.clone();
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        // #1166 S3: the admin gate pair runs in the group-access core,
+        // at this exact position in the write-lock block.
+        if let Err(resp) = group_access::admin_route_gate(info, &caller_hex) {
             return resp;
         }
         if let Some(resp) = treekem_membership_unsupported(info) {
@@ -25900,11 +25983,9 @@ async fn approve_treekem_join_request(
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         let Some(req) = info.join_requests.get(&request_id) else {
             return not_found("request not found");
@@ -26136,15 +26217,12 @@ pub(in crate::server) async fn reject_join_request(
 
     let (metadata_topic, event_group_id, requester_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take.
+        let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
@@ -26219,12 +26297,13 @@ pub(in crate::server) async fn cancel_join_request(
 
     let (metadata_topic, event_group_id, requester_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take; the
+        // request-ownership data gates below are unchanged (#1228).
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
@@ -26905,6 +26984,10 @@ async fn treekem_group_encrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — the gate position under this lock is
+            // load-bearing (ADR-0066 epoch capture follows it).
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27068,6 +27151,9 @@ async fn treekem_group_decrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — same class as the encrypt twin above.
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27143,20 +27229,21 @@ pub(in crate::server) async fn secure_group_encrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER — a miss is a 404 before any gate, so it
+    // fails closed; withdrawn 409; the ADR-0038 restore-quarantine 409;
+    // the #877 fork-quarantine-for-actor gate) runs in the group-access
+    // core under this same read lock, in today's order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
     // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
     // the gate. Re-checked immediately before the effect below. The TreeKEM
     // branch of this handler does its own capture and re-check inside
@@ -27190,6 +27277,11 @@ pub(in crate::server) async fn secure_group_encrypt(
         ..
     } = &actor
     {
+        // #1166 S5 ceiling: the ADR-0039 ladder keeps its handler-side
+        // order (grant → ban → role → delegation → provenance) under
+        // this lock — the S2 ruling, pinned by the rider tests; the
+        // chokepoint's RiderScope label asserts no verified grant.
+        #[allow(clippy::disallowed_methods)]
         if !actor.rider_allows_group(info.stable_group_id()) {
             return forbidden(
                 "rider token is not granted this group (ADR-0039 deny-by-default; Home must be delegated explicitly)",
@@ -27393,20 +27485,21 @@ pub(in crate::server) async fn secure_group_decrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER; withdrawn 409; the ADR-0038
+    // restore-quarantine 409; the #877 fork-quarantine-for-actor gate)
+    // runs in the group-access core under this same read lock, in
+    // today's order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
 
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
@@ -27559,23 +27652,24 @@ pub(in crate::server) async fn secure_group_reseal(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER; withdrawn 409; the ADR-0038
+    // restore-quarantine 409 — round-2 finding 6: this endpoint re-seals
+    // the RESTORED shared secret, so it obeys the same restore
+    // quarantine as encrypt/decrypt, and an evidence-bearing seal lifts
+    // the marker first; the #877 fork-quarantine-for-actor gate) runs
+    // in the group-access core under this same read lock, in today's
+    // order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    // ADR-0038 round-2 (finding 6): this endpoint re-seals the RESTORED
-    // shared secret — it must obey the same restore quarantine as
-    // encrypt/decrypt; an evidence-bearing seal lifts the marker first.
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
     // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
     // the gate. Re-checked immediately before the sealed envelope is returned.
     //
@@ -27711,9 +27805,14 @@ pub(in crate::server) async fn secure_open_envelope_adversarial(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenEnvelopeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // #1166 S2: the withdrawn-record conflict gate (a withdrawn record
+    // with no live same-stable-keyed alias → 409) runs in the
+    // group-access core under this same read lock. No actor or
+    // membership gate exists on this surface, before or after.
     {
         let groups = state.named_groups.read().await;
-        if let Some(resp) = open_envelope_withdrawn_group_conflict(&groups, &req.group_id) {
+        if let Err(resp) = crate::server::group_access::admit_open_envelope(&groups, &req.group_id)
+        {
             return resp;
         }
     }
@@ -35782,7 +35881,10 @@ fn join_artifact_serving_refusal_for(
 /// current evidence. Announce/discovery evidence can therefore only WITHHOLD
 /// (e.g. a stale embedded certificate during a rotation); it is never the
 /// certificate a serve relies on. An #842 inline-certificate first join with
-/// no announce has a Clean verdict and is served.
+/// no announce has a Clean verdict and is served. ADR 0108 §4 (ADR 0107's
+/// permitted Clean alternative): in a committed Home an anonymous announce
+/// from the recipient's own bound machine is no disclosure, so it does not
+/// withhold either; in an ordinary OwnerCertified group it still does.
 async fn join_artifact_serving_refusal(
     state: &AppState,
     group_id: &str,
@@ -35845,6 +35947,9 @@ fn join_artifact_record_probe(
     if info.policy.admission.owner_certified_user_id().is_none() {
         return Ok(None);
     }
+    // Trim the roster only: ADR 0108's Home scope (`GroupInfo::is_home_scope`)
+    // reads metadata, policy and `commit_log`, which the probe must keep, so
+    // the probe's verdict applies the same Home rule as the live record.
     let mut probe = info.clone();
     probe.members_v2.retain(|agent, _| agent == member_hex);
     Ok(Some(probe))
@@ -39257,6 +39362,7 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
+    mod issue1256_metadata_listener;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -54430,10 +54536,10 @@ pub(in crate::server) mod tests {
         {
             let groups = a_state.named_groups.read().await;
             let info = groups.get(&group_id).expect("A holds the group");
-            assert!(
-                require_admin_or_above(info, &a_hex).is_ok(),
-                "A has independent admin authority"
-            );
+            #[allow(clippy::disallowed_methods)]
+            // #1166 S5: authority precondition assert, not admission
+            let a_holds_admin = require_admin_or_above(info, &a_hex).is_ok();
+            assert!(a_holds_admin, "A has independent admin authority");
         }
         assert!(member_treekem_kp(&a_state, &group_id, &member_hex)
             .await

@@ -379,6 +379,114 @@ jobs:
           if-no-files-found: error
 
 
+  w3h-harness:
+    # W3-H (#1164): deterministic simulation harness. Builds the entropy /
+    # wall-clock preload shim, runs every `w3h_` case 20 times in the
+    # isolated namespace, and requires the same verdict in every rerun with
+    # complete receipts (ruling D196). Distinct canonical traces per case
+    # are reported, not required.
+    name: W3-H harness (determinism)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # same exact pin as the Test Suite
+
+      - name: Gate checker unit tests
+        run: python3 -B scripts/ci/test_w3h_trace_check.py -v
+
+      - name: Build the W3-H preload shim
+        run: |
+          mkdir -p target/w3h
+          cc -O2 -Wall -Wextra -Werror -shared -fPIC -o target/w3h/libw3h_shim.so scripts/w3h/w3h_shim.c -ldl
+          rm -rf target/w3h/traces
+
+      - name: Run W3-H cases 20 times
+        env:
+          X0X_ISOLATION_ROLE: w3h-harness
+          X0X_RUNTIME_TIMEOUT_SECONDS: 4800
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --stress-count 20
+
+      # D196: blocking on the verdict (the same in all 20 reruns, every
+      # receipt complete); the per-case distinct-trace counts are printed
+      # (`W3H-TRACES`) and do not fail the job.
+      - name: W3-H gate (verdict-stable reruns, D196)
+        run: >-
+          python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
+          --require w3h_s1_control_group_invite_join_over_public_api
+          --require w3h_red_1256_gossip_only_event_after_a_gossip_member_added
+          --require w3h_1256_control_second_event_also_by_dm
+          --require w3h_1256_control_member_restarted_after_the_first_event
+          --expect w3h_red_1256_gossip_only_event_after_a_gossip_member_added=GREEN
+          --expect w3h_1256_control_second_event_also_by_dm=GREEN
+          --expect w3h_1256_control_member_restarted_after_the_first_event=GREEN
+          --require w3h_s1_negative_control_offline_joiner_is_not_admitted
+          --require w3h_1143_positive_control_consented_owner_announce_admits
+          --require w3h_red_1143_promoted_admin_admits_with_owner_offline
+          --require w3h_s4_control_evidence_hello_over_sim_streams
+          --require w3h_s4_control_owner_sync_over_sim_streams
+          --require w3h_1207_red_baseline_roster_then_discovery_hello_never_sent
+          --require w3h_1207_discovery_then_roster_recovers_through_the_commit_push
+          --require w3h_1207_red_baseline_no_mapping_on_either_side
+          --require w3h_1207_control_admin_knows_joiner
+          --require w3h_1207_control_intact_persisted_evidence
+          --require w3h_1207_control_authorized_third_holder
+          --require w3h_red_1207_ready_hello_roster_then_discovery
+          --require w3h_red_1207_ready_hello_no_mapping_stays_red
+          --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
+          --expect w3h_red_1143_promoted_admin_admits_with_owner_offline=GREEN
+          --expect w3h_1207_red_baseline_roster_then_discovery_hello_never_sent=RED
+          --expect w3h_1207_discovery_then_roster_recovers_through_the_commit_push=GREEN
+          --expect w3h_1207_red_baseline_no_mapping_on_either_side=RED
+          --expect w3h_1207_control_admin_knows_joiner=GREEN
+          --expect w3h_1207_control_intact_persisted_evidence=GREEN
+          --expect w3h_1207_control_authorized_third_holder=GREEN
+          --expect w3h_red_1207_ready_hello_roster_then_discovery=GREEN
+          --expect w3h_red_1207_ready_hello_no_mapping_stays_red=RED
+
+      # Traces, receipts, per-thread entropy stats and raw payload dumps
+      # (test identities only; the `w3h-gate` profile is the only producer
+      # of payload dumps, at most two per case, each capped at 32 MiB).
+      - name: Upload W3-H traces
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: w3h-traces
+          path: target/w3h/traces/
+          if-no-files-found: warn
+          retention-days: 7
+
   test-windows:
     name: Test Suite (Windows)
     runs-on: windows-latest

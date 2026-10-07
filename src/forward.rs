@@ -58,10 +58,11 @@ use crate::trust::TrustDecision;
 
 // Import the ant-quic stream halves under stable names for the bridge helper,
 // plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
+use crate::network::{StreamRecv as HighLevelRecvStream, StreamSend as HighLevelSendStream};
 use ant_quic::crypto::raw_public_keys::pqc::{
     sign_with_ml_dsa, verify_with_ml_dsa, MlDsaSignature,
 };
-use ant_quic::{HighLevelRecvStream, HighLevelSendStream, MlDsaPublicKey};
+use ant_quic::MlDsaPublicKey;
 
 /// Response byte: the inbound side accepted the target and connected.
 const RESP_CONNECTED: u8 = 0x01;

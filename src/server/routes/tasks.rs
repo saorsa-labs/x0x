@@ -187,6 +187,9 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// set the same precedence on
 /// `delegate_group_authority`, where the quarantine refusal precedes the
 /// ban/role checks.
+/// #1166 S5 ceiling: this shared task-list gate parses the group out of
+/// the task-list `:id`, not a `:id` path param, so it cannot live in
+/// the group-route chokepoint; the call is allow-listed here.
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
@@ -198,12 +201,15 @@ async fn reject_quarantined_task_mutation(
     }
     let groups = state.named_groups.read().await;
     let (_, info) = crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)?;
-    crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+    // #1166 S5 ceiling: statement-scoped — the ruling is the fn doc above.
+    #[allow(clippy::disallowed_methods)]
+    let refused = crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
         state,
         &scoped.group_id,
         info,
         actor,
-    )
+    );
+    refused
 }
 
 /// Apply group authorization to a task list handle at the CRDT layer.
@@ -1490,6 +1496,9 @@ pub(in crate::server) async fn update_task(
         if let Some((_, info)) =
             crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
         {
+            // #1166 S5 ceiling: ADR-0066 §3b row 17 (delegation-honouring
+            // branch) — task-list ids again, same class as the shared gate.
+            #[allow(clippy::disallowed_methods)]
             if let Some(refused) =
                 crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
                     &state,
@@ -1942,7 +1951,14 @@ mod tests {
                     .await
                     .expect("node"),
             );
-            let pubsub = Arc::new(x0x::gossip::PubSubManager::new(node, None).expect("pubsub"));
+            // Signed with the daemon's agent key, as production is: since
+            // #1114 an unsigned publish reaches no subscriber, and these tests
+            // read the published record back off the topic.
+            let signing = Arc::new(x0x::gossip::SigningContext::from_keypair(
+                state.agent.identity().agent_keypair(),
+            ));
+            let pubsub =
+                Arc::new(x0x::gossip::PubSubManager::new(node, Some(signing)).expect("pubsub"));
             let peer = saorsa_gossip_types::PeerId::new([1; 32]);
             let list = x0x::crdt::TaskList::new(
                 x0x::crdt::TaskListId::new([9; 32]),

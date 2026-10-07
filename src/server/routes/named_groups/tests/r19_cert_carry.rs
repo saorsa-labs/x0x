@@ -96,6 +96,871 @@ async fn anonymous_announce_invalidates_hand_installed_cert() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0108 S2-1 (#1143): the Home verdict rule at all three verdict sites —
+// the seal, the eviction path and the ADR 0107 serving guard. The ordinary
+// OwnerCertified control above is kept unchanged.
+// ---------------------------------------------------------------------------
+
+/// The mechanism control's daemon: a loopback-only agent with no owner key
+/// (so no certificate of its own), no peer cache, and no `join_network`.
+async fn announce_writer_state(dir: &std::path::Path, plane: &str) -> Result<Arc<AppState>> {
+    let mut config = isolated_loopback_config(plane);
+    config.port_mapping_enabled = false;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_identity_dir(dir)
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+            .with_agent_cert_path(dir.join("agent.cert"))
+            .with_user_key_path(dir.join("absent-user.key"))
+            .with_contact_store_path(dir.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(config)
+            .build()
+            .await?,
+    );
+    secure_endpoint_test_state_at(dir, agent).await
+}
+
+/// [`owner_certified_group`] as a Home: the ADR-0038 policy and metadata,
+/// committed by one owner-certified seal, so `is_home_scope()` holds
+/// (ADR 0108 §1). Every seat must be Clean for that seal.
+async fn committed_home_group(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+    seats: &[(String, &x0x::identity::AgentCertificate, bool)],
+) -> Result<(String, x0x::groups::GroupInfo)> {
+    let (group_key, mut info) = owner_certified_group(&state.agent, owner, suffix, seats);
+    info.policy = x0x::groups::GroupPolicy::home(&owner.user_id());
+    info.home = Some(x0x::groups::HomeMetadata {
+        primary_agent: hex::encode(state.agent.agent_id().as_bytes()),
+        placements: std::collections::BTreeMap::new(),
+        provisioned_at_ms: 1,
+    });
+    assert!(
+        !info.is_home_scope(),
+        "the Home metadata is not committed yet"
+    );
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    assert!(info.is_home_scope(), "fixture: a committed Home scope");
+    Ok((group_key, info))
+}
+
+/// [`owner_certified_group`], sealed once like [`committed_home_group`], so
+/// the ordinary twin differs from the Home only in Home scope.
+async fn committed_ordinary_group(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+    seats: &[(String, &x0x::identity::AgentCertificate, bool)],
+) -> Result<(String, x0x::groups::GroupInfo)> {
+    let (group_key, mut info) = owner_certified_group(&state.agent, owner, suffix, seats);
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    assert!(!info.is_home_scope());
+    Ok((group_key, info))
+}
+
+/// An ANONYMOUS announce by `subject`'s own machine: `subject` is bound to a
+/// fresh machine (the authenticated binding its direct-origin announce
+/// leaves), and that machine's anonymous announce lands in discovery
+/// through the real listener ([`relayed_anonymous_announce_lands`]): the
+/// canonical anonymous digest and no certificate. ADR 0108 §4 reads that
+/// digest as no disclosure only because the subject's bound machine
+/// signed it.
+async fn install_anonymous_discovery(
+    state: &AppState,
+    subject: &x0x::identity::AgentKeypair,
+) -> Result<x0x::identity::MachineKeypair> {
+    let machine = x0x::identity::MachineKeypair::generate()?;
+    state
+        .agent
+        .record_authenticated_binding_for_testing(
+            subject.agent_id(),
+            machine.machine_id(),
+            x0x::groups::owner_cert::restore_clock_now(),
+        )
+        .await;
+    relayed_anonymous_announce_lands(state, subject, &machine).await?;
+    Ok(machine)
+}
+
+/// An anonymous V3 announce naming `subject`, signed by `machine`, through
+/// `state`'s real identity listener; returns once discovery shows it.
+///
+/// A V3 announce is signed by a machine key alone (`announce_v3` `verify`:
+/// machine key ↔ machine id, agent key ↔ agent id, machine signature), so
+/// `machine` need not be the subject's: any machine can sign one. It is
+/// published on `state`'s own pubsub, so the pubsub sender is `state`'s
+/// agent, never `subject`. The listener therefore refuses it as a binding
+/// source (`record_authenticated_machine_binding_from_message`: not
+/// direct-origin) and still caches it for discovery, exactly as for a
+/// forged or relayed announce from the mesh.
+async fn relayed_anonymous_announce_lands(
+    state: &AppState,
+    subject: &x0x::identity::AgentKeypair,
+    machine: &x0x::identity::MachineKeypair,
+) -> Result<()> {
+    // Starts the identity listener; it subscribes before this returns.
+    state.agent.discovered_agents().await?;
+    let announced_at = x0x::groups::owner_cert::restore_clock_now();
+    let v2 = x0x::IdentityAnnouncement {
+        self_name: None,
+        agent_id: subject.agent_id(),
+        machine_id: machine.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine.public_key().as_bytes().to_vec(),
+        machine_signature: Vec::new(),
+        addresses: Vec::new(),
+        announced_at,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        agent_public_key: subject.public_key().as_bytes().to_vec(),
+    };
+    let v3 = x0x::announce_v3::IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0)?;
+    v3.verify()?;
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    anyhow::ensure!(v3.cert_digest == anonymous, "fixture: an anonymous V3");
+    let payload = x0x::announce_v3::serialize_v3(&v3)
+        .map_err(|error| anyhow::anyhow!("serialize v3: {error}"))?;
+    state
+        .agent
+        .pubsub()
+        .context("gossip runtime")?
+        .publish(
+            x0x::IDENTITY_ANNOUNCE_TOPIC.to_string(),
+            bytes::Bytes::from(payload),
+        )
+        .await?;
+    let key = machine.public_key().as_bytes().to_vec();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if state
+                .agent
+                .discovered_agent_for_testing(&subject.agent_id())
+                .await
+                .is_some_and(|entry| {
+                    entry.cert_digest == Some(anonymous)
+                        && entry.agent_certificate.is_none()
+                        && entry.machine_public_key == key
+                        && entry.announced_at == announced_at
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the relayed anonymous announce must land in discovery")?;
+    Ok(())
+}
+
+/// The machine `subject`'s authenticated machine binding names, if any.
+async fn bound_machine(
+    state: &AppState,
+    subject: x0x::identity::AgentId,
+) -> Option<x0x::identity::MachineId> {
+    x0x::dm_inbox::authenticated_machine_binding_for_testing(
+        &state.agent.authenticated_machine_bindings_for_testing(),
+        &subject,
+    )
+    .await
+}
+
+/// SEAL SITE. The Home twin of
+/// `anonymous_announce_invalidates_hand_installed_cert`: the same anonymous
+/// announce lands through the same real listener and drops the discovered
+/// certificate, but the group is a committed Home, so the anonymous digest
+/// is no disclosure (ADR 0108 §4). The seal succeeds on the roster-embedded
+/// certificate and starts no grace. Before S2-1 it refused with
+/// `OwnerCertMemberPending`, exactly like the ordinary control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_announce_keeps_hand_installed_cert_in_a_committed_home() -> Result<()> {
+    let plane = format!("r19-home-writer-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &cert).await;
+    let (_, mut info) =
+        committed_home_group(&state, &owner, &plane, &[(local_hex.clone(), &cert, true)]).await?;
+
+    anonymous_announce_lands(&state.agent).await?;
+    let evidence = owner_cert_seal_evidence(&state, &info).await;
+    assert_eq!(
+        evidence.digest_for(&local_hex),
+        Some(x0x::announce_v3::anonymous_cert_digest()),
+        "the seal evidence holds the anonymous digest"
+    );
+    assert!(evidence.cert_for(&local_hex).is_none());
+    seal_commit_owner_certified(
+        &state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+    .expect("in a committed Home the anonymous digest is no disclosure");
+    assert_eq!(
+        info.members_v2[&local_hex].certificate_missing_since_ms, None,
+        "no grace was started"
+    );
+    assert!(info.is_home_scope(), "the new head still covers the Home");
+    assert!(state.agent.peers().await?.is_empty());
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// EVICTION SITE (`owner_certified_seal_with_eviction`, the explicit seal
+/// route), on the live record. The creator's announce is anonymous and its
+/// missing-evidence grace window has expired. In the ordinary twin that
+/// verdict is `Failed(NoCertificate)`, the eviction set. In a committed Home
+/// the creator is Clean: nothing is evicted, the stale grace stamp is
+/// cleared, and the all-clean seal commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eviction_path_keeps_an_anonymous_creator_seated_in_a_committed_home() -> Result<()> {
+    let plane = format!("r19-home-evict-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &local_cert).await;
+    let creator_kp = x0x::identity::AgentKeypair::generate()?;
+    let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+    let creator_cert = x0x::identity::AgentCertificate::issue(&owner, &creator_kp)?;
+    let seats = [
+        (local_hex.clone(), &local_cert, true),
+        (creator_hex.clone(), &creator_cert, true),
+    ];
+    let (_, ordinary) = committed_ordinary_group(&state, &owner, "evict-ordinary", &seats).await?;
+    let (home_key, home) = committed_home_group(&state, &owner, "evict-home", &seats).await?;
+    install_anonymous_discovery(&state, &creator_kp).await?;
+    let expired_grace = |mut info: x0x::groups::GroupInfo| {
+        info.members_v2
+            .get_mut(&creator_hex)
+            .expect("creator seat")
+            .certificate_missing_since_ms = Some(1);
+        info
+    };
+
+    // Ordinary control: the expired grace window makes the creator the
+    // eviction set.
+    let mut ordinary = expired_grace(ordinary);
+    let evidence = owner_cert_seal_evidence(&state, &ordinary).await;
+    let failed = ordinary.owner_cert_verdict(&evidence).failed();
+    assert_eq!(
+        failed,
+        vec![(
+            creator_hex.clone(),
+            x0x::groups::owner_cert::OwnerCertFailure::NoCertificate
+        )],
+        "the ordinary twin evicts the anonymous creator"
+    );
+
+    // The Home, through the production eviction path.
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(home_key.clone(), expired_grace(home));
+    let (commit, evicted, _) = owner_certified_seal_with_eviction(&state, &home_key, &local_hex)
+        .await
+        .expect("an OwnerCertified group takes the eviction path")
+        .unwrap_or_else(|(status, body)| panic!("eviction-path seal refused: {status} {body:?}"));
+    assert!(evicted.is_empty(), "nobody is evicted: {evicted:?}");
+    assert!(!commit.roster_root.is_empty());
+    let groups = state.named_groups.read().await;
+    let info = groups.get(&home_key).expect("the Home");
+    assert!(
+        info.has_active_member(&creator_hex),
+        "the creator stays seated"
+    );
+    assert_eq!(
+        info.members_v2[&creator_hex].certificate_missing_since_ms, None,
+        "the stale grace stamp is cleared"
+    );
+    drop(groups);
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// SERVING GUARD SITE (ADR 0107, both the pre-phase check and the stream
+/// seam). The verdict there runs on a probe clone trimmed to the recipient's
+/// seat. A Home joiner whose announce is anonymous is Clean there and is
+/// served: ADR 0107's permitted Clean alternative (ADR 0108 §4). In the
+/// ordinary twin the same joiner is still withheld as `InGrace`. The W3-H
+/// #1143 case cannot catch this: its joiner announces consented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serving_guard_serves_an_anonymous_home_joiner_and_withholds_the_ordinary_one() -> Result<()>
+{
+    let plane = format!("r19-home-serve-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &local_cert).await;
+    let joiner_kp = x0x::identity::AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let joiner_cert = x0x::identity::AgentCertificate::issue(&owner, &joiner_kp)?;
+    let seats = [
+        (local_hex.clone(), &local_cert, true),
+        (joiner_hex.clone(), &joiner_cert, true),
+    ];
+    let (ordinary_key, ordinary) =
+        committed_ordinary_group(&state, &owner, "serve-ordinary", &seats).await?;
+    let (home_key, home) = committed_home_group(&state, &owner, "serve-home", &seats).await?;
+    install_anonymous_discovery(&state, &joiner_kp).await?;
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(ordinary_key.clone(), ordinary);
+        groups.insert(home_key.clone(), home);
+    }
+
+    // Home: served at the pre-phase and at the seam.
+    let evidence = join_artifact_serving_check(&state, &home_key, &joiner_hex)
+        .await
+        .unwrap_or_else(|refusal| panic!("the anonymous Home joiner was withheld: {refusal:?}"));
+    assert!(evidence.is_some(), "an OwnerCertified verdict was taken");
+    assert_eq!(
+        join_artifact_seam_refusal(&state, &home_key, &joiner_hex, evidence),
+        None,
+        "the seam serves the anonymous Home joiner"
+    );
+
+    // Ordinary twin: still withheld on both checks.
+    assert_eq!(
+        join_artifact_serving_refusal(&state, &ordinary_key, &joiner_hex).await,
+        Some(JoinArtifactRefusal::CertificateInGrace)
+    );
+    let evidence = owner_cert_evidence_for(&state, &[joiner_hex.as_str()]).await;
+    assert_eq!(
+        join_artifact_seam_refusal(&state, &ordinary_key, &joiner_hex, Some(evidence)),
+        Some(JoinArtifactRefusal::CertificateInGrace)
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0108 §4's premise (Codex P2 on #1247): "Only the subject agent's
+// authenticated bound machine can sign its announce; an arbitrary third
+// party cannot manufacture this absence signal." A V3 announce is signed by
+// a machine key alone, and the identity listener caches one for discovery
+// even when it refuses it as a binding source. Every anonymous announce
+// below goes through that real listener
+// ([`relayed_anonymous_announce_lands`]).
+// ---------------------------------------------------------------------------
+
+/// A Home member that is not this daemon: its agent keys and the machine
+/// its authenticated binding names once a test binds it.
+struct RemoteMember {
+    kp: x0x::identity::AgentKeypair,
+    hex: String,
+    machine: x0x::identity::MachineKeypair,
+}
+
+impl RemoteMember {
+    fn generate() -> Result<Self> {
+        let kp = x0x::identity::AgentKeypair::generate()?;
+        let hex = hex::encode(kp.agent_id().as_bytes());
+        Ok(Self {
+            kp,
+            hex,
+            machine: x0x::identity::MachineKeypair::generate()?,
+        })
+    }
+
+    /// The discovery entry an announce from this member's machine leaves:
+    /// `cert` resolved (or none), committing to `cert_digest`.
+    fn entry(
+        &self,
+        cert: Option<&x0x::identity::AgentCertificate>,
+        cert_digest: [u8; 32],
+        announced_at: u64,
+    ) -> x0x::DiscoveredAgent {
+        x0x::DiscoveredAgent {
+            self_name: None,
+            agent_id: self.kp.agent_id(),
+            machine_id: self.machine.machine_id(),
+            user_id: cert.and_then(|cert| cert.user_id().ok()),
+            addresses: Vec::new(),
+            announced_at,
+            last_seen: x0x::groups::owner_cert::restore_clock_now(),
+            machine_public_key: self.machine.public_key().as_bytes().to_vec(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: cert.and_then(x0x::identity::AgentCertificate::not_after),
+            agent_certificate: cert.cloned(),
+            agent_public_key: self.kp.public_key().as_bytes().to_vec(),
+            cert_digest: Some(cert_digest),
+        }
+    }
+
+    /// Bind this member to `machine` as its direct-origin announce (or an
+    /// origin attestation) would, with that announce's certificate expiry.
+    async fn bind(
+        &self,
+        state: &AppState,
+        machine: x0x::identity::MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
+        state
+            .agent
+            .record_authenticated_binding_with_expiry_for_testing(
+                self.kp.agent_id(),
+                machine,
+                announced_at,
+                cert_not_after,
+            )
+            .await;
+    }
+}
+
+/// A committed Home of this daemon and one remote member, each seat
+/// embedding a valid owner certificate. The member has no discovery entry
+/// and no machine binding yet.
+async fn remote_member_home(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+) -> Result<(String, x0x::groups::GroupInfo, RemoteMember)> {
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(state, &state.agent, &local_cert).await;
+    let member = RemoteMember::generate()?;
+    let member_cert = x0x::identity::AgentCertificate::issue(owner, &member.kp)?;
+    let (home_key, info) = committed_home_group(
+        state,
+        owner,
+        suffix,
+        &[
+            (local_hex, &local_cert, true),
+            (member.hex.clone(), &member_cert, true),
+        ],
+    )
+    .await?;
+    Ok((home_key, info, member))
+}
+
+/// A committed Home of this daemon and one remote member that is RENEWING:
+/// the member's seat embeds (and commits) a certificate that has expired,
+/// and its bound machine has announced a renewal, a certificate-bearing
+/// digest whose bytes have not resolved here yet. That member is InGrace
+/// (a fetch in flight), before and after ADR 0108 S2-1.
+///
+/// The fixture's own seal needs the member Clean, so its valid
+/// certificate resolves here at seal time; the renewal announce then
+/// replaces it in discovery.
+async fn renewing_home(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+) -> Result<(String, x0x::groups::GroupInfo, RemoteMember)> {
+    let now = x0x::groups::owner_cert::restore_clock_now();
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(state, &state.agent, &local_cert).await;
+    let member = RemoteMember::generate()?;
+    let user = Some(owner.user_id());
+    let valid = x0x::identity::AgentCertificate::issue(owner, &member.kp)?;
+    let expired = x0x::identity::AgentCertificate::issue_with_expiry(owner, &member.kp, Some(1))?;
+    let renewal =
+        x0x::identity::AgentCertificate::issue_with_expiry(owner, &member.kp, Some(now + 86_400))?;
+    state.agent.identity_discovery_cache().write().await.insert(
+        member.kp.agent_id(),
+        member.entry(
+            Some(&valid),
+            x0x::announce_v3::cert_digest(&user, &Some(valid.clone())),
+            now - 100,
+        ),
+    );
+    let (home_key, info) = committed_home_group(
+        state,
+        owner,
+        suffix,
+        &[
+            (local_hex, &local_cert, true),
+            (member.hex.clone(), &expired, true),
+        ],
+    )
+    .await?;
+    // The renewal: the member's direct-origin announce binds it to its
+    // machine and commits to the renewal's digest; the bytes are in flight.
+    member
+        .bind(state, member.machine.machine_id(), now - 50, None)
+        .await;
+    state
+        .agent
+        .insert_discovered_agent_for_testing(member.entry(
+            None,
+            x0x::announce_v3::cert_digest(&user, &Some(renewal)),
+            now - 50,
+        ))
+        .await;
+    let status = member_status(state, &info, &member.hex).await;
+    assert!(
+        matches!(
+            status,
+            x0x::groups::owner_cert::MemberCertStatus::InGrace { .. }
+        ),
+        "fixture: the renewal is in flight, got {status:?}"
+    );
+    Ok((home_key, info, member))
+}
+
+/// `member_hex`'s status in the seal's verdict over `info`, evaluated on a
+/// clone (the verdict stamps grace).
+async fn member_status(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+) -> x0x::groups::owner_cert::MemberCertStatus {
+    let evidence = owner_cert_seal_evidence(state, info).await;
+    info.clone()
+        .owner_cert_verdict(&evidence)
+        .per_member
+        .get(member_hex)
+        .cloned()
+        .expect("an active member")
+}
+
+/// The live record of `home_key`.
+async fn live_home(state: &AppState, home_key: &str) -> Result<x0x::groups::GroupInfo> {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(home_key)
+        .cloned()
+        .context("the Home")
+}
+
+/// EVICTION SITE: the explicit seal route on the live record refuses,
+/// retryable, and `member_hex` stays seated.
+async fn eviction_path_keeps(
+    state: &Arc<AppState>,
+    home_key: &str,
+    local_hex: &str,
+    member_hex: &str,
+) -> Result<()> {
+    match owner_certified_seal_with_eviction(state, home_key, local_hex)
+        .await
+        .context("an OwnerCertified group takes the eviction path")?
+    {
+        Ok((_, evicted, _)) => anyhow::bail!("the eviction path sealed, evicting {evicted:?}"),
+        Err((status, body)) => {
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "a retryable refusal: {body:?}"
+            );
+        }
+    }
+    assert!(
+        live_home(state, home_key)
+            .await?
+            .has_active_member(member_hex),
+        "the member stays seated"
+    );
+    Ok(())
+}
+
+/// THE FINDING, ingress to eviction. A renewing Home member (expired seat
+/// bytes, renewal in flight) is InGrace. A third machine signs an anonymous
+/// announce naming it; the real listener refuses it as a binding source
+/// (the binding still names the member's machine) and caches it for
+/// discovery. It is no absence signal: the member stays InGrace (today's
+/// fetch-in-flight rule) and the eviction path keeps it seated. With the
+/// S2-1 rule unguarded the forged digest read as no disclosure, so the
+/// member was Failed(Expired) and the next seal evicted it.
+///
+/// Then routing reconciles the entry's machine id to the member's bound
+/// machine (the connector rewrites `machine_id` to whatever machine is
+/// connected). The machine key the announce carried still names the
+/// forger, so nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_anonymous_announce_keeps_a_renewing_home_member_in_grace() -> Result<()> {
+    let plane = format!("r19-home-forged-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (home_key, info, member) = renewing_home(&state, &owner, &plane).await?;
+    let in_grace = |status: &x0x::groups::owner_cert::MemberCertStatus| {
+        matches!(
+            status,
+            x0x::groups::owner_cert::MemberCertStatus::InGrace { .. }
+        )
+    };
+
+    let forger = x0x::identity::MachineKeypair::generate()?;
+    relayed_anonymous_announce_lands(&state, &member.kp, &forger).await?;
+    assert_eq!(
+        bound_machine(&state, member.kp.agent_id()).await,
+        Some(member.machine.machine_id()),
+        "the listener did not take the forged announce as a binding"
+    );
+    let evidence = owner_cert_seal_evidence(&state, &info).await;
+    assert_eq!(
+        evidence.digest_for(&member.hex),
+        Some(x0x::announce_v3::anonymous_cert_digest()),
+        "the forged anonymous digest reached the seal evidence"
+    );
+    assert!(evidence.cert_for(&member.hex).is_none());
+    let status = member_status(&state, &info, &member.hex).await;
+    assert!(
+        in_grace(&status),
+        "a forged anonymous announce must not end the renewal's grace, got {status:?}"
+    );
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(home_key.clone(), info);
+    eviction_path_keeps(&state, &home_key, &local_hex, &member.hex).await?;
+
+    // Routing reconciliation: the entry now names the bound machine.
+    if let Some(entry) = state
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .get_mut(&member.kp.agent_id())
+    {
+        entry.machine_id = member.machine.machine_id();
+    }
+    let live = live_home(&state, &home_key).await?;
+    let status = member_status(&state, &live, &member.hex).await;
+    assert!(
+        in_grace(&status),
+        "a reconciled machine id does not make the forger's announce the member's, got {status:?}"
+    );
+    eviction_path_keeps(&state, &home_key, &local_hex, &member.hex).await?;
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// The Home rule needs the announce's machine to be the subject's CURRENT
+/// authenticated bound machine. Each state below has an anonymous announce
+/// signed by the member's machine M in discovery and valid embedded bytes:
+/// - no binding at all, a binding whose certificate expiry has passed, a
+///   binding that has moved to another machine, an entry whose machine id
+///   routing has rewritten to another machine, or M revoked: today's rule
+///   (InGrace), so the seal refuses with `OwnerCertMemberPending` and the
+///   ADR 0107 serving guard withholds;
+/// - a current binding to M: the Home rule (Clean), so the seal succeeds
+///   and the guard serves.
+///
+/// With the S2-1 rule unguarded every state read as the Home rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_announce_needs_a_current_bound_machine() -> Result<()> {
+    let plane = format!("r19-home-binding-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let (home_key, info, member) = remote_member_home(&state, &owner, &plane).await?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(home_key.clone(), info);
+    relayed_anonymous_announce_lands(&state, &member.kp, &member.machine).await?;
+    let now = x0x::groups::owner_cert::restore_clock_now();
+    let m = member.machine.machine_id();
+
+    // Every verdict site, on the live record (the seal on a working copy).
+    let sites = async |case: &str, bound: bool| -> Result<()> {
+        let live = live_home(&state, &home_key).await?;
+        let status = member_status(&state, &live, &member.hex).await;
+        let mut working = live;
+        let seal = seal_commit_owner_certified(
+            &state,
+            &mut working,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await;
+        let serving = join_artifact_serving_refusal(&state, &home_key, &member.hex).await;
+        if bound {
+            assert_eq!(
+                status,
+                x0x::groups::owner_cert::MemberCertStatus::Clean,
+                "[{case}]"
+            );
+            assert!(seal.is_ok(), "[{case}] the seal succeeds: {seal:?}");
+            assert_eq!(serving, None, "[{case}] the guard serves");
+        } else {
+            assert!(
+                matches!(
+                    status,
+                    x0x::groups::owner_cert::MemberCertStatus::InGrace { .. }
+                ),
+                "[{case}] today's rule, got {status:?}"
+            );
+            assert!(
+                matches!(
+                    &seal,
+                    Err(x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. })
+                        if *members == vec![member.hex.clone()]
+                ),
+                "[{case}] the seal refuses: {seal:?}"
+            );
+            assert_eq!(
+                serving,
+                Some(JoinArtifactRefusal::CertificateInGrace),
+                "[{case}] the guard withholds"
+            );
+        }
+        Ok(())
+    };
+
+    assert_eq!(bound_machine(&state, member.kp.agent_id()).await, None);
+    sites("no binding", false).await?;
+    member.bind(&state, m, now + 1, Some(1)).await;
+    sites("binding certificate expired", false).await?;
+    let other = x0x::identity::MachineKeypair::generate()?;
+    member.bind(&state, other.machine_id(), now + 2, None).await;
+    sites("binding moved to another machine", false).await?;
+    member.bind(&state, m, now + 3, None).await;
+    sites("current binding", true).await?;
+    let entry_machine = async |machine: x0x::identity::MachineId| {
+        if let Some(entry) = state
+            .agent
+            .identity_discovery_cache()
+            .write()
+            .await
+            .get_mut(&member.kp.agent_id())
+        {
+            entry.machine_id = machine;
+        }
+    };
+    entry_machine(other.machine_id()).await;
+    sites("entry machine id rewritten to another machine", false).await?;
+    entry_machine(m).await;
+    sites("entry machine id back on the bound machine", true).await?;
+    let revocation = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Machine(m),
+        member.machine.public_key(),
+        member.machine.secret_key(),
+        now,
+        Some("r19 bound machine revoked".to_string()),
+    )?;
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(revocation, None)?;
+    sites("bound machine revoked", false).await?;
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// Positive control: ADR 0108 §4 as written still holds for the subject's
+/// own machine. The same relayed anonymous announce, signed by the
+/// member's current bound machine, is the member's own absence signal:
+/// valid embedded bytes are Clean, and expired ones are Failed(Expired)
+/// with no grace (the eviction set) even with a renewal in flight. That is
+/// the ADR's stated residual: an anonymous announce after re-issue erases
+/// the rotation signal, and now only the member's own machine can send it.
+///
+/// The direct-origin source of a binding is the real listener: this
+/// daemon's own anonymous announce binds it to its own machine, and the
+/// entry's machine key derives that machine. That is the W3-H #1143 path,
+/// where A ingests O's own announce. (Checked last: the announce's
+/// copies can still be landing, and the fixtures' first seals run before
+/// their groups are Home scope.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bound_machine_anonymous_announce_applies_the_home_rule() -> Result<()> {
+    let plane = format!("r19-home-bound-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+
+    // Valid embedded bytes: Clean.
+    let (_, info, member) = remote_member_home(&state, &owner, &format!("{plane}-valid")).await?;
+    let now = x0x::groups::owner_cert::restore_clock_now();
+    member
+        .bind(&state, member.machine.machine_id(), now, None)
+        .await;
+    relayed_anonymous_announce_lands(&state, &member.kp, &member.machine).await?;
+    assert_eq!(
+        member_status(&state, &info, &member.hex).await,
+        x0x::groups::owner_cert::MemberCertStatus::Clean
+    );
+
+    // Expired embedded bytes with a renewal in flight: Failed(Expired).
+    let (_, info, member) = renewing_home(&state, &owner, &format!("{plane}-expired")).await?;
+    relayed_anonymous_announce_lands(&state, &member.kp, &member.machine).await?;
+    assert_eq!(
+        bound_machine(&state, member.kp.agent_id()).await,
+        Some(member.machine.machine_id())
+    );
+    let evidence = owner_cert_seal_evidence(&state, &info).await;
+    assert_eq!(
+        info.clone().owner_cert_verdict(&evidence).failed(),
+        vec![(
+            member.hex.clone(),
+            x0x::groups::owner_cert::OwnerCertFailure::Expired
+        )],
+        "the member's own anonymous announce is no disclosure: expired bytes fail"
+    );
+
+    // Direct origin, through the real listener.
+    anonymous_announce_lands(&state.agent).await?;
+    assert_eq!(
+        bound_machine(&state, state.agent.agent_id()).await,
+        Some(state.agent.machine_id()),
+        "a direct-origin announce binds its agent to its machine"
+    );
+    let own = state
+        .agent
+        .discovered_agent_for_testing(&state.agent.agent_id())
+        .await
+        .context("this daemon's own entry")?;
+    let own_key = ant_quic::MlDsaPublicKey::from_bytes(&own.machine_public_key)
+        .map_err(|error| anyhow::anyhow!("own machine key: {error:?}"))?;
+    assert_eq!(
+        x0x::identity::MachineId::from_public_key(&own_key),
+        state.agent.machine_id()
+    );
+    assert_eq!(own.machine_id, state.agent.machine_id());
+    state.agent.shutdown().await;
+    Ok(())
+}
+
 fn seat_digest(cert: &x0x::identity::AgentCertificate) -> String {
     x0x::groups::owner_cert::certificate_digest_hex(cert)
 }

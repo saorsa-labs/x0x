@@ -152,6 +152,9 @@ fn revision_of(event: &NamedGroupMetadataEvent) -> Option<u64> {
     named_group_metadata_event_commit(event).map(|c| c.revision)
 }
 
+// #1166 S5: join-state PROBE (asserts the #447/#458 label), not
+// admission.
+#[allow(clippy::disallowed_methods)]
 async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     let info = joiner.named_groups.read().await.get(group_key).cloned();
     match info {
@@ -5373,3 +5376,6 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
     assert!(wrong_transport.is_empty(), "{wrong_transport:?}");
     Ok(())
 }
+
+// D204 / #1217: main-compatible owner-removal regression and controls.
+include!("issue1217_owner_removal.rs");

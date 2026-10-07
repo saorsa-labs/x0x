@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.4] - 2026-10-06
+
+### Changed
+
+- **Apps receive only verified, identified pub/sub senders (#1114).** Unsigned
+  V1 payloads are dropped silently (debug log). An invalid signature is dropped
+  with a warn log. Revoked or Blocked senders are always dropped. No released
+  x0xd sends inner V1, so only third-party publishers using
+  `PubSubManager::new(_, None)` are affected.
+
+### Fixed
+
+- **An unreadable revocation store is never overwritten (#1116 slice A).**
+  With a blocked store, an identity or binding revoke is applied and published
+  but returns 500 "applied and published; not durable".
+- **Members no longer silently stop receiving group metadata (#1256).** After
+  applying a gossip MemberAdded, a member's metadata listener exited until the
+  next restart. It now keeps the subscription unless the member left, was
+  removed or banned, or the group was deleted.
+- **Home: a promoted admin can admit devices while an anonymously announcing
+  owner is offline (#1143, ADR 0108 S2-1).** This applies only to an anonymous
+  announce from the member's authenticated bound machine.
+- **A "you are removed" notice reaches a quickly-joined member after an owner
+  restart (#1217).** The owner's MemberRemoved send waits up to 5 s for a
+  verified binding to a restart-cold recipient.
+- **Unknown-trust group peers can exchange the EvidenceV1 Hello (#1241).** This
+  goes through a bounded admission lease; every other protocol from an Unknown
+  peer is still refused.
+
+### Added
+
+- `X0X_EVIDENCE_READY_HELLO=1` (off by default) sends a deferred first evidence
+  Hello when relationship readiness arrives after connect (#1207 S1).
+
 ## [v0.46.3] - 2026-10-05
 
 ### Fixed

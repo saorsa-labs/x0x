@@ -9,7 +9,7 @@
 //! no device set to serve or extend and answers `409`, mirroring
 //! `GET /owner/agents`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -27,8 +27,18 @@ use crate::server::state::AppState;
 /// synchronously so the very next reconcile pass cannot re-mint a
 /// pre-merge value (LWW flip-back), while the live `AppState` profile and
 /// its persisted file catch up in a spawned task.
+///
+/// WHY a `Weak<AppState>`: the view is installed on the sync service the
+/// `AppState` owns (`state.owner_sync`), so an `Arc` here is a cycle
+/// (`AppState` -> `OwnerSyncService` -> view -> `AppState`) that nothing
+/// breaks: a stopped owner install's state, and every task and handle it
+/// holds, would never be freed (W3-H S3: the restart drain guard). The
+/// same reason as the task-list gates in `routes/tasks.rs`. While the
+/// daemon runs its router and tasks hold the state, so every upgrade
+/// succeeds; an expired `Weak` means the daemon is gone, and the view then
+/// answers as it does when unsure (mirror names, no pointer, fail closed).
 pub(in crate::server) struct DaemonView {
-    state: Arc<AppState>,
+    state: Weak<AppState>,
     names: std::sync::RwLock<SyncProfileNames>,
 }
 
@@ -43,7 +53,7 @@ impl DaemonView {
             Err(_) => SyncProfileNames::default(),
         };
         Self {
-            state,
+            state: Arc::downgrade(&state),
             names: std::sync::RwLock::new(names),
         }
     }
@@ -51,20 +61,23 @@ impl DaemonView {
 
 impl SyncDaemonView for DaemonView {
     fn profile_names(&self) -> SyncProfileNames {
-        if let Ok(profile) = self.state.profile.try_read() {
-            let fresh = SyncProfileNames {
-                human_name: profile.human_name.clone(),
-                display_name: profile.display_name.clone(),
-                machine_name: profile.machine_name.clone(),
-            };
-            *self
-                .names
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
-            return fresh;
+        if let Some(state) = self.state.upgrade() {
+            if let Ok(profile) = state.profile.try_read() {
+                let fresh = SyncProfileNames {
+                    human_name: profile.human_name.clone(),
+                    display_name: profile.display_name.clone(),
+                    machine_name: profile.machine_name.clone(),
+                };
+                *self
+                    .names
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
+                return fresh;
+            }
         }
-        // Lock contended: report the last-seen mirror (never a regression
-        // to empty — a mint from a wrong default would fight the winner).
+        // Lock contended (or the daemon gone): report the last-seen mirror
+        // (never a regression to empty — a mint from a wrong default would
+        // fight the winner).
         self.names
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -75,10 +88,11 @@ impl SyncDaemonView for DaemonView {
         // Best-effort (try_read): the reconcile pass tolerates a missed
         // snapshot; the SESSION PATH must not — it uses
         // `home_pointer_definitive` (#863 r2 review finding 2).
-        let owner = self.state.agent.identity().user_keypair()?.user_id();
-        let local_hex = hex::encode(self.state.agent.agent_id().as_bytes());
-        let groups = self.state.named_groups.try_read().ok()?;
-        home_pointer_from_state(&self.state, &owner, &local_hex, &groups)
+        let state = self.state.upgrade()?;
+        let owner = state.agent.identity().user_keypair()?.user_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let groups = state.named_groups.try_read().ok()?;
+        home_pointer_from_state(&state, &owner, &local_hex, &groups)
     }
 
     fn home_pointer_definitive(
@@ -88,9 +102,13 @@ impl SyncDaemonView for DaemonView {
         // #863 r2 (review finding 2): the AWAITED read — lock contention
         // waits and is never mistaken for "no Home" (tokio's RwLock does
         // not poison). `Err(())` survives only for the no-owner-key
-        // case; the session path treats Err as fail-closed.
-        let state = std::sync::Arc::clone(&self.state);
+        // case; the session path treats Err as fail-closed. A daemon that
+        // is gone cannot read its Home definitively either: fail closed.
+        let state = self.state.upgrade();
         Box::pin(async move {
+            let Some(state) = state else {
+                return Err(());
+            };
             let owner = match state.agent.identity().user_keypair() {
                 Some(kp) => kp.user_id(),
                 // Anonymous install: nothing to understate.
@@ -105,7 +123,10 @@ impl SyncDaemonView for DaemonView {
     fn canonical_pointer_is_retired(&self, group_id: &str) -> bool {
         // Fail SAFE when the roster lock is contended: "unsure" must answer
         // false, so a busy daemon never mints over a live canonical Home.
-        let Ok(groups) = self.state.named_groups.try_read() else {
+        let Some(state) = self.state.upgrade() else {
+            return false;
+        };
+        let Ok(groups) = state.named_groups.try_read() else {
             return false;
         };
         groups.iter().any(|(id, info)| {
@@ -141,7 +162,10 @@ impl SyncDaemonView for DaemonView {
         if human_name.is_none() && display_name.is_none() && machine_name.is_none() {
             return;
         }
-        let state = Arc::clone(&self.state);
+        // A daemon that is gone has no live profile to catch up.
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
         tokio::spawn(async move {
             let mut profile = state.profile.write().await;
             let mut changed = false;

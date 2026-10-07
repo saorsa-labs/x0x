@@ -7,6 +7,8 @@ on:
       - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
+      - 'scripts/check-adr-consolidation.py'
+      - 'scripts/test_adr_consolidation.py'
       - '.github/workflows/adr-governance.yml'
   push:
     branches:
@@ -17,6 +19,8 @@ on:
       - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
+      - 'scripts/check-adr-consolidation.py'
+      - 'scripts/test_adr_consolidation.py'
       - '.github/workflows/adr-governance.yml'
 
 jobs:
@@ -36,3 +40,7 @@ jobs:
         run: python3 scripts/test_adr_governance.py
       - name: Run ADR governance checks
         run: python3 scripts/adr-governance.py
+      - name: Test the 15-slot transition rules
+        run: python3 scripts/test_adr_consolidation.py
+      - name: Check the 15-slot replacement set
+        run: python3 scripts/check-adr-consolidation.py

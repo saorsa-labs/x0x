@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "phase": "transfer_review",
+  "maximum_current_adrs": 15,
+  "source_commit": "eacf68591dffcb6f949e2a12bc6f05cfb6e8d481",
+  "slots": [
+    {
+      "id": "A01",
+      "revision": 1,
+      "path": "A01-r01-purpose-and-product-limits.md",
+      "title": "Purpose and Product Limits"
+    },
+    {
+      "id": "A02",
+      "revision": 1,
+      "path": "A02-r01-identity-keys-and-device-enrollment.md",
+      "title": "Identity Keys and Device Enrollment"
+    },
+    {
+      "id": "A03",
+      "revision": 1,
+      "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
+      "title": "Trust Permissions Sharing and Revocation"
+    },
+    {
+      "id": "A04",
+      "revision": 1,
+      "path": "A04-r01-agent-attachment-and-inbound-events.md",
+      "title": "Agent Attachment and Inbound Events"
+    },
+    {
+      "id": "A05",
+      "revision": 1,
+      "path": "A05-r01-connectivity-discovery-and-names.md",
+      "title": "Connectivity Discovery and Names"
+    },
+    {
+      "id": "A06",
+      "revision": 1,
+      "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
+      "title": "Gossip Relay Roles and Resource Limits"
+    },
+    {
+      "id": "A07",
+      "revision": 1,
+      "path": "A07-r01-messages-receipts-history-and-retry.md",
+      "title": "Messages Receipts History and Retry"
+    },
+    {
+      "id": "A08",
+      "revision": 1,
+      "path": "A08-r01-groups-home-membership-and-repair.md",
+      "title": "Groups Home Membership and Repair"
+    },
+    {
+      "id": "A09",
+      "revision": 1,
+      "path": "A09-r01-group-encryption-and-key-changes.md",
+      "title": "Group Encryption and Key Changes"
+    },
+    {
+      "id": "A10",
+      "revision": 1,
+      "path": "A10-r01-shared-data-files-and-synchronization.md",
+      "title": "Shared Data Files and Synchronization"
+    },
+    {
+      "id": "A11",
+      "revision": 1,
+      "path": "A11-r01-local-api-applications-and-human-interface.md",
+      "title": "Local API Applications and Human Interface"
+    },
+    {
+      "id": "A12",
+      "revision": 1,
+      "path": "A12-r01-agent-teams-delegation-and-task-coordination.md",
+      "title": "Agent Teams Delegation and Task Coordination"
+    },
+    {
+      "id": "A13",
+      "revision": 1,
+      "path": "A13-r01-voice-and-video.md",
+      "title": "Voice and Video"
+    },
+    {
+      "id": "A14",
+      "revision": 1,
+      "path": "A14-r01-health-updates-and-recovery.md",
+      "title": "Health Updates and Recovery"
+    },
+    {
+      "id": "A15",
+      "revision": 1,
+      "path": "A15-r01-compatibility-validation-and-decision-rules.md",
+      "title": "Compatibility Validation and Decision Rules"
+    }
+  ]
+}

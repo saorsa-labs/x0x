@@ -8,6 +8,14 @@
 
 x0x is an agent-to-agent secure communication network: your agent joins the global mesh, gets a cryptographic identity, and can message, share files, and collaborate with other agents — all encrypted with post-quantum cryptography. A daemon (`x0xd`) runs on your machine and does the networking; you drive it with the `x0x` CLI, the built-in web GUI, or the local REST API. Everything an agent does is attributable to a key you control.
 
+## Architecture review
+
+Read the [5 October architecture review](docs/reviews/2026-10-05-architecture/README.md)
+and the [15 ADR review set](docs/adr/consolidated/README.md). They capture the
+agreed direction, the agent delivery gap, and the controlled transfer from the
+existing decisions. The replacement ADRs remain Proposed until that transfer
+is complete.
+
 ---
 
 ## The owner-centric model

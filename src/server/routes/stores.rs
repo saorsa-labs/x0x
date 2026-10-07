@@ -1903,8 +1903,14 @@ pub(in crate::server) async fn create_group_kv_store(
             Err(response) => return response,
         }
     };
-    if !actor.rider_allows_group(&binding.stable_group_id) {
-        return forbidden("rider token is not granted this group");
+    // S4 group-access core: the rider grant on the binding's stable id,
+    // at the inline check's exact position (owners pass on class; the
+    // middleware's deny-by-default allowlist keeps riders off this
+    // route, so the 403 is defence in depth).
+    if let Err((code, body)) =
+        crate::server::group_access::admit_group_store_route(&actor, &binding.stable_group_id)
+    {
+        return (code, body);
     }
     let snapshot_lease = claim_bound_store_open(&state, &binding).await;
     let reservation = crdt_subscriptions::handle_reservation(
@@ -2328,14 +2334,12 @@ pub(in crate::server) async fn list_legacy_page_imports(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
-        }
-        if !actor.rider_allows_group(&stable) {
-            return forbidden("rider token is not granted this group");
+        // S4 group-access core: the owner-authority gate (durable or
+        // session owner; every rider refused — the grant check that
+        // followed inline was unreachable for riders and always-true
+        // for owners, so the core folds it away).
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         let Some(prefix) = stable.get(..16) else {
             return bad_request("stable group id is too short for a legacy alias");
@@ -2537,11 +2541,10 @@ pub(in crate::server) async fn download_legacy_page_import(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
+        // S4 group-access core: the owner-authority gate, as on the
+        // listing route.
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         stable
     };
@@ -2697,14 +2700,11 @@ pub(in crate::server) async fn import_legacy_page_store(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
-        }
-        if !actor.rider_allows_group(stable) {
-            return forbidden("rider token is not granted this group");
+        // S4 group-access core: the owner-authority gate, as on the
+        // listing route (the rider-grant check it folded away could
+        // never fire — see the core's doc).
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         if !group_writer(info, &state.agent.agent_id()) {
             return forbidden("current group role cannot endorse legacy history");

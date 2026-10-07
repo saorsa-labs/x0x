@@ -572,6 +572,9 @@ mod tests {
     }
 
     #[test]
+    // #1166 S5: unit test of the grant predicate itself — the ceiling
+    // governs call sites, not the definition it polices.
+    #[allow(clippy::disallowed_methods)]
     fn rider_group_scope_explicit_grants_only() {
         // WHY (review r4): there is NO implicit Home grant — a rider
         // reaches exactly the groups on its explicit grant list (which

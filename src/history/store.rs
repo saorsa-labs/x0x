@@ -235,7 +235,16 @@ pub struct RetainOutcome {
 
 /// Synchronous SQLite-backed history store.
 pub struct Store {
+    /// Dropped first: in test builds it runs an optional hook while the
+    /// connection is still open; zero-sized and inert otherwise
+    /// ([`close_watch`]).
+    _before_close: BeforeClose,
     conn: Mutex<Connection>,
+    /// Dropped after `conn` (fields drop in declaration order, and rusqlite
+    /// closes the connection, closing checkpoint included, synchronously in
+    /// its `Drop`): in test builds it marks the close complete; zero-sized
+    /// and inert otherwise.
+    _after_close: AfterClose,
 }
 
 impl std::fmt::Debug for Store {
@@ -291,8 +300,11 @@ impl Store {
         migrate(&conn)?;
         ensure_indexes(&conn)?;
         backfill_canonical_ids(&conn)?;
+        let (before_close, after_close) = close_watch::signals();
         Ok(Self {
+            _before_close: before_close,
             conn: Mutex::new(conn),
+            _after_close: after_close,
         })
     }
 
@@ -2265,3 +2277,101 @@ mod tests {
         );
     }
 }
+
+// W3-H S3 (#1164), the restart drain: a harness must know when a store's
+// connection has closed and released the database's EXCLUSIVE lock. The
+// last `Arc<Store>` reaches a strong count of zero before the store's
+// destructor runs (possibly on another thread, e.g. a reaper
+// `spawn_blocking` task), so a count cannot tell. In test builds the two
+// signal fields above report it; in other builds they are zero-sized types
+// without a `Drop`, so production is unchanged. (Kept at the end of the
+// file, after the tests: `scripts/check-panics.sh` treats every line after
+// a file's first `#[cfg(test)]` as test code.)
+
+/// Test builds: observe the end of a store's connection.
+#[cfg(test)]
+pub(crate) mod close_watch {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// Hook run on the dropping thread just before the connection closes.
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Shared between a store and its observers.
+    #[derive(Default)]
+    pub(crate) struct CloseWatch {
+        closed: AtomicBool,
+        before_close: Mutex<Option<Hook>>,
+    }
+
+    impl CloseWatch {
+        /// Whether the store's connection has closed.
+        pub(crate) fn closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+
+        /// Run `hook` once, on the thread that drops the store, after its
+        /// last reference is gone and before its connection closes (a test
+        /// can hold the destruction in progress).
+        pub(crate) fn before_close(&self, hook: impl FnOnce() + Send + 'static) {
+            *self
+                .before_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        }
+    }
+
+    /// The store's first field: runs the before-close hook.
+    pub(super) struct BeforeClose(Arc<CloseWatch>);
+
+    impl Drop for BeforeClose {
+        fn drop(&mut self) {
+            let hook = self
+                .0
+                .before_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// The store's last field: marks the connection closed.
+    pub(super) struct AfterClose(pub(super) Arc<CloseWatch>);
+
+    impl Drop for AfterClose {
+        fn drop(&mut self) {
+            self.0.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The two signals of one new store.
+    pub(super) fn signals() -> (BeforeClose, AfterClose) {
+        let watch = Arc::new(CloseWatch::default());
+        (BeforeClose(Arc::clone(&watch)), AfterClose(watch))
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// Test builds: the watch that reports when this store's connection
+    /// has closed.
+    pub(crate) fn close_watch(&self) -> std::sync::Arc<close_watch::CloseWatch> {
+        std::sync::Arc::clone(&self._after_close.0)
+    }
+}
+
+/// Other builds: the signals are zero-sized and do nothing.
+#[cfg(not(test))]
+mod close_watch {
+    pub(super) struct BeforeClose;
+    pub(super) struct AfterClose;
+
+    pub(super) fn signals() -> (BeforeClose, AfterClose) {
+        (BeforeClose, AfterClose)
+    }
+}
+
+use close_watch::{AfterClose, BeforeClose};

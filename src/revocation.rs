@@ -40,16 +40,16 @@ use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
 
 /// Magic marker prefixing the on-disk revocation set file.
-const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
+pub(crate) const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
 
 /// Magic marker prefixing the ADR-0043 ad-hoc binding-record file
 /// (`revocations-v2.bin`).
-const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
 
 /// Magic marker prefixing the ADR-0070 share-grant revocation file
 /// (`revocations-v3.bin`). A distinct magic (and file) keeps the v1/v2
 /// stores loadable by older daemons after a downgrade.
-const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
 
 /// How long past the revoked grant's own expiry a share-grant revocation is
 /// kept before it may be garbage-collected. A grant is dead at `expiry`
@@ -758,6 +758,29 @@ impl RevocationSet {
             .collect()
     }
 
+    /// Validate the persisted layout without verifying record signatures.
+    /// Load/merge callers still use the authority-verifying decoders.
+    pub(crate) fn validate_persisted_bytes(
+        bytes: &[u8],
+        magic: &[u8; 4],
+    ) -> Result<(), IdentityError> {
+        use bincode::Options;
+
+        // Keep the existing decoders' empty-file acceptance.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let body = bytes.strip_prefix(magic).ok_or_else(|| {
+            IdentityError::Serialization("revocation file magic mismatch".to_string())
+        })?;
+        let _: Vec<PersistedRevocation> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(body)
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        Ok(())
+    }
+
     /// Encode the V1 set for on-disk persistence: `X0XR` magic + bincode of
     /// the legacy-subject (`Agent`/`Machine`) record list, each record
     /// carrying the certificate that authorizes it. Binding tombstones
@@ -980,6 +1003,135 @@ fn is_v1_subject(subject: &RevokedSubject) -> bool {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[tokio::test]
+    async fn trailing_bytes_block_revocation_overwrite_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = bincode::serialize(&Vec::<PersistedRevocation>::new()).unwrap();
+        for (name, magic, store) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                crate::storage::RevocationStore::V1,
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                crate::storage::RevocationStore::V2,
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                crate::storage::RevocationStore::V3,
+            ),
+        ] {
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&body);
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            let mut garbage = valid.clone();
+            garbage.extend_from_slice(b"trailing garbage");
+            assert!(RevocationSet::validate_persisted_bytes(&garbage, magic).is_err());
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &garbage).await.unwrap();
+            let unreadable = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .expect_err("trailing bytes make the store unreadable");
+            assert!(crate::storage::revocation_persistence_is_blocked(
+                &unreadable
+            ));
+            let outcome = crate::storage::save_private_bytes_to(&path, valid).await;
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                garbage,
+                "persist must preserve a valid body with trailing garbage"
+            );
+            let refused = outcome.expect_err("trailing bytes block overwrite");
+            assert!(crate::storage::revocation_persistence_is_blocked(&refused));
+        }
+    }
+
+    #[tokio::test]
+    async fn structural_validation_keeps_signature_checks_on_load_1116() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &agent).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, magic, subject, subject_cert) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                RevokedSubject::Agent(agent.agent_id()),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                    agent: agent.agent_id(),
+                    machine: crate::identity::MachineId([0x55; 32]),
+                    move_epoch: 1,
+                }),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x66; 32],
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                None,
+            ),
+        ] {
+            let decode = |bytes: &[u8]| match name {
+                "revocations.bin" => RevocationSet::from_bytes(bytes),
+                "revocations-v2.bin" => RevocationSet::from_bytes_v2(bytes),
+                _ => RevocationSet::from_bytes_v3(bytes),
+            };
+            let record = RevocationRecord::sign(
+                subject,
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            let hash = record.record_hash();
+            let mut persisted = vec![PersistedRevocation {
+                record,
+                subject_cert,
+            }];
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            assert!(
+                decode(&valid).unwrap().contains_hash(&hash),
+                "valid subject and authority must load from {name}"
+            );
+            // A native v3 subject is essential: a v1 Agent subject would
+            // be filtered out before v3's signature check, hiding a defect.
+            persisted[0].record.signature[0] ^= 0xff;
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&bytes, magic).is_ok());
+            let loaded = decode(&bytes).unwrap();
+            assert!(
+                loaded.is_empty(),
+                "invalid signature still rejected on load from {name}"
+            );
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            crate::storage::save_private_bytes_to(&path, bytes.clone())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+            let mut malformed = magic.to_vec();
+            malformed.push(1);
+            assert!(RevocationSet::validate_persisted_bytes(&malformed, magic).is_err());
+            assert!(RevocationSet::validate_persisted_bytes(b"X0RX", magic).is_err());
+        }
+    }
 
     mod revocation_cadence {
         use super::super::*;

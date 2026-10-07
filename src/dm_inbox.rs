@@ -2840,7 +2840,12 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Production shape: the pubsub signs with the same agent key the
+        // pipeline signs ACK envelopes with. Since #1114 an unsigned manager's
+        // publishes reach no subscriber, which the ACK-route tests read back.
+        let signing = Arc::new(SigningContext::from_keypair(&recipient));
+        let pubsub =
+            Arc::new(PubSubManager::new(node, Some(Arc::clone(&signing))).expect("pubsub"));
         let authenticated_machine_bindings =
             Arc::new(RwLock::new(AuthenticatedMachineBindingCache::default()));
         if let Some(machine_id) = authenticated_machine {
@@ -2876,7 +2881,7 @@ mod tests {
         );
         let pipeline = InboxPipeline {
             pubsub,
-            signing: Arc::new(SigningContext::from_keypair(&recipient)),
+            signing,
             self_agent_id: recipient_agent_id,
             self_machine_id: recipient_machine_id,
             machine_keypair: Arc::new(

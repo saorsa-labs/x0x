@@ -457,6 +457,28 @@ impl CapabilityStore {
             .map(|entry| entry.capabilities.application_registry.supports(bit))
     }
 
+    /// Non-blocking capability read. `Err(())` defers on contention (or a
+    /// poisoned lock); `Ok(None)` alone means genuinely unknown capability.
+    pub(crate) fn try_machine_registry_supports(
+        &self,
+        machine: &MachineId,
+        bit: u64,
+    ) -> Result<Option<bool>, ()> {
+        let inner = self.inner.try_lock().map_err(|_| ())?;
+        let now = Instant::now();
+        Ok(inner
+            .adverts
+            .values()
+            .filter(|entry| {
+                entry.verified_advert
+                    && entry.machine_id == machine.0
+                    && entry.machine_id != [0; 32]
+                    && now <= entry.expires_at
+            })
+            .max_by_key(|entry| entry.created_at_unix_ms)
+            .map(|entry| entry.capabilities.application_registry.supports(bit)))
+    }
+
     /// Look up a peer's capability together with the machine that signed it.
     pub fn lookup_binding(&self, agent_id: &AgentId) -> Option<CapabilityBinding> {
         self.lookup_binding_at(agent_id, Instant::now())

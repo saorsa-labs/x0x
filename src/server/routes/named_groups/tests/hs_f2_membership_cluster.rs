@@ -487,6 +487,9 @@ async fn issue447_rejected_member_joined_is_retained_and_retried() -> Result<()>
 /// pin but NO roster seat must read `pending_authority_commit`, not a bare
 /// success. A seated member still reads `active`.
 #[tokio::test]
+// #1166 S5: join-state PROBE (asserts the #447/#458 label), not
+// admission.
+#[allow(clippy::disallowed_methods)]
 async fn issue447_typed_pending_join_state() -> Result<()> {
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let group_id = "48".repeat(32);
@@ -1101,6 +1104,8 @@ async fn issue458_third_party_cannot_adopt_across_gap() -> Result<()> {
 /// 2026-08-30/31 campaigns wedged on (#447 evidence timing + #457 rename
 /// binding + #458 rename-gap commit).
 #[tokio::test]
+// #1166 S5: join-state PROBE, as above.
+#[allow(clippy::disallowed_methods)]
 async fn integration_rename_restart_certified_join_single_announce() -> Result<()> {
     let owner_dir = tempfile::tempdir()?;
     let owner_seed = [0x0F; 32];
