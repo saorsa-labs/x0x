@@ -10,6 +10,13 @@
 - **Superseded by:** <ADR NNNN or none>
 - **Related:** <issues/PRs/specs>
 
+<!-- Use approximately 80% ASD-STE100 style. See docs/documentation-style.md.
+D199: during transfer, new or changed decisions use this numbered ADR
+series only, through the ADR 0087 process. A01-A15 slot revisions are drafts
+until David accepts the transfer. Keep reserved numbers 0090/0091 (D18),
+0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue
+through numbered acceptance. -->
+
 ## Context
 
 What problem, constraint, or architectural tension forced this decision?

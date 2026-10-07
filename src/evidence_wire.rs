@@ -21,6 +21,10 @@ use tokio::{
 mod decode;
 pub(crate) mod lookup;
 
+#[cfg(test)]
+#[path = "evidence_wire/tests/admission.rs"]
+mod admission_tests;
+
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
 // All requests/replies, including outbound reads, acquire this conservative
@@ -105,13 +109,31 @@ impl Window {
 #[derive(Default)]
 struct MachineBudget {
     open: usize,
+    jobs: usize,
     bytes: Window,
     lookup: Option<Instant>,
     hello_in: Option<Instant>,
     hello_out: Option<Instant>,
     attempted: bool,
+    hello_generation: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
+}
+impl MachineBudget {
+    // Generation IDs are allocated in increasing order, but ant-quic can
+    // promote an older superseded connection back to Live. Keep a high-water
+    // mark: that promotion fails closed for Hello until a newer generation
+    // arrives. A delayed job must not re-arm a previously used connection.
+    fn observe_hello_generation(&mut self, generation: u64) -> bool {
+        if self.hello_generation.is_some_and(|old| old > generation) {
+            return false;
+        }
+        if self.hello_generation != Some(generation) {
+            self.attempted = false;
+            self.hello_generation = Some(generation);
+        }
+        true
+    }
 }
 #[derive(Default)]
 struct State {
@@ -167,7 +189,10 @@ impl WireCounters {
 
 /// Shared by every connection, acceptor, and outbound exchange on this node.
 pub(crate) struct Limits {
+    pub(crate) ready_hello: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
+    #[cfg(test)]
+    hello_open_pause: Mutex<Option<Arc<HelloOpenPause>>>,
     allocations: Arc<tokio::sync::Semaphore>,
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
@@ -176,10 +201,21 @@ pub(crate) struct Limits {
     pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
     pub(crate) counters: WireCounters,
 }
+// Per-fixture synchronization at the real open boundary; absent in production.
+#[cfg(test)]
+#[derive(Default)]
+struct HelloOpenPause {
+    after_open: bool,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            ready_hello: Default::default(),
             state: Mutex::new(State::default()),
+            #[cfg(test)]
+            hello_open_pause: Mutex::new(None),
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
@@ -193,10 +229,14 @@ impl State {
     fn machine(&mut self, machine: MachineId, now: Instant) -> Option<&mut MachineBudget> {
         if !self.machines.contains_key(&machine) && self.machines.len() >= MACHINE_CAP {
             self.machines.retain(|_, m| {
+                // Idle markers may be forgotten after the cooldown. Keep
+                // leases/jobs and every recent rate entry, including inbound.
                 m.open != 0
-                    || m.attempted
-                    || m.touched
-                        .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
+                    || m.jobs != 0
+                    || [m.touched, m.hello_out, m.hello_in]
+                        .into_iter()
+                        .flatten()
+                        .any(|t| now.duration_since(t) < HELLO_INTERVAL)
             });
         }
         if !self.machines.contains_key(&machine) && self.machines.len() >= MACHINE_CAP {
@@ -208,18 +248,31 @@ impl State {
     }
 }
 impl Limits {
-    /// Only machines without known agents or verified enrollment use this
-    /// pool. Entries exist only while a lease is alive, across all connections.
+    // Pin the budget across work that has not yet acquired a stream lease.
+    // The guard also survives awaits and releases on task cancellation.
+    fn pin_machine(self: &Arc<Self>, machine: MachineId) -> Option<MachineJob> {
+        let mut state = self.state.lock().ok()?;
+        state.machine(machine, Instant::now())?.jobs += 1;
+        Some(MachineJob {
+            limits: Arc::clone(self),
+            machine,
+        })
+    }
+
+    /// Strangers and Unknown relationship peers share this bounded prefix pool.
+    /// Entries exist only while a lease is alive, across all connections.
     pub(crate) fn admit_prefix(self: &Arc<Self>, machine: MachineId) -> Option<PrefixLease> {
         let admitted = self.prefix.lock().ok().and_then(|mut slots| {
             if slots.values().sum::<usize>() >= 32 || slots.get(&machine).copied().unwrap_or(0) >= 2
             {
                 return None;
             }
+            let job = self.pin_machine(machine)?;
             *slots.entry(machine).or_default() += 1;
             Some(PrefixLease {
                 limits: Arc::clone(self),
                 machine,
+                _job: job,
             })
         });
         if admitted.is_none() {
@@ -315,7 +368,41 @@ impl Limits {
         *last = Some(now);
         true
     }
+    /// A cheap, non-blocking scheduler filter. The final atomic decision is
+    /// still begin_hello_on_connection, shared with replies.
+    fn hello_pending(&self, machine: MachineId) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        state.machines.get(&machine).is_none_or(|m| {
+            !m.attempted
+                && m.hello_out
+                    .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
+        })
+    }
+    // Read-only filter for default-off jobs. The authoritative consume still
+    // runs after open, so a replacement or busy read cannot charge an unsent job.
+    fn hello_candidate(&self, machine: MachineId, generation: u64) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.machines.get(&machine).is_none_or(|m| {
+            m.hello_generation
+                .is_none_or(|old| old < generation || (old == generation && !m.attempted))
+                && m.hello_out
+                    .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
+        })
+    }
+    #[cfg(test)]
     fn begin_hello(&self, machine: MachineId, related: bool) -> bool {
+        self.begin_hello_on_connection(machine, related, None)
+    }
+    fn begin_hello_on_connection(
+        &self,
+        machine: MachineId,
+        related: bool,
+        generation: Option<u64>,
+    ) -> bool {
         if !related {
             return false;
         }
@@ -326,22 +413,43 @@ impl Limits {
         let Some(m) = s.machine(machine, now) else {
             return false;
         };
+        // Requests and replies consume the same generation marker under the
+        // same lock as the machine rate gate. A remote close need not emit a
+        // local PeerDisconnected event. Keep hello_out across replacements.
+        if generation.is_some_and(|id| !m.observe_hello_generation(id)) {
+            return false;
+        }
         if m.attempted
             || m.hello_out
                 .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
         {
             return false;
         }
-        // Attempted is set before open/write/read. A reset or refusal never
+        // Attempted is set before the first byte. A reset or refusal never
         // schedules a retry. Reconnect clears only this connection marker.
         m.attempted = true;
         m.hello_out = Some(now);
         true
     }
+    fn hello_connection(&self, machine: MachineId, generation: u64) {
+        if let Ok(mut s) = self.state.lock() {
+            if let Some(m) = s.machines.get_mut(&machine) {
+                // Each readiness pass keeps tracked live markers out of idle eviction.
+                m.touched = Some(Instant::now());
+                let replaced = m.hello_generation.is_none_or(|old| old < generation);
+                if m.observe_hello_generation(generation) && replaced {
+                    m.certificate = None;
+                }
+            }
+        }
+    }
     fn disconnect(&self, machine: MachineId) {
         if let Ok(mut s) = self.state.lock() {
             if let Some(m) = s.machines.get_mut(&machine) {
-                m.attempted = false;
+                // Events carry no generation. A delayed disconnect must not
+                // release the current connection's attempt or machine cooldown.
+                // While retained, only a newer generation re-arms the marker;
+                // an idle entry can be evicted after its cooldown.
                 m.certificate = None;
             }
         }
@@ -362,9 +470,24 @@ impl Limits {
     }
 }
 
+struct MachineJob {
+    limits: Arc<Limits>,
+    machine: MachineId,
+}
+impl Drop for MachineJob {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.limits.state.lock() {
+            if let Some(budget) = state.machines.get_mut(&self.machine) {
+                budget.jobs = budget.jobs.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub(crate) struct PrefixLease {
     limits: Arc<Limits>,
     machine: MachineId,
+    _job: MachineJob,
 }
 impl Drop for PrefixLease {
     fn drop(&mut self) {
@@ -575,6 +698,36 @@ fn mint_hello(
     })
 }
 
+/// Live relationship check for the shared gate's evidence-only Unknown mode.
+/// Discovery locates the candidate; only ingest_hello verifies/stores its bytes.
+pub(crate) async fn unknown_relationship(
+    discovery: &tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>,
+    owner: &crate::owner_trust::OwnerTrust,
+    agent: &AgentId,
+    machine: &MachineId,
+) -> bool {
+    let certificate = discovery
+        .read()
+        .await
+        .get(agent)
+        .filter(|entry| entry.machine_id == *machine)
+        .map(|entry| entry.agent_certificate.clone());
+    let Some(certificate) = certificate else {
+        return false;
+    };
+    owner
+        .evidence()
+        .and_then(|runtime| runtime.store())
+        .is_some_and(|store| {
+            store.related(
+                *agent,
+                *machine,
+                certificate.as_ref(),
+                dm_capability::now_unix_ms(),
+            )
+        })
+}
+
 pub(crate) struct Context {
     bindings: crate::dm_inbox::AuthenticatedMachineBindings,
     runtime: Arc<EvidenceRuntime>,
@@ -633,6 +786,23 @@ impl Context {
         })
     }
     fn own(&self, have: Option<[u8; 32]>, include_cert: bool) -> io::Result<Hello> {
+        self.own_with_pair(have, include_cert, &self.own_cert)
+    }
+    fn own_ready(&self, have: Option<[u8; 32]>, include_cert: bool) -> io::Result<Hello> {
+        let pair = self
+            .own_cert
+            .try_read()
+            .map_err(|_| invalid("certificate busy"))?
+            .clone();
+        // Minting may take CPU time, but never waits on a shared cert lock.
+        self.own_with_pair(have, include_cert, &Arc::new(std::sync::RwLock::new(pair)))
+    }
+    fn own_with_pair(
+        &self,
+        have: Option<[u8; 32]>,
+        include_cert: bool,
+        pair: &crate::announce_blob::SharedCertPair,
+    ) -> io::Result<Hello> {
         let mut v2 = self.template.clone();
         v2.announced_at = dm_capability::now_unix_ms() / 1000;
         v2.addresses = self
@@ -649,7 +819,7 @@ impl Context {
         mint_hello(
             &self.identity,
             v2,
-            &self.own_cert,
+            pair,
             self.capabilities.borrow().clone(),
             have,
             include_cert,
@@ -823,10 +993,9 @@ impl Context {
                     // our Hello. Replies and requests share its 60-second gate.
                     if !crate::dm_capability_service::advert_is_publishable(
                         &self.capabilities.borrow(),
-                    ) || !self
-                        .runtime
-                        .wire_limits
-                        .begin_hello(machine, self.related(machine).await)
+                    ) || self
+                        .begin_hello_current(machine, self.related(machine).await)
+                        .is_none()
                     {
                         let body = codec().serialize(&have_peer).map_err(io::Error::other)?;
                         return write_message(
@@ -853,33 +1022,173 @@ impl Context {
             tracing::debug!(?machine, "evidence stream refused/reset");
         }
     }
+    fn begin_hello_current(&self, machine: MachineId, related: bool) -> Option<u64> {
+        let Ok(Some(generation)) = self
+            .network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+        else {
+            // Busy or absent is not evidence of a replacement. Do not clear
+            // a consumed marker or start an attempt with unknown ownership.
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_gate_closed",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        };
+        if !self
+            .runtime
+            .wire_limits
+            .begin_hello_on_connection(machine, related, Some(generation))
+        {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_attempt_unavailable",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        }
+        Some(generation)
+    }
+
+    #[cfg(test)]
+    async fn pause_hello_open(&self, after_open: bool) {
+        let pause = self
+            .runtime
+            .wire_limits
+            .hello_open_pause
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(pause) = pause.filter(|p| p.after_open == after_open) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    fn same_connection(&self, machine: MachineId, generation: u64) -> bool {
+        self.network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+            == Ok(Some(generation))
+    }
+
     async fn exchange(
         &self,
         machine: MachineId,
         kind: u8,
         hello: Hello,
+        generation: Option<u64>,
+        policy: Option<&ReadyPolicy>,
     ) -> io::Result<(Lease, u8, Vec<u8>)> {
+        let reserved = if policy.is_some() {
+            let now = dm_capability::now_unix_ms();
+            let revoked = self
+                .revoked
+                .try_read()
+                .map_err(|_| invalid("revocation busy"))?;
+            if revoked.is_machine_revoked(&machine) {
+                return Err(invalid("revoked machine"));
+            }
+            let enrolled = self
+                .owner
+                .try_evidence_relation(self.identity.agent_id(), machine, None, &revoked, now)
+                .ok_or_else(|| invalid("owner policy busy"))?
+                & crate::peer_evidence::ENROLLED
+                != 0;
+            enrolled
+                || self
+                    .runtime
+                    .store()
+                    .and_then(|s| s.try_has_machine(machine, now, READY_AGENT_CAP))
+                    .ok_or_else(|| invalid("evidence busy"))?
+        } else {
+            reserved_peer(
+                self.runtime.store().as_deref(),
+                &self.owner,
+                &self.revoked,
+                machine,
+            )
+            .await
+        };
         let lease = self
             .runtime
             .wire_limits
-            .admit(
-                machine,
-                reserved_peer(
-                    self.runtime.store().as_deref(),
-                    &self.owner,
-                    &self.revoked,
-                    machine,
-                )
-                .await,
-            )
+            .admit(machine, reserved)
             .ok_or_else(|| invalid("evidence stream budget"))?;
         let (kind, body) = tokio::time::timeout_at(lease.deadline, async {
+            #[cfg(test)]
+            if kind == HELLO {
+                self.pause_hello_open(false).await;
+            }
+            if generation.is_some_and(|g| !self.same_connection(machine, g)) {
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_generation_changed_before_open",
+                    "evidence Hello connection check failed"
+                );
+                return Err(invalid("Hello connection replaced"));
+            }
             let (mut send, mut recv) = self
                 .network
                 .open_bi(&ant_quic::PeerId(machine.0))
                 .await
                 .map_err(io::Error::other)?;
+            #[cfg(test)]
+            if kind == HELLO {
+                self.pause_hello_open(true).await;
+            }
+            if let Some(generation) = generation.filter(|_| policy.is_some()) {
+                // Open may yield. A busy Hello defers to the next pass. Its
+                // certificate continuation has no later pass, so retry busy
+                // reads on this empty stream within the same lease deadline.
+                loop {
+                    let eligible = policy.map_or(Some(true), |p| p.eligible(self, machine));
+                    let current = self
+                        .network
+                        .try_connection_generation(&ant_quic::PeerId(machine.0));
+                    if eligible == Some(false)
+                        || matches!(current, Ok(value) if value != Some(generation))
+                    {
+                        tracing::debug!(
+                            %machine,
+                            outcome = "hello_generation_or_policy_changed_after_open",
+                            "evidence Hello connection or policy check failed"
+                        );
+                        return Err(invalid("Hello no longer eligible"));
+                    }
+                    if eligible == Some(true) && current == Ok(Some(generation)) {
+                        break;
+                    }
+                    if kind != CERTIFICATE {
+                        tracing::debug!(
+                            %machine,
+                            outcome = "hello_generation_or_policy_unreadable_after_open",
+                            "evidence Hello connection or policy check unavailable"
+                        );
+                        return Err(invalid("Hello no longer eligible"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } else if generation.is_some_and(|g| !self.same_connection(machine, g)) {
+                // Open may yield across a replacement. Drop the empty stream
+                // without consuming the marker or starting the rate window.
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_generation_changed_after_open",
+                    "evidence Hello connection check failed"
+                );
+                return Err(invalid("Hello connection replaced"));
+            }
+            if kind == HELLO
+                && !self
+                    .runtime
+                    .wire_limits
+                    .begin_hello_on_connection(machine, true, generation)
+            {
+                return Err(invalid("Hello already attempted"));
+            }
             send.write_u8(StreamProtocol::EvidenceV1.as_u8()).await?;
+            // Preserve the default-off serialization point and deadline.
             let body = codec().serialize(&hello).map_err(io::Error::other)?;
             drop(hello);
             write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body).await?;
@@ -890,57 +1199,111 @@ impl Context {
         .map_err(io::Error::other)??;
         Ok((lease, kind, body))
     }
-    async fn connect(self: Arc<Self>, machine: MachineId) {
-        // The transport can connect before the inbox publishes its KEM key.
-        // Wait for that initial readiness without spending the one Hello try.
-        let mut caps = self.capabilities.subscribe();
-        if !matches!(
-            tokio::time::timeout(DEADLINE, async {
-                loop {
-                    if crate::dm_capability_service::advert_is_publishable(&caps.borrow()) {
-                        return Ok::<(), io::Error>(());
+    async fn connect(
+        self: Arc<Self>,
+        machine: MachineId,
+        mut generation: Option<u64>,
+        policy: Option<Arc<ReadyPolicy>>,
+    ) {
+        if let Some(policy) = &policy {
+            // Enabled jobs are admitted only when ready; a changed prerequisite
+            // defers to the next pass without holding a slot through a wait.
+            if policy.eligible(&self, machine) != Some(true) {
+                return;
+            }
+        } else {
+            // Preserve the original capability wait and skip before load.
+            let mut caps = self.capabilities.subscribe();
+            if !matches!(
+                tokio::time::timeout(DEADLINE, async {
+                    loop {
+                        if crate::dm_capability_service::advert_is_publishable(&caps.borrow()) {
+                            return Ok::<(), io::Error>(());
+                        }
+                        caps.changed().await.map_err(io::Error::other)?;
                     }
-                    caps.changed().await.map_err(io::Error::other)?;
-                }
-            })
-            .await,
-            Ok(Ok(()))
-        ) {
-            return;
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            if self.caps.machine_registry_supports(
+                &machine,
+                crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1,
+            ) == Some(false)
+            {
+                return;
+            }
+            if !self.runtime.wait(0).await {
+                return;
+            }
+            if !self.related(machine).await {
+                return;
+            }
         }
-        // ADR 0089 S5 / ADR 0093 bit 2: a CURRENT VERIFIED advert from
-        // this machine that lacks `peer_evidence_v1` means it cannot
-        // accept an EvidenceV1 stream — skip the Hello (and its one
-        // try). Unknown state (no current verified advert for the
-        // machine) still sends, per ADR 0093.
+        let Some(_job) = self.runtime.wire_limits.pin_machine(machine) else {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_machine_budget_unavailable",
+                "evidence Hello connect skipped"
+            );
+            return;
+        };
+        if policy.is_none() {
+            let Ok(Some(current)) = self
+                .network
+                .try_connection_generation(&ant_quic::PeerId(machine.0))
+            else {
+                // Unknown ownership cannot authorize an attempt. Leave both
+                // the marker and rate timestamp untouched; no default-off retry.
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_connect_generation_unreadable",
+                    "evidence Hello connect skipped"
+                );
+                return;
+            };
+            if !self.runtime.wire_limits.hello_candidate(machine, current) {
+                tracing::debug!(
+                    %machine,
+                    outcome = "hello_connect_not_candidate",
+                    "evidence Hello connect skipped"
+                );
+                return;
+            }
+            generation = Some(current);
+        }
         if self
-            .caps
-            .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1)
-            == Some(false)
+            .send_hello(machine, generation, policy.as_deref())
+            .await
+            .is_err()
         {
-            return;
-        }
-        if !self.runtime.wait(0).await
-            || !self
-                .runtime
-                .wire_limits
-                .begin_hello(machine, self.related(machine).await)
-        {
-            return;
-        }
-        // All errors (including an old peer's unknown-prefix reset) terminate
-        // this one attempt. Nothing here touches DM state or schedules retries.
-        if self.send_hello(machine).await.is_err() {
             self.runtime.wire_limits.reset(machine);
         }
     }
-    async fn send_hello(self: &Arc<Self>, machine: MachineId) -> io::Result<()> {
-        let mut hello = self.own(None, false)?;
-        hello.have_certificate = self
-            .runtime
-            .store()
-            .and_then(|s| s.machine_certificate_digest(machine, dm_capability::now_unix_ms()));
-        let (lease, kind, body) = self.exchange(machine, HELLO, hello).await?;
+    async fn send_hello(
+        self: &Arc<Self>,
+        machine: MachineId,
+        generation: Option<u64>,
+        policy: Option<&ReadyPolicy>,
+    ) -> io::Result<()> {
+        let mut hello = if policy.is_some() {
+            self.own_ready(None, false)?
+        } else {
+            self.own(None, false)?
+        };
+        // A missing digest only asks the peer to include its certificate. The
+        // opt-in path must not block on the optional cache optimization.
+        if policy.is_none() {
+            hello.have_certificate = self
+                .runtime
+                .store()
+                .and_then(|s| s.machine_certificate_digest(machine, dm_capability::now_unix_ms()));
+        }
+        let (lease, kind, body) = self
+            .exchange(machine, HELLO, hello, generation, policy)
+            .await?;
         let have = match kind {
             ACK => codec()
                 .deserialize::<Option<[u8; 32]>>(&body)
@@ -950,35 +1313,293 @@ impl Context {
                 let have = reply.have_certificate;
                 drop(body);
                 let context = Arc::clone(self);
-                // Keep the reply reservation alive even if this task is aborted
-                // while spawn_blocking finishes verification / a durable move.
+                // Keep the reply reservation alive through durable verification.
                 tokio::task::spawn_blocking(move || {
                     let _lease = lease;
                     context.ingest(machine, reply.into_record())
                 })
                 .await
                 .map_err(io::Error::other)??;
-                return self.send_certificate_if_missing(machine, have).await;
+                return self
+                    .send_certificate_if_missing(machine, have, generation, policy)
+                    .await;
             }
             _ => return Err(invalid("evidence Hello refused")),
         };
         drop(body);
         drop(lease);
-        self.send_certificate_if_missing(machine, have).await
+        self.send_certificate_if_missing(machine, have, generation, policy)
+            .await
     }
     async fn send_certificate_if_missing(
         &self,
         machine: MachineId,
         have: Option<[u8; 32]>,
+        generation: Option<u64>,
+        policy: Option<&ReadyPolicy>,
     ) -> io::Result<()> {
-        let follow = self.own(have, true)?;
+        let follow = if policy.is_some() {
+            self.own_ready(have, true)?
+        } else {
+            self.own(have, true)?
+        };
         if follow.certificate.is_some() {
-            let (_lease, kind, body) = self.exchange(machine, CERTIFICATE, follow).await?;
+            let (_lease, kind, body) = self
+                .exchange(machine, CERTIFICATE, follow, generation, policy)
+                .await?;
             if kind != ACK || !body.is_empty() {
                 return Err(invalid("certificate refused"));
             }
         }
         Ok(())
+    }
+}
+
+/// Live denial inputs for the opt-in outgoing path. These are borrowed with
+/// try-locks only; a busy read is not an authorization or a consumed attempt.
+struct ReadyPolicy {
+    contacts: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+    placements: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
+}
+impl ReadyPolicy {
+    fn eligible(&self, context: &Context, machine: MachineId) -> Option<bool> {
+        if !context.runtime.is_ready() {
+            return None;
+        }
+        if !crate::dm_capability_service::advert_is_publishable(&context.capabilities.borrow()) {
+            return Some(false);
+        }
+        if context
+            .caps
+            .try_machine_registry_supports(
+                &machine,
+                crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1,
+            )
+            .ok()?
+            == Some(false)
+        {
+            return Some(false);
+        }
+        let store = context.runtime.store()?;
+        let now = dm_capability::now_unix_ms();
+        let cache = context.discovery.try_read().ok()?;
+        let revoked = context.revoked.try_read().ok()?;
+        let contacts = self.contacts.try_read().ok()?;
+        let placements = self.placements.try_read().ok()?;
+        if revoked.is_machine_revoked(&machine) {
+            return Some(false);
+        }
+        let trust = crate::trust::TrustEvaluator::new(&contacts);
+        let mut agents = store
+            .try_agents_on_machine(machine, READY_AGENT_CAP + 1)
+            .ok()?;
+        agents.extend(
+            cache
+                .values()
+                .filter(|d| d.machine_id == machine)
+                .map(|d| d.agent_id)
+                .take(READY_AGENT_CAP + 1),
+        );
+        agents.sort_by_key(|a| a.0);
+        agents.dedup();
+        if agents.len() > READY_AGENT_CAP {
+            // Do not miss a co-resident denial by truncating authority input.
+            return Some(false);
+        }
+        let mut related = context.owner.try_evidence_relation(
+            context.identity.agent_id(),
+            machine,
+            None,
+            &revoked,
+            now,
+        )? & crate::peer_evidence::ENROLLED
+            != 0;
+        for agent in agents {
+            let discovery = cache.get(&agent).filter(|d| d.machine_id == machine);
+            if revoked.is_agent_revoked(&agent)
+                || matches!(
+                    trust.evaluate(&crate::trust::TrustContext {
+                        agent_id: &agent,
+                        machine_id: &machine,
+                    }),
+                    crate::trust::TrustDecision::RejectBlocked
+                        | crate::trust::TrustDecision::RejectMachineMismatch
+                )
+                || discovery.is_some_and(|d| {
+                    crate::identity::is_expired(d.cert_not_after, now / 1000)
+                        || d.agent_certificate
+                            .as_ref()
+                            .is_some_and(|c| c.is_expired(now / 1000))
+                })
+            {
+                return Some(false);
+            }
+            // Dead pairings do not become authority; live co-residents can
+            // still establish a relationship, as in the shared machine gate.
+            if crate::key_move::enforce_pairing(
+                &revoked,
+                placements.placement_view(),
+                &agent,
+                &machine,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            if let Some(d) = discovery {
+                if now / 1000
+                    <= d.announced_at
+                        .saturating_add(dm_capability::ADVERT_CACHE_TTL_SECS)
+                {
+                    related |=
+                        store.try_related(agent, machine, d.agent_certificate.as_ref(), now)?;
+                }
+            }
+            related |= store
+                .try_usable_agent(agent, now)
+                .ok()?
+                .is_some_and(|view| view.announcement.machine_id == machine);
+        }
+        Some(related)
+    }
+}
+
+const LOOP_JOB_CAP: usize = 64;
+const READY_PASS_CAP: usize = 64;
+const READY_AGENT_CAP: usize = 64;
+const READY_INTERVAL: Duration = Duration::from_secs(1);
+
+struct WireJob {
+    machine: MachineId,
+    outgoing: bool,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Both ingress and outgoing work use this single admission point. Aborted
+/// jobs keep their slot and machine ownership until JoinSet reports completion.
+#[derive(Default)]
+struct WireJobs {
+    tasks: tokio::task::JoinSet<()>,
+    jobs: HashMap<tokio::task::Id, WireJob>,
+}
+impl WireJobs {
+    fn outgoing(&self, machine: MachineId) -> bool {
+        self.jobs
+            .values()
+            .any(|j| j.machine == machine && j.outgoing)
+    }
+    fn spawn(
+        &mut self,
+        machine: MachineId,
+        outgoing: bool,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        if self.tasks.len() >= LOOP_JOB_CAP || (outgoing && self.outgoing(machine)) {
+            return false;
+        }
+        let abort = self.tasks.spawn(task);
+        self.jobs.insert(
+            abort.id(),
+            WireJob {
+                machine,
+                outgoing,
+                abort,
+            },
+        );
+        true
+    }
+    fn cancel(&self, machine: MachineId) {
+        for job in self
+            .jobs
+            .values()
+            .filter(|j| j.machine == machine && j.outgoing)
+        {
+            job.abort.abort();
+        }
+    }
+    async fn join(&mut self) -> Option<Result<(), tokio::task::JoinError>> {
+        let result = self.tasks.join_next_with_id().await?;
+        let id = match &result {
+            Ok((id, ())) => *id,
+            Err(error) => error.id(),
+        };
+        self.jobs.remove(&id);
+        Some(result.map(|(_, ())| ()))
+    }
+    async fn shutdown(&mut self) {
+        self.tasks.abort_all();
+        while !self.tasks.is_empty() {
+            let _ = self.join().await;
+        }
+    }
+}
+
+/// Only current connections occupy this queue. Its rotation advances even
+/// when a candidate is busy, ineligible, or already owns a job.
+struct ReadyConnections {
+    order: VecDeque<MachineId>,
+    generations: HashMap<MachineId, Option<u64>>,
+    cap: usize,
+    last_pass: Option<Instant>,
+}
+impl ReadyConnections {
+    fn new(cap: u32) -> Self {
+        Self {
+            order: VecDeque::new(),
+            generations: HashMap::new(),
+            cap: if cap == 0 {
+                crate::network::DEFAULT_MAX_CONNECTIONS
+            } else {
+                cap
+            } as usize,
+            last_pass: None,
+        }
+    }
+    fn insert(&mut self, machine: MachineId) -> bool {
+        if self.generations.contains_key(&machine) {
+            return true;
+        }
+        if self.order.len() >= self.cap {
+            return false;
+        }
+        self.order.push_back(machine);
+        self.generations.insert(machine, None);
+        true
+    }
+    fn remove(&mut self, machine: MachineId, jobs: &WireJobs, limits: &Limits) {
+        self.order.retain(|m| *m != machine);
+        self.generations.remove(&machine);
+        jobs.cancel(machine);
+        // Even a peer rejected by the tracking cap can have an inbound marker.
+        limits.disconnect(machine);
+    }
+    fn generation(&mut self, machine: MachineId, id: u64, jobs: &WireJobs, limits: &Limits) {
+        if let Some(previous) = self.generations.get_mut(&machine) {
+            if previous.is_some_and(|old| old != id) {
+                jobs.cancel(machine);
+            }
+            // A reply may already have consumed this generation before the
+            // readiness pass observes it. Never clear that new marker.
+            limits.hello_connection(machine, id);
+            *previous = Some(id);
+        }
+    }
+    fn candidates(&mut self, now: Instant) -> Vec<MachineId> {
+        if self
+            .last_pass
+            .is_some_and(|last| now.duration_since(last) < READY_INTERVAL)
+        {
+            return Vec::new();
+        }
+        self.last_pass = Some(now);
+        let mut result = Vec::with_capacity(READY_PASS_CAP.min(self.order.len()));
+        for _ in 0..READY_PASS_CAP.min(self.order.len()) {
+            if let Some(machine) = self.order.pop_front() {
+                self.order.push_back(machine);
+                result.push(machine);
+            }
+        }
+        result
     }
 }
 
@@ -993,6 +1614,17 @@ impl crate::Agent {
         let Ok(template) = self.build_announcement(false, false) else {
             return;
         };
+        let enabled = self
+            .peer_evidence()
+            .wire_limits
+            .ready_hello
+            .load(std::sync::atomic::Ordering::Acquire);
+        let policy = enabled.then(|| {
+            Arc::new(ReadyPolicy {
+                contacts: Arc::clone(&self.contact_store),
+                placements: Arc::clone(&self.move_state),
+            })
+        });
         let context = Arc::new(Context {
             bindings: Arc::clone(&self.authenticated_machine_bindings),
             runtime: Arc::clone(self.peer_evidence()),
@@ -1016,28 +1648,105 @@ impl crate::Agent {
         let mut events = network.subscribe();
         let token = self.shutdown_token.clone();
         self.spawn_tracked(async move {
-            let mut tasks = tokio::task::JoinSet::new();
-            loop {
+            if !enabled {
+                // Preserve the original event loop, including duplicate connect
+                // jobs, disconnect handling, select fairness and shutdown.
+                let mut tasks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                        stream = acceptor.next() => {
+                            let Some(stream) = stream else { break; };
+                            tasks.spawn(Arc::clone(&context).accept(stream));
+                        }
+                        event = events.recv() => match event {
+                            Ok(crate::network::NetworkEvent::PeerConnected { peer_id, .. }) if tasks.len() < 64 => {
+                                tasks.spawn(Arc::clone(&context).connect(MachineId(peer_id), None, None));
+                            }
+                            Ok(crate::network::NetworkEvent::PeerDisconnected { peer_id, .. }) => context.runtime.wire_limits.disconnect(MachineId(peer_id)),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            _ => {},
+                        },
+                    }
+                }
+                tasks.abort_all();
+                return;
+            }
+            let mut jobs = WireJobs::default();
+            let mut connections = ReadyConnections::new(context.network.config().max_connections);
+            let mut tick = tokio::time::interval(READY_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The immediate first tick includes startup connections. Only an
+            // authoritative absent generation removes tracking, never a snapshot.
+            'wire: loop {
                 tokio::select! {
                     _ = token.cancelled() => break,
-                    Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                    _ = jobs.join(), if !jobs.tasks.is_empty() => {},
+                    at = tick.tick() => {
+                        let peers = tokio::select! {
+                            _ = token.cancelled() => break 'wire,
+                            peers = context.network.connected_peers() => peers,
+                        };
+                        for peer in peers {
+                            connections.insert(MachineId(peer.0));
+                        }
+                        for machine in connections.candidates(at) {
+                            let generation = match context.network.try_connection_generation(&ant_quic::PeerId(machine.0)) {
+                                Ok(Some(generation)) => generation,
+                                Ok(None) => {
+                                    connections.remove(machine, &jobs, &context.runtime.wire_limits);
+                                    continue;
+                                }
+                                // Busy/unavailable is not a disconnect. Retain
+                                // the generation and consumed-attempt marker.
+                                Err(()) => continue,
+                            };
+                            connections.generation(machine, generation, &jobs, &context.runtime.wire_limits);
+                            if context.runtime.wire_limits.hello_pending(machine)
+                                && !jobs.outgoing(machine)
+                                && policy.as_ref().is_some_and(|p| p.eligible(&context, machine) == Some(true))
+                            {
+                                jobs.spawn(machine, true, Arc::clone(&context).connect(machine, Some(generation), policy.clone()));
+                            }
+                        }
+                    }
                     stream = acceptor.next() => {
                         let Some(stream) = stream else { break; };
-                        tasks.spawn(Arc::clone(&context).accept(stream));
+                        let machine = stream.peer();
+                        if !jobs.spawn(machine, false, Arc::clone(&context).accept(stream)) {
+                            context.runtime.wire_limits.reset(machine);
+                        }
                     }
                     event = events.recv() => match event {
-                        Ok(crate::network::NetworkEvent::PeerConnected { peer_id, .. }) if tasks.len() < 64 => {
-                            // Bound pending connect jobs too. Request bodies are
-                            // separately covered by the shared allocation pool.
-                            tasks.spawn(Arc::clone(&context).connect(MachineId(peer_id)));
+                        Ok(crate::network::NetworkEvent::PeerConnected { peer_id, .. }) => {
+                            connections.insert(MachineId(peer_id));
                         }
-                        Ok(crate::network::NetworkEvent::PeerDisconnected { peer_id, .. }) => context.runtime.wire_limits.disconnect(MachineId(peer_id)),
+                        Ok(crate::network::NetworkEvent::PeerDisconnected { peer_id, .. }) => {
+                            let machine = MachineId(peer_id);
+                            if !connections.generations.contains_key(&machine) {
+                                // Over-cap peers can still have inbound markers.
+                                // No tracked generation needs a replacement fence.
+                                connections.remove(machine, &jobs, &context.runtime.wire_limits);
+                                continue;
+                            }
+                            // A delayed event can describe an old generation.
+                            match context.network.try_connection_generation(&ant_quic::PeerId(peer_id)) {
+                                Ok(Some(generation)) => {
+                                    if connections.insert(machine) {
+                                        connections.generation(machine, generation, &jobs, &context.runtime.wire_limits);
+                                    }
+                                }
+                                Ok(None) => connections.remove(machine, &jobs, &context.runtime.wire_limits),
+                                Err(()) => {},
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         _ => {},
                     },
                 }
             }
-            tasks.abort_all();
+            jobs.shutdown().await;
         });
     }
 }
@@ -1045,6 +1754,628 @@ impl crate::Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn issue1207_shared_job_bound_and_cancelled_slots_are_not_reused() {
+        let mut jobs = WireJobs::default();
+        let machine = MachineId([1; 32]);
+        assert!(jobs.spawn(machine, true, std::future::pending()));
+        for _ in 0..10_000 {
+            assert!(!jobs.spawn(machine, true, std::future::pending()));
+        }
+        for i in 1..LOOP_JOB_CAP {
+            assert!(jobs.spawn(MachineId([i as u8; 32]), false, std::future::pending()));
+        }
+        assert_eq!(jobs.tasks.len(), LOOP_JOB_CAP);
+        assert!(!jobs.spawn(MachineId([99; 32]), true, std::future::pending()));
+        assert!(!jobs.spawn(MachineId([99; 32]), false, std::future::pending()));
+        jobs.cancel(machine);
+        assert!(jobs.outgoing(machine));
+        assert_eq!(jobs.tasks.len(), LOOP_JOB_CAP);
+        assert!(!jobs.spawn(machine, true, std::future::pending()));
+        let _ = jobs.join().await;
+        assert_eq!(jobs.tasks.len(), LOOP_JOB_CAP - 1);
+        assert!(
+            jobs.jobs
+                .values()
+                .any(|j| j.machine == machine && !j.outgoing && !j.abort.is_finished()),
+            "cancellation must preserve inbound work for this machine"
+        );
+        jobs.shutdown().await;
+        assert!(jobs.tasks.is_empty());
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue1207_round_robin_pass_rate_capacity_and_generation_cancellation() {
+        let mut connections = ReadyConnections::new(130);
+        let mut jobs = WireJobs::default();
+        let limits = Limits::default();
+        for i in 0..130 {
+            assert!(connections.insert(MachineId([i; 32])));
+        }
+        assert!(!connections.insert(MachineId([200; 32])));
+        assert_eq!(connections.generations.len(), 130);
+        let now = Instant::now();
+        let first = connections.candidates(now);
+        assert_eq!(first.len(), 64);
+        for _ in 0..10_000 {
+            assert!(connections.candidates(now).is_empty());
+        }
+        assert!(connections
+            .candidates(now + Duration::from_millis(999))
+            .is_empty());
+        let second = connections.candidates(now + READY_INTERVAL);
+        assert_eq!(second.len(), 64);
+        assert!(!second.iter().any(|m| first.contains(m)));
+        let third = connections.candidates(now + READY_INTERVAL * 100);
+        assert_eq!(&third[..2], &[MachineId([128; 32]), MachineId([129; 32])]);
+        assert!(connections
+            .candidates(now + READY_INTERVAL * 100)
+            .is_empty());
+        assert_eq!(
+            ReadyConnections::new(0).cap,
+            crate::network::DEFAULT_MAX_CONNECTIONS as usize
+        );
+
+        let machine = first[0];
+        connections.generation(machine, 10, &jobs, &limits);
+        assert!(jobs.spawn(machine, true, std::future::pending()));
+        assert!(limits.begin_hello(machine, true));
+        connections.generation(machine, 11, &jobs, &limits);
+        assert!(
+            jobs.outgoing(machine),
+            "cancelled generation still owns its job slot"
+        );
+        let _ = jobs.join().await;
+        assert!(!jobs.outgoing(machine));
+        assert!(
+            !limits.begin_hello(machine, true),
+            "replacement retains per-machine cooldown"
+        );
+        assert!(jobs.spawn(machine, true, std::future::pending()));
+        connections.remove(machine, &jobs, &limits);
+        assert!(!connections.generations.contains_key(&machine));
+        assert!(!connections.order.contains(&machine));
+        let _ = jobs.join().await;
+        assert!(jobs.jobs.is_empty());
+        let overflow = MachineId([200; 32]);
+        assert!(limits.begin_hello(overflow, true));
+        assert!(!connections.generations.contains_key(&overflow));
+        connections.remove(overflow, &jobs, &limits);
+        assert!(
+            limits.state.lock().unwrap().machines[&overflow].attempted,
+            "generation-blind disconnect must retain an inbound attempt"
+        );
+    }
+
+    // Real loopback connections; executed only by the isolated Linux CI lane.
+    async fn ready_test_agent(path: &std::path::Path) -> crate::Agent {
+        std::fs::create_dir_all(path).unwrap();
+        crate::Agent::builder()
+            .with_identity_dir(path)
+            .with_machine_key(path.join("machine.key"))
+            .with_agent_key_path(path.join("agent.key"))
+            .with_user_key_path(path.join("user.key"))
+            .with_agent_cert_path(path.join("agent.cert"))
+            .with_contact_store_path(path.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(crate::network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    fn ready_test_context(agent: &crate::Agent) -> Arc<Context> {
+        Arc::new(Context {
+            bindings: Arc::clone(&agent.authenticated_machine_bindings),
+            runtime: Arc::clone(agent.peer_evidence()),
+            capture: Arc::clone(&agent.capability_store.evidence_wire),
+            network: Arc::clone(agent.network.as_ref().unwrap()),
+            identity: Arc::clone(&agent.identity),
+            template: agent.build_announcement(false, false).unwrap(),
+            own_cert: Arc::clone(&agent.own_cert_pair),
+            capabilities: Arc::clone(&agent.dm_capabilities_tx),
+            caps: Arc::clone(&agent.capability_store),
+            discovery: Arc::clone(&agent.identity_discovery_cache),
+            machines: Arc::clone(&agent.machine_discovery_cache),
+            owner: agent.owner_trust.clone(),
+            revoked: Arc::clone(&agent.revocation_set),
+        })
+    }
+
+    async fn ready_test_policy(
+        a: &crate::Agent,
+        b: &crate::Agent,
+        path: &std::path::Path,
+    ) -> Arc<ReadyPolicy> {
+        let context = ready_test_context(a);
+        let peer = b.agent_id();
+        let runtime_policy = Arc::new(crate::peer_evidence::RuntimePolicy::new(
+            a.agent_id(),
+            a.owner_trust.clone(),
+            Arc::clone(&a.revocation_set),
+        ));
+        runtime_policy.set_groups(Arc::new(move |agent| Some(agent == peer)));
+        assert!(context.runtime.start(
+            path.to_path_buf(),
+            Default::default(),
+            runtime_policy,
+            Arc::clone(&context.capture)
+        ));
+        assert!(context.runtime.wait(0).await);
+        for agent in [a, b] {
+            agent
+                .dm_capabilities_tx
+                .send_replace(crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]));
+        }
+        context
+            .ingest(
+                b.machine_id(),
+                ready_test_context(b)
+                    .own(None, false)
+                    .unwrap()
+                    .into_record(),
+            )
+            .unwrap();
+        let policy = Arc::new(ReadyPolicy {
+            contacts: Arc::clone(&a.contact_store),
+            placements: Arc::clone(&a.move_state),
+        });
+        assert_eq!(policy.eligible(&context, b.machine_id()), Some(true));
+        policy
+    }
+
+    #[tokio::test]
+    async fn issue1207_store_set_before_ready_defers_hello_without_charging_barrier() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = ready_test_agent(&dir.path().join("a")).await;
+        let b = ready_test_agent(&dir.path().join("b")).await;
+        let policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
+        let mut context = ready_test_context(&a);
+        // Model start's exact store-set/not-ready window with a verified,
+        // otherwise eligible stored binding and no discovery-cache fallback.
+        let (runtime, ready) =
+            EvidenceRuntime::loading_store_for_test(context.runtime.store().unwrap());
+        Arc::get_mut(&mut context).unwrap().runtime = runtime;
+        assert!(context.discovery.read().await.is_empty());
+        let machine = b.machine_id();
+        context
+            .network
+            .connect_addr(b.network().unwrap().bound_addr().await.unwrap())
+            .await
+            .unwrap();
+        let generation = context
+            .network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+            .unwrap()
+            .unwrap();
+        let mut connections = ReadyConnections::new(1);
+        assert!(connections.insert(machine));
+        let now = Instant::now();
+        assert!(context.runtime.store().is_some());
+        assert!(!context.runtime.is_ready());
+        assert_eq!(policy.eligible(&context, machine), None);
+        for candidate in connections.candidates(now) {
+            Arc::clone(&context)
+                .connect(candidate, Some(generation), Some(Arc::clone(&policy)))
+                .await;
+        }
+        let limits = &context.runtime.wire_limits;
+        assert_eq!(
+            limits.counters.evidence_hello_sent.load(Ordering::Relaxed),
+            0
+        );
+        assert!(limits.hello_pending(machine));
+        assert_eq!(
+            context
+                .runtime
+                .evidence_load_barrier_waits
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        ready.cancel();
+        assert_eq!(policy.eligible(&context, machine), Some(true));
+        let remote = Arc::clone(b.network.as_ref().unwrap());
+        let reader = tokio::spawn(async move {
+            let (_, mut send, mut recv) = remote.accept_bi().await.unwrap();
+            assert_eq!(
+                recv.read_u8().await.unwrap(),
+                StreamProtocol::EvidenceV1.as_u8()
+            );
+            let limits = Arc::new(Limits::default());
+            let (kind, body) = read_message(&mut recv, &limits).await.unwrap();
+            assert_eq!(kind, HELLO);
+            assert!(decode::hello(&body).is_ok());
+            write_message(
+                &mut send,
+                &limits,
+                MachineId([7; 32]),
+                ACK,
+                &codec().serialize(&Option::<[u8; 32]>::None).unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        for at in [now + READY_INTERVAL, now + READY_INTERVAL * 2] {
+            for candidate in connections.candidates(at) {
+                if limits.hello_pending(candidate) {
+                    Arc::clone(&context)
+                        .connect(candidate, Some(generation), Some(Arc::clone(&policy)))
+                        .await;
+                }
+            }
+        }
+        tokio::time::timeout(DEADLINE, reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            limits.counters.evidence_hello_sent.load(Ordering::Relaxed),
+            1
+        );
+        assert!(!limits.hello_pending(machine));
+        assert_eq!(
+            context
+                .runtime
+                .evidence_load_barrier_waits
+                .load(Ordering::Relaxed),
+            0
+        );
+        a.network().unwrap().shutdown().await;
+        b.network().unwrap().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn issue1207_stored_only_relationship_and_live_nonblocking_rechecks() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ready_test_agent(&dir.path().join("a")).await;
+        let b = ready_test_agent(&dir.path().join("b")).await;
+        let context = ready_test_context(&a);
+        let peer_context = ready_test_context(&b);
+        let machine = b.machine_id();
+        let agent = b.agent_id();
+        let roster = Arc::new(tokio::sync::RwLock::new(true));
+        let live = Arc::clone(&roster);
+        let runtime_policy = Arc::new(crate::peer_evidence::RuntimePolicy::new(
+            a.agent_id(),
+            a.owner_trust.clone(),
+            Arc::clone(&a.revocation_set),
+        ));
+        runtime_policy.set_groups(Arc::new(move |peer| {
+            live.try_read().ok().map(|r| *r && peer == agent)
+        }));
+        assert!(context.runtime.start(
+            dir.path().join("evidence"),
+            Default::default(),
+            runtime_policy,
+            Arc::clone(&context.capture)
+        ));
+        assert!(context.runtime.wait(0).await);
+        for c in [&context, &peer_context] {
+            c.capabilities
+                .send_replace(crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]));
+        }
+        context
+            .ingest(
+                machine,
+                peer_context.own(None, false).unwrap().into_record(),
+            )
+            .unwrap();
+        assert!(context.discovery.read().await.is_empty());
+        let store = context.runtime.store().unwrap();
+        assert!(store.try_agents_on_machine(machine, 0).unwrap().is_empty());
+        assert_eq!(
+            store.try_agents_on_machine(machine, 1).unwrap(),
+            vec![agent]
+        );
+        let policy = ReadyPolicy {
+            contacts: Arc::clone(&a.contact_store),
+            placements: Arc::clone(&a.move_state),
+        };
+        assert_eq!(
+            policy.eligible(&context, machine),
+            Some(true),
+            "stored-only relationship survives absent discovery"
+        );
+        let guard = roster.write().await;
+        assert_eq!(policy.eligible(&context, machine), None);
+        assert!(context.runtime.wire_limits.hello_pending(machine));
+        drop(guard);
+        let contacts = a.contact_store.write().await;
+        assert_eq!(policy.eligible(&context, machine), None);
+        drop(contacts);
+        let placements = a.move_state.write().await;
+        assert_eq!(policy.eligible(&context, machine), None);
+        drop(placements);
+        assert_eq!(policy.eligible(&context, machine), Some(true));
+        a.contact_store
+            .write()
+            .await
+            .set_identity_type(&agent, crate::contacts::IdentityType::Pinned);
+        assert_eq!(
+            policy.eligible(&context, machine),
+            Some(false),
+            "stored evidence cannot bypass current pinning"
+        );
+        a.contact_store
+            .write()
+            .await
+            .set_identity_type(&agent, crate::contacts::IdentityType::Anonymous);
+        a.contact_store
+            .write()
+            .await
+            .set_trust(&agent, crate::contacts::TrustLevel::Blocked);
+        assert_eq!(
+            policy.eligible(&context, machine),
+            Some(false),
+            "stored evidence cannot bypass current Blocked"
+        );
+        a.contact_store
+            .write()
+            .await
+            .set_trust(&agent, crate::contacts::TrustLevel::Unknown);
+        *roster.write().await = false;
+        assert_eq!(
+            policy.eligible(&context, machine),
+            Some(false),
+            "stored relationship flags cannot replace the live roster"
+        );
+        assert!(context.runtime.wire_limits.hello_pending(machine));
+        a.network().unwrap().shutdown().await;
+        b.network().unwrap().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn issue1207_disconnect_cancels_waiting_hello_and_shutdown_drains_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ready_test_agent(&dir.path().join("a")).await;
+        let b = ready_test_agent(&dir.path().join("b")).await;
+        let context = ready_test_context(&a);
+        let policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
+        let machine = b.machine_id();
+        let peer = ant_quic::PeerId(machine.0);
+        context
+            .network
+            .connect_addr(b.network().unwrap().bound_addr().await.unwrap())
+            .await
+            .unwrap();
+        let generation = context
+            .network
+            .try_connection_generation(&peer)
+            .unwrap()
+            .unwrap();
+        let mut connections = ReadyConnections::new(1);
+        let mut jobs = WireJobs::default();
+        connections.insert(machine);
+        connections.generation(machine, generation, &jobs, &context.runtime.wire_limits);
+        // This eligible job sends a real Hello, then waits for the peer's reply.
+        // Its capability is already published, before spawning or joining.
+        assert_eq!(policy.eligible(&context, machine), Some(true));
+        assert!(jobs.spawn(
+            machine,
+            true,
+            Arc::clone(&context).connect(machine, Some(generation), Some(policy))
+        ));
+        let (_send, mut recv) = tokio::time::timeout(DEADLINE, async {
+            let (_, send, mut recv) = b.network().unwrap().accept_bi().await.unwrap();
+            assert_eq!(
+                recv.read_u8().await.unwrap(),
+                StreamProtocol::EvidenceV1.as_u8()
+            );
+            let (kind, _) = read_message(&mut recv, &Arc::new(Limits::default()))
+                .await
+                .unwrap();
+            assert_eq!(kind, HELLO);
+            (send, recv)
+        })
+        .await
+        .unwrap();
+        // Cancellation must win even without the transport reset completing.
+        // Removing the abort makes this assertion fail (normal completion or
+        // the job's five-second deadline is not accepted as cancellation).
+        connections.remove(machine, &jobs, &context.runtime.wire_limits);
+        let result = tokio::time::timeout(Duration::from_secs(1), jobs.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().is_cancelled());
+        assert!(!jobs.outgoing(machine));
+        assert!(context.runtime.wire_limits.state.lock().unwrap().machines[&machine].attempted);
+        context.network.disconnect(&peer).await.unwrap();
+        // Keep the reply stream alive until after the cancellation assertion.
+        let _ = &mut recv;
+        assert!(jobs.spawn(machine, true, std::future::pending()));
+        assert!(jobs.spawn(machine, false, std::future::pending()));
+        tokio::time::timeout(Duration::from_secs(1), jobs.shutdown())
+            .await
+            .unwrap();
+        assert!(jobs.jobs.is_empty());
+        a.network().unwrap().shutdown().await;
+        b.network().unwrap().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn issue1207_old_generation_cannot_emit_hello_or_certificate_on_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ready_test_agent(&dir.path().join("a")).await;
+        let b = ready_test_agent(&dir.path().join("b")).await;
+        let context = ready_test_context(&a);
+        let policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
+        let machine = b.machine_id();
+        let peer = ant_quic::PeerId(machine.0);
+        let address = b.network().unwrap().bound_addr().await.unwrap();
+        context.network.connect_addr(address).await.unwrap();
+        let old = context
+            .network
+            .try_connection_generation(&peer)
+            .unwrap()
+            .unwrap();
+        assert!(context.same_connection(machine, old));
+        context.network.disconnect(&peer).await.unwrap();
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                if !b
+                    .network()
+                    .unwrap()
+                    .peer_link_conn(&ant_quic::PeerId(a.machine_id().0))
+                    .await
+                    .is_ok_and(|c| c.inner().close_reason().is_none())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        context.network.connect_addr(address).await.unwrap();
+        let replacement = context
+            .network
+            .try_connection_generation(&peer)
+            .unwrap()
+            .unwrap();
+        assert_ne!(old, replacement);
+        assert!(!context.same_connection(machine, old));
+        assert!(context.same_connection(machine, replacement));
+        context
+            .capabilities
+            .send_replace(crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]));
+        for kind in [HELLO, CERTIFICATE] {
+            let hello = context.own(None, false).unwrap();
+            assert!(context
+                .exchange(machine, kind, hello, Some(old), Some(&policy))
+                .await
+                .is_err());
+        }
+        assert!(
+            context.runtime.wire_limits.hello_pending(machine),
+            "stale generation consumes no replacement attempt"
+        );
+        assert_eq!(
+            context
+                .runtime
+                .wire_limits
+                .counters
+                .evidence_hello_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        // Positive control: the same fence permits a real Hello on the live
+        // generation. The raw remote verifies the prefix/kind and sends ACK.
+        let remote = Arc::clone(b.network.as_ref().unwrap());
+        let reader = tokio::spawn(async move {
+            let (_, mut send, mut recv) = remote.accept_bi().await.unwrap();
+            assert_eq!(
+                recv.read_u8().await.unwrap(),
+                StreamProtocol::EvidenceV1.as_u8()
+            );
+            let limits = Arc::new(Limits::default());
+            let (kind, body) = read_message(&mut recv, &limits).await.unwrap();
+            assert_eq!(kind, HELLO);
+            assert!(decode::hello(&body).is_ok());
+            write_message(
+                &mut send,
+                &limits,
+                MachineId([7; 32]),
+                ACK,
+                &codec().serialize(&Option::<[u8; 32]>::None).unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        let hello = context.own(None, false).unwrap();
+        let (_, kind, _) = context
+            .exchange(machine, HELLO, hello, Some(replacement), Some(&policy))
+            .await
+            .unwrap();
+        assert_eq!(kind, ACK);
+        reader.await.unwrap();
+        assert!(!context.runtime.wire_limits.hello_pending(machine));
+        a.network().unwrap().shutdown().await;
+        b.network().unwrap().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn issue1207_superseded_but_open_connection_cannot_emit() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ready_test_agent(&dir.path().join("a")).await;
+        let b = ready_test_agent(&dir.path().join("b")).await;
+        // Same machine at a second address: dialing from the same initiator
+        // replaces the winner but leaves the old connection open to drain.
+        std::fs::create_dir_all(dir.path().join("b2")).unwrap();
+        std::fs::copy(
+            dir.path().join("b/machine.key"),
+            dir.path().join("b2/machine.key"),
+        )
+        .unwrap();
+        let b2 = ready_test_agent(&dir.path().join("b2")).await;
+        assert_eq!(b.machine_id(), b2.machine_id());
+        let context = ready_test_context(&a);
+        let policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
+        let machine = b.machine_id();
+        let peer = ant_quic::PeerId(machine.0);
+        context
+            .network
+            .connect_addr(b.network().unwrap().bound_addr().await.unwrap())
+            .await
+            .unwrap();
+        let old = context
+            .network
+            .try_connection_generation(&peer)
+            .unwrap()
+            .unwrap();
+        let retained = context.network.peer_link_conn(&peer).await.unwrap();
+        context
+            .network
+            .connect_addr(b2.network().unwrap().bound_addr().await.unwrap())
+            .await
+            .unwrap();
+        let current = context
+            .network
+            .try_connection_generation(&peer)
+            .unwrap()
+            .unwrap();
+        assert_ne!(old, current, "must actually supersede the old generation");
+        assert!(
+            retained.inner().close_reason().is_none(),
+            "old connection must still be OPEN"
+        );
+        assert!(!context.same_connection(machine, old));
+        assert!(context.same_connection(machine, current));
+        for kind in [HELLO, CERTIFICATE] {
+            let hello = context.own_ready(None, false).unwrap();
+            let error = context
+                .exchange(machine, kind, hello, Some(old), Some(&policy))
+                .await
+                .err()
+                .expect("stale generation must refuse");
+            assert_eq!(error.to_string(), "Hello connection replaced");
+            assert!(retained.inner().close_reason().is_none());
+        }
+        assert!(context.runtime.wire_limits.hello_pending(machine));
+        assert_eq!(
+            context
+                .runtime
+                .wire_limits
+                .counters
+                .evidence_hello_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        a.network().unwrap().shutdown().await;
+        b.network().unwrap().shutdown().await;
+        b2.network().unwrap().shutdown().await;
+    }
 
     #[tokio::test]
     async fn s3_hello_mints_only_own_evidence_and_sends_cert_only_on_miss() {
@@ -1264,10 +2595,14 @@ mod tests {
         tokio::time::advance(HELLO_INTERVAL).await;
         assert!(!limits.begin_hello(m, true), "no retry until reconnect");
         limits.disconnect(m);
-        assert!(limits.begin_hello(m, true));
-        limits.disconnect(m);
         assert!(
             !limits.begin_hello(m, true),
+            "disconnect alone cannot re-arm"
+        );
+        assert!(limits.begin_hello_on_connection(m, true, Some(1)));
+        limits.disconnect(m);
+        assert!(
+            !limits.begin_hello_on_connection(m, true, Some(2)),
             "reconnect churn retains cooldown"
         );
     }

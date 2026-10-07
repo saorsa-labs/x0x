@@ -163,6 +163,13 @@ pub struct OwnerCertEvidence {
     digests: HashMap<String, [u8; 32]>,
     /// Agent ids (hex) present in the local ADR-0018 revocation set.
     revoked: HashSet<String>,
+    /// ADR 0108 §4 premise: agent ids (hex) whose recorded digest is the
+    /// canonical anonymous one AND was announced by the agent's current
+    /// authenticated bound machine (the builder checks that). Only these
+    /// anonymous digests are absence of disclosure in a Home scope.
+    /// Recording a pending digest for the agent clears its entry; a
+    /// certificate's digest is never the anonymous one.
+    bound_anonymous: HashSet<String>,
     /// Wall-clock unix seconds used for expiry checks.
     now_unix: u64,
 }
@@ -175,6 +182,7 @@ impl OwnerCertEvidence {
             certs: HashMap::new(),
             digests: HashMap::new(),
             revoked: HashSet::new(),
+            bound_anonymous: HashSet::new(),
             now_unix,
         }
     }
@@ -193,7 +201,27 @@ impl OwnerCertEvidence {
     /// flight). Absent cert + present digest = evidence in flight.
     pub fn observe_pending_digest(&mut self, agent_hex: impl Into<String>, digest: [u8; 32]) {
         let agent_hex = agent_hex.into();
+        self.bound_anonymous.remove(&agent_hex);
         self.digests.insert(agent_hex, digest);
+    }
+
+    /// ADR 0108 §4 premise: record that `agent_hex`'s recorded anonymous
+    /// digest was announced by the agent's current authenticated bound
+    /// machine, so in a Home scope it is absence of disclosure
+    /// ([`Self::disclosed_digest_for`]). The caller checks the binding;
+    /// call it after the digest is recorded, because
+    /// [`Self::observe_pending_digest`] clears this mark.
+    pub fn observe_bound_machine_anonymous(&mut self, agent_hex: impl Into<String>) {
+        self.bound_anonymous.insert(agent_hex.into());
+    }
+
+    /// Whether `agent_hex`'s recorded digest is the canonical anonymous one
+    /// announced by its current authenticated bound machine
+    /// ([`Self::observe_bound_machine_anonymous`]).
+    #[must_use]
+    pub fn anonymous_from_bound_machine(&self, agent_hex: &str) -> bool {
+        self.bound_anonymous.contains(agent_hex)
+            && self.digest_for(agent_hex) == Some(crate::announce_v3::anonymous_cert_digest())
     }
 
     /// Record that `agent_hex` is in the local revocation set.
@@ -219,6 +247,37 @@ impl OwnerCertEvidence {
     #[must_use]
     pub fn fetch_in_flight(&self, agent_hex: &str) -> bool {
         self.digest_for(agent_hex).is_some() && self.cert_for(agent_hex).is_none()
+    }
+
+    /// The announced digest a verdict reads for `agent_hex` (ADR 0108 §4).
+    ///
+    /// With `home_scope` set (the group is a committed Home scope,
+    /// [`crate::groups::GroupInfo::is_home_scope`]), the canonical
+    /// anonymous digest announced by the agent's current authenticated
+    /// bound machine ([`Self::anonymous_from_bound_machine`]) is absence of
+    /// public disclosure: it reads as no discovery entry at all. It never
+    /// contradicts committed evidence, never counts as a warranted
+    /// certificate fetch and never starts missing-evidence grace. The ADR
+    /// rests on "only the subject agent's authenticated bound machine can
+    /// sign its announce", and any machine can sign a V3 announce naming
+    /// any agent, so an anonymous digest from any other machine keeps
+    /// today's reading. A certificate-bearing digest, and every digest
+    /// outside Home scope, reads exactly as [`Self::digest_for`].
+    #[must_use]
+    pub fn disclosed_digest_for(&self, agent_hex: &str, home_scope: bool) -> Option<[u8; 32]> {
+        if home_scope && self.anonymous_from_bound_machine(agent_hex) {
+            return None;
+        }
+        self.digest_for(agent_hex)
+    }
+
+    /// [`Self::fetch_in_flight`] over [`Self::disclosed_digest_for`]: in
+    /// Home scope an anonymous announce from the agent's bound machine
+    /// never leaves a fetch outstanding.
+    #[must_use]
+    pub fn disclosed_fetch_in_flight(&self, agent_hex: &str, home_scope: bool) -> bool {
+        self.disclosed_digest_for(agent_hex, home_scope).is_some()
+            && self.cert_for(agent_hex).is_none()
     }
 
     /// Whether `agent_hex` is locally known to be revoked (ADR-0018).

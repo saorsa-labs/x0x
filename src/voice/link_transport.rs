@@ -185,8 +185,8 @@ fn requeue_salvaged(
 /// [`StreamType`]. The recv half is parked alongside so the peer's stream
 /// state stays open for the lane's lifetime.
 struct OutboundLane {
-    send: ant_quic::HighLevelSendStream,
-    _recv: ant_quic::HighLevelRecvStream,
+    send: crate::network::StreamSend,
+    _recv: crate::network::StreamRecv,
     /// The most recent frames written to THIS stream, bounded by
     /// [`LANE_REPLAY_MAX_FRAMES`] / [`LANE_REPLAY_MAX_BYTES`].
     ///

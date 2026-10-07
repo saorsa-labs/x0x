@@ -371,6 +371,9 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
     })
 }
 
+// #1166 S5: join-state PROBE (asserts the #447/#458 label), not
+// admission.
+#[allow(clippy::disallowed_methods)]
 async fn join_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
     let info = joiner
         .named_groups
@@ -1008,6 +1011,8 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
 // in-process stand-in for the control-blob pull). Red without #1148
 // (probe PR #1151), green with it (probe PR #1152).
 // ---------------------------------------------------------------------------
+// #1166 S5: join-state PROBE, as above.
+#[allow(clippy::disallowed_methods)]
 async fn wa_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
     let info = joiner.named_groups.read().await.get(group_key).cloned();
     match info {

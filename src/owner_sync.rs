@@ -2278,7 +2278,10 @@ pub const OWNER_REANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// machines seen within one interval (enrolled machines only).
 pub(crate) struct ReannounceLimiter {
     interval: Duration,
-    last: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    /// `tokio::time::Instant` reads the std clock unless tokio time is paused
+    /// (tests only), so the W3-H simulation can age this window with virtual
+    /// time across a restart.
+    last: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
 }
 
 impl ReannounceLimiter {
@@ -2291,7 +2294,7 @@ impl ReannounceLimiter {
 
     /// Whether `machine` may trigger a re-announcement at `now`; records it
     /// when allowed.
-    pub(crate) fn allow(&mut self, machine: &MachineId, now: std::time::Instant) -> bool {
+    pub(crate) fn allow(&mut self, machine: &MachineId, now: tokio::time::Instant) -> bool {
         let interval = self.interval;
         self.last
             .retain(|_, at| now.saturating_duration_since(*at) < interval);
@@ -2424,7 +2427,7 @@ impl OwnerSyncService {
         {
             return;
         }
-        if !limiter.allow(&machine, std::time::Instant::now()) {
+        if !limiter.allow(&machine, tokio::time::Instant::now()) {
             tracing::debug!(
                 target: "x0x::owner_sync",
                 machine = %hex::encode(machine.0),
@@ -2489,10 +2492,22 @@ impl OwnerSyncService {
     /// session tasks is bounded by the semaphore — a flood of inbound
     /// streams cannot spawn unbounded tasks. Without a permit the stream
     /// is dropped (reset) right there.
+    ///
+    /// WHY a `Weak<Self>` (as [`Self::spawn_reannounce_on_owner_connect`]):
+    /// `acceptor.next()` never returns `None` (the acceptor keeps a sender
+    /// of its own channel for deregistration), so this task never ends by
+    /// itself. With an `Arc` it kept the service, and through it the agent
+    /// and the agent's history database lock, alive after the daemon shut
+    /// down, and the service's `Drop`, which aborts this task, never ran.
+    /// With a `Weak` the service drops with its last owner, and its `Drop`
+    /// aborts this task.
     async fn spawn_acceptor_loop(self: &Arc<Self>, mut acceptor: crate::streams::StreamAcceptor) {
-        let service = Arc::clone(self);
+        let service = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             while let Some(stream) = acceptor.next().await {
+                let Some(service) = service.upgrade() else {
+                    break; // the service is gone: drop => reset
+                };
                 let permit = match service.session_permits.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -2503,7 +2518,6 @@ impl OwnerSyncService {
                         continue; // drop => reset, fail closed and bounded
                     }
                 };
-                let service = Arc::clone(&service);
                 tokio::spawn(async move { service.handle_inbound(stream, permit).await });
             }
         });
@@ -4627,7 +4641,7 @@ mod home_pointer_election_tests {
     fn owner_reconnect_reannounce_is_rate_limited_per_machine() {
         let interval = OWNER_REANNOUNCE_MIN_INTERVAL;
         let mut limiter = ReannounceLimiter::new(interval);
-        let t0 = std::time::Instant::now();
+        let t0 = tokio::time::Instant::now();
         assert!(
             limiter.allow(&MachineId([1; 32]), t0),
             "first connect re-announces"

@@ -695,6 +695,128 @@ the canonical "did I break the protocol" first-line test.
 
 ---
 
+## 7f. Survivor Rekey After Remove/Ban — `e2e_vps_survivor_rekey.py`
+
+**Path:** `tests/e2e_vps_survivor_rekey.py` (pure-python tests:
+`tests/test_e2e_vps_survivor_rekey.py`)
+
+Testnet-only acceptance for #1216 (G10 condition 2 of #1190). After a member
+is removed or banned, every survivor must get the new epoch and the removed
+member must get nothing. It runs on one GSS group (MlsEncrypted, legacy plane)
+and one TreeKEM group (`private_secure`), opening one SSH tunnel per node.
+
+### Roles and variants
+
+`--nodes` takes at least five labels. The first is the remover (the group
+creator), the second-last is removed, the last is banned, and the rest
+survive. Each group therefore has five or more members at the removal and
+four or more at the ban.
+
+| Variant | What changes |
+|---|---|
+| `plain` | No restart |
+| `restart` | The remover's `x0xd-testnet.service` restarts 10–20 s before each removal (`--restart-lead-secs`, default 15). Needs `--allow-service-restart`; restored in `finally` |
+
+Each variant builds fresh groups for each plane (`--plane gss|treekem`,
+default both). Every joiner must decrypt a message sealed after its join before
+the next step (#1214: readiness is proven by decrypting, not by roster state).
+
+### Checks per case (remove, then ban)
+
+1. Key barrier: every member, including the target, decrypts a fresh message.
+2. The remover removes or bans the target, then seals a message at an advanced
+   secret epoch.
+3. Every survivor decrypts it: the class-K share on GSS, the commit on
+   TreeKEM. The latency from the removal is recorded per survivor.
+4. No excluded node decrypts it, during convergence and for `--watch-secs`
+   more (default 40 s, minimum 30 s, which covers the share resend and a
+   withheld re-check). The excluded nodes are the target and, in the ban case,
+   the member removed earlier, so a ban rotation that reaches it is caught.
+5. Survivors' rosters drop the target. On GSS the remover must answer the
+   explicit recipient-ineligible refusal (404 `recipient is not a member` or
+   409 `recipient_not_active`) when asked to re-seal the secret to it. After a
+   ban, the target re-joins with an invite minted before the ban: the join
+   response (accepted-and-unseated, or a 409 with a typed refusal code), every
+   remover roster read, the target's own membership state and its join-status
+   must all show it unseated, and it gains no key.
+6. A final message decrypts on every survivor and on no excluded node.
+
+### Verdicts and evidence classes
+
+Every check is pass, fail or **INCONCLUSIVE**, and an inconclusive check stays
+inconclusive in its case, the report's top-level `verdict` and the exit code
+(0 pass, 1 fail, 3 inconclusive). Only exact typed responses count as an
+exclusion or a refusal: for an excluded node's decrypt, 403 `not a member`, 404
+`group not found`, or a typed key-material answer; for the re-join, a 409 with
+a known refusal code. Transport errors, timeouts, 5xx, fork quarantine,
+untyped 4xx and malformed roster or status reads (a row without its `state`,
+for example) make the check and its case inconclusive.
+
+The D60 check "no post-removal key reaches the node" is claimed only with key
+evidence:
+
+| Class | Meaning |
+|---|---|
+| `key` | The node's last decrypt answer came from its key material: GSS no secret, AEAD failure, or an epoch mismatch that reports the node's local epoch below the new one; TreeKEM group not loaded or decrypt failure |
+| `limited` | No key evidence. A removed member's daemon answers `not a member` before it consults any key, TreeKEM logs no key install, and an epoch mismatch without the local epoch proves nothing. The check is not claimed: it goes to `limitations`, not `assertions` |
+
+On GSS each excluded node's journal is also scanned for its share-install line
+("stored new group shared secret (epoch N)"). A line for this group at the new
+epoch or later fails the check. Its absence is never evidence: x0xd's
+non-blocking log writer drops lines without a signal, and log filters can hide
+it. Every journal window starts at the node's own clock, read over SSH before
+the action, so connection delay at scan time cannot hide an early install.
+
+In practice a removed member is `limited` on both planes, and a banned member
+gives `key` evidence on both planes.
+
+Evidence labels start with `<variant>/<plane>/<action>`, for example
+`restart/treekem/ban: sfo rekeyed and decrypts the post-ban message` or
+`plain/gss/ban: no post-ban key reaches singapore during the watch (D60)`.
+Each report case records `rekey_latency_s`, `slowest_survivor`, per-node probe
+classes for every excluded node, epochs, the restart lead, the remover's binary
+before and after the restart, and every role's version. Journals are read-only
+grep counts: `err_recipient_undiscovered` (count and `waited_ms`) on the
+remover, share installs on GSS excluded nodes. No tokens, ciphertexts, invites
+or log text are written.
+
+### Running
+
+```bash
+# Direct (always pass an explicit testnet tokens path):
+python3 -B tests/e2e_vps_survivor_rekey.py --network test \
+  --tokens-file "${X0X_TESTNET_TOKENS_FILE:?source testnet-hosts.env after deploy}" \
+  --nodes nyc sfo helsinki nuremberg singapore \
+  --variant plain --variant restart --allow-service-restart \
+  --report /absolute/path/rekey.json
+
+# Ephemeral testnet, once the testnet-ephemeral skill registers `rekey`
+# (restart-bearing, so run it last in a batch):
+$E fixture --run ID rekey --receipts "$R" --attempt a1 [--rotate K]
+```
+
+Other flags: `--rekey-timeout` (120 s), `--rejoin-watch-secs` (30 s),
+`--poll-timeout` (120 s), `--hosts-json`, `--expect-mixed`,
+`--no-journal-scan`. Every duration must be a finite number of seconds within
+its bounds (watch ≥ 30, rejoin watch ≥ 10, timeouts ≥ 10, all ≤ 3600; restart
+lead 10–20). Expect roughly 20–30 minutes for both variants.
+
+### Mixed-version arm
+
+Nothing assumes one binary (#1208). Deploy the arm with a per-node map, for
+example `$E deploy --run ID --binary <v0.46.3 x0xd> --binary-map
+sfo=<v0.46.2 x0xd>,helsinki=<v0.46.2 x0xd> ...`, then run the fixture; use
+`--rotate K` to put the other version in the remover's seat. The harness reads
+`testnet-hosts.json` next to the tokens file (or `--hosts-json`). It refuses a
+hosts file whose addresses differ from the tokens file or that lacks a valid
+sha256 and version for any selected node. Over SSH it reads the sha256 of each
+node's running x0xd (`/proc/<MainPID>/exe`); each node's live `/health` version
+and running sha256 must equal what was deployed to that node, and an unreadable
+value is inconclusive. For a direct run, `--expect-mixed` also requires two or
+more distinct verified running binaries among `--nodes`.
+
+---
+
 ## 9. Live Network Test — `e2e_live_network.sh`
 
 **Path:** `tests/e2e_live_network.sh`

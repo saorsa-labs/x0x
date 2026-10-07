@@ -1,6 +1,7 @@
 # ADR 0108: Home-Scoped Owner Certificate and Seal Verdict (0088 S2)
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-05 by David Irvine (D178, as written: the Proposed text on main at 6544555, which records rulings D64–D173). The status change was applied by Claude at his direct instruction.
 - **Date:** 2026-10-04
 - **Decision owners:** David Irvine
 - **Author:** Codex (GPT-6)

@@ -2,6 +2,21 @@
 import re
 
 
+def fixture_identity(environ):
+    """Keep access to the sudo caller's private paths, without running as root."""
+    if "SUDO_UID" not in environ and "SUDO_GID" not in environ:
+        return 65534, 65534
+    values = [environ.get(name, "") for name in ("SUDO_UID", "SUDO_GID")]
+    if any(not re.fullmatch(r"[0-9]+", value) for value in values):
+        raise ValueError("invalid sudo fixture identity")
+    uid, gid = map(int, values)
+    if uid == 0 and gid == 0:
+        return 65534, 65534
+    if not (0 < uid < 2**32 - 1 and 0 < gid < 2**32 - 1):
+        raise ValueError("fixture identity must be unprivileged")
+    return uid, gid
+
+
 def validate(receipt, parent_netns):
     if not isinstance(receipt, dict):
         raise ValueError("missing child isolation receipt")

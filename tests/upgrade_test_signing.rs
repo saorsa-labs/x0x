@@ -177,6 +177,14 @@ fn compile_verifier(root: &Path, test_feature: bool) -> PathBuf {
         .arg(&target)
         .env_remove("RUSTFLAGS")
         .env_remove("LLVM_PROFILE_FILE")
+        // cargo-llvm-cov wraps rustc for the outer build; a nested build
+        // must not inherit that wrapper or its coverage flags.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_LLVM_COV")
+        .env_remove("CARGO_LLVM_COV_SHOW_ENV")
+        .env_remove("CARGO_LLVM_COV_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET")
         .current_dir(root);
     if test_feature {
@@ -256,6 +264,14 @@ fn release_build_with_test_signing_feature_is_refused() {
         .arg(scratch.path().join("target"))
         .env_remove("RUSTFLAGS")
         .env_remove("LLVM_PROFILE_FILE")
+        // cargo-llvm-cov wraps rustc for the outer build; a nested build
+        // must not inherit that wrapper or its coverage flags.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_LLVM_COV")
+        .env_remove("CARGO_LLVM_COV_SHOW_ENV")
+        .env_remove("CARGO_LLVM_COV_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET")
         .current_dir(scratch.path())
         .output()

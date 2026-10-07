@@ -2698,4 +2698,191 @@ mod tests {
         assert!(!html.contains("super-secret-api-token"));
         assert!(!html.contains("X0X_TOKEN"));
     }
+
+    // ========================================================================
+    // #1114 (charter I3) — unsigned inner V1 never reaches SDK, SSE or WS.
+    // ========================================================================
+
+    /// The next app message for `topic` on the SSE broadcast, if any arrives
+    /// within `wait`. Other event types (peer events) are skipped.
+    async fn next_sse_message(
+        sse: &mut broadcast::Receiver<crate::server::sse::SseEvent>,
+        topic: &str,
+        wait: Duration,
+    ) -> Option<serde_json::Value> {
+        tokio::time::timeout(wait, async {
+            loop {
+                match sse.recv().await {
+                    Ok(event) if event.event_type == "message" && event.data["topic"] == topic => {
+                        return Some(event.data);
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// The next live gossip frame for `topic` on a WS session, if any
+    /// arrives within `wait`, as `(base64 payload, origin)`.
+    async fn next_ws_message(
+        rx: &mut mpsc::Receiver<WsOutbound>,
+        topic: &str,
+        wait: Duration,
+    ) -> Option<(String, Option<String>)> {
+        tokio::time::timeout(wait, async {
+            while let Some(frame) = rx.recv().await {
+                if let WsOutbound::Message {
+                    topic: frame_topic,
+                    payload,
+                    origin,
+                    ..
+                } = frame
+                {
+                    if frame_topic == topic {
+                        return Some((payload, origin));
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// WHY (#1114): `POST /subscribe` (SSE) and the WS `subscribe` command
+    /// forward whatever `Agent::subscribe` yields — an unsigned inner V1
+    /// payload went out with `sender: null` / no origin, past the
+    /// RevocationSet and Blocked checks. One valid outer V2 PlumTree frame
+    /// carrying unsigned inner V1 is fed to the agent's real pub/sub manager;
+    /// none of the three app-facing sinks may emit it. A signed V2 frame fed
+    /// right after is the positive control: every sink delivers it, first and
+    /// alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue1114_unsigned_inner_v1_never_reaches_sdk_sse_or_ws() {
+        use crate::gossip::pubsub::test_support::{
+            outer_v2_frame, signed_inner_v2, unsigned_inner_v1,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().expect("agent key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .expect("networked agent"),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .expect("state");
+        let topic = "issue1114-app-sinks";
+
+        // Sink 1: the SDK subscription.
+        let mut sdk = agent.subscribe(topic).await.expect("sdk subscribe");
+        // Sink 2: POST /subscribe, forwarded to the SSE broadcast.
+        let mut sse = state.broadcast_tx.subscribe();
+        let response = crate::server::routes::subscribe(
+            State(Arc::clone(&state)),
+            Json(
+                serde_json::from_value(serde_json::json!({ "topic": topic }))
+                    .expect("subscribe body"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Sink 3: a WS session subscribed to the topic.
+        register_test_session(&state, "issue1114").await;
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(16);
+        let stats = WsOutboundStats::default();
+        let subscribe = serde_json::json!({ "type": "subscribe", "topics": [topic] }).to_string();
+        handle_ws_command(&state, "issue1114", &subscribe, &ws_tx, &stats, false).await;
+
+        let topic_id = saorsa_gossip_types::TopicId::from_entity(topic.as_bytes());
+        let from = saorsa_gossip_types::PeerId::new([0x14; 32]);
+        let unsigned = unsigned_inner_v1(topic, &bytes::Bytes::from_static(b"unsigned-v1"));
+        agent
+            .handle_gossip_incoming_for_test(from, outer_v2_frame(topic_id, unsigned, [0x21; 32]))
+            .await;
+        let author = crate::gossip::SigningContext::from_keypair(
+            &crate::identity::AgentKeypair::generate().expect("author key"),
+        );
+        let signed = signed_inner_v2(&author, topic, &bytes::Bytes::from_static(b"signed-v2"));
+        agent
+            .handle_gossip_incoming_for_test(from, outer_v2_frame(topic_id, signed, [0x22; 32]))
+            .await;
+
+        let author_hex = hex::encode(author.agent_id.as_bytes());
+        let signed_b64 = BASE64.encode(b"signed-v2");
+        let quiet = Duration::from_millis(300);
+
+        // The first message on every sink must be the signed control.
+        let sdk_first = tokio::time::timeout(Duration::from_secs(5), sdk.recv())
+            .await
+            .expect("SDK must deliver a message")
+            .expect("SDK subscription open");
+        let sse_first = next_sse_message(&mut sse, topic, Duration::from_secs(5))
+            .await
+            .expect("SSE must deliver a message");
+        let (ws_payload, ws_origin) = next_ws_message(&mut ws_rx, topic, Duration::from_secs(5))
+            .await
+            .expect("WS must deliver a message");
+        let mut leaked = Vec::new();
+        if sdk_first.payload.as_ref() != b"signed-v2" {
+            leaked.push("SDK");
+        }
+        if sse_first["payload"] != signed_b64 {
+            leaked.push("SSE");
+        }
+        if ws_payload != signed_b64 {
+            leaked.push("WS");
+        }
+        assert!(
+            leaked.is_empty(),
+            "#1114: unsigned inner V1 reached {leaked:?} ahead of the signed control"
+        );
+        assert!(sdk_first.verified);
+        assert_eq!(sdk_first.sender, Some(author.agent_id));
+        assert_eq!(sse_first["verified"], true);
+        assert_eq!(sse_first["sender"], author_hex);
+        assert_eq!(ws_origin.as_deref(), Some(author_hex.as_str()));
+
+        // Nothing else may follow on any sink.
+        assert!(
+            tokio::time::timeout(quiet, sdk.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "#1114: SDK delivered a second message"
+        );
+        assert!(
+            next_sse_message(&mut sse, topic, quiet).await.is_none(),
+            "#1114: SSE delivered a second message"
+        );
+        assert!(
+            next_ws_message(&mut ws_rx, topic, quiet).await.is_none(),
+            "#1114: WS delivered a second message"
+        );
+
+        agent.shutdown().await;
+    }
 }

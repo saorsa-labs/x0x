@@ -20,6 +20,71 @@ command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/
 [[profile.default.scripts]]
 filter = 'all()'
 run-wrapper = 'x0x-test-home'
+
+# W3-H (#1164) simulation harness. `--profile w3h` runs only `w3h_` tests,
+# each with the Linux entropy/wall-clock shim preloaded (build it first:
+# `just w3h-shim`) and its canonical trace written under target/w3h/traces.
+# The shim stays inert unless W3H_SHIM_ACTIVE=1 and W3H_ENTROPY_SEED are set,
+# which only this wrapper does.
+# The `W3-H harness` CI job runs the `w3h-gate` profile with `--stress-count
+# 20`, and `scripts/ci/w3h-trace-check.py` requires the same verdict with
+# complete receipts in every rerun (D196); distinct traces are reported.
+[scripts.wrapper.w3h-sim]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces'
+
+[[profile.w3h.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim'
+
+[profile.w3h]
+default-filter = 'test(/(^|::)w3h_/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The CI `W3-H harness` gate job only: the same as `w3h`, plus raw payload
+# dumps (`<case>-<pid>.payloads`, test identities only; the first run of
+# each case and the first run whose digest differs from it) next to the
+# traces, and the output of passing tests (`W3H-TRACE`, `W3H-ENTROPY`,
+# receipts) in the log. No other job or recipe uses this profile.
+[scripts.wrapper.w3h-sim-dump]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces W3H_DUMP_PAYLOADS=1'
+
+[[profile.w3h-gate.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim-dump'
+
+[profile.w3h-gate]
+default-filter = 'test(/(^|::)w3h_/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+success-output = "final"
+
+# W3-H S3: the #1143 cases with creator and admin identities permuted (ADR
+# 0108 s2_home_anonymous_owner_offline: "repeat with creator/admin
+# identities permuted"). `W3H_IDENTITY_ORDER` names the case's labels from
+# the lowest agent id to the highest; `Sim::empty` assigns the pre-generated
+# keys sorted that way and marks the order in the trace. Each order writes
+# to its own trace dir, so its receipts are gated on their own (`just
+# test-w3h-permuted`). The positive control stays unpermuted.
+[scripts.wrapper.w3h-sim-creator-low]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces-creator-low W3H_IDENTITY_ORDER=O,X,A,J'
+
+[[profile.w3h-permuted-creator-low.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim-creator-low'
+
+[profile.w3h-permuted-creator-low]
+default-filter = 'test(/(^|::)w3h_1143_/) and not test(/positive_control/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[scripts.wrapper.w3h-sim-admin-low]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces-admin-low W3H_IDENTITY_ORDER=A,X,O,J'
+
+[[profile.w3h-permuted-admin-low.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim-admin-low'
+
+[profile.w3h-permuted-admin-low]
+default-filter = 'test(/(^|::)w3h_1143_/) and not test(/positive_control/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
 [profile.default]
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS

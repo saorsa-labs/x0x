@@ -51,18 +51,13 @@ pub(in crate::server) struct HomeMarker {
 }
 
 /// ADR-0038 Home policy: Hidden + OwnerCertified(owner) + MlsEncrypted +
-/// MembersOnly/MembersOnly.
+/// MembersOnly/MembersOnly. Delegates to [`crate::groups::GroupPolicy::home`],
+/// the one definition ADR 0108 §1's Home scope also checks against.
 #[must_use]
 pub(in crate::server) fn home_policy(
     owner: &crate::identity::UserId,
 ) -> crate::groups::GroupPolicy {
-    crate::groups::GroupPolicy {
-        discoverability: crate::groups::GroupDiscoverability::Hidden,
-        admission: crate::groups::GroupAdmission::OwnerCertified(*owner),
-        confidentiality: crate::groups::GroupConfidentiality::MlsEncrypted,
-        read_access: crate::groups::GroupReadAccess::MembersOnly,
-        write_access: crate::groups::GroupWriteAccess::MembersOnly,
-    }
+    crate::groups::GroupPolicy::home(owner)
 }
 
 /// Whether `policy` is EXACTLY the Home policy for `owner` — all five axes
@@ -4496,6 +4491,9 @@ pub(in crate::server::routes) mod tests {
     /// loosened to "any non-session actor" while the middleware still
     /// happens to reject riders on its own.
     #[tokio::test]
+    // #1166 S5: fixture PRECONDITION (the rider must hold the grant the
+    // test then proves the seat gate refuses) — not admission logic.
+    #[allow(clippy::disallowed_methods)]
     async fn home_seat_refuses_rider_caller() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x52; 32]).await?;

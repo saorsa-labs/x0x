@@ -22,6 +22,49 @@ The report contains assertion labels, status codes, store identifiers and
 content hashes, never bearer tokens or page bytes. Success here does not cover
 legacy migration or browser/GUI rendering.
 
+## Survivor rekey testnet acceptance (#1216)
+
+`e2e_vps_survivor_rekey.py` checks the rekey after a member is removed or
+banned, on a GSS (MlsEncrypted, legacy plane) group and a TreeKEM
+(`private_secure`) group. It needs at least five `--nodes`: the first removes
+and bans, the second-last is removed, the last is banned, and the rest
+survive. `--variant plain` and `--variant restart` (default: both) each build
+fresh groups. In `restart` the remover's `x0xd-testnet.service` restarts
+10-20 s before each removal, so that variant needs `--allow-service-restart`.
+
+A case passes only if every survivor decrypts a message sealed after the
+removal (rekey latency recorded per survivor), no excluded node decrypts it
+during a further `--watch-secs` window (the target, and in the ban case the
+member removed earlier), survivors' rosters drop the target, GSS answers the
+explicit recipient-ineligible refusal to a re-seal, and a banned target's
+re-join is never seated. Only exact typed responses count as an exclusion or a
+refusal; transport errors, 5xx, untyped 4xx, fork quarantine and malformed
+reads make a check INCONCLUSIVE, which stays inconclusive in the report
+`verdict` and the exit code (0 pass, 1 fail, 3 inconclusive). The D60 "no
+later key" check is claimed only with key evidence: the node's last decrypt
+answer came from its key material, and an epoch mismatch must report its local
+epoch. A removed member that answers the membership gate first is listed under
+`limitations` instead. A GSS share-install journal line can only fail the
+check; its absence is never evidence. Journal windows start at each node's own
+clock, read before the action. Key readiness is proven by decrypting, never by
+roster state (#1214). Nothing assumes one binary (#1208): each node's live
+version and running sha256 are recorded and, with the eph `testnet-hosts.json`
+next to the tokens file, must equal what was deployed to that node.
+
+```bash
+python3 -B tests/e2e_vps_survivor_rekey.py --network test \
+  --tokens-file "${X0X_TESTNET_TOKENS_FILE:?source testnet-hosts.env after deploy}" \
+  --nodes nyc sfo helsinki nuremberg singapore \
+  --variant plain --variant restart --allow-service-restart \
+  --report /absolute/path/rekey.json
+```
+
+On an ephemeral run, use `$E fixture --run ID rekey --receipts DIR` once the
+testnet-ephemeral skill registers `rekey`. The report holds labels, status
+codes, response classes, epochs, latencies and per-node versions, never
+tokens, ciphertexts, invites or log text. Pure-python tests:
+`test_e2e_vps_survivor_rekey.py`. Details: `TEST_SUITE_GUIDE.md` §7f.
+
 ## Integration Test Organization
 
 33 integration test files in `tests/` (curated core subset; the directory holds more):

@@ -570,6 +570,9 @@ pub(in crate::server) fn populate_invite_base_state_v4(
 /// credential, exactly like `POST /groups/:id/invite` (its #446 durable
 /// fence). A session bearer (or a rider, or a direct handler call with
 /// no actor context) gets the group OMITTED with a recorded reason.
+// #1166 S5 ceiling: the card-invite mint filter reuses the authority
+// predicate in a background loop (skip-and-count, not refuse) — it is
+// not a route admission gate, so it is not a group_access core.
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
     actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
@@ -647,6 +650,9 @@ pub(in crate::server) async fn get_agent_card(
                 }
                 let inviter_hex = hex::encode(agent_id.as_bytes());
                 // Only active admins may mint; others are skipped silently.
+                // #1166 S5 ceiling: the card filter is a background
+                // skip-and-count, not route admission — allow at the call.
+                #[allow(clippy::disallowed_methods)]
                 if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
                     .is_err()
                 {
@@ -699,6 +705,9 @@ pub(in crate::server) async fn get_agent_card(
                 let Some(info) = groups.get(&map_key) else {
                     continue;
                 };
+                // #1166 S5 ceiling: same authority predicate, same
+                // background-mint ruling as phase 1.
+                #[allow(clippy::disallowed_methods)]
                 if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
                     .is_err()
                 {
@@ -1543,6 +1552,10 @@ pub(in crate::server) async fn identity_revoke(
                     "reason": record.reason,
                 })),
             ),
+            Err(e @ x0x::error::IdentityError::Storage(_)) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("binding revocation applied and published; not durable: {e}"),
+            ),
             Err(e) => api_error(
                 StatusCode::FORBIDDEN,
                 format!("binding revocation rejected (owner key + certificate required): {e}"),
@@ -1592,6 +1605,10 @@ pub(in crate::server) async fn identity_revoke(
             });
             (StatusCode::OK, Json(resp))
         }
+        Err(e @ x0x::error::IdentityError::Storage(_)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("revocation applied and published; not durable: {e}"),
+        ),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("authority") || msg.contains("rejected") {
@@ -2613,5 +2630,121 @@ mod issue1099_tests {
         card.sign(&other).unwrap();
         import(card, state).await;
         assert!(store.lookup(&other.agent_id()).is_none());
+    }
+}
+
+#[cfg(test)]
+pub(in crate::server::routes) mod revocation_persistence_tests {
+    use super::*;
+    use crate::server::rider_auth::ActorContext;
+    use axum::body::to_bytes;
+
+    pub(in crate::server::routes) async fn state_at(dir: &std::path::Path) -> Arc<AppState> {
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir)
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_user_key(x0x::identity::UserKeypair::generate().unwrap())
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: vec![],
+                    mdns_enabled: false,
+                    ..x0x::network::NetworkConfig::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        super::super::named_groups::tests::secure_endpoint_test_state_at(dir, agent)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn binding_revoke_reports_own_store_durability_1116() {
+        // The real route must return 200 for blocked v1 only, and 500
+        // with an applied/publication message for its blocked v2 store.
+        for blocked in ["revocations.bin", "revocations-v2.bin"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_at(dir.path()).await;
+            assert_eq!(state.agent.move_mint_placements().await.unwrap(), 1);
+            let agent_id = state.agent.agent_id();
+            let machine_id = state.agent.machine_id();
+            let revocations = state.agent.revocation_set();
+            let moves = state.agent.move_state();
+            let path = dir.path().join(blocked);
+            tokio::fs::write(&path, b"unreadable").await.unwrap();
+            {
+                let revoked = revocations.read().await;
+                let placements = moves.read().await;
+                assert_eq!(
+                    x0x::key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &agent_id,
+                        &machine_id,
+                    ),
+                    None,
+                    "binding must be allowed before revoke with {blocked} blocked"
+                );
+            }
+            let response = identity_revoke(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(ActorContext::Owner { durable: true }),
+                Json(RevokeRequest {
+                    agent_id: Some(hex::encode(state.agent.agent_id().as_bytes())),
+                    machine_id: Some(hex::encode(state.agent.machine_id().as_bytes())),
+                    move_epoch: Some(0),
+                    reason: None,
+                }),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if blocked == "revocations.bin" {
+                assert_eq!(status, StatusCode::OK);
+                let restored = x0x::revocation::RevocationSet::from_bytes_v2(
+                    &tokio::fs::read(dir.path().join("revocations-v2.bin"))
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    restored.is_binding_revoked(&state.agent.agent_id(), &state.agent.machine_id())
+                );
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains("applied and published; not durable"));
+            }
+            {
+                // revocation_records() is the legacy v1 snapshot and omits
+                // bindings. Check the live B/P gate used by delivery instead.
+                let revoked = revocations.read().await;
+                let placements = moves.read().await;
+                assert!(
+                    revoked.is_binding_revoked(&agent_id, &machine_id),
+                    "binding revoke must remain applied in memory with {blocked} blocked"
+                );
+                assert_eq!(
+                    x0x::key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &agent_id,
+                        &machine_id,
+                    ),
+                    Some(x0x::key_move::PairingDenial::BindingRevoked),
+                    "delivery must deny the binding with {blocked} blocked"
+                );
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable");
+            state.agent.shutdown().await;
+        }
     }
 }

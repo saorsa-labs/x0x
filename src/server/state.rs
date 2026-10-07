@@ -164,6 +164,13 @@ pub struct ServerHandle {
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// W3-H (#1164) test builds: the daemon's state (weak, so a restart can
+    /// drop it) and its router, so the harness drives the public API through
+    /// `Router::oneshot` without a socket.
+    #[cfg(test)]
+    pub(super) test_state: std::sync::Weak<AppState>,
+    #[cfg(test)]
+    pub(super) test_router: axum::Router,
     // Issue #601/#645: the data-dir and identity-dir instance locks are NOT
     // fields here. They are moved into the supervisor task by
     // `serve_with_options` so they are released only after the supervisor has
@@ -1105,10 +1112,11 @@ pub(super) struct AppState {
     /// #946 r2: requester-side per-digest suppression for group-scoped
     /// certificate fetches (in-flight dedup + 60 s negative cache).
     pub(super) cert_fetch_requested:
-        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: responder-side suppression deadline per (stable group id,
     /// digest) — the answer rate limit and the miss negative cache.
-    pub(super) cert_fetch_answered: StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    pub(super) cert_fetch_answered:
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: the current certificate-unobtainable refusal window per
     /// (stable group id, joining member) — the typed refusal is staged only
     /// after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.

@@ -1133,6 +1133,10 @@ pub(in crate::server) async fn history_purge(
         // annotation; it lets `Store::purge` below destroy the forensic
         // record of a quarantined group. The refusal names the resolved MAP
         // KEY, because that is the id the manual clear route accepts.
+        // #1166 S5 ceiling: the purge gate consumes the query's `scope`
+        // (group:<stable id>) and resolves both spellings itself — it
+        // cannot move into the extractor (the S4 ruling).
+        #[allow(clippy::disallowed_methods)]
         let refusal = {
             let groups = state.named_groups.read().await;
             crate::server::resolve_group_entry_locked(&groups, group_id).and_then(|(key, info)| {

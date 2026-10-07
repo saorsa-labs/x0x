@@ -424,7 +424,7 @@ async fn requester_rejects_a_wrong_user_response() -> Result<()> {
         .cert_fetch_requested
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(remote_digest.clone(), std::time::Instant::now());
+        .insert(remote_digest.clone(), tokio::time::Instant::now());
     use base64::Engine as _;
     let response = serde_json::to_vec(&seat_cert_fetch::GroupCertFetchResponse {
         group_id: stable_group_id,

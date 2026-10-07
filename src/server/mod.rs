@@ -17,12 +17,16 @@ mod auth;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
+mod group_access;
 mod instance_lock;
 mod legacy_store_migration;
 mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+// W3-H (#1164): deterministic simulation harness (test builds only:
+// `#![cfg(test)]` inside the module).
+mod w3h;
 mod ws;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
@@ -1291,6 +1295,10 @@ pub async fn serve_with_options(
                         .all(|id| g.members_v2.get(*id).is_some_and(|m| m.is_active()))
             }))
         }));
+    agent.peer_evidence().wire_limits.ready_hello.store(
+        std::env::var("X0X_EVIDENCE_READY_HELLO").as_deref() == Ok("1"),
+        std::sync::atomic::Ordering::Release,
+    );
     let evidence_state = Arc::downgrade(&state);
     agent.start_peer_evidence(
         config.data_dir.clone(),
@@ -2635,6 +2643,10 @@ pub async fn serve_with_options(
     // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
     let cancel = tokio_util::sync::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
+    #[cfg(test)]
+    let test_state = Arc::downgrade(&state);
+    #[cfg(test)]
+    let test_router = app.clone();
 
     let task = tokio::spawn(async move {
         // #645: the single-instance guards live HERE, in the supervisor
@@ -2823,6 +2835,10 @@ pub async fn serve_with_options(
         cancel,
         acl_admin,
         task: Some(task),
+        #[cfg(test)]
+        test_state,
+        #[cfg(test)]
+        test_router,
     })
 }
 

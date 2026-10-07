@@ -4891,7 +4891,7 @@ mod tests {
         policy: AccessPolicy,
     ) -> (KvStoreSync, Arc<PubSubManager>) {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let store =
             KvStore::new(store_id(1), "Test".to_string(), agent(1), policy).expect("kv store");
         let sync = KvStoreSync::new(
@@ -4905,13 +4905,22 @@ mod tests {
         (sync, pubsub)
     }
 
+    /// A fresh pubsub signer. Production pubsub always signs, and since #1114
+    /// nothing unsigned is delivered, so a fixture whose test reads the topic
+    /// (or relies on a started sync's own listener) must sign.
+    fn test_signing() -> Option<Arc<crate::gossip::SigningContext>> {
+        Some(Arc::new(crate::gossip::SigningContext::from_keypair(
+            &crate::identity::AgentKeypair::generate().expect("pubsub signer"),
+        )))
+    }
+
     #[tokio::test]
     async fn group_signed_responder_serves_tombstone_only_history() {
         let _ = tracing_subscriber::fmt::try_init();
         let node = make_node().await;
         let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
             String::new(),
@@ -5154,7 +5163,7 @@ mod tests {
     #[tokio::test]
     async fn group_signed_responder_reports_missing_retained_history() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let keypair = AgentKeypair::generate().expect("owner keypair");
         let owner = keypair.agent_id();
         let mut group = crate::groups::GroupInfo::new(
@@ -6284,7 +6293,7 @@ mod tests {
         let writer_keypair = crate::identity::AgentKeypair::generate().expect("writer keypair");
         let owner = owner_keypair.agent_id();
         let writer = writer_keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
             String::new(),
@@ -7574,7 +7583,7 @@ mod tests {
         let node = make_node().await;
         let keypair = AgentKeypair::generate().expect("keypair");
         let owner = keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let (_, contexts, group_id) = encrypted_group(&[owner]);
         let context = contexts[0].clone();
         let id = store_id(13);
@@ -7860,7 +7869,7 @@ mod tests {
         // refresh. The writer may commit first on the old code; with the
         // publication gate it waits until the pending publish is enqueued.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let topic = "group/private/epoch-race".to_string();
         let mut captured = pubsub.subscribe(topic.clone()).await;
         let owner_keypair = AgentKeypair::generate().expect("owner");
@@ -7964,7 +7973,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_publication_cannot_enqueue_pre_removal_sealed_wire_after_commit() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let topic = "group/private/queued-epoch-race".to_string();
         let mut captured = pubsub.subscribe(topic.clone()).await;
         let owner_keypair = AgentKeypair::generate().expect("owner");
@@ -8617,7 +8626,7 @@ mod tests {
         // membership, and merges. No plaintext delta is involved at any
         // point on the wire.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -8695,7 +8704,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_put_publishes_no_unsealed_bytes_on_the_topic() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -8955,7 +8964,7 @@ mod tests {
         // through merge AND persist, and a draining retire must wait for it.
         use std::sync::atomic::Ordering::SeqCst;
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
         let owner = owner_kp.agent_id();
@@ -9098,7 +9107,7 @@ mod tests {
     #[tokio::test]
     async fn treekem_responder_pages_large_history_and_receiver_reassembles_out_of_order() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let writer_kp = AgentKeypair::generate().expect("writer kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
@@ -9356,7 +9365,7 @@ mod tests {
     #[tokio::test]
     async fn treekem_retained_publisher_retries_partial_frames_and_receiver_reassembles() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let writer_kp = AgentKeypair::generate().expect("writer kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
@@ -9584,7 +9593,7 @@ mod tests {
         // receiver — even though its record decrypts and its signature is
         // valid.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let kp_c = AgentKeypair::generate().expect("kp"); // holds a context, NOT a member
@@ -9675,7 +9684,7 @@ mod tests {
         // injected onto an encrypted store's topic must not decode as a
         // sealed envelope and must never reach the merge.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let a = kp_a.agent_id();
         let (_info, ctxs, group_id) = encrypted_group(&[a]);
@@ -9730,7 +9739,7 @@ mod tests {
         // must hard-error at this boundary instead of falling into the
         // plaintext branch, and a subscribed observer must receive NOTHING.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp = AgentKeypair::generate().expect("kp");
         let a = kp.agent_id();
         let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
@@ -9779,6 +9788,21 @@ mod tests {
         // The observer heard nothing: no plaintext ever left the process.
         let leak = tokio::time::timeout(Duration::from_millis(300), observer.recv()).await;
         assert!(leak.is_err(), "plaintext delta was published to the topic");
+
+        // Liveness control (#1114): the observer does hear this pubsub's
+        // signed publishes, so the silence above is not a delivery failure.
+        pubsub
+            .publish(
+                "store/enc-unpub".to_string(),
+                bytes::Bytes::from_static(b"sentinel"),
+            )
+            .await
+            .expect("sentinel publish");
+        let sentinel = tokio::time::timeout(Duration::from_secs(5), observer.recv())
+            .await
+            .expect("observer must hear the sentinel")
+            .expect("observer open");
+        assert_eq!(sentinel.payload.as_ref(), b"sentinel");
     }
 
     #[tokio::test]
@@ -9828,7 +9852,7 @@ mod tests {
         // ALL travel sealed. B joins after A's write and must still receive
         // the pre-join key.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -9887,7 +9911,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_bootstrap_recovers_when_membership_arrives_after_open() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner keypair");
         let joiner_kp = AgentKeypair::generate().expect("joiner keypair");
         let owner = owner_kp.agent_id();

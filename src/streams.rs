@@ -519,8 +519,8 @@ pub struct PeerStream {
     agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
-    send: ant_quic::HighLevelSendStream,
-    recv: ant_quic::HighLevelRecvStream,
+    send: crate::network::StreamSend,
+    recv: crate::network::StreamRecv,
     pub(crate) evidence_lease: Option<crate::evidence_wire::Lease>,
 }
 
@@ -532,8 +532,8 @@ impl PeerStream {
         agents: Vec<crate::identity::AgentId>,
         peer: MachineId,
         protocol: StreamProtocol,
-        send: ant_quic::HighLevelSendStream,
-        recv: ant_quic::HighLevelRecvStream,
+        send: crate::network::StreamSend,
+        recv: crate::network::StreamRecv,
     ) -> Self {
         Self {
             agents,
@@ -582,27 +582,29 @@ impl PeerStream {
     }
 
     /// Borrow the send (write) half.
-    pub fn send_mut(&mut self) -> &mut ant_quic::HighLevelSendStream {
+    pub fn send_mut(&mut self) -> &mut crate::network::StreamSend {
         &mut self.send
     }
 
     /// Borrow the recv (read) half.
-    pub fn recv_mut(&mut self) -> &mut ant_quic::HighLevelRecvStream {
+    pub fn recv_mut(&mut self) -> &mut crate::network::StreamRecv {
         &mut self.recv
     }
 
     /// Deconstruct into the owned send/recv halves (e.g. for two-task copy
     /// loops in the forwarder).
-    pub fn into_split(self) -> (ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream) {
+    pub fn into_split(self) -> (crate::network::StreamSend, crate::network::StreamRecv) {
         (self.send, self.recv)
     }
 }
 
 /// Admission decided before reading any protocol bytes. A prefix lease is
-/// present only for machines without known agents or verified enrollment.
+/// present for strangers and Unknown relationship peers.
 pub(crate) struct InboundAdmission {
     pub(crate) agents: Option<Vec<crate::identity::AgentId>>,
     pub(crate) prefix: Option<crate::evidence_wire::PrefixLease>,
+    /// A known Unknown relationship peer: recheck it even if discovery vanishes.
+    pub(crate) evidence_only: bool,
 }
 
 /// First agent of a stream's agent list, `None` when the list is empty
@@ -618,7 +620,7 @@ fn first_agent(agents: &[crate::identity::AgentId]) -> Option<crate::identity::A
 /// Called by the opener immediately after [`ant_quic::Node::open_bi`] so the
 /// accept side can demux the stream type.
 pub(crate) async fn write_protocol_prefix(
-    send: &mut ant_quic::HighLevelSendStream,
+    send: &mut crate::network::StreamSend,
     protocol: StreamProtocol,
 ) -> NetworkResult<()> {
     send.write_all(&[protocol.as_u8()])

@@ -115,7 +115,7 @@ pub(in crate::server) fn publish_group_cert_fetch(
     stable_group_id: &str,
     digest_hex: &str,
 ) {
-    let now = std::time::Instant::now();
+    let now = tokio::time::Instant::now();
     {
         let mut requested = state
             .cert_fetch_requested
@@ -165,9 +165,9 @@ pub(in crate::server) fn publish_group_cert_fetch(
 /// Reserve a request in the bounded TTL cache. Kept separate from transport
 /// so admission and eviction can be tested without an Agent or runtime.
 fn reserve_cert_fetch(
-    requested: &mut std::collections::HashMap<String, std::time::Instant>,
+    requested: &mut std::collections::HashMap<String, tokio::time::Instant>,
     digest_hex: &str,
-    now: std::time::Instant,
+    now: tokio::time::Instant,
 ) -> bool {
     requested
         .retain(|_, at| (now.duration_since(*at).as_millis() as u64) < CERT_FETCH_REQUESTED_TTL_MS);
@@ -193,7 +193,7 @@ fn reserve_cert_fetch(
 
 /// `true` while this node's own request for `digest_hex` is in flight.
 fn cert_fetch_in_flight(state: &AppState, digest_hex: &str) -> bool {
-    let now = std::time::Instant::now();
+    let now = tokio::time::Instant::now();
     state
         .cert_fetch_requested
         .lock()
@@ -210,7 +210,7 @@ fn responder_key(stable_group_id: &str, digest_hex: &str) -> String {
 }
 
 /// `true` while `key` is suppressed (a recent answer or miss).
-fn responder_suppressed(state: &AppState, key: &str, now: std::time::Instant) -> bool {
+fn responder_suppressed(state: &AppState, key: &str, now: tokio::time::Instant) -> bool {
     state
         .cert_fetch_answered
         .lock()
@@ -227,7 +227,7 @@ fn responder_suppressed(state: &AppState, key: &str, now: std::time::Instant) ->
 fn responder_try_suppress(
     state: &AppState,
     key: String,
-    now: std::time::Instant,
+    now: tokio::time::Instant,
     ttl_ms: u64,
 ) -> bool {
     let mut suppressed = state
@@ -274,7 +274,7 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
     let Some(digest_arr) = parse_digest_hex(&request.cert_digest) else {
         return false;
     };
-    let now = std::time::Instant::now();
+    let now = tokio::time::Instant::now();
     // Resolve the group (either spelling) and validate the request against
     // the CURRENT owner-signed roster under one read. The lock is released
     // BEFORE the cache hash scan.
@@ -1037,7 +1037,8 @@ mod recovery_scope_tests {
     use crate::groups::{GroupAdmission, GroupInfo, GroupPolicyPreset, GroupRole};
     use crate::identity::{AgentId, UserId};
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     // Inert post-apply state: no Agent/AppState, transport, filesystem or tasks.
     // The returned plan is the sole input to the production publish loop.
