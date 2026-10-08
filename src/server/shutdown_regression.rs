@@ -1,4 +1,20 @@
-//! Real-socket regressions. Run only inside the approved loopback sandbox.
+//! Real-socket in-process shutdown regressions (#1262, #1263 part 1).
+//!
+//! Every daemon binds loopback only, has no bootstrap peer outside the
+//! test, runs with mDNS, port mapping, the peer cache and update checks
+//! off, uses a private plane and temporary directories. The tests are
+//! `#[ignore]`d and run only inside the approved loopback-only sandbox.
+//!
+//! - `issue1262_concurrent_embedded_shutdown_*`: concurrent shutdown and
+//!   relaunch of three idle or peered daemons.
+//! - `issue1262_shutdown_with_dial_in_flight`: a handshake to a silent
+//!   peer is in flight at shutdown (an offline seed).
+//! - `issue1262_owned_workload_parallel`: the embedder's parallel-test
+//!   shape. Knobs for investigation: `X0X_1262_PAIRS`,
+//!   `X0X_1262_UPTIME_SECS`, `X0X_1262_STAGGER_MS` (`none` stops a pair
+//!   concurrently), `X0X_1262_NO_GROUPS`/`_KV`/`_DM=1`, and `RUST_LOG`.
+//! - `issue1263_shutdown_with_frozen_peer`: sends blocked on a peer that
+//!   stopped reading must not stall network teardown.
 
 #![cfg(test)]
 
@@ -614,8 +630,7 @@ mod workload {
         }
     }
 
-    /// Run [`PAIRS`] pairs at once, each on its own OS thread and runtime.
-    pub(super) fn run() {
+    fn init_tracing() {
         if std::env::var("RUST_LOG").is_ok() {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -623,6 +638,11 @@ mod workload {
                 .with_thread_names(true)
                 .try_init();
         }
+    }
+
+    /// Run [`PAIRS`] pairs at once, each on its own OS thread and runtime.
+    pub(super) fn run() {
+        init_tracing();
         let pairs = std::env::var("X0X_1262_PAIRS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -709,12 +729,137 @@ mod workload {
             failures.len()
         );
     }
+
+    /// #1263 part 1: B stops reading (a suspended phone or a stalled host)
+    /// while it stays connected. A's gossip sends to B (SWIM probes, eager
+    /// pushes) then block in ant-quic `open_uni` until B's connection idles
+    /// out (30 s). Such a send must not hold up A's network teardown.
+    pub(super) fn frozen_peer() {
+        init_tracing();
+        let root = tempfile::tempdir().expect("isolated daemon directories");
+        let plane = format!("x0x.test.1263.{}", std::process::id());
+        let runtime = |workers: usize| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("daemon runtime")
+        };
+        const B_WORKERS: usize = 2;
+        let b_runtime = runtime(B_WORKERS);
+        let a_runtime = runtime(4);
+        let (http_a, http_b) = (client(), client());
+        let topic = "x0x.test.1263.frozen";
+        let b = b_runtime.block_on(start(&root.path().join("b"), &plane, &[]));
+        let a = a_runtime.block_on(start(&root.path().join("a"), &plane, &[b.udp]));
+        let subscribe = serde_json::json!({ "topic": topic });
+        b_runtime.block_on(call(
+            &http_b,
+            &b,
+            reqwest::Method::POST,
+            "/subscribe",
+            Some(subscribe.clone()),
+        ));
+        a_runtime.block_on(async {
+            assert!(wait_connected(&a, &b).await, "A and B connect");
+            call(
+                &http_a,
+                &a,
+                reqwest::Method::POST,
+                "/subscribe",
+                Some(subscribe),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let network_a = a
+            .state
+            .upgrade()
+            .and_then(|state| state.agent.network().cloned())
+            .expect("A network");
+        let peer_b = b
+            .state
+            .upgrade()
+            .and_then(|state| state.agent.network().map(|network| network.peer_id()))
+            .expect("B peer id");
+
+        // Freeze B: occupy every B worker until one shared deadline, so a
+        // sleeper that starts late does not extend the freeze.
+        let thaw = Instant::now() + Duration::from_secs(70);
+        for _ in 0..B_WORKERS * 2 {
+            b_runtime.spawn(async move {
+                std::thread::sleep(thaw.saturating_duration_since(Instant::now()));
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Fill B's stream credit with sends A cannot complete, so later
+        // sends block in ant-quic `open_uni` while A shuts down, well
+        // inside B's idle timeout. A transport that holds its node lock
+        // across such a send makes teardown wait for that timeout.
+        let senders = {
+            let network = Arc::clone(&network_a);
+            a_runtime.spawn(async move {
+                use saorsa_gossip_transport::GossipTransport as _;
+                let mut sends = tokio::task::JoinSet::new();
+                for _ in 0..320 {
+                    let network = Arc::clone(&network);
+                    sends.spawn(async move {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(90),
+                            network.send_to_peer(
+                                saorsa_gossip_types::PeerId::new(peer_b.0),
+                                saorsa_gossip_transport::GossipStreamType::Bulk,
+                                bytes::Bytes::from_static(&[0u8; 256]),
+                            ),
+                        )
+                        .await;
+                    });
+                }
+                while sends.join_next().await.is_some() {}
+            })
+        };
+        a_runtime.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+        let started = Instant::now();
+        let failure = a_runtime.block_on(stop(a, "frozen/a"));
+        senders.abort();
+        drop(network_a);
+        a_runtime.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+        eprintln!(
+            "ISSUE1263 frozen-peer A runtime alive_tasks_after_shutdown={}",
+            a_runtime.metrics().num_alive_tasks()
+        );
+        let took = started.elapsed();
+        eprintln!("ISSUE1263 frozen-peer A shutdown took {took:?} failure={failure:?}");
+
+        // Thaw B, then stop it as well.
+        std::thread::sleep(thaw.saturating_duration_since(Instant::now()));
+        let failure_b = b_runtime.block_on(stop(b, "frozen/b"));
+        eprintln!("ISSUE1263 frozen-peer B failure={failure_b:?}");
+        if took >= Duration::from_secs(10) {
+            eprintln!("ISSUE1262 FAILURE frozen/a: shutdown stalled {took:?}");
+        }
+        assert!(failure.is_none(), "A shutdown failed: {failure:?}");
+        assert!(
+            took < Duration::from_secs(10),
+            "A shutdown stalled {took:?} behind sends to a frozen peer"
+        );
+        assert!(failure_b.is_none(), "B shutdown failed: {failure_b:?}");
+    }
 }
 
 #[test]
 #[ignore = "real sockets: requires the approved loopback-only sandbox"]
 fn issue1262_owned_workload_parallel() {
     workload::run();
+}
+
+#[test]
+#[ignore = "real sockets: requires the approved loopback-only sandbox"]
+fn issue1263_shutdown_with_frozen_peer() {
+    workload::frozen_peer();
 }
 
 /// #1262/#1263: a daemon whose peer is unreachable (an offline phone, or a
