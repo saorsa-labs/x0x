@@ -208,20 +208,68 @@ pub struct HistoryService {
     reaper: tokio::task::JoinHandle<()>,
 }
 
+/// What [`HistoryService::open`] produced: the opened store plus everything
+/// the service's tasks need, with **no tasks spawned yet**. Dropping it
+/// closes the store and releases the exclusive database lock. This is the
+/// cancellation-safe unit the blocking-pool boot path moves across the
+/// `await` (review round 2, R2-E): if the builder future is dropped while
+/// the blocking `Store::open` is still running, the runtime drops this value
+/// when the task completes — instead of leaking an unowned writer thread and
+/// reaper that hold the database forever.
+pub(crate) struct OpenedHistory {
+    store: Arc<Store>,
+    policy: RetentionPolicy,
+    quarantine_pins: Arc<QuarantinePinSlot>,
+}
+
 impl HistoryService {
     /// Open the store at `config.db_path` (or `<data_dir>/history.db`) and
     /// start the writer thread + retention reaper.
     ///
-    /// Must be called from within a tokio runtime (the reaper is a tokio
-    /// task).
+    /// The constructor itself is SYNCHRONOUS and blocking — migrations plus
+    /// the canonical-id backfill can take minutes on a large history — and
+    /// must be called from within a tokio runtime (the reaper is a tokio
+    /// task). An async caller runs it on the blocking pool:
+    /// `tokio::task::spawn_blocking(move || HistoryService::start(&cfg, &dir))`
+    /// with owned config/path values. `AgentBuilder::build` does exactly
+    /// that, through the cancellation-safe open/start-tasks split this
+    /// method is a shorthand for.
     pub fn start(config: &HistoryConfig, data_dir: &std::path::Path) -> HistoryResult<Self> {
+        Ok(Self::start_tasks(Self::open(config, data_dir)?))
+    }
+
+    /// Open (migrate + canonical backfill) WITHOUT spawning any tasks.
+    ///
+    /// Blocking; run inside `spawn_blocking` on async paths. The builder
+    /// calls this in the blocking closure and defers [`Self::start_tasks`]
+    /// to after the `await`: a cancelled build future can therefore never
+    /// leave an unowned writer/reaper running — the runtime drops the
+    /// returned value, closing the store.
+    pub(crate) fn open(
+        config: &HistoryConfig,
+        data_dir: &std::path::Path,
+    ) -> HistoryResult<OpenedHistory> {
         let db_path = config
             .db_path
             .clone()
             .unwrap_or_else(|| data_dir.join("history.db"));
-        let store = Arc::new(Store::open(&db_path)?);
+        Ok(OpenedHistory {
+            store: Arc::new(Store::open(&db_path)?),
+            policy: config.retention_policy(),
+            quarantine_pins: Arc::new(QuarantinePinSlot::default()),
+        })
+    }
+
+    /// Spawn the writer thread + retention reaper over an [`Self::open`]ed
+    /// store. Only ever called by an owner that survived the open — the
+    /// public [`Self::start`], or the builder after its `await` resolved.
+    pub(crate) fn start_tasks(opened: OpenedHistory) -> Self {
+        let OpenedHistory {
+            store,
+            policy,
+            quarantine_pins,
+        } = opened;
         let writer = writer::Writer::spawn(Arc::clone(&store));
-        let quarantine_pins = Arc::new(QuarantinePinSlot::default());
         let handle = HistoryHandle {
             writer: writer.handle(),
             store: Arc::clone(&store),
@@ -229,16 +277,16 @@ impl HistoryService {
         };
         let reaper = reaper::spawn(
             store,
-            config.retention_policy(),
+            policy,
             handle.counters(),
             HISTORY_REAPER_INTERVAL_SECS,
             quarantine_pins,
         );
-        Ok(Self {
+        Self {
             handle,
             writer: Some(writer),
             reaper,
-        })
+        }
     }
 
     /// The shared handle.
@@ -269,5 +317,70 @@ impl HistoryService {
             // Writer drain is blocking (joins an OS thread).
             let _ = tokio::task::spawn_blocking(move || writer.shutdown()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review round 2 (R2-E): cancelling the builder while its blocking
+    /// `Store::open` runs must not leak an unowned writer/reaper that holds
+    /// the exclusive database lock forever. The builder moves only the
+    /// NOT-YET-STARTED opened store ([`OpenedHistory`]) across the `await`;
+    /// when the build future is dropped, the runtime drops that value when
+    /// the blocking task completes — closing the store — because no tasks
+    /// were ever spawned. This test reproduces the builder's exact shape:
+    /// the join handle is dropped mid-flight (the cancelled `await`), the
+    /// closure still finishes, and the history file must become openable
+    /// again. `Store` holds `PRAGMA locking_mode = EXCLUSIVE`, so a leaked
+    /// owner would fail every reopen here.
+    #[tokio::test]
+    async fn cancelled_boot_open_leaves_no_orphan_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.path().join("history.db")),
+            ..HistoryConfig::default()
+        };
+        // Seed a database so the blocking open does real work.
+        drop(Store::open(config.db_path.as_ref().unwrap()).unwrap());
+
+        // The builder's blocking closure: open WITHOUT starting tasks.
+        let opened_cfg = config.clone();
+        let opened_dir = dir.path().to_path_buf();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_in_closure = Arc::clone(&finished);
+        let join = tokio::task::spawn_blocking(move || {
+            let opened = HistoryService::open(&opened_cfg, &opened_dir);
+            // Signals the test the closure is done; the task harness then
+            // drops the returned (unclaimed, un-started) value.
+            finished_in_closure.store(true, std::sync::atomic::Ordering::Release);
+            opened
+        });
+        // The cancelled build: nobody awaits the open.
+        drop(join);
+
+        // Wait for the closure to finish, then for the runtime to drop its
+        // unclaimed output, and prove the lock came back: a fresh open must
+        // succeed. Under the round-2 shape (tasks started inside the
+        // closure) the reaper would hold the store forever and every probe
+        // would fail until the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if HistoryService::open(&config, dir.path()).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history.db stayed exclusively locked after a cancelled boot open: \
+                 an unowned service is holding the store"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire),
+            "the probe must not pass before the cancelled closure finished"
+        );
     }
 }
