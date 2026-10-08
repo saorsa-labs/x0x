@@ -6,7 +6,9 @@
 //! `#[ignore]`d and run only inside the approved loopback-only sandbox.
 //!
 //! - `issue1262_concurrent_embedded_shutdown_*`: concurrent shutdown and
-//!   relaunch of three idle or peered daemons.
+//!   relaunch of three idle or peered daemons. These guard the release,
+//!   rebind and relaunch contract; they pass on unfixed main and are not
+//!   reproducers of #1262.
 //! - `issue1262_shutdown_with_dial_in_flight`: a handshake to a silent
 //!   peer is in flight at shutdown (an offline seed).
 //! - `issue1262_owned_workload_parallel`: the embedder's parallel-test
@@ -15,6 +17,14 @@
 //!   concurrently), `X0X_1262_NO_GROUPS`/`_KV`/`_DM=1`, and `RUST_LOG`.
 //! - `issue1263_shutdown_with_frozen_peer`: sends blocked on a peer that
 //!   stopped reading must not stall network teardown.
+//!
+//! Known residual: `issue1262_owned_workload_parallel` can still fail on
+//! about 0.4–0.8 % of shutdowns. In those runs, handles inside ant-quic
+//! 0.27.54 hold the original socket: hole-punch coordinator dials, NAT
+//! traversal session handles and MASQUE relay sessions. The x0x teardown
+//! token cannot reach them. They are tracked in saorsa-labs/ant-quic#305;
+//! the test is expected to be fully green once x0x pins the ant-quic
+//! release that fixes it.
 
 #![cfg(test)]
 

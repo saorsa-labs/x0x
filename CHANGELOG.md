@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-process shutdown releases the UDP socket and no longer stalls (#1262, #1263 part 1).**
+  An embedded daemon (`x0x::server::serve`) running beside other daemons in one
+  process could fail graceful shutdown with `shutdown socket release timeout ...
+  weak_socket_owner_still_live`, because bootstrap, proactive-reconnect and
+  gossip-membership dials kept an in-flight handshake on the socket. Network
+  teardown now abandons in-flight dials first. Node read guards are no longer
+  held across network sends, so a peer that stopped reading cannot stall
+  teardown for up to 30 s. A shutdown that abandons a dial takes about 5 s. A
+  small residual inside ant-quic is tracked in saorsa-labs/ant-quic#305.
+
 ## [v0.46.5] - 2026-10-07
 
 ### Security
