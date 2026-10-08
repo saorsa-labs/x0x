@@ -752,13 +752,14 @@ mod workload {
         );
     }
 
-    /// How long the Agent and AppState of a stopped daemon may outlive a
-    /// successful `shutdown_and_wait` (#1269).
+    /// Diagnostics only (#1269): how long the test keeps watching a stopped
+    /// daemon's owners after a failed check. The contract itself is
+    /// immediate: no owner may survive `shutdown_and_wait`.
     const GROUP_JOIN_RELEASE_BOUND: Duration = Duration::from_secs(2);
 
-    /// Wait up to [`GROUP_JOIN_RELEASE_BOUND`] for both weak handles to
-    /// lose their last strong owner. Returns the final strong counts and
-    /// how long the wait took.
+    /// Diagnostics only: wait up to [`GROUP_JOIN_RELEASE_BOUND`] for both
+    /// weak handles to lose their last strong owner. Returns the final
+    /// strong counts and how long the wait took.
     async fn released(
         state: &Weak<AppState>,
         agent: &Weak<crate::Agent>,
@@ -899,16 +900,12 @@ mod workload {
             matches!(result, Ok(Ok(()))),
             "A shutdown_and_wait after {took:?}: {result:?}"
         );
-        let (appstate_strong, agent_strong, waited) =
-            a_runtime.block_on(released(&state_a, &agent_a));
-        eprintln!(
-            "ISSUE1269 a shutdown took {took:?}; +{waited:?} appstate_strong={appstate_strong} \
-             agent_strong={agent_strong} a_runtime_alive_tasks={}",
-            a_runtime.metrics().num_alive_tasks()
-        );
+        // The contract is immediate: no owner of A's AppState or Agent may
+        // survive the return, and the relaunch below starts at once.
+        let (appstate_strong, agent_strong) = (state_a.strong_count(), agent_a.strong_count());
 
-        // Relaunch A on the same data and identity dirs. One attempt only:
-        // a stray owner of the old Agent still holds `history.db`.
+        // Relaunch A on the same data and identity dirs, at once and only
+        // once: a stray owner of the old Agent still holds `history.db`.
         let relaunch = a_runtime.block_on(serve_with_options(
             config(&dir_a, &plane, &[b.udp]),
             ServeOptions {
@@ -920,6 +917,15 @@ mod workload {
             },
         ));
         let relaunch_error = relaunch.as_ref().err().map(|error| format!("{error:#}"));
+        // Diagnostics only: whether, and when, a stray owner lets go.
+        let (late_appstate, late_agent, waited) = a_runtime.block_on(released(&state_a, &agent_a));
+        eprintln!(
+            "ISSUE1269 a shutdown took {took:?}; +{:?} appstate_strong={appstate_strong} \
+             agent_strong={agent_strong} (at return); after +{waited:?} \
+             appstate_strong={late_appstate} agent_strong={late_agent} a_runtime_alive_tasks={}",
+            Duration::ZERO,
+            a_runtime.metrics().num_alive_tasks()
+        );
         eprintln!("ISSUE1269 a relaunch error={relaunch_error:?}");
 
         // Stop everything before asserting, so a failure leaks nothing.
@@ -937,17 +943,20 @@ mod workload {
         let result_b = b_runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(60), b.handle.shutdown_and_wait()).await
         });
-        let (appstate_strong_b, agent_strong_b, waited_b) =
+        let (appstate_strong_b, agent_strong_b) = (state_b.strong_count(), agent_b.strong_count());
+        let (late_appstate_b, late_agent_b, waited_b) =
             b_runtime.block_on(released(&state_b, &agent_b));
         eprintln!(
-            "ISSUE1269 b result={result_b:?} +{waited_b:?} appstate_strong={appstate_strong_b} \
-             agent_strong={agent_strong_b}"
+            "ISSUE1269 b result={result_b:?} +{:?} appstate_strong={appstate_strong_b} \
+             agent_strong={agent_strong_b} (at return); after +{waited_b:?} \
+             appstate_strong={late_appstate_b} agent_strong={late_agent_b}",
+            Duration::ZERO
         );
 
         assert_eq!(
             (appstate_strong, agent_strong),
             (0, 0),
-            "A's AppState/Agent outlive shutdown_and_wait by more than {GROUP_JOIN_RELEASE_BOUND:?}"
+            "A's AppState/Agent still owned when shutdown_and_wait returned"
         );
         assert!(
             relaunch_error.is_none(),
@@ -957,7 +966,7 @@ mod workload {
         assert_eq!(
             (appstate_strong_b, agent_strong_b),
             (0, 0),
-            "B's AppState/Agent outlive shutdown_and_wait by more than {GROUP_JOIN_RELEASE_BOUND:?}"
+            "B's AppState/Agent still owned when shutdown_and_wait returned"
         );
     }
 
