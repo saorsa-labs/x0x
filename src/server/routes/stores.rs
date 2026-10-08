@@ -1513,6 +1513,8 @@ fn refresh_gss_store_binding(
 /// The sync loops call this before every seal/open, so a rekey or roster
 /// change takes effect on the very next record. Only an ineligible binding
 /// retires the handle; a pending key for the current epoch does not (#1266).
+/// The first refresh that finds the key installed again after a pending
+/// one sends one state request, so records dropped in the gap come back.
 pub(in crate::server) fn gss_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::GssKvSecureContext>,
@@ -1521,11 +1523,14 @@ pub(in crate::server) fn gss_kv_refresh(
     creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
     let state = Arc::clone(state);
+    // Set by a KeyPending refresh; taken by the next Current one.
+    let key_gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
         let state = Arc::clone(&state);
         let group_key = group_key.clone();
         let topic = topic.clone();
+        let key_gap = Arc::clone(&key_gap);
         Box::pin(async move {
             let outcome = {
                 let groups = state.named_groups.read().await;
@@ -1536,16 +1541,62 @@ pub(in crate::server) fn gss_kv_refresh(
                     &state.agent.agent_id(),
                 )
             };
-            if outcome == GssBindingRefresh::Ineligible {
-                tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
-                let mut stores = state.kv_stores.write().await;
-                if let Some(h) = stores.get(&topic).cloned() {
-                    h.retire();
-                    stores.remove(&topic);
+            match outcome {
+                GssBindingRefresh::Current => {
+                    if key_gap.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        spawn_gss_key_gap_repair(&state, topic);
+                    }
+                }
+                GssBindingRefresh::KeyPending => {
+                    key_gap.store(true, std::sync::atomic::Ordering::Release);
+                }
+                GssBindingRefresh::Ineligible => {
+                    tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
+                    let mut stores = state.kv_stores.write().await;
+                    if let Some(h) = stores.get(&topic).cloned() {
+                        h.retire();
+                        stores.remove(&topic);
+                    }
                 }
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
+}
+
+/// Upper bound for one key-gap repair request, including the wait for the
+/// GSS publication gate (#1266).
+const GSS_KEY_GAP_REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #1266: after a key gap, ask the group once for this store's current
+/// state. Detached, because the refresh hook runs inside receive and seal
+/// sections; the task takes no lock while it waits.
+fn spawn_gss_key_gap_repair(state: &Arc<AppState>, topic: String) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let handle = state.kv_stores.read().await.get(&topic).cloned();
+        let Some(handle) = handle else {
+            return;
+        };
+        match tokio::time::timeout(GSS_KEY_GAP_REPAIR_DEADLINE, handle.request_state_repair()).await
+        {
+            Ok(Ok(true)) => tracing::info!(
+                target: "x0x::kv",
+                "encrypted store {topic}: group key re-armed after a gap; requested current state once"
+            ),
+            Ok(Ok(false)) => tracing::debug!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state request not sent"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state request failed: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state request timed out"
+            ),
+        }
+    });
 }
 
 /// Retire EVERY encrypted store handle bound to `stable_group_id` (topic

@@ -188,3 +188,177 @@ async fn issue1266_removal_first_rekey_gap_keeps_survivor_store() -> Result<()> 
     assert_eq!(reopened["epoch"].as_u64(), Some(f.new_epoch));
     Ok(())
 }
+
+async fn wait_for_value(
+    state: &Arc<AppState>,
+    topic: &str,
+    key: &str,
+    deadline: Duration,
+) -> Result<(StatusCode, serde_json::Value)> {
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        let (status, body) = get_value(state, topic, key).await?;
+        if status == StatusCode::OK || tokio::time::Instant::now() >= until {
+            return Ok((status, body));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// #1266 follow-up (a): a sealed record that reaches the survivor inside the
+/// keyless gap cannot be opened and is dropped, not queued. When the share
+/// installs and the store re-arms, the survivor must ask the group once for
+/// current state, so the dropped record comes back without a restart.
+///
+/// Alice is a second encrypted sync on the survivor's own pub/sub (loopback
+/// node, no peers), holding the admin identity and its own GSS context. Both
+/// bootstrap requesters are silenced, as after convergence, so the only
+/// state request on the side topic is the one the re-arm sends.
+#[tokio::test]
+async fn issue1266_record_dropped_in_rekey_gap_is_repaired_once() -> Result<()> {
+    use x0x::kv::encrypted::KvSecureContext as _;
+    let (state, dir) = loopback_survivor_state().await?;
+    let f = f1_gss_rotation_fixture_on(state, dir, "issue1266repair").await?;
+    let admin = f.admin_kp.agent_id();
+    let (status, created) = open_group_store(&f.state, &f.group_id).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "open survivor store: {created}"
+    );
+    let topic = created["topic"]
+        .as_str()
+        .context("store topic")?
+        .to_string();
+    let bob = f
+        .state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .context("store handle registered")?;
+    bob.silence_bootstrap_for_test();
+    let baseline_requests = bob.state_sync_snapshot().requests_sent;
+
+    // Alice's replica of the same store, at the pre-removal epoch.
+    let parent = f
+        .state
+        .named_groups
+        .read()
+        .await
+        .get(&f.group_id)
+        .cloned()
+        .context("parent group")?;
+    let stable = parent.stable_group_id().to_string();
+    let (store_id, alice_topic) = x0x::kv::encrypted::group_store_identity(&stable, "ws");
+    assert_eq!(alice_topic, topic);
+    let alice_ctx =
+        Arc::new(x0x::groups::GssKvSecureContext::from_group(&parent).context("alice context")?);
+    let alice_store = x0x::kv::KvStore::new_encrypted(
+        store_id,
+        "ws".to_string(),
+        admin,
+        stable.as_bytes().to_vec(),
+        Arc::clone(&alice_ctx) as Arc<dyn x0x::kv::encrypted::KvSecureContext>,
+    )?;
+    let alice_peer = saorsa_gossip_types::PeerId::new([0xA1; 32]);
+    let mut alice = x0x::kv::KvStoreSync::new(
+        alice_store,
+        f.state.agent.pubsub().context("survivor pubsub")?,
+        topic.clone(),
+        alice_peer,
+        Some(admin),
+    )?;
+    alice.set_secure_context(
+        Arc::clone(&alice_ctx) as Arc<dyn x0x::kv::encrypted::KvSecureContext>,
+        None,
+    );
+    alice.set_author_signing(x0x::kv::encrypted::AuthorSigning::from_keypair(
+        &f.admin_kp,
+    )?);
+    alice.silence_bootstrap();
+    alice.start().await?;
+
+    // Metadata-first removal: the survivor is keyless at the new epoch.
+    let removed =
+        apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None).await;
+    assert!(removed.should_exit, "signed MemberRemoved must apply");
+    let mut rotated = f
+        .state
+        .named_groups
+        .read()
+        .await
+        .get(&f.group_id)
+        .cloned()
+        .context("group after removal")?;
+    assert!(
+        rotated.shared_secret.is_none(),
+        "removal-first gap is keyless"
+    );
+    rotated.shared_secret = Some(f.new_secret.to_vec());
+    alice_ctx.update_from_group(&rotated);
+    assert_eq!(alice_ctx.current_epoch(), f.new_epoch);
+
+    // Alice writes at the rotated epoch; the sealed record reaches the
+    // keyless survivor, which must drop it.
+    let delta = {
+        let mut s = alice.write().await;
+        s.put(
+            "gap".to_string(),
+            b"gap-value".to_vec(),
+            "text/plain".to_string(),
+            alice_peer,
+        )?;
+        let entry = s.get("gap").cloned().context("alice gap entry")?;
+        x0x::kv::KvStoreDelta::for_put(
+            "gap".to_string(),
+            entry,
+            (alice_peer, s.next_seq()?),
+            s.current_version(),
+        )
+    };
+    alice.publish_delta(alice_peer, delta).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        bob.wait_receive_rejected_for_test(),
+    )
+    .await
+    .context("the survivor must receive and drop the gap record")?;
+    let (status, body) = get_value(&f.state, &topic, "gap").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
+    assert_eq!(body["error"], "key not found", "store stays bound: {body}");
+
+    // The share installs; the next refresh re-arms the store.
+    let delivered =
+        apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
+            .await;
+    assert!(!delivered.should_exit);
+    let (status, body) = wait_for_value(&f.state, &topic, "gap", Duration::from_secs(15)).await?;
+    let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
+    let served = alice.state_sync_snapshot();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the gap record must be repaired without a restart: {body}; survivor \
+         repair requests {requests}; responder received {} answered {}",
+        served.requests_received,
+        served.requests_answered
+    );
+    assert_eq!(body["value"], BASE64.encode(b"gap-value"));
+    assert_eq!(requests, 1, "exactly one repair request per key gap");
+    assert_eq!(served.requests_received, 1);
+    assert_eq!(served.requests_answered, 1);
+
+    // Later refreshes at the same keyed epoch send nothing more.
+    let (status, _) = get_value(&f.state, &topic, "gap").await?;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        bob.state_sync_snapshot().requests_sent - baseline_requests,
+        1,
+        "no second repair request without a new gap"
+    );
+    alice.cancel_sync();
+    Ok(())
+}

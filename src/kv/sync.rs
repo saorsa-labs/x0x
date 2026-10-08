@@ -900,6 +900,10 @@ pub struct KvStoreSync {
     /// its snapshot write. Tests use the stored permit; production has no hook.
     #[cfg(test)]
     receive_merged_test: Arc<tokio::sync::Notify>,
+    /// #1266 test barrier fired when the listener drops a sealed main-topic
+    /// record of an encrypted store without merging it.
+    #[cfg(test)]
+    receive_rejected_test: Arc<tokio::sync::Notify>,
     /// #765 test instrument: termination counter for the background loop
     /// futures `start_with_spawner` spawns for this sync. Dropping the
     /// last `KvStoreSync` reference (or a shutdown sweep's `cancel_sync`)
@@ -1101,6 +1105,8 @@ impl KvStoreSync {
             sealed_before_publish_test: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             receive_merged_test: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            receive_rejected_test: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             loop_exits: Arc::new(LoopExitTracker::default()),
             #[cfg(test)]
@@ -2411,6 +2417,8 @@ impl KvStoreSync {
         #[cfg(test)]
         let listener_receive_merged_test = Arc::clone(&self.receive_merged_test);
         #[cfg(test)]
+        let listener_receive_rejected_test = Arc::clone(&self.receive_rejected_test);
+        #[cfg(test)]
         let listener_loop_exits = Arc::clone(&self.loop_exits);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
@@ -2530,6 +2538,10 @@ impl KvStoreSync {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
+                    }
+                    #[cfg(test)]
+                    if !merged && listener_is_encrypted {
+                        listener_receive_rejected_test.notify_one();
                     }
                     continue;
                 }
@@ -3624,6 +3636,89 @@ impl KvStoreSync {
         self.bootstrap_cancel.cancel();
     }
 
+    /// Publish ONE sealed `StateRequest` for a GSS-encrypted store, outside
+    /// the bootstrap schedule (#1266).
+    ///
+    /// A sealed record that arrives while this replica has no secret for the
+    /// current epoch cannot be opened, so the listener drops it. Once the
+    /// bootstrap requester has converged, nothing asks for that record
+    /// again. The daemon calls this once when the store's key re-arms. It
+    /// sends the existing request message, and holders answer with their
+    /// existing sealed full-state serve at the current epoch. It never
+    /// retries; a holder inside its response cooldown does not answer it.
+    ///
+    /// Returns `Ok(true)` when the request was published, and `Ok(false)`
+    /// when the sync is cancelled or the request cannot be sealed (the local
+    /// agent is no current reader, or holds no key).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when the
+    /// publish fails.
+    pub(crate) async fn request_state_repair(&self) -> Result<bool> {
+        if self.cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let (Some(ctx), Some(signing)) = (self.secure.as_ref(), self.author_signing.as_ref())
+        else {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        };
+        let (encrypted, store_id) = {
+            let store = self.store.read().await;
+            (store.is_encrypted(), *store.id())
+        };
+        if !encrypted || self.treekem_secure.is_some() {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        }
+        let request = KvSyncMessage::StateRequest {
+            requester: self.local_peer_id,
+        };
+        let _publication_guard = match self.gss_publication_gate.as_ref() {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        let deadline = gss_deadline(_publication_guard.is_some());
+        let sealed = within_gss_deadline(
+            Self::seal_control_message(
+                ctx,
+                self.secure_refresh.as_ref(),
+                signing,
+                &store_id,
+                self.local_peer_id,
+                &request,
+            ),
+            deadline,
+        )
+        .await
+        .flatten();
+        let Some(sealed) = sealed else {
+            self.state_sync_counters
+                .request_seal_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        let published = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Ok(false),
+            result = publish_with_gss_deadline(
+                self.pubsub.as_ref(),
+                self.state_sync_topic(),
+                bytes::Bytes::from(sealed),
+                deadline,
+            ) => result,
+        };
+        published
+            .map_err(|e| KvError::Gossip(format!("state repair request publish failed: {e}")))?;
+        self.state_sync_counters
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Tear down ALL of this sync's background loops (delta listener,
     /// state-request responder, bootstrap requester) WITHOUT touching topic
     /// subscriptions.
@@ -3672,6 +3767,13 @@ impl KvStoreSync {
     #[cfg(test)]
     pub(crate) async fn wait_receive_merged_for_test(&self) {
         self.receive_merged_test.notified().await;
+    }
+
+    /// Wait until the listener has dropped a sealed record of this encrypted
+    /// store without merging it (#1266). One permit is retained, as above.
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.receive_rejected_test.notified().await;
     }
 
     /// This sync's background-loop termination counter (#765): the

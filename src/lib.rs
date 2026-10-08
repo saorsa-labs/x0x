@@ -21954,6 +21954,31 @@ impl KvStoreHandle {
         self.sync.wait_receive_merged_for_test().await;
     }
 
+    /// Ask the group once for current state after this store's group key
+    /// re-armed (#1266). See `KvStoreSync::request_state_repair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when the
+    /// publish fails.
+    pub(crate) async fn request_state_repair(&self) -> error::Result<bool> {
+        self.sync
+            .request_state_repair()
+            .await
+            .map_err(|error| kv_storage_err(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.sync.wait_receive_rejected_for_test().await;
+    }
+
+    /// Stop only the bootstrap requester, as a converged requester would.
+    #[cfg(test)]
+    pub(crate) fn silence_bootstrap_for_test(&self) {
+        self.sync.silence_bootstrap();
+    }
+
     #[cfg(test)]
     pub(crate) fn receive_section_active_for_test(&self) -> bool {
         self.sync.receive_section_active_for_test()
