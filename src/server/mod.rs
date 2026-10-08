@@ -29,6 +29,9 @@ mod state;
 mod w3h;
 mod ws;
 
+#[cfg(test)]
+mod shutdown_regression;
+
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
@@ -5212,3 +5215,8 @@ mod startup_update_check_tests {
             .expect("clean shutdown");
     }
 }
+
+// GHSA-rr9m-cvx5-pmv9 (fixed in v0.46.5): regression tests for ADR 0115
+// (Accepted), identity discovery authority. Test builds only.
+#[cfg(test)]
+mod identity_ingest_authority_tests;

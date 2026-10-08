@@ -1938,8 +1938,46 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
 /// row predating schema v4 carry NULL, and indexing those wastes space for a
 /// lookup that can never match them. Mirrors the existing `idx_replace`
 /// partial-index precedent.
+///
+/// `history_backfill_progress` holds the canonical-backfill cursor (one row,
+/// `scanned_to_id`). It follows the same rule as the projection table:
+/// purely derived, rebuildable state created idempotently at open, never part
+/// of the versioned migration chain, so `SCHEMA_VERSION` stays 4 and an older
+/// binary opens this database unchanged (ADR 0085: an older build must still
+/// open the DB; the marker is additive and ignorable, and deleting it just
+/// costs one full rebuild pass on the next open).
+///
+/// `history.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, so SQLite
+/// REUSES rowids: purge the rows that held the highest ids and the next
+/// insert lands at a reused id at or below the completed cursor, where the
+/// backfill fast path (`scanned_to_id >= MAX(id)` scan from the cursor up)
+/// would never look again. The `history_backfill_lower` trigger closes that
+/// hole in the database file itself — triggers fire for every writer,
+/// including older binaries that predate the cursor and maintain no
+/// projections — by lowering the watermark to just below any inserted id at
+/// or below it, so the next open rescans the reused range. An insert by this
+/// binary normally takes `MAX(id)+1`, above the watermark, and never fires
+/// the trigger; the one exception is the replace path (delete the current
+/// max row, insert its successor), which re-lowers the watermark by one row
+/// and costs a harmless idempotent rescan of a row `insert_row` already
+/// projected.
 fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
-    conn.execute_batch(
+    let setup_err = |e: rusqlite::Error| HistoryError::Database(format!("index setup failed: {e}"));
+    // One transaction: a projection recreated empty and the cursor reset it
+    // needs commit together, so an interrupted open cannot keep the new
+    // empty table with a stale completed cursor.
+    let tx = conn.unchecked_transaction().map_err(setup_err)?;
+    // A projection table created empty below (lost, dropped, or new) must be
+    // rebuilt from the bottom, whatever a surviving cursor says.
+    let projection_existed: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'history_canonical_ids')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(setup_err)?;
+    tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_logical_request \
          ON history(ingress_sender_agent, logical_request_id) \
          WHERE logical_request_id IS NOT NULL; \
@@ -1950,13 +1988,33 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
            scope_id TEXT NOT NULL \
          ); \
          CREATE INDEX IF NOT EXISTS idx_history_canonical \
-           ON history_canonical_ids(canonical_msg_id, scope_kind, scope_id); \
+         ON history_canonical_ids(canonical_msg_id, scope_kind, scope_id); \
          CREATE TRIGGER IF NOT EXISTS history_canonical_ids_ad AFTER DELETE ON history BEGIN \
            DELETE FROM history_canonical_ids WHERE history_msg_id = old.msg_id; \
+         END; \
+         CREATE TABLE IF NOT EXISTS history_backfill_progress ( \
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+           scanned_to_id INTEGER NOT NULL \
+         ); \
+         INSERT OR IGNORE INTO history_backfill_progress (singleton, scanned_to_id) \
+           VALUES (1, 0); \
+         CREATE TRIGGER IF NOT EXISTS history_backfill_lower AFTER INSERT ON history \
+         WHEN NEW.id <= (SELECT scanned_to_id FROM history_backfill_progress \
+                         WHERE singleton = 1) \
+         BEGIN \
+           UPDATE history_backfill_progress SET scanned_to_id = NEW.id - 1 \
+           WHERE singleton = 1; \
          END;",
     )
-    .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
-    Ok(())
+    .map_err(setup_err)?;
+    if !projection_existed {
+        tx.execute(
+            "UPDATE history_backfill_progress SET scanned_to_id = 0 WHERE singleton = 1",
+            [],
+        )
+        .map_err(setup_err)?;
+    }
+    tx.commit().map_err(setup_err)
 }
 
 /// Populate the rebuildable canonical projection for rows written by an older
@@ -1964,23 +2022,51 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
 /// group artifact is indexed; the history row itself is never changed. The
 /// existing unique history `msg_id` is the cache key so SQLite rowid reuse
 /// cannot attach an old projection to a new row.
+///
+/// Progress persists in `history_backfill_progress`, so a full pass runs once
+/// per database, not once per open (issue #1263 part 2). The cursor is the
+/// highest history rowid examined; rows above it are new, or were written by
+/// a binary that does not maintain projections at insert. Rows
+/// `canonical_group_msg_id` rejects (e.g. MLS plaintext group rows with no
+/// `signed_artifact`) are examined exactly once and then sit below the cursor
+/// forever — never rescanned. A row inserted at a REUSED id at or below the
+/// cursor (any writer, however old — see `history_backfill_lower` in
+/// [`ensure_indexes`]) lowers the watermark inside the inserting
+/// transaction, so the next open rescans it; `insert_row` has already
+/// projected rows written by this binary, and re-projecting them is
+/// idempotent (`INSERT OR REPLACE` keyed on the unique `msg_id`).
 fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
-    // Reconcile only missing keys: the existing unique artifact hash is
-    // immutable for a history row, and the delete trigger removes its
-    // projection when an older writer deletes that row. Keep each read
-    // bounded so opening a large history cannot allocate all payloads at
-    // once. Invalid rows still advance the id cursor and cannot stall this
-    // loop. Commit each bounded batch independently so an interrupted open
-    // retains completed projection work and resumes on the next open.
-    let mut after_id = 0_i64;
+    // Fast path: two scalar reads, no scan. A pass is complete when the
+    // cursor has reached the table maximum.
+    let max_id: i64 =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM history", [], |r| r.get(0))?;
+    // A missing progress row (older tooling, manual repair) is not an error:
+    // the projection is rebuildable, so restart from the bottom.
+    let mut after_id: i64 = conn
+        .query_row(
+            "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    if after_id >= max_id {
+        return Ok(());
+    }
     loop {
         let tx = conn.unchecked_transaction()?;
+        // `+h.scope_kind` makes the kind term un-indexable, so the planner
+        // cannot pick `idx_scope_time` and sort a candidate set per batch
+        // (issue #1263 part 2: O(n²/256) opens): the rowid range drives the
+        // scan and `ORDER BY h.id` is the scan order itself. Keep each read
+        // bounded so opening a large history cannot allocate all payloads at
+        // once; invalid rows still advance the cursor and cannot stall this
+        // loop.
         let candidates = {
             let mut stmt = tx.prepare(
                 "SELECT h.id, h.msg_id, h.scope_id, h.payload, h.signed_artifact \
-                 FROM history h LEFT JOIN history_canonical_ids c \
-                 ON c.history_msg_id = h.msg_id \
-                 WHERE h.scope_kind = 1 AND c.history_msg_id IS NULL AND h.id > ?1 \
+                 FROM history h \
+                 WHERE h.id > ?1 AND +h.scope_kind = 1 \
                  ORDER BY h.id LIMIT 256",
             )?;
             let rows = stmt.query_map(rusqlite::params![after_id], |row| {
@@ -1994,8 +2080,17 @@ fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let Some((last_id, _, _, _, _)) = candidates.last() else {
-            tx.rollback()?;
+        #[cfg(test)]
+        backfill_probe::add(candidates.len() as u64);
+        let Some((last_id, ..)) = candidates.last() else {
+            // No group rows remain above the cursor: the pass is complete.
+            // Mark it at the table maximum (not the last group rowid) so a
+            // table whose tail is non-group rows still takes the fast path.
+            tx.execute(
+                "UPDATE history_backfill_progress SET scanned_to_id = ?1 WHERE singleton = 1",
+                rusqlite::params![max_id],
+            )?;
+            tx.commit()?;
             break;
         };
         let last_id = *last_id;
@@ -2012,6 +2107,13 @@ fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
                 rusqlite::params![history_msg_id, &canonical_msg_id[..], scope_id],
             )?;
         }
+        // Commit each bounded batch independently (projection work AND the
+        // cursor advance) so an interrupted open retains completed work and
+        // resumes on the next open.
+        tx.execute(
+            "UPDATE history_backfill_progress SET scanned_to_id = ?1 WHERE singleton = 1",
+            rusqlite::params![last_id],
+        )?;
         tx.commit()?;
         after_id = last_id;
     }
@@ -2863,6 +2965,369 @@ mod tests {
             .unwrap();
         assert_eq!(indexed, 600, "a later open must resume all missing batches");
         assert_eq!(stored_schema_version(&store), 4);
+    }
+
+    /// Issue #1263 part 2: rows `canonical_group_msg_id` rejects (MLS
+    /// plaintext group rows with no `signed_artifact`, the shape
+    /// `record_mls_history` writes) must be examined exactly once, not
+    /// rescanned on every open. The persisted cursor makes the steady-state
+    /// open O(new rows).
+    #[test]
+    fn unprojectable_rows_are_not_rescanned_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let store = Store::open(&path).unwrap();
+            drop(store);
+        }
+        // Rows written the way an embedding writes MLS history: scope_kind=1,
+        // no signed_artifact — never projectable.
+        let conn = Connection::open(&path).unwrap();
+        for n in 0..600_u64 {
+            let record = mls_rec("mls-group", n, format!("mls plaintext {n}").as_bytes());
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 direction, content_type, payload, provenance) \
+                 VALUES (?1, 1, 'mls-group', ?2, ?2, 0, 'text/plain', ?3, 1)",
+                rusqlite::params![&record.msg_id[..], n as i64 + 1, &record.payload],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            600,
+            "the first open examines every row exactly once"
+        );
+        {
+            let guard = lock_conn(&store.conn).unwrap();
+            let indexed: i64 = guard
+                .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(indexed, 0, "unprojectable rows never enter the projection");
+            let scanned: i64 = guard
+                .query_row(
+                    "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let max_id: i64 = guard
+                .query_row("SELECT MAX(id) FROM history", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(scanned, max_id, "the cursor must complete the pass");
+        }
+        drop(store);
+
+        // THE regression (#1263 part 2): reopening rescans nothing.
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            0,
+            "a completed pass must make reopen O(1), not a full rescan"
+        );
+        drop(store);
+
+        // Only rows above the cursor are examined on later opens.
+        let conn = Connection::open(&path).unwrap();
+        for n in 0..20_u64 {
+            let record = mls_rec(
+                "mls-group",
+                1_000 + n,
+                format!("later plaintext {n}").as_bytes(),
+            );
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 direction, content_type, payload, provenance) \
+                 VALUES (?1, 1, 'mls-group', ?2, ?2, 0, 'text/plain', ?3, 1)",
+                rusqlite::params![&record.msg_id[..], 2_000_i64 + n as i64, &record.payload],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        backfill_probe::reset();
+        let _store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            20,
+            "reopen cost must be O(rows-new), not O(all rows)"
+        );
+    }
+
+    /// Issue #1263 part 2: the backfill batch scan must run as a rowid range.
+    /// Without the `+h.scope_kind` guard the planner picks `idx_scope_time`
+    /// and builds a TEMP B-TREE for `ORDER BY h.id` on every 256-row batch —
+    /// O(n²/256) on a database with no ANALYZE data.
+    #[test]
+    fn backfill_scan_is_a_rowid_range_not_a_sort() {
+        let (store, _dir) = open();
+        let guard = lock_conn(&store.conn).unwrap();
+        let plan: String = guard
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT h.id FROM history h \
+                 WHERE h.id > ?1 AND +h.scope_kind = 1 ORDER BY h.id LIMIT 256",
+                rusqlite::params![0_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("PRIMARY KEY"),
+            "the batch scan must use the rowid range, got plan: {plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "ORDER BY h.id must not sort, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("idx_scope_time"),
+            "the kind filter must not drive the scan through idx_scope_time, got plan: {plan}"
+        );
+    }
+
+    /// ADR 0085 posture for the persisted backfill cursor: the marker must
+    /// not bump the schema version (an older binary keeps opening the
+    /// database), rows written behind the cursor's back by a binary that
+    /// does not maintain projections are picked up on the next open, and a
+    /// missing progress row self-heals by rebuilding the projection.
+    #[test]
+    fn backfill_progress_is_downgrade_safe_and_rebuildable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let (target, target_canonical) = group_record("compat-group", "compat body", 1);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.insert(&target).unwrap(), InsertOutcome::Inserted);
+        }
+        // Completing an open advances the cursor past the inserted row.
+        backfill_probe::reset();
+        {
+            let _store = Store::open(&path).unwrap();
+            assert_eq!(
+                backfill_probe::read(),
+                1,
+                "the first completing open examines the row below the cursor"
+            );
+        }
+
+        // An "older binary" (schema v4 only, no projection at insert, no
+        // knowledge of the progress table) writes one more row.
+        let (legacy, legacy_canonical) = group_record("compat-group", "legacy compat body", 2);
+        {
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version, 4,
+                "the progress marker must not bump the schema version"
+            );
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 author_agent, direction, content_type, payload, signed_artifact, signature, \
+                 sig_context, provenance) \
+                 VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    &legacy.msg_id[..],
+                    "compat-group",
+                    legacy.sent_at_ms,
+                    legacy.author_agent,
+                    legacy.content_type,
+                    legacy.payload,
+                    legacy.signed_artifact,
+                    legacy.signature,
+                    legacy.sig_context,
+                ],
+            )
+            .unwrap();
+        }
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            1,
+            "only the row above the cursor is examined"
+        );
+        assert!(store
+            .get_by_canonical_group_msg_id(legacy_canonical, "compat-group")
+            .unwrap()
+            .is_some());
+        assert_eq!(stored_schema_version(&store), 4);
+        drop(store);
+
+        // A dropped or corrupt progress table must not brick the store: the
+        // next open restarts from the bottom and rebuilds the projection.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE history_backfill_progress;")
+                .unwrap();
+        }
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            2,
+            "a missing marker forces one full pass over the group rows"
+        );
+        assert!(store
+            .get_by_canonical_group_msg_id(target_canonical, "compat-group")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_by_canonical_group_msg_id(legacy_canonical, "compat-group")
+            .unwrap()
+            .is_some());
+        assert_eq!(stored_schema_version(&store), 4);
+    }
+
+    /// Review round 3 (projection loss): a completed cursor must not survive
+    /// the loss of the projection it describes. If `history_canonical_ids`
+    /// is dropped while `history_backfill_progress` remains, the next open
+    /// recreates the projection empty and must rebuild it from the bottom.
+    #[test]
+    fn lost_projection_table_is_rebuilt_despite_a_completed_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let (record, canonical) = group_record("lost-projection", "kept body", 1);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.insert(&record).unwrap(), InsertOutcome::Inserted);
+        }
+        // Complete a pass so the cursor sits at the table maximum.
+        drop(Store::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE history_canonical_ids;")
+                .unwrap();
+            let cursor: i64 = conn
+                .query_row(
+                    "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(cursor >= 1, "the cursor survives the projection loss");
+        }
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            1,
+            "the recreated projection is rebuilt from the bottom"
+        );
+        assert!(store
+            .get_by_canonical_group_msg_id(canonical, "lost-projection")
+            .unwrap()
+            .is_some());
+    }
+
+    /// Review round 2 (cursor bypass): `history.id` is `INTEGER PRIMARY KEY`
+    /// without `AUTOINCREMENT`, so an "older binary" that purges the rows
+    /// holding the top ids and then inserts projectable group rows makes
+    /// SQLite reuse ids AT OR BELOW the completed watermark — where the
+    /// backfill fast path never looks. The `history_backfill_lower` trigger
+    /// lives in the database file, so the old writer fires it without
+    /// knowing it exists: the watermark drops inside the insert, and the
+    /// next open rescans (and projects) the reused-id row.
+    #[test]
+    fn backfill_projects_rows_written_at_reused_ids_below_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        // Six projectable group rows (ids 1..=6).
+        {
+            let store = Store::open(&path).unwrap();
+            for n in 0..6_u64 {
+                let (record, _) = group_record("reuse-group", &format!("original {n}"), 100 + n);
+                assert_eq!(store.insert(&record).unwrap(), InsertOutcome::Inserted);
+            }
+        }
+        // Complete a pass so the watermark sits at the table maximum (6).
+        backfill_probe::reset();
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                backfill_probe::read(),
+                6,
+                "the completing pass scans all rows"
+            );
+            let guard = lock_conn(&store.conn).unwrap();
+            let watermark: i64 = guard
+                .query_row(
+                    "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(watermark, 6);
+        }
+
+        // The "old binary": a raw v4-only connection that knows nothing
+        // about the cursor or the projection. It purges the newest rows —
+        // dropping MAX(id) to 3 — and inserts one projectable group row,
+        // which SQLite allocates at the REUSED id 4, below the watermark.
+        let (legacy, legacy_canonical) = group_record("reuse-group", "reused-id body", 200);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DELETE FROM history WHERE id >= 4", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 author_agent, direction, content_type, payload, signed_artifact, signature, \
+                 sig_context, provenance) \
+                 VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    &legacy.msg_id[..],
+                    "reuse-group",
+                    legacy.sent_at_ms,
+                    legacy.author_agent,
+                    legacy.content_type,
+                    legacy.payload,
+                    legacy.signed_artifact,
+                    legacy.signature,
+                    legacy.sig_context,
+                ],
+            )
+            .unwrap();
+            let reused_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM history WHERE msg_id = ?1",
+                    rusqlite::params![&legacy.msg_id[..]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(reused_id, 4, "the fixture must exercise rowid reuse");
+            // The trigger fired inside the old binary's transaction.
+            let watermark: i64 = conn
+                .query_row(
+                    "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(watermark, 3, "the trigger must lower the watermark");
+        }
+
+        // Re-upgrade: the next open rescans from the lowered watermark and
+        // projects the reused-id row, so the canonical lookup finds it.
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            1,
+            "only the reused-id row is above the lowered watermark"
+        );
+        assert!(
+            store
+                .get_by_canonical_group_msg_id(legacy_canonical, "reuse-group")
+                .unwrap()
+                .is_some(),
+            "the reused-id row must be projected on the next open"
+        );
     }
 
     #[test]
@@ -4899,3 +5364,28 @@ mod close_watch {
 }
 
 use close_watch::{AfterClose, BeforeClose};
+
+/// Test builds: count the history rows the canonical backfill examined, so a
+/// test can prove a reopen scanned nothing (issue #1263 part 2). Production
+/// builds never reference it. Kept after the tests module for
+/// `scripts/check-panics.sh` (same convention as `close_watch` above);
+/// nextest runs each test in its own process, so the counter needs no
+/// cross-test locking.
+#[cfg(test)]
+pub(crate) mod backfill_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ROWS_EXAMINED: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn reset() {
+        ROWS_EXAMINED.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add(rows: u64) {
+        ROWS_EXAMINED.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn read() -> u64 {
+        ROWS_EXAMINED.load(Ordering::Relaxed)
+    }
+}

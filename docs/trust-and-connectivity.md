@@ -103,6 +103,95 @@ The sync `build_announcement()` leaves these as `None` (no network access). The 
 
 **Protocol note**: These fields use bincode 1.x serialization. Old→new messages will fail to decode because bincode 1.x treats every field as required. This is a deliberate protocol version bump.
 
+## Identity discovery authority (ADR 0115)
+
+An identity announcement is signed by a machine key only, and an agent
+certificate carries no consent from its agent. So a valid announcement proves
+only that its machine signed it. [ADR 0115](adr/0115-identity-discovery-authority.md)
+decides what such an announcement may change (`src/identity_authority.rs`):
+
+- **Class A**: the verified pubsub author is the announced agent. It may set
+  every field and records the authenticated binding.
+- **Class B**: another author, but the announcing machine is the agent's
+  authenticated pairing (its authenticated binding, unexpired and unrevoked,
+  or a usable ADR 0089 evidence record). It may refresh the certificate,
+  user, name and agent key. It never moves the agent.
+- **Class C**: anything else. The listener drops it and counts it. It writes
+  no discovery field, binding store, DM registry entry, contact machine
+  record or bootstrap hint.
+
+The routing `machine_id` in a discovery entry, and the DM registry, are
+hints. Security readers (raw delivery verification,
+`Agent::is_agent_machine_verified`, raw-first and pinned resolution, the
+stream and datagram gates, EvidenceV1 Lookup and admission, placement minting
+and owner-sync candidate choice) use a routing machine only when an authority
+store confirms that agent on that machine:
+
+- the authenticated binding. Its writers are class A announcements, ADR 0021
+  origin attestations, and one local source: a card the local user imports
+  (`POST /agent/card/import`, token-authenticated, `Agent::pin_card_binding`).
+  A card import is a local-user pin for its (agent, machine). It is
+  newest-wins, so a stale card never rolls back a fresher binding. No network
+  input reaches it.
+- the announced binding (class A or B announcements only);
+- a usable ADR 0089 evidence record for exactly that (agent, machine).
+
+Otherwise they use the authority stores' machine, or treat the agent as
+unverified. The connector records a dialed machine only when an authority
+store confirms it. An unconfirmed connection can carry the current send as an
+unverified hint, but never creates a binding.
+
+Behaviour to know:
+
+- **Rendezvous-discovered agents are addresses only.** An agent that
+  `find_agent` finds only through a rendezvous summary (stage 3) gets an
+  address hint and no binding. Raw-first delivery, streams and
+  `Agent::is_agent_machine_verified` fail closed for it (a send returns
+  `AgentNotFound`) until its own class A or B announcement, or a usable
+  evidence record, arrives. This is a user-visible change from earlier
+  releases.
+- **One authority record per agent; the newest beat wins.** An agent that
+  runs on two machines alternates: after a beat from machine M2, machine M1
+  is unconfirmed until M1's next beat (at most one heartbeat, 600 s by
+  default). Meanwhile streams and datagram lanes from M1 are denied, and raw
+  DMs from M1 are delivered annotated unverified.
+- **`find_agent` shard lookup (stage 2).** It applies the classes and the
+  identity listener's timestamp, certificate-expiry, trust, revocation and
+  ADR-0043 pairing gates. Two differences from the listener: it writes the
+  announced binding for class A only, so a class B shard beat refreshes the
+  cached certificate without committing its digest (that certificate has no
+  issuer-revocation provenance until a class A or B announcement on the
+  identity topic commits it; fail closed); and it does not apply the
+  listener's cache-freshness TTL, so an old but skew-acceptable class A shard
+  beat can be cached. Neither changes what class C can do.
+- **Confirmation checks presence only.** It asks whether an authority record
+  names the machine. Each reader keeps its own certificate-expiry and
+  revocation checks (the stream gate, the raw-delivery live checks, the
+  ADR-0043 pairing check).
+- **Non-authorizing readers stay on the raw route.** DM telemetry and retry
+  hints (`dm_peer_rtt_ms`, `dm_lifecycle_hint`), the live direct-ACK hedge,
+  the non-strict arm of the pinned stand-in admission (it feeds only a denial
+  check) and presence event annotation read the routing machine or the DM
+  registry directly. They grant no authorization or verification; the worst
+  case is a misdirected ACK or a spurious denial. The ForwardV2 opener check
+  also compares the routing machine, behind the opener's agent signature and
+  the shared inbound gate (ADR 0115 §6: closed at the root).
+
+A certificate is issuer-revocation authority only when it has authenticated
+provenance: a class A or B announcement carried it or committed to its
+digest, it is the certificate of a usable ADR 0089 evidence record, or the
+local owner issued it (the local certificate journal). An ADR 0043 bundle is
+accepted only when its owner equals the owner of such a certificate for the
+subject. A revocation whose `revoked_at` is more than 300 s ahead is
+rejected, and dropped at load.
+
+On the first start of a build with ADR 0115, persisted issuer revocations and
+bundles not issued by the local user move to `revocation-quarantine.bin`
+(D214). They are not enforced until a certificate with authenticated
+provenance confirms their issuer, and they lapse after 7 days. `GET
+/diagnostics/gossip` reports the counters and the quarantine under
+`identity_authority`.
+
 ## Peer Relay (`peer_relay.rs`, X0X-0070b + #193)
 
 When a direct DM to peer `P` fails `fail_threshold` times within `fail_window`,

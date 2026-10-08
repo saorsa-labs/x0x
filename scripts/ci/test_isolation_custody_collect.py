@@ -122,6 +122,17 @@ class CollectorTests(unittest.TestCase):
         self.assertNotIn("/home/runner", text); self.assertNotIn("4242", text)
         self.assertIn("target/debug/deps/voice_datagram_e2e-66a743b2", text)
 
+    def test_fixture_diagnostics_sibling_does_not_change_custody_receipt(self):
+        self.valid_pair(); self.run_collector()
+        original = self.receipt()
+        diagnostics = self.runner_temp / "x0x-fixture-diagnostics-acceptance"
+        diagnostics.mkdir()
+        (diagnostics / "manifest.json").write_text('{"exit": 101}')
+        (diagnostics / "daemon.stderr.log").write_text("untrusted mutable debug output")
+        self.output = self.root / "out-with-diagnostics"
+        self.run_collector()
+        self.assertEqual(self.receipt(), original)
+
     def test_boolean_cannot_satisfy_integer_or_namespace_fields(self):
         self.valid_pair(); path = self.runner_temp / "x0x-isolation-selection" / "admission.json"
         raw = json.loads(path.read_text()); raw["uid"] = True; path.write_text(json.dumps(raw))
