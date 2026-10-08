@@ -52,12 +52,54 @@ pub const HISTORY_QUARANTINE_PIN_BASE_DIVISOR: u64 = 64;
 /// and the multiplier arm coincide at 64 MiB.
 pub const HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR: u64 = 16;
 
-/// Connection-local table holding the pinned scopes of the pass in flight.
+/// FTS5 index output pages one maintenance merge statement may write
+/// (issue #1264 part 1). Applied as the rank of an FTS5 `'merge'` command:
+/// the POSITIVE rank resumes an in-progress merge (or merges levels with
+/// enough segments); the NEGATIVE rank `-N` starts a fresh optimize-shaped
+/// merge. See [`Store::reclaim_pass`] for the sequencing and why.
 ///
-/// `TEMP`, so `SCHEMA_VERSION` and [`migrate`] are untouched and an older
-/// binary opening the same `history.db` sees nothing new (ADR-0068 D1: "no
-/// schema change").
-const PINNED_SCOPES_TEMP_TABLE: &str = "history_pinned_scopes";
+/// HONEST bound (review round 2, R2-A): the budget counts OUTPUT leaf
+/// pages, and the bundled engine checks it only when the term changes
+/// (`fts5IndexMergeLevel`, sqlite3.c ~245313), so a term whose posting
+/// list exceeds the budget is processed entirely within one statement,
+/// and tombstone-annihilated input is read without producing budgeted
+/// output. One statement is therefore bounded by this many output pages
+/// PLUS the largest posting list it must cross — on a flooded term that
+/// is not a small number, and nothing can interrupt a statement in
+/// flight. What is actually guaranteed: how many statements run per pass
+/// ([`RECLAIM_PASS_TIME_BUDGET`] is checked between every statement) and
+/// how many output pages each one writes.
+const FTS_MERGE_PAGES_PER_SLICE: i64 = 64;
+
+/// Upper bound on `incremental_vacuum` statements per maintenance slice.
+/// Measured on the bundled SQLite 3.46.0: ONE page moves per statement
+/// whatever the argument says (the argument caps newer builds that honor
+/// it), so the loop of statements is the real bound here. Each statement
+/// is deadline-checked; the loop stops early once `page_count` stops
+/// falling, so a settled store costs one no-op pragma per slice.
+const VACUUM_PAGES_PER_SLICE: i64 = 512;
+
+/// Maintenance slices per [`Store::reclaim_pass`] — each slice is a
+/// bounded FTS merge step plus a bounded vacuum step, with the store
+/// mutex taken and RELEASED between slices so writer and reader traffic
+/// interleaves instead of queueing behind whole-store maintenance.
+const RECLAIM_SLICES_PER_PASS: usize = 16;
+
+/// Wall-clock ceiling for one maintenance pass. Checked BETWEEN
+/// statements (each merge/vacuum statement is separately bounded in
+/// output pages — see [`FTS_MERGE_PAGES_PER_SLICE`] for why a statement
+/// in flight cannot be interrupted); a pass that hits the deadline hands
+/// the remaining work to the next pass.
+const RECLAIM_PASS_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Reclaim rounds one retention pass may spend on ACTIVE maintenance — an
+/// FTS merge still consuming budget, or pages still being returned to the
+/// OS — before it stops and lets the next reaper tick continue (review
+/// round 2, R2-C: while maintenance is merely INCOMPLETE, not exhausted,
+/// deleting history would destroy rows the cap did not require). Bounding
+/// this keeps one `retain_with_pins` call finite on a large, fragmented
+/// store; convergence then happens across reaper ticks.
+const RECLAIM_ROUNDS_PER_RETAIN: usize = 32;
 
 /// Outcome of an insert (mirrors the donor's `InsertOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +282,13 @@ pub struct Store {
     /// ([`close_watch`]).
     _before_close: BeforeClose,
     conn: Mutex<Connection>,
+    /// Serialises whole retention passes (review round 2, R2-D). Phase 4 of
+    /// [`Store::retain_with_pins`] releases the connection mutex between
+    /// its bounded maintenance slices, so two overlapping passes on one
+    /// shared `Arc<Store>` (the reaper and any embedder call) must not
+    /// interleave; this lock is held for an entire pass and guards no SQL
+    /// itself. Zero-sized.
+    retention: Mutex<()>,
     /// Dropped after `conn` (fields drop in declaration order, and rusqlite
     /// closes the connection, closing checkpoint included, synchronously in
     /// its `Drop`): in test builds it marks the close complete; zero-sized
@@ -304,6 +353,7 @@ impl Store {
         Ok(Self {
             _before_close: before_close,
             conn: Mutex::new(conn),
+            retention: Mutex::new(()),
             _after_close: after_close,
         })
     }
@@ -616,9 +666,8 @@ impl Store {
     /// chosen to pay for a pinned scope's overshoot, and every unpinned scope
     /// keeps its bounds exactly as before.
     ///
-    /// Cost: O(pinned scopes) inserts into a connection-local `TEMP` table
-    /// plus one indexed lookup per eviction candidate — never
-    /// O(rows × groups). With nothing pinned the table is never created and
+    /// Cost: O(pinned scopes) inline values in the phase SQL — never
+    /// O(rows × groups). With nothing pinned the predicate is empty and
     /// the original statements run unchanged.
     pub fn retain_with_pins(
         &self,
@@ -629,90 +678,318 @@ impl Store {
             pinned_scopes: pinned.len() as u64,
             ..RetainOutcome::default()
         };
-        let guard = lock_conn(&self.conn)?;
+        // Review round 2 (R2-D): whole passes serialize here. Phase 4
+        // releases the connection mutex between its bounded maintenance
+        // slices; without this second lock two overlapping callers on one
+        // shared `Arc<Store>` (the reaper and any embedder) could
+        // interleave phases. The lock guards no SQL itself and is held
+        // for the entire pass.
+        let _retention = self
+            .retention
+            .lock()
+            .map_err(|_| HistoryError::Database("retention mutex poisoned".into()))?;
 
-        // 0. Materialize the pinned set for this pass. `exclude` is the
-        //    predicate every ordinary phase below ANDs in; it is the empty
-        //    string when nothing is pinned, so the unquarantined node runs
-        //    the pre-ADR-0068 SQL verbatim.
-        let exclude = if pinned.is_empty() {
-            String::new()
-        } else {
-            materialize_pinned_scopes(&guard, pinned)?;
-            format!(
-                " AND NOT EXISTS (SELECT 1 FROM {PINNED_SCOPES_TEMP_TABLE} p \
-                   WHERE p.scope_kind = history.scope_kind AND p.scope_id = history.scope_id)"
-            )
-        };
+        // 0. This pass's pin exclusion, inlined into the SQL of every
+        //    ordinary phase below (R2-D: no connection-shared `TEMP` table
+        //    another call could clear mid-pass — the pins travel with the
+        //    call's own statements). Empty when nothing is pinned, so the
+        //    unquarantined node runs the pre-ADR-0068 SQL verbatim.
+        let exclude = pinned_exclusion_sql(pinned);
 
-        // 1. Age bound.
-        if policy.max_age_days > 0 {
-            let cutoff =
-                now_ms().saturating_sub((policy.max_age_days as i64).saturating_mul(86_400_000));
-            outcome.evicted += guard.execute(
-                &format!(
-                    "DELETE FROM history WHERE replace_key IS NULL AND seen_at_ms < ?1{exclude}"
-                ),
-                rusqlite::params![cutoff],
-            )? as u64;
-        }
+        {
+            let guard = lock_conn(&self.conn)?;
 
-        // 2. Pinned ceilings, per pinned scope, oldest-first WITHIN the scope.
-        //
-        //    BEFORE the budget phases, not after: a pinned scope's overshoot
-        //    must be cut back before the whole-database budget is measured,
-        //    or phase 4 — which cannot touch pinned rows — would evict
-        //    HEALTHY scopes to pay for it. Getting this order wrong is
-        //    exactly the "a flooder can burn only its own group's ceiling"
-        //    promise inverted, and the flood fixture fails on it.
-        for (kind, id) in &pinned.scopes {
-            let scope = Scope::from_columns(*kind, id.clone())?;
-            let ceiling = Self::pinned_ceiling(policy, &scope);
-            let evicted = evict_pinned_scope_to_ceiling(&guard, &scope, ceiling)?;
-            outcome.evicted += evicted;
-            outcome.pinned_evicted += evicted;
+            // 1. Age bound.
+            if policy.max_age_days > 0 {
+                let cutoff = now_ms()
+                    .saturating_sub((policy.max_age_days as i64).saturating_mul(86_400_000));
+                outcome.evicted += guard.execute(
+                    &format!(
+                        "DELETE FROM history WHERE replace_key IS NULL \
+                         AND seen_at_ms < ?1{exclude}"
+                    ),
+                    rusqlite::params![cutoff],
+                )? as u64;
+            }
+
+            // 2. Pinned ceilings, per pinned scope, oldest-first WITHIN the
+            //    scope.
+            //
+            //    BEFORE the budget phases, not after: a pinned scope's
+            //    overshoot must be cut back before the whole-database
+            //    budget is measured, or phase 4 — which cannot touch
+            //    pinned rows — would evict HEALTHY scopes to pay for it.
+            //    Getting this order wrong is exactly the "a flooder can
+            //    burn only its own group's ceiling" promise inverted, and
+            //    the flood fixture fails on it.
+            for (kind, id) in &pinned.scopes {
+                let scope = Scope::from_columns(*kind, id.clone())?;
+                let ceiling = Self::pinned_ceiling(policy, &scope);
+                let evicted = evict_pinned_scope_to_ceiling(&guard, &scope, ceiling)?;
+                outcome.evicted += evicted;
+                outcome.pinned_evicted += evicted;
+            }
+
+            // 3. Per-scope byte budgets. A pinned scope is governed by its
+            //    ceiling in phase 2 instead, never by both.
+            for limit in &policy.scope_limits {
+                let scope = Scope::parse(&limit.scope)?;
+                if pinned.contains(&scope) {
+                    continue;
+                }
+                outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
+            }
         }
         if outcome.pinned_evicted > 0 {
-            // Return the pages now, so phase 4 measures the database as the
-            // pinned cut-back left it rather than as it was.
-            guard.execute_batch("PRAGMA incremental_vacuum;")?;
+            // Return what the pinned cut-back freed, in bounded
+            // mutex-yielding slices, before the budget phase measures
+            // (phase 4 measures live pages, which already exclude the
+            // freelist; this also hands the OS the pages back sooner).
+            self.reclaim_pass()?;
         }
 
-        // 3. Per-scope byte budgets. A pinned scope is governed by its
-        //    ceiling in phase 2 instead, never by both.
-        for limit in &policy.scope_limits {
-            let scope = Scope::parse(&limit.scope)?;
-            if pinned.contains(&scope) {
+        // 4. Whole-database byte budget (issue #1264 part 1).
+        //
+        //    Measure LIVE bytes — (page_count − freelist_count) × page_size
+        //    — not the file size: rows deleted by earlier passes leave
+        //    pages on the freelist and FTS5 deletes append tombstone
+        //    postings to the index shadow tables, so the file size barely
+        //    moves while history is destroyed. Each round reclaims FIRST
+        //    in bounded slices ([`Self::reclaim_pass`] — tombstones from
+        //    earlier passes can be most of the overshoot, and folding them
+        //    may reach the cap with no deletion at all), and only when a
+        //    full pass reports NO maintenance activity — no merge
+        //    statement did work, no pages were vacuumed: reclamation truly
+        //    exhausted (R2-C) — does
+        //    the loop delete ONE bounded batch of the oldest durable rows
+        //    and remeasure. While maintenance is still ACTIVE the loop
+        //    keeps reclaiming instead of deleting: a pass can look idle on
+        //    the live measure while an optimize merge copies a large live
+        //    prefix toward the tombstoned tail, and deleting history then
+        //    would destroy rows the cap did not require.
+        //
+        //    Bounded, honestly: each round is ≤ [`RECLAIM_SLICES_PER_PASS`]
+        //    deadline-checked slices, at most
+        //    [`RECLAIM_ROUNDS_PER_RETAIN`] active rounds run per call
+        //    (leftover maintenance continues on the next reaper tick), and
+        //    eviction is one bounded transaction per settled round, so the
+        //    call is finite on any store; on a fragmented multi-GiB index
+        //    full convergence can span reaper ticks by design.
+        //
+        //    The per-row measure that picks an eviction batch is an
+        //    ESTIMATE, never a footprint guarantee — see
+        //    [`evict_oldest_batch`]. The batch always includes the row
+        //    that crosses the target and, while the store is over the cap,
+        //    always takes at least the oldest eligible row, so the pass
+        //    cannot stop above the cap with eligible rows remaining;
+        //    undershooting the cap by less than one row is the accepted
+        //    overshoot. Bounded transactions plus the WAL checkpoints
+        //    between them keep the WAL bounded — small in the steady
+        //    state, not minimal.
+        //
+        //    Adaptive batch sizing: the estimate steers the FIRST batch,
+        //    but on rows whose estimate is far below their real cost
+        //    (short binary rows, metadata-heavy signed rows) it is useless.
+        //    Each completed batch teaches the loop the MEASURED live bytes
+        //    freed per deleted row, and later batches are sized to the
+        //    remaining excess so the pass stops near the minimum number of
+        //    rows instead of a batch granularity past it.
+        let mut learned_marginal: Option<u64> = None;
+        let mut active_rounds = 0_usize;
+        loop {
+            let live = self.live_bytes()?;
+            if live <= policy.max_bytes {
+                break;
+            }
+            let report = self.reclaim_pass()?;
+            if report.live <= policy.max_bytes {
+                break;
+            }
+            if report.active() {
+                active_rounds += 1;
+                if active_rounds >= RECLAIM_ROUNDS_PER_RETAIN {
+                    // Bounded work per invocation; the reaper retries on
+                    // its next tick.
+                    break;
+                }
                 continue;
             }
-            outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
-        }
-
-        // 4. Whole-database byte budget.
-        loop {
-            if db_bytes(&guard)? as u64 <= policy.max_bytes {
-                break;
-            }
-            let n = guard.execute(
-                &format!(
-                    "DELETE FROM history WHERE id IN (\
-                       SELECT id FROM history WHERE replace_key IS NULL{exclude} \
-                       ORDER BY seen_at_ms ASC LIMIT ?1)"
-                ),
-                rusqlite::params![RETAIN_EVICT_BATCH as i64],
-            )?;
+            // Settled: reclamation is exhausted, the excess is live data.
+            let excess = report.live - policy.max_bytes;
+            let limit = match learned_marginal {
+                None => RETAIN_EVICT_BATCH,
+                // +1 row: the batch must always be able to include the
+                // crossing row, and a learned marginal of 0 (a batch that
+                // freed no whole page yet) must not stall the loop at
+                // zero-row batches.
+                Some(m) => ((excess / m.max(1)) as usize + 1).min(RETAIN_EVICT_BATCH),
+            };
+            let n = {
+                let guard = lock_conn(&self.conn)?;
+                evict_oldest_batch(&guard, excess, &exclude, limit)?
+            };
             if n == 0 {
+                // No eligible durable row remains; nothing this pass can
+                // do brings the store under the cap.
                 break;
             }
-            outcome.evicted += n as u64;
-            guard.execute_batch("PRAGMA incremental_vacuum;")?;
+            let after = self.live_bytes()?;
+            learned_marginal = Some(report.live.saturating_sub(after) / n);
+            outcome.evicted += n;
         }
 
         if outcome.evicted > 0 {
-            guard.execute_batch("PRAGMA incremental_vacuum;")?;
+            // Return what this pass freed — FTS segments, freelist pages
+            // and the WAL — in bounded slices before the reaper goes back
+            // to sleep.
+            self.reclaim_pass()?;
         }
+        let guard = lock_conn(&self.conn)?;
         cleanup_canonical_ids(&guard)?;
         Ok(outcome)
+    }
+
+    /// [`live_db_bytes`] under the store mutex — the phase-4 measure.
+    ///
+    /// Read-only on purpose (review round 2, R2-F): the pager already
+    /// takes the database size from the WAL (bundled sqlite3.c ~60381), so
+    /// committed-but-uncheckpointed pages cannot hide from the cap and a
+    /// measurement needs no checkpoint. Checkpointing is a deliberate
+    /// maintenance cadence, not part of measuring — see
+    /// [`Self::reclaim_pass`].
+    fn live_bytes(&self) -> HistoryResult<u64> {
+        let guard = lock_conn(&self.conn)?;
+        Ok(live_db_bytes(&guard)?.max(0) as u64)
+    }
+
+    /// Checkpoint the WAL, truncating it. Runs between the bounded
+    /// maintenance statements so the WAL stays small between transactions
+    /// (deliberate cadence, not part of measuring — R2-F).
+    fn checkpoint_wal(conn: &Connection) -> HistoryResult<()> {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| HistoryError::Database(format!("wal checkpoint failed: {e}")))
+    }
+
+    /// The FTS5 structure record — the bundled engine's persisted index
+    /// layout (segments, in-progress merges), stored as the `history_fts`
+    /// `%_data` row at the engine's fixed structure rowid (10). The engine
+    /// rewrites this record if and only if a `'merge'` statement actually
+    /// did work, which makes comparing it around a statement the exact
+    /// "did this merge do anything" signal [`Store::reclaim_pass`] needs.
+    fn fts_structure(conn: &Connection) -> HistoryResult<Vec<u8>> {
+        conn.query_row(
+            "SELECT block FROM history_fts_data WHERE id = 10",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| HistoryError::Database(format!("fts structure read failed: {e}")))
+        .map(|row| row.unwrap_or_default())
+    }
+
+    /// One bounded maintenance pass (issue #1264 part 1, review round 2):
+    /// fold FTS tombstones in bounded merge slices, return freelist pages
+    /// to the OS in bounded `incremental_vacuum` slices, and truncate the
+    /// WAL between the bounded transactions. Every slice takes and
+    /// RELEASES the store mutex, so writer and reader traffic interleaves
+    /// instead of queueing behind whole-store maintenance. The pass is
+    /// bounded by [`RECLAIM_SLICES_PER_PASS`] slices and
+    /// [`RECLAIM_PASS_TIME_BUDGET`] (checked between statements); leftover
+    /// work runs on the next pass.
+    ///
+    /// Merge sequencing (R2-B): each slice first issues a POSITIVE-rank
+    /// `'merge'` — the bundled engine resumes an in-progress merge where
+    /// it stopped (the merge state lives in the persisted structure
+    /// record, and a writer commit between slices only ADDS a segment the
+    /// resumed merge ignores) — and only when that statement writes no
+    /// frames, which proves no merge is in progress anywhere, issues the
+    /// NEGATIVE rank to START a fresh optimize-shaped merge. The negative
+    /// form re-flattens every segment — partial output included — whenever
+    /// even one new segment appeared since, so it is used strictly to
+    /// start, never to resume: leading with it after every writer commit
+    /// would restart the merge on the already-written lexical prefix and,
+    /// under steady inserts, starve the tombstoned tail forever.
+    ///
+    /// Returns what the pass did plus the live measure after it. A pass
+    /// with zero worked merge statements and zero vacuumed pages left
+    /// the index
+    /// settled: nothing more can be reclaimed without deleting rows.
+    fn reclaim_pass(&self) -> HistoryResult<ReclaimReport> {
+        let deadline = std::time::Instant::now() + RECLAIM_PASS_TIME_BUDGET;
+        let mut report = ReclaimReport::default();
+        for _ in 0..RECLAIM_SLICES_PER_PASS {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            {
+                let guard = lock_conn(&self.conn)?;
+                // Merge slice: resume-or-automerge first; start only on a
+                // proven no-op. Ranks and honest bounds: the
+                // [`FTS_MERGE_PAGES_PER_SLICE`] doc. Activity is detected
+                // by comparing the FTS structure record around the
+                // statement — the bundled engine rewrites it if and only
+                // if the statement did work (WAL frame counts cannot be
+                // used: this store checkpoints TRUNCATE-style, and a
+                // TRUNCATE checkpoint reports its post-truncation frame
+                // count, always zero).
+                let structure_before = Self::fts_structure(&guard)?;
+                Self::checkpoint_wal(&guard)?;
+                guard.execute(
+                    "INSERT INTO history_fts(history_fts, rank) VALUES('merge', ?1)",
+                    rusqlite::params![FTS_MERGE_PAGES_PER_SLICE],
+                )?;
+                Self::checkpoint_wal(&guard)?;
+                let mut did_work = Self::fts_structure(&guard)? != structure_before;
+                if !did_work {
+                    // No in-progress merge existed (a positive rank would
+                    // have resumed one) and no level had enough segments
+                    // to automerge — safe to START a merge without
+                    // discarding one.
+                    guard.execute(
+                        "INSERT INTO history_fts(history_fts, rank) VALUES('merge', ?1)",
+                        rusqlite::params![-FTS_MERGE_PAGES_PER_SLICE],
+                    )?;
+                    Self::checkpoint_wal(&guard)?;
+                    did_work = Self::fts_structure(&guard)? != structure_before;
+                }
+                report.merge_steps += u64::from(did_work);
+
+                // Vacuum slice: return freelist pages to the OS. The
+                // file's auto_vacuum mode is READ here, never set —
+                // changing it on an existing file rewrites the header, a
+                // file-format change this code must not make silently.
+                // `FULL` reclaims at commit (nothing incremental to do);
+                // `NONE` needs a whole-file VACUUM, which the reaper must
+                // not run on its own. In those modes the merge and the
+                // checkpoint still apply.
+                let auto_vacuum: i64 = guard.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+                if auto_vacuum == 2 {
+                    // One page per statement on the bundled SQLite
+                    // (measured; see [`VACUUM_PAGES_PER_SLICE`]), so loop
+                    // bounded statements, deadline-checked, and stop the
+                    // moment the file stops shrinking.
+                    for _ in 0..VACUUM_PAGES_PER_SLICE {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        let before: i64 = guard.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                        guard.execute_batch(&format!(
+                            "PRAGMA incremental_vacuum({VACUUM_PAGES_PER_SLICE});"
+                        ))?;
+                        let after: i64 = guard.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                        if after >= before {
+                            break;
+                        }
+                        report.vacuumed_pages += before - after;
+                    }
+                }
+                // Fold this slice's frames back in; the next bounded
+                // transaction starts from a truncated WAL.
+                Self::checkpoint_wal(&guard)?;
+            }
+        }
+        report.live = self.live_bytes()?;
+        Ok(report)
     }
 
     /// ADR-0068 D1: the byte ceiling for one pinned scope.
@@ -778,32 +1055,154 @@ fn now_ms() -> i64 {
     }
 }
 
+/// What one [`Store::reclaim_pass`] did (issue #1264 part 1, review
+/// round 2).
+#[derive(Debug, Clone, Copy, Default)]
+struct ReclaimReport {
+    /// Live bytes after the pass ((page_count − freelist) × page_size).
+    live: u64,
+    /// Merge statements of the pass that did work (the FTS structure
+    /// record changed around them). Zero across a whole pass means every
+    /// merge statement was a no-op: no merge is in progress and no level
+    /// holds enough segments to merge — the index is settled and only
+    /// deleting rows can shrink it further.
+    merge_steps: u64,
+    /// Pages the pass's `incremental_vacuum` statements returned to the OS.
+    vacuumed_pages: i64,
+}
+
+impl ReclaimReport {
+    /// Maintenance that is still doing work. While true, more merging or
+    /// vacuuming may still shrink the live measure, so the retention loop
+    /// keeps reclaiming instead of deleting history (R2-C: "pass made no
+    /// visible progress on the live measure" is NOT the same as "nothing
+    /// left to reclaim" — an in-progress merge can copy a large live
+    fn active(&self) -> bool {
+        self.merge_steps > 0 || self.vacuumed_pages > 0
+    }
+}
+
+/// Build the pin-exclusion SQL fragment for THIS retention call
+/// (ADR-0068 D1; review round 2, R2-D): a row-value `NOT IN (VALUES …)`
+/// list inlined into the age and global-budget statements. Deliberately
+/// NOT a connection-local `TEMP` table: phase 4 of
+/// [`Store::retain_with_pins`] drops the connection mutex between its
+/// bounded maintenance slices, and two overlapping passes on one shared
+/// `Arc<Store>` would otherwise materialize into (and clear) the SAME
+/// table — pass B's refresh would unpin pass A's scopes mid-flight. With
+/// the list inlined, each call's pins travel with its own SQL, and whole
+/// passes serialize on [`Store::retention`]. Pin sets are small
+/// (fork-quarantined scopes) and the values are literal-escaped, so the
+/// fragment stays trivial.
+fn pinned_exclusion_sql(pinned: &PinnedScopes) -> String {
+    if pinned.scopes.is_empty() {
+        return String::new();
+    }
+    let values = pinned
+        .scopes
+        .iter()
+        .map(|(kind, id)| format!("({kind}, '{}')", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND (history.scope_kind, history.scope_id) NOT IN (VALUES {values})")
+}
+
+/// Database size in bytes (page_count × page_size) as reported by
+/// [`Store::stats`]: the size the main file occupies, including pages on
+/// the freelist that retention has already emptied.
 fn db_bytes(conn: &Connection) -> HistoryResult<i64> {
     let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     Ok(pages.saturating_mul(size))
 }
 
-/// ADR-0068 D1: load this pass's pinned scopes into the connection-local
-/// `TEMP` table the eviction phases join against.
+/// Live bytes of the main database: pages in use (`page_count` minus the
+/// freelist) × `page_size` (issue #1264 part 1). Freed pages sit on the
+/// freelist until `incremental_vacuum` returns them and FTS5 delete
+/// tombstones occupy live index pages until a `'merge'` folds them away, so
+/// neither the file size nor `page_count` reflects what retention has
+/// actually reclaimed — reaping against either over-deletes and never
+/// converges.
+fn live_db_bytes(conn: &Connection) -> HistoryResult<i64> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok(page_count
+        .saturating_sub(freelist)
+        .saturating_mul(page_size))
+}
+
+/// Delete ONE bounded batch of the oldest durable rows whose estimated
+/// footprint covers `excess` — INCLUDING the row that crosses the target
+/// (issue #1264 part 1, review round 2). The window is
+/// `running − own_estimate < excess` — every row whose predecessors' total
+/// is below the excess — so the oldest eligible row is ALWAYS selected
+/// while the store is over the cap (its predecessor total is zero, and the
+/// caller only invokes this with `excess > 0`), and the batch never
+/// overshoots the target by more than one row. A store whose oldest
+/// eligible row estimates larger than the whole excess therefore still
+/// loses that row: the alternative is stopping above the configured cap,
+/// which the budget exists to prevent.
 ///
-/// Recreated (and emptied) every pass: the pinned set is derived live from the
-/// marker state, so a stale row here would pin a group whose quarantine has
-/// been cleared.
-fn materialize_pinned_scopes(conn: &Connection, pinned: &PinnedScopes) -> HistoryResult<()> {
-    conn.execute_batch(&format!(
-        "CREATE TEMP TABLE IF NOT EXISTS {PINNED_SCOPES_TEMP_TABLE} (\
-           scope_kind INTEGER NOT NULL, scope_id TEXT NOT NULL, \
-           PRIMARY KEY (scope_kind, scope_id)); \
-         DELETE FROM {PINNED_SCOPES_TEMP_TABLE};"
-    ))?;
-    let mut stmt = conn.prepare(&format!(
-        "INSERT OR IGNORE INTO {PINNED_SCOPES_TEMP_TABLE} (scope_kind, scope_id) VALUES (?1, ?2)"
-    ))?;
-    for (kind, id) in &pinned.scopes {
-        stmt.execute(rusqlite::params![kind, id])?;
+/// The per-row measure — payload + signed artifact + the FTS `payload_text`
+/// projection — is a SELECTION ESTIMATE, not a footprint: it omits the
+/// 32-byte `msg_id`, signature/public-key/author metadata, B-tree and index
+/// overhead and the row's actual FTS postings, so short binary rows and
+/// metadata-heavy signed rows both occupy more live bytes than the estimate
+/// claims (review round 2). That is safe only because the caller never
+/// trusts the estimate across batches: this helper returns after ONE
+/// bounded transaction of at most `limit` rows (≤ [`RETAIN_EVICT_BATCH`]),
+/// and the caller remeasures live pages before selecting more — sizing
+/// later batches from the measured marginal, not from the estimate.
+/// Including `payload_text` keeps the estimate high enough that an
+/// FTS-heavy text row is not under-counted several-fold within a single
+/// batch. Same oldest-first ordering as [`evict_pinned_scope_to_ceiling`];
+/// pinned scopes stay out of reach through the caller's `exclude`
+/// predicate. Returns rows evicted (0 = no eligible durable row exists).
+fn evict_oldest_batch(
+    conn: &Connection,
+    excess: u64,
+    exclude: &str,
+    limit: usize,
+) -> HistoryResult<u64> {
+    let tx = conn.unchecked_transaction()?;
+    // `running` is the cumulative estimate in oldest-first order; admitting
+    // rows while `running - len < excess` stops the window at — and includes
+    // — the first row whose cumulative total reaches the excess.
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id FROM (SELECT id, len, \
+               SUM(len) OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+             FROM (SELECT id, seen_at_ms, \
+               LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x'')) \
+                 + LENGTH(COALESCE(payload_text, x'')) AS len \
+             FROM history WHERE replace_key IS NULL{exclude})) \
+             WHERE running - len < ?1 LIMIT ?2"
+        ))?;
+        let excess = excess.min(i64::MAX as u64) as i64;
+        let rows = stmt.query_map(rusqlite::params![excess, limit as i64], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if ids.is_empty() {
+        tx.rollback()?;
+        return Ok(0);
     }
-    Ok(())
+    let values: Vec<rusqlite::types::Value> = ids
+        .iter()
+        .map(|id| rusqlite::types::Value::from(*id))
+        .collect();
+    let placeholders = (1..=values.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    tx.execute(
+        &format!("DELETE FROM history WHERE id IN ({placeholders})"),
+        rusqlite::params_from_iter(values),
+    )?;
+    tx.commit()?;
+    Ok(ids.len() as u64)
 }
 
 /// ADR-0068 D1: bring ONE pinned scope back to its ceiling, oldest-first,
@@ -2275,6 +2674,622 @@ mod tests {
             msg.contains("pragma setup"),
             "must be the pragma-setup path, not open/lock/create; got: {msg}"
         );
+    }
+
+    /// Issue #1264 part 1: the whole-database budget must converge on LIVE
+    /// bytes (page_count − freelist) with FTS tombstones reclaimed, instead
+    /// of over-deleting against a file size that deletes never shrink. The
+    /// oldest rows deleted must cover the excess — and not much more — the
+    /// file must physically shrink, and a converged store must stop losing
+    /// rows on later passes.
+    #[test]
+    fn whole_db_budget_converges_without_over_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let store = Store::open(&path).unwrap();
+
+        // Durable text rows with many distinct words, so the FTS index (and
+        // its tombstones) are a real share of the on-disk bytes.
+        const ROWS: usize = 400;
+        const WORDS: [&str; 16] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+        ];
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(ROWS);
+        for i in 0..ROWS {
+            let mut body = String::new();
+            while body.len() < 2048 {
+                for word in WORDS {
+                    body.push_str(word);
+                    body.push(' ');
+                }
+                body.push_str(&format!("row{i:04} "));
+            }
+            payloads.push(body.into_bytes());
+        }
+        for (i, payload) in payloads.iter().enumerate() {
+            let mut r = rec(payload, Scope::Group("reap".into()));
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            assert_eq!(store.insert(&r).unwrap(), InsertOutcome::Inserted);
+        }
+
+        let file_bytes = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let live = |store: &Store| -> u64 {
+            let guard = lock_conn(&store.conn).unwrap();
+            live_db_bytes(&guard).unwrap() as u64
+        };
+        {
+            // Normalize the WAL before measuring the starting point.
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let live_before = live(&store);
+        let file_before = file_bytes(&path);
+        // A cap the payloads can reach: the FTS postings of these wordy rows
+        // are ~2.5× the payload bytes, so 3/4 of the live size leaves an
+        // excess coverable by the oldest quarter of the rows (the earlier
+        // half-of-live cap sat below the total payload bytes and could only
+        // ever be met by deleting every durable row).
+        let cap = live_before * 3 / 4;
+
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let evicted = store.retain(&policy).unwrap();
+        assert!(evicted > 0, "cap is below the live size; rows must go");
+
+        let live_after = live(&store);
+        assert!(
+            live_after <= cap,
+            "one pass must reach the cap: live={live_after}, cap={cap}"
+        );
+        let file_after = file_bytes(&path);
+        assert!(
+            file_after < file_before,
+            "the file must shrink after merge slices + incremental_vacuum + checkpoint: \
+             before={file_before}, after={file_after}"
+        );
+
+        let rows_after: usize = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+                .unwrap() as usize
+        };
+        assert!(
+            rows_after > 0,
+            "the pass must not destroy everything (#1264 over-delete)"
+        );
+        // Deleted footprint stays close to the minimum: each row's window
+        // measure is payload + FTS projection (~4 KiB for these 2 KiB text
+        // rows), so the minimum is excess/4096 plus a little
+        // page-granularity slack. The pre-fix behaviour deleted every
+        // durable row and still missed the cap.
+        let deleted_rows = ROWS - rows_after;
+        let min_rows = ((live_before - cap) / 4096) as usize;
+        assert!(
+            deleted_rows <= min_rows + 2,
+            "over-delete guard: deleted {deleted_rows} rows, minimum ~{min_rows} \
+             (live_before={live_before}, cap={cap})"
+        );
+        // The oldest rows went first: every survivor is newer than the
+        // deleted prefix.
+        let remaining_seen: Vec<i64> = store
+            .query(&HistoryQuery {
+                limit: MAX_QUERY_LIMIT,
+                ..HistoryQuery::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|r| r.record.seen_at_ms)
+            .collect();
+        assert!(
+            remaining_seen.iter().min().copied().unwrap_or(0) >= 1_000 + deleted_rows as i64 - 1,
+            "eviction must be oldest-first"
+        );
+        // FTS survives the merges: a surviving row is still searchable.
+        assert!(
+            !store
+                .search("alpha bravo", &HistoryQuery::default())
+                .unwrap()
+                .is_empty(),
+            "search must still find surviving rows after the pass"
+        );
+
+        // A converged store must not keep shedding rows every pass — the
+        // pre-fix loop never reached the cap and deleted on every pass.
+        let evicted_again = store.retain(&policy).unwrap();
+        assert_eq!(
+            evicted_again, 0,
+            "a second pass over a converged store must evict nothing"
+        );
+    }
+    /// Review round 2, finding 4: a store barely over the cap whose OLDEST
+    /// eligible row estimates larger than the whole excess must still lose
+    /// that row — it is the row that crosses the target. The pre-fix window
+    /// (`running <= excess`) selected nothing, the helper returned 0, and
+    /// retention stopped ABOVE the cap with eligible rows remaining.
+    #[test]
+    fn whole_db_budget_takes_the_crossing_row_when_over_cap() {
+        let (store, _dir) = open();
+        // One big old text row (estimate ≫ one page), then small newer rows.
+        let mut big = rec(&vec![b'x'; 64_000], Scope::Group("cross".into()));
+        big.seen_at_ms = 1;
+        big.sent_at_ms = 1;
+        assert_eq!(store.insert(&big).unwrap(), InsertOutcome::Inserted);
+        for i in 0..40_u64 {
+            let mut r = rec(
+                format!("small {i}").as_bytes(),
+                Scope::Group("cross".into()),
+            );
+            r.seen_at_ms = 2_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        // Settle any insert-time FTS merge work so the fixture starts with
+        // no pending reclamation (otherwise merging alone could reach the
+        // cap and the delete path would never run).
+        loop {
+            let report = store.reclaim_pass().unwrap();
+            if !report.active() {
+                break;
+            }
+        }
+        let live = store.live_bytes().unwrap();
+        // One byte of excess: far below the big row's estimate, so only the
+        // crossing-row rule can evict anything.
+        let cap = live - 1;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let evicted = store.retain(&policy).unwrap();
+        assert_eq!(
+            evicted, 1,
+            "the crossing row alone must bring the store under the cap"
+        );
+        assert!(
+            store.live_bytes().unwrap() <= cap,
+            "the pass must converge, not stop above the cap"
+        );
+        let rows: usize = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+                .unwrap() as usize
+        };
+        assert_eq!(rows, 40, "only the big row went; the newer rows remain");
+        assert_eq!(
+            store.retain(&policy).unwrap(),
+            0,
+            "converged: next pass idle"
+        );
+    }
+
+    /// Review round 2, finding 5 (short binary rows): a row's live cost —
+    /// row storage, the 32-byte `msg_id`, its FTS doc entry and B-tree
+    /// overhead — is a large multiple of a short binary payload, so the
+    /// per-row estimate under-counts badly. The pre-fix helper kept
+    /// deleting against the original byte deficit until the estimates
+    /// covered it — on such rows, until EVERY eligible row was gone. The
+    /// reaper must delete one bounded batch, remeasure live pages, and stop
+    /// as soon as the cap is met.
+    #[test]
+    fn whole_db_budget_converges_on_short_binary_rows_without_over_deleting() {
+        let (store, _dir) = open();
+        const ROWS: usize = 2000;
+        let live_empty = store.live_bytes().unwrap();
+        for i in 0..ROWS {
+            let mut r = rec(format!("b{i:04}").as_bytes(), Scope::Group("tiny".into()));
+            // NOT text/*: no payload_text, so the FTS projection holds an
+            // empty doc while the row itself still costs real pages.
+            r.content_type = "application/octet-stream".into();
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        let live_before = store.live_bytes().unwrap();
+        // Average live cost of one short binary row, measured on this very
+        // database — the yardstick for "close to the minimum". It is a
+        // large multiple of the ~6-byte payload: row storage, the 32-byte
+        // msg_id, index entries and the FTS doc entry.
+        let per_row = (live_before - live_empty) / ROWS as u64;
+        assert!(
+            per_row > 64,
+            "fixture must be metadata-dominated, got {per_row} B/row"
+        );
+        let cap = live_before * 3 / 4;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let evicted = store.retain(&policy).unwrap();
+        assert!(evicted > 0, "the store starts above the cap");
+        let live_after = store.live_bytes().unwrap();
+        assert!(
+            live_after <= cap,
+            "must converge to the cap, not stop above it: live={live_after} cap={cap}"
+        );
+        // Near-minimum deletion in row counts: the loop remeasures after
+        // every bounded batch, so the deleted set may exceed the true
+        // minimum by at most one RETAIN_EVICT_BATCH plus page-granularity
+        // slack. The pre-fix behaviour deleted EVERY eligible row (the
+        // payload estimate could never cover the excess).
+        let min_rows = (live_before - cap) / per_row;
+        assert!(
+            evicted <= min_rows + RETAIN_EVICT_BATCH as u64 + 8,
+            "over-delete: {evicted} rows deleted, minimum ≈ {min_rows} \
+             (per_row={per_row} B, excess {} B)",
+            live_before - cap
+        );
+        let rows_after: usize = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+                .unwrap() as usize
+        };
+        assert_eq!(
+            rows_after as u64,
+            ROWS as u64 - evicted,
+            "durable rows only"
+        );
+        assert!(rows_after > 0, "must not destroy everything");
+        assert_eq!(
+            store.retain(&policy).unwrap(),
+            0,
+            "converged: next pass idle"
+        );
+    }
+
+    /// Review round 2, finding 5 (metadata-heavy signed rows): the estimate
+    /// counts `signed_artifact` but not the signature, the public key or
+    /// the author ids, so a signed row occupies ~3× its estimate. Same
+    /// contract as the binary-row test: converge, delete near the minimum,
+    /// stay converged.
+    #[test]
+    fn whole_db_budget_converges_on_metadata_heavy_rows_without_over_deleting() {
+        let (store, _dir) = open();
+        const ROWS: usize = 600;
+        let live_empty = store.live_bytes().unwrap();
+        for i in 0..ROWS {
+            let payload = format!("meta {i:04}").into_bytes();
+            let mut r = rec(&payload, Scope::Group("meta".into()));
+            // Unique per row: msg_id is BLAKE3(artifact), so a shared
+            // artifact would collapse the fixture to one row.
+            let mut artifact = vec![7_u8; 2048];
+            artifact[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            r.signed_artifact = Some(artifact);
+            r.signature = Some(vec![8_u8; 3072]);
+            r.author_pubkey = Some(vec![9_u8; 1536]);
+            // validate() keys msg_id on the artifact once present.
+            r.msg_id = HistoryRecord::compute_msg_id(r.signed_artifact.as_deref(), &payload);
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        let live_before = store.live_bytes().unwrap();
+        let per_row = (live_before - live_empty) / ROWS as u64;
+        // The estimate (payload + artifact + payload_text ≈ 2 KiB) must
+        // under-count the real per-row cost for this fixture to bite.
+        assert!(
+            per_row > 3 * 2048,
+            "fixture must be metadata-dominated, got {per_row} B/row"
+        );
+        let cap = live_before * 3 / 4;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let evicted = store.retain(&policy).unwrap();
+        assert!(evicted > 0, "the store starts above the cap");
+        let live_after = store.live_bytes().unwrap();
+        assert!(
+            live_after <= cap,
+            "must converge to the cap: live={live_after} cap={cap}"
+        );
+        // Near-minimum in row counts (one remeasured batch of slack); the
+        // pre-fix helper kept deleting until the ~2 KiB estimates covered
+        // the excess — ~3× the necessary rows here.
+        let min_rows = (live_before - cap) / per_row;
+        assert!(
+            evicted <= min_rows + RETAIN_EVICT_BATCH as u64 + 8,
+            "over-delete: {evicted} rows deleted, minimum ≈ {min_rows} \
+             (per_row={per_row} B, excess {} B)",
+            live_before - cap
+        );
+        // Oldest-first: survivors are the newest rows.
+        let oldest_survivor: i64 = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row("SELECT MIN(seen_at_ms) FROM history", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(
+            oldest_survivor >= 1_000 + evicted as i64 - 1,
+            "eviction must be oldest-first"
+        );
+        assert_eq!(
+            store.retain(&policy).unwrap(),
+            0,
+            "converged: next pass idle"
+        );
+    }
+
+    /// Review round 2 (R2-C): an overshoot held by FTS tombstones, not by
+    /// live data, must be met by RECLAMATION alone — the reaper may not
+    /// delete history while merging is still folding the tombstones, and a
+    /// round that does not visibly move the live measure is NOT permission
+    /// to delete. The cap here is reachable with zero deletion.
+    #[test]
+    fn whole_db_budget_meets_a_tombstone_overshoot_without_evicting() {
+        let (store, _dir) = open();
+        const ROWS: usize = 800;
+        const WORDS: [&str; 16] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+        ];
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(ROWS);
+        for i in 0..ROWS {
+            let mut body = String::new();
+            while body.len() < 2048 {
+                for word in WORDS {
+                    body.push_str(word);
+                    body.push(' ');
+                }
+                body.push_str(&format!("row{i:04} "));
+            }
+            payloads.push(body.into_bytes());
+        }
+        for (i, payload) in payloads.iter().enumerate() {
+            let mut r = rec(payload, Scope::Group("tomb".into()));
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            assert_eq!(store.insert(&r).unwrap(), InsertOutcome::Inserted);
+        }
+        // Settle insert-time merge work, then delete half the rows RAW.
+        // The deletes free their table pages, but the FTS index still
+        // holds every deleted row's postings PLUS new tombstone postings —
+        // index bytes only a merge can reclaim.
+        loop {
+            let report = store.reclaim_pass().unwrap();
+            if !report.active() {
+                break;
+            }
+        }
+        {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .execute("DELETE FROM history WHERE id % 2 = 1", [])
+                .unwrap();
+        }
+        // A cap between the post-delete live measure and the folded floor:
+        // the deleted half's postings (plus the tombstones) are well over
+        // a quarter of the index bytes, so folding alone reaches a cap set
+        // one quarter of the index bytes below the post-delete measure.
+        let live_after_deletes = store.live_bytes().unwrap();
+        let fts_bytes: i64 = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(block)), 0) FROM history_fts_data",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert!(fts_bytes > 0, "fixture must have a real FTS index");
+        let cap = live_after_deletes - (fts_bytes as u64) / 4;
+        assert!(
+            store.live_bytes().unwrap() > cap,
+            "the fixture must start over the cap with reclaimable index bytes"
+        );
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let evicted = store.retain(&policy).unwrap();
+        assert_eq!(
+            evicted, 0,
+            "a tombstone overshoot must be met by reclamation, not deletion"
+        );
+        assert!(
+            store.live_bytes().unwrap() <= cap,
+            "folding the tombstones must reach the cap"
+        );
+    }
+
+    /// Review round 2 (R2-B): a writer commit between maintenance activity
+    /// adds a new level-0 FTS segment, which an optimize-shaped (`-N`)
+    /// merge start would re-flatten — restarting on the already-written
+    /// lexical prefix and, under steady inserts, starving the tombstoned
+    /// tail. The pass resumes in-progress merges with the positive rank
+    /// instead. At fixture scale the observable contract: interleaving
+    /// writer commits with reclaim passes does not wedge the machinery —
+    /// once the writer quiesces, the tombstones still fold and the index
+    /// reaches the settled state.
+    #[test]
+    fn merges_keep_progressing_across_writer_commits() {
+        let (store, _dir) = open();
+        const ROWS: usize = 200;
+        const WORDS: [&str; 8] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(ROWS);
+        for i in 0..ROWS {
+            let mut body = String::new();
+            while body.len() < 1024 {
+                for word in WORDS {
+                    body.push_str(word);
+                    body.push(' ');
+                }
+                body.push_str(&format!("row{i:04} "));
+            }
+            payloads.push(body.into_bytes());
+        }
+        for (i, payload) in payloads.iter().enumerate() {
+            let mut r = rec(payload, Scope::Group("il".into()));
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        // Tombstones: delete the oldest half raw.
+        {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .execute(
+                    "DELETE FROM history WHERE id IN \
+                     (SELECT id FROM history ORDER BY seen_at_ms ASC LIMIT 100)",
+                    [],
+                )
+                .unwrap();
+        }
+        let live_after_deletes = store.live_bytes().unwrap();
+
+        // Several rounds of writer-commit-then-reclaim: each commit adds an
+        // FTS segment between maintenance work.
+        for round in 0..8_u64 {
+            let mut r = rec(
+                format!("interleave {round}").as_bytes(),
+                Scope::Group("il".into()),
+            );
+            r.seen_at_ms = 100_000 + round as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+            let _ = store.reclaim_pass().unwrap();
+        }
+
+        // Writer quiesced: the merge machinery must converge to the settled
+        // state despite the interleaved commits (bounded: a wedged merger
+        // never reports inactive and fails the guard).
+        let mut passes = 0;
+        loop {
+            let report = store.reclaim_pass().unwrap();
+            if !report.active() {
+                break;
+            }
+            passes += 1;
+            assert!(
+                passes < 64,
+                "merging must settle despite interleaved writer commits"
+            );
+        }
+        assert!(
+            store.live_bytes().unwrap() < live_after_deletes,
+            "the tombstones must have been folded away after settling"
+        );
+    }
+
+    /// Review round 2 (R2-F): measuring live bytes is read-only. It must
+    /// not checkpoint-truncate the WAL — that synchronous I/O belongs to
+    /// the maintenance cadence in `reclaim_pass`, and the measure is
+    /// correct without it (the pager reads the database size from the WAL).
+    #[test]
+    fn live_bytes_does_not_truncate_the_wal_but_reclaim_does() {
+        let (store, _dir) = open();
+        for i in 0..40_u64 {
+            let mut r = rec(
+                format!("wal probe {i}").as_bytes(),
+                Scope::Group("wal".into()),
+            );
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        let wal_frames = |store: &Store| -> i64 {
+            let guard = lock_conn(&store.conn).unwrap();
+            // PASSIVE reports the frame count without truncating.
+            guard
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+                .unwrap()
+        };
+        let before = wal_frames(&store);
+        assert!(
+            before > 0,
+            "the fixture must leave committed frames in the WAL (got {before})"
+        );
+        let _measure = store.live_bytes().unwrap();
+        assert_eq!(
+            wal_frames(&store),
+            before,
+            "live_bytes must not checkpoint the WAL"
+        );
+        let _ = store.reclaim_pass().unwrap();
+        assert_eq!(
+            wal_frames(&store),
+            0,
+            "reclaim_pass must leave a truncated WAL between transactions"
+        );
+    }
+
+    /// Review round 2 (R2-D): retention passes serialize on the store's
+    /// retention lock, and each pass's pins are inlined into its own SQL
+    /// (no connection-shared TEMP table another call could clear). While
+    /// this test holds the lock, a concurrent `retain_with_pins` under
+    /// global pressure with the store's only scope pinned must stay blocked
+    /// — deterministically observable, it cannot finish — and once
+    /// released it must complete without deleting the rows it pinned.
+    #[test]
+    fn retention_passes_serialize_and_pins_survive_their_own_pass() {
+        let (store, _dir) = open();
+        for i in 0..30_u64 {
+            let mut r = rec(
+                format!("pinned row {i}").as_bytes(),
+                Scope::Group("pinned".into()),
+            );
+            r.seen_at_ms = 1_000 + i as i64;
+            r.sent_at_ms = r.seen_at_ms;
+            store.insert(&r).unwrap();
+        }
+        // Real global pressure: half the live size. Everything deletable is
+        // pinned, so a corrupted pin set is the only way this pass could
+        // delete rows.
+        let cap = store.live_bytes().unwrap() / 2;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let pinned = PinnedScopes::from_canonical(["group:pinned"]);
+
+        let hold = store.retention.lock().unwrap_or_else(|e| e.into_inner());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let spawned = s.spawn(|| {
+                let _ = store.retain_with_pins(&policy, &pinned).unwrap();
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !done.load(std::sync::atomic::Ordering::SeqCst),
+                "retain_with_pins must not run while another pass holds the retention lock"
+            );
+            drop(hold);
+            spawned.join().unwrap();
+        });
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "the serialized pass must complete once the lock is released"
+        );
+        let rows: i64 = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row(
+                    "SELECT COUNT(*) FROM history WHERE scope_kind = 1 AND scope_id = 'pinned'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(rows, 30, "a fully pinned store keeps every row");
     }
 }
 
