@@ -5251,3 +5251,8 @@ mod startup_update_check_tests {
             .expect("clean shutdown");
     }
 }
+
+// GHSA-rr9m-cvx5-pmv9 (fixed in v0.46.5): regression tests for ADR 0115
+// (Accepted), identity discovery authority. Test builds only.
+#[cfg(test)]
+mod identity_ingest_authority_tests;

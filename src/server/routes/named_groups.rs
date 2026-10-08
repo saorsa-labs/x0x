@@ -39379,6 +39379,7 @@ pub(in crate::server) mod tests {
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
     mod issue1256_metadata_listener;
+    mod issue1266_survivor_store_rekey_gap;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -47249,7 +47250,17 @@ pub(in crate::server) mod tests {
     // path. The envelope is sealed to the survivor's KEM public key with the
     // same AAD the opener recomputes.
     async fn f1_gss_rotation_fixture(group_tag: &str) -> Result<F1GssRotationFixture> {
-        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (state, dir) = secure_endpoint_test_state().await?;
+        f1_gss_rotation_fixture_on(state, dir, group_tag).await
+    }
+
+    // The same fixture over a caller-built survivor state (#1266 needs one
+    // with a gossip runtime, so the survivor can hold a live store handle).
+    async fn f1_gss_rotation_fixture_on(
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        group_tag: &str,
+    ) -> Result<F1GssRotationFixture> {
         let admin_kp = crate::identity::AgentKeypair::generate()?;
         let admin_id = admin_kp.agent_id();
         let admin_hex = hex::encode(admin_id.as_bytes());

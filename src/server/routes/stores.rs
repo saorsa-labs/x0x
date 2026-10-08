@@ -1270,6 +1270,22 @@ fn validate_gss_store_group(
     info: &x0x::groups::GroupInfo,
     caller: &AgentId,
 ) -> Result<(), GroupStoreResponse> {
+    validate_gss_store_membership(info, caller)?;
+    if info.shared_secret.is_none() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "local daemon holds no shared secret for this group yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Every GSS store eligibility rule except holding the current secret. The
+/// secret is a separate, transient condition for a bound handle (#1266).
+fn validate_gss_store_membership(
+    info: &x0x::groups::GroupInfo,
+    caller: &AgentId,
+) -> Result<(), GroupStoreResponse> {
     if info.withdrawn {
         return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
     }
@@ -1300,12 +1316,6 @@ fn validate_gss_store_group(
     if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
         return Err(bad_request(
             "encrypted stores v1 are GSS-backed; other planes are not supported yet",
-        ));
-    }
-    if info.shared_secret.is_none() {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "local daemon holds no shared secret for this group yet",
         ));
     }
     Ok(())
@@ -1476,31 +1486,53 @@ fn public_kv_refresh(
     })
 }
 
+/// Result of re-checking a bound GSS store against its live group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GssBindingRefresh {
+    /// Eligible and keyed: the context mirrors the live group.
+    Current,
+    /// Eligible, but this daemon has no secret for the current epoch yet.
+    /// A removal-first GSS rotation (ADR 0024 §6) clears the secret before
+    /// the survivor's `SecureShareDelivered` lands (#1266). The context
+    /// mirrors that keyless state, so seal, open and local writes fail
+    /// closed. The handle stays bound, and the first refresh after the share
+    /// installs re-arms the same context.
+    KeyPending,
+    /// The binding is no longer eligible: the context is invalidated and the
+    /// handle must be retired.
+    Ineligible,
+}
+
 /// Used by the real per-record refresh hook; invalidation also fences clones.
 fn refresh_gss_store_binding(
     ctx: &x0x::groups::GssKvSecureContext,
     info: Option<&x0x::groups::GroupInfo>,
     creator: AgentId,
     caller: &AgentId,
-) -> bool {
+) -> GssBindingRefresh {
     if let Some(info) = info {
         if info.creator == creator
             && info.stable_group_id().as_bytes() == ctx.group_id()
-            && validate_gss_store_group(info, caller).is_ok()
+            && validate_gss_store_membership(info, caller).is_ok()
         {
             ctx.update_from_group(info);
-            return true;
+            return if info.shared_secret.is_some() {
+                GssBindingRefresh::Current
+            } else {
+                GssBindingRefresh::KeyPending
+            };
         }
     }
     ctx.invalidate();
-    false
+    GssBindingRefresh::Ineligible
 }
 
 /// Deterministic refresh hook for a GSS encrypted-store context: re-reads
 /// the authoritative group from the daemon's named-groups map (under the
 /// read guard — no `GroupInfo` clone) and refreshes the context snapshot.
 /// The sync loops call this before every seal/open, so a rekey or roster
-/// change takes effect on the very next record.
+/// change takes effect on the very next record. Only an ineligible binding
+/// retires the handle; a pending key for the current epoch does not (#1266).
 pub(in crate::server) fn gss_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::GssKvSecureContext>,
@@ -1515,7 +1547,7 @@ pub(in crate::server) fn gss_kv_refresh(
         let group_key = group_key.clone();
         let topic = topic.clone();
         Box::pin(async move {
-            let valid = {
+            let outcome = {
                 let groups = state.named_groups.read().await;
                 refresh_gss_store_binding(
                     &ctx,
@@ -1524,7 +1556,7 @@ pub(in crate::server) fn gss_kv_refresh(
                     &state.agent.agent_id(),
                 )
             };
-            if !valid {
+            if outcome == GssBindingRefresh::Ineligible {
                 tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
                 let mut stores = state.kv_stores.write().await;
                 if let Some(h) = stores.get(&topic).cloned() {
@@ -3228,14 +3260,21 @@ mod tests {
             let ctx = GssKvSecureContext::from_group(&base).unwrap();
             let cloned = ctx.clone();
             let current = (case != 7).then_some(&info);
-            assert!(
-                !refresh_gss_store_binding(&ctx, current, base.creator, &AgentId([2; 32])),
-                "case {case}"
-            );
-            assert!(
-                !cloned.is_active_member(&AgentId([2; 32])),
-                "clone fenced case {case}"
-            );
+            let outcome = refresh_gss_store_binding(&ctx, current, base.creator, &AgentId([2; 32]));
+            if case == 4 {
+                // #1266: a missing secret alone is a pending key, not
+                // ineligibility. The member keeps its binding, but the
+                // keyless context cannot seal or authorize a writer.
+                assert_eq!(outcome, GssBindingRefresh::KeyPending);
+                assert!(cloned.is_active_member(&AgentId([2; 32])));
+                assert!(!cloned.is_authorized_writer(&AgentId([2; 32])));
+            } else {
+                assert_eq!(outcome, GssBindingRefresh::Ineligible, "case {case}");
+                assert!(
+                    !cloned.is_active_member(&AgentId([2; 32])),
+                    "clone fenced case {case}"
+                );
+            }
             let id = x0x::kv::encrypted::group_store_identity(&gid, "Wiki").0;
             assert!(cloned.seal(&id, b"private").is_err());
             if !(5..8).contains(&case) {
@@ -3246,13 +3285,33 @@ mod tests {
         let ctx = GssKvSecureContext::from_group(&base).unwrap();
         let mut advanced = base.clone();
         advanced.secret_epoch += 1;
-        assert!(refresh_gss_store_binding(
-            &ctx,
-            Some(&advanced),
-            base.creator,
-            &AgentId([2; 32])
-        ));
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&advanced), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::Current
+        );
         assert_eq!(ctx.current_epoch(), advanced.secret_epoch);
+
+        // #1266: a removal-first rotation leaves the survivor keyless at the
+        // new epoch. The same context fails closed, then re-arms when the
+        // share installs the new secret.
+        let id = x0x::kv::encrypted::group_store_identity(&gid, "Wiki").0;
+        let mut pending = advanced.clone();
+        pending.secret_epoch += 1;
+        pending.shared_secret = None;
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&pending), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::KeyPending
+        );
+        assert_eq!(ctx.current_epoch(), pending.secret_epoch);
+        assert!(ctx.seal(&id, b"private").is_err(), "no seal while pending");
+        let mut installed = pending.clone();
+        installed.shared_secret = Some(vec![8; 32]);
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&installed), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::Current
+        );
+        let (epoch, _, _) = ctx.seal(&id, b"private").expect("re-armed seal");
+        assert_eq!(epoch, installed.secret_epoch);
         let groups = std::collections::HashMap::from([(gid.clone(), base)]);
         assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([3; 32])).is_err());
         assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());

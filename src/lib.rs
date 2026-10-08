@@ -19747,8 +19747,27 @@ impl AgentBuilder {
                                 .into(),
                         )
                     })?;
-                let service = history::HistoryService::start(cfg, &data_dir)
-                    .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
+                // `HistoryService::start` stays synchronous (public 0.46.x
+                // API), but its `Store::open` — migrations plus the
+                // canonical-id backfill — can block for minutes on a large
+                // history, so it runs on the blocking pool with owned
+                // config/path values (issue #1263 part 2: the open never
+                // parks an async worker). Only the NOT-YET-STARTED opened
+                // store crosses the `await`: if this build future is
+                // cancelled while the open runs, the runtime drops that
+                // value when the task completes — closing the store —
+                // instead of leaking an unowned writer/reaper holding the
+                // exclusive lock (review round 2, R2-E). The tasks are
+                // started here, after the `await`, where the service has an
+                // owner.
+                let start_cfg = cfg.clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    history::HistoryService::open(&start_cfg, &data_dir)
+                })
+                .await
+                .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?
+                .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
+                let service = history::HistoryService::start_tasks(opened);
                 let handle = service.handle();
                 (Some(service), Some(handle))
             }
