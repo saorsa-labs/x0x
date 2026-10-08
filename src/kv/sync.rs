@@ -271,6 +271,13 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
 /// main topic); a request that lands inside the window is served by the
 /// requester's next scheduled attempt.
 const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
+
+/// A key-gap repair (#1266) sends one request and exactly one retry.
+const KEY_GAP_REPAIR_ATTEMPTS: u8 = 2;
+
+/// The retry waits out the holders' response cooldown, plus a margin.
+const KEY_GAP_REPAIR_RETRY_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS + 1);
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
@@ -900,6 +907,10 @@ pub struct KvStoreSync {
     /// its snapshot write. Tests use the stored permit; production has no hook.
     #[cfg(test)]
     receive_merged_test: Arc<tokio::sync::Notify>,
+    /// #1266 test barrier fired when the listener drops a sealed main-topic
+    /// record of an encrypted store without merging it.
+    #[cfg(test)]
+    receive_rejected_test: Arc<tokio::sync::Notify>,
     /// #765 test instrument: termination counter for the background loop
     /// futures `start_with_spawner` spawns for this sync. Dropping the
     /// last `KvStoreSync` reference (or a shutdown sweep's `cancel_sync`)
@@ -1101,6 +1112,8 @@ impl KvStoreSync {
             sealed_before_publish_test: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             receive_merged_test: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            receive_rejected_test: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             loop_exits: Arc::new(LoopExitTracker::default()),
             #[cfg(test)]
@@ -2411,6 +2424,8 @@ impl KvStoreSync {
         #[cfg(test)]
         let listener_receive_merged_test = Arc::clone(&self.receive_merged_test);
         #[cfg(test)]
+        let listener_receive_rejected_test = Arc::clone(&self.receive_rejected_test);
+        #[cfg(test)]
         let listener_loop_exits = Arc::clone(&self.loop_exits);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
@@ -2530,6 +2545,10 @@ impl KvStoreSync {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
+                    }
+                    #[cfg(test)]
+                    if !merged && listener_is_encrypted {
+                        listener_receive_rejected_test.notify_one();
                     }
                     continue;
                 }
@@ -3624,6 +3643,124 @@ impl KvStoreSync {
         self.bootstrap_cancel.cancel();
     }
 
+    /// Ask the group for current state after this GSS-encrypted store's key
+    /// re-armed (#1266), outside the bootstrap schedule.
+    ///
+    /// A sealed record that arrives while this replica has no secret for the
+    /// current epoch cannot be opened, so the listener drops it. Once the
+    /// bootstrap requester has converged, nothing asks for that record
+    /// again. The daemon calls this once when the store's key re-arms. It
+    /// sends the existing sealed `StateRequest`; holders answer with their
+    /// existing sealed full-state serve at the current epoch.
+    ///
+    /// Bounded: exactly `KEY_GAP_REPAIR_ATTEMPTS` requests. A holder that
+    /// served a full state less than `STATE_RESPONSE_COOLDOWN_SECS` ago
+    /// suppresses a request, and nothing on the side topic proves that this
+    /// replica received the state: a `StateServed` marker can be late, can
+    /// describe a serve this replica dropped while keyless, and an empty
+    /// holder sends one without serving anything. So the retry is
+    /// unconditional: `KEY_GAP_REPAIR_RETRY_AFTER` after the first request
+    /// (past every holder's cooldown), this re-authorizes, re-seals and
+    /// sends exactly one more. Every wait ends when the sync is cancelled
+    /// (retire, shutdown).
+    ///
+    /// Returns the number of requests published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when a
+    /// publish fails.
+    pub(crate) async fn request_state_repair(&self) -> Result<u8> {
+        let cancel = self.cancel.clone();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(0),
+            result = self.request_state_repair_attempts() => result,
+        }
+    }
+
+    async fn request_state_repair_attempts(&self) -> Result<u8> {
+        let (Some(ctx), Some(signing)) = (self.secure.as_ref(), self.author_signing.as_ref())
+        else {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        };
+        let (encrypted, store_id) = {
+            let store = self.store.read().await;
+            (store.is_encrypted(), *store.id())
+        };
+        if !encrypted || self.treekem_secure.is_some() {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        }
+        let mut published = 0u8;
+        for attempt in 0..KEY_GAP_REPAIR_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+            }
+            if !self
+                .publish_state_repair_request(ctx, signing, &store_id)
+                .await?
+            {
+                break;
+            }
+            published = published.saturating_add(1);
+        }
+        Ok(published)
+    }
+
+    /// Authorize, seal and publish one `StateRequest` under the GSS
+    /// publication gate. `Ok(false)` when it cannot be sealed (the local
+    /// agent is no current reader, or holds no key).
+    async fn publish_state_repair_request(
+        &self,
+        ctx: &SharedKvSecureContext,
+        signing: &Arc<AuthorSigning>,
+        store_id: &KvStoreId,
+    ) -> Result<bool> {
+        let request = KvSyncMessage::StateRequest {
+            requester: self.local_peer_id,
+        };
+        let _publication_guard = match self.gss_publication_gate.as_ref() {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        let deadline = gss_deadline(_publication_guard.is_some());
+        let sealed = within_gss_deadline(
+            Self::seal_control_message(
+                ctx,
+                self.secure_refresh.as_ref(),
+                signing,
+                store_id,
+                self.local_peer_id,
+                &request,
+            ),
+            deadline,
+        )
+        .await
+        .flatten();
+        let Some(sealed) = sealed else {
+            self.state_sync_counters
+                .request_seal_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        publish_with_gss_deadline(
+            self.pubsub.as_ref(),
+            self.state_sync_topic(),
+            bytes::Bytes::from(sealed),
+            deadline,
+        )
+        .await
+        .map_err(|e| KvError::Gossip(format!("state repair request publish failed: {e}")))?;
+        self.state_sync_counters
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Tear down ALL of this sync's background loops (delta listener,
     /// state-request responder, bootstrap requester) WITHOUT touching topic
     /// subscriptions.
@@ -3672,6 +3809,53 @@ impl KvStoreSync {
     #[cfg(test)]
     pub(crate) async fn wait_receive_merged_for_test(&self) {
         self.receive_merged_test.notified().await;
+    }
+
+    /// Wait until the listener has dropped a sealed record of this encrypted
+    /// store without merging it (#1266). One permit is retained, as above.
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.receive_rejected_test.notified().await;
+    }
+
+    /// Publish the sealed `StateServedV2` marker this holder's responder
+    /// sends after a serve, on its own (#1266 r3): models a marker that
+    /// reaches a requester late, separated from the state it describes.
+    #[cfg(test)]
+    pub(crate) async fn publish_served_marker_for_test(&self) -> Result<()> {
+        let (Some(ctx), Some(signing)) = (self.secure.as_ref(), self.author_signing.as_ref())
+        else {
+            return Err(KvError::SecureRecord(
+                "marker needs a sealed store".to_string(),
+            ));
+        };
+        let (store_id, digest, entry_count) = {
+            let store = self.store.read().await;
+            (
+                *store.id(),
+                store.served_digest(),
+                store.checkpoint_pairs().len() as u32,
+            )
+        };
+        let marker = KvSyncMessage::StateServedV2 {
+            responder: self.local_peer_id,
+            digest,
+            entry_count,
+        };
+        let sealed = Self::seal_control_message(
+            ctx,
+            self.secure_refresh.as_ref(),
+            signing,
+            &store_id,
+            self.local_peer_id,
+            &marker,
+        )
+        .await
+        .ok_or_else(|| KvError::SecureRecord("marker seal failed".to_string()))?;
+        self.pubsub
+            .publish(self.state_sync_topic(), bytes::Bytes::from(sealed))
+            .await
+            .map_err(|e| KvError::Gossip(format!("marker publish failed: {e}")))
     }
 
     /// This sync's background-loop termination counter (#765): the
