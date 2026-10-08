@@ -9,7 +9,7 @@
 //! shared-data-dir posture).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -101,15 +101,28 @@ const VACUUM_CHECKPOINT_EVERY: i64 = 8;
 /// "plus one statement" because a statement already in flight cannot be
 /// interrupted, and a single merge statement can overrun on one huge
 /// posting list (see [`FTS_MERGE_PAGES_PER_SLICE`] for the honest bound).
-/// Checked before every statement of the held pass — the age bound, the
-/// pinned-ceiling and per-scope helper loops, maintenance (merge, vacuum,
-/// negative probe), settled and forced eviction batches, and the trailing
-/// canonical-id cleanup — with ONE deliberate exception: the teardown
-/// `wal_checkpoint(TRUNCATE)`, the single post-deadline statement every
-/// pass runs so it always leaves a truncated WAL behind. A vacuum that
-/// stops on the deadline reports itself as skipped and never counts as a
-/// no-op toward the settled certificate (R4-A). The connection is
-/// released between passes; leftover work belongs to the next pass.
+///
+/// Round 6 (R4-A): the deadline is threaded to the actual statement
+/// boundaries, not merely to statement groups. Every helper checks it
+/// between its own statements — a SUM that consumed the budget is never
+/// followed by its DELETE ([`evict_pinned_scope_to_ceiling`],
+/// [`evict_scope_to_budget`]), [`evict_oldest_batch`] rolls back instead
+/// of deleting behind a selection that outlasted the budget,
+/// [`Store::merge_slice`] runs its trailing checkpoint and structure
+/// re-read only while in budget, [`Store::vacuum_slice`] will not even
+/// start its mode probe past the deadline, and each caller re-checks
+/// between the maintenance sub-calls so no probe, checkpoint or fold
+/// starts behind an overlong merge. The forced path is gated on entry
+/// ([`Store::enforce_global_budget`] 4a) so its whole-table `COUNT(*)`
+/// never starts after an earlier phase exhausted the budget. TWO
+/// deliberate post-deadline exceptions remain: the teardown
+/// `wal_checkpoint(TRUNCATE)` — the single extra statement every pass
+/// runs so it always leaves a truncated WAL behind — and phase 4d's
+/// final three-pragma live measure, which the unsettled counter's
+/// correctness (R4-B) requires to read the pass's FINAL state. A vacuum
+/// that stops on the deadline reports itself as skipped and never counts
+/// as a no-op toward the settled certificate. The connection is released
+/// between passes; leftover work belongs to the next pass.
 const RETENTION_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// C-1264-1 §3, the progress guarantee (review round 3, R3-C): how many
@@ -315,6 +328,18 @@ pub struct Store {
     /// certificate), read by the forced-eviction escape hatch in
     /// [`Store::enforce_global_budget`].
     unsettled_passes: AtomicU32,
+    /// R5-B (round 6): where the per-scope loops START this pass — a
+    /// round-robin cursor over the pinned-ceiling and per-scope-budget
+    /// phases, advanced once per pass (wrapping). Without it, every pass
+    /// restarts at index 0, so a prefix of configured scopes whose
+    /// full-scope SUM scans consume the budget starves every later
+    /// over-limit scope on every pass, forever; with it, an over-limit
+    /// scope is first in line no later than `scopes` passes later. In
+    /// memory only, like [`Self::unsettled_passes`]: scope ORDER inside
+    /// a phase carries no semantic meaning (only phase order does —
+    /// ceilings before the global budget, C-1264-1), so restart/reopen
+    /// merely resumes the rotation from zero.
+    scope_rotation: AtomicUsize,
     /// Round-4 test hook: [`Store::maintain_until_settled`] reports
     /// "budget ran out before the index settled" without running
     /// statements, making the forced-eviction path deterministically
@@ -343,6 +368,12 @@ pub struct Store {
     test_wal_peak: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_merge_slices: std::sync::atomic::AtomicU64,
+    /// Round-6 test hook (R4-A/R5-B fixtures): pass-budget override in
+    /// whole milliseconds; 0 keeps [`RETENTION_PASS_BUDGET`]. Lets a
+    /// fixture prove a scope's SUM scan outlasts the budget without a
+    /// multi-gigabyte fixture. Absent in production builds.
+    #[cfg(test)]
+    test_pass_budget_ms: std::sync::atomic::AtomicU64,
     /// Dropped after `conn` (fields drop in declaration order, and rusqlite
     /// closes the connection, closing checkpoint included, synchronously in
     /// its `Drop`): in test builds it marks the close complete; zero-sized
@@ -409,6 +440,7 @@ impl Store {
             conn: Mutex::new(conn),
             retention: Mutex::new(()),
             unsettled_passes: AtomicU32::new(0),
+            scope_rotation: AtomicUsize::new(0),
             #[cfg(test)]
             test_never_settles: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -421,6 +453,8 @@ impl Store {
             test_wal_peak: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_merge_slices: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_pass_budget_ms: std::sync::atomic::AtomicU64::new(0),
             _after_close: after_close,
         })
     }
@@ -794,7 +828,26 @@ impl Store {
         while self.test_pause_pass.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let deadline = std::time::Instant::now() + RETENTION_PASS_BUDGET;
+        // Round-6 test hook (R4-A/R5-B fixtures): shrink the budget so a
+        // fixture's SUM scan provably outlasts it. Inert in production
+        // builds; 0 keeps the production budget.
+        #[cfg(test)]
+        let budget = {
+            let ms = self.test_pass_budget_ms.load(Ordering::Relaxed);
+            if ms == 0 {
+                RETENTION_PASS_BUDGET
+            } else {
+                std::time::Duration::from_millis(ms)
+            }
+        };
+        #[cfg(not(test))]
+        let budget = RETENTION_PASS_BUDGET;
+        let deadline = std::time::Instant::now() + budget;
+        // R5-B (round 6): advance the per-scope rotation once per pass.
+        // The loops below START at this index so a pass that budget-outs
+        // inside the first configured scopes does not starve the later
+        // ones on every subsequent pass.
+        let rotation = self.scope_rotation.fetch_add(1, Ordering::Relaxed);
 
         // 1. Age bound. One statement — the pass's first — and the
         //    deadline was computed the line above, so it cannot have
@@ -831,11 +884,18 @@ impl Store {
         //    R4-A: the deadline bounds this loop too. A scope whose cut
         //    was interrupted by budget-out keeps the rest of its
         //    overshoot until the next pass (the helper itself also stops
-        //    starting statements past the deadline).
-        for (kind, id) in &pinned.scopes {
+        //    starting statements past the deadline — including between
+        //    its SUM and its DELETE, round 6).
+        //
+        //    R5-B (round 6): the loop starts at `rotation`, wrapping — a
+        //    pass that budget-outs inside the first pinned scopes must
+        //    not starve the later pinned scopes' ceilings on every pass.
+        let pinned_list: Vec<&(i64, String)> = pinned.scopes.iter().collect();
+        for i in 0..pinned_list.len() {
             if std::time::Instant::now() >= deadline {
                 break;
             }
+            let (kind, id) = pinned_list[rotation.wrapping_add(i) % pinned_list.len()];
             let scope = Scope::from_columns(*kind, id.clone())?;
             let ceiling = Self::pinned_ceiling(policy, &scope);
             let evicted = evict_pinned_scope_to_ceiling(&guard, &scope, ceiling, deadline)?;
@@ -846,11 +906,16 @@ impl Store {
         // 3. Per-scope byte budgets. A pinned scope is governed by its
         //    ceiling in phase 2 instead, never by both. R4-A: same
         //    deadline rule — scopes not reached within the budget belong
-        //    to the next pass.
-        for limit in &policy.scope_limits {
+        //    to the next pass. R5-B (round 6): the loop starts at
+        //    `rotation`, wrapping, so an over-limit scope behind a
+        //    budget-hungry prefix of in-limit scopes is first in line no
+        //    later than `scope_limits.len()` passes later — round-5 code
+        //    restarted at index 0 every pass and could starve it forever.
+        for i in 0..policy.scope_limits.len() {
             if std::time::Instant::now() >= deadline {
                 break;
             }
+            let limit = &policy.scope_limits[rotation.wrapping_add(i) % policy.scope_limits.len()];
             let scope = Scope::parse(&limit.scope)?;
             if pinned.contains(&scope) {
                 continue;
@@ -928,9 +993,16 @@ impl Store {
     ) -> HistoryResult<()> {
         // 4a. Escape hatch first, with the pass's whole budget ahead of it:
         // three consecutive passes have already failed to settle this
-        // store while it sat over the cap (C-1264-1 §3).
-        if self.unsettled_passes.load(Ordering::Relaxed) as usize
-            >= UNSETTLED_PASSES_BEFORE_FORCED_EVICT
+        // store while it sat over the cap (C-1264-1 §3). R4-A (round 6):
+        // the deadline check comes FIRST in the conjunction — an earlier
+        // phase may already have exhausted the budget, and the escape
+        // hatch's live measure and whole-table COUNT(*) are statements
+        // that must not start past it; a forced eviction belongs to a
+        // pass that can still spend one, and the streak persists until
+        // such a pass arrives.
+        if std::time::Instant::now() < deadline
+            && self.unsettled_passes.load(Ordering::Relaxed) as usize
+                >= UNSETTLED_PASSES_BEFORE_FORCED_EVICT
             && live_db_bytes(conn)?.max(0) as u64 > policy.max_bytes
         {
             self.forced_evict_over_cap(conn, policy, exclude, deadline, outcome)?;
@@ -975,10 +1047,12 @@ impl Store {
                 // zero-row batches.
                 Some(m) => ((excess / m.max(1)) as usize + 1).min(RETAIN_EVICT_BATCH),
             };
-            let n = evict_oldest_batch(conn, excess, exclude, limit)?;
+            let n = evict_oldest_batch(conn, excess, exclude, limit, deadline)?;
             if n == 0 {
-                // No eligible durable row remains; nothing this pass can
-                // do brings the store under the cap.
+                // No eligible durable row remains — or the batch's own
+                // selection outlasted the budget (R4-A round 6) — either
+                // way no further statement of this pass can help; the
+                // final-state accounting below stays correct.
                 break;
             }
             outcome.evicted += n;
@@ -1008,7 +1082,11 @@ impl Store {
         // 4d. Account the pass ONCE, from its final state (R4-B): the only
         // writer of `unsettled_passes` in the pass. Budget-out with the
         // index still unsettled while over the cap increments; ending
-        // settled, or at/under the cap, resets.
+        // settled, or at/under the cap, resets. The three-pragma live
+        // measure here is the pass's SECOND deliberate post-deadline
+        // statement group (see [`RETENTION_PASS_BUDGET`]): the counter
+        // must read the final state or the R4-B accounting is wrong, and
+        // three pragma reads cannot hold the writer meaningfully.
         if !settled && live_db_bytes(conn)?.max(0) as u64 > policy.max_bytes {
             self.unsettled_passes.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1049,7 +1127,13 @@ impl Store {
     /// reports `skipped` and is not a no-op observation; a positive no-op
     /// followed by an expired budget does not run the negative probe and
     /// does not certify. No new statement starts once the deadline has
-    /// passed — one already in flight may overrun, by design.
+    /// passed — one already in flight may overrun, by design. Round 6
+    /// threads that rule BETWEEN the sub-calls, not just around them:
+    /// the vacuum probe and the cadence checkpoint never start behind an
+    /// overlong merge slice, and `merge_slice` itself leaves its trailing
+    /// checkpoint and structure re-read out when the merge statement was
+    /// the in-flight overrun (reporting "worked", conservatively, so a
+    /// cut-short slice can never be read as a no-op observation).
     ///
     /// Every merge statement is followed by `wal_checkpoint(TRUNCATE)`, so
     /// the WAL between statements holds about one slice
@@ -1075,16 +1159,24 @@ impl Store {
             }
             // Merge slice: positive rank — resume an in-progress merge or
             // merge a level with enough segments.
-            let worked = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE)?;
+            let worked = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, deadline)?;
+            // R4-A (round 6): the merge statement may have been the
+            // in-flight overrun; the vacuum probe and the cadence
+            // checkpoint are NEW statements and must not start behind
+            // it. Reporting is moot — this return is "not settled".
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
             let (vacuumed, vacuum_skipped) = self.vacuum_slice(conn, deadline)?;
-            Self::checkpoint_wal(conn)?;
-            if vacuum_skipped {
+            if vacuum_skipped || std::time::Instant::now() >= deadline {
                 // The vacuum stopped on the deadline: its page count is
                 // not the no-op the certificate needs (there may still be
                 // freelist pages to return), and no further statement may
-                // start (R4-A).
+                // start (R4-A) — including the cadence checkpoint below,
+                // which the pass's teardown checkpoint stands in for.
                 return Ok(false);
             }
+            Self::checkpoint_wal(conn)?;
             if worked || vacuumed > 0 {
                 continue;
             }
@@ -1098,12 +1190,18 @@ impl Store {
             if std::time::Instant::now() >= deadline {
                 return Ok(false);
             }
-            let flattened = self.merge_slice(conn, -FTS_MERGE_PAGES_PER_SLICE)?;
-            let (vacuumed_after, vacuum_skipped_after) = self.vacuum_slice(conn, deadline)?;
-            Self::checkpoint_wal(conn)?;
-            if vacuum_skipped_after {
+            let flattened = self.merge_slice(conn, -FTS_MERGE_PAGES_PER_SLICE, deadline)?;
+            // R4-A (round 6): same rule as the positive probe above —
+            // no vacuum probe, no cadence checkpoint behind an overlong
+            // negative merge.
+            if std::time::Instant::now() >= deadline {
                 return Ok(false);
             }
+            let (vacuumed_after, vacuum_skipped_after) = self.vacuum_slice(conn, deadline)?;
+            if vacuum_skipped_after || std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            Self::checkpoint_wal(conn)?;
             if flattened || vacuumed_after > 0 {
                 continue;
             }
@@ -1117,11 +1215,33 @@ impl Store {
     /// checkpoint. Returns whether the statement did work (the FTS
     /// structure record changed around it).
     ///
+    /// R4-A (round 6): every statement of the slice is deadline-checked
+    /// individually — the leading structure read, the merge itself, and
+    /// the trailing checkpoint/re-read. When the merge statement was the
+    /// pass's in-flight overrun, the trailing statements are SKIPPED and
+    /// the slice reports `true` (worked): an unread structure cannot
+    /// certify a no-op, and the caller's own post-slice deadline check
+    /// ends the pass. The un-checkpointed merge tail is bounded by the
+    /// pass's teardown checkpoint.
+    ///
     /// Test builds also count the slice and observe the WAL size around
     /// the statement/checkpoint pair (R4-C): the deterministic in-pass
     /// peak record that replaced the round-4 external poller.
-    fn merge_slice(&self, conn: &Connection, rank: i64) -> HistoryResult<bool> {
+    fn merge_slice(
+        &self,
+        conn: &Connection,
+        rank: i64,
+        deadline: std::time::Instant,
+    ) -> HistoryResult<bool> {
+        if std::time::Instant::now() >= deadline {
+            // Nothing ran: conservatively "worked", so no caller can
+            // read this as a no-op observation (R4-A round 6).
+            return Ok(true);
+        }
         let structure_before = Self::fts_structure(conn)?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(true);
+        }
         conn.execute(
             "INSERT INTO history_fts(history_fts, rank) VALUES('merge', ?1)",
             rusqlite::params![rank],
@@ -1130,6 +1250,12 @@ impl Store {
         {
             self.test_merge_slices.fetch_add(1, Ordering::Relaxed);
             self.observe_wal_for_tests();
+        }
+        if std::time::Instant::now() >= deadline {
+            // The merge statement above may have been the in-flight
+            // overrun; its checkpoint and structure re-read are new
+            // statements and must not start (R4-A round 6).
+            return Ok(true);
         }
         Self::checkpoint_wal(conn)?;
         #[cfg(test)]
@@ -1146,12 +1272,13 @@ impl Store {
     /// the merge slices and checkpoints still apply.
     ///
     /// Returns `(pages_returned, skipped)`. `skipped` is true ONLY when
-    /// the loop stopped because the deadline expired (R4-A): a
-    /// deadline-skipped vacuum is not the same observation as a genuine
-    /// no-op, and the settled certificate may complete only from
-    /// statements that actually ran. Stopping because `page_count` stopped
-    /// falling, or a non-incremental `auto_vacuum` mode, is a genuine
-    /// no-op (`skipped = false`).
+    /// the slice stopped because the deadline expired (R4-A) — including
+    /// the mode probe never running because the budget was already gone
+    /// on entry (round 6): a deadline-skipped vacuum is not the same
+    /// observation as a genuine no-op, and the settled certificate may
+    /// complete only from statements that actually ran. Stopping because
+    /// `page_count` stopped falling, or a non-incremental `auto_vacuum`
+    /// mode, is a genuine no-op (`skipped = false`).
     ///
     /// One page moves per statement on the bundled SQLite whatever the
     /// argument says (measured; see [`VACUUM_PAGES_PER_SLICE`]), so the
@@ -1170,6 +1297,12 @@ impl Store {
         conn: &Connection,
         deadline: std::time::Instant,
     ) -> HistoryResult<(i64, bool)> {
+        // R4-A (round 6): the mode probe is a statement too — an expired
+        // budget means the slice did not run and must not be read as a
+        // no-op.
+        if std::time::Instant::now() >= deadline {
+            return Ok((0, true));
+        }
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
         if auto_vacuum != 2 {
             return Ok((0, false));
@@ -1214,8 +1347,11 @@ impl Store {
     /// one bounded merge/vacuum slice and a truncating checkpoint, and it
     /// stops early the moment a remeasure fits the cap. R4-A: every
     /// statement group — delete, fold, remeasure — is deadline-checked
-    /// before it starts; at most the statement in flight when the budget
-    /// runs out overruns.
+    /// before it starts, and (round 6) between the fold's own sub-calls;
+    /// at most the statement in flight when the budget runs out
+    /// overruns. Entry itself is gated by the caller's 4a deadline
+    /// check, so the leading measure and whole-table COUNT never start
+    /// on an exhausted budget.
     ///
     /// OVER-DELETION IS BOUNDED BY THE ESTIMATE ERROR, no more: the
     /// average mixes cheap and expensive rows, and the tombstones this
@@ -1264,13 +1400,21 @@ impl Store {
             }
             // Fold what the batch's tombstones allow and keep the WAL
             // bounded; a settled fold would have taken the exact path
-            // instead of this one.
-            let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE)?;
-            let (_vacuumed, vacuum_skipped) = self.vacuum_slice(conn, deadline)?;
-            Self::checkpoint_wal(conn)?;
-            if vacuum_skipped {
+            // instead of this one. R4-A (round 6): the checks BETWEEN the
+            // fold's sub-calls mirror `maintain_until_settled` — the
+            // vacuum probe, the cadence checkpoint and the remeasure are
+            // all statements that must not start behind an overlong merge
+            // or an expired budget; the caller's teardown checkpoint
+            // bounds whatever WAL the skipped cadence left.
+            let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, deadline)?;
+            if std::time::Instant::now() >= deadline {
                 return Ok(());
             }
+            let (_vacuumed, vacuum_skipped) = self.vacuum_slice(conn, deadline)?;
+            if vacuum_skipped || std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            Self::checkpoint_wal(conn)?;
             if live_db_bytes(conn)?.max(0) as u64 <= policy.max_bytes {
                 return Ok(());
             }
@@ -1455,11 +1599,21 @@ fn live_db_bytes(conn: &Connection) -> HistoryResult<i64> {
 /// batch. Same oldest-first ordering as [`evict_pinned_scope_to_ceiling`];
 /// pinned scopes stay out of reach through the caller's `exclude`
 /// predicate. Returns rows evicted (0 = no eligible durable row exists).
+///
+/// R4-A (round 6): the deadline is checked BETWEEN the selection and the
+/// DELETE — a selection statement that consumed the remaining budget is
+/// never followed by the delete it selected for; the transaction is
+/// rolled back (teardown of the transaction begun in budget, not new
+/// work) and 0 is returned, which the caller treats as "this pass is
+/// done" while the pass's final-state accounting stays correct. The
+/// caller deadline-checks before the batch, so expiry can only strike
+/// mid-helper here.
 fn evict_oldest_batch(
     conn: &Connection,
     excess: u64,
     exclude: &str,
     limit: usize,
+    deadline: std::time::Instant,
 ) -> HistoryResult<u64> {
     let tx = conn.unchecked_transaction()?;
     // `running` is the cumulative estimate in oldest-first order; admitting
@@ -1482,6 +1636,14 @@ fn evict_oldest_batch(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     if ids.is_empty() {
+        tx.rollback()?;
+        return Ok(0);
+    }
+    // R4-A (round 6): the selection above may have been the in-flight
+    // overrun; the DELETE and COMMIT are NEW statements and must not
+    // start past the deadline. The rollback is teardown of the
+    // transaction this helper opened while in budget.
+    if std::time::Instant::now() >= deadline {
         tx.rollback()?;
         return Ok(0);
     }
@@ -1536,10 +1698,13 @@ fn evict_oldest_rows_by_count(
 /// window picks exactly the oldest rows whose bytes cover the excess, and the
 /// batch cap still bounds one statement.
 ///
-/// R4-A: the loop is deadline-checked before every SELECT/DELETE pair — no
-/// new statement starts once the pass's budget has expired (the one in
-/// flight may overrun, by design). A cut interrupted by budget-out leaves
-/// the rest of the overshoot to the next pass.
+/// R4-A: the loop is deadline-checked before every SELECT/DELETE pair AND
+/// between the SUM and its DELETE (round 6) — no new statement starts once
+/// the pass's budget has expired, so a SUM that consumed the remaining
+/// budget is never followed by the delete it computed the overshoot for
+/// (the one statement in flight may overrun, by design). A cut
+/// interrupted by budget-out leaves the rest of the overshoot to the
+/// next pass.
 fn evict_pinned_scope_to_ceiling(
     conn: &Connection,
     scope: &Scope,
@@ -1559,6 +1724,12 @@ fn evict_pinned_scope_to_ceiling(
         )?;
         let excess = (used as u64).saturating_sub(ceiling);
         if excess == 0 {
+            return Ok(evicted);
+        }
+        // R4-A (round 6): the SUM above may have been the in-flight
+        // overrun; its DELETE is a NEW statement and must not start past
+        // the deadline.
+        if std::time::Instant::now() >= deadline {
             return Ok(evicted);
         }
         let n = conn.execute(
@@ -1595,8 +1766,10 @@ fn evict_pinned_scope_to_ceiling(
 /// only — a replaceable row is current state and counts toward the measure
 /// without being evictable).
 ///
-/// R4-A: deadline-checked before every SELECT/DELETE pair, same rule as
-/// [`evict_pinned_scope_to_ceiling`] — a cut interrupted by budget-out
+/// R4-A: deadline-checked before every SELECT/DELETE pair AND between the
+/// SUM and its DELETE (round 6), same rule as
+/// [`evict_pinned_scope_to_ceiling`] — a SUM that consumed the budget is
+/// never followed by its DELETE, and a cut interrupted by budget-out
 /// leaves the rest to the next pass.
 fn evict_scope_to_budget(
     conn: &Connection,
@@ -1616,6 +1789,12 @@ fn evict_scope_to_budget(
             |r| r.get(0),
         )?;
         if used as u64 <= max_bytes {
+            return Ok(evicted);
+        }
+        // R4-A (round 6): the SUM above may have been the in-flight
+        // overrun; its DELETE is a NEW statement and must not start past
+        // the deadline.
+        if std::time::Instant::now() >= deadline {
             return Ok(evicted);
         }
         let n = conn.execute(
@@ -4255,6 +4434,235 @@ mod tests {
             "fixture database must dwarf the WAL bound (db={db_len}, bound={bound})"
         );
     }
+
+    /// Round-6 fixture helper: seed `rows` tiny durable rows into one
+    /// scope with direct SQL (one transaction, one prepared statement).
+    /// The R4-A/R5-B fixtures need six-figure row counts so a full-scope
+    /// SUM scan measurably outlasts a shrunken pass budget — far past
+    /// what the per-record insert path should absorb in a test. `tag`
+    /// keeps `msg_id` unique across calls.
+    fn seed_tiny_rows(store: &Store, scope: &Scope, rows: usize, payload_len: usize, tag: u64) {
+        let mut guard = lock_conn(&store.conn).unwrap();
+        let tx = guard.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                     direction, content_type, payload, payload_text, provenance) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'application/octet-stream', ?7, NULL, ?8)",
+                )
+                .unwrap();
+            for i in 0..rows as i64 {
+                let mut msg_id = [0_u8; 32];
+                msg_id[..8].copy_from_slice(&tag.to_le_bytes());
+                msg_id[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+                let mut payload = vec![b'f'; payload_len];
+                payload[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                stmt.execute(rusqlite::params![
+                    &msg_id[..],
+                    scope.kind(),
+                    scope.id(),
+                    1_000 + i,
+                    1_000 + i,
+                    Direction::Inbound.as_i64(),
+                    &payload[..],
+                    Provenance::LocalAppDecrypt.as_i64(),
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    /// The exact SUM the per-scope helpers run, for fixture math and
+    /// assertions.
+    fn scope_payload_bytes(store: &Store, scope: &Scope) -> u64 {
+        let guard = lock_conn(&store.conn).unwrap();
+        let used: i64 = guard
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(payload) \
+                   + LENGTH(COALESCE(signed_artifact, x''))), 0) \
+                 FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+                rusqlite::params![scope.kind(), scope.id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        used.max(0) as u64
+    }
+
+    fn scope_row_count(store: &Store, scope: &Scope) -> i64 {
+        let guard = lock_conn(&store.conn).unwrap();
+        guard
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+                rusqlite::params![scope.kind(), scope.id()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Time ONE warm full-scope SUM over `scope`, discarding the cold run
+    /// so the calibration matches the in-pass scans that follow it (the
+    /// fixture insert already touched every page; the discarded run
+    /// settles any remaining cache difference).
+    fn warm_scope_sum_ms(store: &Store, scope: &Scope) -> u64 {
+        let run = || scope_payload_bytes(store, scope);
+        let _cold = run();
+        let t = std::time::Instant::now();
+        let _warm = run();
+        t.elapsed().as_millis() as u64
+    }
+
+    /// R5-B (round 6): a pass that budget-outs inside the FIRST
+    /// configured scopes must not starve the later ones forever. The
+    /// fixture is the review's exact scenario — age eviction off, no
+    /// pins, database below its global cap — with an early in-limit
+    /// scope of so many rows that ONE full-scope SUM scan outlasts the
+    /// shrunken pass budget, and a later over-limit scope with evictable
+    /// durable rows. Round-5 code restarted every pass at index 0,
+    /// repeated the early scan until the budget was gone and never
+    /// reached the later scope; the rotating start must serve it within
+    /// a bounded number of passes.
+    #[test]
+    fn rotated_scope_starts_do_not_starve_later_over_limit_scopes() {
+        const ROW_BYTES: u64 = 512;
+        const EARLY_ROWS: usize = 120_000;
+        const LATE_ROWS: usize = 600;
+        let (store, _dir) = open();
+        let early = Scope::Group("early".into());
+        let late = Scope::Group("late".into());
+        seed_tiny_rows(&store, &early, EARLY_ROWS, ROW_BYTES as usize, 1);
+        seed_tiny_rows(&store, &late, LATE_ROWS, ROW_BYTES as usize, 2);
+        // Any limit strictly between 344×512 (what survives one bounded
+        // batch) and 600×512 makes the late scope unambiguously
+        // over-limit and one batch the whole fix.
+        let late_limit = ROW_BYTES * 450;
+        let late_bytes = scope_payload_bytes(&store, &late);
+        assert!(
+            late_bytes > late_limit,
+            "fixture: the late scope must start over its limit ({late_bytes} <= {late_limit})"
+        );
+        // Calibrate the early scan and shrink the budget to half of it:
+        // the scan provably outlasts the budget (2× margin, warm on both
+        // sides), while the ≥ 10 ms floor leaves the late scope's own
+        // SUM + one 256-row DELETE (single-digit milliseconds) well
+        // inside the pass that starts AT it.
+        let scan_ms = warm_scope_sum_ms(&store, &early);
+        assert!(
+            scan_ms >= 20,
+            "fixture: the early scope's SUM must take >= 20 ms (took {scan_ms} ms)"
+        );
+        store.shrink_pass_budget_for_tests(std::time::Duration::from_millis(scan_ms / 2));
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "group:early".into(),
+                    max_bytes: u64::MAX,
+                },
+                ScopeLimit {
+                    scope: "group:late".into(),
+                    max_bytes: late_limit,
+                },
+            ],
+        };
+
+        let mut served_pass = 0;
+        for pass in 1..=4 {
+            let _ = store.retain(&policy).unwrap();
+            if scope_payload_bytes(&store, &late) <= late_limit {
+                served_pass = pass;
+                break;
+            }
+        }
+        assert!(
+            served_pass > 0,
+            "the over-limit late scope must be served within a bounded \
+             number of passes (rotation reaches it first no later than \
+             pass 2; two full rotations allowed)"
+        );
+        assert!(
+            served_pass <= 2,
+            "rotation puts the late scope first in line on pass 2 at the \
+             latest (took {served_pass})"
+        );
+        assert_eq!(
+            scope_row_count(&store, &late),
+            (LATE_ROWS - RETAIN_EVICT_BATCH) as i64,
+            "the late scope is cut by exactly one bounded batch"
+        );
+        assert_eq!(
+            scope_row_count(&store, &early),
+            EARLY_ROWS as i64,
+            "the in-limit early scope never loses a row"
+        );
+    }
+
+    /// R4-A (round 6): in the per-scope helper, a SUM that consumes the
+    /// remaining budget must not be followed by its DELETE. One
+    /// over-limit scope whose full-scope SUM provably outlasts the
+    /// shrunken budget (calibrated warm, same as the rotation fixture):
+    /// the hooked pass must evict NOTHING — the DELETE is a new
+    /// statement and may not start past the deadline — and a later pass
+    /// with the production budget restored still cuts the scope to its
+    /// limit.
+    #[test]
+    fn a_scope_sum_that_exhausts_the_budget_is_not_followed_by_its_delete() {
+        const ROW_BYTES: u64 = 512;
+        const ROWS: usize = 120_000;
+        let (store, _dir) = open();
+        let scope = Scope::Group("overdue".into());
+        seed_tiny_rows(&store, &scope, ROWS, ROW_BYTES as usize, 3);
+        // Over limit by ~300 rows' worth of bytes: a restored-budget pass
+        // finishes the cut in exactly two bounded batches (the SUM's cost
+        // is row-count-driven, so the big row count keeps the scan slow
+        // while the byte overshoot stays small).
+        let limit = ROW_BYTES * (ROWS as u64 - 300);
+        let bytes = scope_payload_bytes(&store, &scope);
+        assert!(
+            bytes > limit,
+            "fixture: the scope must start over its limit ({bytes} <= {limit})"
+        );
+        let scan_ms = warm_scope_sum_ms(&store, &scope);
+        assert!(
+            scan_ms >= 20,
+            "fixture: the scope's SUM must take >= 20 ms (took {scan_ms} ms)"
+        );
+        store.shrink_pass_budget_for_tests(std::time::Duration::from_millis(scan_ms / 2));
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![ScopeLimit {
+                scope: "group:overdue".into(),
+                max_bytes: limit,
+            }],
+        };
+
+        let evicted = store.retain(&policy).unwrap();
+        assert_eq!(
+            evicted, 0,
+            "the SUM ran past the deadline; its DELETE must not start (R4-A)"
+        );
+        assert_eq!(
+            scope_row_count(&store, &scope),
+            ROWS as i64,
+            "no row may be deleted behind an expired budget"
+        );
+
+        // Production budget restored: the same pass shape cuts the scope
+        // back to its limit — batch 1 sheds 256 rows, the re-SUM still
+        // reads ~44 rows of overshoot, batch 2 sheds the crossing
+        // remainder (the count-driven helper takes whole batches).
+        store.shrink_pass_budget_for_tests(std::time::Duration::ZERO);
+        let evicted = store.retain(&policy).unwrap();
+        assert_eq!(
+            evicted,
+            2 * RETAIN_EVICT_BATCH as u64,
+            "with the budget restored the over-limit scope is cut by two bounded batches"
+        );
+        assert!(scope_payload_bytes(&store, &scope) <= limit);
+    }
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
@@ -4362,6 +4770,16 @@ impl Store {
     /// Round-4 fixtures: release a parked pass.
     pub(crate) fn unpause_pass_for_tests(&self) {
         self.test_pause_pass.store(false, Ordering::Relaxed);
+    }
+
+    /// Round-6 fixtures (R4-A/R5-B): shrink the pass budget so a scope's
+    /// full-scope SUM scan provably outlasts it — a `Duration::ZERO`
+    /// argument restores [`RETENTION_PASS_BUDGET`].
+    pub(crate) fn shrink_pass_budget_for_tests(&self, budget: std::time::Duration) {
+        self.test_pass_budget_ms.store(
+            budget.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Round-5 fixtures (R4-B): every pass reports "budget ran out while
