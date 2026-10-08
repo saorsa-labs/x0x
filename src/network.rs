@@ -2086,6 +2086,10 @@ enum NetworkShutdownOutcome {
 #[derive(Debug)]
 struct NetworkShutdownCoordinator {
     started: std::sync::atomic::AtomicBool,
+    /// Cancelled when teardown starts, before the node is taken. Outbound
+    /// dials select on it (see [`NetworkNode::dial_until_teardown`]), so no
+    /// handshake outlives the start of teardown (#1262).
+    teardown: tokio_util::sync::CancellationToken,
     outcome: tokio::sync::watch::Sender<NetworkShutdownOutcome>,
 }
 
@@ -2094,6 +2098,7 @@ impl NetworkShutdownCoordinator {
         let (outcome, _receiver) = tokio::sync::watch::channel(NetworkShutdownOutcome::Pending);
         Self {
             started: std::sync::atomic::AtomicBool::new(false),
+            teardown: tokio_util::sync::CancellationToken::new(),
             outcome,
         }
     }
@@ -2108,6 +2113,8 @@ impl NetworkShutdownCoordinator {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Abandon every in-flight dial before the teardown worker runs.
+            self.teardown.cancel();
             let completion = self.outcome.clone();
             tokio::spawn(async move {
                 // Keep custody independent of the initiating caller: dropping
@@ -2144,6 +2151,17 @@ impl NetworkShutdownCoordinator {
             }
         }
     }
+}
+
+/// The error a dial reports when network teardown abandons it (see
+/// [`NetworkNode::dial_until_teardown`]).
+fn dial_abandoned(origin: &'static str) -> NetworkError {
+    tracing::debug!(
+        target: "x0x::connect",
+        origin,
+        "dial abandoned: network teardown started"
+    );
+    NetworkError::ConnectionFailed("dial abandoned: network is shutting down".to_string())
 }
 
 /// #677 test-only seam: when armed for a node id, THAT node's accept loop
@@ -3297,7 +3315,9 @@ impl NetworkNode {
             "starting direct dial"
         );
         let start = std::time::Instant::now();
-        let result = node.connect_addr(addr).await;
+        let Some(result) = self.dial_until_teardown(node.connect_addr(addr)).await else {
+            return Err(dial_abandoned(origin));
+        };
         let dur_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -3381,9 +3401,10 @@ impl NetworkNode {
         self.dial_gated(&peer_id, "peer").await?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
-        let peer_conn = node
-            .connect_peer(peer_id)
+        let peer_conn = self
+            .dial_until_teardown(node.connect_peer(peer_id))
             .await
+            .ok_or_else(|| dial_abandoned("peer"))?
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
         // Issue #292 invariant C: a tombstone that landed mid-handshake
@@ -3483,7 +3504,12 @@ impl NetworkNode {
             .collect();
 
         let start = std::time::Instant::now();
-        let peer_conn_res = node.connect_peer_with_addrs(peer_id, addrs).await;
+        let Some(peer_conn_res) = self
+            .dial_until_teardown(node.connect_peer_with_addrs(peer_id, addrs))
+            .await
+        else {
+            return Err(dial_abandoned("peer_with_addrs"));
+        };
         let dur_ms = start.elapsed().as_millis() as u64;
 
         let peer_conn = match peer_conn_res {
@@ -4389,6 +4415,32 @@ impl NetworkNode {
             .shutdown_failure_for_test
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
+    }
+
+    /// Drive one outbound dial unless network teardown has started (#1262).
+    ///
+    /// A QUIC handshake in flight owns ant-quic connection state, and that
+    /// state owns the endpoint's original UDP socket. ant-quic's shutdown
+    /// closes the connections it has registered, but not a handshake that
+    /// is still being dialled. A dial that outlives the start of teardown
+    /// (a bootstrap dial to an offline seed, or a reconnect to a peer that
+    /// already stopped) therefore keeps the bound port open past the
+    /// socket-release deadline, and shutdown fails with
+    /// `weak_socket_owner_still_live`. Dropping the dial future drops the
+    /// handshake, which closes it; it then drains inside ant-quic's bounded
+    /// idle wait.
+    ///
+    /// Returns `None` when teardown starts first. The caller reports a
+    /// [`NetworkError::ConnectionFailed`] from [`dial_abandoned`] and records
+    /// nothing about the peer: an abandoned dial is not evidence that the
+    /// peer is unreachable.
+    async fn dial_until_teardown<F: std::future::Future>(&self, dial: F) -> Option<F::Output> {
+        let teardown = &self.shutdown_state.teardown;
+        tokio::select! {
+            biased;
+            () = teardown.cancelled() => None,
+            output = dial => Some(output),
+        }
     }
 
     /// Get a clone of the inner node, returning an error if not initialized.
