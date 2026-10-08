@@ -1114,17 +1114,22 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
 /// and costs a harmless idempotent rescan of a row `insert_row` already
 /// projected.
 fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
+    let setup_err = |e: rusqlite::Error| HistoryError::Database(format!("index setup failed: {e}"));
+    // One transaction: a projection recreated empty and the cursor reset it
+    // needs commit together, so an interrupted open cannot keep the new
+    // empty table with a stale completed cursor.
+    let tx = conn.unchecked_transaction().map_err(setup_err)?;
     // A projection table created empty below (lost, dropped, or new) must be
     // rebuilt from the bottom, whatever a surviving cursor says.
-    let projection_existed: bool = conn
+    let projection_existed: bool = tx
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_master \
              WHERE type = 'table' AND name = 'history_canonical_ids')",
             [],
             |row| row.get(0),
         )
-        .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
-    conn.execute_batch(
+        .map_err(setup_err)?;
+    tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_logical_request \
          ON history(ingress_sender_agent, logical_request_id) \
          WHERE logical_request_id IS NOT NULL; \
@@ -1153,15 +1158,15 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
            WHERE singleton = 1; \
          END;",
     )
-    .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
+    .map_err(setup_err)?;
     if !projection_existed {
-        conn.execute(
+        tx.execute(
             "UPDATE history_backfill_progress SET scanned_to_id = 0 WHERE singleton = 1",
             [],
         )
-        .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
+        .map_err(setup_err)?;
     }
-    Ok(())
+    tx.commit().map_err(setup_err)
 }
 
 /// Populate the rebuildable canonical projection for rows written by an older
