@@ -26,9 +26,9 @@ async fn state_with_unsaved_group() -> Result<(Arc<AppState>, tempfile::TempDir,
     Ok((state, dir, group_key))
 }
 
-async fn wait_reached() -> bool {
+async fn wait_reached(pause: &atomic_write_test_seam::WritePause) -> bool {
     let deadline = tokio::time::Instant::now() + WAIT;
-    while !atomic_write_test_seam::reached() {
+    while !pause.reached() {
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
@@ -66,13 +66,16 @@ fn persisted_has(path: &FsPath, group_key: &str) -> bool {
 async fn issue1269_drain_never_aborts_a_shielded_apply_mid_write() -> Result<()> {
     let (state, _dir, group_key) = state_with_unsaved_group().await?;
     let path = state.named_groups_path.clone();
-    atomic_write_test_seam::arm(&path);
+    let pause = atomic_write_test_seam::arm(&path);
     let (saved_tx, saved_rx) = tokio::sync::oneshot::channel();
     let apply_state = Arc::clone(&state);
     assert!(state.spawn_shielded(async move {
         let _ = saved_tx.send(save_named_groups(&apply_state).await);
     }));
-    assert!(wait_reached().await, "the write parks before its rename");
+    assert!(
+        wait_reached(&pause).await,
+        "the write parks before its rename"
+    );
 
     let drain_state = Arc::clone(&state);
     let drain = tokio::spawn(async move {
@@ -85,7 +88,7 @@ async fn issue1269_drain_never_aborts_a_shielded_apply_mid_write() -> Result<()>
         "the drain must wait for a shielded apply, not abort it"
     );
     assert!(!persisted_has(&path, &group_key), "still parked");
-    atomic_write_test_seam::release();
+    pause.release();
     tokio::time::timeout(WAIT, drain).await??;
 
     assert!(saved_rx.await?, "the parked write completes durably");
@@ -115,12 +118,15 @@ async fn issue1269_drain_never_aborts_a_shielded_apply_mid_write() -> Result<()>
 async fn issue1269_drain_aborts_a_detached_task_mid_write() -> Result<()> {
     let (state, _dir, group_key) = state_with_unsaved_group().await?;
     let path = state.named_groups_path.clone();
-    atomic_write_test_seam::arm(&path);
+    let pause = atomic_write_test_seam::arm(&path);
     let apply_state = Arc::clone(&state);
     assert!(state.spawn_detached(async move {
         let _ = save_named_groups(&apply_state).await;
     }));
-    assert!(wait_reached().await, "the write parks before its rename");
+    assert!(
+        wait_reached(&pause).await,
+        "the write parks before its rename"
+    );
 
     let started = tokio::time::Instant::now();
     tokio::time::timeout(WAIT, crate::server::drain_server_tasks(&state, Vec::new())).await?;
@@ -128,7 +134,7 @@ async fn issue1269_drain_aborts_a_detached_task_mid_write() -> Result<()> {
         started.elapsed() >= Duration::from_secs(2),
         "the drain gives the grace first"
     );
-    atomic_write_test_seam::release();
+    pause.release();
     assert!(
         !persisted_has(&path, &group_key),
         "the aborted write never reached its rename"
@@ -204,6 +210,63 @@ async fn issue1269_welcome_fetch_ends_when_shutdown_starts() -> Result<()> {
     )
     .await;
     assert_eq!(late, Err(WELCOME_FETCH_SHUTDOWN.to_string()));
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    Ok(())
+}
+
+/// r3: the Welcome request send itself can wait about 24 s on a missing
+/// receipt. A send that is in progress when shutdown starts must end at
+/// once too, with the same cleanup, and without being awaited further.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue1269_welcome_fetch_send_ends_when_shutdown_starts() -> Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let welcome_id = welcome_id_for_bytes(b"Welcome whose request never returns");
+    let welcome_ref = WelcomeRef {
+        welcome_id: welcome_id.clone(),
+        byte_len: 35,
+        source: hex::encode(owner.agent.agent_id().as_bytes()),
+    };
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let started_tx = std::sync::Mutex::new(Some(started_tx));
+    let fetch_state = Arc::clone(&joiner);
+    let fetch = tokio::spawn(async move {
+        fetch_treekem_welcome_via_schedule(
+            &fetch_state,
+            &"ef".repeat(32),
+            &welcome_ref,
+            move |_, _| {
+                // The injected sender signals that it is sending, then
+                // blocks like a send whose receipt never arrives.
+                if let Some(tx) = started_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<std::result::Result<(), WelcomeFetchSendError>>()
+            },
+            &[Duration::ZERO, Duration::from_secs(30)],
+            WELCOME_FETCH_TIMEOUT,
+        )
+        .await
+    });
+    tokio::time::timeout(WAIT, started_rx).await??;
+    assert!(
+        joiner
+            .pending_welcome_waiters
+            .read()
+            .await
+            .contains_key(&welcome_id),
+        "the fetch is registered while its request is in flight"
+    );
+    let started = tokio::time::Instant::now();
+    joiner.shutdown_started.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), fetch).await??;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(result, Err(WELCOME_FETCH_SHUTDOWN.to_string()));
+    assert!(joiner.pending_welcome_waiters.read().await.is_empty());
     assert!(joiner.pending_welcome_receives.read().await.is_empty());
     Ok(())
 }

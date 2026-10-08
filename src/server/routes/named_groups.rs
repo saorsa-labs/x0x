@@ -33837,45 +33837,58 @@ pub(in crate::server) enum AtomicWriteOutcome {
 /// #1269 r2: test-only seam that parks one atomic named-groups write for a
 /// given destination after its temp file is synced and before the rename
 /// (a slow write), so a test can stop the daemon in the middle of it.
+///
+/// r3: every pause is keyed by its destination path and owns its own
+/// reached/released state, so tests that run in parallel in one process
+/// (each with its own temp dir) cannot reset or release each other's pause.
 #[cfg(test)]
 pub(in crate::server) mod atomic_write_test_seam {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    static ARMED: Mutex<Option<PathBuf>> = Mutex::new(None);
-    static REACHED: AtomicBool = AtomicBool::new(false);
-    static RELEASED: AtomicBool = AtomicBool::new(false);
+    /// One armed pause; the test keeps it to observe and release the write.
+    #[derive(Default)]
+    pub(in crate::server) struct WritePause {
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl WritePause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::server) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<PathBuf, Arc<WritePause>>>> = Mutex::new(None);
 
     /// Park the next write whose destination is `path` (one-shot).
-    pub(in crate::server) fn arm(path: &Path) {
-        REACHED.store(false, Ordering::SeqCst);
-        RELEASED.store(false, Ordering::SeqCst);
-        *ARMED
+    pub(in crate::server) fn arm(path: &Path) -> Arc<WritePause> {
+        let pause = Arc::new(WritePause::default());
+        ARMED
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
-    }
-
-    pub(in crate::server) fn reached() -> bool {
-        REACHED.load(Ordering::SeqCst)
-    }
-
-    pub(in crate::server) fn release() {
-        RELEASED.store(true, Ordering::SeqCst);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), Arc::clone(&pause));
+        pause
     }
 
     pub(super) async fn park(path: &Path) {
-        {
-            let mut armed = ARMED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if armed.as_deref() != Some(path) {
-                return;
-            }
-            *armed = None;
-        }
-        REACHED.store(true, Ordering::SeqCst);
-        while !RELEASED.load(Ordering::SeqCst) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(path));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
@@ -38530,7 +38543,17 @@ where
                 group_id: group_id.to_string(),
                 welcome_id: welcome_ref.welcome_id.clone(),
             };
-            match send(source, request).await {
+            // #1269 r3: the request send itself can wait about 24 s on a
+            // missing receipt (attempt, backoff, attempt). Shutdown ends it
+            // like a lost peer, as it ends the waits below and above.
+            let sent = tokio::select! {
+                sent = send(source, request) => sent,
+                () = state.shutdown_started.cancelled() => {
+                    cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                    return Err(WELCOME_FETCH_SHUTDOWN.to_string());
+                }
+            };
+            match sent {
                 Ok(()) => {}
                 Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
                     tracing::warn!(

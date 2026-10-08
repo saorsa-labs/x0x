@@ -1058,7 +1058,7 @@ fn spawn_blob_apply(
         let _permit = permit;
         let _lease = lease;
         #[cfg(test)]
-        blob_apply_test_seam::park().await;
+        blob_apply_test_seam::park(&reference.digest).await;
         if let Err(reason) = apply_fetched_blob(&task_state, &reference, source, bytes).await {
             tracing::warn!(kind = ?reference.kind, byte_len = reference.byte_len, reason, "control blob apply failed");
         }
@@ -1071,44 +1071,66 @@ fn spawn_blob_apply(
 
 /// #1269 r2: test-only seam that parks a shielded blob apply at its start,
 /// so a test can stop the daemon while the apply is in progress.
+///
+/// r3: each pause is keyed by the blob digest and owns its own state, so
+/// other tests that apply blobs in the same process cannot consume, reset
+/// or release it.
 #[cfg(test)]
 pub(super) mod blob_apply_test_seam {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    static REACHED: AtomicBool = AtomicBool::new(false);
-    static RELEASED: AtomicBool = AtomicBool::new(false);
-    static FINISHED: AtomicBool = AtomicBool::new(false);
-
-    pub(in crate::server) fn arm() {
-        REACHED.store(false, Ordering::SeqCst);
-        RELEASED.store(false, Ordering::SeqCst);
-        FINISHED.store(false, Ordering::SeqCst);
-        ARMED.store(true, Ordering::SeqCst);
+    /// One armed pause; the test keeps it to observe and release the apply.
+    #[derive(Default)]
+    pub(in crate::server) struct ApplyPause {
+        reached: AtomicBool,
+        released: AtomicBool,
+        finished: AtomicBool,
     }
 
-    pub(in crate::server) fn reached() -> bool {
-        REACHED.load(Ordering::SeqCst)
-    }
-
-    pub(in crate::server) fn release() {
-        RELEASED.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether a parked apply resumed after its release.
-    pub(in crate::server) fn finished() -> bool {
-        FINISHED.load(Ordering::SeqCst)
-    }
-
-    pub(super) async fn park() {
-        if !ARMED.swap(false, Ordering::SeqCst) {
-            return;
+    impl ApplyPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
         }
-        REACHED.store(true, Ordering::SeqCst);
-        while !RELEASED.load(Ordering::SeqCst) {
+
+        pub(in crate::server) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+
+        /// Whether the parked apply resumed after its release.
+        pub(in crate::server) fn finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<ApplyPause>>>> = Mutex::new(None);
+
+    /// Park the next apply of the blob with this digest (one-shot).
+    pub(in crate::server) fn arm(digest: &str) -> Arc<ApplyPause> {
+        let pause = Arc::new(ApplyPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(digest.to_string(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(super) async fn park(digest: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(digest));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        FINISHED.store(true, Ordering::SeqCst);
+        pause.finished.store(true, Ordering::SeqCst);
     }
 }
 
@@ -2124,7 +2146,7 @@ mod tests {
                 .expect("fetch slot")
         };
 
-        blob_apply_test_seam::arm();
+        let pause = blob_apply_test_seam::arm(&reference.digest);
         let lease = store.reserve_incoming(&reference).expect("lease");
         assert!(spawn_blob_apply(
             &state,
@@ -2135,13 +2157,10 @@ mod tests {
             lease
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while !blob_apply_test_seam::reached() && tokio::time::Instant::now() < deadline {
+        while !pause.reached() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(
-            blob_apply_test_seam::reached(),
-            "the apply parks at its start"
-        );
+        assert!(pause.reached(), "the apply parks at its start");
 
         let drain_state = Arc::clone(&state);
         let drain = tokio::spawn(async move {
@@ -2157,12 +2176,9 @@ mod tests {
             reference.byte_len,
             "the apply in progress still holds its lease"
         );
-        blob_apply_test_seam::release();
+        pause.release();
         tokio::time::timeout(Duration::from_secs(15), drain).await??;
-        assert!(
-            blob_apply_test_seam::finished(),
-            "the apply resumed and ended"
-        );
+        assert!(pause.finished(), "the apply resumed and ended");
         assert_eq!(store.incoming_bytes_held(), 0);
 
         // A blob fetched after shutdown began is never applied.
