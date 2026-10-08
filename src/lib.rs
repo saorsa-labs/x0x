@@ -7064,7 +7064,7 @@ impl Agent {
     /// teardown. Returns without spawning once the registry is `closed` (i.e.
     /// `shutdown()` has begun) — this is what closes the join_network race:
     /// a listener requested after shutdown started must never run.
-    fn spawn_tracked<F>(&self, fut: F)
+    pub(crate) fn spawn_tracked<F>(&self, fut: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -7078,6 +7078,12 @@ impl Agent {
             return;
         }
         guard.handles.push(tokio::spawn(fut));
+    }
+
+    /// The token `begin_shutdown`/`shutdown` cancel first. Crate tasks that
+    /// hold resources across awaits select on it so they stop promptly.
+    pub(crate) fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
     }
 
     /// Begin shutdown WITHOUT tearing anything down yet: cancel the shutdown
@@ -21952,6 +21958,37 @@ impl KvStoreHandle {
     #[cfg(test)]
     pub(crate) async fn wait_receive_merged_for_test(&self) {
         self.sync.wait_receive_merged_for_test().await;
+    }
+
+    /// Ask the group once for current state after this store's group key
+    /// re-armed (#1266). See `KvStoreSync::request_state_repair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when a
+    /// publish fails. Otherwise returns the number of requests published.
+    pub(crate) async fn request_state_repair(&self) -> error::Result<u8> {
+        self.sync
+            .request_state_repair()
+            .await
+            .map_err(|error| kv_storage_err(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.sync.wait_receive_rejected_for_test().await;
+    }
+
+    /// Stop only the bootstrap requester, as a converged requester would.
+    #[cfg(test)]
+    pub(crate) fn silence_bootstrap_for_test(&self) {
+        self.sync.silence_bootstrap();
+    }
+
+    /// A weak reference to this handle's sync, to prove its release.
+    #[cfg(test)]
+    pub(crate) fn sync_weak_for_test(&self) -> std::sync::Weak<kv::KvStoreSync> {
+        std::sync::Arc::downgrade(&self.sync)
     }
 
     #[cfg(test)]
