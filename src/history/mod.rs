@@ -349,24 +349,40 @@ mod tests {
         // The builder's blocking closure: open WITHOUT starting tasks.
         let opened_cfg = config.clone();
         let opened_dir = dir.path().to_path_buf();
-        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 0 = running, 1 = the closure's open succeeded, 2 = it failed.
+        let finished = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let finished_in_closure = Arc::clone(&finished);
         let join = tokio::task::spawn_blocking(move || {
             let opened = HistoryService::open(&opened_cfg, &opened_dir);
             // Signals the test the closure is done; the task harness then
             // drops the returned (unclaimed, un-started) value.
-            finished_in_closure.store(true, std::sync::atomic::Ordering::Release);
+            let outcome = if opened.is_ok() { 1 } else { 2 };
+            finished_in_closure.store(outcome, std::sync::atomic::Ordering::Release);
             opened
         });
         // The cancelled build: nobody awaits the open.
         drop(join);
 
-        // Wait for the closure to finish, then for the runtime to drop its
-        // unclaimed output, and prove the lock came back: a fresh open must
-        // succeed. Under the round-2 shape (tasks started inside the
-        // closure) the reaper would hold the store forever and every probe
-        // would fail until the deadline.
+        // Wait until the closure has really opened the store, so the probe
+        // below cannot win the lock before the cancelled open takes it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while finished.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled boot open never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            finished.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the cancelled boot open itself must succeed"
+        );
+
+        // Then wait for the runtime to drop its unclaimed output, and prove
+        // the lock came back: a fresh open must succeed. Under the round-2
+        // shape (tasks started inside the closure) the reaper would hold the
+        // store forever and every probe would fail until the deadline.
         loop {
             if HistoryService::open(&config, dir.path()).is_ok() {
                 break;
@@ -378,9 +394,5 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        assert!(
-            finished.load(std::sync::atomic::Ordering::Acquire),
-            "the probe must not pass before the cancelled closure finished"
-        );
     }
 }

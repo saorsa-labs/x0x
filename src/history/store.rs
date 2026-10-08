@@ -1114,6 +1114,16 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
 /// and costs a harmless idempotent rescan of a row `insert_row` already
 /// projected.
 fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
+    // A projection table created empty below (lost, dropped, or new) must be
+    // rebuilt from the bottom, whatever a surviving cursor says.
+    let projection_existed: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'history_canonical_ids')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_logical_request \
          ON history(ingress_sender_agent, logical_request_id) \
@@ -1144,6 +1154,13 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
          END;",
     )
     .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
+    if !projection_existed {
+        conn.execute(
+            "UPDATE history_backfill_progress SET scanned_to_id = 0 WHERE singleton = 1",
+            [],
+        )
+        .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
+    }
     Ok(())
 }
 
@@ -2290,6 +2307,47 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(stored_schema_version(&store), 4);
+    }
+
+    /// Review round 3 (projection loss): a completed cursor must not survive
+    /// the loss of the projection it describes. If `history_canonical_ids`
+    /// is dropped while `history_backfill_progress` remains, the next open
+    /// recreates the projection empty and must rebuild it from the bottom.
+    #[test]
+    fn lost_projection_table_is_rebuilt_despite_a_completed_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let (record, canonical) = group_record("lost-projection", "kept body", 1);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.insert(&record).unwrap(), InsertOutcome::Inserted);
+        }
+        // Complete a pass so the cursor sits at the table maximum.
+        drop(Store::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE history_canonical_ids;")
+                .unwrap();
+            let cursor: i64 = conn
+                .query_row(
+                    "SELECT scanned_to_id FROM history_backfill_progress WHERE singleton = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(cursor >= 1, "the cursor survives the projection loss");
+        }
+        backfill_probe::reset();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            backfill_probe::read(),
+            1,
+            "the recreated projection is rebuilt from the bottom"
+        );
+        assert!(store
+            .get_by_canonical_group_msg_id(canonical, "lost-projection")
+            .unwrap()
+            .is_some());
     }
 
     /// Review round 2 (cursor bypass): `history.id` is `INTEGER PRIMARY KEY`
