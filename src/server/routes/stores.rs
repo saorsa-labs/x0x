@@ -1514,7 +1514,14 @@ fn refresh_gss_store_binding(
 /// change takes effect on the very next record. Only an ineligible binding
 /// retires the handle; a pending key for the current epoch does not (#1266).
 /// The first refresh that finds the key installed again after a pending
-/// one sends one state request, so records dropped in the gap come back.
+/// one starts one bounded state repair, so records dropped in the gap come
+/// back.
+///
+/// The hook holds the daemon state only weakly: the store's sync owns this
+/// closure, and the daemon state owns the store, so a strong capture would
+/// keep the state (and the Agent and its history database) alive after
+/// shutdown. Once the state is gone the context is invalidated (fail
+/// closed).
 pub(in crate::server) fn gss_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::GssKvSecureContext>,
@@ -1522,70 +1529,93 @@ pub(in crate::server) fn gss_kv_refresh(
     topic: String,
     creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
-    let state = Arc::clone(state);
-    // Set by a KeyPending refresh; taken by the next Current one.
+    let state = Arc::downgrade(state);
+    // Set by a KeyPending refresh; taken by the next Current one. Both are
+    // decided under the named-groups read guard, and a share installs under
+    // its write guard, so a stale KeyPending refresh cannot set the latch
+    // again after the Current refresh that took it.
     let key_gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
-        let state = Arc::clone(&state);
+        let state = state.clone();
         let group_key = group_key.clone();
         let topic = topic.clone();
         let key_gap = Arc::clone(&key_gap);
         Box::pin(async move {
-            let outcome = {
+            let Some(state) = state.upgrade() else {
+                ctx.invalidate();
+                return;
+            };
+            let (outcome, start_repair) = {
                 let groups = state.named_groups.read().await;
-                refresh_gss_store_binding(
+                let outcome = refresh_gss_store_binding(
                     &ctx,
                     groups.get(&group_key),
                     creator,
                     &state.agent.agent_id(),
-                )
+                );
+                #[cfg(test)]
+                key_gap_test_seam::pause_point(&topic, outcome).await;
+                let start_repair = match outcome {
+                    GssBindingRefresh::Current => {
+                        key_gap.swap(false, std::sync::atomic::Ordering::AcqRel)
+                    }
+                    GssBindingRefresh::KeyPending => {
+                        key_gap.store(true, std::sync::atomic::Ordering::Release);
+                        false
+                    }
+                    GssBindingRefresh::Ineligible => false,
+                };
+                (outcome, start_repair)
             };
-            match outcome {
-                GssBindingRefresh::Current => {
-                    if key_gap.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                        spawn_gss_key_gap_repair(&state, topic);
-                    }
-                }
-                GssBindingRefresh::KeyPending => {
-                    key_gap.store(true, std::sync::atomic::Ordering::Release);
-                }
-                GssBindingRefresh::Ineligible => {
-                    tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
-                    let mut stores = state.kv_stores.write().await;
-                    if let Some(h) = stores.get(&topic).cloned() {
-                        h.retire();
-                        stores.remove(&topic);
-                    }
+            if start_repair {
+                spawn_gss_key_gap_repair(&state, topic);
+            } else if outcome == GssBindingRefresh::Ineligible {
+                tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
+                let mut stores = state.kv_stores.write().await;
+                if let Some(h) = stores.get(&topic).cloned() {
+                    h.retire();
+                    stores.remove(&topic);
                 }
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
 }
 
-/// Upper bound for one key-gap repair request, including the wait for the
-/// GSS publication gate (#1266).
-const GSS_KEY_GAP_REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound for one whole key-gap repair (#1266): the store lookup, the
+/// first request, the wait out of the holders' response cooldown and the
+/// single retry, including waits for the GSS publication gate.
+const GSS_KEY_GAP_REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// #1266: after a key gap, ask the group once for this store's current
-/// state. Detached, because the refresh hook runs inside receive and seal
-/// sections; the task takes no lock while it waits.
+/// #1266: after a key gap, ask the group for this store's current state.
+///
+/// The repair runs as a tracked Agent task, because the refresh hook runs
+/// inside receive and seal sections: it is refused once shutdown has begun,
+/// every wait ends when the Agent's shutdown token is cancelled, and Agent
+/// shutdown joins it before the daemon releases its instance locks. It holds
+/// the daemon state only weakly and only for the store lookup.
 fn spawn_gss_key_gap_repair(state: &Arc<AppState>, topic: String) {
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        let handle = state.kv_stores.read().await.get(&topic).cloned();
-        let Some(handle) = handle else {
-            return;
+    #[cfg(test)]
+    key_gap_test_seam::record_repair(&topic);
+    let weak = Arc::downgrade(state);
+    let shutdown = state.agent.shutdown_token();
+    state.agent.spawn_tracked(async move {
+        let outcome = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            outcome = tokio::time::timeout(
+                GSS_KEY_GAP_REPAIR_DEADLINE,
+                run_gss_key_gap_repair(weak, &topic),
+            ) => outcome,
         };
-        match tokio::time::timeout(GSS_KEY_GAP_REPAIR_DEADLINE, handle.request_state_repair()).await
-        {
-            Ok(Ok(true)) => tracing::info!(
-                target: "x0x::kv",
-                "encrypted store {topic}: group key re-armed after a gap; requested current state once"
-            ),
-            Ok(Ok(false)) => tracing::debug!(
+        match outcome {
+            Ok(Ok(0)) => tracing::debug!(
                 target: "x0x::kv",
                 "encrypted store {topic}: key-gap state request not sent"
+            ),
+            Ok(Ok(requests)) => tracing::info!(
+                target: "x0x::kv",
+                "encrypted store {topic}: group key re-armed after a gap; sent {requests} state request(s)"
             ),
             Ok(Err(error)) => tracing::warn!(
                 target: "x0x::kv",
@@ -1593,10 +1623,94 @@ fn spawn_gss_key_gap_repair(state: &Arc<AppState>, topic: String) {
             ),
             Err(_) => tracing::warn!(
                 target: "x0x::kv",
-                "encrypted store {topic}: key-gap state request timed out"
+                "encrypted store {topic}: key-gap state repair timed out"
             ),
         }
     });
+}
+
+async fn run_gss_key_gap_repair(
+    state: std::sync::Weak<AppState>,
+    topic: &str,
+) -> x0x::error::Result<u8> {
+    let handle = {
+        let Some(state) = state.upgrade() else {
+            return Ok(0);
+        };
+        let handle = state.kv_stores.read().await.get(topic).cloned();
+        handle
+    };
+    match handle {
+        Some(handle) => handle.request_state_repair().await,
+        None => Ok(0),
+    }
+}
+
+/// #1266 test seam, keyed by store topic so parallel tests in one process
+/// cannot interfere: a one-shot pause between a refresh's `KeyPending`
+/// observation and its latch decision, and a count of started repairs.
+#[cfg(test)]
+pub(in crate::server) mod key_gap_test_seam {
+    use super::GssBindingRefresh;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Default)]
+    pub(in crate::server) struct Pause {
+        pub(in crate::server) reached: tokio::sync::Notify,
+        pub(in crate::server) release: tokio::sync::Notify,
+    }
+
+    fn pauses() -> &'static Mutex<HashMap<String, Arc<Pause>>> {
+        static PAUSES: OnceLock<Mutex<HashMap<String, Arc<Pause>>>> = OnceLock::new();
+        PAUSES.get_or_init(Default::default)
+    }
+
+    fn repairs_started() -> &'static Mutex<HashMap<String, usize>> {
+        static REPAIRS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        REPAIRS.get_or_init(Default::default)
+    }
+
+    /// Pause the next `KeyPending` refresh of `topic` once.
+    pub(in crate::server) fn arm(topic: &str) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(topic.to_string(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(super) async fn pause_point(topic: &str, outcome: GssBindingRefresh) {
+        if outcome != GssBindingRefresh::KeyPending {
+            return;
+        }
+        let pause = pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(topic);
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    pub(super) fn record_repair(topic: &str) {
+        *repairs_started()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(topic.to_string())
+            .or_default() += 1;
+    }
+
+    pub(in crate::server) fn repairs(topic: &str) -> usize {
+        repairs_started()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(topic)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 /// Retire EVERY encrypted store handle bound to `stable_group_id` (topic

@@ -362,3 +362,460 @@ async fn issue1266_record_dropped_in_rekey_gap_is_repaired_once() -> Result<()> 
     alice.cancel_sync();
     Ok(())
 }
+
+/// Alice's replica of the survivor's store: a second encrypted sync on the
+/// survivor's own pub/sub (loopback node, no peers), signed by the F1 admin,
+/// with its own GSS context. Its bootstrap requester is silenced.
+struct AliceReplica {
+    sync: x0x::kv::KvStoreSync,
+    ctx: Arc<x0x::groups::GssKvSecureContext>,
+    peer: saorsa_gossip_types::PeerId,
+}
+
+impl AliceReplica {
+    async fn start(
+        state: &Arc<AppState>,
+        group_id: &str,
+        admin_kp: &crate::identity::AgentKeypair,
+        topic: &str,
+    ) -> Result<Self> {
+        let current = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .cloned()
+            .context("group for Alice")?;
+        let stable = current.stable_group_id().to_string();
+        let (store_id, alice_topic) = x0x::kv::encrypted::group_store_identity(&stable, "ws");
+        assert_eq!(alice_topic, topic);
+        let ctx = Arc::new(
+            x0x::groups::GssKvSecureContext::from_group(&current).context("alice context")?,
+        );
+        let store = x0x::kv::KvStore::new_encrypted(
+            store_id,
+            "ws".to_string(),
+            admin_kp.agent_id(),
+            stable.as_bytes().to_vec(),
+            Arc::clone(&ctx) as Arc<dyn x0x::kv::encrypted::KvSecureContext>,
+        )?;
+        let peer = saorsa_gossip_types::PeerId::new([0xA1; 32]);
+        let mut sync = x0x::kv::KvStoreSync::new(
+            store,
+            state.agent.pubsub().context("survivor pubsub")?,
+            topic.to_string(),
+            peer,
+            Some(admin_kp.agent_id()),
+        )?;
+        sync.set_secure_context(
+            Arc::clone(&ctx) as Arc<dyn x0x::kv::encrypted::KvSecureContext>,
+            None,
+        );
+        sync.set_author_signing(x0x::kv::encrypted::AuthorSigning::from_keypair(admin_kp)?);
+        sync.silence_bootstrap();
+        sync.start().await?;
+        Ok(Self { sync, ctx, peer })
+    }
+
+    /// Move Alice to the rotated epoch: the survivor's post-removal view
+    /// plus the rotated secret.
+    async fn rotate(&self, state: &Arc<AppState>, group_id: &str, secret: &[u8; 32]) -> Result<()> {
+        let mut rotated = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .cloned()
+            .context("group after removal")?;
+        rotated.shared_secret = Some(secret.to_vec());
+        self.ctx.update_from_group(&rotated);
+        Ok(())
+    }
+
+    async fn publish(&self, key: &str, value: &[u8]) -> Result<()> {
+        let delta = {
+            let mut s = self.sync.write().await;
+            s.put(
+                key.to_string(),
+                value.to_vec(),
+                "text/plain".to_string(),
+                self.peer,
+            )?;
+            let entry = s.get(key).cloned().context("alice entry")?;
+            x0x::kv::KvStoreDelta::for_put(
+                key.to_string(),
+                entry,
+                (self.peer, s.next_seq()?),
+                s.current_version(),
+            )
+        };
+        self.sync.publish_delta(self.peer, delta).await?;
+        Ok(())
+    }
+}
+
+async fn wait_for_count(mut read: impl FnMut() -> u64, at_least: u64, deadline: Duration) -> u64 {
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        let value = read();
+        if value >= at_least || tokio::time::Instant::now() >= until {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// #1266 review r2 (P2, sync.rs): the holder served a full state shortly
+/// before the gap ended, so it suppresses the first repair request inside
+/// its 15 s response cooldown and sends no evidence. The survivor must retry
+/// exactly once after the cooldown, freshly authorized and sealed, and the
+/// dropped record must come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> {
+    let (state, dir) = loopback_survivor_state().await?;
+    let f = f1_gss_rotation_fixture_on(state, dir, "issue1266cooldown").await?;
+    let admin = f.admin_kp.agent_id();
+    let (status, created) = open_group_store(&f.state, &f.group_id).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "open survivor store: {created}"
+    );
+    let topic = created["topic"]
+        .as_str()
+        .context("store topic")?
+        .to_string();
+    let bob = f
+        .state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .context("store handle registered")?;
+    bob.silence_bootstrap_for_test();
+    let alice = AliceReplica::start(&f.state, &f.group_id, &f.admin_kp, &topic).await?;
+
+    // Pre-gap: Alice holds content, and serves a full state now.
+    alice.publish("seed", b"seed-value").await?;
+    let (status, body) = wait_for_value(&f.state, &topic, "seed", Duration::from_secs(10)).await?;
+    assert_eq!(status, StatusCode::OK, "seed replicated: {body}");
+    let _ = bob.request_state_repair().await?;
+    let answered = wait_for_count(
+        || alice.sync.state_sync_snapshot().requests_answered,
+        1,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(answered, 1, "Alice served a full state before the gap");
+    let baseline_requests = bob.state_sync_snapshot().requests_sent;
+
+    // The gap: a record at the rotated epoch is dropped.
+    let removed =
+        apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None).await;
+    assert!(removed.should_exit, "signed MemberRemoved must apply");
+    alice.rotate(&f.state, &f.group_id, &f.new_secret).await?;
+    alice.publish("gap", b"gap-value").await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        bob.wait_receive_rejected_for_test(),
+    )
+    .await
+    .context("the survivor must receive and drop the gap record")?;
+    let (status, body) = get_value(&f.state, &topic, "gap").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
+
+    // The share installs well inside Alice's cooldown.
+    let delivered =
+        apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
+            .await;
+    assert!(!delivered.should_exit);
+    let (status, body) = wait_for_value(&f.state, &topic, "gap", Duration::from_secs(40)).await?;
+    let served = alice.sync.state_sync_snapshot();
+    let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the retry must repair the gap record: {body}; survivor requests {requests}; \
+         responder cooldown rejections {} answered {}",
+        served.rejected_cooldown,
+        served.requests_answered
+    );
+    assert_eq!(body["value"], BASE64.encode(b"gap-value"));
+    assert_eq!(
+        served.rejected_cooldown, 1,
+        "the first repair request fell in the cooldown"
+    );
+    assert_eq!(requests, 2, "one repair request plus exactly one retry");
+    assert_eq!(served.requests_answered, 2);
+    alice.sync.cancel_sync();
+    Ok(())
+}
+
+/// #1266 review r2 (P3): refreshes that race the share install must start
+/// exactly one repair per key gap. A stale refresh observes `KeyPending` and
+/// is paused before its latch decision while the share installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1266_concurrent_refreshes_start_one_repair_per_gap() -> Result<()> {
+    use crate::server::routes::stores::key_gap_test_seam as seam;
+    let (state, dir) = loopback_survivor_state().await?;
+    let f = f1_gss_rotation_fixture_on(state, dir, "issue1266latch").await?;
+    let admin = f.admin_kp.agent_id();
+    let (status, created) = open_group_store(&f.state, &f.group_id).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "open survivor store: {created}"
+    );
+    let topic = created["topic"]
+        .as_str()
+        .context("store topic")?
+        .to_string();
+    f.state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .context("store handle registered")?
+        .silence_bootstrap_for_test();
+
+    let removed =
+        apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None).await;
+    assert!(removed.should_exit, "signed MemberRemoved must apply");
+    // One refresh in the gap latches KeyPending.
+    let (status, _) = get_value(&f.state, &topic, "absent").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A second, stale KeyPending refresh pauses before its latch decision.
+    let pause = seam::arm(&topic);
+    let stale = tokio::spawn({
+        let state = Arc::clone(&f.state);
+        let topic = topic.clone();
+        async move { get_value(&state, &topic, "absent").await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .context("the stale refresh reached the pause")?;
+    let mut install = tokio::spawn({
+        let state = Arc::clone(&f.state);
+        let envelope = f.envelope_event.clone();
+        async move {
+            apply_named_group_metadata_event(&state, envelope, admin, true, None)
+                .await
+                .should_exit
+        }
+    });
+    let installed_while_paused = tokio::time::timeout(Duration::from_secs(2), &mut install)
+        .await
+        .is_ok();
+    if installed_while_paused {
+        // The share installed under the paused refresh: a Current refresh
+        // takes the latch before the stale one resumes.
+        let _ = get_value(&f.state, &topic, "absent").await?;
+        pause.release.notify_one();
+        let _ = stale.await??;
+    } else {
+        pause.release.notify_one();
+        let _ = stale.await??;
+        let should_exit = tokio::time::timeout(Duration::from_secs(10), install)
+            .await
+            .context("the share installs after the paused refresh")??;
+        assert!(!should_exit);
+    }
+    for _ in 0..3 {
+        let _ = get_value(&f.state, &topic, "absent").await?;
+    }
+    assert_eq!(
+        seam::repairs(&topic),
+        1,
+        "exactly one repair per key gap (share installed while the stale refresh \
+         was paused: {installed_while_paused})"
+    );
+    assert!(
+        !installed_while_paused,
+        "the latch decision must hold the group read guard, so the share waits for it"
+    );
+    Ok(())
+}
+
+fn loopback_daemon_config(
+    root: &std::path::Path,
+    tag: &str,
+) -> Result<crate::server::DaemonConfig> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "bind_address": "127.0.0.1:0",
+        "api_address": "127.0.0.1:0",
+        "data_dir": root.join("data"),
+        "identity_dir": root.join("identity"),
+        "bootstrap_peers": [],
+        "mdns_enabled": false,
+        "port_mapping_enabled": false,
+        "network_id": format!("x0x.test.1266.{tag}.{}", std::process::id())
+    }))?)
+}
+
+fn loopback_daemon_options() -> crate::server::ServeOptions {
+    crate::server::ServeOptions {
+        skip_update_check: true,
+        cli_no_port_mapping: true,
+        cli_disable_peer_cache: true,
+        self_update_enabled: false,
+        ..crate::server::ServeOptions::default()
+    }
+}
+
+fn tracked_task_count(state: &AppState) -> usize {
+    state
+        .agent
+        .tracked_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .handles
+        .len()
+}
+
+fn unfinished_tracked_since(state: &AppState, from: usize) -> usize {
+    state
+        .agent
+        .tracked_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .handles
+        .iter()
+        .skip(from)
+        .filter(|handle| !handle.is_finished())
+        .count()
+}
+
+/// #1266 review r2 (P2, stores.rs): a real daemon shuts down while a GSS
+/// store is open (and, with `repair_in_flight`, while a key-gap repair is
+/// parked on the GSS publication gate). Shutdown must return, release the
+/// daemon state, the Agent (and with it history.db) and the store's sync,
+/// and a relaunch on the same directories must succeed.
+async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let tag = if repair_in_flight { "repair" } else { "store" };
+    let config = loopback_daemon_config(root.path(), tag)?;
+    let handle =
+        crate::server::serve_with_options(config.clone(), loopback_daemon_options()).await?;
+    let state = handle.test_state.upgrade().context("live daemon state")?;
+    let state_weak = Arc::downgrade(&state);
+    let agent_weak = Arc::downgrade(&state.agent);
+    let F1GssRotationFixture {
+        state,
+        admin_kp,
+        group_id,
+        remove_event,
+        envelope_event,
+        ..
+    } = f1_gss_rotation_fixture_on(state, tempfile::tempdir()?, "issue1266shutdown").await?;
+    let admin = admin_kp.agent_id();
+    let (status, created) = open_group_store(&state, &group_id).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "open survivor store: {created}"
+    );
+    let topic = created["topic"]
+        .as_str()
+        .context("store topic")?
+        .to_string();
+    let bob = state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .context("store handle registered")?;
+    bob.silence_bootstrap_for_test();
+    let sync_weak = bob.sync_weak_for_test();
+    let mut gate = None;
+    if repair_in_flight {
+        let baseline_requests = bob.state_sync_snapshot().requests_sent;
+        let removed =
+            apply_named_group_metadata_event(&state, remove_event, admin, true, None).await;
+        assert!(removed.should_exit, "signed MemberRemoved must apply");
+        let (status, _) = get_value(&state, &topic, "absent").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let delivered =
+            apply_named_group_metadata_event(&state, envelope_event, admin, true, None).await;
+        assert!(!delivered.should_exit);
+        // Hold the publication gate so the repair parks on it.
+        gate = Some(Arc::clone(&state.gss_publication_gate).write_owned().await);
+        let tracked_before = tracked_task_count(&state);
+        let (status, _) = get_value(&state, &topic, "absent").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            unfinished_tracked_since(&state, tracked_before),
+            1,
+            "the repair runs as one tracked Agent task"
+        );
+        assert_eq!(
+            bob.state_sync_snapshot().requests_sent,
+            baseline_requests,
+            "the repair is parked on the publication gate"
+        );
+        // Shutdown begins: the Agent's shutdown token must end the parked
+        // wait itself, while the gate is still held, not the drain's abort.
+        state.agent.begin_shutdown();
+        let parked = wait_for_count(
+            || u64::from(unfinished_tracked_since(&state, tracked_before) == 0),
+            1,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(parked, 1, "the shutdown token ends the parked repair");
+    }
+    drop(bob);
+    drop(state);
+
+    let result = tokio::time::timeout(Duration::from_secs(60), handle.shutdown_and_wait())
+        .await
+        .context("shutdown returns within 60 s")?;
+    assert!(result.is_ok(), "shutdown: {result:?}");
+    let released = wait_for_count(
+        || {
+            u64::from(
+                state_weak.strong_count() == 0
+                    && agent_weak.strong_count() == 0
+                    && sync_weak.strong_count() == 0,
+            )
+        },
+        1,
+        Duration::from_secs(10),
+    )
+    .await
+        == 1;
+    assert!(
+        released,
+        "shutdown must release the daemon state ({}), the Agent ({}) and the store sync ({})",
+        state_weak.strong_count(),
+        agent_weak.strong_count(),
+        sync_weak.strong_count()
+    );
+    drop(gate);
+    // The same data and identity directories: the instance locks and
+    // history.db must be free.
+    let relaunched = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::server::serve_with_options(config, loopback_daemon_options()),
+    )
+    .await
+    .context("relaunch returns within 60 s")?
+    .context("relaunch on the same directories")?;
+    tokio::time::timeout(Duration::from_secs(60), relaunched.shutdown_and_wait())
+        .await
+        .context("relaunched daemon shuts down")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1266_daemon_shutdown_releases_open_gss_store() -> Result<()> {
+    daemon_shutdown_releases_gss_store(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1266_daemon_shutdown_with_repair_in_flight_releases_state() -> Result<()> {
+    daemon_shutdown_releases_gss_store(true).await
+}
