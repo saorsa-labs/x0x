@@ -710,6 +710,7 @@ fn unfinished_tracked_since(state: &AppState, from: usize) -> usize {
 /// daemon state, the Agent (and with it history.db) and the store's sync,
 /// and a relaunch on the same directories must succeed.
 async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()> {
+    use crate::server::routes::stores::key_gap_test_seam as seam;
     let root = tempfile::tempdir()?;
     let tag = if repair_in_flight { "repair" } else { "store" };
     let config = loopback_daemon_config(root.path(), tag)?;
@@ -763,10 +764,13 @@ async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()
         let (status, _) = get_value(&state, &topic, "absent").await?;
         assert_eq!(status, StatusCode::NOT_FOUND);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            unfinished_tracked_since(&state, tracked_before),
-            1,
-            "the repair runs as one tracked Agent task"
+        // Exactly one repair for this store. Other daemon work may also be
+        // tracked in this window (seen on Linux CI), so the tracked-task
+        // check only requires the repair to be among the unfinished tasks.
+        assert_eq!(seam::repairs(&topic), 1, "exactly one repair starts");
+        assert!(
+            unfinished_tracked_since(&state, tracked_before) >= 1,
+            "the repair runs as a tracked Agent task"
         );
         assert_eq!(
             bob.state_sync_snapshot().requests_sent,
@@ -776,10 +780,12 @@ async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()
         // Shutdown begins: the Agent's shutdown token must end the parked
         // wait itself, while the gate is still held, not the drain's abort.
         state.agent.begin_shutdown();
+        // Every tracked task honours the shutdown token; allow the other
+        // tracked work a short margin to observe it too.
         let parked = wait_for_count(
             || u64::from(unfinished_tracked_since(&state, tracked_before) == 0),
             1,
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .await;
         assert_eq!(parked, 1, "the shutdown token ends the parked repair");
