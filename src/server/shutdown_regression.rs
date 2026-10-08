@@ -12,7 +12,8 @@
 //! - `issue1262_owned_workload_parallel`: the embedder's parallel-test
 //!   shape. Knobs for investigation: `X0X_1262_PAIRS`,
 //!   `X0X_1262_UPTIME_SECS`, `X0X_1262_STAGGER_MS` (`none` stops a pair
-//!   concurrently), `X0X_1262_NO_GROUPS`/`_KV`/`_DM=1`, and `RUST_LOG`.
+//!   concurrently), `X0X_1262_NO_GROUPS`/`_KV`/`_DM=1`,
+//!   `X0X_1262_GROUPS_EVERY_CYCLE=1`, and `RUST_LOG`.
 //! - `issue1263_shutdown_with_frozen_peer`: sends blocked on a peer that
 //!   stopped reading must not stall network teardown.
 //! - `issue1269_group_join_shutdown_releases_owner`: after a peer joins a
@@ -142,7 +143,11 @@ mod workload {
     const PAIRS: usize = 4;
 
     fn off(feature: &str) -> bool {
-        std::env::var(format!("X0X_1262_NO_{feature}")).is_ok_and(|v| v == "1")
+        on(&format!("NO_{feature}"))
+    }
+
+    fn on(knob: &str) -> bool {
+        std::env::var(format!("X0X_1262_{knob}")).is_ok_and(|v| v == "1")
     }
 
     fn uptime() -> Duration {
@@ -596,10 +601,13 @@ mod workload {
             let until = Instant::now()
                 + uptime()
                 + Duration::from_millis(jitter_ms(index + 7, cycle, 3000));
-            // Groups only in the last cycle: a group's join-artifact egress
-            // keeps the old AppState (and its history.db lock) alive after
-            // shutdown, which would block the relaunch of a later cycle.
-            traffic(&http, &a, &b, &tag, until, cycle + 1 == CYCLES).await;
+            // Groups only in the last cycle by default, as #1262 ran it.
+            // Before #1269, a group made the old AppState (and its
+            // history.db lock) outlive shutdown, which blocked the relaunch
+            // of a later cycle. `X0X_1262_GROUPS_EVERY_CYCLE=1` runs groups
+            // in every cycle.
+            let groups = cycle + 1 == CYCLES || on("GROUPS_EVERY_CYCLE");
+            traffic(&http, &a, &b, &tag, until, groups).await;
             eprintln!("ISSUE1262 pair{index} cycle{cycle} connected={connected} stopping");
             let (label_a, label_b) = (
                 format!("pair{index}/cycle{cycle}/a"),
@@ -739,19 +747,31 @@ mod workload {
     const GROUP_JOIN_RELEASE_BOUND: Duration = Duration::from_secs(2);
 
     /// Wait up to [`GROUP_JOIN_RELEASE_BOUND`] for both weak handles to
-    /// lose their last strong owner. Returns the final strong counts.
-    async fn released(state: &Weak<AppState>, agent: &Weak<crate::Agent>) -> (usize, usize) {
-        let deadline = Instant::now() + GROUP_JOIN_RELEASE_BOUND;
+    /// lose their last strong owner. Returns the final strong counts and
+    /// how long the wait took.
+    async fn released(
+        state: &Weak<AppState>,
+        agent: &Weak<crate::Agent>,
+    ) -> (usize, usize, Duration) {
+        let started = Instant::now();
+        let deadline = started + GROUP_JOIN_RELEASE_BOUND;
         while (state.strong_count() > 0 || agent.strong_count() > 0) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        (state.strong_count(), agent.strong_count())
+        (
+            state.strong_count(),
+            agent.strong_count(),
+            started.elapsed(),
+        )
     }
 
-    /// #1269: A creates a named group, B joins it by invite, then A shuts
-    /// down. A's AppState and Agent (and with them the exclusive
-    /// `history.db` connection) must go when `shutdown_and_wait` returns,
-    /// and a relaunch on the same data dir must succeed at once.
+    /// #1269: A creates a named group, B joins it by invite, A opens a
+    /// group store, then A shuts down. A's AppState and Agent (and with
+    /// them the exclusive `history.db` connection) must go when
+    /// `shutdown_and_wait` returns, and a relaunch on the same data dir
+    /// must succeed at once. The join leaves delayed direct deliveries
+    /// (A) and join-attempt polls (B) running; the TreeKEM group store's
+    /// protector refers back to A's AppState from A's `kv_stores` (#1250).
     ///
     /// Each daemon runs on its own runtime, as an embedder's daemons do;
     /// the HTTP driver runs on a third.
@@ -793,6 +813,25 @@ mod workload {
             .await
             .and_then(|v| v["group_id"].as_str().map(str::to_string))
             .expect("A creates a named group");
+            // A group store, opened before the join so that A stops right
+            // after it seats B (B's join attempt is then still live). Its
+            // handle in A's `kv_stores` holds A's AppState.
+            let store = call(
+                &http,
+                &a,
+                reqwest::Method::POST,
+                &format!("/groups/{group}/stores"),
+                Some(serde_json::json!({ "name": "gs-1269" })),
+            )
+            .await
+            .unwrap_or_default();
+            assert_eq!(store["ok"], true, "A creates a group store: {store}");
+            // The #1250 shape: the default group is TreeKEM, so the store's
+            // TreeKEM protector is what refers back to A's AppState.
+            assert_eq!(
+                store["ownership"]["policy"], "treekem_encrypted",
+                "store: {store}"
+            );
             let invite = call(
                 &http,
                 &a,
@@ -850,11 +889,11 @@ mod workload {
             matches!(result, Ok(Ok(()))),
             "A shutdown_and_wait after {took:?}: {result:?}"
         );
-        let (appstate_strong, agent_strong) = a_runtime.block_on(released(&state_a, &agent_a));
+        let (appstate_strong, agent_strong, waited) =
+            a_runtime.block_on(released(&state_a, &agent_a));
         eprintln!(
-            "ISSUE1269 a shutdown took {took:?}; +{:?} appstate_strong={appstate_strong} \
+            "ISSUE1269 a shutdown took {took:?}; +{waited:?} appstate_strong={appstate_strong} \
              agent_strong={agent_strong} a_runtime_alive_tasks={}",
-            GROUP_JOIN_RELEASE_BOUND,
             a_runtime.metrics().num_alive_tasks()
         );
 
@@ -888,9 +927,10 @@ mod workload {
         let result_b = b_runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(60), b.handle.shutdown_and_wait()).await
         });
-        let (appstate_strong_b, agent_strong_b) = b_runtime.block_on(released(&state_b, &agent_b));
+        let (appstate_strong_b, agent_strong_b, waited_b) =
+            b_runtime.block_on(released(&state_b, &agent_b));
         eprintln!(
-            "ISSUE1269 b result={result_b:?} appstate_strong={appstate_strong_b} \
+            "ISSUE1269 b result={result_b:?} +{waited_b:?} appstate_strong={appstate_strong_b} \
              agent_strong={agent_strong_b}"
         );
 
