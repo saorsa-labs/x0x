@@ -1116,6 +1116,7 @@ pub async fn serve_with_options(
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
         detached_tasks: StdMutex::new(Some(Vec::new())),
+        shielded_tasks: StdMutex::new(Some(Vec::new())),
         join_artifact_egress: StdMutex::new(HashMap::new()),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
@@ -2763,80 +2764,7 @@ pub async fn serve_with_options(
         //    returns a `JoinError`; that is expected, never unwrap it. Draining
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
-        let mut bg_tasks = bg_tasks;
-        bg_tasks.extend(
-            std::mem::take(&mut *state.group_metadata_tasks.write().await)
-                .into_values()
-                .map(|reg| reg.handle),
-        );
-        bg_tasks
-            .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
-        // Taking `Some` closes admission under the same mutex used by
-        // FetchRequest replacement. A handler waiting here cannot spawn a
-        // stream after this shutdown drain.
-        let welcome_streams = state
-            .pending_welcome_streams
-            .lock()
-            .await
-            .take()
-            .unwrap_or_default();
-        bg_tasks.extend(welcome_streams.into_values());
-        bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
-        // #1269: detached best-effort tasks (delayed direct deliveries, the
-        // redelivery schedule, control-blob transfers, delayed publishes)
-        // and the joiner's join-attempt polls and sends hold the Agent or
-        // this AppState. Left running, one asleep before a delayed delivery
-        // keeps the Agent, and its exclusive `history.db` connection, alive
-        // after this supervisor returns, and a same-dir relaunch is refused.
-        // Taking `Some` closes detached admission; the attempt registry is
-        // drained after it, so `spawn_attempt_task_under_guard` (which checks
-        // admission under the registry lock) either registered its task
-        // before this drain or spawns nothing. None of this work is durable:
-        // the deliveries and publishes are best-effort copies of what the
-        // metadata topic and the join-result fetch carry, the redelivery
-        // schedule is deliberately not persisted, and the join-attempt
-        // registry is in-memory and dies with this AppState anyway (recovery
-        // after a joiner restart is ADR 0107's durable carry remnant).
-        bg_tasks.extend(
-            state
-                .detached_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .unwrap_or_default(),
-        );
-        bg_tasks.extend(
-            state
-                .pending_join_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .values_mut()
-                .flat_map(|attempt| {
-                    std::mem::take(&mut attempt.polls)
-                        .into_iter()
-                        .chain(std::mem::take(&mut attempt.tasks))
-                }),
-        );
-        // Keep abort handles so stragglers can be aborted after the grace window.
-        // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
-        // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
-        // so that after aborting we `join.await` the remainder. Without this, the
-        // "join_network fully stopped before Agent shutdown" guarantee would
-        // only hold on the non-timeout path; now it holds on BOTH. A cancelled/
-        // aborted task yields Err(JoinError) — expected, never unwrapped.
-        let abort_handles: Vec<tokio::task::AbortHandle> =
-            bg_tasks.iter().map(|h| h.abort_handle()).collect();
-        let mut join = futures::future::join_all(bg_tasks);
-        tokio::select! {
-            _results = &mut join => {}
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                tracing::warn!("background tasks did not stop within grace; aborting stragglers");
-                for handle in &abort_handles {
-                    handle.abort();
-                }
-                let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
-            }
-        }
+        drain_server_tasks(&state, bg_tasks).await;
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
         //    reaper / DM-inbox / advert / presence, drain the Agent's own
@@ -2879,6 +2807,118 @@ pub async fn serve_with_options(
         #[cfg(test)]
         test_router,
     })
+}
+
+/// #1269 r2: how long the shutdown tail waits for admitted group-state
+/// applies (see [`drain_server_tasks`]) before it leaves them to finish.
+const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
+
+/// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
+/// server-owned task (the startup tasks in `bg_tasks`, the AppState handle
+/// maps, the detached registry and the join-attempt registry), then await,
+/// never abort, the shielded group-state applies.
+async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+    bg_tasks.extend(
+        std::mem::take(&mut *state.group_metadata_tasks.write().await)
+            .into_values()
+            .map(|reg| reg.handle),
+    );
+    bg_tasks.extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
+    // Taking `Some` closes admission under the same mutex used by
+    // FetchRequest replacement. A handler waiting here cannot spawn a
+    // stream after this shutdown drain.
+    let welcome_streams = state
+        .pending_welcome_streams
+        .lock()
+        .await
+        .take()
+        .unwrap_or_default();
+    bg_tasks.extend(welcome_streams.into_values());
+    bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
+    // #1269: detached best-effort tasks (delayed direct deliveries, the
+    // redelivery schedules, control-blob fetches, the owner-side join-result
+    // and Welcome fetch handlers, delayed publishes) and the joiner's
+    // join-attempt polls and sends hold the Agent or this AppState. Left
+    // running, one asleep before a delayed delivery keeps the Agent, and its
+    // exclusive `history.db` connection, alive after the supervisor returns,
+    // and a same-dir relaunch is refused. Taking `Some` closes detached
+    // admission; the attempt registry is drained after it, so
+    // `spawn_attempt_task_under_guard` (which checks admission under the
+    // registry lock) either registered its task before this drain or spawns
+    // nothing. None of this work persists anything: the deliveries and
+    // publishes are best-effort copies of what the metadata topic and the
+    // join-result fetch carry, the redelivery schedules are deliberately not
+    // persisted, and the join-attempt registry is in-memory and dies with
+    // this AppState anyway (recovery after a joiner restart is ADR 0107's
+    // durable carry remnant). Work that does persist runs shielded (below).
+    bg_tasks.extend(
+        state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default(),
+    );
+    bg_tasks.extend(
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+            .flat_map(|attempt| {
+                std::mem::take(&mut attempt.polls)
+                    .into_iter()
+                    .chain(std::mem::take(&mut attempt.tasks))
+            }),
+    );
+    // #1269 r2: close shielded admission at the same moment: an apply that
+    // has not started is refused from here on (as if it had arrived after
+    // the stop), and one that has started is awaited below, never aborted.
+    let shielded = state
+        .shielded_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    // Keep abort handles so stragglers can be aborted after the grace window.
+    // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
+    // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
+    // so that after aborting we `join.await` the remainder. Without this, the
+    // "join_network fully stopped before Agent shutdown" guarantee would
+    // only hold on the non-timeout path; now it holds on BOTH. A cancelled/
+    // aborted task yields Err(JoinError) — expected, never unwrapped.
+    let abort_handles: Vec<tokio::task::AbortHandle> =
+        bg_tasks.iter().map(|h| h.abort_handle()).collect();
+    let mut join = futures::future::join_all(bg_tasks);
+    tokio::select! {
+        _results = &mut join => {}
+        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            tracing::warn!("background tasks did not stop within grace; aborting stragglers");
+            for handle in &abort_handles {
+                handle.abort();
+            }
+            let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+        }
+    }
+    // #1269 r2: admitted applies that persist group state (a pulled control
+    // blob's apply, the owner-certificate join retry) run to completion. An
+    // abort inside an atomic write or its journal step would leave the
+    // persisted state torn, or leave a blocking write running after the
+    // instance locks are released. They are awaited before the Agent stops,
+    // bounded; one still running after the bound is left to finish (never
+    // aborted), and the AppState it holds then outlives this supervisor.
+    if !shielded.is_empty() {
+        let applies = futures::future::join_all(shielded);
+        if tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
+                "a group-state apply is still running at shutdown; it is left to finish, not aborted"
+            );
+        }
+    }
 }
 
 /// Whether two directory paths refer to the same directory, tolerating

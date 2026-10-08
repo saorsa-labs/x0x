@@ -16728,11 +16728,15 @@ fn spawn_delegation_carrier_redelivery(
     if schedule.is_empty() {
         return;
     }
-    let state = Arc::clone(state);
+    let task_state = Arc::clone(state);
     let topic = topic.to_string();
     let bytes = bytes.to_vec();
     let msg = msg.clone();
-    tokio::spawn(async move {
+    // #1269 r2: the schedule holds the AppState for up to a minute,
+    // independent of transport shutdown; the shutdown drain ends it (it is
+    // deliberately not persisted, see above).
+    state.spawn_detached(async move {
+        let state = task_state;
         let start = tokio::time::Instant::now();
         for (index, offset) in schedule.iter().enumerate() {
             tokio::time::sleep_until(start + *offset).await;
@@ -33830,6 +33834,53 @@ pub(in crate::server) enum AtomicWriteOutcome {
     Durable,
 }
 
+/// #1269 r2: test-only seam that parks one atomic named-groups write for a
+/// given destination after its temp file is synced and before the rename
+/// (a slow write), so a test can stop the daemon in the middle of it.
+#[cfg(test)]
+pub(in crate::server) mod atomic_write_test_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static REACHED: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+
+    /// Park the next write whose destination is `path` (one-shot).
+    pub(in crate::server) fn arm(path: &Path) {
+        REACHED.store(false, Ordering::SeqCst);
+        RELEASED.store(false, Ordering::SeqCst);
+        *ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+    }
+
+    pub(in crate::server) fn reached() -> bool {
+        REACHED.load(Ordering::SeqCst)
+    }
+
+    pub(in crate::server) fn release() {
+        RELEASED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) async fn park(path: &Path) {
+        {
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if armed.as_deref() != Some(path) {
+                return;
+            }
+            *armed = None;
+        }
+        REACHED.store(true, Ordering::SeqCst);
+        while !RELEASED.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
 pub(in crate::server) async fn write_named_groups_json_atomic(
     path: &FsPath,
     json: &str,
@@ -33879,6 +33930,10 @@ pub(in crate::server) async fn write_named_groups_json_atomic(
         return Ok(AtomicWriteOutcome::NotReplaced);
     }
     drop(file);
+    // #1269 r2: a test can hold the write here, between the synced temp
+    // file and the rename, to stop the daemon in the middle of it.
+    #[cfg(test)]
+    atomic_write_test_seam::park(path).await;
 
     // Pre-rename failure: destination unchanged.
     if let Err(error) = tokio::fs::rename(&temp_path, path).await {
@@ -37016,27 +37071,37 @@ pub(in crate::server) async fn dispatch_join_result_message(
     };
     let task_state = Arc::clone(state);
     let requester = *sender;
-    let worker = tokio::spawn(async move {
-        tokio::time::timeout(
+    // #1269 r2: one shutdown-owned task. It holds the AppState for up to the
+    // handler timeout, so the shutdown drain must own it; a separate
+    // supervisor would detach the worker when it is aborted. It keeps the
+    // admission ticket until the handler ends and reports a handler that
+    // panicked or timed out. The handler's only durable step, the
+    // owner-certificate join retry, runs shielded inside it.
+    state.spawn_detached(async move {
+        let _ticket = ticket;
+        let handler = tokio::time::timeout(
             JOIN_RESULT_FETCH_HANDLER_TIMEOUT,
             handle_join_result_message(&task_state, &requester, verified, msg),
-        )
-        .await
-        .is_err()
-    });
-    // Supervisor: holds the admission ticket until the handler ends and
-    // reports a handler that panicked or timed out.
-    tokio::spawn(async move {
-        let _ticket = ticket;
-        match worker.await {
-            Ok(false) => {}
-            Ok(true) => tracing::warn!("join-result fetch handler timed out; the joiner retries"),
-            Err(e) if e.is_panic() => {
-                tracing::error!("join-result fetch handler panicked: {e}");
-            }
-            Err(_) => {}
+        );
+        match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => tracing::warn!("join-result fetch handler timed out; the joiner retries"),
+            Err(panic) => tracing::error!(
+                "join-result fetch handler panicked: {}",
+                panic_payload_message(panic.as_ref())
+            ),
         }
     });
+}
+
+/// #1269 r2: the message of a caught panic payload, for the fetch-handler
+/// supervisors that used to read it from a `JoinError`.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 pub(in crate::server) async fn handle_join_result_message(
@@ -37091,7 +37156,16 @@ async fn handle_join_result_message_bound(
             // fetch completed, heartbeat landed). Re-run any retained
             // admission for this group BEFORE answering, so "nothing
             // staged" can turn into a staged result on the next poll.
-            retry_pending_owner_cert_joins(state, Some(&group_id)).await;
+            // #1269 r2: the retry can seat a member (roster and TreeKEM
+            // persistence), so it runs shielded: neither the shutdown drain
+            // nor this handler's timeout aborts it once it has started.
+            let retry_state = Arc::clone(state);
+            let retry_group = group_id.clone();
+            let _ = state
+                .run_shielded(async move {
+                    retry_pending_owner_cert_joins(&retry_state, Some(&retry_group)).await;
+                })
+                .await;
             let key = join_result_key(&group_id, &member_agent_id);
             // #477 A4: the result/refusal selection is linearized with the
             // apply path — the SAME lookup-gated membership mutex the apply
@@ -38559,28 +38633,27 @@ pub(in crate::server) async fn dispatch_welcome_blob_message(
             let task_state = Arc::clone(state);
             let requester = *sender;
             let log_id = welcome_id.clone();
-            let worker = tokio::spawn(async move {
-                tokio::time::timeout(
+            // #1269 r2: one shutdown-owned task, as for the join-result
+            // fetch handler. The handler only serves the staged Welcome (its
+            // stream lands in `pending_welcome_streams`) and persists
+            // nothing, so the drain may abort it.
+            state.spawn_detached(async move {
+                let _ticket = ticket;
+                let handler = tokio::time::timeout(
                     WELCOME_FETCH_HANDLER_TIMEOUT,
                     handle_welcome_fetch_request(&task_state, &requester, group_id, welcome_id),
-                )
-                .await
-                .is_err()
-            });
-            // Supervisor: holds the admission ticket until the handler ends
-            // and reports a handler that panicked or timed out.
-            tokio::spawn(async move {
-                let _ticket = ticket;
-                match worker.await {
-                    Ok(false) => {}
-                    Ok(true) => tracing::warn!(
+                );
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => tracing::warn!(
                         welcome_id = %LogHexId::new("welcome", &log_id),
                         "Welcome fetch handler timed out; the joiner retries"
                     ),
-                    Err(e) if e.is_panic() => {
-                        tracing::error!("Welcome fetch handler panicked: {e}");
-                    }
-                    Err(_) => {}
+                    Err(panic) => tracing::error!(
+                        "Welcome fetch handler panicked: {}",
+                        panic_payload_message(panic.as_ref())
+                    ),
                 }
             });
         }
@@ -39380,6 +39453,7 @@ pub(in crate::server) mod tests {
     mod issue1139_back_to_back_join;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
+    mod issue1269_shutdown_apply_boundary;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -40137,6 +40211,7 @@ pub(in crate::server) mod tests {
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             detached_tasks: StdMutex::new(Some(Vec::new())),
+            shielded_tasks: StdMutex::new(Some(Vec::new())),
             join_artifact_egress: StdMutex::new(HashMap::new()),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
