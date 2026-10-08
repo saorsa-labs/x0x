@@ -29,6 +29,9 @@ mod state;
 mod w3h;
 mod ws;
 
+#[cfg(test)]
+mod shutdown_regression;
+
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
