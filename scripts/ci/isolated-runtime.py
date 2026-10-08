@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import select
 import signal
+import stat
 import time
 import subprocess
 import sys
@@ -20,6 +21,84 @@ ENV_KEYS = (
     'CARGO_INCREMENTAL', 'CARGO_LLVM_COV', 'CARGO_LLVM_COV_TARGET_DIR', 'CARGO_LLVM_COV_BUILD_DIR',
     'LLVM_COV', 'LLVM_PROFDATA', 'X0X_SLOW_CONSUMER_PROOF', 'X0X_REQUIRE_NETWORK_TESTS',
 )
+
+
+def retain_fixture_diagnostics(config, returncode):
+    """Best-effort, unprivileged copy before private /tmp disappears.
+
+    Opt in with X0X_RETAIN_FIXTURE_DIAGNOSTICS=1 on the outer runner. Keep
+    mutable runtime output in a sibling with its own prefix, outside the
+    custody collector's x0x-isolation-* / x0x-metadata-* sets and build hashes.
+    This output is debugging material, never an isolation/custody receipt.
+    """
+    if not returncode or not config.get('retain_fixture_diagnostics'):
+        return
+    evidence = Path(config['evidence'])
+    destination = evidence.with_name(
+        evidence.name.replace('x0x-isolation-', 'x0x-fixture-diagnostics-', 1))
+    # Bound content, individual files and traversal/manifest entries. Oversized
+    # files retain their tail (useful for daemon logs); record every offset.
+    byte_limit, file_limit, entry_limit = 32 * 1024 * 1024, 4 * 1024 * 1024, 1024
+    manifest = dict(evidence=evidence.name, exit=returncode, bytes=0,
+                    byte_limit=byte_limit, file_limit=file_limit,
+                    entry_limit=entry_limit, entries=[], limit_reached=False)
+    try:
+        destination.mkdir(mode=0o700)  # fresh output only; never follow/reuse it
+        source_fd = os.open(config['env']['TMPDIR'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # dir_fd + no-follow opens avoid copying symlinks, including a
+            # fixture/file replaced by a symlink while collection is in flight.
+            for directory, dirs, files, dir_fd in os.fwalk('.', dir_fd=source_fd, follow_symlinks=False):
+                if directory == '.':
+                    dirs[:] = sorted(name for name in dirs if name.startswith('x0x-test-'))
+                    continue
+                dirs.sort()
+                for name in [None, *sorted(files)]:
+                    if len(manifest['entries']) >= entry_limit or manifest['bytes'] >= byte_limit:
+                        manifest['limit_reached'] = True
+                        break
+                    relative = Path(directory) if name is None else Path(directory) / name
+                    row = dict(path=str(relative))
+                    manifest['entries'].append(row)
+                    if name is None:
+                        row['status'] = 'directory'
+                        continue
+                    try:
+                        # NONBLOCK prevents a FIFO from hanging us before fstat.
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                        with os.fdopen(fd, 'rb') as source:
+                            info = os.fstat(source.fileno())
+                            if not stat.S_ISREG(info.st_mode):
+                                row['status'] = 'skipped-nonregular'
+                                continue
+                            size = min(info.st_size, file_limit, byte_limit - manifest['bytes'])
+                            offset = info.st_size - size
+                            source.seek(offset)
+                            output = destination / relative
+                            output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            with output.open('xb') as target:
+                                remaining = size
+                                while remaining:
+                                    chunk = source.read(min(remaining, 64 * 1024))
+                                    if not chunk:
+                                        break
+                                    target.write(chunk)
+                                    manifest['bytes'] += len(chunk)
+                                    remaining -= len(chunk)
+                            row.update(status='copied', source_bytes=info.st_size,
+                                       offset=offset, copied_bytes=size - remaining)
+                    except OSError as error:
+                        row.update(status='error', errno=error.errno)
+                if manifest['limit_reached']:
+                    break
+        finally:
+            os.close(source_fd)
+        (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        print(f'Retained fixture diagnostics: {destination}', flush=True)
+    except OSError as error:
+        # Collection must never turn a test failure into success or replace its
+        # exit code. Supervisor cancellation/deadline still bounds this work.
+        print(f'Fixture diagnostics collection failed: {error}', file=sys.stderr, flush=True)
 
 
 def checked(*args):
@@ -64,6 +143,7 @@ def admitted(config):
         }) + '\n')
     result = subprocess.run(config['command'], env=config['env'], close_fds=True)
     (Path(config['evidence']) / 'exit.json').write_text(json.dumps({'exit': result.returncode}) + '\n')
+    retain_fixture_diagnostics(config, result.returncode)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
@@ -187,6 +267,8 @@ def main():
     config = dict(command=command, env=env, uid=os.getuid(), gid=os.getgid(),
                   parent_netns=os.readlink('/proc/self/ns/net'), evidence=str(evidence),
                   timeout_seconds=int(os.environ.get('X0X_RUNTIME_TIMEOUT_SECONDS', '21600')))
+    if os.environ.get('X0X_RETAIN_FIXTURE_DIAGNOSTICS') == '1':
+        config['retain_fixture_diagnostics'] = True
     if role:
         config.update(role=role, scratch=Path(scratch).name if scratch else None)
     if not 1 <= config['timeout_seconds'] <= 21600:
