@@ -18,13 +18,11 @@
 //! - `issue1263_shutdown_with_frozen_peer`: sends blocked on a peer that
 //!   stopped reading must not stall network teardown.
 //!
-//! Known residual: `issue1262_owned_workload_parallel` can still fail on
-//! about 0.4–0.8 % of shutdowns. In those runs, handles inside ant-quic
-//! 0.27.54 hold the original socket: hole-punch coordinator dials, NAT
-//! traversal session handles and MASQUE relay sessions. The x0x teardown
-//! token cannot reach them. They are tracked in saorsa-labs/ant-quic#305;
-//! the test is expected to be fully green once x0x pins the ant-quic
-//! release that fixes it.
+//! The ant-quic 0.27.54 residual (hole-punch coordinator dials, NAT
+//! traversal session handles and MASQUE relay sessions holding the
+//! original socket, saorsa-labs/ant-quic#305) is fixed in ant-quic 0.27.55,
+//! which x0x now pins. `issue1262_owned_workload_parallel` is expected to
+//! be fully green.
 
 #![cfg(test)]
 

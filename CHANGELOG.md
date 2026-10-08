@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **ant-quic 0.27.55** (from 0.27.54). Node shutdown now releases the UDP
+  socket in every case found in saorsa-labs/ant-quic#305: hole-punch dials,
+  NAT-traversal session handles, relay sessions, winner-map registrations that
+  race shutdown, proactive relay setup, back-pressured stream readers, and
+  queued unaccepted streams. This closes the residual in-process relaunch
+  failure left after #1262. ant-quic's `accept_bi` now returns `ShuttingDown`
+  for streams still queued when shutdown runs; x0x's accept loops already stop
+  on shutdown.
+
 ### Fixed
 
 - **In-process shutdown releases the UDP socket and no longer stalls (#1262, #1263 part 1).**
@@ -13,8 +24,8 @@ All notable changes to this project will be documented in this file.
   gossip-membership dials kept an in-flight handshake on the socket. Network
   teardown now abandons in-flight dials first. Node read guards are no longer
   held across network sends, so a peer that stopped reading cannot stall
-  teardown for up to 30 s. A shutdown that abandons a dial takes about 5 s. A
-  small residual inside ant-quic is tracked in saorsa-labs/ant-quic#305.
+  teardown for up to 30 s. A shutdown that abandons a dial takes about 5 s. The
+  remaining ant-quic residual is fixed by ant-quic 0.27.55 (see Changed).
 
 ## [v0.46.5] - 2026-10-07
 
