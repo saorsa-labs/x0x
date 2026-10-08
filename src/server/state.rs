@@ -978,6 +978,11 @@ pub(super) struct AppState {
     /// admission (an apply that has not started is refused); the shutdown
     /// tail then awaits the admitted ones, bounded, before the Agent stops.
     pub(super) shielded_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    /// #1269 r2: cancelled when the shutdown drain starts. A network wait
+    /// inside a shielded apply (the joiner's Welcome fetch) selects on it,
+    /// so the apply takes its ordinary failure path instead of waiting out
+    /// a peer that can no longer answer while shutdown waits for it.
+    pub(super) shutdown_started: tokio_util::sync::CancellationToken,
     /// ADR 0107 (review r2): every in-flight join-artifact egress task
     /// (join-result send, control-blob staging and chunk sends), keyed by
     /// `(group id, recipient hex)`. Registered under the group's membership

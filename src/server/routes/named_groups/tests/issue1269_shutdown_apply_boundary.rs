@@ -140,3 +140,70 @@ async fn issue1269_drain_aborts_a_detached_task_mid_write() -> Result<()> {
     );
     Ok(())
 }
+
+/// A shielded apply can be inside the joiner's Welcome fetch when shutdown
+/// starts. That wait (up to 115 s) must end at once, as on a lost peer, so
+/// the drain does not wait out a Welcome whose listener has stopped; its
+/// receive and waiter registrations are removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue1269_welcome_fetch_ends_when_shutdown_starts() -> Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let bytes = b"Welcome that never arrives".to_vec();
+    let welcome_id = welcome_id_for_bytes(&bytes);
+    let welcome_ref = WelcomeRef {
+        welcome_id: welcome_id.clone(),
+        byte_len: bytes.len() as u64,
+        source: hex::encode(owner.agent.agent_id().as_bytes()),
+    };
+    let fetch_state = Arc::clone(&joiner);
+    let fetch = tokio::spawn(async move {
+        fetch_treekem_welcome_via_schedule(
+            &fetch_state,
+            &"ef".repeat(32),
+            &welcome_ref,
+            |_, _| async { Ok(()) },
+            &[Duration::ZERO, Duration::from_secs(30)],
+            WELCOME_FETCH_TIMEOUT,
+        )
+        .await
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !joiner
+        .pending_welcome_waiters
+        .read()
+        .await
+        .contains_key(&welcome_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fetch registers"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let started = tokio::time::Instant::now();
+    joiner.shutdown_started.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), fetch).await??;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(result, Err(WELCOME_FETCH_SHUTDOWN.to_string()));
+    assert!(joiner.pending_welcome_waiters.read().await.is_empty());
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    // A fetch that starts after shutdown began ends before it registers.
+    let late_ref = WelcomeRef {
+        welcome_id: welcome_id_for_bytes(b"late"),
+        byte_len: 4,
+        source: hex::encode(owner.agent.agent_id().as_bytes()),
+    };
+    let late = fetch_treekem_welcome_via_schedule(
+        &joiner,
+        &"ef".repeat(32),
+        &late_ref,
+        |_, _| async { Ok(()) },
+        &[Duration::ZERO],
+        WELCOME_FETCH_TIMEOUT,
+    )
+    .await;
+    assert_eq!(late, Err(WELCOME_FETCH_SHUTDOWN.to_string()));
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    Ok(())
+}

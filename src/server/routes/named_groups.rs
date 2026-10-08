@@ -33998,6 +33998,9 @@ const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 // final receive wait must finish inside that window.
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
 
+/// #1269 r2: the error of a Welcome fetch ended by daemon shutdown.
+const WELCOME_FETCH_SHUTDOWN: &str = "TreeKEM Welcome fetch ended: the daemon is shutting down";
+
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
     Duration::from_secs(5),
@@ -38420,6 +38423,12 @@ where
     if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
         return Err("TreeKEM Welcome blob exceeds maximum transfer size".to_string());
     }
+    // #1269 r2: an apply that runs during shutdown is shielded and awaited,
+    // so it must not wait up to `fetch_timeout` for a Welcome whose
+    // listener has stopped. Shutdown ends this wait like a lost peer.
+    if state.shutdown_started.is_cancelled() {
+        return Err(WELCOME_FETCH_SHUTDOWN.to_string());
+    }
     let source = parse_agent_id_hex(&welcome_ref.source)?;
     let total_chunks =
         x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
@@ -38485,6 +38494,10 @@ where
                 break;
             }
             () = tokio::time::sleep_until(due) => {}
+            () = state.shutdown_started.cancelled() => {
+                cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                return Err(WELCOME_FETCH_SHUTDOWN.to_string());
+            }
         }
         if attempt > 0 {
             let progress_bytes = state
@@ -38537,7 +38550,13 @@ where
         }
     }
     if received.is_none() {
-        received = tokio::time::timeout_at(deadline, &mut rx).await.ok();
+        received = tokio::select! {
+            result = tokio::time::timeout_at(deadline, &mut rx) => result.ok(),
+            () = state.shutdown_started.cancelled() => {
+                cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                return Err(WELCOME_FETCH_SHUTDOWN.to_string());
+            }
+        };
     }
     let received = match received {
         Some(Ok(result)) => result?,
@@ -40212,6 +40231,7 @@ pub(in crate::server) mod tests {
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             detached_tasks: StdMutex::new(Some(Vec::new())),
             shielded_tasks: StdMutex::new(Some(Vec::new())),
+            shutdown_started: tokio_util::sync::CancellationToken::new(),
             join_artifact_egress: StdMutex::new(HashMap::new()),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,

@@ -1117,6 +1117,7 @@ pub async fn serve_with_options(
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
         detached_tasks: StdMutex::new(Some(Vec::new())),
         shielded_tasks: StdMutex::new(Some(Vec::new())),
+        shutdown_started: tokio_util::sync::CancellationToken::new(),
         join_artifact_egress: StdMutex::new(HashMap::new()),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
@@ -2818,6 +2819,9 @@ const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
 /// maps, the detached registry and the join-attempt registry), then await,
 /// never abort, the shielded group-state applies.
 async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+    // #1269 r2: end the network waits of applies in progress first (they
+    // fail as on a lost peer), so the shielded wait below stays short.
+    state.shutdown_started.cancel();
     bg_tasks.extend(
         std::mem::take(&mut *state.group_metadata_tasks.write().await)
             .into_values()
