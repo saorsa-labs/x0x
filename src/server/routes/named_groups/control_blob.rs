@@ -836,8 +836,11 @@ pub(in crate::server) async fn handle_control_blob_message(
                 return;
             };
             let generation = lease.generation;
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
+            let task_state = Arc::clone(state);
+            // #1269: the pull holds the AppState until its fetch deadline,
+            // also when the source has gone; the shutdown drain ends it.
+            state.spawn_detached(async move {
+                let state = task_state;
                 let _permit = permit;
                 let _lease = lease;
                 if let Err(reason) = fetch_and_apply(&state, &reference, generation).await {
@@ -963,7 +966,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             };
             let agent = Arc::clone(&state.agent);
             let recipient = *sender;
-            tokio::spawn(async move {
+            // #1269: shutdown-owned; the send holds the Agent.
+            state.spawn_detached(async move {
                 let _permit = permit;
                 let message = ControlBlobMessage::Chunk {
                     reference,
@@ -1086,7 +1090,8 @@ async fn fetch_and_apply(
     let release_state = Arc::clone(state);
     let release_source = source;
     let release_reference = reference.clone();
-    tokio::spawn(async move {
+    // #1269: shutdown-owned; the notice holds the AppState.
+    state.spawn_detached(async move {
         let release = ControlBlobMessage::Release {
             reference: release_reference,
         };

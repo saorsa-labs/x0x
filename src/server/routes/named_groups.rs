@@ -3403,29 +3403,35 @@ fn named_group_event_delivery_future(
     })
 }
 
+/// #1269: the delivery holds the Agent, so it is registered with
+/// [`AppState::spawn_detached`], which the shutdown tail drains, never
+/// spawned bare.
 pub(in crate::server) fn spawn_named_group_event_delivery(
     state: &AppState,
     recipient_hex: &str,
     event: &NamedGroupMetadataEvent,
-) -> tokio::task::JoinHandle<()> {
-    match named_group_event_delivery_future(state, recipient_hex, event, "direct") {
-        Some(delivery) => tokio::spawn(delivery),
-        None => tokio::spawn(async {}),
+) {
+    if let Some(delivery) = named_group_event_delivery_future(state, recipient_hex, event, "direct")
+    {
+        state.spawn_detached(delivery);
     }
 }
 
+/// #1269: as [`spawn_named_group_event_delivery`]; the shutdown drain ends
+/// the delay as well as the send.
 fn spawn_named_group_event_delivery_after(
     state: &AppState,
     recipient_hex: &str,
     event: &NamedGroupMetadataEvent,
     delay: Duration,
-) -> tokio::task::JoinHandle<()> {
-    match named_group_event_delivery_future(state, recipient_hex, event, "delayed") {
-        Some(delivery) => tokio::spawn(async move {
+) {
+    if let Some(delivery) =
+        named_group_event_delivery_future(state, recipient_hex, event, "delayed")
+    {
+        state.spawn_detached(async move {
             tokio::time::sleep(delay).await;
             delivery.await;
-        }),
-        None => tokio::spawn(async {}),
+        });
     }
 }
 
@@ -3565,12 +3571,15 @@ fn spawn_group_control_event_redelivery(
         kind = named_group_metadata_event_kind(event),
         recipients = ?recipients, extra = ?extra_recipients,
     );
-    let state = Arc::clone(state);
+    let task_state = Arc::clone(state);
     let metadata_topic = metadata_topic.to_string();
     let event = event.clone();
     let kind = named_group_metadata_event_kind(&event);
     let group_id = named_group_metadata_event_group_id(&event).to_string();
-    tokio::spawn(async move {
+    // #1269: the schedule holds the AppState for up to a minute; the
+    // shutdown drain ends it (it is deliberately not persisted, see above).
+    state.spawn_detached(async move {
+        let state = task_state;
         let start = tokio::time::Instant::now();
         for (index, offset) in schedule.iter().enumerate() {
             tokio::time::sleep_until(start + *offset).await;
@@ -14933,7 +14942,8 @@ pub(in crate::server) async fn create_named_group(
                         drop(cache);
                         let state_for_card = Arc::clone(&state);
                         let group_id_for_card = group_id_hex.clone();
-                        tokio::spawn(async move {
+                        // #1269: shutdown-owned; it holds the AppState.
+                        state.spawn_detached(async move {
                             tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
                             publish_group_card_to_discovery(
                                 state_for_card.as_ref(),
@@ -14974,7 +14984,8 @@ pub(in crate::server) async fn create_named_group(
             let state_for_chat = Arc::clone(&state);
             let chat_topic_for_chat = chat_topic.clone();
             let announcement_bytes = announcement.to_string().into_bytes();
-            tokio::spawn(async move {
+            // #1269: shutdown-owned; it holds the AppState across the delay.
+            state.spawn_detached(async move {
                 tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
                 if let Err(e) = state_for_chat
                     .agent
@@ -35271,6 +35282,12 @@ where
         .pending_join_attempts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // #1269: the shutdown tail drains every registered handle under this
+    // lock after it closes detached admission, so a task checked here
+    // either lands where that drain finds it or is never spawned.
+    if state.detached_admission_closed() {
+        return false;
+    }
     if attempt_id.is_empty() {
         if attempts.contains_key(&key) {
             // A registered attempt owns this key: legacy work must not
@@ -35278,8 +35295,7 @@ where
             return false;
         }
         drop(attempts);
-        let _detached = tokio::spawn(task);
-        return true;
+        return state.spawn_detached(task);
     }
     let Some(entry) = attempts.get_mut(&key) else {
         // Already finalized: nothing owns this send — never spawned.
@@ -40119,6 +40135,7 @@ pub(in crate::server) mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+            detached_tasks: StdMutex::new(Some(Vec::new())),
             join_artifact_egress: StdMutex::new(HashMap::new()),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,

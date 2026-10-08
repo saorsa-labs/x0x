@@ -959,6 +959,15 @@ pub(super) struct AppState {
     /// One cancellable owner-side stream per staged Welcome.
     /// `None` closes admission during shutdown under the same lock as replacement.
     pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// #1269: detached best-effort tasks that capture the Agent or this
+    /// AppState: named-group event direct deliveries (immediate and
+    /// delayed), the terminal-event redelivery schedule, legacy join
+    /// work, control-blob transfers, and the delayed card and chat
+    /// publishes of `POST /groups`. `None` closes admission during
+    /// shutdown; the shutdown tail drains them with the other server
+    /// tasks, so none of them keeps the Agent and its exclusive
+    /// `history.db` connection alive after `shutdown_and_wait`.
+    pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// ADR 0107 (review r2): every in-flight join-artifact egress task
     /// (join-result send, control-blob staging and chunk sends), keyed by
     /// `(group id, recipient hex)`. Registered under the group's membership
@@ -1282,6 +1291,36 @@ pub(super) struct AppState {
     /// clear or append another instance's evidence (#759 item 4).
     #[cfg(test)]
     pub(super) named_group_test_recorders: NamedGroupTestRecorders,
+}
+
+impl AppState {
+    /// #1269: spawn `task` and register it in [`AppState::detached_tasks`],
+    /// so the shutdown tail drains it (grace, then abort). Once shutdown has
+    /// closed admission, `task` is dropped unrun and `false` is returned.
+    pub(super) fn spawn_detached<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tasks) = guard.as_mut() else {
+            return false;
+        };
+        // Reap finished tasks so the registry holds only live ones.
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(task));
+        true
+    }
+
+    /// #1269: whether shutdown has closed detached-task admission.
+    pub(super) fn detached_admission_closed(&self) -> bool {
+        self.detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
 }
 
 /// ADR 0107 (review r2): in-flight join-artifact egress tasks keyed by

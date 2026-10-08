@@ -1115,6 +1115,7 @@ pub async fn serve_with_options(
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+        detached_tasks: StdMutex::new(Some(Vec::new())),
         join_artifact_egress: StdMutex::new(HashMap::new()),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
@@ -2781,6 +2782,41 @@ pub async fn serve_with_options(
             .unwrap_or_default();
         bg_tasks.extend(welcome_streams.into_values());
         bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
+        // #1269: detached best-effort tasks (delayed direct deliveries, the
+        // redelivery schedule, control-blob transfers, delayed publishes)
+        // and the joiner's join-attempt polls and sends hold the Agent or
+        // this AppState. Left running, one asleep before a delayed delivery
+        // keeps the Agent, and its exclusive `history.db` connection, alive
+        // after this supervisor returns, and a same-dir relaunch is refused.
+        // Taking `Some` closes detached admission; the attempt registry is
+        // drained after it, so `spawn_attempt_task_under_guard` (which checks
+        // admission under the registry lock) either registered its task
+        // before this drain or spawns nothing. None of this work is durable:
+        // the deliveries and publishes are best-effort copies of what the
+        // metadata topic and the join-result fetch carry, the redelivery
+        // schedule is deliberately not persisted, and the join-attempt
+        // registry is in-memory and dies with this AppState anyway (recovery
+        // after a joiner restart is ADR 0107's durable carry remnant).
+        bg_tasks.extend(
+            state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_default(),
+        );
+        bg_tasks.extend(
+            state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values_mut()
+                .flat_map(|attempt| {
+                    std::mem::take(&mut attempt.polls)
+                        .into_iter()
+                        .chain(std::mem::take(&mut attempt.tasks))
+                }),
+        );
         // Keep abort handles so stragglers can be aborted after the grace window.
         // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
         // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
