@@ -2055,12 +2055,10 @@ pub struct NetworkNode {
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
-    /// Tracked so `shutdown` can abort them: the receiver and accept loops park
-    /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
-    /// they must be aborted before `shutdown` can take the *write* lock to drop
-    /// the node. Without this, `shutdown` would deadlock on an idle node that
-    /// never receives another packet/connection. The typed ant-quic shutdown
-    /// then verifies release of the bound UDP socket before reporting success.
+    /// Tracked so `shutdown` can abort and join them, releasing their endpoint
+    /// clones before consuming the node. Network awaits never retain a guard
+    /// on the shared node slot. Typed ant-quic shutdown then verifies release
+    /// of the bound UDP socket before reporting success.
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// One-shot shutdown coordinator shared by every clone. The ant node is
     /// consumed by shutdown, so both success and failure must remain visible
@@ -2412,8 +2410,8 @@ impl NetworkNode {
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
         let plane_gatekeeper = network_node.spawn_plane_gatekeeper();
-        // Record the handles so `shutdown` can abort them (letting it take the
-        // node write lock and shut the node down without deadlocking). This runs
+        // Record the handles so `shutdown` can abort and join their endpoint
+        // operations before consuming the node. This runs
         // at construction before the node is shared, so there is no contention;
         // if the lock is somehow poisoned, recover the guard rather than panic
         // (the handles are only used for clean teardown).
@@ -3173,8 +3171,8 @@ impl NetworkNode {
         }
 
         if self.is_connected(&peer_id).await {
-            let node_guard = self.node.read().await;
-            if let Some(node) = node_guard.as_ref() {
+            let node = self.node.read().await.as_ref().cloned();
+            if let Some(node) = node {
                 if let Some(addr) = node
                     .connected_peers()
                     .await
@@ -4119,8 +4117,8 @@ impl NetworkNode {
                         };
                         if !pending.is_empty() {
                             let frame = build_plane_hello_frame(&plane_id);
-                            let guard = node.read().await;
-                            if let Some(node) = guard.as_ref() {
+                            let node = node.read().await.as_ref().cloned();
+                            if let Some(node) = node {
                                 for peer in pending {
                                     let _ = node.send(&peer, &frame).await;
                                 }
@@ -4212,8 +4210,8 @@ impl NetworkNode {
     ///
     /// Vector of connected peer IDs.
     pub async fn connected_peers(&self) -> Vec<AntPeerId> {
-        let node_guard = self.node.read().await;
-        match node_guard.as_ref() {
+        let node = self.node.read().await.as_ref().cloned();
+        match node {
             Some(node) => node
                 .connected_peers()
                 .await
@@ -4234,8 +4232,8 @@ impl NetworkNode {
     ///
     /// True if connected to the peer.
     pub async fn is_connected(&self, peer_id: &AntPeerId) -> bool {
-        let node_guard = self.node.read().await;
-        match node_guard.as_ref() {
+        let node = self.node.read().await.as_ref().cloned();
+        match node {
             Some(node) => node.is_connected(peer_id).await,
             None => false,
         }
@@ -4315,10 +4313,8 @@ impl NetworkNode {
     /// connections, and shut down the ant-quic node.
     ///
     /// The background receiver and accept loops park in `recv()`/`accept().await`
-    /// while holding a *read* guard on `node`, so they are aborted FIRST —
-    /// otherwise taking the *write* lock below would deadlock on an idle node
-    /// that never receives another packet. After the tasks are aborted (releasing
-    /// their read guards and `node` clones), the node is taken and shut down.
+    /// with endpoint clones. They are aborted and joined before the node is
+    /// taken and shut down, so those operations no longer own the transport.
     ///
     /// Compatibility wrapper for callers that cannot consume a typed shutdown
     /// result. Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
@@ -4400,6 +4396,11 @@ impl NetworkNode {
     /// This helper reduces boilerplate in methods that need exclusive
     /// access to the node after releasing the read lock.
     async fn require_node(&self) -> NetworkResult<LinkNode> {
+        if self.shutdown_state.started.load(Ordering::Acquire) {
+            return Err(NetworkError::NodeError(
+                "network is shutting down".to_string(),
+            ));
+        }
         self.node
             .read()
             .await
@@ -4912,9 +4913,8 @@ impl NetworkNode {
             debug!("NetworkNode receiver task started");
 
             loop {
-                // Get node read lock
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
+                let node_handle = node.read().await.as_ref().cloned();
+                let node_ref = match node_handle.as_ref() {
                     Some(n) => n,
                     None => {
                         debug!("Node not initialized, receiver stopping");
@@ -4923,11 +4923,8 @@ impl NetworkNode {
                 };
 
                 let recv_result = node_ref.recv_with_generation().await;
-                // Explicitly drop the read lock guard so we don't hold it
-                // across channel sends — otherwise a backpressured direct_tx
-                // or stream-specific gossip channel can stall every other caller
-                // that wants the same read lock and masks as a delivery bug.
-                drop(node_guard);
+                // Release this endpoint clone before any channel backpressure.
+                drop(node_handle);
 
                 match recv_result {
                     Ok((peer_id, source_generation, data)) => {
@@ -5241,8 +5238,8 @@ impl NetworkNode {
             debug!("NetworkNode accept loop started");
 
             loop {
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
+                let node_handle = node.read().await.as_ref().cloned();
+                let node_ref = match node_handle.as_ref() {
                     Some(n) => n,
                     None => {
                         debug!("Node not initialized, accept loop stopping");
@@ -6019,8 +6016,8 @@ async fn plane_note_connected(
     let frame = build_plane_hello_frame(plane_id);
     let node = Arc::clone(node);
     tokio::spawn(async move {
-        let guard = node.read().await;
-        if let Some(node) = guard.as_ref() {
+        let node = node.read().await.as_ref().cloned();
+        if let Some(node) = node {
             if let Err(e) = node.send(&peer, &frame).await {
                 tracing::debug!(
                     target: "x0x::connect",
@@ -6193,10 +6190,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // per-peer sends in a small timeout; a multi-second liveness repair on
         // this path turns healthy gossip degradation into a timeout/log storm.
         {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
 
             node.send(&ant_peer, &buf)
                 .await
@@ -6251,12 +6245,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // allocation. Policy is *not* settled here — the authoritative
         // rechecks run inside the post-`open_uni` callback below.
         let (ant_generation, session) = {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
             Self::current_session_for_peer(
-                node,
+                &node,
                 &self.authenticated_sessions,
                 self.session_registry_cap(),
                 &ant_peer,
@@ -6276,10 +6267,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         }
 
         {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
             node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
                 frame_guarded_admission(
                     stream_type,
@@ -6287,7 +6275,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                     actual,
                     session,
                     Self::current_session_for_peer(
-                        node,
+                        &node,
                         &self.authenticated_sessions,
                         self.session_registry_cap(),
                         &ant_peer,

@@ -988,6 +988,24 @@ const _: () = assert!(
 );
 
 impl PubSubManager {
+    /// Stop membership-hold receivers and PlumTree's background senders before
+    /// the gossip runtime hands transport ownership to network shutdown.
+    pub(crate) async fn shutdown(&self) {
+        let handles: Vec<_> = self.membership_holds.write().await.drain().collect();
+        for (_, handle) in &handles {
+            handle.abort();
+        }
+        for (_, handle) in handles {
+            let _ = handle.await;
+        }
+        let report = self.plumtree.shutdown().await;
+        tracing::debug!(
+            joined = report.joined,
+            aborted = report.aborted,
+            "PlumTree background shutdown completed"
+        );
+    }
+
     /// Install the live security views used to authorize roster preferences.
     pub fn set_group_identity_context(
         &self,
