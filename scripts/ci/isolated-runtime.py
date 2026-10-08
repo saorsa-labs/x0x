@@ -23,6 +23,18 @@ ENV_KEYS = (
 )
 
 
+# Never upload fixture key material or the daemon bearer token, even though the
+# fixtures use throwaway loopback identities. Their manifest rows keep the size.
+# named_groups.json is kept on purpose: the roster/epoch/secret-presence fields
+# are the diagnosis, and its group secrets belong to throwaway test groups.
+SECRET_BASENAMES = frozenset({'machine.key', 'agent.key', 'user.key', 'agent_kem.key',
+                              'api-token'})
+
+
+def secret_fixture_file(relative):
+    return relative.name in SECRET_BASENAMES or 'identity' in relative.parts[:-1]
+
+
 def retain_fixture_diagnostics(config, returncode):
     """Best-effort, unprivileged copy before private /tmp disappears.
 
@@ -63,6 +75,13 @@ def retain_fixture_diagnostics(config, returncode):
                     if name is None:
                         row['status'] = 'directory'
                         continue
+                    if secret_fixture_file(relative):
+                        try:
+                            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                            row.update(status='skipped-secret', source_bytes=info.st_size)
+                        except OSError as error:
+                            row.update(status='skipped-secret', errno=error.errno)
+                        continue
                     try:
                         # NONBLOCK prevents a FIFO from hanging us before fstat.
                         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
@@ -91,6 +110,10 @@ def retain_fixture_diagnostics(config, returncode):
                         row.update(status='error', errno=error.errno)
                 if manifest['limit_reached']:
                     break
+        except OSError as error:
+            # A walk error (e.g. a directory removed mid-descent) keeps what was
+            # already copied and labels the manifest instead of discarding it.
+            manifest['aborted'] = error.errno
         finally:
             os.close(source_fd)
         (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -60,6 +60,31 @@ class FixtureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(manifest['exit'], 101)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.evidence.iterdir()})
 
+    def test_key_files_and_api_token_are_never_copied(self):
+        identity = self.fixture / 'identity'
+        identity.mkdir()
+        (identity / 'agent.key').write_bytes(b'AGENT-SECRET')
+        (identity / 'machine.key').write_bytes(b'MACHINE-SECRET')
+        (identity / 'other.bin').write_bytes(b'IDENTITY-DIR-SECRET')
+        (self.fixture / 'user.key').write_bytes(b'USER-SECRET')
+        (self.fixture / 'api-token').write_text('TOKEN-SECRET')
+        (self.fixture / 'named_groups.json').write_text('{"epoch": 2}')
+        (self.fixture / 'daemon.stderr.log').write_text('log line\n')
+        manifest = self.collect()
+        rows = {row['path']: row for row in manifest['entries']}
+        for path, size in (('x0x-test-bob/identity/agent.key', 12),
+                           ('x0x-test-bob/identity/machine.key', 14),
+                           ('x0x-test-bob/identity/other.bin', 19),
+                           ('x0x-test-bob/user.key', 11),
+                           ('x0x-test-bob/api-token', 12)):
+            self.assertEqual(rows[path]['status'], 'skipped-secret')
+            self.assertEqual(rows[path]['source_bytes'], size)
+            self.assertFalse((self.output / path).exists())
+        uploaded = b''.join(p.read_bytes() for p in self.output.rglob('*') if p.is_file())
+        self.assertNotIn(b'SECRET', uploaded)
+        self.assertEqual((self.output / 'x0x-test-bob/named_groups.json').read_text(), '{"epoch": 2}')
+        self.assertEqual((self.output / 'x0x-test-bob/daemon.stderr.log').read_text(), 'log line\n')
+
     def test_success_and_non_opted_in_failure_do_not_copy(self):
         runtime.retain_fixture_diagnostics(self.config, 0)
         self.assertFalse(self.output.exists())
