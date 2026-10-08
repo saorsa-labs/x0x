@@ -207,8 +207,10 @@ async fn wait_for_value(
 
 /// #1266 follow-up (a): a sealed record that reaches the survivor inside the
 /// keyless gap cannot be opened and is dropped, not queued. When the share
-/// installs and the store re-arms, the survivor must ask the group once for
-/// current state, so the dropped record comes back without a restart.
+/// installs and the store re-arms, the survivor must ask the group for
+/// current state, so the dropped record comes back without a restart. Here
+/// the first request is answered; the single retry is due only after the
+/// holders' response cooldown.
 ///
 /// Alice is a second encrypted sync on the survivor's own pub/sub (loopback
 /// node, no peers), holding the admin identity and its own GSS context. Both
@@ -346,18 +348,19 @@ async fn issue1266_record_dropped_in_rekey_gap_is_repaired_once() -> Result<()> 
         served.requests_answered
     );
     assert_eq!(body["value"], BASE64.encode(b"gap-value"));
-    assert_eq!(requests, 1, "exactly one repair request per key gap");
+    assert_eq!(requests, 1, "the first repair request recovered the record");
     assert_eq!(served.requests_received, 1);
     assert_eq!(served.requests_answered, 1);
 
-    // Later refreshes at the same keyed epoch send nothing more.
+    // Later refreshes at the same keyed epoch start no new repair; the
+    // single retry waits out the cooldown.
     let (status, _) = get_value(&f.state, &topic, "gap").await?;
     assert_eq!(status, StatusCode::OK);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         bob.state_sync_snapshot().requests_sent - baseline_requests,
         1,
-        "no second repair request without a new gap"
+        "no new repair without a new gap, and no early retry"
     );
     alice.cancel_sync();
     Ok(())
@@ -379,6 +382,19 @@ impl AliceReplica {
         admin_kp: &crate::identity::AgentKeypair,
         topic: &str,
     ) -> Result<Self> {
+        let replica = Self::build(state, group_id, admin_kp, topic, 0xA1).await?;
+        replica.sync.start().await?;
+        Ok(replica)
+    }
+
+    /// The replica without its background loops (it can still publish).
+    async fn build(
+        state: &Arc<AppState>,
+        group_id: &str,
+        admin_kp: &crate::identity::AgentKeypair,
+        topic: &str,
+        peer_byte: u8,
+    ) -> Result<Self> {
         let current = state
             .named_groups
             .read()
@@ -399,7 +415,7 @@ impl AliceReplica {
             stable.as_bytes().to_vec(),
             Arc::clone(&ctx) as Arc<dyn x0x::kv::encrypted::KvSecureContext>,
         )?;
-        let peer = saorsa_gossip_types::PeerId::new([0xA1; 32]);
+        let peer = saorsa_gossip_types::PeerId::new([peer_byte; 32]);
         let mut sync = x0x::kv::KvStoreSync::new(
             store,
             state.agent.pubsub().context("survivor pubsub")?,
@@ -413,7 +429,6 @@ impl AliceReplica {
         );
         sync.set_author_signing(x0x::kv::encrypted::AuthorSigning::from_keypair(admin_kp)?);
         sync.silence_bootstrap();
-        sync.start().await?;
         Ok(Self { sync, ctx, peer })
     }
 
@@ -500,7 +515,9 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     alice.publish("seed", b"seed-value").await?;
     let (status, body) = wait_for_value(&f.state, &topic, "seed", Duration::from_secs(10)).await?;
     assert_eq!(status, StatusCode::OK, "seed replicated: {body}");
-    let _ = bob.request_state_repair().await?;
+    // Only the first request is wanted here: drop the repair before its
+    // retry is due.
+    let _ = tokio::time::timeout(Duration::from_secs(2), bob.request_state_repair()).await;
     let answered = wait_for_count(
         || alice.sync.state_sync_snapshot().requests_answered,
         1,
@@ -818,4 +835,125 @@ async fn issue1266_daemon_shutdown_releases_open_gss_store() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1266_daemon_shutdown_with_repair_in_flight_releases_state() -> Result<()> {
     daemon_shutdown_releases_gss_store(true).await
+}
+
+/// #1266 review r3: a serve marker is not proof that the survivor holds the
+/// state. Alice serves her current-epoch state to another requester while
+/// the survivor is keyless, so the survivor drops it. When the survivor's
+/// first repair request falls in Alice's cooldown, that serve's marker
+/// arrives late and is valid at the survivor's epoch. The repair must still
+/// send its single retry, and the dropped record must come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1266_delayed_marker_does_not_cancel_the_repair_retry() -> Result<()> {
+    let (state, dir) = loopback_survivor_state().await?;
+    let f = f1_gss_rotation_fixture_on(state, dir, "issue1266marker").await?;
+    let admin = f.admin_kp.agent_id();
+    let (status, created) = open_group_store(&f.state, &f.group_id).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "open survivor store: {created}"
+    );
+    let topic = created["topic"]
+        .as_str()
+        .context("store topic")?
+        .to_string();
+    let bob = f
+        .state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .context("store handle registered")?;
+    bob.silence_bootstrap_for_test();
+    let alice = AliceReplica::start(&f.state, &f.group_id, &f.admin_kp, &topic).await?;
+    alice.publish("seed", b"seed-value").await?;
+    let (status, body) = wait_for_value(&f.state, &topic, "seed", Duration::from_secs(10)).await?;
+    assert_eq!(status, StatusCode::OK, "seed replicated: {body}");
+    // Another requester: Alice's identity on a second peer id, with no
+    // background loops, so it never answers anything itself.
+    let other = AliceReplica::build(&f.state, &f.group_id, &f.admin_kp, &topic, 0xA2).await?;
+
+    // The gap. Alice writes at the rotated epoch without publishing, then
+    // serves her full state to another requester (her own identity on a
+    // second peer id). The keyless survivor drops that serve.
+    let removed =
+        apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None).await;
+    assert!(removed.should_exit, "signed MemberRemoved must apply");
+    alice.rotate(&f.state, &f.group_id, &f.new_secret).await?;
+    {
+        let mut s = alice.sync.write().await;
+        s.put(
+            "gap".to_string(),
+            b"gap-value".to_vec(),
+            "text/plain".to_string(),
+            alice.peer,
+        )?;
+    }
+    other.rotate(&f.state, &f.group_id, &f.new_secret).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), other.sync.request_state_repair()).await;
+    let answered = wait_for_count(
+        || alice.sync.state_sync_snapshot().requests_answered,
+        1,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        answered, 1,
+        "Alice served her current-epoch state in the gap"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        bob.wait_receive_rejected_for_test(),
+    )
+    .await
+    .context("the survivor must receive and drop the served state")?;
+    let (status, body) = get_value(&f.state, &topic, "gap").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
+    let baseline_requests = bob.state_sync_snapshot().requests_sent;
+
+    // The share installs inside Alice's cooldown: the first repair request
+    // is suppressed.
+    let delivered =
+        apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
+            .await;
+    assert!(!delivered.should_exit);
+    let (status, _) = get_value(&f.state, &topic, "gap").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let suppressed = wait_for_count(
+        || alice.sync.state_sync_snapshot().rejected_cooldown,
+        1,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        suppressed, 1,
+        "the first repair request fell in the cooldown"
+    );
+
+    // The serve's marker arrives late, valid at the survivor's epoch.
+    alice.sync.publish_served_marker_for_test().await?;
+
+    let (status, body) = wait_for_value(&f.state, &topic, "gap", Duration::from_secs(40)).await?;
+    let served = alice.sync.state_sync_snapshot();
+    let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a late marker must not cancel the retry: {body}; survivor requests {requests}; \
+         responder cooldown rejections {} answered {}",
+        served.rejected_cooldown,
+        served.requests_answered
+    );
+    assert_eq!(body["value"], BASE64.encode(b"gap-value"));
+    assert_eq!(requests, 2, "one repair request plus exactly one retry");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        bob.state_sync_snapshot().requests_sent - baseline_requests,
+        2,
+        "the repair is capped at two requests"
+    );
+    alice.sync.cancel_sync();
+    Ok(())
 }
