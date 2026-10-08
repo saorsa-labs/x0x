@@ -1,4 +1,4 @@
-//! Real-socket in-process shutdown regressions (#1262, #1263 part 1).
+//! Real-socket in-process shutdown regressions (#1262, #1263 part 1, #1269).
 //!
 //! Every daemon binds loopback only, has no bootstrap peer outside the
 //! test, runs with mDNS, port mapping, the peer cache and update checks
@@ -15,6 +15,10 @@
 //!   concurrently), `X0X_1262_NO_GROUPS`/`_KV`/`_DM=1`, and `RUST_LOG`.
 //! - `issue1263_shutdown_with_frozen_peer`: sends blocked on a peer that
 //!   stopped reading must not stall network teardown.
+//! - `issue1269_group_join_shutdown_releases_owner`: after a peer joins a
+//!   named group, both daemons' AppState and Agent must be released when
+//!   `shutdown_and_wait` returns, so a same-dir relaunch can reopen
+//!   `history.db`.
 
 #![cfg(test)]
 
@@ -730,6 +734,183 @@ mod workload {
         );
     }
 
+    /// How long the Agent and AppState of a stopped daemon may outlive a
+    /// successful `shutdown_and_wait` (#1269).
+    const GROUP_JOIN_RELEASE_BOUND: Duration = Duration::from_secs(2);
+
+    /// Wait up to [`GROUP_JOIN_RELEASE_BOUND`] for both weak handles to
+    /// lose their last strong owner. Returns the final strong counts.
+    async fn released(state: &Weak<AppState>, agent: &Weak<crate::Agent>) -> (usize, usize) {
+        let deadline = Instant::now() + GROUP_JOIN_RELEASE_BOUND;
+        while (state.strong_count() > 0 || agent.strong_count() > 0) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (state.strong_count(), agent.strong_count())
+    }
+
+    /// #1269: A creates a named group, B joins it by invite, then A shuts
+    /// down. A's AppState and Agent (and with them the exclusive
+    /// `history.db` connection) must go when `shutdown_and_wait` returns,
+    /// and a relaunch on the same data dir must succeed at once.
+    ///
+    /// Each daemon runs on its own runtime, as an embedder's daemons do;
+    /// the HTTP driver runs on a third.
+    pub(super) fn group_join_relaunch() {
+        init_tracing();
+        let runtime = |name: &str| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name(name)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("daemon runtime")
+        };
+        let (a_runtime, b_runtime, driver) = (
+            runtime("issue1269-a"),
+            runtime("issue1269-b"),
+            runtime("issue1269-driver"),
+        );
+        let root = tempfile::tempdir().expect("isolated daemon directories");
+        let plane = format!("x0x.test.1269.{}", std::process::id());
+        let dir_a = root.path().join("a");
+        let dir_b = root.path().join("b");
+        let http = client();
+        let a = a_runtime.block_on(start(&dir_a, &plane, &[]));
+        let b = b_runtime.block_on(start(&dir_b, &plane, &[a.udp]));
+        assert!(
+            a_runtime.block_on(wait_connected(&a, &b)),
+            "A and B connect"
+        );
+        let group = driver.block_on(async {
+            let group = call(
+                &http,
+                &a,
+                reqwest::Method::POST,
+                "/groups",
+                Some(serde_json::json!({ "name": "g-1269" })),
+            )
+            .await
+            .and_then(|v| v["group_id"].as_str().map(str::to_string))
+            .expect("A creates a named group");
+            let invite = call(
+                &http,
+                &a,
+                reqwest::Method::POST,
+                &format!("/groups/{group}/invite"),
+                Some(serde_json::json!({ "expiry_secs": 3600 })),
+            )
+            .await
+            .and_then(|v| v["invite_link"].as_str().map(str::to_string))
+            .expect("A mints an invite");
+            let joined = call(
+                &http,
+                &b,
+                reqwest::Method::POST,
+                "/groups/join",
+                Some(serde_json::json!({ "invite": invite })),
+            )
+            .await;
+            eprintln!("ISSUE1269 join response: {joined:?}");
+            assert!(joined.is_some(), "B's join request is accepted");
+            // The join is complete when A's roster lists B.
+            let seated_deadline = Instant::now() + Duration::from_secs(30);
+            let mut seated = false;
+            while !seated && Instant::now() < seated_deadline {
+                seated = call(
+                    &http,
+                    &a,
+                    reqwest::Method::GET,
+                    &format!("/groups/{group}/members"),
+                    None,
+                )
+                .await
+                .is_some_and(|v| v["members"].to_string().contains(&b.agent_hex));
+                if !seated {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            assert!(seated, "A seats B within 30 s");
+            group
+        });
+        eprintln!("ISSUE1269 B seated in group {group}");
+
+        let state_a = a.state.clone();
+        let agent_a = a
+            .state
+            .upgrade()
+            .map(|state| Arc::downgrade(&state.agent))
+            .expect("live A agent");
+        let started = Instant::now();
+        let result = a_runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), a.handle.shutdown_and_wait()).await
+        });
+        let took = started.elapsed();
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "A shutdown_and_wait after {took:?}: {result:?}"
+        );
+        let (appstate_strong, agent_strong) = a_runtime.block_on(released(&state_a, &agent_a));
+        eprintln!(
+            "ISSUE1269 a shutdown took {took:?}; +{:?} appstate_strong={appstate_strong} \
+             agent_strong={agent_strong} a_runtime_alive_tasks={}",
+            GROUP_JOIN_RELEASE_BOUND,
+            a_runtime.metrics().num_alive_tasks()
+        );
+
+        // Relaunch A on the same data and identity dirs. One attempt only:
+        // a stray owner of the old Agent still holds `history.db`.
+        let relaunch = a_runtime.block_on(serve_with_options(
+            config(&dir_a, &plane, &[b.udp]),
+            ServeOptions {
+                skip_update_check: true,
+                cli_no_port_mapping: true,
+                cli_disable_peer_cache: true,
+                self_update_enabled: false,
+                ..ServeOptions::default()
+            },
+        ));
+        let relaunch_error = relaunch.as_ref().err().map(|error| format!("{error:#}"));
+        eprintln!("ISSUE1269 a relaunch error={relaunch_error:?}");
+
+        // Stop everything before asserting, so a failure leaks nothing.
+        if let Ok(handle) = relaunch {
+            let _ = a_runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(60), handle.shutdown_and_wait()).await
+            });
+        }
+        let state_b = b.state.clone();
+        let agent_b = b
+            .state
+            .upgrade()
+            .map(|state| Arc::downgrade(&state.agent))
+            .expect("live B agent");
+        let result_b = b_runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), b.handle.shutdown_and_wait()).await
+        });
+        let (appstate_strong_b, agent_strong_b) = b_runtime.block_on(released(&state_b, &agent_b));
+        eprintln!(
+            "ISSUE1269 b result={result_b:?} appstate_strong={appstate_strong_b} \
+             agent_strong={agent_strong_b}"
+        );
+
+        assert_eq!(
+            (appstate_strong, agent_strong),
+            (0, 0),
+            "A's AppState/Agent outlive shutdown_and_wait by more than {GROUP_JOIN_RELEASE_BOUND:?}"
+        );
+        assert!(
+            relaunch_error.is_none(),
+            "same-dir relaunch of A refused: {relaunch_error:?}"
+        );
+        assert!(matches!(result_b, Ok(Ok(()))), "B shutdown: {result_b:?}");
+        assert_eq!(
+            (appstate_strong_b, agent_strong_b),
+            (0, 0),
+            "B's AppState/Agent outlive shutdown_and_wait by more than {GROUP_JOIN_RELEASE_BOUND:?}"
+        );
+    }
+
     /// #1263 part 1: B stops reading (a suspended phone or a stalled host)
     /// while it stays connected. A's gossip sends to B (SWIM probes, eager
     /// pushes) then block in ant-quic `open_uni` until B's connection idles
@@ -860,6 +1041,12 @@ fn issue1262_owned_workload_parallel() {
 #[ignore = "real sockets: requires the approved loopback-only sandbox"]
 fn issue1263_shutdown_with_frozen_peer() {
     workload::frozen_peer();
+}
+
+#[test]
+#[ignore = "real sockets: requires the approved loopback-only sandbox"]
+fn issue1269_group_join_shutdown_releases_owner() {
+    workload::group_join_relaunch();
 }
 
 /// #1262/#1263: a daemon whose peer is unreachable (an offline phone, or a
