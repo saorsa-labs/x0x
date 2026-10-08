@@ -1284,6 +1284,11 @@ impl Store {
                 return Ok((vacuumed, true));
             }
             let before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            // R4-A (round 7 review): the leading read may have used up the
+            // budget; the vacuum step is a new reclamation write.
+            if std::time::Instant::now() >= deadline {
+                return Ok((vacuumed, true));
+            }
             conn.execute_batch(&format!(
                 "PRAGMA incremental_vacuum({VACUUM_PAGES_PER_SLICE});"
             ))?;
