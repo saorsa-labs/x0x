@@ -20,8 +20,11 @@ CARD = Path('.well-known/agent.json')
 EXPECTED_RELEASE_JOB_NEEDS = {
     'require-green-ci': ['validate-release-metadata'],
     'resolve-release-lock': ['validate-release-metadata', 'require-green-ci'],
-    'build-release': [
+    'prepare-m2-signing-controls': [
         'validate-release-metadata', 'require-green-ci', 'resolve-release-lock'],
+    'build-release': [
+        'validate-release-metadata', 'require-green-ci', 'resolve-release-lock',
+        'prepare-m2-signing-controls'],
     'sign-release': ['build-release'],
     'create-release': ['build-release', 'sign-release'],
 }
@@ -92,6 +95,13 @@ def job_needs_violations(text, expected, workflow_name):
     """Return exact-name gating violations for one workflow's jobs."""
     needs = parse_workflow_needs(text)
     violations = []
+    # Check every declared edge, including jobs not yet in the expected map.
+    # Otherwise a new job can hide a misspelled dependency from this guard.
+    for job, dependencies in needs.items():
+        for dependency in dependencies:
+            if dependency not in needs:
+                violations.append(
+                    f'{job} needs unknown job {dependency!r} in {workflow_name}')
     for job, dependencies in expected.items():
         if job not in needs:
             violations.append(f'{job} is missing from {workflow_name}')

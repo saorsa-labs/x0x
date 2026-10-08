@@ -21,6 +21,9 @@ jobs:
       - name: Test build artifact provenance controls
         run: python3 .github/scripts/test_build_artifact_provenance.py
 
+      - name: Test M2 signing gate controls
+        run: python3 .github/scripts/test_m2_release_signing_gate.py
+
       - name: Test release metadata validation
         run: python3 .github/scripts/test_release_metadata.py
 
@@ -37,9 +40,44 @@ jobs:
           python3 .github/scripts/validate_release_metadata.py \
             --mode push_main
 
+  # Generate one fresh public control bundle; this crate depends only on
+  # fips204, so no leg pays for a host debug build of the x0x graph.
+  prepare-m2-signing-controls:
+    name: Prepare M2 signing controls
+    needs: validate-release-metadata
+    runs-on: ubuntu-latest
+    outputs:
+      receipt_sha256: ${{ steps.fixture.outputs.receipt_sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache small signing fixture build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ runner.temp }}/m2-signing-helper/target
+          key: linux-m2-signing-fixture-${{ hashFiles('Cargo.lock', '.github/scripts/m2_release_signing_gate_fixture.py') }}
+          restore-keys: linux-m2-signing-fixture-
+
+      - name: Generate and verify throwaway public controls
+        id: fixture
+        run: |
+          python3 .github/scripts/m2_release_signing_gate_fixture.py \
+            --helper "${RUNNER_TEMP}/m2-signing-helper" \
+            --output "${RUNNER_TEMP}/m2-signing-controls"
+
+      - name: Upload public signing controls
+        uses: actions/upload-artifact@v5
+        with:
+          name: m2-signing-controls
+          path: ${{ runner.temp }}/m2-signing-controls/
+          if-no-files-found: error
+
   build-matrix:
     name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
+    needs: [validate-release-metadata, prepare-m2-signing-controls]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -163,6 +201,71 @@ jobs:
             --build-messages "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
           python3 .github/scripts/build_artifact_provenance.py verify \
             --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}"
+
+      # Exercise the release gate on all six executors on every PR/main build.
+      - name: Package signing control archive
+        shell: bash
+        env:
+          M2_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+          platform = os.environ["M2_PLATFORM"]
+          custody = Path(os.environ["RUNNER_TEMP"]) / ("x0x-" + platform)
+          output = Path(os.environ["RUNNER_TEMP"]) / ("m2-build-signing-" + platform)
+          output.mkdir()
+          suffix = ".exe" if platform == "windows-x64" else ""
+          names = [name + suffix for name in ("x0x", "x0xd")]
+          if suffix:
+              with zipfile.ZipFile(output / "archive.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                  for name in names:
+                      archive.write(custody / name, arcname=name)
+          else:
+              with tarfile.open(output / "archive.tar.gz", "w:gz") as archive:
+                  for name in names:
+                      archive.add(custody / name, arcname=name)
+          PY
+
+      - name: Prepare ARM64 packaged verification
+        if: matrix.platform == 'linux-arm64-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
+
+      - name: Download public signing controls
+        uses: actions/download-artifact@v5
+        with:
+          name: m2-signing-controls
+          path: ${{ runner.temp }}/m2-signing-controls
+
+      - name: Prove packaged production trust and test-feature absence
+        shell: bash
+        env:
+          M2_PLATFORM: ${{ matrix.platform }}
+        run: |
+          archive="archive.tar.gz"
+          if [[ "$M2_PLATFORM" == windows-* ]]; then
+            archive="archive.zip"
+          fi
+          python3 .github/scripts/m2_release_signing_gate.py \
+            --build-messages "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl" \
+            --archive "${RUNNER_TEMP}/m2-build-signing-${{ matrix.platform }}/${archive}" \
+            --custody "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
+            --control-fixture "${RUNNER_TEMP}/m2-signing-controls" \
+            --control-receipt-sha256 "${{ needs.prepare-m2-signing-controls.outputs.receipt_sha256 }}" \
+            --platform "${{ matrix.platform }}" \
+            --receipt "${RUNNER_TEMP}/m2-build-signing-${{ matrix.platform }}/receipt.json"
+
+      - name: Upload M2 packaged signing evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: m2-build-signing-${{ matrix.platform }}
+          path: ${{ runner.temp }}/m2-build-signing-${{ matrix.platform }}/receipt.json
+          if-no-files-found: error
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5

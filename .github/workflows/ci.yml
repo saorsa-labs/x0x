@@ -168,6 +168,13 @@ jobs:
           name: test-results
           path: target/nextest/
 
+      # The workspace all-features lane exercises the debug seam. Also run the
+      # committed H controls with the default production trust root in isolation.
+      - name: M2 default-key and debug-signing controls
+        env:
+          X0X_ISOLATION_ROLE: m2-signing-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+
 
       # Run after the workspace artifact is uploaded so this nextest invocation
       # cannot replace the full-suite results kept above.
@@ -325,6 +332,9 @@ jobs:
       - name: Exercise inert runner controls
         run: python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
 
+      - name: Exercise inert M2 release metadata controls
+        run: python3 -B .github/scripts/test_m2_release_signing_gate.py -v
+
       - name: Prepare Linux acceptance custody
         shell: bash
         run: |
@@ -358,7 +368,9 @@ jobs:
       - name: Exercise literal systemd paths and arguments
         shell: bash
         run: |
-          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance/literals"
+          # A sibling keeps the dropped fixture owner from traversing the
+          # acceptance directory after it has been returned to the runner.
+          artifact="${RUNNER_TEMP}/linux690-systemd-literals"
           python3 -B scripts/ci/test_systemd_literals.py --self-test
           set +e
           sudo python3 -B scripts/ci/test_systemd_literals.py \
@@ -368,6 +380,7 @@ jobs:
           set -e
           sudo chown -R "$(id -u):$(id -g)" "${artifact}"
           printf 'LITERAL_ACCEPTANCE_EXIT=%s\n' "${literal_status}" >"${artifact}/workflow-exit.txt"
+          mv "${artifact}" "${RUNNER_TEMP}/linux690-systemd-acceptance/literals"
           exit "${literal_status}"
 
       - name: Upload Linux systemd acceptance custody
