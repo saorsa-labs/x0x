@@ -1995,6 +1995,7 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 | GET | `/history/message/:msg_id` | `x0x history message <MSG_ID>` | Point lookup of one row by exposed `msg_id` (`?scope=` for canonical group ids; 404 when absent, 400 malformed) |
 | GET | `/history/search` | `x0x history search [SCOPE] <QUERY>` | Full-text search over text payloads. `scope` is **optional**: omitted, it searches every retained scope |
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
+| GET | `/history/policy` | `x0x history policy` | Local history policy in force (ADR 0116): rules, defaults, protected groups, counters. **Owner-only** (durable token) |
 | DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
@@ -2058,6 +2059,28 @@ owner-only. The ADR-0039 rider allowlist admits exactly `GET /history`, so
 the auth middleware answers `403` on both before the handler runs; a rider
 can neither read rows nor learn row counts for scopes outside its grants.
 That boundary is unchanged by this issue.
+
+### Local history policy — `GET /history/policy` (ADR 0116)
+
+Owner-only: only the durable API token in `Authorization: Bearer …` reads
+it. A session or rider token gets **403**, and a missing or unknown token,
+or a token in the query string, gets **401**. The read works when history is
+disabled.
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether durable history is enabled on this daemon |
+| `rules` | The rules in force: `max_bytes`, `max_age_days`, `scope_limits`, `record_topics`, `dm_recording`, `class_limits` (Durable then Replaceable), `topic_rules` (prefix byte order). With history enabled these are what the open store enforces; with it disabled, the configured `[history]` table |
+| `defaults` | The same fields with every key unset (the daemon defaults) |
+| `class_derivation` | How a stored row's class is derived: `replace_key IS NULL` is Durable, `IS NOT NULL` is Replaceable; Ephemeral is never stored |
+| `protected_group_exception` | Group history has no Ephemeral opt-out (`group_history_ephemeral: false`), and fork-quarantine pins win over every rule. `pinned_scopes` lists each pinned group under both spellings with its `ceiling_bytes`; `ceiling` gives the ADR 0068 formula and constants |
+| `counters` | `null` when history is disabled. Otherwise bounded, unlabelled counters: `policy_suppressed_dm_total`, `policy_suppressed_topic_total`, `policy_durable_receipt_withheld_total` (cumulative), and `skipped_scope_limits`, `skipped_topic_rules` (entries the latest retention pass skipped) |
+| `store` | `null` when history is disabled; otherwise `text_encoding` of the history database. Topic-rule limits need `UTF-8` |
+
+These counters appear only here; `/diagnostics/history` is unchanged. An
+older daemon has no such route and answers 404. A client must report that
+the operation is unsupported, and must not fall back to reading the
+database.
 
 ### Fork quarantine on the history surface (ADR-0066 §3a)
 

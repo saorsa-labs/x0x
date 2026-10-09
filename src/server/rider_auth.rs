@@ -536,6 +536,7 @@ mod tests {
             // rows or row counts for scopes it was never granted.
             ("/history/scopes", Method::GET),
             ("/history/stats", Method::GET),
+            ("/history/policy", Method::GET),
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),
             ("/forwards", Method::POST),

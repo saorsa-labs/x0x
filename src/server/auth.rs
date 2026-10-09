@@ -372,6 +372,9 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
             ) || is_two_segment_action(path, "delegate")
         }
         Method::DELETE => is_sync_device_path(path),
+        // ADR 0116 §3: the local history policy, with its counters and the
+        // fork-quarantine pins, is an owner-only read.
+        Method::GET => path == "/history/policy",
         _ => false,
     }
 }

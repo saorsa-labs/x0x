@@ -44,6 +44,14 @@ All notable changes to this project will be documented in this file.
   `policy_durable_receipt_withheld_total` record this locally. A new
   `HistoryError::PolicySuppressed` is returned by `record_committed` for a
   suppressed record.
+- **`GET /history/policy` and `x0x history policy` (ADR 0116 slice E,
+  #1264).** An owner-only read (durable token; sessions and riders get 403)
+  of the local history policy in force. It reports the rules, the defaults,
+  how a row's class is derived, the protected-group exception (the current
+  fork-quarantine pins and their ceiling) and the bounded counters: the
+  three suppression counters and the `skipped_scope_limits` /
+  `skipped_topic_rules` gauges. It works with history disabled. These
+  counters appear only here; no existing response changed.
 
 ### Changed
 

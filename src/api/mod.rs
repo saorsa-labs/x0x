@@ -735,6 +735,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/history/policy",
+        cli_name: "history policy",
+        description: "Local history policy in force (ADR 0116): rules, defaults, pins and counters (owner-only)",
+        category: "history",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
         method: Method::Delete,
         path: "/history",
         cli_name: "history purge",

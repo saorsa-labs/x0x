@@ -159,6 +159,14 @@ pub async fn stats(client: &DaemonClient) -> Result<()> {
     client.run_get("/history/stats").await
 }
 
+/// `x0x history policy` — GET /history/policy (ADR 0116 §3)
+///
+/// Prints the local history policy in force: rules, defaults, protected
+/// groups and counters. Needs the durable API token.
+pub async fn policy(client: &DaemonClient) -> Result<()> {
+    client.run_get("/history/policy").await
+}
+
 /// `x0x history purge` — DELETE /history
 ///
 /// Purges one scope from the local store. Local-only: never propagated to

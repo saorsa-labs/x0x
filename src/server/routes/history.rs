@@ -1160,13 +1160,187 @@ pub(in crate::server) async fn history_purge(
     }
 }
 
-/// GET /history/policy (ADR 0116 §3).
+/// Rules as `GET /history/policy` reports them: the global and exact-scope
+/// bounds, the topics recorded, and the ADR 0116 rules in compiled form
+/// (class limits Durable then Replaceable; topic rules in prefix byte
+/// order).
+fn history_policy_rules_json(
+    policy: &x0x::history::HistoryPolicy,
+    retention: &x0x::history::RetentionPolicy,
+    record_topics: &[String],
+) -> serde_json::Value {
+    const DAY_MS: i64 = 86_400_000;
+    let class_limits: Vec<serde_json::Value> = [
+        x0x::history::RetainedClass::Durable,
+        x0x::history::RetainedClass::Replaceable,
+    ]
+    .into_iter()
+    .filter_map(|class| {
+        policy.class_bounds(class).map(|bounds| {
+            serde_json::json!({
+                "class": class,
+                "max_bytes": bounds.max_bytes,
+                "max_age_days": bounds.max_age_ms.map(|ms| ms / DAY_MS),
+            })
+        })
+    })
+    .collect();
+    let topic_rules: Vec<serde_json::Value> = policy
+        .topic_rules()
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "prefix": rule.prefix,
+                "recording": rule.recording,
+                "max_bytes": rule.bounds.max_bytes,
+                "max_age_days": rule.bounds.max_age_ms.map(|ms| ms / DAY_MS),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "max_bytes": retention.max_bytes,
+        "max_age_days": retention.max_age_days,
+        "scope_limits": retention.scope_limits,
+        "record_topics": record_topics,
+        "dm_recording": policy.dm_recording(),
+        "class_limits": class_limits,
+        "topic_rules": topic_rules,
+    })
+}
+
+/// GET /history/policy (ADR 0116 §3): the local history policy in force.
 ///
-/// RED SEAM (slice E test commit): not wired into the router and returns
-/// 501, so the slice E tests compile against the base and fail on their
-/// assertions. The next commit replaces it.
-pub(in crate::server) async fn history_policy() -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+/// Owner-only. The durable bearer is enforced at the route layer
+/// (`auth::requires_durable_owner`) and again here; sessions and riders get
+/// 403. The read works when history is disabled: it then reports the
+/// configured `[history]` rules, with no store and no counters. With
+/// history enabled it reports what the open store enforces.
+///
+/// Ruling Q11: this is the only body that carries the ADR 0116 counters
+/// and gauges (C's suppression counters; the #1286 and topic-rule skip
+/// gauges). No existing response gained a key. Every counter is a bounded
+/// scalar: no topic, payload or other label.
+///
+/// ADR 0066 §1: classified Observability. It reports the fork-quarantine
+/// pins (the protected-group exception) and does not act under them.
+pub(in crate::server) async fn history_policy(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "the history policy is owner-only: use the durable API token",
+        );
+    }
+    let history = state.agent.history();
+    let config = &state.history_config;
+    let from_config;
+    let (policy, retention) = match history {
+        Some(history) => (history.policy(), history.retention_policy().clone()),
+        None => {
+            from_config = match config.compile_policy() {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("history policy: {e}"),
+                    )
+                }
+            };
+            (
+                &from_config,
+                x0x::history::RetentionPolicy {
+                    max_bytes: config.max_bytes,
+                    max_age_days: config.max_age_days,
+                    scope_limits: config.scope_limits.clone(),
+                },
+            )
+        }
+    };
+    let rules = history_policy_rules_json(policy, &retention, &config.record_topics);
+
+    let defaults = {
+        let daemon = x0x::history::HistoryConfig::daemon_default();
+        let mut defaults = history_policy_rules_json(
+            &x0x::history::HistoryPolicy::default(),
+            &x0x::history::RetentionPolicy {
+                max_bytes: daemon.max_bytes,
+                max_age_days: daemon.max_age_days,
+                scope_limits: daemon.scope_limits.clone(),
+            },
+            &daemon.record_topics,
+        );
+        defaults["enabled"] = daemon.enabled.into();
+        defaults
+    };
+
+    // The protected-group exception: every fork-quarantined group, under
+    // both spellings, with the ADR 0068 ceiling that alone may evict it.
+    // Owner-only route, so every marker is visible.
+    let pinned_scopes: Vec<serde_json::Value> = all_quarantine_markers(&state)
+        .await
+        .into_iter()
+        .filter_map(|(scope, _marker)| {
+            let parsed = Scope::parse(&scope).ok()?;
+            Some(serde_json::json!({
+                "scope": scope,
+                "ceiling_bytes": x0x::history::Store::pinned_ceiling(&retention, &parsed),
+            }))
+        })
+        .collect();
+
+    let (counters, store) = match history {
+        Some(history) => {
+            use std::sync::atomic::Ordering::Relaxed;
+            let c = history.counters();
+            let store = history.store();
+            (
+                serde_json::json!({
+                    "policy_suppressed_dm_total": c.policy_suppressed_dm_total.load(Relaxed),
+                    "policy_suppressed_topic_total": c.policy_suppressed_topic_total.load(Relaxed),
+                    "policy_durable_receipt_withheld_total":
+                        c.policy_durable_receipt_withheld_total.load(Relaxed),
+                    "skipped_scope_limits": store.skipped_scope_limits(),
+                    "skipped_topic_rules": store.skipped_topic_rules(),
+                }),
+                serde_json::json!({ "text_encoding": store.text_encoding() }),
+            )
+        }
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "enabled": history.is_some(),
+            "rules": rules,
+            "defaults": defaults,
+            "class_derivation": {
+                "durable": "replace_key IS NULL",
+                "replaceable": "replace_key IS NOT NULL",
+                "ephemeral": "never stored",
+            },
+            "protected_group_exception": {
+                "group_history_ephemeral": false,
+                "pins_win_over_every_rule": true,
+                "pinned_scopes": pinned_scopes,
+                "ceiling": {
+                    "formula": "min(multiplier * base, max_bytes / absolute_divisor); \
+                                base = the scope's scope_limits entry, else \
+                                max_bytes / base_divisor",
+                    "multiplier": x0x::history::HISTORY_QUARANTINE_PIN_MULTIPLIER,
+                    "base_divisor": x0x::history::HISTORY_QUARANTINE_PIN_BASE_DIVISOR,
+                    "absolute_divisor": x0x::history::HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR,
+                },
+            },
+            "counters": counters,
+            "store": store,
+        })),
+    )
 }
 
 /// GET /diagnostics/history — writer/reaper counters (one-per-subsystem

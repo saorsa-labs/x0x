@@ -547,6 +547,14 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/history/stats",
         level: AccessLevel::PublicRead,
     },
+    // ADR 0116 §3: owner-only (durable token, enforced by the auth
+    // middleware's durable-owner table); sessions 403, riders never reach
+    // the handler.
+    RouteAccess {
+        method: Method::GET,
+        path: "/history/policy",
+        level: AccessLevel::OwnerDurable,
+    },
     RouteAccess {
         method: Method::GET,
         path: "/task-lists",
@@ -1981,6 +1989,7 @@ mod tests {
             (Method::GET, "/history/scopes", AccessLevel::PublicRead),
             (Method::GET, "/history/search", AccessLevel::PublicRead),
             (Method::GET, "/history/stats", AccessLevel::PublicRead),
+            (Method::GET, "/history/policy", AccessLevel::OwnerDurable),
             (Method::GET, "/task-lists", AccessLevel::PublicRead),
             (
                 Method::POST,

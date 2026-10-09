@@ -949,6 +949,9 @@ enum HistorySub {
     },
     /// Print row counts, database size, and retention bounds.
     Stats,
+    /// Print the local history policy in force (ADR 0116): rules, defaults,
+    /// protected groups and counters. Needs the durable API token.
+    Policy,
     /// Purge one scope from the local store (local-only).
     Purge {
         /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
@@ -2474,6 +2477,7 @@ async fn run(
                 commands::history::message(&client, &msg_id, scope.as_deref()).await
             }
             HistorySub::Stats => commands::history::stats(&client).await,
+            HistorySub::Policy => commands::history::policy(&client).await,
             HistorySub::Purge { scope } => commands::history::purge(&client, &scope).await,
         },
         Commands::Auth { sub } => match sub {
