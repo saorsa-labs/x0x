@@ -963,19 +963,28 @@ pub(super) struct AppState {
     /// AppState: named-group event direct deliveries (immediate and
     /// delayed), the terminal-event and delegation-carrier redelivery
     /// schedules, legacy join work, control-blob fetches and sends, the
-    /// owner-side join-result and Welcome fetch handlers, and the delayed
-    /// card and chat publishes of `POST /groups`. None of them persists
-    /// anything. `None` closes admission during shutdown; the shutdown tail
-    /// drains them with the other server tasks (grace, then abort), so none
-    /// of them keeps the Agent and its exclusive `history.db` connection
-    /// alive after `shutdown_and_wait`.
+    /// owner-side join-result and Welcome fetch handlers, the delayed card
+    /// and chat publishes of `POST /groups`, and since #1274 the public
+    /// message fan-out race (gossip publish and member unicasts), the
+    /// one-shot predecessor-relay offer used when the durable offer
+    /// obligation could not be persisted, the member-keyed KeyPackage
+    /// catch-up requests, the KV-store delta direct deliveries and the
+    /// outgoing file-chunk streams. None of them owns a write that an abort
+    /// could cut: the most a send leaves behind is the outbound DM history
+    /// row that `Agent::send_direct_with_history` enqueues synchronously
+    /// after a successful send, and the history writer owns that
+    /// transaction. `None` closes admission during shutdown; the shutdown
+    /// tail drains them with the other server tasks (grace, then abort), so
+    /// none of them keeps the Agent and its exclusive `history.db`
+    /// connection alive after `shutdown_and_wait`.
     pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// #1269 r2: admitted applies that persist group state (a pulled
     /// control blob's apply, the owner-certificate join retry) and, since
     /// #1275, every apply a server listener runs for an event it received
     /// (named-group metadata, join results, catch-up responses, group
     /// bootstraps, predecessor relays, KV-store deltas, certificate
-    /// hydrations). Shutdown never aborts them: an abort inside an atomic
+    /// hydrations), and since #1274 the owner-sync profile catch-up write.
+    /// Shutdown never aborts them: an abort inside an atomic
     /// write or its journal step would leave the persisted state torn, or
     /// leave a blocking write running after the daemon released its locks.
     /// `None` closes admission (an apply that has not started is refused);
@@ -993,6 +1002,19 @@ pub(super) struct AppState {
     /// lock before it runs; a removal or ban aborts and awaits them inside
     /// its critical section, before it commits.
     pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
+    /// #1274 r3: the shutdown drain's completion fence for join-artifact
+    /// egress. One `AbortHandle` per accepted egress task, pushed under the
+    /// `join_artifact_egress` lock when the task is registered, and pruned
+    /// only once the task is finished. A task's own cleanup and the
+    /// removal/ban quiesce edit the registry above, so registry emptiness
+    /// does not prove that a task has released what it captured; a
+    /// finished task has. Tokio drops a task's future, and with it every
+    /// owner the future captured, before it marks the task complete
+    /// (tokio 1.53 `runtime/task/harness.rs`: `poll_future` stores the
+    /// output, replacing the future, and `cancel_task` drops it, both
+    /// before `complete()` sets COMPLETE, which `AbortHandle::is_finished`
+    /// reads). Lock order: `join_artifact_egress`, then this.
+    pub(super) join_artifact_egress_owners: StdMutex<Vec<tokio::task::AbortHandle>>,
     /// ADR 0107 (review r2; r5 G6): fair, coalescing admission for Welcome
     /// `FetchRequest` handlers, which run off the single Welcome listener
     /// loop (they can wait on a group membership lock): one in-flight

@@ -9059,12 +9059,26 @@ async fn resolve_member_treekem_kp_for_removal_locked(
     }
     // Local recovery miss — request the package from peers that witnessed the
     // join (fire-and-forget) and tell the client to retry once it lands.
+    //
+    // #1274: the catch-up only sends requests; its one write is the
+    // in-memory request throttle. The response is applied, and persisted,
+    // by the catch-up listener, whose apply is shielded (#1275). So the
+    // request task is detached and the shutdown drain may abort it; the
+    // client's retry asks again after a restart. Before this, sequential
+    // requests to unavailable witnesses kept this AppState, and with it
+    // `history.db`, alive after `shutdown_and_wait`.
     let bg_state = Arc::clone(state);
     let bg_group = group_id.to_string();
     let bg_member = agent_id_hex.to_string();
-    tokio::spawn(async move {
+    if !state.spawn_detached(async move {
         request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
-    });
+    }) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(agent_id_hex),
+            "shutdown has begun; member-keyed KeyPackage catch-up not requested"
+        );
+    }
     Err((
         StatusCode::FAILED_DEPENDENCY,
         Json(serde_json::json!({
@@ -10782,6 +10796,12 @@ async fn request_member_key_package_catchup(
                 continue;
             }
         };
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::key_package_catchup_key(
+            group_id,
+            member_agent_id,
+        ))
+        .await;
         if let Err(e) = state
             .agent
             .send_direct_with_config(&peer, payload, direct_message_send_config())
@@ -17127,10 +17147,122 @@ fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     config
 }
 
+/// #1274: test-only pause for a background send. A test arms a key; the
+/// next send with that key parks right before it hands its bytes to the
+/// transport, still holding everything its task captured, until the test
+/// releases it or the task is aborted. This stands in for a send held up by
+/// back-pressure or an unavailable peer. Keys are per test, so parallel
+/// tests in one process never touch each other's pause.
+#[cfg(test)]
+pub(in crate::server) mod detached_send_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct SendPause {
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    /// One armed pause. Dropping it releases the send (and disarms the key
+    /// if no send took it), so a failed assertion never leaves a task
+    /// parked for the rest of the test process.
+    pub(in crate::server) struct ArmedSendPause {
+        key: String,
+        pause: Arc<SendPause>,
+    }
+
+    impl ArmedSendPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ArmedSendPause {
+        fn drop(&mut self) {
+            self.pause.released.store(true, Ordering::SeqCst);
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<SendPause>>>> = Mutex::new(None);
+
+    /// Park the next send whose key is `key` (one-shot).
+    pub(in crate::server) fn arm(key: &str) -> ArmedSendPause {
+        let pause = Arc::new(SendPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), Arc::clone(&pause));
+        ArmedSendPause {
+            key: key.to_string(),
+            pause,
+        }
+    }
+
+    pub(in crate::server) async fn park(key: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(key));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The fan-out race's gossip publish of a public message on `topic`.
+    pub(in crate::server) fn public_gossip_key(topic: &str) -> String {
+        format!("public-gossip:{topic}")
+    }
+
+    /// The fan-out race's unicast of a public message of `group_id` to
+    /// `recipient_hex`.
+    pub(in crate::server) fn public_unicast_key(group_id: &str, recipient_hex: &str) -> String {
+        format!("public-unicast:{group_id}:{recipient_hex}")
+    }
+
+    /// The one-shot predecessor-relay offer to `creator_hex` for `group_id`.
+    pub(in crate::server) fn predecessor_fallback_key(group_id: &str, creator_hex: &str) -> String {
+        format!("predecessor-fallback:{group_id}:{creator_hex}")
+    }
+
+    /// The member-keyed KeyPackage catch-up request for `member_hex` in
+    /// `group_id`.
+    pub(in crate::server) fn key_package_catchup_key(group_id: &str, member_hex: &str) -> String {
+        format!("kp-catchup:{group_id}:{member_hex}")
+    }
+}
+
 /// Fan-out a persisted public group message as a race: gossip topic publish
 /// starts immediately and does not wait for per-member unicast to finish or
 /// fail (issue #310). First success wins per recipient because
 /// [`cache_public_message`] no-ops on an already-cached signature.
+///
+/// #1274: every leg is a send. The caller has already published the message
+/// and cached it locally (history row included) before this runs, so the
+/// race persists nothing and only adds copies of a message that is already
+/// on the wire. Its tasks are detached ([`AppState::spawn_detached`]): the
+/// shutdown drain gives them the server grace and then aborts them, so a
+/// publish or unicast held up by back-pressure or an unavailable peer can
+/// no longer keep the Agent, and its `history.db` connection, alive after
+/// `shutdown_and_wait`. A leg that shutdown refuses is never started.
 fn spawn_group_public_message_fanout_race(
     state: Arc<AppState>,
     topic: String,
@@ -17144,12 +17276,14 @@ fn spawn_group_public_message_fanout_race(
     let gossip_bytes = bytes;
     let gossip_group = msg.group_id.clone();
     let gossip_outstanding = Arc::clone(&unicast_outstanding);
-    tokio::spawn(async move {
+    state.spawn_detached(async move {
         tracing::info!(
             target: "x0x::groups",
             group_id = %LogHexId::group(&gossip_group),
             "public group message gossip publish starting (raced with unicast)"
         );
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::public_gossip_key(&topic)).await;
         if let Err(e) = gossip_state
             .agent
             .publish(&topic, gossip_bytes.clone())
@@ -17205,10 +17339,14 @@ fn spawn_group_public_message_delivery(
                 recipient = %LogHexId::agent(recipient_hex),
                 "X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL=timeout; hanging public-message unicast (test-only, #310)"
             );
-            tokio::spawn(async move {
+            // #1274: drained like the real unicast it stands in for.
+            let hung = Arc::clone(&outstanding);
+            if !state.spawn_detached(async move {
                 tokio::time::sleep(Duration::from_secs(24)).await;
+                hung.fetch_sub(1, Ordering::Relaxed);
+            }) {
                 outstanding.fetch_sub(1, Ordering::Relaxed);
-            });
+            }
             return;
         }
         GroupPublicUnicastInject::KeyUnavailable => {
@@ -17244,7 +17382,18 @@ fn spawn_group_public_message_delivery(
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let group_id = msg.group_id.clone();
-    tokio::spawn(async move {
+    let task_outstanding = Arc::clone(&outstanding);
+    // #1274: a send only (see `spawn_group_public_message_fanout_race`), so
+    // it is detached and the shutdown drain may abort it. A send that
+    // shutdown refuses is never started and no longer counts as outstanding.
+    let admitted = state.spawn_detached(async move {
+        let outstanding = task_outstanding;
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::public_unicast_key(
+            &group_id,
+            &recipient_label,
+        ))
+        .await;
         match agent
             .send_direct_with_config(
                 &recipient,
@@ -17271,6 +17420,9 @@ fn spawn_group_public_message_delivery(
         }
         outstanding.fetch_sub(1, Ordering::Relaxed);
     });
+    if !admitted {
+        outstanding.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub(in crate::server) async fn ingest_public_message(
@@ -25347,29 +25499,13 @@ pub(in crate::server) async fn create_join_request(
                     "#908: failed to persist the requester offer obligation; falling back to a one-shot send"
                 );
                 if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
-                    let mut dm_payload = Vec::with_capacity(
-                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len(),
+                    spawn_predecessor_relay_fallback_offer(
+                        &state,
+                        &event_group_id,
+                        &creator_hex,
+                        creator_id,
+                        &envelope,
                     );
-                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-                    dm_payload.extend_from_slice(&envelope);
-                    let agent = Arc::clone(&state.agent);
-                    let creator = creator_hex.clone();
-                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
-                    tokio::spawn(async move {
-                        if let Err(e) = agent
-                            .send_direct_with_config(
-                                &creator_id,
-                                dm_payload,
-                                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                creator = %LogHexId::agent(&creator),
-                                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
-                            );
-                        }
-                    });
                 }
             }
         }
@@ -25383,6 +25519,69 @@ pub(in crate::server) async fn create_join_request(
             "group_id": id,
         })),
     )
+}
+
+/// The pre-#908 one-shot offer of a requester-signed predecessor envelope to
+/// the authority (ADR 0028), used only when `create_join_request` could not
+/// persist the durable offer obligation.
+///
+/// #1274: the durable path and this fallback are kept apart. The obligation
+/// is written by `insert_requester_offer_obligation`, awaited inline in the
+/// request handler before the 201 returns, and retried from the outbox by
+/// the requester-offer worker; no detached task ever owns that write. This
+/// fallback runs only after that write failed, so there is no obligation to
+/// keep: it is one direct send. Its only local write is the outbound DM
+/// history row that `Agent::send_direct_with_history` enqueues
+/// synchronously once the send has succeeded; the history writer owns that
+/// transaction, so an abort cannot cut it. The task is therefore detached
+/// ([`AppState::spawn_detached`]) and the shutdown drain may abort it. An
+/// aborted offer may be lost; no worker retries it, as before (the request
+/// itself is in the persisted roster and was published on the metadata
+/// topic, but neither guarantees this exact offer is retried). Before this,
+/// a send that waited out an unavailable authority kept the Agent, and its
+/// `history.db` connection, alive after `shutdown_and_wait`.
+fn spawn_predecessor_relay_fallback_offer(
+    state: &AppState,
+    group_id: &str,
+    creator_hex: &str,
+    creator_id: AgentId,
+    envelope: &[u8],
+) {
+    let mut dm_payload =
+        Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
+    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+    dm_payload.extend_from_slice(envelope);
+    let agent = Arc::clone(&state.agent);
+    let creator = creator_hex.to_string();
+    let fallback_digest: [u8; 32] = blake3::hash(envelope).into();
+    let group = group_id.to_string();
+    #[cfg(test)]
+    let pause_key = detached_send_test_seam::predecessor_fallback_key(group_id, creator_hex);
+    let admitted = state.spawn_detached(async move {
+        #[cfg(test)]
+        detached_send_test_seam::park(&pause_key).await;
+        if let Err(e) = agent
+            .send_direct_with_config(
+                &creator_id,
+                dm_payload,
+                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
+            )
+            .await
+        {
+            tracing::warn!(
+                group_id = %LogHexId::group(&group),
+                creator = %LogHexId::agent(&creator),
+                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+            );
+        }
+    });
+    if !admitted {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            creator = %LogHexId::agent(creator_hex),
+            "ADR 0028: shutdown has begun; the one-shot predecessor offer is not sent"
+        );
+    }
 }
 
 /// POST /groups/:id/requests/:request_id/approve — approve request (admin+).
@@ -36337,6 +36536,16 @@ const WELCOME_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 /// removal or ban that quiesces this recipient can never miss it. Every body
 /// re-checks eligibility under the group's membership lock before it hands
 /// bytes to the transport; receipt waits run outside that lock.
+///
+/// #1274: the shutdown check, the spawn and the registration happen under
+/// the egress registry lock, so they are atomic against the shutdown drain,
+/// which cancels `shutdown_started` before it reads the registry. An egress
+/// accepted before that is registered, so the drain waits for it and then
+/// aborts it; one asked for after it is refused before anything is spawned
+/// or cloned, and its body is dropped by this call (review r2, P2: a task
+/// spawned and then aborted would keep its captures, including this
+/// AppState, until the runtime ran the cancellation, possibly after the
+/// drain had already seen an idle registry).
 fn spawn_join_artifact_egress<F>(
     state: &Arc<AppState>,
     group_id: &str,
@@ -36347,9 +36556,28 @@ fn spawn_join_artifact_egress<F>(
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let mut registry = state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.shutdown_started.is_cancelled() {
+        drop(registry);
+        // Dropped here, outside the registry lock: nothing it captured
+        // outlives this call, and nothing is sent.
+        drop(body);
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            recipient = %LogHexId::agent(recipient),
+            kind,
+            "shutdown has begun; join-artifact egress not started"
+        );
+        return;
+    }
     let (registered, ready) = oneshot::channel::<()>();
     let cleanup_state = Arc::clone(state);
     let registry_key = (group_id.to_string(), recipient.to_string());
+    // Spawned under the registry lock. Until `ready` fires the task only
+    // waits, so it never contends for that lock.
     let handle = tokio::spawn(async move {
         if ready.await.is_ok() {
             // r5 (G9): the task leaves the registry itself when it ends —
@@ -36367,21 +36595,72 @@ fn spawn_join_artifact_egress<F>(
             let _ = tokio::time::timeout_at(deadline.into(), body).await;
         }
     });
+    // #1274 r3: the drain's completion fence. Only a finished task leaves
+    // it, so it still lists a task whose cleanup has already removed the
+    // task's handle from the registry below (or whose handle a quiesce has
+    // taken) until the task has dropped everything it captured.
     {
-        let mut registry = state
-            .join_artifact_egress
+        let mut owners = state
+            .join_artifact_egress_owners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        registry.retain(|_, tasks| {
-            tasks.retain(|task| !task.is_finished());
-            !tasks.is_empty()
-        });
-        registry
-            .entry((group_id.to_string(), recipient.to_string()))
-            .or_default()
-            .push(handle);
+        owners.retain(|owner| !owner.is_finished());
+        owners.push(handle.abort_handle());
     }
+    registry.retain(|_, tasks| {
+        tasks.retain(|task| !task.is_finished());
+        !tasks.is_empty()
+    });
+    registry
+        .entry((group_id.to_string(), recipient.to_string()))
+        .or_default()
+        .push(handle);
+    drop(registry);
     let _ = registered.send(());
+}
+
+/// #1274: whether any accepted join-artifact egress task is not yet
+/// finished, read from the owners fence (`AppState::join_artifact_egress_owners`),
+/// not from the registry: a task leaves the registry from its own cleanup
+/// before that cleanup has dropped its AppState handle (review r3, P2), and
+/// a quiesce takes handles out of it. A finished task has dropped
+/// everything it captured. The registry lock is taken first, so a spawn
+/// that passed its shutdown check has also entered the fence before this
+/// reads it.
+fn join_artifact_egress_running(state: &AppState) -> bool {
+    let _registry = state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut owners = state
+        .join_artifact_egress_owners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    owners.retain(|owner| !owner.is_finished());
+    !owners.is_empty()
+}
+
+/// #1274: resolves once every accepted join-artifact egress task is
+/// finished, so none of them still owns this AppState. The registry handles
+/// are never taken here: a removal or ban can still quiesce them meanwhile.
+pub(in crate::server) async fn join_artifact_egress_idle(state: &AppState) {
+    while join_artifact_egress_running(state) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// #1274: abort every unfinished join-artifact egress task in place,
+/// through the owners fence, so this also reaches a task whose handle a
+/// quiesce has taken out of the registry.
+pub(in crate::server) fn abort_join_artifact_egress(state: &AppState) {
+    for owner in state
+        .join_artifact_egress_owners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+    {
+        owner.abort();
+    }
 }
 
 /// ADR 0107 (r5, G9): removes its own task's handle from the egress registry
@@ -36408,17 +36687,129 @@ impl Drop for JoinArtifactEgressCleanup {
             &self.state,
             format!("egress_ended:{}:{}:{}", self.key.0, self.key.1, self.kind),
         );
-        let mut registry = self
-            .state
-            .join_artifact_egress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(tasks) = registry.get_mut(&self.key) {
-            tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
-            if tasks.is_empty() {
-                registry.remove(&self.key);
+        {
+            let mut registry = self
+                .state
+                .join_artifact_egress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(tasks) = registry.get_mut(&self.key) {
+                tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
+                if tasks.is_empty() {
+                    registry.remove(&self.key);
+                }
             }
         }
+        // #1274 r3: the registry no longer lists this task and its lock is
+        // released, but `self.state` (an AppState owner) drops only after
+        // this body returns. The shutdown drain therefore waits on the
+        // owners fence (`AppState::join_artifact_egress_owners`), which
+        // lists the task until it is finished, not on this registry.
+        #[cfg(test)]
+        egress_cleanup_test_seam::pause(&self.key);
+    }
+}
+
+/// #1274 r3: test-only pause at the end of [`JoinArtifactEgressCleanup`]'s
+/// drop body: after the task has removed its own handle from the egress
+/// registry and released the registry lock, and before the guard's
+/// `state: Arc<AppState>` field is dropped. The pause blocks the worker
+/// thread, standing in for a preemption at that point. Keyed by
+/// `(group, recipient)`, so parallel tests never touch each other's pause.
+#[cfg(test)]
+pub(in crate::server) mod egress_cleanup_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    /// A parked cleanup gives up after this long, so a failed test can never
+    /// hang the test binary.
+    const PAUSE_CAP: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct CleanupPause {
+        reached: AtomicBool,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl CleanupPause {
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// One armed pause. Dropping it releases the cleanup (and disarms the
+    /// key if no cleanup took it).
+    pub(in crate::server) struct ArmedCleanupPause {
+        key: (String, String),
+        pause: Arc<CleanupPause>,
+    }
+
+    impl ArmedCleanupPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::server) fn release(&self) {
+            self.pause.release();
+        }
+    }
+
+    impl Drop for ArmedCleanupPause {
+        fn drop(&mut self) {
+            self.pause.release();
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    type Armed = HashMap<(String, String), Arc<CleanupPause>>;
+    static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
+
+    /// Park the next egress cleanup for `(group, recipient)` (one-shot).
+    pub(in crate::server) fn arm(group: &str, recipient: &str) -> ArmedCleanupPause {
+        let key = (group.to_string(), recipient.to_string());
+        let pause = Arc::new(CleanupPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key.clone(), Arc::clone(&pause));
+        ArmedCleanupPause { key, pause }
+    }
+
+    pub(super) fn pause(key: &(String, String)) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(key));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        let released = pause
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = pause
+            .wake
+            .wait_timeout_while(released, PAUSE_CAP, |released| !*released);
     }
 }
 
@@ -39613,6 +40004,7 @@ pub(in crate::server) mod tests {
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
+    mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
@@ -40374,6 +40766,7 @@ pub(in crate::server) mod tests {
             shielded_tasks: StdMutex::new(Some(Vec::new())),
             shutdown_started: tokio_util::sync::CancellationToken::new(),
             join_artifact_egress: StdMutex::new(HashMap::new()),
+            join_artifact_egress_owners: StdMutex::new(Vec::new()),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,

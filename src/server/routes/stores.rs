@@ -165,7 +165,13 @@ fn spawn_kv_store_delta_delivery_one(
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let store_label = store_id.to_string();
-    tokio::spawn(async move {
+    // #1274: a best-effort copy of a delta the local store has already
+    // written, so the task only sends. It is detached
+    // (`AppState::spawn_detached`) and the shutdown drain may abort it,
+    // which loses no more than a process exit would. Before this, the
+    // delayed copy kept the Agent, and its `history.db` connection, alive
+    // for its delay plus the send after `shutdown_and_wait`.
+    state.spawn_detached(async move {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }

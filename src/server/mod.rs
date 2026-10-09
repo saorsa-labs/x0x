@@ -1118,6 +1118,7 @@ pub async fn serve_with_options(
         shielded_tasks: StdMutex::new(Some(Vec::new())),
         shutdown_started: tokio_util::sync::CancellationToken::new(),
         join_artifact_egress: StdMutex::new(HashMap::new()),
+        join_artifact_egress_owners: StdMutex::new(Vec::new()),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
@@ -2858,10 +2859,19 @@ pub async fn serve_with_options(
 /// applies (see [`drain_server_tasks`]) before it leaves them to finish.
 const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
 
+/// The single grace window the shutdown tail gives every abortable server
+/// task (see [`drain_server_tasks`]) before it aborts the stragglers.
+const SERVER_TASK_GRACE: Duration = Duration::from_secs(2);
+
+/// #1274: how long the shutdown tail waits for aborted join-artifact egress
+/// tasks to end (an abort takes effect at the task's next await point).
+const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
+
 /// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
 /// server-owned task (the startup tasks in `bg_tasks`, the AppState handle
-/// maps, the detached registry and the join-attempt registry), then await,
-/// never abort, the shielded group-state applies.
+/// maps, the detached registry, the join-attempt registry and, in place,
+/// the join-artifact egress registry), then await, never abort, the
+/// shielded group-state applies.
 async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
@@ -2885,20 +2895,29 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
     // #1269: detached best-effort tasks (delayed direct deliveries, the
     // redelivery schedules, control-blob fetches, the owner-side join-result
-    // and Welcome fetch handlers, delayed publishes) and the joiner's
-    // join-attempt polls and sends hold the Agent or this AppState. Left
-    // running, one asleep before a delayed delivery keeps the Agent, and its
-    // exclusive `history.db` connection, alive after the supervisor returns,
-    // and a same-dir relaunch is refused. Taking `Some` closes detached
-    // admission; the attempt registry is drained after it, so
+    // and Welcome fetch handlers, delayed publishes; since #1274 also the
+    // public-message fan-out race, the one-shot predecessor-relay fallback
+    // offer, the member-keyed KeyPackage catch-up requests, the KV-store
+    // delta direct deliveries and the outgoing file-chunk streams) and the
+    // joiner's join-attempt polls and sends hold the Agent or this AppState.
+    // Left running, one asleep before a delayed delivery keeps the Agent, and
+    // its exclusive `history.db` connection, alive after the supervisor
+    // returns, and a same-dir relaunch is refused. Taking `Some` closes
+    // detached admission; the attempt registry is drained after it, so
     // `spawn_attempt_task_under_guard` (which checks admission under the
     // registry lock) either registered its task before this drain or spawns
-    // nothing. None of this work persists anything: the deliveries and
+    // nothing. None of this work owns a write that an abort could cut (a
+    // successful direct send at most enqueues its outbound DM history row,
+    // synchronously, for the history writer): the deliveries and
     // publishes are best-effort copies of what the metadata topic and the
-    // join-result fetch carry, the redelivery schedules are deliberately not
-    // persisted, and the join-attempt registry is in-memory and dies with
-    // this AppState anyway (recovery after a joiner restart is ADR 0107's
-    // durable carry remnant). Work that does persist runs shielded (below).
+    // join-result fetch carry (the public fan-out re-sends a message already
+    // published and cached; the predecessor fallback runs only after its
+    // durable obligation could not be written, and that write is the request
+    // handler's own, never a detached task's), the redelivery schedules are
+    // deliberately not persisted, and the join-attempt registry is in-memory
+    // and dies with this AppState anyway (recovery after a joiner restart is
+    // ADR 0107's durable carry remnant). Work that does persist runs shielded
+    // (below).
     bg_tasks.extend(
         state
             .detached_tasks
@@ -2937,15 +2956,49 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // aborted task yields Err(JoinError) — expected, never unwrapped.
     let abort_handles: Vec<tokio::task::AbortHandle> =
         bg_tasks.iter().map(|h| h.abort_handle()).collect();
+    let grace_end = tokio::time::Instant::now() + SERVER_TASK_GRACE;
     let mut join = futures::future::join_all(bg_tasks);
     tokio::select! {
         _results = &mut join => {}
-        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+        _ = tokio::time::sleep_until(grace_end) => {
             tracing::warn!("background tasks did not stop within grace; aborting stragglers");
             for handle in &abort_handles {
                 handle.abort();
             }
             let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+        }
+    }
+    // #1274: the ADR 0107 join-artifact egress tasks (join-result and
+    // control-blob sends, secure shares) hold this AppState up to their
+    // artifact deadline: a secure share to an unavailable member retries for
+    // up to `PENDING_JOIN_RESULT_TTL` (10 min). They only send, and a removal
+    // or ban already aborts them at any await point, so they are abortable
+    // by design. They stay in their registry, which that quiesce uses, so
+    // they are not taken here: they share the grace window above, and any
+    // still running at its end is aborted in place and awaited (bounded).
+    // Both waits read the owners fence, which lists a task until it is
+    // finished and has so dropped every owner it captured (#1274 r3: an
+    // empty registry does not prove that). `shutdown_started` (cancelled
+    // above) closes their admission under the registry lock.
+    if tokio::time::timeout_at(
+        grace_end,
+        routes::named_groups::join_artifact_egress_idle(state),
+    )
+    .await
+    .is_err()
+    {
+        routes::named_groups::abort_join_artifact_egress(state);
+        if tokio::time::timeout(
+            JOIN_ARTIFACT_EGRESS_ABORT_BOUND,
+            routes::named_groups::join_artifact_egress_idle(state),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                bound_secs = JOIN_ARTIFACT_EGRESS_ABORT_BOUND.as_secs(),
+                "a join-artifact egress task did not end after its abort"
+            );
         }
     }
     // #1269 r2: admitted applies that persist group state (a pulled control
