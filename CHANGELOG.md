@@ -19,7 +19,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **Library API (breaking for some embedders).** `HistoryConfig` gains three
+- **Library API (breaking for some embedders; the release that carries this
+  is 0.47.0).** `HistoryConfig` gains three
   public fields (`dm_recording`, `class_limits`, `topic_rules`) and
   `HistoryError` gains `InvalidConfig`. Code that lists every
   `HistoryConfig` field without `..HistoryConfig::default()`, or matches
