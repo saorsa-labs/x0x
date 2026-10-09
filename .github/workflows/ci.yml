@@ -487,6 +487,8 @@ jobs:
           --expect w3h_1207_control_authorized_third_holder=GREEN
           --expect w3h_red_1207_ready_hello_roster_then_discovery=GREEN
           --expect w3h_red_1207_ready_hello_no_mapping_stays_red=RED
+          --require w3h_811_late_joiner_reads_history_from_plain_member
+          --expect w3h_811_late_joiner_reads_history_from_plain_member=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
