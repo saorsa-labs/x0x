@@ -149,6 +149,12 @@ pub(in crate::server) async fn subscribe(
             }
             let mut recv_sub = sub;
             let forwarder = tokio::spawn(async move {
+                // Test-only. A blocking pause is not an await, so abort does
+                // not finish this task until the pause ends and `recv` is
+                // polled. The DELETE test uses that to show the handler
+                // waits for the forwarder.
+                #[cfg(test)]
+                tests::rest_forwarder_test_pause::wait(&topic);
                 while let Some(msg) = recv_sub.recv().await {
                     if let Some(history) = history.as_ref() {
                         record_topic_message(history, &topic, &msg);
@@ -260,19 +266,21 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use axum::extract::State;
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::Json;
 
     use super::super::super::state::AppState;
-    use super::{subscribe, SubscribeRequest};
+    use super::{subscribe, unsubscribe, SubscribeRequest};
     use crate::Agent;
 
     /// Bound on one daemon start or shutdown.
     const LIFECYCLE: Duration = Duration::from_secs(60);
     /// Topic listed in `[history] record_topics` for this test.
     const TOPIC: &str = "issue1288.row2.subscribe";
+    /// Distinct topic so the DELETE pause cannot stall the other tests.
+    const DELETE_TOPIC: &str = "issue1288.row2.delete";
 
     fn loopback_daemon_config(
         root: &std::path::Path,
@@ -293,7 +301,7 @@ mod tests {
             ),
             "history": {
                 "enabled": true,
-                "record_topics": [TOPIC]
+                "record_topics": [TOPIC, DELETE_TOPIC]
             }
         }))?)
     }
@@ -449,5 +457,208 @@ mod tests {
             "REST /subscribe: a same-dir relaunch must open history.db (outcome: {outcome:?})"
         );
         Ok(())
+    }
+
+    /// Once shutdown has cancelled `shutdown_started`, `POST /subscribe`
+    /// is refused and leaves no registered forwarder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue1288_subscribe_after_shutdown_started_registers_nothing() -> Result<()> {
+        let (daemon, state) = start_daemon("closed").await?;
+        state.shutdown_started.cancel();
+
+        let response = subscribe(
+            State(Arc::clone(&state)),
+            Json(SubscribeRequest {
+                topic: TOPIC.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subscribe after shutdown starts must be refused: {body}"
+        );
+        assert!(
+            state.subscriptions.read().await.is_empty(),
+            "a refused subscribe must leave no registered forwarder"
+        );
+        drop(state);
+
+        let outcome = daemon.stop_and_relaunch().await?;
+        assert_eq!(
+            outcome.at_return,
+            (0, 0),
+            "refused subscribe: owners must be gone when shutdown returns (outcome: {outcome:?})"
+        );
+        assert!(
+            outcome.relaunch.is_ok(),
+            "refused subscribe: a same-dir relaunch must open history.db (outcome: {outcome:?})"
+        );
+        Ok(())
+    }
+
+    /// `DELETE /subscribe/:id` returns only after the forwarder task has
+    /// finished. The forwarder is held in a blocking pause, so abort cannot
+    /// complete it until that pause ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue1288_delete_subscribe_returns_after_forwarder_finishes() -> Result<()> {
+        let pause = rest_forwarder_test_pause::arm(DELETE_TOPIC);
+        let (daemon, state) = start_daemon("delete").await?;
+        let response = subscribe(
+            State(Arc::clone(&state)),
+            Json(SubscribeRequest {
+                topic: DELETE_TOPIC.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "POST /subscribe: {body}");
+        let id = body["subscription_id"]
+            .as_str()
+            .context("subscription_id")?
+            .to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !pause.entered() {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the forwarder did not reach its pause"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let abort = {
+            let subs = state.subscriptions.read().await;
+            subs.get(&id)
+                .context("the subscription is registered")?
+                .forwarder
+                .abort_handle()
+        };
+
+        let mut pending = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { unsubscribe(State(state), Path(id)).await.into_response() }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut pending).await;
+        assert!(
+            early.is_err(),
+            "DELETE returned while the forwarder was still paused"
+        );
+        assert!(
+            !abort.is_finished(),
+            "the forwarder finished before DELETE was released to join it"
+        );
+
+        drop(pause);
+        let response = pending.await.context("DELETE task")?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "DELETE /subscribe: {body}");
+        assert!(
+            abort.is_finished(),
+            "DELETE returned before the forwarder finished"
+        );
+        assert!(
+            !state.subscriptions.read().await.contains_key(&id),
+            "DELETE left the subscription registered"
+        );
+        drop(state);
+
+        let outcome = daemon.stop_and_relaunch().await?;
+        assert_eq!(
+            outcome.at_return,
+            (0, 0),
+            "DELETE: owners must be gone when shutdown returns (outcome: {outcome:?})"
+        );
+        assert!(
+            outcome.relaunch.is_ok(),
+            "DELETE: a same-dir relaunch must open history.db (outcome: {outcome:?})"
+        );
+        Ok(())
+    }
+
+    /// Blocking pause for one forwarder topic. Abort cannot finish the task
+    /// while it is inside [`Pause::wait`], because that wait is not an await.
+    pub(super) mod rest_forwarder_test_pause {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct Pause {
+            topic: String,
+            entered: AtomicBool,
+            release: Mutex<bool>,
+            cv: Condvar,
+        }
+
+        static ARMED: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+        pub(super) struct Armed {
+            pause: Arc<Pause>,
+        }
+
+        pub(super) fn arm(topic: &str) -> Armed {
+            let pause = Arc::new(Pause {
+                topic: topic.to_string(),
+                entered: AtomicBool::new(false),
+                release: Mutex::new(false),
+                cv: Condvar::new(),
+            });
+            *ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+            Armed { pause }
+        }
+
+        impl Armed {
+            pub(super) fn entered(&self) -> bool {
+                self.pause.entered.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Drop for Armed {
+            fn drop(&mut self) {
+                {
+                    let mut go = self
+                        .pause
+                        .release
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *go = true;
+                    self.pause.cv.notify_all();
+                }
+                let mut slot = ARMED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &self.pause)) {
+                    *slot = None;
+                }
+            }
+        }
+
+        pub(in super::super) fn wait(topic: &str) {
+            let pause = {
+                let slot = ARMED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                slot.as_ref()
+                    .filter(|pause| pause.topic == topic)
+                    .map(Arc::clone)
+            };
+            let Some(pause) = pause else {
+                return;
+            };
+            pause.entered.store(true, Ordering::SeqCst);
+            let mut go = pause
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*go {
+                go = pause
+                    .cv
+                    .wait(go)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
     }
 }
