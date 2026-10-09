@@ -663,6 +663,7 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("POST /mls/groups/:id/welcome", RouteClass::ControlPlane),
     // ── Observability ───────────────────────────────────────────────────
     ("GET /diagnostics/groups", RouteClass::Observability),
+    ("GET /history/policy", RouteClass::Observability),
     // ── Not bound to group authority state ──────────────────────────────
     // The adversarial confidentiality-proof endpoint: it opens an envelope
     // with THIS daemon's own KEM key and reads no group authority state

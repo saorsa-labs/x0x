@@ -210,6 +210,9 @@ pub struct HistoryHandle {
     /// ADR 0116 §1: the compiled local recording and retention policy,
     /// fixed at open. A policy change needs a restart (ADR 0116 §4).
     policy: Arc<HistoryPolicy>,
+    /// The global and exact-scope retention bounds the reaper enforces,
+    /// fixed at open (reported by `GET /history/policy`).
+    retention: Arc<RetentionPolicy>,
 }
 
 impl HistoryHandle {
@@ -218,6 +221,13 @@ impl HistoryHandle {
     #[must_use]
     pub fn policy(&self) -> &HistoryPolicy {
         &self.policy
+    }
+
+    /// The global and exact-scope retention bounds this store's reaper
+    /// enforces, as fixed at open.
+    #[must_use]
+    pub fn retention_policy(&self) -> &RetentionPolicy {
+        &self.retention
     }
 
     /// Enqueue a record (never blocks; sheds on full — ADR-0023 §5).
@@ -397,6 +407,7 @@ impl HistoryService {
             store: Arc::clone(&store),
             quarantine_pins: Arc::clone(&quarantine_pins),
             policy: Arc::clone(&rules),
+            retention: Arc::new(policy.clone()),
         };
         let reaper = reaper::spawn(
             store,

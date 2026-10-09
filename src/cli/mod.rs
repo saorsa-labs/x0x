@@ -376,19 +376,59 @@ impl DaemonClient {
     }
 
     async fn handle_response(&self, resp: reqwest::Response) -> Result<serde_json::Value> {
-        let status = resp.status();
-        let text = resp.text().await.context("failed to read response body")?;
-        let body = if text.trim().is_empty() {
-            serde_json::json!({ "ok": status.is_success() })
-        } else {
-            serde_json::from_str(&text).context("failed to parse response")?
+        response_body(resp, None).await
+    }
+
+    /// Send the request of an operation that older daemons may lack
+    /// (ADR 0116 §5), and return the response body.
+    ///
+    /// `body` is sent as JSON for every method except GET. Errors are those
+    /// of [`Self::get`] and [`Self::post`], except that a 404 reports an
+    /// unsupported operation: see [`NewerOperation`].
+    pub async fn request_newer(
+        &self,
+        op: &NewerOperation,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let body = match op.method {
+            crate::api::Method::Get => None,
+            _ => body,
         };
-
-        if !status.is_success() {
-            return Err(error_from_body(status, &body));
+        if self.dump {
+            return self.emit_dump(&op.method.to_string(), op.path, body.cloned());
         }
+        let method = match op.method {
+            crate::api::Method::Get => reqwest::Method::GET,
+            crate::api::Method::Post => reqwest::Method::POST,
+            crate::api::Method::Put => reqwest::Method::PUT,
+            crate::api::Method::Patch => reqwest::Method::PATCH,
+            crate::api::Method::Delete => reqwest::Method::DELETE,
+        };
+        let mut request = self
+            .client
+            .request(method, format!("{}{}", self.base_url, op.path))
+            .headers(self.auth_headers());
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request
+            .send()
+            .await
+            .context("request failed — is x0xd running?")?;
+        response_body(resp, Some(op)).await
+    }
 
-        Ok(body)
+    /// Ensure the daemon is running, send the request of an operation that
+    /// older daemons may lack, and print the response.
+    pub async fn run_newer(
+        &self,
+        op: &NewerOperation,
+        body: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.ensure_running().await?;
+        let resp = self.request_newer(op, body).await?;
+        print_value(self.format, &resp);
+        Ok(())
     }
 
     /// Ensure the daemon is running, send a GET, and print the response.
@@ -437,6 +477,75 @@ impl DaemonClient {
 /// `serde_json::Value::String` helper for the dump-mode query map.
 fn json_str(v: &str) -> serde_json::Value {
     serde_json::Value::String(v.to_string())
+}
+
+/// A daemon operation that older `x0xd` releases do not serve.
+///
+/// ADR 0116 §5: older local API servers do not offer the new history
+/// endpoints, and a client must report an unsupported operation. It must
+/// not fall back to SQL. An older daemon has no route for the operation,
+/// so it answers 404, usually with an empty body.
+/// [`DaemonClient::run_newer`] reports that 404 as an unsupported operation
+/// that names the command and says the daemon predates it. Every other
+/// status keeps its usual error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewerOperation {
+    /// The CLI command, as typed (`x0x history policy`).
+    pub command: &'static str,
+    /// The route's method.
+    pub method: crate::api::Method,
+    /// The route's path.
+    pub path: &'static str,
+}
+
+impl NewerOperation {
+    /// The error for a daemon that predates this operation. The daemon's
+    /// own `error` sentence, when its 404 body has one, is kept.
+    fn unsupported(&self, body: Option<&serde_json::Value>) -> anyhow::Error {
+        let daemon = body
+            .and_then(|b| b.get("error"))
+            .and_then(|e| e.as_str())
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "unsupported operation: `{}` needs {} {}, and this x0xd predates it \
+             (HTTP 404{daemon}). Upgrade x0xd to use this command.",
+            self.command,
+            self.method,
+            self.path,
+        )
+    }
+}
+
+/// Read a daemon response: its JSON body on success, an error otherwise.
+///
+/// `newer` names an operation that older daemons may lack; see
+/// [`NewerOperation`].
+async fn response_body(
+    resp: reqwest::Response,
+    newer: Option<&NewerOperation>,
+) -> Result<serde_json::Value> {
+    let status = resp.status();
+    let text = resp.text().await.context("failed to read response body")?;
+    // ADR 0116 §5: an older daemon has no route for a newer operation. Its
+    // 404 may be empty, JSON or neither, so map it before parsing.
+    if let Some(op) = newer {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+            return Err(op.unsupported(parsed.as_ref()));
+        }
+    }
+    let body = if text.trim().is_empty() {
+        serde_json::json!({ "ok": status.is_success() })
+    } else {
+        serde_json::from_str(&text).context("failed to parse response")?
+    };
+
+    if !status.is_success() {
+        return Err(error_from_body(status, &body));
+    }
+
+    Ok(body)
 }
 
 /// Build an `anyhow::Error` from a non-success HTTP status and its JSON body.
@@ -602,6 +711,135 @@ mod tests {
             error_from_body(reqwest::StatusCode::NOT_FOUND, &body).to_string(),
             "group not found (HTTP 404)"
         );
+    }
+
+    /// An operation older daemons lack, for the ADR 0116 §5 tests below.
+    const NEWER_PROBE: NewerOperation = NewerOperation {
+        command: "x0x history policy",
+        method: crate::api::Method::Get,
+        path: "/history/policy",
+    };
+
+    /// A canned daemon response: no socket, no process.
+    fn canned(status: u16, body: &'static str) -> reqwest::Response {
+        reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(status)
+                .body(body)
+                .expect("canned response"),
+        )
+    }
+
+    async fn rendered_error(
+        status: u16,
+        body: &'static str,
+        newer: Option<&NewerOperation>,
+    ) -> String {
+        response_body(canned(status, body), newer)
+            .await
+            .expect_err("a non-2xx status is an error")
+            .to_string()
+    }
+
+    fn assert_unsupported(rendered: &str) {
+        assert!(
+            rendered.contains("unsupported operation")
+                && rendered.contains("`x0x history policy`")
+                && rendered.contains("GET /history/policy")
+                && rendered.contains("predates"),
+            "a 404 must name the operation and say the daemon predates it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unknown error"),
+            "a 404 must not print as an unknown error: {rendered}"
+        );
+    }
+
+    /// WHY (ADR 0116 §5, Codex E r1 P2): an older daemon has no route for a
+    /// new history operation, so axum answers an empty 404. The client must
+    /// report an unsupported operation, not `unknown error (HTTP 404)`.
+    #[tokio::test]
+    async fn adr0116_unsupported_empty_404_names_the_operation() {
+        assert_unsupported(&rendered_error(404, "", Some(&NEWER_PROBE)).await);
+    }
+
+    /// A JSON 404 (a daemon with a JSON fallback, or a proxy) maps the same
+    /// way. The daemon's own sentence is kept, not dropped.
+    #[tokio::test]
+    async fn adr0116_unsupported_json_404_names_the_operation() {
+        let rendered = rendered_error(
+            404,
+            r#"{"ok":false,"error":"no such route"}"#,
+            Some(&NEWER_PROBE),
+        )
+        .await;
+        assert_unsupported(&rendered);
+        assert!(rendered.contains("no such route"), "{rendered}");
+    }
+
+    /// A non-JSON 404 body (an HTML or plain-text page from something in
+    /// front of the daemon) is still an unsupported operation, not a parse
+    /// failure.
+    #[tokio::test]
+    async fn adr0116_unsupported_non_json_404_names_the_operation() {
+        assert_unsupported(&rendered_error(404, "Not Found", Some(&NEWER_PROBE)).await);
+    }
+
+    /// Control: every other status keeps exactly the error it had before,
+    /// so auth, conflict and server failures are never reported as an old
+    /// daemon.
+    #[tokio::test]
+    async fn adr0116_unsupported_leaves_other_statuses_unchanged() {
+        let cases: [(u16, &'static str, &str); 5] = [
+            (401, "", "unknown error (HTTP 401)"),
+            (
+                403,
+                r#"{"ok":false,"error":"durable API token required"}"#,
+                "durable API token required (HTTP 403)",
+            ),
+            (
+                409,
+                r#"{"ok":false,"error":"another history retention operation is running","reason":"history_retention_busy"}"#,
+                "another history retention operation is running (HTTP 409, reason: history_retention_busy)",
+            ),
+            (
+                500,
+                r#"{"ok":false,"error":"history store failed"}"#,
+                "history store failed (HTTP 500)",
+            ),
+            (400, r#"{"ok":false,"error":"bad body"}"#, "bad body (HTTP 400)"),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                rendered_error(status, body, Some(&NEWER_PROBE)).await,
+                expected,
+                "HTTP {status} with a newer operation"
+            );
+            assert_eq!(
+                rendered_error(status, body, None).await,
+                expected,
+                "HTTP {status} without one"
+            );
+        }
+    }
+
+    /// Control: the mapping is opt-in per operation. A 404 for any other
+    /// command keeps its existing rendering, and success bodies pass
+    /// through unchanged.
+    #[tokio::test]
+    async fn adr0116_unsupported_mapping_is_opt_in_per_operation() {
+        assert_eq!(
+            rendered_error(404, "", None).await,
+            "unknown error (HTTP 404)"
+        );
+        assert_eq!(
+            rendered_error(404, r#"{"ok":false,"error":"group not found"}"#, None).await,
+            "group not found (HTTP 404)"
+        );
+        let ok = response_body(canned(200, r#"{"ok":true,"n":1}"#), Some(&NEWER_PROBE))
+            .await
+            .expect("2xx is a body");
+        assert_eq!(ok, serde_json::json!({ "ok": true, "n": 1 }));
     }
 
     #[test]

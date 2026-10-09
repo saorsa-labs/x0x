@@ -66,15 +66,15 @@ use routes::{
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
     handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
-    history_diagnostics, history_list, history_message, history_purge, history_scopes,
-    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
-    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
-    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
-    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
-    list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
-    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
-    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    history_diagnostics, history_list, history_message, history_policy, history_purge,
+    history_scopes, history_search, history_stats, identity_revocations, identity_revoke,
+    import_agent_card, import_group_card, ingest_public_message, introduction,
+    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
+    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
+    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
+    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
@@ -2600,6 +2600,8 @@ pub async fn serve_with_options(
         .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
+        // ADR 0116 §3: owner-only policy read (durable token, see auth.rs).
+        .route("/history/policy", get(history_policy))
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/state-sync", get(state_sync_diagnostics))

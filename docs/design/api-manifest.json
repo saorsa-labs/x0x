@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 201,
+  "endpoint_count": 202,
   "endpoints": [
     {
       "category": "status",
@@ -1077,6 +1077,16 @@
       "description": "History row counts, database size, and retention bounds",
       "method": "GET",
       "path": "/history/stats",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "history",
+      "cli_name": "history policy",
+      "description": "Local history policy in force (ADR 0116): rules, defaults, pins and counters (owner-only)",
+      "method": "GET",
+      "path": "/history/policy",
       "request": {
         "kind": "none"
       }

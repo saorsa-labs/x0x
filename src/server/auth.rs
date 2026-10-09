@@ -372,6 +372,9 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
             ) || is_two_segment_action(path, "delegate")
         }
         Method::DELETE => is_sync_device_path(path),
+        // ADR 0116 §3: the local history policy, with its counters and the
+        // fork-quarantine pins, is an owner-only read.
+        Method::GET => path == "/history/policy",
         _ => false,
     }
 }
@@ -1302,6 +1305,25 @@ mod tests {
             "/acl/connectx",
         ] {
             assert!(!is_acl_admin_path(path), "{path} must not be classified");
+        }
+    }
+
+    /// ADR 0116 §3: `GET /history/policy` is owner-only, enforced at the
+    /// route layer like the other durable-owner surfaces. The other history
+    /// reads keep their existing tiers.
+    #[test]
+    fn history_policy_requires_durable_owner_and_other_history_reads_do_not() {
+        assert!(requires_durable_owner(&Method::GET, "/history/policy"));
+        for path in [
+            "/history",
+            "/history/stats",
+            "/history/scopes",
+            "/history/search",
+        ] {
+            assert!(
+                !requires_durable_owner(&Method::GET, path),
+                "GET {path} keeps its tier"
+            );
         }
     }
 
