@@ -180,6 +180,7 @@ jobs:
     timeout-minutes: 30
     env:
       X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+      X0X_RETAIN_FIXTURE_DIAGNOSTICS: '1'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -361,6 +362,16 @@ jobs:
           name: issue321-moderated-custody
           path: ${{ runner.temp }}/issue321-moderated/safe/custody-receipt.json
           if-no-files-found: error
+      - name: Upload retained fixture diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: integration-groups-fixture-diagnostics
+          # Issue #321 selectors override RUNNER_TEMP with per-selector roots.
+          path: ${{ runner.temp }}/**/x0x-fixture-diagnostics-*
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
 
   # Issue #277 datagram-lane acceptance (ADR-0042 (c)). Loopback only:
   # every agent binds 127.0.0.1:0 and the lossy proxy binds 127.0.0.1:0,
