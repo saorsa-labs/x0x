@@ -390,3 +390,59 @@ async fn issue1274_join_artifact_egress_refused_after_shutdown_start_releases_at
     );
     Ok(())
 }
+
+/// Review r3 (P2): the drain's egress fence must hold until an egress task
+/// has released every owner it captured, not merely until it has left the
+/// registry. A finished egress task's cleanup guard removes its own handle
+/// from the registry and releases the registry lock, and only then drops
+/// its `state: Arc<AppState>` field. The test parks the guard exactly
+/// there (`egress_cleanup_test_seam`, which blocks that worker thread) and
+/// checks, with a synchronous single poll rather than timing, that the
+/// drain's idle wait is not satisfied while the guard still owns the
+/// AppState, and that it is satisfied once the guard is released. Inert:
+/// no daemon, no socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1274_egress_fence_holds_until_the_cleanup_releases_its_owner() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group = random_hex(32);
+    let recipient = random_hex(32);
+    let pause = egress_cleanup_test_seam::arm(&group, &recipient);
+    spawn_join_artifact_egress(
+        &state,
+        &group,
+        &recipient,
+        "join_result",
+        Instant::now() + PENDING_JOIN_RESULT_TTL,
+        async {},
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !pause.reached() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the egress cleanup did not reach its pause within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Parked: the task has left the registry, but its guard still owns the
+    // AppState.
+    let listed = state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(group.clone(), recipient.clone()))
+        .map_or(0, Vec::len);
+    let idle_while_parked =
+        futures::FutureExt::now_or_never(join_artifact_egress_idle(&state)).is_some();
+    pause.release();
+    let idle_after_release = tokio::time::timeout(WAIT, join_artifact_egress_idle(&state))
+        .await
+        .is_ok();
+    assert_eq!(
+        (listed, idle_while_parked, idle_after_release),
+        (0, false, true),
+        "(registry entries while the guard is parked, drain idle while parked, drain idle \
+         after release): the drain must not see the egress idle while its cleanup guard \
+         still owns the AppState"
+    );
+    Ok(())
+}

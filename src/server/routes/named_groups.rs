@@ -36666,17 +36666,127 @@ impl Drop for JoinArtifactEgressCleanup {
             &self.state,
             format!("egress_ended:{}:{}:{}", self.key.0, self.key.1, self.kind),
         );
-        let mut registry = self
-            .state
-            .join_artifact_egress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(tasks) = registry.get_mut(&self.key) {
-            tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
-            if tasks.is_empty() {
-                registry.remove(&self.key);
+        {
+            let mut registry = self
+                .state
+                .join_artifact_egress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(tasks) = registry.get_mut(&self.key) {
+                tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
+                if tasks.is_empty() {
+                    registry.remove(&self.key);
+                }
             }
         }
+        // #1274 r3: the registry no longer lists this task and its lock is
+        // released, but `self.state` (an AppState owner) drops only after
+        // this body returns.
+        #[cfg(test)]
+        egress_cleanup_test_seam::pause(&self.key);
+    }
+}
+
+/// #1274 r3: test-only pause at the end of [`JoinArtifactEgressCleanup`]'s
+/// drop body: after the task has removed its own handle from the egress
+/// registry and released the registry lock, and before the guard's
+/// `state: Arc<AppState>` field is dropped. The pause blocks the worker
+/// thread, standing in for a preemption at that point. Keyed by
+/// `(group, recipient)`, so parallel tests never touch each other's pause.
+#[cfg(test)]
+pub(in crate::server) mod egress_cleanup_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    /// A parked cleanup gives up after this long, so a failed test can never
+    /// hang the test binary.
+    const PAUSE_CAP: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct CleanupPause {
+        reached: AtomicBool,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl CleanupPause {
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// One armed pause. Dropping it releases the cleanup (and disarms the
+    /// key if no cleanup took it).
+    pub(in crate::server) struct ArmedCleanupPause {
+        key: (String, String),
+        pause: Arc<CleanupPause>,
+    }
+
+    impl ArmedCleanupPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::server) fn release(&self) {
+            self.pause.release();
+        }
+    }
+
+    impl Drop for ArmedCleanupPause {
+        fn drop(&mut self) {
+            self.pause.release();
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    type Armed = HashMap<(String, String), Arc<CleanupPause>>;
+    static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
+
+    /// Park the next egress cleanup for `(group, recipient)` (one-shot).
+    pub(in crate::server) fn arm(group: &str, recipient: &str) -> ArmedCleanupPause {
+        let key = (group.to_string(), recipient.to_string());
+        let pause = Arc::new(CleanupPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key.clone(), Arc::clone(&pause));
+        ArmedCleanupPause { key, pause }
+    }
+
+    pub(super) fn pause(key: &(String, String)) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(key));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        let released = pause
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = pause
+            .wake
+            .wait_timeout_while(released, PAUSE_CAP, |released| !*released);
     }
 }
 
