@@ -1255,7 +1255,8 @@ impl Store {
         // This certificate is INTERMEDIATE: it authorizes eviction below
         // but must not touch the counter (R4-B) — the pass's final state,
         // after its last statement, is what 4d accounts.
-        let mut settled = self.maintain_until_settled(conn, deadline, None)?;
+        let mut settled =
+            self.maintain_until_settled(conn, ReclaimGate::deadline_only(deadline))?;
 
         // 4c. Settled eviction: measure, delete one bounded batch, fold its
         // tombstones, remeasure — all inside the held connection.
@@ -1311,7 +1312,7 @@ impl Store {
             settled = if fold_timed_out {
                 false
             } else {
-                self.maintain_until_settled(conn, deadline, None)?
+                self.maintain_until_settled(conn, ReclaimGate::deadline_only(deadline))?
             };
             if settled {
                 let after = live_db_bytes(conn)?.max(0) as u64;
@@ -1383,16 +1384,10 @@ impl Store {
     fn maintain_until_settled(
         &self,
         conn: &Connection,
-        deadline: std::time::Instant,
-        cancel: Option<&AtomicBool>,
+        gate: ReclaimGate<'_>,
     ) -> HistoryResult<bool> {
         loop {
-            if std::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            // ADR 0116 §4: a cancelled trim starts no further reclamation
-            // statement. The reaper passes `None`.
-            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            if gate.closed() {
                 return Ok(false);
             }
             // Round-4 test hook: stand in for "the budget ran out before
@@ -1404,16 +1399,16 @@ impl Store {
             }
             // Merge slice: positive rank — resume an in-progress merge or
             // merge a level with enough segments.
-            let worked = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, deadline)?;
+            let worked = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, gate)?;
             // R4-A (round 6): the merge statement may have been the
             // in-flight overrun; the vacuum probe and the cadence
             // checkpoint are NEW statements and must not start behind
             // it. Reporting is moot — this return is "not settled".
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok(false);
             }
-            let (vacuumed, vacuum_skipped) = self.vacuum_slice(conn, deadline)?;
-            if vacuum_skipped || std::time::Instant::now() >= deadline {
+            let (vacuumed, vacuum_skipped) = self.vacuum_slice(conn, gate)?;
+            if vacuum_skipped || gate.closed() {
                 // The vacuum stopped on the deadline: its page count is
                 // not the no-op the certificate needs (there may still be
                 // freelist pages to return), and no further reclamation
@@ -1435,18 +1430,18 @@ impl Store {
             // nothing left to merge. A statement that does not run
             // cannot certify: if the budget expired with the positive
             // no-op, the negative probe belongs to the next pass (R4-A).
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok(false);
             }
-            let flattened = self.merge_slice(conn, -FTS_MERGE_PAGES_PER_SLICE, deadline)?;
+            let flattened = self.merge_slice(conn, -FTS_MERGE_PAGES_PER_SLICE, gate)?;
             // R4-A: same rule as the positive probe above — no vacuum
             // probe, no cadence checkpoint behind an overlong negative
             // merge.
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok(false);
             }
-            let (vacuumed_after, vacuum_skipped_after) = self.vacuum_slice(conn, deadline)?;
-            if vacuum_skipped_after || std::time::Instant::now() >= deadline {
+            let (vacuumed_after, vacuum_skipped_after) = self.vacuum_slice(conn, gate)?;
+            if vacuum_skipped_after || gate.closed() {
                 return Ok(false);
             }
             self.stmt_start("checkpoint");
@@ -1481,16 +1476,16 @@ impl Store {
         &self,
         conn: &Connection,
         rank: i64,
-        deadline: std::time::Instant,
+        gate: ReclaimGate<'_>,
     ) -> HistoryResult<bool> {
-        if std::time::Instant::now() >= deadline {
+        if gate.closed() {
             // Nothing ran: conservatively "worked", so no caller can
             // read this as a no-op observation (R4-A round 6).
             return Ok(true);
         }
         self.stmt_start("fts_structure");
         let structure_before = Self::fts_structure(conn)?;
-        if std::time::Instant::now() >= deadline {
+        if gate.closed() {
             return Ok(true);
         }
         self.stmt_start("fts_merge");
@@ -1504,7 +1499,7 @@ impl Store {
             self.test_merge_slices.fetch_add(1, Ordering::Relaxed);
             self.observe_wal_for_tests();
         }
-        if std::time::Instant::now() >= deadline {
+        if gate.closed() {
             // The merge statement above may have been the in-flight
             // overrun; its checkpoint and structure re-read are new
             // reclamation statements and must not start (R4-A).
@@ -1519,7 +1514,7 @@ impl Store {
         // in-flight overrun, and no reclamation statement starts past the
         // deadline. An unread structure cannot certify a no-op, so report
         // "worked", conservatively.
-        if std::time::Instant::now() >= deadline {
+        if gate.closed() {
             return Ok(true);
         }
         self.stmt_start("fts_structure");
@@ -1558,15 +1553,11 @@ impl Store {
     /// between the slice's checkpoints (R3-E). Test builds observe the WAL
     /// after every statement and every checkpoint (R4-C), so removing
     /// those checkpoints is observable as a peak overrun.
-    fn vacuum_slice(
-        &self,
-        conn: &Connection,
-        deadline: std::time::Instant,
-    ) -> HistoryResult<(i64, bool)> {
+    fn vacuum_slice(&self, conn: &Connection, gate: ReclaimGate<'_>) -> HistoryResult<(i64, bool)> {
         // R4-A (round 6): the mode probe is a statement too — an expired
         // budget means the slice did not run and must not be read as a
         // no-op.
-        if std::time::Instant::now() >= deadline {
+        if gate.closed() {
             return Ok((0, true));
         }
         self.stmt_start("auto_vacuum_probe");
@@ -1576,14 +1567,14 @@ impl Store {
         }
         let mut vacuumed = 0_i64;
         for i in 0..VACUUM_PAGES_PER_SLICE {
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok((vacuumed, true));
             }
             self.stmt_start("vacuum_page_count");
             let before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             // R4-A (round 7 review): the leading read may have used up the
             // budget; the vacuum step is a new reclamation write.
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok((vacuumed, true));
             }
             self.stmt_start("incremental_vacuum");
@@ -1598,7 +1589,7 @@ impl Store {
             // statements too — if the step above consumed the remaining
             // budget they must not start, and the unobserved step reports
             // itself as skipped, never as a no-op toward the certificate.
-            if std::time::Instant::now() >= deadline {
+            if gate.closed() {
                 return Ok((vacuumed, true));
             }
             self.stmt_start("vacuum_page_count");
@@ -1608,7 +1599,7 @@ impl Store {
             }
             vacuumed += before - after;
             if i % VACUUM_CHECKPOINT_EVERY == VACUUM_CHECKPOINT_EVERY - 1 {
-                if std::time::Instant::now() >= deadline {
+                if gate.closed() {
                     return Ok((vacuumed, true));
                 }
                 self.stmt_start("checkpoint");
@@ -1680,8 +1671,9 @@ impl Store {
             // like every reclamation statement (the slice helpers check
             // before each of their own statements, so an exhausted budget
             // degrades only the folding, never the deletes above).
-            let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, deadline)?;
-            let (_vacuumed, _vacuum_skipped) = self.vacuum_slice(conn, deadline)?;
+            let gate = ReclaimGate::deadline_only(deadline);
+            let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, gate)?;
+            let (_vacuumed, _vacuum_skipped) = self.vacuum_slice(conn, gate)?;
             if std::time::Instant::now() < deadline {
                 Self::checkpoint_wal(conn)?;
             }
@@ -1908,7 +1900,10 @@ impl Store {
     ///   reaper's own phases unchanged).
     /// - **Budgets.** Cancellation and the time budget are checked before
     ///   every statement, the row budget before every delete; the trim stops
-    ///   at a committed boundary. One statement already running may overrun
+    ///   at a committed boundary. "Every statement" includes each PRAGMA of
+    ///   the live-size measure and every reclamation statement (merge slice,
+    ///   vacuum step, checkpoint, structure and page-count reads), which take
+    ///   the trim's cancel flag through [`ReclaimGate`]. One statement already running may overrun
     ///   the time budget: it is a work-admission budget, not a deadline.
     /// - **Connection.** Held for the whole trim, like a reaper pass
     ///   (C-1264-1), so every observation and the deletion it leads to see
@@ -2454,8 +2449,7 @@ impl Store {
         }
         trim_gate!(run.gate());
         run.statements += 1;
-        let mut settled =
-            self.maintain_until_settled(conn, run.budget.deadline, Some(run.budget.cancel))?;
+        let mut settled = self.maintain_until_settled(conn, run.reclaim())?;
         let delete = format!(
             "DELETE FROM history WHERE id IN (SELECT id FROM (SELECT id, len, \
                SUM(len) OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
@@ -2495,14 +2489,32 @@ impl Store {
             )?;
             run.add(TrimBucket::GlobalBudget, n);
             if n == 0 {
-                // Settled and over the cap with no eligible row: pinned or
-                // Replaceable rows alone keep it exceeded.
-                return Ok(UnitEnd::Done(Observation::Protected));
+                // Settled and over the cap with no eligible row. Pinned or
+                // exempt (Replaceable) history keeps it exceeded only when
+                // such rows exist. With none, the overshoot is the
+                // database's own footprint (schema pages): no policy work is
+                // left, and `complete` promises no file shrinkage (Codex D r1
+                // P2-4).
+                trim_gate!(run.gate());
+                let probe = if run.include.is_empty() {
+                    "SELECT EXISTS(SELECT 1 FROM history WHERE replace_key IS NOT NULL)".to_string()
+                } else {
+                    format!(
+                        "SELECT EXISTS(SELECT 1 FROM history WHERE replace_key IS NOT NULL) \
+                         OR EXISTS(SELECT 1 FROM history WHERE 1 = 1{})",
+                        run.include
+                    )
+                };
+                let held = self.trim_query(conn, "global_protected_probe", &probe, &[], run)?;
+                return Ok(UnitEnd::Done(if held != 0 {
+                    Observation::Protected
+                } else {
+                    Observation::Settled
+                }));
             }
             trim_gate!(run.gate());
             run.statements += 1;
-            settled =
-                self.maintain_until_settled(conn, run.budget.deadline, Some(run.budget.cancel))?;
+            settled = self.maintain_until_settled(conn, run.reclaim())?;
             if settled {
                 let after = trim_gate!(self.trim_live_bytes(conn, run)?);
                 learned_marginal = Some(live.saturating_sub(after) / n);
@@ -2555,11 +2567,11 @@ impl Store {
             remaining = remaining.saturating_sub(n);
             if run.gate().is_ok() {
                 run.statements += 1;
-                let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, run.budget.deadline)?;
+                let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, run.reclaim())?;
             }
             if run.gate().is_ok() {
                 run.statements += 1;
-                let _ = self.vacuum_slice(conn, run.budget.deadline)?;
+                let _ = self.vacuum_slice(conn, run.reclaim())?;
             }
             if run.gate().is_ok() {
                 run.statements += 1;
@@ -2624,10 +2636,15 @@ impl Store {
         conn: &Connection,
         run: &mut TrimRun<'_>,
     ) -> HistoryResult<Result<u64, RetainStop>> {
+        // Codex D r1 P2-1: each PRAGMA is a statement, and each is admitted
+        // by its own budget check, so at most the one running overruns.
         if let Err(stop) = run.gate() {
             return Ok(Err(stop));
         }
         let page_count = self.trim_query(conn, "live_page_count", "PRAGMA page_count", &[], run)?;
+        if let Err(stop) = run.gate() {
+            return Ok(Err(stop));
+        }
         let freelist = self.trim_query(
             conn,
             "live_freelist_count",
@@ -2635,6 +2652,9 @@ impl Store {
             &[],
             run,
         )?;
+        if let Err(stop) = run.gate() {
+            return Ok(Err(stop));
+        }
         let page_size = self.trim_query(conn, "live_page_size", "PRAGMA page_size", &[], run)?;
         Ok(Ok(u64::try_from(
             page_count
@@ -2752,6 +2772,34 @@ enum TrimEnd {
     Lap { protected: bool },
 }
 
+/// When the reclamation statements (merge slices, vacuum steps and their
+/// checkpoints and probes) stop starting: the pass deadline, and for an
+/// ADR 0116 trim also its caller's cancel flag. The reaper passes no flag,
+/// so its reclamation is deadline-gated exactly as before (C-1264-2).
+#[derive(Clone, Copy)]
+struct ReclaimGate<'a> {
+    deadline: std::time::Instant,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl ReclaimGate<'_> {
+    /// The reaper's gate: its pass deadline only.
+    fn deadline_only(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            cancel: None,
+        }
+    }
+
+    /// May no further reclamation statement start?
+    fn closed(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+            || self
+                .cancel
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    }
+}
+
 /// One trim's budgets and committed counts.
 struct TrimRun<'r> {
     budget: &'r TrimBudget<'r>,
@@ -2760,6 +2808,17 @@ struct TrimRun<'r> {
     deleted: RetainDeleted,
     /// Statements started, to tell whether a unit got its turn.
     statements: u64,
+}
+
+impl<'r> TrimRun<'r> {
+    /// The reclamation gate of this trim: its deadline and its cancel flag
+    /// (Codex D r1 P2-2: cancellation reaches every reclamation statement).
+    fn reclaim(&self) -> ReclaimGate<'r> {
+        ReclaimGate {
+            deadline: self.budget.deadline,
+            cancel: Some(self.budget.cancel),
+        }
+    }
 }
 
 impl TrimRun<'_> {
@@ -6606,7 +6665,11 @@ mod tests {
                 "fixture: the raw delete must leave freelist pages (got {freelist_before})"
             );
             let worked = store
-                .merge_slice(&guard, FTS_MERGE_PAGES_PER_SLICE, past)
+                .merge_slice(
+                    &guard,
+                    FTS_MERGE_PAGES_PER_SLICE,
+                    ReclaimGate::deadline_only(past),
+                )
                 .unwrap();
             assert!(
                 worked,
@@ -6622,7 +6685,9 @@ mod tests {
                 structure_before,
                 "no statement of the slice may run past the deadline"
             );
-            let (pages, skipped) = store.vacuum_slice(&guard, past).unwrap();
+            let (pages, skipped) = store
+                .vacuum_slice(&guard, ReclaimGate::deadline_only(past))
+                .unwrap();
             assert_eq!(pages, 0, "no vacuum step may move a page past the deadline");
             assert!(skipped, "an expired-deadline vacuum reports skipped");
             let freelist: i64 = guard

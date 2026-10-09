@@ -342,9 +342,10 @@ impl HistoryHandle {
         let store = Arc::clone(&self.store);
         let retention = Arc::clone(&self.retention);
         let rules = Arc::clone(&self.policy);
+        let counters = self.writer.counters();
         let max_rows = u64::from(options.max_rows);
         let joined = tokio::task::spawn_blocking(move || {
-            store.trim(
+            let result = store.trim(
                 &retention,
                 &rules,
                 &pinned,
@@ -354,10 +355,15 @@ impl HistoryHandle {
                     deadline,
                     cancel: &cancel,
                 },
-            )
+            );
+            // Published here, on the blocking task, not after the caller's
+            // await: a caller that leaves must not lose ADR 0068's count of
+            // rows already committed (Codex D r1 P2-3).
+            publish_pinned_evictions(&counters, &result);
+            result
         })
         .await;
-        let result = match joined {
+        match joined {
             Ok(result) => result,
             Err(join) => Err(RetainError::Failed {
                 error: HistoryError::Database(format!("history trim task did not finish: {join}")),
@@ -368,26 +374,31 @@ impl HistoryHandle {
                     None,
                 ),
             }),
-        };
-        // ADR 0068's counter keeps counting every row a pinned scope sheds
-        // at its own ceiling, whether the reaper or a trim deleted it.
-        let pinned_evicted = match &result {
-            Ok(report) => report.pin_ceiling_deleted,
-            Err(RetainError::Failed { committed, .. }) => committed.pin_ceiling_deleted,
-            Err(_) => 0,
-        };
-        if pinned_evicted > 0 {
-            self.writer
-                .counters()
-                .quarantine_pinned_evictions
-                .fetch_add(pinned_evicted, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                pinned_evicted,
-                "[history] a trim cut a fork-quarantined scope back to its pinned \
-                 ceiling; it shed its OWN oldest rows (ADR-0068 D1)"
-            );
         }
-        result
+    }
+}
+
+/// ADR 0068's counter keeps counting every row a pinned scope sheds at its
+/// own ceiling, whether the reaper or a trim deleted it. Called with the
+/// trim's result on the blocking task, after the store's locks are released.
+fn publish_pinned_evictions(
+    counters: &HistoryCounters,
+    result: &Result<RetainReport, RetainError>,
+) {
+    let pinned_evicted = match result {
+        Ok(report) => report.pin_ceiling_deleted,
+        Err(RetainError::Failed { committed, .. }) => committed.pin_ceiling_deleted,
+        Err(_) => 0,
+    };
+    if pinned_evicted > 0 {
+        counters
+            .quarantine_pinned_evictions
+            .fetch_add(pinned_evicted, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            pinned_evicted,
+            "[history] a trim cut a fork-quarantined scope back to its pinned \
+             ceiling; it shed its OWN oldest rows (ADR-0068 D1)"
+        );
     }
 }
 
