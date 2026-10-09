@@ -297,3 +297,70 @@ async fn issue1274_key_package_catchup_at_shutdown_releases_owner() -> Result<()
     drop(catchup);
     Ok(())
 }
+
+/// Same shape, found by the #1274 audit: an ADR 0107 join-artifact egress
+/// task holds the AppState up to its artifact deadline. A secure share to
+/// an unavailable member retries for up to `PENDING_JOIN_RESULT_TTL`
+/// (10 min). The body here stands in for that retry loop: it holds what a
+/// secure-share body captures (the AppState) and waits. The task goes
+/// through the real `spawn_join_artifact_egress` and its registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1274_join_artifact_egress_at_shutdown_releases_owner() -> Result<()> {
+    let (daemon, state) = start_daemon("egress").await?;
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let body_state = Arc::clone(&state);
+    spawn_join_artifact_egress(
+        &state,
+        &random_hex(32),
+        &random_hex(32),
+        "secure_share",
+        Instant::now() + PENDING_JOIN_RESULT_TTL,
+        async move {
+            let _held = body_state;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
+    tokio::time::timeout(WAIT, started_rx)
+        .await
+        .context("the egress body starts")??;
+    drop(state);
+
+    let outcome = daemon.stop_and_relaunch().await?;
+    assert_released(&outcome, "join-artifact egress");
+    Ok(())
+}
+
+/// Once the shutdown drain has started, a new join-artifact egress is not
+/// registered and its body never runs. Inert: no daemon, no socket.
+#[tokio::test]
+async fn issue1274_join_artifact_egress_after_shutdown_start_is_refused() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    state.shutdown_started.cancel();
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_ran = Arc::clone(&ran);
+    spawn_join_artifact_egress(
+        &state,
+        &random_hex(32),
+        &random_hex(32),
+        "join_result",
+        Instant::now() + PENDING_JOIN_RESULT_TTL,
+        async move {
+            body_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "no egress body runs after shutdown has started"
+    );
+    let registered = state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .flatten()
+        .any(|task| !task.is_finished());
+    assert!(!registered, "no egress task is left in the registry");
+    Ok(())
+}
