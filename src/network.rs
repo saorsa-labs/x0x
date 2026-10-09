@@ -161,10 +161,42 @@ impl SessionConnection {
 ///
 /// `next` mints process-unique SG token generations; it is unrelated to ant's
 /// connection generation namespace stored alongside in each entry.
-#[derive(Default)]
+///
+/// `teardown` is the node's teardown token (#1262). Once it is cancelled the
+/// registry resolves no session and accepts no insert (#1277). The check
+/// runs under the registry lock, which the teardown clear also takes, and
+/// the coordinator cancels the token before the teardown worker starts. So
+/// an insert either precedes the clear (and the clear removes it) or sees
+/// the cancelled token and is refused: no entry can follow the clear.
 struct AuthenticatedSessions {
     next: u64,
     peers: HashMap<AntPeerId, SessionEntry>,
+    teardown: tokio_util::sync::CancellationToken,
+}
+
+impl AuthenticatedSessions {
+    fn new(teardown: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            next: 0,
+            peers: HashMap::new(),
+            teardown,
+        }
+    }
+
+    /// Whether network teardown has started. Callers hold the registry lock.
+    fn closed(&self) -> bool {
+        self.teardown.is_cancelled()
+    }
+}
+
+/// Drop every retained session handle. Network teardown calls this before
+/// and after the transport shutdown (#1277).
+fn clear_session_registry(registry: &Mutex<AuthenticatedSessions>) {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .peers
+        .clear();
 }
 
 /// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
@@ -238,6 +270,7 @@ impl std::fmt::Debug for AuthenticatedSessions {
         f.debug_struct("AuthenticatedSessions")
             .field("next", &self.next)
             .field("live_entries", &self.peers.len())
+            .field("closed", &self.closed())
             .finish()
     }
 }
@@ -2075,7 +2108,21 @@ pub struct NetworkNode {
     /// pub-sub publish funnel can record attempts before mesh fan-out.
     #[cfg(test)]
     sim_link: Option<Arc<sim::SimLink>>,
+    /// #1277 test-only seam: a one-shot pause in the teardown worker right
+    /// after it clears the session registry (see
+    /// [`NetworkNode::pause_shutdown_after_registry_clear_for_test`]).
+    #[cfg(test)]
+    registry_clear_pause_for_test: Arc<Mutex<Option<RegistryClearPause>>>,
 }
+
+/// #1277 test seam: the worker reports on the sender that it cleared the
+/// session registry, then waits on the receiver before it shuts the
+/// transport down.
+#[cfg(test)]
+type RegistryClearPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 #[derive(Clone, Debug)]
 enum NetworkShutdownOutcome {
@@ -2383,6 +2430,12 @@ impl NetworkNode {
             pool_max_connections,
             CONNECTION_POOL_IDLE_EVICT_AFTER,
         ));
+        let shutdown_state = Arc::new(NetworkShutdownCoordinator::new());
+        // The registry shares the teardown token so it refuses inserts once
+        // teardown has started (#1277).
+        let authenticated_sessions = Arc::new(Mutex::new(AuthenticatedSessions::new(
+            shutdown_state.teardown.clone(),
+        )));
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -2407,7 +2460,7 @@ impl NetworkNode {
             transport_signing_key,
             bootstrap_cache,
             connection_pool,
-            authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
+            authenticated_sessions,
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -2415,13 +2468,15 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
-            shutdown_state: Arc::new(NetworkShutdownCoordinator::new()),
+            shutdown_state,
             #[cfg(test)]
             shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             sim_link,
+            #[cfg(test)]
+            registry_clear_pause_for_test: Arc::new(Mutex::new(None)),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -2737,7 +2792,8 @@ impl NetworkNode {
     }
 
     /// Current `(ant generation, SG token)` for a peer with a live, open QUIC
-    /// connection, minting/reusing a registry entry as needed.
+    /// connection, minting/reusing a registry entry as needed. Returns `None`
+    /// once network teardown has started (#1277).
     ///
     /// A returned entry proves: a non-sentinel current ant generation, a
     /// non-closed retained QUIC connection whose stable id matches the one
@@ -2764,6 +2820,14 @@ impl NetworkNode {
             return None;
         }
         let mut sessions = registry.lock().ok()?;
+        // #1277: once teardown has started, resolve nothing and insert
+        // nothing. A send that took its `LinkNode` before teardown can reach
+        // here after the teardown clear while its connection is still open;
+        // this check, under the lock the clear takes, keeps that connection
+        // out of the registry.
+        if sessions.closed() {
+            return None;
+        }
         if let Some(entry) = sessions.peers.get_mut(ant_peer) {
             if entry.connection.stable_id() == connection.stable_id()
                 && entry.ant_generation == ant_generation
@@ -4362,6 +4426,8 @@ impl NetworkNode {
         let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
         #[cfg(test)]
         let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
+        #[cfg(test)]
+        let registry_clear_pause = Arc::clone(&self.registry_clear_pause_for_test);
         self.shutdown_state
             .run(async move {
                 let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
@@ -4381,20 +4447,32 @@ impl NetworkNode {
                     let mut node_guard = node.write().await;
                     node_guard.take()
                 };
-                // Drop retained session-registry connections alongside the
-                authenticated_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .peers
-                    .clear();
+                // Drop the retained session-registry connections before the
+                // transport shuts down. The registry has refused inserts
+                // since teardown started (#1277), so nothing re-enters it.
+                clear_session_registry(&authenticated_sessions);
+                #[cfg(test)]
+                {
+                    let pause = registry_clear_pause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some((cleared, resume)) = pause {
+                        let _ = cleared.send(());
+                        let _ = resume.await;
+                    }
+                }
                 let Some(node) = node else {
                     return Err(
                         "network node was absent before shutdown established a result".to_string(),
                     );
                 };
-                node.try_shutdown()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let released = node.try_shutdown().await;
+                // Belt and braces (#1277): clear again once the transport is
+                // down, whatever its result, so no session handle outlives
+                // teardown even if an insert path ever skips the check.
+                clear_session_registry(&authenticated_sessions);
+                released.map_err(|error| error.to_string())?;
                 #[cfg(test)]
                 if let Some(error) = shutdown_failure
                     .lock()
@@ -4415,6 +4493,22 @@ impl NetworkNode {
             .shutdown_failure_for_test
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
+    }
+
+    /// Arm a one-shot pause in the teardown worker right after it clears the
+    /// session registry, before it shuts the transport down (#1277). The
+    /// worker sends on `cleared`, then waits for `resume` (or for its sender
+    /// to drop).
+    #[cfg(test)]
+    pub(crate) fn pause_shutdown_after_registry_clear_for_test(
+        &self,
+        cleared: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .registry_clear_pause_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((cleared, resume));
     }
 
     /// Drive one outbound dial unless network teardown has started (#1262).
@@ -7067,6 +7161,106 @@ mod tests {
         assert!(error
             .to_string()
             .contains("release failed after caller cancellation"));
+    }
+
+    fn session_registry_len(node: &NetworkNode) -> usize {
+        node.authenticated_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peers
+            .len()
+    }
+
+    /// #1277: a guarded gossip send that passed `require_node` before
+    /// teardown started, and resolves its session after the teardown worker
+    /// cleared the registry, must not put the still-open connection back.
+    ///
+    /// Inert: both nodes run on the W3-H simulation fabric (no socket). The
+    /// test-only pause holds the worker between the registry clear and the
+    /// transport shutdown, and the racing step runs in that window. It is
+    /// the first step of `send_to_peer_guarded`: resolve the session with
+    /// the `LinkNode` clone that `require_node` returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1277_send_racing_teardown_cannot_reinsert_a_session() {
+        let plane = "issue1277-registry-teardown";
+        let fabric = sim::SimFabric::new(1277);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+
+        // The send task: `require_node` passes before teardown starts, and
+        // the session it resolves now is minted into the registry.
+        let held = a.require_node().await.unwrap();
+        let cap = a.session_registry_cap();
+        assert!(
+            NetworkNode::current_session_for_peer(&held, &a.authenticated_sessions, cap, &peer_b)
+                .is_some(),
+            "the live simulated connection mints a session before teardown"
+        );
+        assert_eq!(session_registry_len(&a), 1);
+
+        let (cleared_tx, cleared_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        a.pause_shutdown_after_registry_clear_for_test(cleared_tx, resume_rx);
+        let shutdown = tokio::spawn({
+            let a = a.clone();
+            async move { a.try_shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleared_rx)
+            .await
+            .expect("teardown reached the registry clear in time")
+            .expect("teardown worker reports the clear");
+        assert_eq!(
+            session_registry_len(&a),
+            0,
+            "the teardown worker cleared the registry"
+        );
+
+        // The race: the send resolves its session between the clear and
+        // the transport shutdown. Its connection is still open.
+        assert!(
+            held.session_connection(&peer_b)
+                .is_some_and(|connection| !connection.is_closed()),
+            "the held link still reports the open connection in the window"
+        );
+        let raced =
+            NetworkNode::current_session_for_peer(&held, &a.authenticated_sessions, cap, &peer_b);
+        let in_window = session_registry_len(&a);
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), shutdown)
+            .await
+            .expect("teardown finished in time")
+            .expect("teardown task joins")
+            .expect("teardown succeeds");
+        drop(held);
+
+        assert_eq!(
+            session_registry_len(&a),
+            0,
+            "no session handle may outlive network teardown"
+        );
+        assert_eq!(
+            in_window, 0,
+            "an insert after the teardown clear must be refused"
+        );
+        assert!(
+            raced.is_none(),
+            "a registry whose teardown has started must not resolve a session"
+        );
+        b.try_shutdown().await.unwrap();
     }
 
     /// Boundary regression for ant-quic's transport-aware connected snapshot.
