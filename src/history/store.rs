@@ -5436,6 +5436,128 @@ mod tests {
             "the gauge follows the latest pass"
         );
     }
+
+    /// A `tracing` layer that, when the #1286 skip warning fires, checks
+    /// whether the store's two locks are free and then reads the store
+    /// through `stats()`, as a subscriber that inspects history would.
+    ///
+    /// It uses `try_lock`, not `lock`: a `std` mutex already held by this
+    /// thread would deadlock, and the RED arm must fail, not hang.
+    struct LockProbe {
+        store: std::sync::Arc<Store>,
+        /// One `(retention free, connection free, stats() succeeded)` per
+        /// warning.
+        seen: std::sync::Arc<Mutex<Vec<(bool, bool, bool)>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LockProbe {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() != tracing::Level::WARN || meta.target() != "x0x::history::store" {
+                return;
+            }
+            let retention_free = self.store.retention.try_lock().is_ok();
+            let conn_free = self.store.conn.try_lock().is_ok();
+            let stats_ok = retention_free && conn_free && self.store.stats().is_ok();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((retention_free, conn_free, stats_ok));
+        }
+    }
+
+    /// Issue #1286 round 2 (Codex P2): tracing calls the subscriber
+    /// synchronously, so the skip warning must be emitted after the pass has
+    /// released BOTH the retention mutex and the connection. Otherwise a
+    /// subscriber that reads the store deadlocks, and a blocked log sink
+    /// stalls readers, writers and the reaper, and the first bad entry can
+    /// still stop the cap.
+    #[test]
+    fn skip_warning_is_emitted_with_no_store_lock_held() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (store, _dir) = open();
+        let store = std::sync::Arc::new(store);
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(LockProbe {
+                store: std::sync::Arc::clone(&store),
+                seen: std::sync::Arc::clone(&seen),
+            }));
+        let bad = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![ScopeLimit {
+                scope: "not-a-scope".into(),
+                max_bytes: 0,
+            }],
+        };
+        store.retain(&bad).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the skip warning fires once: {seen:?}");
+        assert_eq!(
+            seen[0],
+            (true, true, true),
+            "when the warning is emitted: (retention lock free, connection lock free, \
+             stats() succeeded)"
+        );
+    }
+
+    /// Issue #1286 round 2: concurrent passes on one store claim the single
+    /// warning between them. Each thread has its own subscriber, and every
+    /// subscriber writes to one shared buffer.
+    #[test]
+    fn concurrent_passes_log_the_skip_once() {
+        let (store, _dir) = open();
+        let store = std::sync::Arc::new(store);
+        let log = CapturedLog::default();
+        let bad = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "dm:".into(),
+                    max_bytes: 0,
+                },
+                ScopeLimit {
+                    scope: "chan:x".into(),
+                    max_bytes: 0,
+                },
+            ],
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let writer = log.clone();
+                let bad = bad.clone();
+                std::thread::spawn(move || {
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false)
+                        .with_max_level(tracing::Level::WARN)
+                        .finish();
+                    tracing::subscriber::with_default(subscriber, || {
+                        for _ in 0..4 {
+                            store.retain(&bad).unwrap();
+                            assert_eq!(store.skipped_scope_limits(), 2);
+                        }
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let text = log.text();
+        assert_eq!(
+            text.matches("#1286").count(),
+            1,
+            "32 concurrent passes, one warning: {text}"
+        );
+    }
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
