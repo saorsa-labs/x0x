@@ -303,58 +303,65 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
     remember_treekem_membership_event(&authority, &add_j1.event).await;
     remember_treekem_membership_event(&authority, &add_j2.event).await;
 
-    // Exactly what the authority serves J2's FetchRequest from the stub
-    // revision: stage_join_result's v2 owner attestation plus
-    // intervening_chain_from (named_groups.rs, FetchRequest arm).
-    let chain = intervening_chain_from(&next, base.state_revision, add_j2.commit.revision);
-    assert_eq!(chain.len(), 1, "the authority serves the r+1 link");
-    let head_attestation = HeadAttestation::sign_for_terminal(
-        &stable_group_id,
-        &add_j2.commit,
-        &add_j2.member_hex,
-        match &add_j2.event {
-            NamedGroupMetadataEvent::MemberAdded { treekem_epoch, .. } => *treekem_epoch,
-            _ => None,
-        },
-        owner,
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
-    // A pre-#1139 (legacy) authority serves no intervening events.
-    let j2_legacy_result = JoinResultMessage::Result {
-        event: Box::new(add_j2.event.clone()),
-        chain,
-        head_attestation: Some(Box::new(head_attestation)),
-        roster_certificates_b64: Vec::new(),
-        intervening_events: Vec::new(),
-    };
-    // #1139: what the fixed FetchRequest arm adds from the authority's log.
-    let intervening = super::super::intervening_membership_events(
-        &authority,
-        std::slice::from_ref(&stable_group_id),
-        base.state_revision,
-        add_j2.commit.revision,
-    )
-    .await;
-    let j2_result = match j2_legacy_result.clone() {
-        JoinResultMessage::Result {
-            event,
-            chain,
-            head_attestation,
-            roster_certificates_b64,
-            ..
-        } => JoinResultMessage::Result {
-            event,
-            chain,
-            head_attestation,
-            roster_certificates_b64,
-            intervening_events: intervening,
-        },
-        other => other,
-    };
-
+    // #1163: the joiner's result is whatever the production FetchRequest
+    // arm serves after the seal is staged. A hand-built Result can keep
+    // the carry tests green after that arm stops assembling the chain.
+    let stub_revision = base.state_revision;
     let owner_pin = hex::encode(owner.user_id().as_bytes());
     let j1_attempt = route_join(&j1, &link, &stable_group_id, &owner_pin).await?;
     let j2_attempt = route_join(&j2, &link, &stable_group_id, &owner_pin).await?;
+    super::super::stage_join_result(
+        &authority,
+        &stable_group_id,
+        &add_j2.member_hex,
+        add_j2.event.clone(),
+        Some(j2_attempt.as_str()),
+    )
+    .await;
+    let j2_result = super::adr0107_stuck_join_rearm::serve_result(
+        &authority,
+        &j2,
+        &stable_group_id,
+        &j2_attempt,
+        Some(stub_revision),
+    )
+    .await
+    .ok_or_else(|| anyhow::anyhow!("FetchRequest arm served no join result"))?;
+    let (served_event, served_chain, served_head, served_certs, served_intervening) =
+        match j2_result.clone() {
+            JoinResultMessage::Result {
+                event,
+                chain,
+                head_attestation,
+                roster_certificates_b64,
+                intervening_events,
+            } => (
+                event,
+                chain,
+                head_attestation,
+                roster_certificates_b64,
+                intervening_events,
+            ),
+            other => anyhow::bail!("FetchRequest arm served {other:?}"),
+        };
+    assert_eq!(
+        served_chain.len(),
+        1,
+        "the FetchRequest arm serves the r+1 state link"
+    );
+    assert_eq!(
+        served_intervening.len(),
+        1,
+        "the FetchRequest arm serves the r+1 membership carry"
+    );
+    // A pre-#1139 (legacy) authority serves the same result with no carry.
+    let j2_legacy_result = JoinResultMessage::Result {
+        event: served_event,
+        chain: served_chain,
+        head_attestation: served_head,
+        roster_certificates_b64: served_certs,
+        intervening_events: Vec::new(),
+    };
     Ok(BackToBack {
         j1_attempt,
         j2_attempt,
@@ -407,7 +414,9 @@ async fn deliver_j2_result(s: &BackToBack) {
 
 /// The page the authority's TreeKEM catch-up responder serves for J2's
 /// request (`handle_treekem_catchup_request`: every logged membership
-/// event past J2's revision OR epoch).
+/// event past J2's revision OR epoch). The joiner half of the loop needs
+/// the inline Welcome; the wire-size check stages that Welcome by
+/// reference.
 fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
@@ -415,6 +424,31 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         events: vec![s.add_j1.event.clone(), s.add_j2.event.clone()],
         truncated: false,
     }
+}
+
+/// The MemberAdded the seal path logs for catch-up: the real commit and
+/// the real Welcome bytes, staged by `stage_treekem_welcome` and carried
+/// as a reference. An inline Welcome is a larger shape than the log.
+async fn production_catchup_event(s: &BackToBack) -> Result<NamedGroupMetadataEvent> {
+    let mut event = s.add_j1.event.clone();
+    let NamedGroupMetadataEvent::MemberAdded {
+        treekem_welcome_b64,
+        welcome_ref,
+        agent_id,
+        ..
+    } = &mut event
+    else {
+        anyhow::bail!("sealed add is not a MemberAdded");
+    };
+    let inline = treekem_welcome_b64
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("sealed add has no Welcome bytes to stage"))?;
+    let bytes = BASE64.decode(inline)?;
+    let reference =
+        super::super::stage_treekem_welcome(&s._authority, &s.stable_group_id, agent_id, bytes)
+            .await;
+    *welcome_ref = Some(reference);
+    Ok(event)
 }
 
 /// WHY (#1139): pins the mechanism. J2 holds only its OWN join result
@@ -508,15 +542,29 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         "pending_authority_commit"
     );
     // The responder sends this page as ONE plain direct message
-    // (`handle_treekem_catchup_request` → `send_direct_with_config`), but
-    // even a single Home MemberAdded exceeds the DM budget — so on the
-    // wire this page is never delivered today. Injected here to prove
-    // the joiner half of the loop.
+    // (`handle_treekem_catchup_request` → `send_direct_with_config`).
+    // The injected page below still carries an inline Welcome so the
+    // joiner can adopt without a blob pull. The size check measures the
+    // event the catch-up log stores: the same commit, Welcome by reference.
     let page = catchup_page(&s);
+    let logged = production_catchup_event(&s).await?;
+    match &logged {
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } => {
+            assert!(
+                treekem_welcome_b64.is_none() && welcome_ref.is_some(),
+                "catch-up size must measure a Welcome reference, not an inline Welcome"
+            );
+        }
+        _ => panic!("catch-up event is a MemberAdded"),
+    }
     let one_event = serde_json::to_vec(&TreeKemCatchupResponse {
         message_type: page.message_type.clone(),
         group_id: page.group_id.clone(),
-        events: vec![s.add_j1.event.clone()],
+        events: vec![logged],
         truncated: false,
     })?
     .len();
@@ -528,6 +576,34 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     handle_treekem_catchup_response(&s.j2, &s.authority_id, true, page).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    Ok(())
+}
+
+/// WHY (#1163): the authority's FetchRequest arm, not a hand-built
+/// `JoinResultMessage::Result`, is what serves J2 the intervening carry.
+#[tokio::test]
+async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let served = super::adr0107_stuck_join_rearm::serve_result(
+        &s._authority,
+        &s.j2,
+        &s.stable_group_id,
+        &s.j2_attempt,
+        Some(s.add_j1.commit.revision - 1),
+    )
+    .await;
+    let Some(JoinResultMessage::Result {
+        intervening_events, ..
+    }) = served
+    else {
+        anyhow::bail!("FetchRequest served no Result");
+    };
+    assert_eq!(
+        intervening_events.len(),
+        1,
+        "the handler serves the r+1 link"
+    );
     Ok(())
 }
 
