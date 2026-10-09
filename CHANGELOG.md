@@ -63,7 +63,9 @@ All notable changes to this project will be documented in this file.
     (saorsa-labs/ant-quic#313 Part 1). Before this, in the coordinator race
     the winning connection could have no reader, so messages the peer sent
     on it were never delivered.
-  - No wire or public-API change, and no new connection closes.
+  - No wire or public-API change. Reader adoption adds no retirement
+    policy; the losing concurrent hole-punch candidate is now closed as a
+    duplicate instead of staying open and orphaned.
 
 - **Library API (breaking for some embedders; the release that carries this
   is 0.47.0).** `HistoryConfig` gains three
