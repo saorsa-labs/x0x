@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{HistoryError, HistoryResult};
 
-use super::policy::HistoryPolicy;
+use super::policy::{CompiledTopicRule, HistoryPolicy, RetainedClass};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
@@ -394,6 +394,15 @@ pub struct Store {
     /// multi-gigabyte fixture. Absent in production builds.
     #[cfg(test)]
     test_pass_budget_ms: std::sync::atomic::AtomicU64,
+    /// ADR 0116 slice B test hook: the clock the rule-age phases read, in
+    /// unix ms; 0 uses the real clock. Main's global age statement keeps
+    /// its own clock untouched. Absent in production builds.
+    #[cfg(test)]
+    test_rule_now_ms: std::sync::atomic::AtomicI64,
+    /// ADR 0116 slice B test hook: the phases the latest pass ran, in
+    /// order. Absent in production builds.
+    #[cfg(test)]
+    test_phase_trace: Mutex<Vec<&'static str>>,
     /// Dropped after `conn` (fields drop in declaration order, and rusqlite
     /// closes the connection, closing checkpoint included, synchronously in
     /// its `Drop`): in test builds it marks the close complete; zero-sized
@@ -476,6 +485,10 @@ impl Store {
             test_merge_slices: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_pass_budget_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_rule_now_ms: std::sync::atomic::AtomicI64::new(0),
+            #[cfg(test)]
+            test_phase_trace: Mutex::new(Vec::new()),
             _after_close: after_close,
         })
     }
@@ -823,6 +836,27 @@ impl Store {
         policy: &RetentionPolicy,
         pinned: &PinnedScopes,
     ) -> HistoryResult<RetainOutcome> {
+        self.retain_with_rules(policy, &HistoryPolicy::default(), pinned)
+    }
+
+    /// ADR 0116 §2: [`Self::retain_with_pins`] plus the class and topic
+    /// retention rules of `rules`, in the ADR's phase order: ages, pin
+    /// ceilings, class budgets, topic budgets, exact-scope budgets, then
+    /// the global budget.
+    ///
+    /// A rule-free policy ([`HistoryPolicy::has_retention_bounds`] false)
+    /// runs main's statements and nothing else (Validation row 1). Pinned
+    /// rows are outside every new phase; the ADR 0068 ceiling is computed
+    /// from `policy` alone, so no rule lowers it. Replaceable rows enter
+    /// eviction only through a Replaceable class limit or a matching topic
+    /// limit (D229); the global age, the global cap and the exact-scope
+    /// budgets still exempt them (ruling Q7).
+    pub fn retain_with_rules(
+        &self,
+        policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
+        pinned: &PinnedScopes,
+    ) -> HistoryResult<RetainOutcome> {
         // Issue #1286 round 2: a skip warning claimed during the pass is
         // emitted here, after `retain_pass` has returned and so released
         // both the retention mutex and the connection. Tracing calls
@@ -832,27 +866,11 @@ impl Store {
         // coverage is unchanged: one held connection from phase 1 through
         // the cleanup.
         let mut skip_warning = None;
-        let result = self.retain_pass(policy, pinned, &mut skip_warning);
+        let result = self.retain_pass(policy, rules, pinned, &mut skip_warning);
         if let Some(warning) = skip_warning {
             warning.emit();
         }
         result
-    }
-
-    /// ADR 0116 §2: [`Self::retain_with_pins`] plus the class and topic
-    /// retention rules of `rules`.
-    ///
-    /// RED SEAM (slice B, test commit): `rules` is not applied yet. This
-    /// forwards to [`Self::retain_with_pins`] so the slice B tests compile
-    /// against the base and fail on their assertions.
-    pub fn retain_with_rules(
-        &self,
-        policy: &RetentionPolicy,
-        rules: &HistoryPolicy,
-        pinned: &PinnedScopes,
-    ) -> HistoryResult<RetainOutcome> {
-        let _ = rules;
-        self.retain_with_pins(policy, pinned)
     }
 
     /// The body of [`Store::retain_with_pins`]: one whole pass under the
@@ -863,9 +881,14 @@ impl Store {
     fn retain_pass(
         &self,
         policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
         pinned: &PinnedScopes,
         skip_warning: &mut Option<SkippedScopeLimitsWarning>,
     ) -> HistoryResult<RetainOutcome> {
+        #[cfg(test)]
+        if let Ok(mut trace) = self.test_phase_trace.lock() {
+            trace.clear();
+        }
         let mut outcome = RetainOutcome {
             pinned_scopes: pinned.len() as u64,
             ..RetainOutcome::default()
@@ -923,6 +946,23 @@ impl Store {
                 ),
                 rusqlite::params![cutoff],
             )? as u64;
+            self.trace_phase("global_age");
+        }
+
+        // ADR 0116 §2. With no class or topic bound configured, none of the
+        // rule phases below runs: the pass is main's, statement for
+        // statement (Validation row 1). Like every eviction phase here they
+        // are not deadline-gated (C-1264-2) and have no per-pass row cap
+        // (ruling Q1); budgets delete in bounded transactions.
+        let rule_bounds = rules.has_retention_bounds();
+
+        // 1b. Class and topic ages. Each positive age is applied on its
+        //     own, so the shortest one that covers a row decides; a zero
+        //     age is no bound and cannot disable the global one above.
+        //     Strictly older than the cutoff, as main's age.
+        if rule_bounds {
+            outcome.evicted += apply_rule_ages(&guard, rules, &exclude, self.rule_now_ms())?;
+            self.trace_phase("rule_ages");
         }
 
         // 2. Pinned ceilings, per pinned scope, oldest-first WITHIN the
@@ -951,6 +991,20 @@ impl Store {
             outcome.evicted += evicted;
             outcome.pinned_evicted += evicted;
         }
+        if !pinned.scopes.is_empty() {
+            self.trace_phase("pin_ceilings");
+        }
+
+        // 2b/2c. ADR 0116 §2: class budgets (Durable, then Replaceable),
+        //     then topic budgets in prefix byte order. Aggregate ceilings
+        //     over unpinned rows, on the logical scope measure; they add to
+        //     the exact-scope and global budgets below, never replace them.
+        if rule_bounds {
+            outcome.evicted += apply_class_budgets(&guard, rules, &exclude)?;
+            self.trace_phase("class_budgets");
+            outcome.evicted += apply_topic_budgets(&guard, rules, &exclude)?;
+            self.trace_phase("topic_budgets");
+        }
 
         // 3. Per-scope byte budgets. A pinned scope is governed by its
         //    ceiling in phase 2 instead, never by both. C-1264-2: not
@@ -976,9 +1030,13 @@ impl Store {
             outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
         }
         *skip_warning = self.record_skipped_scope_limits(&skipped);
+        if !policy.scope_limits.is_empty() {
+            self.trace_phase("scope_budgets");
+        }
 
         // 4. Whole-database byte budget (issue #1264 part 1).
         self.enforce_global_budget(&guard, policy, &exclude, deadline, &mut outcome)?;
+        self.trace_phase("global_budget");
 
         // Cleanup runs in every pass, exactly as on main: it is derived
         // state maintenance over rows the pass just deleted, not
@@ -1527,6 +1585,28 @@ impl Store {
         .map(|row| row.unwrap_or_default())
     }
 
+    /// The clock the ADR 0116 rule-age phases read. Real time, except in
+    /// test builds where a fixture may set it.
+    fn rule_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        {
+            let fixed = self.test_rule_now_ms.load(Ordering::Relaxed);
+            if fixed != 0 {
+                return fixed;
+            }
+        }
+        now_ms()
+    }
+
+    /// Test builds: record that a pass phase ran. A no-op in production.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn trace_phase(&self, _phase: &'static str) {
+        #[cfg(test)]
+        if let Ok(mut trace) = self.test_phase_trace.lock() {
+            trace.push(_phase);
+        }
+    }
+
     /// Issue #1286: how many `scope_limits` entries the most recent
     /// retention pass skipped because their scope string does not parse
     /// (it must be `dm:<agent>`, `group:<id>` or `topic:<name>`). Zero means
@@ -1778,6 +1858,181 @@ fn evict_oldest_rows_by_count(
         rusqlite::params![count as i64],
     )?;
     Ok(n as u64)
+}
+
+/// ADR 0116 §2: the SQL predicate for the rows topic rule `index` wins:
+/// topic-scoped rows whose name starts with the rule's prefix and with no
+/// longer configured prefix. Returns the fragment (unqualified columns of
+/// `history`, positional `?` parameters) and its parameters in order.
+///
+/// `substr` on TEXT counts characters, and Rust's `chars()` counts the same
+/// code points, so `substr(scope_id, 1, n) = prefix` is a literal prefix
+/// test; `=` uses BINARY collation, so it is case-sensitive. No LIKE or
+/// GLOB: `_`, `%` and `*` in a prefix are ordinary characters. A longer
+/// prefix can only cover a row this one covers if it starts with this one,
+/// so only those are carved out. Must agree with
+/// [`HistoryPolicy::winning_topic_rule`]; a test holds the two together.
+fn topic_rule_predicate(
+    rules: &[CompiledTopicRule],
+    index: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from("scope_kind = 2");
+    let mut params = Vec::new();
+    let Some(rule) = rules.get(index) else {
+        // Unreachable for an index from `rules`; select nothing.
+        return (String::from("0"), params);
+    };
+    let char_len = |prefix: &str| i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX);
+    sql.push_str(" AND substr(scope_id, 1, ?) = ?");
+    params.push(rusqlite::types::Value::from(char_len(&rule.prefix)));
+    params.push(rusqlite::types::Value::from(rule.prefix.clone()));
+    for other in rules {
+        if other.prefix.len() > rule.prefix.len() && other.prefix.starts_with(&rule.prefix) {
+            sql.push_str(" AND substr(scope_id, 1, ?) <> ?");
+            params.push(rusqlite::types::Value::from(char_len(&other.prefix)));
+            params.push(rusqlite::types::Value::from(other.prefix.clone()));
+        }
+    }
+    (sql, params)
+}
+
+/// The class a `replace_key` column test selects (ADR 0116 §5: the class is
+/// derived from `replace_key`, not stored).
+fn class_predicate(class: RetainedClass) -> &'static str {
+    match class {
+        RetainedClass::Durable => "replace_key IS NULL",
+        RetainedClass::Replaceable => "replace_key IS NOT NULL",
+    }
+}
+
+/// ADR 0116 §2, phase 1b: the class and topic ages. One statement per
+/// configured age, like main's age bound; pinned rows are excluded.
+fn apply_rule_ages(
+    conn: &Connection,
+    rules: &HistoryPolicy,
+    exclude: &str,
+    now: i64,
+) -> HistoryResult<u64> {
+    let mut evicted = 0_u64;
+    for class in [RetainedClass::Durable, RetainedClass::Replaceable] {
+        if let Some(age) = rules.class_bounds(class).and_then(|b| b.max_age_ms) {
+            evicted += conn.execute(
+                &format!(
+                    "DELETE FROM history WHERE {} AND seen_at_ms < ?1{exclude}",
+                    class_predicate(class)
+                ),
+                rusqlite::params![now.saturating_sub(age)],
+            )? as u64;
+        }
+    }
+    for (index, rule) in rules.topic_rules().iter().enumerate() {
+        let Some(age) = rule.bounds.max_age_ms else {
+            continue;
+        };
+        let (predicate, mut params) = topic_rule_predicate(rules.topic_rules(), index);
+        params.push(rusqlite::types::Value::from(now.saturating_sub(age)));
+        evicted += conn.execute(
+            &format!("DELETE FROM history WHERE {predicate} AND seen_at_ms < ?{exclude}"),
+            rusqlite::params_from_iter(params),
+        )? as u64;
+    }
+    Ok(evicted)
+}
+
+/// ADR 0116 §2, phase 2b: class budgets, Durable then Replaceable.
+fn apply_class_budgets(
+    conn: &Connection,
+    rules: &HistoryPolicy,
+    exclude: &str,
+) -> HistoryResult<u64> {
+    let mut evicted = 0_u64;
+    for class in [RetainedClass::Durable, RetainedClass::Replaceable] {
+        if let Some(max_bytes) = rules.class_bounds(class).and_then(|b| b.max_bytes) {
+            evicted += evict_rows_to_budget(conn, class_predicate(class), &[], exclude, max_bytes)?;
+        }
+    }
+    Ok(evicted)
+}
+
+/// ADR 0116 §2, phase 2c: topic budgets, in prefix byte order. One budget
+/// covers every topic its prefix wins, both classes.
+fn apply_topic_budgets(
+    conn: &Connection,
+    rules: &HistoryPolicy,
+    exclude: &str,
+) -> HistoryResult<u64> {
+    let mut evicted = 0_u64;
+    for (index, rule) in rules.topic_rules().iter().enumerate() {
+        let Some(max_bytes) = rule.bounds.max_bytes else {
+            continue;
+        };
+        let (predicate, params) = topic_rule_predicate(rules.topic_rules(), index);
+        evicted += evict_rows_to_budget(conn, &predicate, &params, exclude, max_bytes)?;
+    }
+    Ok(evicted)
+}
+
+/// Evict oldest-first by `(seen_at_ms, id)` from the unpinned rows
+/// `predicate` selects until their logical bytes fit `max_bytes`. Returns
+/// rows evicted.
+///
+/// The measure is the scope measure (payload plus signed artifact; a
+/// missing artifact counts zero), over the same rows that are candidates.
+/// Each step is one transaction of at most [`RETAIN_EVICT_BATCH`] rows,
+/// chosen by the running-total window `running - len < excess`. That
+/// window always includes the row that crosses the excess, so a row larger
+/// than the remaining excess is evicted rather than stalling the cap
+/// (ADR 0116 §2). The loop ends when the rows fit, which happens at the
+/// latest when no candidate is left (their sum is then 0).
+fn evict_rows_to_budget(
+    conn: &Connection,
+    predicate: &str,
+    params: &[rusqlite::types::Value],
+    exclude: &str,
+    max_bytes: u64,
+) -> HistoryResult<u64> {
+    const LEN: &str = "LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))";
+    let mut evicted = 0_u64;
+    loop {
+        let used: i64 = conn.query_row(
+            &format!("SELECT COALESCE(SUM({LEN}), 0) FROM history WHERE {predicate}{exclude}"),
+            rusqlite::params_from_iter(params.iter()),
+            |r| r.get(0),
+        )?;
+        let used = used.max(0) as u64;
+        if used <= max_bytes {
+            return Ok(evicted);
+        }
+        let excess = i64::try_from(used - max_bytes).unwrap_or(i64::MAX);
+        let tx = conn.unchecked_transaction()?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id FROM (SELECT id, len, \
+                   SUM(len) OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+                 FROM (SELECT id, seen_at_ms, {LEN} AS len \
+                   FROM history WHERE {predicate}{exclude})) \
+                 WHERE running - len < ? LIMIT ?"
+            ))?;
+            let mut batch_params = params.to_vec();
+            batch_params.push(rusqlite::types::Value::from(excess));
+            batch_params.push(rusqlite::types::Value::from(RETAIN_EVICT_BATCH as i64));
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch_params), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if ids.is_empty() {
+            tx.rollback()?;
+            return Ok(evicted);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        tx.execute(
+            &format!("DELETE FROM history WHERE id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        tx.commit()?;
+        evicted += ids.len() as u64;
+    }
 }
 
 /// ADR-0068 D1: bring ONE pinned scope back to its ceiling, oldest-first,
@@ -6550,6 +6805,112 @@ mod tests {
             CHAR_EVICTION_RESULT,
             "unset rules must give main's eviction results"
         );
+    }
+
+    fn b_trace(store: &Store) -> Vec<&'static str> {
+        store.test_phase_trace.lock().unwrap().clone()
+    }
+
+    /// ADR 0116 §2: "Each pass applies age limits, pin ceilings, class
+    /// budgets, topic budgets, exact-scope budgets, then the global
+    /// budget."
+    #[test]
+    fn adr0116_b_phase_order_follows_the_adr() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        b_insert(
+            &store,
+            vec![
+                b_row("a", b_topic("app.x"), 64, now - 2 * B_DAY_MS, None),
+                b_row(
+                    "b",
+                    Scope::Group("pin".into()),
+                    64,
+                    now - 2 * B_DAY_MS,
+                    None,
+                ),
+            ],
+        );
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 30,
+            scope_limits: vec![ScopeLimit {
+                scope: b_dm().canonical(),
+                max_bytes: u64::MAX,
+            }],
+        };
+        let rules = b_rules(
+            &[(RetainedClass::Durable, Some(u64::MAX >> 2), Some(10))],
+            &[("app.", Some(u64::MAX >> 2), Some(10))],
+        );
+        store
+            .retain_with_rules(
+                &policy,
+                &rules,
+                &PinnedScopes::from_canonical(["group:pin"]),
+            )
+            .unwrap();
+        assert_eq!(
+            b_trace(&store),
+            [
+                "global_age",
+                "rule_ages",
+                "pin_ceilings",
+                "class_budgets",
+                "topic_budgets",
+                "scope_budgets",
+                "global_budget",
+            ]
+        );
+    }
+
+    /// Validation row 1: with no class or topic bound, no rule phase runs,
+    /// so the pass executes main's statements and only those.
+    #[test]
+    fn adr0116_b_no_rule_phase_runs_without_a_bound() {
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 30,
+            scope_limits: Vec::new(),
+        };
+        for rules in [
+            HistoryPolicy::default(),
+            b_rules(&[], &[("app.", None, None)]),
+        ] {
+            let (store, _dir) = open();
+            b_insert(&store, vec![b_row("a", b_topic("app.x"), 64, 1, None)]);
+            store
+                .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_trace(&store), ["global_age", "global_budget"]);
+        }
+    }
+
+    /// Validation row 2: delete only rows strictly older than the cutoff,
+    /// for class and topic ages alike (pinned clock).
+    #[test]
+    fn adr0116_b_rule_age_cutoff_is_strict() {
+        let t = 1_800_000_000_000_i64;
+        for (classes, topics) in [
+            (vec![(RetainedClass::Durable, None, Some(7))], vec![]),
+            (vec![], vec![("app.", None, Some(7))]),
+        ] {
+            let (store, _dir) = open();
+            store.test_rule_now_ms.store(t, Ordering::Relaxed);
+            let cutoff = t - 7 * B_DAY_MS;
+            b_insert(
+                &store,
+                vec![
+                    b_row("at", b_topic("app.x"), 64, cutoff, None),
+                    b_row("before", b_topic("app.x"), 64, cutoff - 1, None),
+                ],
+            );
+            let rules = b_rules(&classes, &topics);
+            store
+                .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["at"]));
+        }
     }
 }
 

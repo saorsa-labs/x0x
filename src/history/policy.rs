@@ -252,6 +252,16 @@ impl HistoryPolicy {
             && self.topic_rules.is_empty()
     }
 
+    /// Whether any class or topic rule sets a retention bound. When false
+    /// the reaper runs main's retention unchanged (ADR 0116 Validation
+    /// row 1): a prefix-only topic rule bounds nothing.
+    #[must_use]
+    pub fn has_retention_bounds(&self) -> bool {
+        self.durable.is_some()
+            || self.replaceable.is_some()
+            || self.topic_rules.iter().any(|rule| !rule.bounds.is_empty())
+    }
+
     /// Ordinary-DM recording mode.
     #[must_use]
     pub fn dm_recording(&self) -> DmRecording {
@@ -285,30 +295,21 @@ impl HistoryPolicy {
 
     /// Refuse a rule this build cannot enforce yet.
     ///
-    /// ADR 0116 lands in slices. This build parses and validates every new
-    /// rule (slice A) but enforces none, so a rule that would change
-    /// recording or retention is refused rather than accepted and ignored.
-    /// A prefix-only topic rule changes nothing on its own and passes. The
-    /// slices that enforce each rule remove its arm here.
+    /// ADR 0116 lands in slices. This build enforces the class and topic
+    /// retention bounds (slice B) but not the `ephemeral` recording modes
+    /// (slice C), so those are refused rather than accepted and ignored.
+    /// Slice C removes this guard.
     pub(crate) fn ensure_enforceable(&self) -> HistoryResult<()> {
         if self.dm_recording == DmRecording::Ephemeral {
             return Err(unsupported("dm_recording = \"ephemeral\""));
         }
-        for class in [RetainedClass::Durable, RetainedClass::Replaceable] {
-            if self.class_bounds(class).is_some() {
-                return Err(unsupported(&format!(
-                    "[[history.class_limits]] class = \"{}\"",
-                    class_name(class)
-                )));
-            }
-        }
         if let Some(rule) = self
             .topic_rules
             .iter()
-            .find(|rule| rule.recording == TopicRecording::Ephemeral || !rule.bounds.is_empty())
+            .find(|rule| rule.recording == TopicRecording::Ephemeral)
         {
             return Err(unsupported(&format!(
-                "[[history.topic_rules]] prefix = {:?} with a limit or recording = \"ephemeral\"",
+                "[[history.topic_rules]] prefix = {:?} with recording = \"ephemeral\"",
                 rule.prefix
             )));
         }
@@ -318,8 +319,9 @@ impl HistoryPolicy {
 
 fn unsupported(what: &str) -> HistoryError {
     invalid(format!(
-        "{what} is not supported by this build yet: it parses and validates the ADR 0116 \
-         rules but does not enforce them. Remove the rule, or run a build that enforces it"
+        "{what} is not supported by this build yet: it enforces the ADR 0116 retention \
+         limits but not the ephemeral recording modes. Remove the rule, or run a build that \
+         enforces it"
     ))
 }
 
@@ -546,25 +548,39 @@ mod tests {
     }
 
     #[test]
-    fn only_prefix_only_topic_rules_are_enforceable_in_this_build() {
+    fn only_the_ephemeral_recording_modes_are_refused_in_this_build() {
         let carve_out =
             HistoryPolicy::compile(DmRecording::Inherit, &[], &[rule("app.chat")]).unwrap();
         assert!(!carve_out.is_unset(), "a configured rule is not \"unset\"");
+        assert!(
+            !carve_out.has_retention_bounds(),
+            "a prefix-only rule bounds nothing"
+        );
         assert!(carve_out.ensure_enforceable().is_ok());
 
-        let mut ephemeral = rule("app.sync.");
-        ephemeral.recording = TopicRecording::Ephemeral;
         let mut limited = rule("app.chat");
         limited.max_age_days = Some(1);
         for policy in [
-            HistoryPolicy::compile(DmRecording::Ephemeral, &[], &[]),
             HistoryPolicy::compile(
                 DmRecording::Inherit,
                 &[class(RetainedClass::Replaceable, None, Some(30))],
                 &[],
             ),
-            HistoryPolicy::compile(DmRecording::Inherit, &[], &[ephemeral]),
             HistoryPolicy::compile(DmRecording::Inherit, &[], &[limited]),
+        ] {
+            let policy = policy.unwrap();
+            assert!(policy.has_retention_bounds());
+            assert!(
+                policy.ensure_enforceable().is_ok(),
+                "slice B enforces limits"
+            );
+        }
+
+        let mut ephemeral = rule("app.sync.");
+        ephemeral.recording = TopicRecording::Ephemeral;
+        for policy in [
+            HistoryPolicy::compile(DmRecording::Ephemeral, &[], &[]),
+            HistoryPolicy::compile(DmRecording::Inherit, &[], &[ephemeral]),
         ] {
             let error = policy.unwrap().ensure_enforceable().unwrap_err();
             assert!(
