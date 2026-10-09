@@ -357,7 +357,7 @@ impl HistoryHandle {
             )
         })
         .await;
-        match joined {
+        let result = match joined {
             Ok(result) => result,
             Err(join) => Err(RetainError::Failed {
                 error: HistoryError::Database(format!("history trim task did not finish: {join}")),
@@ -368,7 +368,26 @@ impl HistoryHandle {
                     None,
                 ),
             }),
+        };
+        // ADR 0068's counter keeps counting every row a pinned scope sheds
+        // at its own ceiling, whether the reaper or a trim deleted it.
+        let pinned_evicted = match &result {
+            Ok(report) => report.pin_ceiling_deleted,
+            Err(RetainError::Failed { committed, .. }) => committed.pin_ceiling_deleted,
+            Err(_) => 0,
+        };
+        if pinned_evicted > 0 {
+            self.writer
+                .counters()
+                .quarantine_pinned_evictions
+                .fetch_add(pinned_evicted, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                pinned_evicted,
+                "[history] a trim cut a fork-quarantined scope back to its pinned \
+                 ceiling; it shed its OWN oldest rows (ADR-0068 D1)"
+            );
         }
+        result
     }
 }
 

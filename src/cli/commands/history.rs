@@ -174,6 +174,43 @@ pub(crate) const POLICY: NewerOperation = NewerOperation {
     path: "/history/policy",
 };
 
+/// `x0x history retain` — POST /history/retain (ADR 0116 §4)
+///
+/// Trims local history now under the daemon's startup policy, within a row
+/// budget and a time budget, and prints the report: committed deletions by
+/// phase, pin-ceiling deletions, elapsed time and `state` (`complete`,
+/// `more_work` or `blocked_by_protected_rows`). Needs the durable API token.
+/// Only the budgets given are sent; the daemon applies its defaults for the
+/// rest. An older daemon reports an unsupported operation.
+pub async fn retain(
+    client: &DaemonClient,
+    max_rows: Option<u32>,
+    budget_ms: Option<u32>,
+) -> Result<()> {
+    client
+        .run_newer(&RETAIN, Some(&retain_body(max_rows, budget_ms)))
+        .await
+}
+
+/// The `POST /history/retain` body: only the budgets the user gave.
+fn retain_body(max_rows: Option<u32>, budget_ms: Option<u32>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(max_rows) = max_rows {
+        body.insert("max_rows".into(), max_rows.into());
+    }
+    if let Some(budget_ms) = budget_ms {
+        body.insert("budget_ms".into(), budget_ms.into());
+    }
+    serde_json::Value::Object(body)
+}
+
+/// `x0x history retain`: older daemons lack the route (ADR 0116 §5).
+pub(crate) const RETAIN: NewerOperation = NewerOperation {
+    command: "x0x history retain",
+    method: crate::api::Method::Post,
+    path: "/history/retain",
+};
+
 /// `x0x history purge` — DELETE /history
 ///
 /// Purges one scope from the local store. Local-only: never propagated to
@@ -258,7 +295,7 @@ mod tests {
     /// and the registered CLI command, so the unsupported-operation error
     /// points at the real route.
     /// Every history operation older daemons may lack.
-    const NEWER_OPERATIONS: &[NewerOperation] = &[POLICY];
+    const NEWER_OPERATIONS: &[NewerOperation] = &[POLICY, RETAIN];
 
     #[test]
     fn adr0116_unsupported_operations_match_the_api_registry() {
@@ -367,5 +404,39 @@ mod tests {
             .to_string();
         server.abort();
         assert_eq!(rendered, "durable API token required (HTTP 403)");
+    }
+
+    /// ADR 0116 §5 for the trim: `x0x history retain` against a daemon from
+    /// before ADR 0116 reports an unsupported operation, as `policy` does.
+    #[tokio::test]
+    async fn adr0116_unsupported_retain_on_an_older_daemon() {
+        let (client, server) = daemon_at(older_daemon()).await;
+        let rendered = retain(&client, Some(10), None)
+            .await
+            .expect_err("an older daemon cannot trim")
+            .to_string();
+        server.abort();
+        assert!(
+            rendered.contains("unsupported operation")
+                && rendered.contains("`x0x history retain`")
+                && rendered.contains("POST /history/retain")
+                && rendered.contains("predates"),
+            "{rendered}"
+        );
+    }
+
+    /// The CLI sends only the budgets the user gave; the daemon applies its
+    /// defaults (ruling Q12: an empty object is the default request).
+    #[test]
+    fn retain_sends_only_the_budgets_given() {
+        assert_eq!(retain_body(None, None), serde_json::json!({}));
+        assert_eq!(
+            retain_body(Some(5), None),
+            serde_json::json!({ "max_rows": 5 })
+        );
+        assert_eq!(
+            retain_body(Some(5), Some(50)),
+            serde_json::json!({ "max_rows": 5, "budget_ms": 50 })
+        );
     }
 }

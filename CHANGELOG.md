@@ -52,6 +52,22 @@ All notable changes to this project will be documented in this file.
   three suppression counters and the `skipped_scope_limits` /
   `skipped_topic_rules` gauges. It works with history disabled. These
   counters appear only here; no existing response changed.
+- **`POST /history/retain`, `x0x history retain` and
+  `HistoryHandle::retain` (ADR 0116 slice D, #1264).** An owner-only
+  (durable token) trim of local history now, under the startup policy:
+  the reaper's phases, pins and ceilings, within `max_rows` (1–65536,
+  default 4096; pin-ceiling deletions included) and `budget_ms` (1–10000,
+  default 2000). It deletes at most 256 rows per transaction, checks the
+  time budget before each statement (one running statement may overrun
+  it), stops at a committed boundary, and reports committed counts by
+  phase with `state` `complete`, `more_work` or
+  `blocked_by_protected_rows`. One retention operation runs per store: a
+  trim gets 409 `history_retention_busy` while the reaper or another trim
+  runs, and the reaper waits for a trim. Disabled history is 409
+  `history_disabled`; an SQLite failure is a typed 500 with the counts
+  committed before it. The body takes only the two budgets (1 KiB; 400 or
+  413 otherwise). Against an older daemon the CLI reports an unsupported
+  operation (as `x0x history policy` now does), never a bare 404.
 
 ### Changed
 

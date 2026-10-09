@@ -1996,6 +1996,7 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 | GET | `/history/search` | `x0x history search [SCOPE] <QUERY>` | Full-text search over text payloads. `scope` is **optional**: omitted, it searches every retained scope |
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
 | GET | `/history/policy` | `x0x history policy` | Local history policy in force (ADR 0116): rules, defaults, protected groups, counters. **Owner-only** (durable token) |
+| POST | `/history/retain` | `x0x history retain [--max-rows N] [--budget-ms MS]` | Trim local history now under its startup policy, within a row and time budget (ADR 0116). **Owner-only** (durable token) |
 | DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
@@ -2080,6 +2081,89 @@ disabled.
 These counters appear only here; `/diagnostics/history` is unchanged. An
 older daemon has no such route and answers 404. A client must report that
 the operation is unsupported, and must not fall back to reading the
+database.
+
+### Runtime trim — `POST /history/retain` (ADR 0116 §4)
+
+Trims local history now, under the policy the daemon started with: the same
+phases, pins and ceilings as the periodic retention reaper, within a row
+budget and a time budget. It applies policy; it is not a purge. The library
+equivalent is `HistoryHandle::retain(RetainOptions)`, which embedders can
+call before `serve()` without opening SQLite themselves. Policy changes
+still need a restart.
+
+**Auth.** Owner-only, like the policy read: the durable API token in
+`Authorization: Bearer …`. Sessions and riders get **403**; a missing or
+unknown token, or a token in the query string, gets **401**.
+
+**Body.** At most 1 KiB (larger is **413**). Only two keys; an empty body
+means `{}`:
+
+| Key | Range | Default | Meaning |
+|---|---|---|---|
+| `max_rows` | 1–65536 | 4096 | Most rows to delete, pin-ceiling deletions included |
+| `budget_ms` | 1–10000 | 2000 | Work-admission budget: checked before each statement |
+
+Anything else (malformed JSON, a non-object, an unknown key, a wrong type, a
+value out of range) is **400**. There is no SQL, path, force flag,
+replacement policy or scope selector.
+
+**Results.**
+
+| Status | When |
+|---|---|
+| 200 | The trim ran. Body below |
+| 409 `history_disabled` | History is disabled on this daemon |
+| 409 `history_retention_busy` | A reaper pass or another trim holds the store; nothing is queued, try again |
+| 500 `history_retention_failed` | SQLite failed. `committed` carries the counts of the batches committed before the failure; they are not rolled back |
+
+```json
+{
+  "ok": true,
+  "state": "more_work",
+  "deleted": 4096,
+  "deleted_by_phase": {
+    "global_age": 4000, "rule_ages": 0, "pin_ceilings": 96,
+    "class_budgets": 0, "topic_budgets": 0, "scope_budgets": 0,
+    "global_budget": 0
+  },
+  "pin_ceiling_deleted": 96,
+  "elapsed_ms": 412,
+  "stopped_by": "row_budget"
+}
+```
+
+| `state` | Meaning |
+|---|---|
+| `complete` | This observed pass found no eligible policy work pending. It promises neither a smaller file nor a bound on future writes |
+| `more_work` | Work remains: a budget ran out (`stopped_by`: `row_budget`, `time_budget`), the caller went away (`cancelled`), or index reclamation is still pending (`reclamation`) |
+| `blocked_by_protected_rows` | No eligible work remains, but pinned (fork-quarantined) or exempt (Replaceable) rows alone keep a configured bound exceeded. Never returned while eligible work remains |
+
+Bounds, as ADR 0116 §4 requires:
+
+- One retention operation per store at a time, shared with the reaper. The
+  reaper waits for a trim; a trim never waits for the reaper (it gets the
+  409).
+- At most 256 rows per transaction, age eviction included. Each batch
+  commits on its own; a trim stops only at a committed boundary.
+- The time budget is checked before every statement. The one statement
+  already running when it runs out may overrun it, so it is not a hard
+  response deadline. The trim holds the store while it runs, so writes wait
+  for up to the budget plus that statement.
+- The whole-database budget keeps part 1's rules: no eviction before the
+  full-text index settles (`more_work`, `reclamation` until it does), and the
+  forced path only after three unsettled reaper passes. Trims never count as
+  such passes.
+- Repeated small trims take turns across phases: each starts after the phase
+  the previous one stopped in, so a large backlog in one phase cannot starve
+  the others.
+- Fork-quarantine pins are read fresh for every call; a marker installed
+  during a trim applies from the next call.
+- Pin-ceiling deletions also count in
+  `history_quarantine_pinned_evictions` (`GET /diagnostics/history`).
+
+An older daemon has no such route and answers 404; `x0x history retain`
+reports that the operation is unsupported and never falls back to the
 database.
 
 ### Fork quarantine on the history surface (ADR-0066 §3a)

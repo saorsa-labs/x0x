@@ -537,6 +537,7 @@ mod tests {
             ("/history/scopes", Method::GET),
             ("/history/stats", Method::GET),
             ("/history/policy", Method::GET),
+            ("/history/retain", Method::POST),
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),
             ("/forwards", Method::POST),

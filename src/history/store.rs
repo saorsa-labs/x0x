@@ -457,6 +457,10 @@ pub struct Store {
     /// Set while a trim is parked by `test_pause_trim`.
     #[cfg(test)]
     test_trim_parked: AtomicBool,
+    /// ADR 0116 §4: the one bounded phase cursor of this store's trims, the
+    /// unit the next trim starts at (`None`: the first). In memory only;
+    /// touched only under the retention lock.
+    trim_cursor: Mutex<Option<TrimCursor>>,
     /// Dropped after `conn` (fields drop in declaration order, and rusqlite
     /// closes the connection, closing checkpoint included, synchronously in
     /// its `Drop`): in test builds it marks the close complete; zero-sized
@@ -473,6 +477,16 @@ impl std::fmt::Debug for Store {
 fn lock_conn(conn: &Mutex<Connection>) -> HistoryResult<std::sync::MutexGuard<'_, Connection>> {
     conn.lock()
         .map_err(|_| HistoryError::Database("history store mutex poisoned".into()))
+}
+
+/// Inside an ADR 0116 trim unit: stop the unit when a budget gate refuses.
+macro_rules! trim_gate {
+    ($gate:expr) => {
+        match $gate {
+            Ok(value) => value,
+            Err(stop) => return Ok(UnitEnd::Stop(stop)),
+        }
+    };
 }
 
 impl Store {
@@ -557,6 +571,7 @@ impl Store {
             test_pause_trim: AtomicBool::new(false),
             #[cfg(test)]
             test_trim_parked: AtomicBool::new(false),
+            trim_cursor: Mutex::new(None),
             _after_close: after_close,
         })
     }
@@ -1222,7 +1237,7 @@ impl Store {
         // This certificate is INTERMEDIATE: it authorizes eviction below
         // but must not touch the counter (R4-B) — the pass's final state,
         // after its last statement, is what 4d accounts.
-        let mut settled = self.maintain_until_settled(conn, deadline)?;
+        let mut settled = self.maintain_until_settled(conn, deadline, None)?;
 
         // 4c. Settled eviction: measure, delete one bounded batch, fold its
         // tombstones, remeasure — all inside the held connection.
@@ -1278,7 +1293,7 @@ impl Store {
             settled = if fold_timed_out {
                 false
             } else {
-                self.maintain_until_settled(conn, deadline)?
+                self.maintain_until_settled(conn, deadline, None)?
             };
             if settled {
                 let after = live_db_bytes(conn)?.max(0) as u64;
@@ -1351,9 +1366,15 @@ impl Store {
         &self,
         conn: &Connection,
         deadline: std::time::Instant,
+        cancel: Option<&AtomicBool>,
     ) -> HistoryResult<bool> {
         loop {
             if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            // ADR 0116 §4: a cancelled trim starts no further reclamation
+            // statement. The reaper passes `None`.
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
                 return Ok(false);
             }
             // Round-4 test hook: stand in for "the budget ran out before
@@ -1837,21 +1858,868 @@ impl Store {
         Ok((written, dups))
     }
 
-    /// ADR 0116 §4: one bounded trim (RED stub: deletes nothing).
+    /// ADR 0116 §4: one bounded runtime trim of this store under `policy`,
+    /// `rules` and `pinned`, within `budget`. The supported trim behind
+    /// [`super::HistoryHandle::retain`], `POST /history/retain` and
+    /// `x0x history retain`; it applies the configured policy, not a purge.
+    ///
+    /// - **Admission.** One retention operation per store, shared with the
+    ///   reaper: the trim takes the retention lock with `try_lock`, so it
+    ///   returns [`RetainError::Busy`] at once while a reaper pass or another
+    ///   trim holds the store. The reaper keeps its blocking `lock()` on the
+    ///   blocking pool, so it waits for a trim (ruling Q2).
+    /// - **Phases.** The reaper's phases in ADR 0116 §2 order, as units: the
+    ///   global age, class and topic ages, pin ceilings, class budgets, topic
+    ///   budgets, exact-scope budgets, then the global budget. Each delete is
+    ///   one statement and transaction of at most
+    ///   `min(256, rows left in max_rows)` rows, the ages included, and
+    ///   pin-ceiling deletions count against `max_rows` (ruling Q1 keeps the
+    ///   reaper's own phases unchanged).
+    /// - **Budgets.** Cancellation and the time budget are checked before
+    ///   every statement, the row budget before every delete; the trim stops
+    ///   at a committed boundary. One statement already running may overrun
+    ///   the time budget: it is a work-admission budget, not a deadline.
+    /// - **Connection.** Held for the whole trim, like a reaper pass
+    ///   (C-1264-1), so every observation and the deletion it leads to see
+    ///   the same state.
+    /// - **Global budget.** Part 1's rules: pin ceilings first (R3-A), then
+    ///   the forced path when three REAPER passes ended unsettled over the
+    ///   cap (ruling Q3: a trim reads `unsettled_passes` and never changes
+    ///   it), then the settled certificate before any settled eviction.
+    ///   Without it the trim stops with [`RetainStop::Reclamation`].
+    /// - **Cursor.** One bounded cursor per store names the unit the next
+    ///   trim starts at: after the unit that last got service, so repeated
+    ///   small trims cannot starve later phases. A full cycle resets it.
+    /// - **State.** `complete` or `blocked_by_protected_rows` only after a
+    ///   full cycle with no budget stop whose observations no later deletion
+    ///   invalidated; `blocked_by_protected_rows` when pinned or exempt rows
+    ///   alone keep a bound exceeded. Any stop is `more_work`, so `blocked`
+    ///   never hides eligible work.
+    /// - **Pins** are the caller's, read fresh for each call; a marker
+    ///   installed during a trim applies from the next one (ADR 0068).
+    ///
+    /// # Errors
+    /// [`RetainError::Busy`], or [`RetainError::Failed`] carrying the counts
+    /// of the statements committed before an SQLite failure. Those stay
+    /// committed.
     pub(crate) fn trim(
         &self,
-        _policy: &RetentionPolicy,
-        _rules: &HistoryPolicy,
-        _pinned: &PinnedScopes,
+        policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
+        pinned: &PinnedScopes,
         budget: &TrimBudget<'_>,
     ) -> Result<RetainReport, RetainError> {
-        Ok(RetainReport::new(
-            RetainState::Complete,
-            RetainDeleted::default(),
-            budget.started.elapsed(),
-            None::<RetainStop>,
-        ))
+        let mut run = TrimRun {
+            budget,
+            exclude: pinned_exclusion_sql(pinned),
+            include: pinned_inclusion_sql(pinned),
+            deleted: RetainDeleted::default(),
+            statements: 0,
+        };
+        let _admission = match self.retention.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(RetainError::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(run.failed(HistoryError::Database("retention mutex poisoned".into())))
+            }
+        };
+        #[cfg(test)]
+        if let Ok(mut batches) = self.test_trim_batches.lock() {
+            batches.clear();
+        }
+        let conn = lock_conn(&self.conn).map_err(|e| run.failed(e))?;
+        #[cfg(test)]
+        self.park_trim_for_tests();
+
+        let units = self.trim_units(policy, rules, pinned);
+        let pins: Vec<(Scope, u64)> = units
+            .iter()
+            .filter_map(|(_, unit)| match unit {
+                TrimUnit::PinCeiling { scope, ceiling } => Some((scope.clone(), *ceiling)),
+                _ => None,
+            })
+            .collect();
+        // Touched only under the retention lock held above.
+        let mut cursor = self
+            .trim_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = cursor
+            .and_then(|at| units.iter().position(|(key, _)| *key >= at))
+            .unwrap_or(0);
+        let end = match self.trim_walk(&conn, policy, &units, &pins, start, &mut run) {
+            Ok(end) => end,
+            Err(error) => return Err(run.failed(error)),
+        };
+        let (state, stop) = match end {
+            TrimEnd::Stopped { stop, next } => {
+                *cursor = units.get(next).map(|(key, _)| *key);
+                (RetainState::MoreWork, Some(stop))
+            }
+            TrimEnd::Lap { protected } => {
+                *cursor = None;
+                let state = if protected {
+                    RetainState::BlockedByProtectedRows
+                } else {
+                    RetainState::Complete
+                };
+                (state, None)
+            }
+        };
+        drop(cursor);
+
+        // As at the end of a reaper pass: derived-state cleanup over the
+        // rows this trim deleted, then a truncating checkpoint. Both are
+        // statements, so neither starts once a budget is spent; the next
+        // pass or trim does them.
+        if run.deleted.total() > 0 && run.gate().is_ok() {
+            run.statements += 1;
+            cleanup_canonical_ids(&conn).map_err(|e| run.failed(e))?;
+        }
+        if run.gate().is_ok() {
+            run.statements += 1;
+            Self::checkpoint_wal(&conn).map_err(|e| run.failed(e))?;
+        }
+        Ok(run.report(state, stop))
     }
+
+    /// The trim's units in ADR 0116 §2 order, each keyed for the cursor.
+    /// The same phases [`Self::retain_pass`] runs, with the same skips: no
+    /// rule phase without a class or topic bound, no topic phase on a
+    /// non-UTF-8 database (fail closed), no unparseable exact scope (#1286).
+    fn trim_units(
+        &self,
+        policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
+        pinned: &PinnedScopes,
+    ) -> Vec<(TrimCursor, TrimUnit)> {
+        let key = |phase, index| TrimCursor { phase, index };
+        let mut units = Vec::new();
+        if policy.max_age_days > 0 {
+            let days = i64::try_from(policy.max_age_days).unwrap_or(i64::MAX);
+            units.push((
+                key(TrimPhase::GlobalAge, 0),
+                TrimUnit::Age {
+                    predicate: "replace_key IS NULL".to_string(),
+                    params: Vec::new(),
+                    cutoff: now_ms().saturating_sub(days.saturating_mul(86_400_000)),
+                    bucket: TrimBucket::GlobalAge,
+                },
+            ));
+        }
+        let rule_bounds = rules.has_retention_bounds();
+        let topics_in_force = self.text_encoding_is_utf8();
+        const CLASSES: [RetainedClass; 2] = [RetainedClass::Durable, RetainedClass::Replaceable];
+        if rule_bounds {
+            let now = self.rule_now_ms();
+            for (index, class) in CLASSES.into_iter().enumerate() {
+                if let Some(age) = rules.class_bounds(class).and_then(|b| b.max_age_ms) {
+                    units.push((
+                        key(TrimPhase::RuleAge, index),
+                        TrimUnit::Age {
+                            predicate: class_predicate(class).to_string(),
+                            params: Vec::new(),
+                            cutoff: now.saturating_sub(age),
+                            bucket: TrimBucket::RuleAges,
+                        },
+                    ));
+                }
+            }
+            if topics_in_force {
+                for (index, rule) in rules.topic_rules().iter().enumerate() {
+                    if let Some(age) = rule.bounds.max_age_ms {
+                        let (predicate, params) = topic_rule_predicate(rules.topic_rules(), index);
+                        units.push((
+                            key(TrimPhase::RuleAge, CLASSES.len() + index),
+                            TrimUnit::Age {
+                                predicate,
+                                params,
+                                cutoff: now.saturating_sub(age),
+                                bucket: TrimBucket::RuleAges,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        for (index, (kind, id)) in pinned.scopes.iter().enumerate() {
+            if let Ok(scope) = Scope::from_columns(*kind, id.clone()) {
+                let ceiling = Self::pinned_ceiling(policy, &scope);
+                units.push((
+                    key(TrimPhase::PinCeiling, index),
+                    TrimUnit::PinCeiling { scope, ceiling },
+                ));
+            }
+        }
+        if rule_bounds {
+            for (index, class) in CLASSES.into_iter().enumerate() {
+                if let Some(max_bytes) = rules.class_bounds(class).and_then(|b| b.max_bytes) {
+                    units.push((
+                        key(TrimPhase::ClassBudget, index),
+                        TrimUnit::Budget {
+                            predicate: class_predicate(class).to_string(),
+                            params: Vec::new(),
+                            max_bytes,
+                            bucket: TrimBucket::ClassBudgets,
+                        },
+                    ));
+                }
+            }
+            if topics_in_force {
+                for (index, rule) in rules.topic_rules().iter().enumerate() {
+                    if let Some(max_bytes) = rule.bounds.max_bytes {
+                        let (predicate, params) = topic_rule_predicate(rules.topic_rules(), index);
+                        units.push((
+                            key(TrimPhase::TopicBudget, index),
+                            TrimUnit::Budget {
+                                predicate,
+                                params,
+                                max_bytes,
+                                bucket: TrimBucket::TopicBudgets,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        for (index, limit) in policy.scope_limits.iter().enumerate() {
+            let Ok(scope) = Scope::parse(&limit.scope) else {
+                continue;
+            };
+            let pinned = pinned.contains(&scope);
+            units.push((
+                key(TrimPhase::ScopeBudget, index),
+                TrimUnit::ExactScope {
+                    scope,
+                    max_bytes: limit.max_bytes,
+                    pinned,
+                },
+            ));
+        }
+        units.push((key(TrimPhase::GlobalBudget, 0), TrimUnit::Global));
+        units
+    }
+
+    /// Walk the units cyclically from `start` until a budget stops the trim
+    /// or a full lap finishes with no observation left stale.
+    ///
+    /// A unit that got any statement this call has had its turn: a stop
+    /// inside it moves the cursor to the next unit, and a stop before its
+    /// first statement keeps the cursor on it. Deleting rows can create no
+    /// eligible work for another unit (it only lowers measures), but it can
+    /// change what an earlier unit observed: the global budget's settled
+    /// certificate (new tombstones), or a protected overshoot. Such an
+    /// observation is stale when a later deletion happened in the same lap,
+    /// and the walk then runs another lap.
+    fn trim_walk(
+        &self,
+        conn: &Connection,
+        policy: &RetentionPolicy,
+        units: &[(TrimCursor, TrimUnit)],
+        pins: &[(Scope, u64)],
+        start: usize,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<TrimEnd> {
+        let count = units.len();
+        if count == 0 {
+            return Ok(TrimEnd::Lap { protected: false });
+        }
+        let mut at = start % count;
+        let mut finished = 0_usize;
+        let mut stamps: Vec<u64> = Vec::new();
+        let mut protected = false;
+        loop {
+            let Some((_, unit)) = units.get(at) else {
+                return Ok(TrimEnd::Lap { protected });
+            };
+            let before = run.statements;
+            match self.trim_unit(conn, policy, unit, pins, run)? {
+                UnitEnd::Stop(stop) => {
+                    let next = if run.statements > before {
+                        (at + 1) % count
+                    } else {
+                        at
+                    };
+                    return Ok(TrimEnd::Stopped { stop, next });
+                }
+                UnitEnd::Done(Observation::None) => {}
+                UnitEnd::Done(Observation::Settled) => stamps.push(run.deleted.total()),
+                UnitEnd::Done(Observation::Protected) => {
+                    stamps.push(run.deleted.total());
+                    protected = true;
+                }
+            }
+            finished += 1;
+            at = (at + 1) % count;
+            if finished == count {
+                let total = run.deleted.total();
+                if stamps.iter().all(|&stamp| stamp == total) {
+                    return Ok(TrimEnd::Lap { protected });
+                }
+                finished = 0;
+                stamps.clear();
+                protected = false;
+            }
+        }
+    }
+
+    fn trim_unit(
+        &self,
+        conn: &Connection,
+        policy: &RetentionPolicy,
+        unit: &TrimUnit,
+        pins: &[(Scope, u64)],
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        match unit {
+            TrimUnit::Age {
+                predicate,
+                params,
+                cutoff,
+                bucket,
+            } => self.trim_age(conn, predicate, params, *cutoff, *bucket, run),
+            TrimUnit::PinCeiling { scope, ceiling } => {
+                self.trim_pin_ceiling(conn, scope, *ceiling, run)
+            }
+            TrimUnit::Budget {
+                predicate,
+                params,
+                max_bytes,
+                bucket,
+            } => self.trim_budget(conn, predicate, params, *max_bytes, *bucket, run),
+            TrimUnit::ExactScope {
+                scope,
+                max_bytes,
+                pinned,
+            } => self.trim_exact_scope(conn, scope, *max_bytes, *pinned, run),
+            TrimUnit::Global => self.trim_global(conn, policy, pins, run),
+        }
+    }
+
+    /// An age bound in batches: oldest first, strictly older than `cutoff`,
+    /// pinned rows excluded. When pins exist, one more statement asks
+    /// whether pinned rows alone are left past the bound.
+    fn trim_age(
+        &self,
+        conn: &Connection,
+        predicate: &str,
+        params: &[rusqlite::types::Value],
+        cutoff: i64,
+        bucket: TrimBucket,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        let delete = format!(
+            "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE {predicate} \
+             AND seen_at_ms < ?{} ORDER BY seen_at_ms ASC, id ASC LIMIT ?)",
+            run.exclude
+        );
+        loop {
+            let limit = trim_gate!(run.gate_delete());
+            let mut values = params.to_vec();
+            values.push(rusqlite::types::Value::from(cutoff));
+            values.push(sql_count(limit));
+            let n = self.trim_delete(conn, &delete, &values, run)?;
+            run.add(bucket, n);
+            if n < u64::try_from(limit).unwrap_or(u64::MAX) {
+                break;
+            }
+        }
+        if run.include.is_empty() {
+            return Ok(UnitEnd::Done(Observation::None));
+        }
+        trim_gate!(run.gate());
+        let mut values = params.to_vec();
+        values.push(rusqlite::types::Value::from(cutoff));
+        let held = self.trim_query(
+            conn,
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM history WHERE {predicate} AND seen_at_ms < ?{})",
+                run.include
+            ),
+            &values,
+            run,
+        )?;
+        Ok(UnitEnd::Done(if held != 0 {
+            Observation::Protected
+        } else {
+            Observation::None
+        }))
+    }
+
+    /// One pinned scope back to its ADR 0068 ceiling: the reaper's window,
+    /// in batches. A residual overshoot (only Replaceable rows, or an oldest
+    /// row larger than the excess) is protected.
+    fn trim_pin_ceiling(
+        &self,
+        conn: &Connection,
+        scope: &Scope,
+        ceiling: u64,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        let kind = rusqlite::types::Value::from(scope.kind());
+        let id = rusqlite::types::Value::from(scope.id().to_string());
+        loop {
+            trim_gate!(run.gate());
+            let used = self.trim_query(conn, SCOPE_BYTES_SQL, &[kind.clone(), id.clone()], run)?;
+            let excess = u64::try_from(used).unwrap_or(0).saturating_sub(ceiling);
+            if excess == 0 {
+                return Ok(UnitEnd::Done(Observation::None));
+            }
+            let limit = trim_gate!(run.gate_delete());
+            let n = self.trim_delete(
+                conn,
+                "DELETE FROM history WHERE id IN (\
+                   SELECT id FROM (\
+                     SELECT id, SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))) \
+                       OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+                     FROM history \
+                     WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL) \
+                   WHERE running <= ?3 LIMIT ?4)",
+                &[
+                    kind.clone(),
+                    id.clone(),
+                    sql_bytes(excess),
+                    sql_count(limit),
+                ],
+                run,
+            )?;
+            run.add(TrimBucket::PinCeilings, n);
+            if n == 0 {
+                return Ok(UnitEnd::Done(Observation::Protected));
+            }
+        }
+    }
+
+    /// A class or topic budget: the reaper's running-total window over the
+    /// unpinned rows the predicate selects, in batches. Pinned rows are in
+    /// neither the measure nor the candidates, so this never reports a
+    /// protected overshoot.
+    fn trim_budget(
+        &self,
+        conn: &Connection,
+        predicate: &str,
+        params: &[rusqlite::types::Value],
+        max_bytes: u64,
+        bucket: TrimBucket,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        const LEN: &str = "LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))";
+        let measure = format!(
+            "SELECT COALESCE(SUM({LEN}), 0) FROM history WHERE {predicate}{}",
+            run.exclude
+        );
+        let delete = format!(
+            "DELETE FROM history WHERE id IN (SELECT id FROM (SELECT id, len, \
+               SUM(len) OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+             FROM (SELECT id, seen_at_ms, {LEN} AS len \
+               FROM history WHERE {predicate}{})) \
+             WHERE running - len < ? LIMIT ?)",
+            run.exclude
+        );
+        loop {
+            trim_gate!(run.gate());
+            let used = u64::try_from(self.trim_query(conn, &measure, params, run)?).unwrap_or(0);
+            if used <= max_bytes {
+                return Ok(UnitEnd::Done(Observation::None));
+            }
+            let limit = trim_gate!(run.gate_delete());
+            let mut values = params.to_vec();
+            values.push(sql_bytes(used - max_bytes));
+            values.push(sql_count(limit));
+            let n = self.trim_delete(conn, &delete, &values, run)?;
+            run.add(bucket, n);
+            if n == 0 {
+                // Unreachable while the measured rows are the candidates.
+                return Ok(UnitEnd::Done(Observation::None));
+            }
+        }
+    }
+
+    /// An exact-scope budget, the reaper's statement in batches. A pinned
+    /// scope is governed by its ceiling instead; over its limit it, like a
+    /// scope whose overshoot is Replaceable rows only, is protected.
+    fn trim_exact_scope(
+        &self,
+        conn: &Connection,
+        scope: &Scope,
+        max_bytes: u64,
+        pinned: bool,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        let kind = rusqlite::types::Value::from(scope.kind());
+        let id = rusqlite::types::Value::from(scope.id().to_string());
+        loop {
+            trim_gate!(run.gate());
+            let used = self.trim_query(conn, SCOPE_BYTES_SQL, &[kind.clone(), id.clone()], run)?;
+            if u64::try_from(used).unwrap_or(0) <= max_bytes {
+                return Ok(UnitEnd::Done(Observation::None));
+            }
+            if pinned {
+                return Ok(UnitEnd::Done(Observation::Protected));
+            }
+            let limit = trim_gate!(run.gate_delete());
+            let n = self.trim_delete(
+                conn,
+                "DELETE FROM history WHERE id IN (\
+                   SELECT id FROM history \
+                   WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL \
+                   ORDER BY seen_at_ms ASC LIMIT ?3)",
+                &[kind.clone(), id.clone(), sql_count(limit)],
+                run,
+            )?;
+            run.add(TrimBucket::ScopeBudgets, n);
+            if n == 0 {
+                return Ok(UnitEnd::Done(Observation::Protected));
+            }
+        }
+    }
+
+    /// The whole-database budget under part 1's rules, bounded: pin
+    /// ceilings first (R3-A), the forced path on the reaper's counter
+    /// (read only, ruling Q3), then settled eviction only after the settled
+    /// certificate, folding after each batch.
+    fn trim_global(
+        &self,
+        conn: &Connection,
+        policy: &RetentionPolicy,
+        pins: &[(Scope, u64)],
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<UnitEnd> {
+        // A trim may start past the pin-ceiling units (the cursor), so the
+        // ceilings are re-checked here on the held connection: the global
+        // measure must never charge a pinned overshoot to healthy scopes.
+        for (scope, ceiling) in pins {
+            if let UnitEnd::Stop(stop) = self.trim_pin_ceiling(conn, scope, *ceiling, run)? {
+                return Ok(UnitEnd::Stop(stop));
+            }
+        }
+        trim_gate!(run.gate());
+        run.statements += 1;
+        let live = live_bytes_u64(conn)?;
+        if self.unsettled_passes.load(Ordering::Relaxed) as usize
+            >= UNSETTLED_PASSES_BEFORE_FORCED_EVICT
+            && live > policy.max_bytes
+        {
+            if let Some(stop) = self.trim_forced(conn, policy, live, run)? {
+                return Ok(UnitEnd::Stop(stop));
+            }
+        }
+        trim_gate!(run.gate());
+        run.statements += 1;
+        let mut settled =
+            self.maintain_until_settled(conn, run.budget.deadline, Some(run.budget.cancel))?;
+        let delete = format!(
+            "DELETE FROM history WHERE id IN (SELECT id FROM (SELECT id, len, \
+               SUM(len) OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+             FROM (SELECT id, seen_at_ms, \
+               LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x'')) \
+                 + LENGTH(COALESCE(payload_text, x'')) AS len \
+             FROM history WHERE replace_key IS NULL{})) \
+             WHERE running - len < ?1 LIMIT ?2)",
+            run.exclude
+        );
+        let mut learned_marginal: Option<u64> = None;
+        loop {
+            if !settled {
+                let stop = if run.budget.cancel.load(Ordering::Relaxed) {
+                    RetainStop::Cancelled
+                } else {
+                    RetainStop::Reclamation
+                };
+                return Ok(UnitEnd::Stop(stop));
+            }
+            trim_gate!(run.gate());
+            run.statements += 1;
+            let live = live_bytes_u64(conn)?;
+            if live <= policy.max_bytes {
+                return Ok(UnitEnd::Done(Observation::Settled));
+            }
+            let excess = live - policy.max_bytes;
+            let mut limit = trim_gate!(run.gate_delete());
+            if let Some(marginal) = learned_marginal {
+                let sized = usize::try_from(excess / marginal.max(1)).unwrap_or(usize::MAX);
+                limit = limit.min(sized.saturating_add(1));
+            }
+            let n = self.trim_delete(conn, &delete, &[sql_bytes(excess), sql_count(limit)], run)?;
+            run.add(TrimBucket::GlobalBudget, n);
+            if n == 0 {
+                // Settled and over the cap with no eligible row: pinned or
+                // Replaceable rows alone keep it exceeded.
+                return Ok(UnitEnd::Done(Observation::Protected));
+            }
+            trim_gate!(run.gate());
+            run.statements += 1;
+            settled =
+                self.maintain_until_settled(conn, run.budget.deadline, Some(run.budget.cancel))?;
+            if settled {
+                trim_gate!(run.gate());
+                run.statements += 1;
+                let after = live_bytes_u64(conn)?;
+                learned_marginal = Some(live.saturating_sub(after) / n);
+            }
+        }
+    }
+
+    /// Part 1's forced path (C-1264-1 §3) inside a trim: delete by estimate
+    /// in batches capped by `max_rows`, folding between them while the
+    /// budget lasts. Returns the stop, if a budget ended it.
+    fn trim_forced(
+        &self,
+        conn: &Connection,
+        policy: &RetentionPolicy,
+        live: u64,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<Option<RetainStop>> {
+        if let Err(stop) = run.gate() {
+            return Ok(Some(stop));
+        }
+        let rows =
+            u64::try_from(self.trim_query(conn, "SELECT COUNT(*) FROM history", &[], run)?)
+                .unwrap_or(0);
+        if rows == 0 {
+            return Ok(None);
+        }
+        let avg = (live / rows).max(1);
+        let mut remaining = live.saturating_sub(policy.max_bytes) / avg + 1;
+        let delete = format!(
+            "DELETE FROM history WHERE id IN (\
+               SELECT id FROM history WHERE replace_key IS NULL{} \
+               ORDER BY seen_at_ms ASC, id ASC LIMIT ?1)",
+            run.exclude
+        );
+        while remaining > 0 {
+            let limit = match run.gate_delete() {
+                Ok(limit) => limit.min(usize::try_from(remaining).unwrap_or(usize::MAX)),
+                Err(stop) => return Ok(Some(stop)),
+            };
+            let n = self.trim_delete(conn, &delete, &[sql_count(limit)], run)?;
+            run.add(TrimBucket::GlobalBudget, n);
+            if n == 0 {
+                return Ok(None);
+            }
+            remaining = remaining.saturating_sub(n);
+            if run.gate().is_ok() {
+                run.statements += 1;
+                let _ = self.merge_slice(conn, FTS_MERGE_PAGES_PER_SLICE, run.budget.deadline)?;
+            }
+            if run.gate().is_ok() {
+                run.statements += 1;
+                let _ = self.vacuum_slice(conn, run.budget.deadline)?;
+            }
+            if run.gate().is_ok() {
+                run.statements += 1;
+                Self::checkpoint_wal(conn)?;
+            }
+            if let Err(stop) = run.gate() {
+                return Ok(Some(stop));
+            }
+            run.statements += 1;
+            if live_bytes_u64(conn)? <= policy.max_bytes {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
+    /// One trim delete statement: its own transaction.
+    fn trim_delete(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        params: &[rusqlite::types::Value],
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<u64> {
+        run.statements += 1;
+        #[cfg(test)]
+        self.trim_delete_hooks_for_tests(conn)?;
+        let n = conn.execute(sql, rusqlite::params_from_iter(params.iter()))? as u64;
+        #[cfg(test)]
+        if n > 0 {
+            if let Ok(mut batches) = self.test_trim_batches.lock() {
+                batches.push(n);
+            }
+        }
+        Ok(n)
+    }
+
+    /// One trim measure statement returning an integer.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn trim_query(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        params: &[rusqlite::types::Value],
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<i64> {
+        run.statements += 1;
+        Ok(conn.query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?)
+    }
+}
+
+/// The exact-scope measure the reaper uses: payload plus signed artifact.
+const SCOPE_BYTES_SQL: &str =
+    "SELECT COALESCE(SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))), 0) \
+     FROM history WHERE scope_kind = ?1 AND scope_id = ?2";
+
+/// The retention phases a trim walks, in ADR 0116 §2 order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TrimPhase {
+    GlobalAge,
+    RuleAge,
+    PinCeiling,
+    ClassBudget,
+    TopicBudget,
+    ScopeBudget,
+    GlobalBudget,
+}
+
+/// ADR 0116 §4: the one bounded in-memory phase cursor a store keeps, the
+/// unit the next trim starts at. A phase plus the rule, pin or scope index
+/// inside it, so a changed pin set or policy only moves it to the next
+/// unit at or after the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TrimCursor {
+    phase: TrimPhase,
+    index: usize,
+}
+
+/// The deletion counter a unit's rows go to.
+#[derive(Debug, Clone, Copy)]
+enum TrimBucket {
+    GlobalAge,
+    RuleAges,
+    PinCeilings,
+    ClassBudgets,
+    TopicBudgets,
+    ScopeBudgets,
+    GlobalBudget,
+}
+
+/// One unit of trim work: a phase, or one rule, pin or scope inside it.
+enum TrimUnit {
+    Age {
+        predicate: String,
+        params: Vec<rusqlite::types::Value>,
+        cutoff: i64,
+        bucket: TrimBucket,
+    },
+    PinCeiling {
+        scope: Scope,
+        ceiling: u64,
+    },
+    Budget {
+        predicate: String,
+        params: Vec<rusqlite::types::Value>,
+        max_bytes: u64,
+        bucket: TrimBucket,
+    },
+    ExactScope {
+        scope: Scope,
+        max_bytes: u64,
+        pinned: bool,
+    },
+    Global,
+}
+
+/// What a finished unit observed, for the end-of-lap verdict.
+enum Observation {
+    /// Nothing a later deletion could change.
+    None,
+    /// The global budget held with the settled certificate.
+    Settled,
+    /// Pinned or exempt rows alone keep this unit's bound exceeded.
+    Protected,
+}
+
+enum UnitEnd {
+    Done(Observation),
+    Stop(RetainStop),
+}
+
+enum TrimEnd {
+    /// A budget stopped the trim; `next` is the unit to resume at.
+    Stopped { stop: RetainStop, next: usize },
+    /// A full lap found no eligible work.
+    Lap { protected: bool },
+}
+
+/// One trim's budgets and committed counts.
+struct TrimRun<'r> {
+    budget: &'r TrimBudget<'r>,
+    exclude: String,
+    include: String,
+    deleted: RetainDeleted,
+    /// Statements started, to tell whether a unit got its turn.
+    statements: u64,
+}
+
+impl TrimRun<'_> {
+    fn rows_left(&self) -> u64 {
+        self.budget.max_rows.saturating_sub(self.deleted.total())
+    }
+
+    /// May another statement start? Cancellation first, then the time
+    /// budget.
+    fn gate(&self) -> Result<(), RetainStop> {
+        if self.budget.cancel.load(Ordering::Relaxed) {
+            return Err(RetainStop::Cancelled);
+        }
+        if std::time::Instant::now() >= self.budget.deadline {
+            return Err(RetainStop::TimeBudget);
+        }
+        Ok(())
+    }
+
+    /// May another delete start, and with how many rows at most?
+    fn gate_delete(&self) -> Result<usize, RetainStop> {
+        self.gate()?;
+        match self.rows_left() {
+            0 => Err(RetainStop::RowBudget),
+            left => Ok(usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(RETAIN_EVICT_BATCH)),
+        }
+    }
+
+    fn add(&mut self, bucket: TrimBucket, rows: u64) {
+        let counter = match bucket {
+            TrimBucket::GlobalAge => &mut self.deleted.global_age,
+            TrimBucket::RuleAges => &mut self.deleted.rule_ages,
+            TrimBucket::PinCeilings => &mut self.deleted.pin_ceilings,
+            TrimBucket::ClassBudgets => &mut self.deleted.class_budgets,
+            TrimBucket::TopicBudgets => &mut self.deleted.topic_budgets,
+            TrimBucket::ScopeBudgets => &mut self.deleted.scope_budgets,
+            TrimBucket::GlobalBudget => &mut self.deleted.global_budget,
+        };
+        *counter += rows;
+    }
+
+    fn report(&self, state: RetainState, stop: Option<RetainStop>) -> RetainReport {
+        RetainReport::new(state, self.deleted, self.budget.started.elapsed(), stop)
+    }
+
+    /// An SQLite failure, with the counts committed before it.
+    fn failed(&self, error: HistoryError) -> RetainError {
+        RetainError::Failed {
+            error,
+            committed: self.report(RetainState::MoreWork, None),
+        }
+    }
+}
+
+/// A row count bound into SQL.
+fn sql_count(rows: usize) -> rusqlite::types::Value {
+    rusqlite::types::Value::from(i64::try_from(rows).unwrap_or(i64::MAX))
+}
+
+/// A byte count bound into SQL.
+fn sql_bytes(bytes: u64) -> rusqlite::types::Value {
+    rusqlite::types::Value::from(i64::try_from(bytes).unwrap_or(i64::MAX))
+}
+
+/// [`live_db_bytes`] as an unsigned count.
+fn live_bytes_u64(conn: &Connection) -> HistoryResult<u64> {
+    Ok(u64::try_from(live_db_bytes(conn)?).unwrap_or(0))
 }
 
 /// Effective query limit: default 100, clamped to [`MAX_QUERY_LIMIT`].
@@ -1887,6 +2755,22 @@ fn pinned_exclusion_sql(pinned: &PinnedScopes) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" AND (history.scope_kind, history.scope_id) NOT IN (VALUES {values})")
+}
+
+/// ADR 0116 §4: the inverse of [`pinned_exclusion_sql`], for the trim's
+/// "do pinned rows alone keep this bound exceeded" probes. Empty when
+/// nothing is pinned.
+fn pinned_inclusion_sql(pinned: &PinnedScopes) -> String {
+    if pinned.scopes.is_empty() {
+        return String::new();
+    }
+    let values = pinned
+        .scopes
+        .iter()
+        .map(|(kind, id)| format!("({kind}, '{}')", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND (history.scope_kind, history.scope_id) IN (VALUES {values})")
 }
 
 /// Database size in bytes (page_count × page_size) as reported by
@@ -7931,6 +8815,45 @@ mod tests {
         assert_eq!(d_ancient_rows(&store), 0);
     }
 
+    /// The verdict needs a lap whose observations no later deletion changed.
+    /// Here a trim starts at the exact-scope unit (the cursor), sees
+    /// Replaceable rows alone over the scope limit, and only afterwards, in
+    /// the same lap, the Replaceable class age deletes them. That overshoot
+    /// is gone, so the trim must not report `blocked_by_protected_rows`.
+    #[test]
+    fn adr0116_d_an_overshoot_cleared_later_in_the_lap_is_not_reported_blocked() {
+        let (store, _dir) = open();
+        let rows = (0..20_i64)
+            .map(|i| {
+                let key = format!("old-card:{i}");
+                b_row(
+                    &format!("c{i}"),
+                    b_topic("cards"),
+                    100,
+                    1 + i,
+                    Some(key.as_str()),
+                )
+            })
+            .collect();
+        b_insert(&store, rows);
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![ScopeLimit {
+                scope: "topic:cards".into(),
+                max_bytes: 500,
+            }],
+        };
+        let rules = b_rules(&[(RetainedClass::Replaceable, None, Some(1))], &[]);
+        let first = d_trim(&store, &policy, &rules, &PinnedScopes::none(), 5).unwrap();
+        assert_eq!(first.deleted_by_phase.rule_ages, 5);
+        assert_eq!(first.stopped_by, Some(RetainStop::RowBudget));
+        let second = d_trim(&store, &policy, &rules, &PinnedScopes::none(), 65_536).unwrap();
+        assert_eq!(second.deleted_by_phase.rule_ages, 15, "{second:?}");
+        assert_eq!(second.state, RetainState::Complete, "{second:?}");
+        assert_eq!(d_rows(&store), 0);
+    }
+
     /// §4 keeps part 1's settled-index rule: without the settled
     /// certificate the global budget deletes nothing and the trim reports
     /// reclamation pending. Ruling Q3: trims never advance
@@ -8307,6 +9230,37 @@ impl Store {
     /// ADR 0116 slice D: is a trim parked holding admission?
     pub(crate) fn trim_parked_for_tests(&self) -> bool {
         self.test_trim_parked.load(Ordering::Relaxed)
+    }
+
+    /// ADR 0116 slice D: park a trim after admission while
+    /// [`Self::pause_trim_for_tests`] is set.
+    fn park_trim_for_tests(&self) {
+        if !self.test_pause_trim.load(Ordering::Relaxed) {
+            return;
+        }
+        self.test_trim_parked.store(true, Ordering::Relaxed);
+        while self.test_pause_trim.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.test_trim_parked.store(false, Ordering::Relaxed);
+    }
+
+    /// ADR 0116 slice D: the slow-statement and failure hooks of one trim
+    /// delete statement, run after the budget check that admitted it.
+    fn trim_delete_hooks_for_tests(&self, conn: &Connection) -> HistoryResult<()> {
+        let slow = self.test_trim_slow_ms.swap(0, Ordering::Relaxed);
+        if slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(slow));
+        }
+        match self.test_trim_fail_after.load(Ordering::Relaxed) {
+            0 => {}
+            1 => {
+                self.test_trim_fail_after.store(0, Ordering::Relaxed);
+                conn.execute("DELETE FROM x0x_injected_trim_failure", [])?;
+            }
+            n => self.test_trim_fail_after.store(n - 1, Ordering::Relaxed),
+        }
+        Ok(())
     }
 
     /// ADR 0116 slice D: is the retention admission free right now? Takes

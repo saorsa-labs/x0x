@@ -5,8 +5,8 @@
 //! `spawn_blocking` — the store is synchronous SQLite and must never run on
 //! the async executor threads.
 
-use super::super::api_error;
 use super::super::state::AppState;
+use super::super::{api_error, api_error_with_reason};
 use crate as x0x;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -2792,15 +2792,122 @@ mod adr0066_fork_quarantine_tests {
 /// ADR 0116 §4: the body limit of `POST /history/retain`.
 pub(in crate::server) const HISTORY_RETAIN_BODY_LIMIT: usize = 1024;
 
-/// POST /history/retain (ADR 0116 §4). RED stub, not wired.
+/// The only body `POST /history/retain` accepts (ADR 0116 §4): no SQL,
+/// path, force flag, replacement policy or scope selector. A field given as
+/// `null` means "use the default", like an omitted one.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct HistoryRetainBody {
+    /// Most rows to delete, pin-ceiling deletions included (1–65 536;
+    /// default 4 096).
+    #[serde(default)]
+    max_rows: Option<u32>,
+    /// Work-admission budget in milliseconds (1–10 000; default 2 000).
+    #[serde(default)]
+    budget_ms: Option<u32>,
+}
+
+/// Decode a `POST /history/retain` body from its raw bytes. An empty (or
+/// all-whitespace) body is `{}` (ruling Q12). Anything else must be a JSON
+/// object with only the two knobs, in range. Decoding the bytes here, not
+/// through axum's `Json` extractor, keeps every refusal a 400 (`Json` would
+/// answer 415 or 422).
+fn parse_retain_body(body: &[u8]) -> Result<x0x::history::RetainOptions, String> {
+    let parsed = if body.iter().all(u8::is_ascii_whitespace) {
+        HistoryRetainBody::default()
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+        if !value.is_object() {
+            return Err("the body must be a JSON object".to_string());
+        }
+        serde_json::from_value(value).map_err(|e| {
+            format!("invalid retain body: {e}; only max_rows and budget_ms are accepted")
+        })?
+    };
+    let options = x0x::history::RetainOptions {
+        max_rows: parsed
+            .max_rows
+            .unwrap_or(x0x::history::RETAIN_DEFAULT_MAX_ROWS),
+        budget_ms: parsed
+            .budget_ms
+            .unwrap_or(x0x::history::RETAIN_DEFAULT_BUDGET_MS),
+    };
+    options.validate().map_err(|e| e.to_string())?;
+    Ok(options)
+}
+
+/// POST /history/retain — one bounded trim of local history under the
+/// daemon's startup policy now (ADR 0116 §4). Owner-only: the durable
+/// bearer, enforced at the route layer (`auth.rs`) and again here.
+///
+/// The body takes only `max_rows` and `budget_ms` (1 KiB limit: larger
+/// bodies are 413). Malformed or out-of-range bodies are 400. Disabled
+/// history is 409 `history_disabled`; a reaper pass or another trim holding
+/// the store is 409 `history_retention_busy` (nothing is queued). A 200
+/// carries the [`x0x::history::RetainReport`]: committed deletions by
+/// phase, pin-ceiling deletions, elapsed time and `state`. An SQLite
+/// failure is a typed 500 with the counts committed before it.
+///
+/// ADR 0066 §1 classification `Covered(&[27])`: the trim runs through the
+/// retention service and the daemon's live pin source (ADR 0068 D1), so a
+/// fork-quarantined group's rows are pinned exactly as for the reaper.
 pub(in crate::server) async fn history_retain(
-    State(_state): State<Arc<AppState>>,
-    axum::extract::Extension(_actor): axum::extract::Extension<
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
-    _body: axum::body::Bytes,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
-    api_error(StatusCode::NOT_IMPLEMENTED, "ADR 0116 slice D red stub").into_response()
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "history retention is owner-only: use the durable API token",
+        )
+        .into_response();
+    }
+    let options = match parse_retain_body(&body) {
+        Ok(options) => options,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(history) = state.agent.history() else {
+        return api_error_with_reason(
+            StatusCode::CONFLICT,
+            "history is disabled on this daemon",
+            "history_disabled",
+        )
+        .into_response();
+    };
+    match history.retain(options).await {
+        Ok(report) => {
+            let mut body = serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}));
+            body["ok"] = true.into();
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(x0x::history::RetainError::Busy) => api_error_with_reason(
+            StatusCode::CONFLICT,
+            "another history retention operation is running; try again later",
+            "history_retention_busy",
+        )
+        .into_response(),
+        Err(x0x::history::RetainError::InvalidOptions(message)) => {
+            api_error(StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(x0x::history::RetainError::Failed { error, committed }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "history trim failed: {error}. The {} deletions committed before the \
+                     failure are not rolled back.",
+                    committed.deleted
+                ),
+                "reason": "history_retention_failed",
+                "committed": committed,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

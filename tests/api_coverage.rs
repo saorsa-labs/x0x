@@ -190,6 +190,7 @@ const COVERED: &[CoveredEndpoint] = &[
         rest_history_list_search_stats_purge_roundtrip
     ),
     covered!(Get, "/history/policy", adr0116_policy_token_matrix),
+    covered!(Post, "/history/retain", adr0116_retain_token_matrix),
     covered!(
         Delete,
         "/history",

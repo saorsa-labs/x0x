@@ -369,6 +369,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // ADR 0116 §4: the runtime history trim.
+                    | "/history/retain"
             ) || is_two_segment_action(path, "delegate")
         }
         Method::DELETE => is_sync_device_path(path),

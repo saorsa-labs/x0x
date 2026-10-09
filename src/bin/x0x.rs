@@ -952,6 +952,18 @@ enum HistorySub {
     /// Print the local history policy in force (ADR 0116): rules, defaults,
     /// protected groups and counters. Needs the durable API token.
     Policy,
+    /// Trim local history now under the daemon's startup policy, within a
+    /// row and time budget (ADR 0116). Needs the durable API token.
+    Retain {
+        /// Most rows to delete, pin-ceiling deletions included (1-65536;
+        /// daemon default 4096).
+        #[arg(long)]
+        max_rows: Option<u32>,
+        /// Work-admission budget in milliseconds (1-10000; daemon default
+        /// 2000). One statement already running may overrun it.
+        #[arg(long)]
+        budget_ms: Option<u32>,
+    },
     /// Purge one scope from the local store (local-only).
     Purge {
         /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
@@ -2478,6 +2490,10 @@ async fn run(
             }
             HistorySub::Stats => commands::history::stats(&client).await,
             HistorySub::Policy => commands::history::policy(&client).await,
+            HistorySub::Retain {
+                max_rows,
+                budget_ms,
+            } => commands::history::retain(&client, max_rows, budget_ms).await,
             HistorySub::Purge { scope } => commands::history::purge(&client, &scope).await,
         },
         Commands::Auth { sub } => match sub {
