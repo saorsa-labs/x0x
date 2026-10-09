@@ -6350,10 +6350,49 @@ mod tests {
     /// carve-outs, so exactly the topics rule `k` wins are evicted.
     #[test]
     fn adr0116_b_sql_topic_assignment_matches_the_rust_matcher() {
+        // Codex B review (P2): NUL, backslash and quote cases too. A TEXT
+        // `substr` stops at NUL, so "app\0keep.x" must still go to the
+        // "app\0keep" carve-out, not to the bounded "app".
         let topics = [
-            "a", "ab", "abc", "a_b", "a%", "a.x", "é", "é.", "é.x", "éa", "b", "A", "ab.", "abz",
+            "a",
+            "ab",
+            "abc",
+            "a_b",
+            "a%",
+            "a.x",
+            "é",
+            "é.",
+            "é.x",
+            "éa",
+            "b",
+            "A",
+            "ab.",
+            "abz",
+            "app",
+            "app.x",
+            "app\0keep.x",
+            "app\0keep",
+            "app\0other",
+            "\0x",
+            "a\\b.x",
+            "a'b.x",
+            "a\"q.x",
+            "a\\",
+            "x'",
         ];
-        let prefixes = ["a", "ab", "a_", "é", "é."];
+        let prefixes = [
+            "a",
+            "ab",
+            "a_",
+            "é",
+            "é.",
+            "app",
+            "app\0keep",
+            "\0",
+            "a\\b",
+            "a'b",
+            "a\"q",
+        ];
         for path in ["age", "budget"] {
             for k in 0..prefixes.len() {
                 let topic_rules: Vec<(&str, Option<u64>, Option<u64>)> = prefixes
@@ -6805,6 +6844,84 @@ mod tests {
             CHAR_EVICTION_RESULT,
             "unset rules must give main's eviction results"
         );
+    }
+
+    /// Codex B review (M6 was instrumentation-only): ADR 0116 §2 runs class
+    /// budgets before topic budgets, and the order changes which rows
+    /// survive. A topic budget covers a topic's Replaceable rows; the Durable
+    /// class budget does not. Class first evicts the old Durable topic row,
+    /// and the topic then fits. Topic first would evict the Replaceable
+    /// row, after which the class budget still evicts the Durable topic row.
+    #[test]
+    fn adr0116_b_class_budgets_run_before_topic_budgets_by_survivors() {
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row(
+                    "topic_state",
+                    b_topic("app.x"),
+                    1_000,
+                    1,
+                    Some("app-state:1"),
+                ),
+                b_row("topic_msg", b_topic("app.x"), 1_000, 2, None),
+                b_row("dm_msg", b_dm(), 1_000, 3, None),
+            ],
+        );
+        let rules = b_rules(
+            &[(RetainedClass::Durable, Some(1_000), None)],
+            &[("app.", Some(1_000), None)],
+        );
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["dm_msg", "topic_state"]));
+    }
+
+    /// The class and topic measure counts the signed artifact as well as
+    /// the payload (the exact-scope measure): 100 payload bytes plus a
+    /// 900-byte artifact weigh 1 000.
+    #[test]
+    fn adr0116_b_budgets_count_signed_artifact_bytes() {
+        for (classes, topics) in [
+            (vec![(RetainedClass::Durable, Some(1_500), None)], vec![]),
+            (vec![], vec![("app.", Some(1_500), None)]),
+        ] {
+            let (store, _dir) = open();
+            let artifact = vec![b'a'; 900];
+            let mut signed = b_row("signed", b_topic("app.x"), 100, 1, None);
+            signed.signed_artifact = Some(artifact.clone());
+            signed.provenance = Provenance::VerifiedEnvelope;
+            signed.msg_id = HistoryRecord::compute_msg_id(Some(&artifact), &signed.payload);
+            b_insert(
+                &store,
+                vec![signed, b_row("plain", b_topic("app.x"), 1_000, 2, None)],
+            );
+            let rules = b_rules(&classes, &topics);
+            store
+                .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["plain"]));
+        }
+    }
+
+    /// A class budget that has to remove more than one 256-row batch gets
+    /// there in one pass, oldest first, without overshooting.
+    #[test]
+    fn adr0116_b_a_class_budget_spans_several_batches() {
+        let (store, _dir) = open();
+        let rows: Vec<HistoryRecord> = (0..600_i64)
+            .map(|i| b_row(&format!("m{i:03}"), b_dm(), 100, i, None))
+            .collect();
+        b_insert(&store, rows);
+        let rules = b_rules(&[(RetainedClass::Durable, Some(10_000), None)], &[]);
+        let outcome = store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(outcome.evicted, 500, "two batches: 256 + 244");
+        let expected: Vec<String> = (500..600_i64).map(|i| format!("m{i:03}")).collect();
+        assert_eq!(b_tags(&store), expected);
     }
 
     fn b_trace(store: &Store) -> Vec<&'static str> {
