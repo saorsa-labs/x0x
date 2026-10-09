@@ -26,7 +26,8 @@
 //! The ant-quic 0.27.54 residual (hole-punch coordinator dials, NAT
 //! traversal session handles and MASQUE relay sessions holding the
 //! original socket, saorsa-labs/ant-quic#305) is fixed in ant-quic 0.27.55,
-//! which x0x now pins. `issue1262_owned_workload_parallel` is expected to
+//! and the rarer holders (saorsa-labs/ant-quic#309) in 0.27.56, which x0x
+//! now pins. `issue1262_owned_workload_parallel` is expected to
 //! be fully green.
 
 #![cfg(test)]

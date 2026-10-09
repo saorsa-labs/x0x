@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **ant-quic 0.27.55** (from 0.27.54). Node shutdown now releases the UDP
+- **ant-quic 0.27.56** (from 0.27.54, via 0.27.55). Node shutdown now releases the UDP
   socket in every case found in saorsa-labs/ant-quic#305: hole-punch dials,
   NAT-traversal session handles, relay sessions, winner-map registrations that
   race shutdown, proactive relay setup, back-pressured stream readers, and
@@ -14,6 +14,11 @@ All notable changes to this project will be documented in this file.
   failure left after #1262. ant-quic's `accept_bi` now returns `ShuttingDown`
   for streams still queued when shutdown runs; x0x's accept loops already stop
   on shutdown.
+  0.27.56 (saorsa-labs/ant-quic#309) also releases the socket when a connection
+  driver exits or is cancelled while the application keeps the connection, closes
+  connections no map holds any more, and rebinds still-draining connections at
+  shutdown. In x0x's in-process shutdown workload: 0 failures in 1,495 shutdowns,
+  against 4 in 490 on 0.27.55.
 
 ### Fixed
 
