@@ -19,11 +19,12 @@ FOUND_ISSUES=0
 # Populated once by load_test_regions.
 declare -A IN_TEST=()
 
-# A line is test-only when it sits in a #[cfg(test)], #[cfg(all(..., test, ...))],
-# #[test], or #[tokio::test] item, or after #![cfg(test)]. The item ends when
-# its brace body closes, or at ';' / ',' when it has no body. Strings,
-# characters, and comments do not move the brace depth, so a format string
-# that continues with a backslash cannot close the item early.
+# A match is test-only when its byte offset sits in a #[cfg(test)],
+# #[cfg(all(..., test, ...))], #[test], or #[tokio::test] item, or after
+# #![cfg(test)]. The item ends when its brace body closes, or at ';' / ','
+# when it has no body. Strings stay open until the closing quote, block
+# comments nest, and a brace inside a generic argument is not the body.
+# Code after the closing brace on the same line is still production.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
@@ -53,16 +54,20 @@ BLOCK_WORDS = {
 }
 
 
-def test_lines(text: str) -> set[int]:
-    """Return 1-based line numbers that are inside test-only source."""
+def test_lines(text: str) -> dict[int, str]:
+    """Return 1-based lines to a test-span spec.
+
+    ``*`` means the whole line is test-only. Otherwise the spec is a
+    comma-separated list of half-open byte ranges that are test-only.
+    """
     lines = text.splitlines()
-    marked: set[int] = set()
+    regions: dict[int, str] = {}
 
     depth = 0
     paren = 0
     bracket = 0
     angle = 0
-    in_block = False
+    block_depth = 0
     in_raw = False
     raw_hashes = 0
     in_string = False
@@ -95,12 +100,37 @@ def test_lines(text: str) -> set[int]:
 
     for idx, line in enumerate(lines):
         if file_test:
-            marked.add(idx + 1)
+            regions[idx + 1] = "*"
             continue
 
-        line_in_test = active and phase != "after"
-        i = 0
         n = len(line)
+        byte_of = [0]
+        for character in line:
+            byte_of.append(byte_of[-1] + len(character.encode("utf-8")))
+        spans: list[list[int]] = []
+        # Character index where the current test span opened, if any.
+        mark = [0 if (active and phase != "after") else None]
+
+        def stop_marking(at: int) -> None:
+            start_i = mark[0]
+            if start_i is None:
+                return
+            mark[0] = None
+            if at <= start_i:
+                return
+            start_b = byte_of[start_i]
+            end_b = byte_of[at]
+            if spans and start_b <= spans[-1][1]:
+                if end_b > spans[-1][1]:
+                    spans[-1][1] = end_b
+            else:
+                spans.append([start_b, end_b])
+
+        def ensure_marking(at: int) -> None:
+            if mark[0] is None:
+                mark[0] = at
+
+        i = 0
         while i < n:
             ch = line[i]
             nxt = line[i + 1] if i + 1 < n else ""
@@ -113,6 +143,8 @@ def test_lines(text: str) -> set[int]:
                 i += 1
                 continue
 
+            # A regular string stays open until its closing quote, including
+            # across a newline that is not escaped with a backslash.
             if in_string:
                 if ch == "\\":
                     if i + 1 >= n:
@@ -126,20 +158,29 @@ def test_lines(text: str) -> set[int]:
                 i += 1
                 continue
 
-            if in_block:
+            # Rust block comments nest. The first */ does not end an outer comment.
+            if ch == "/" and nxt == "*":
+                block_depth += 1
+                i += 2
+                continue
+            if block_depth:
                 if ch == "*" and nxt == "/":
-                    in_block = False
+                    block_depth -= 1
                     i += 2
                     continue
                 i += 1
                 continue
 
             if ch == "/" and nxt == "/":
+                if active and phase == "after":
+                    stop_marking(i)
+                    end_item()
+                elif active:
+                    ensure_marking(i)
+                    stop_marking(n)
+                else:
+                    stop_marking(i)
                 break
-            if ch == "/" and nxt == "*":
-                in_block = True
-                i += 2
-                continue
 
             if ch == '"':
                 hashes = _raw_hashes(line, i)
@@ -159,14 +200,16 @@ def test_lines(text: str) -> set[int]:
             if ch == "#":
                 kind = _attr_kind(line, i)
                 if active and phase == "after":
+                    stop_marking(i)
                     end_item()
                 if kind == "file":
                     file_test = True
-                    line_in_test = True
+                    mark[0] = 0
+                    i = n
                     break
                 if kind in {"cfg", "test"} and not active:
                     start_item()
-                    line_in_test = True
+                    ensure_marking(i)
                 i += 1
                 continue
 
@@ -177,28 +220,51 @@ def test_lines(text: str) -> set[int]:
                 if _word_at(line, i) == "else":
                     phase = "header"
                     mode = ""
-                    line_in_test = True
+                    ensure_marking(i)
                     i += 4
                     continue
+                stop_marking(i)
                 end_item()
                 continue
 
             if ch == "{":
+                # A brace inside a generic argument of a block item is not the body.
+                if angle > 0 and mode == "block" and phase == "header":
+                    i += 1
+                    continue
                 if active and phase == "header" and at_item_level():
                     phase = "body"
-                    line_in_test = True
+                    ensure_marking(i)
                 depth += 1
                 i += 1
                 continue
 
             if ch == "}":
+                if angle > 0 and mode == "block" and phase == "header":
+                    i += 1
+                    continue
                 if depth > 0:
                     depth -= 1
-                if active and phase == "body" and depth == floor and paren == paren_floor and bracket == bracket_floor:
+                if (
+                    active
+                    and phase == "body"
+                    and depth == floor
+                    and paren == paren_floor
+                    and bracket == bracket_floor
+                ):
                     phase = "after"
-                    line_in_test = True
-                elif active and phase == "header" and depth < floor and paren == paren_floor and bracket == bracket_floor:
+                    i += 1
+                    continue
+                if (
+                    active
+                    and phase == "header"
+                    and depth < floor
+                    and paren == paren_floor
+                    and bracket == bracket_floor
+                ):
+                    stop_marking(i)
                     end_item()
+                    continue
                 i += 1
                 continue
 
@@ -207,7 +273,14 @@ def test_lines(text: str) -> set[int]:
                 i += 1
                 continue
             if ch == ")":
-                if active and phase == "header" and paren <= paren_floor and depth == floor and bracket == bracket_floor:
+                if (
+                    active
+                    and phase == "header"
+                    and paren <= paren_floor
+                    and depth == floor
+                    and bracket == bracket_floor
+                ):
+                    stop_marking(i)
                     end_item()
                     continue
                 if paren > 0:
@@ -219,7 +292,14 @@ def test_lines(text: str) -> set[int]:
                 i += 1
                 continue
             if ch == "]":
-                if active and phase == "header" and bracket <= bracket_floor and depth == floor and paren == paren_floor:
+                if (
+                    active
+                    and phase == "header"
+                    and bracket <= bracket_floor
+                    and depth == floor
+                    and paren == paren_floor
+                ):
+                    stop_marking(i)
                     end_item()
                     continue
                 if bracket > 0:
@@ -237,9 +317,9 @@ def test_lines(text: str) -> set[int]:
                 continue
 
             if ch == ";" and active and phase == "header" and at_item_level():
-                end_item()
-                line_in_test = True
                 i += 1
+                stop_marking(i)
+                end_item()
                 continue
 
             if (
@@ -250,9 +330,9 @@ def test_lines(text: str) -> set[int]:
                 and angle == 0
                 and at_item_level()
             ):
-                end_item()
-                line_in_test = True
                 i += 1
+                stop_marking(i)
+                end_item()
                 continue
 
             if ch.isalpha() or ch == "_":
@@ -265,23 +345,38 @@ def test_lines(text: str) -> set[int]:
                     and angle == 0
                 ):
                     mode = "block" if word in BLOCK_WORDS else "expr"
-                if active:
-                    line_in_test = True
+                if active and phase != "after":
+                    ensure_marking(i)
                 i += len(word)
                 continue
 
             if active and phase != "after":
-                line_in_test = True
+                ensure_marking(i)
             i += 1
 
-        if in_string and not _odd_trailing_backslash(line):
-            in_string = False
+        stop_marking(n)
+        spec = _span_spec(spans, byte_of[n])
+        if spec:
+            regions[idx + 1] = spec
 
-        if line_in_test:
-            marked.add(idx + 1)
+    return regions
 
-    return marked
 
+def _span_spec(spans: list[list[int]], nbytes: int) -> str:
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    if not merged:
+        return ""
+    if len(merged) == 1 and merged[0][0] == 0 and merged[0][1] >= nbytes > 0:
+        return "*"
+    return ",".join(f"{start}-{end}" for start, end in merged)
 
 def _word_at(line: str, i: int) -> str:
     j = i + 1
@@ -305,15 +400,6 @@ def _attr_kind(line: str, i: int) -> str:
     if _cfg_all_requires_test(rest):
         return "cfg"
     return ""
-
-
-def _odd_trailing_backslash(line: str) -> bool:
-    count = 0
-    j = len(line) - 1
-    while j >= 0 and line[j] == "\\":
-        count += 1
-        j -= 1
-    return count % 2 == 1
 
 
 def _cfg_all_requires_test(rest: str) -> bool:
@@ -393,8 +479,8 @@ def _emit(root, out):
             rel = os.path.relpath(path, ".").replace(os.sep, "/")
             with open(path, encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
-            for number in test_lines(text):
-                out.write(f"{rel}\t{number}\n")
+            for number, spec in test_lines(text).items():
+                out.write(f"{rel}\t{number}\t{spec}\n")
 
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     _emit("src", handle)
@@ -405,15 +491,47 @@ PY
         echo "panic scanner could not classify #[cfg(test)] regions" >&2
         exit 1
     fi
-    while IFS=$'\t' read -r file num; do
-        [[ -n "$file" && -n "$num" ]] || continue
-        IN_TEST["${file}:${num}"]=1
+    while IFS=$'\t' read -r file num spec; do
+        [[ -n "$file" && -n "$num" && -n "$spec" ]] || continue
+        IN_TEST["${file}:${num}"]="$spec"
     done < "$tmp"
     rm -f "$tmp"
 }
 
+# spec is "*" or comma-separated half-open byte ranges, for example "0-12,40-55".
+_offset_in_spans() {
+    local offset="$1"
+    local spec="$2"
+    local part start end
+    local IFS=','
+    for part in $spec; do
+        start=${part%%-*}
+        end=${part#*-}
+        if (( offset >= start && offset < end )); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Return 0 when every occurrence of pattern on this line is inside a test span.
 is_in_test_code() {
-    [[ -n "${IN_TEST["$1:$2"]+x}" ]]
+    local file="$1"
+    local line_num="$2"
+    local content="$3"
+    local pattern="$4"
+    local spec="${IN_TEST["$file:$line_num"]-}"
+    local offset found=0
+    [[ -n "$spec" ]] || return 1
+    [[ "$spec" == "*" ]] && return 0
+    while IFS=: read -r offset _; do
+        [[ -n "$offset" ]] || continue
+        found=1
+        if ! _offset_in_spans "$offset" "$spec"; then
+            return 1
+        fi
+    done < <(printf '%s\n' "$content" | grep -aboE -- "$pattern" || true)
+    [[ "$found" -eq 1 ]]
 }
 
 # Function to scan and report
@@ -434,12 +552,14 @@ scan_pattern() {
             continue
         fi
 
-        # Extract file and line number
-        local file=$(echo "$match" | cut -d: -f1)
-        local line_num=$(echo "$match" | cut -d: -f2)
+        # Extract file, line number, and the source line (it may contain ':').
+        local file="${match%%:*}"
+        local rest="${match#*:}"
+        local line_num="${rest%%:*}"
+        local content="${rest#*:}"
 
-        # Check if in test code
-        if is_in_test_code "$file" "$line_num"; then
+        # Skip only when the matched bytes themselves sit in a test item.
+        if is_in_test_code "$file" "$line_num" "$content" "$pattern"; then
             continue
         fi
 
