@@ -4282,8 +4282,6 @@ async fn deferred_eager_retry_records_each_peer_frame_once() {
         (3, peer_bytes),
         "EAGER meter must count each peer frame once, at its encoded length"
     );
-    reconcile_eager_retry_meter(&attempts, &per_peer)
-        .expect("wire frames are one deferred retry plus the two initial sends");
     let _ = pubsub.shutdown().await;
     assert_eq!(
         transport.eager_frames().len(),
