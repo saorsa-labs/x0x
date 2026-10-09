@@ -304,6 +304,28 @@ pub struct RetainOutcome {
     pub pinned_scopes: u64,
 }
 
+/// Issue #1286: the one warning a store emits when a pass skips an
+/// unparseable `scope_limits` entry. Built inside the pass and emitted by
+/// [`Store::retain_with_pins`] after the pass has released its locks.
+struct SkippedScopeLimitsWarning {
+    /// Entries the pass skipped.
+    skipped: usize,
+    /// At most 16 of them, as written in the config.
+    shown: Vec<String>,
+}
+
+impl SkippedScopeLimitsWarning {
+    fn emit(self) {
+        tracing::warn!(
+            skipped = self.skipped,
+            scopes = ?self.shown,
+            "[history] skipping [[history.scope_limits]] entries whose scope does not parse \
+             (expected dm:<agent>, group:<id> or topic:<name>); the other limits and the \
+             whole-database budget still apply (#1286). Logged once per store."
+        );
+    }
+}
+
 /// Synchronous SQLite-backed history store.
 pub struct Store {
     /// Dropped first: in test builds it runs an optional hook while the
@@ -327,12 +349,15 @@ pub struct Store {
     unsettled_passes: AtomicU32,
     /// Issue #1286: how many `scope_limits` entries the most recent pass
     /// skipped because their scope string does not parse. A gauge,
-    /// overwritten by each pass. The retention policy is fixed for the
-    /// store's life, so a non-zero value means "this many configured
-    /// limits are not in force". Read through
-    /// [`Store::skipped_scope_limits`].
+    /// overwritten by each pass. The reaper passes the same policy every
+    /// time, so for the daemon a non-zero value means "this many configured
+    /// limits are not in force". A direct [`Store::retain`] caller may pass a
+    /// different policy each time; the gauge always describes the latest
+    /// pass. Read through [`Store::skipped_scope_limits`].
     skipped_scope_limits: AtomicU64,
     /// Issue #1286: the skip is logged once per store, not once per pass.
+    /// Claimed inside a pass (passes are serialised); the warning itself is
+    /// emitted after the pass has released its locks.
     skipped_scope_limits_logged: AtomicBool,
     /// Round-4 test hook: [`Store::maintain_until_settled`] reports
     /// "budget ran out before the index settled" without running
@@ -797,6 +822,33 @@ impl Store {
         policy: &RetentionPolicy,
         pinned: &PinnedScopes,
     ) -> HistoryResult<RetainOutcome> {
+        // Issue #1286 round 2: a skip warning claimed during the pass is
+        // emitted here, after `retain_pass` has returned and so released
+        // both the retention mutex and the connection. Tracing calls
+        // subscribers synchronously. Emitting under either lock would let a
+        // subscriber that reads this store deadlock, and let a blocked log
+        // sink stall every reader, writer and reaper. The pass's own lock
+        // coverage is unchanged: one held connection from phase 1 through
+        // the cleanup.
+        let mut skip_warning = None;
+        let result = self.retain_pass(policy, pinned, &mut skip_warning);
+        if let Some(warning) = skip_warning {
+            warning.emit();
+        }
+        result
+    }
+
+    /// The body of [`Store::retain_with_pins`]: one whole pass under the
+    /// retention mutex and one held connection (C-1264-1), both released
+    /// when this returns. A #1286 skip warning the pass claims is handed
+    /// back through `skip_warning`, also when a later phase fails, for the
+    /// caller to emit outside the locks.
+    fn retain_pass(
+        &self,
+        policy: &RetentionPolicy,
+        pinned: &PinnedScopes,
+        skip_warning: &mut Option<SkippedScopeLimitsWarning>,
+    ) -> HistoryResult<RetainOutcome> {
         let mut outcome = RetainOutcome {
             pinned_scopes: pinned.len() as u64,
             ..RetainOutcome::default()
@@ -906,7 +958,7 @@ impl Store {
             }
             outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
         }
-        self.note_skipped_scope_limits(&skipped);
+        *skip_warning = self.record_skipped_scope_limits(&skipped);
 
         // 4. Whole-database byte budget (issue #1264 part 1).
         self.enforce_global_budget(&guard, policy, &exclude, deadline, &mut outcome)?;
@@ -1468,10 +1520,16 @@ impl Store {
     }
 
     /// Record phase 3's skipped `scope_limits` entries: overwrite the gauge,
-    /// and warn the first time any pass on this store skips one. The policy
-    /// cannot change while the store is open, so one warning carries all
-    /// the information; repeating it every pass would only add noise.
-    fn note_skipped_scope_limits(&self, skipped: &[&str]) {
+    /// and claim this store's one warning the first time any pass skips an
+    /// entry. It runs inside the pass, where passes are serialised, so the
+    /// claim is made once. It emits nothing: the caller emits the returned
+    /// warning after the pass has released its locks.
+    ///
+    /// One warning per store: the reaper passes the same policy every time,
+    /// so a second warning would repeat the first. A direct `retain` caller
+    /// that later passes a different bad entry gets no second warning, but
+    /// the gauge still reports every pass.
+    fn record_skipped_scope_limits(&self, skipped: &[&str]) -> Option<SkippedScopeLimitsWarning> {
         self.skipped_scope_limits
             .store(skipped.len() as u64, Ordering::Relaxed);
         if skipped.is_empty()
@@ -1479,18 +1537,18 @@ impl Store {
                 .skipped_scope_limits_logged
                 .swap(true, Ordering::Relaxed)
         {
-            return;
+            return None;
         }
-        // Operator-supplied strings from the config file; show a bounded
-        // number of them.
-        let shown: Vec<&str> = skipped.iter().take(16).copied().collect();
-        tracing::warn!(
-            skipped = skipped.len(),
-            scopes = ?shown,
-            "[history] skipping [[history.scope_limits]] entries whose scope does not parse \
-             (expected dm:<agent>, group:<id> or topic:<name>); the other limits and the \
-             whole-database budget still apply (#1286). Logged once per store."
-        );
+        Some(SkippedScopeLimitsWarning {
+            skipped: skipped.len(),
+            // Operator-supplied strings from the config; keep a bounded
+            // number of them.
+            shown: skipped
+                .iter()
+                .take(16)
+                .map(|scope| (*scope).to_owned())
+                .collect(),
+        })
     }
 
     /// ADR-0068 D1: the byte ceiling for one pinned scope.
