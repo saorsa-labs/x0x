@@ -37158,10 +37158,10 @@ pub(in crate::server) async fn dispatch_join_result_message(
         ..
     } = &msg
     else {
-        // #1275: a result, refusal or invite-secret answer seats the joiner
-        // or finalizes its attempt (roster and TreeKEM persistence), so it
-        // runs shielded: an abort of this listener cannot cut it off. The
-        // listener awaits it, so these messages still apply in order.
+        // #1275: a result seats the joiner (roster and TreeKEM persistence)
+        // and a refusal finalizes its attempt under the persistence lock,
+        // so they run shielded: an abort of this listener cannot cut them
+        // off. The listener awaits each, so they still apply in order.
         // `false` (shutdown refused it, or it panicked) stops the listener.
         let apply_state = Arc::clone(state);
         let sender = *sender;
