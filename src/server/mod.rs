@@ -30,6 +30,8 @@ mod w3h;
 mod ws;
 
 #[cfg(test)]
+mod issue1288_ws_shutdown;
+#[cfg(test)]
 mod shutdown_regression;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
@@ -2929,7 +2931,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // and Welcome fetch handlers, delayed publishes; since #1274 also the
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
-    // delta direct deliveries and the outgoing file-chunk streams) and the
+    // delta direct deliveries, the outgoing file-chunk streams, and since
+    // #1288 the WebSocket session loop and its writer and forwarders) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and
     // its exclusive `history.db` connection, alive after the supervisor

@@ -975,7 +975,10 @@ pub(super) struct AppState {
     /// one-shot predecessor-relay offer used when the durable offer
     /// obligation could not be persisted, the member-keyed KeyPackage
     /// catch-up requests, the KV-store delta direct deliveries and the
-    /// outgoing file-chunk streams. None of them owns a write that an abort
+    /// outgoing file-chunk streams, and since #1288 the WebSocket session
+    /// loop and its child tasks (the writer, the direct-message, call, and
+    /// keepalive forwarders, and the shared and per-session topic
+    /// forwarders). None of them owns a write that an abort
     /// could cut: the most a send leaves behind is the outbound DM history
     /// row that `Agent::send_direct_with_history` enqueues synchronously
     /// after a successful send, and the history writer owns that
@@ -1348,17 +1351,30 @@ impl AppState {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        self.spawn_detached_with_abort(task).is_some()
+    }
+
+    /// #1288 row 4: [`spawn_detached`](Self::spawn_detached), plus the task's
+    /// abort handle so a WebSocket session can stop one child on
+    /// unsubscribe without dropping the drain's `JoinHandle`. `None` once
+    /// shutdown has closed admission; `task` is not started.
+    pub(super) fn spawn_detached_with_abort<F>(&self, task: F) -> Option<tokio::task::AbortHandle>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let mut guard = self
             .detached_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(tasks) = guard.as_mut() else {
-            return false;
+            return None;
         };
         // Reap finished tasks so the registry holds only live ones.
         tasks.retain(|task| !task.is_finished());
-        tasks.push(tokio::spawn(task));
-        true
+        let handle = tokio::spawn(task);
+        let abort = handle.abort_handle();
+        tasks.push(handle);
+        Some(abort)
     }
 
     /// #1269: whether shutdown has closed detached-task admission.

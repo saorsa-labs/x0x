@@ -59,7 +59,8 @@ pub(super) struct WsSession {
     /// Whether this session receives direct messages.
     receives_direct: bool,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
-    topic_forwarders: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// The drain owns the `JoinHandle`; this is only the abort handle.
+    topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
 }
 
 /// Shared state for a single gossip topic subscription shared across WS sessions.
@@ -69,7 +70,8 @@ pub(super) struct SharedTopicState {
     /// Session IDs currently subscribed to this topic.
     subscribers: HashSet<String>,
     /// Gossip forwarder task handle (aborted when last subscriber leaves).
-    forwarder: tokio::task::JoinHandle<()>,
+    /// The drain owns the `JoinHandle`; this is only the abort handle.
+    forwarder: tokio::task::AbortHandle,
 }
 
 /// Server → Client WebSocket message.
@@ -426,8 +428,21 @@ pub(super) async fn ws_handler(
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
+    let durable = actor.is_durable_owner();
     ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state, false, None, actor.is_durable_owner())
+        let state = state;
+        async move {
+            // #1288 row 4: axum detaches this callback. The session has to be
+            // on the shutdown drain, or a client that is still connected
+            // keeps AppState after `shutdown_and_wait` returns.
+            let _admitted = state.spawn_detached(handle_ws_connection(
+                socket,
+                Arc::clone(&state),
+                false,
+                None,
+                durable,
+            ));
+        }
     })
 }
 
@@ -448,14 +463,20 @@ pub(super) async fn ws_direct_handler(
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
+    let durable = actor.is_durable_owner();
+    let backfill = params.backfill;
     ws.on_upgrade(move |socket| {
-        handle_ws_connection(
-            socket,
-            state,
-            true,
-            params.backfill,
-            actor.is_durable_owner(),
-        )
+        let state = state;
+        async move {
+            // #1288 row 4: same drain registration as `ws_handler`.
+            let _admitted = state.spawn_detached(handle_ws_connection(
+                socket,
+                Arc::clone(&state),
+                true,
+                backfill,
+                durable,
+            ));
+        }
     })
 }
 
@@ -643,6 +664,29 @@ async fn run_ws_writer<S, E>(
     }
 }
 
+/// #1288 row 4: register a session child on the shutdown drain.
+///
+/// `None` means shutdown has closed admission and `task` was not started.
+fn spawn_ws_task(
+    state: &AppState,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Option<tokio::task::AbortHandle> {
+    state.spawn_detached_with_abort(task)
+}
+
+/// Stop children already admitted and drop the session row. Used when a
+/// later child cannot be admitted because shutdown closed the registry.
+async fn abandon_ws_session(
+    state: &AppState,
+    session_id: &str,
+    children: &[tokio::task::AbortHandle],
+) {
+    for child in children {
+        child.abort();
+    }
+    state.ws_sessions.write().await.remove(session_id);
+}
+
 /// Core WebSocket connection lifecycle.
 async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
@@ -708,9 +752,10 @@ async fn handle_ws_connection(
     let writer_session_id = session_id.clone();
     let writer_slow_close = slow_close.clone();
     let writer_flush_budget = state.ws_slow_close_flush;
-    let mut writer: tokio::task::JoinHandle<
-        futures::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
-    > = tokio::spawn(async move {
+    // The drain owns the writer. The oneshot still returns the sink so the
+    // close sequence below can finish the #287 grace flush.
+    let (sink_tx, sink_rx) = tokio::sync::oneshot::channel();
+    let Some(writer_abort) = spawn_ws_task(&state, async move {
         run_ws_writer(
             &mut outbound_rx,
             &mut ws_tx,
@@ -719,8 +764,11 @@ async fn handle_ws_connection(
         )
         .await;
         tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
-        ws_tx
-    });
+        let _ = sink_tx.send(ws_tx);
+    }) else {
+        abandon_ws_session(&state, &session_id, &[]).await;
+        return;
+    };
 
     // If direct mode, spawn a forwarder for direct messages
     let direct_handle = if direct_mode {
@@ -791,7 +839,7 @@ async fn handle_ws_connection(
         let dm_stats = Arc::clone(&stats);
         let dm_slow_close = slow_close.clone();
         let dm_counted = Arc::clone(&slow_close_counted);
-        Some(tokio::spawn(async move {
+        let admitted = spawn_ws_task(&state, async move {
             let mut dedupe = dm_backfill_hashes;
             while let Some(msg) = direct_rx.recv().await {
                 if let Some(set) = dedupe.as_mut() {
@@ -821,7 +869,12 @@ async fn handle_ws_connection(
                 }
             }
             tracing::debug!(session_id = %sid, "Direct message forwarder stopped");
-        }))
+        });
+        if admitted.is_none() {
+            abandon_ws_session(&state, &session_id, &[writer_abort]).await;
+            return;
+        }
+        admitted
     } else {
         None
     };
@@ -833,7 +886,7 @@ async fn handle_ws_connection(
     let call_slow_close = slow_close.clone();
     let call_counted = Arc::clone(&slow_close_counted);
     let mut call_rx = state.broadcast_tx.subscribe();
-    let call_forwarder = tokio::spawn(async move {
+    let Some(call_forwarder) = spawn_ws_task(&state, async move {
         loop {
             let event = match call_rx.recv().await {
                 Ok(event) => event,
@@ -849,7 +902,14 @@ async fn handle_ws_connection(
                 break;
             }
         }
-    });
+    }) else {
+        let mut children = vec![writer_abort];
+        if let Some(direct) = direct_handle {
+            children.push(direct);
+        }
+        abandon_ws_session(&state, &session_id, &children).await;
+        return;
+    };
 
     // Spawn keepalive pinger (30s interval). The keepalive is the reliable
     // slow-consumer detector: every interval it tries to enqueue a Pong and,
@@ -859,7 +919,7 @@ async fn handle_ws_connection(
     let ka_stats = Arc::clone(&stats);
     let ka_slow_close = slow_close.clone();
     let ka_counted = Arc::clone(&slow_close_counted);
-    let keepalive = tokio::spawn(async move {
+    let Some(keepalive) = spawn_ws_task(&state, async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
@@ -873,7 +933,14 @@ async fn handle_ws_connection(
                 break;
             }
         }
-    });
+    }) else {
+        let mut children = vec![writer_abort, call_forwarder];
+        if let Some(direct) = direct_handle {
+            children.push(direct);
+        }
+        abandon_ws_session(&state, &session_id, &children).await;
+        return;
+    };
 
     // Reader loop: ws_rx → dispatch commands
     let mut shutdown_rx = state.shutdown_notify.subscribe();
@@ -947,7 +1014,7 @@ async fn handle_ws_connection(
     // sink does NOT unbound memory: the outbound queue and feeders are gone;
     // only the OS socket persists for the bounded grace.
     let grace_deadline = tokio::time::Instant::now() + WS_SLOW_CLOSE_GRACE;
-    match tokio::time::timeout_at(grace_deadline, &mut writer).await {
+    match tokio::time::timeout_at(grace_deadline, sink_rx).await {
         Ok(Ok(mut ws_tx_back)) => {
             if slow_close.is_cancelled() {
                 // Slow-consumer close: the writer's flush budget may have
@@ -964,16 +1031,19 @@ async fn handle_ws_connection(
             // Ordinary teardown (client Close / channel end / send error):
             // nothing is pending; drop the sink immediately at scope end.
         }
-        Ok(Err(e)) => {
-            // The writer task itself failed; its sink died with it. Nothing
-            // to hold open — teardown proceeds as before.
-            tracing::debug!(session_id = %session_id, "WebSocket writer task failed: {e}");
+        Ok(Err(_closed)) => {
+            // The writer ended without handing the sink back (it was aborted,
+            // or the task failed). Nothing to hold open.
+            tracing::debug!(
+                session_id = %session_id,
+                "WebSocket writer ended without returning the sink"
+            );
         }
         Err(_) => {
             // Still inside its own flush budget at the grace deadline (e.g.
             // a flush budget configured past the grace): bounded teardown
-            // wins, as before.
-            writer.abort();
+            // wins, as before. The drain also joins this task.
+            writer_abort.abort();
         }
     }
 
@@ -1056,12 +1126,12 @@ async fn handle_ws_command(
                     continue;
                 }
 
-                let broadcast_rx = {
+                let Some(broadcast_rx) = ({
                     let mut ws_topics = state.ws_topics.write().await;
                     if let Some(ts) = ws_topics.get_mut(topic) {
                         // Existing shared channel — just subscribe and track
                         ts.subscribers.insert(session_id.to_string());
-                        ts.channel.subscribe()
+                        Some(ts.channel.subscribe())
                     } else {
                         // First WS subscriber — create gossip sub + broadcast + forwarder
                         let (broadcast_tx, broadcast_rx) = broadcast::channel::<WsOutbound>(256);
@@ -1072,7 +1142,7 @@ async fn handle_ws_command(
                             if let Ok(mut gossip_sub) = state.agent.subscribe(topic).await {
                                 let btx = broadcast_tx.clone();
                                 let topic_clone = topic.clone();
-                                tokio::spawn(async move {
+                                spawn_ws_task(state, async move {
                                     while let Some(msg) = gossip_sub.recv().await {
                                         let out = WsOutbound::Message {
                                             topic: topic_clone.clone(),
@@ -1089,19 +1159,29 @@ async fn handle_ws_command(
                                     }
                                 })
                             } else {
-                                tokio::spawn(async {}) // no-op if subscribe failed
+                                // No-op if subscribe failed. Still tracked so
+                                // shutdown joins it with the other children.
+                                spawn_ws_task(state, async {})
                             };
-
-                        ws_topics.insert(
-                            topic.clone(),
-                            SharedTopicState {
-                                channel: broadcast_tx,
-                                subscribers,
-                                forwarder,
-                            },
-                        );
-                        broadcast_rx
+                        if let Some(forwarder) = forwarder {
+                            ws_topics.insert(
+                                topic.clone(),
+                                SharedTopicState {
+                                    channel: broadcast_tx,
+                                    subscribers,
+                                    forwarder,
+                                },
+                            );
+                            Some(broadcast_rx)
+                        } else {
+                            // Shutdown closed admission before this topic's
+                            // forwarder could start. Do not publish a shared
+                            // subscription that nothing will drain.
+                            None
+                        }
                     }
+                }) else {
+                    break;
                 };
 
                 // ADR-0023 backfill-then-live: the live tap (broadcast_rx,
@@ -1186,7 +1266,7 @@ async fn handle_ws_command(
                 let tx_clone = tx.clone();
                 let fwd_stats = Arc::clone(&state.ws_outbound_stats);
                 let fwd_state = Arc::clone(state);
-                let handle = tokio::spawn(async move {
+                let Some(handle) = spawn_ws_task(state, async move {
                     let mut rx = broadcast_rx;
                     // Dedupe frames already delivered by backfill: drop live
                     // frames whose payload hash matches a backfilled row,
@@ -1250,7 +1330,13 @@ async fn handle_ws_command(
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                });
+                }) else {
+                    // The shared subscription was recorded above. Drop this
+                    // session's seat so a forwarder that shutdown will not
+                    // track is not left running for it.
+                    cleanup_ws_topic_if_empty(state, topic, session_id).await;
+                    break;
+                };
                 handles.push((topic.clone(), handle));
             }
 
