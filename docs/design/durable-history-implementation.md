@@ -211,8 +211,27 @@ How the rules combine:
   counted (`Store::skipped_topic_rules`) and logged once. Class limits and
   every other bound still apply.
 
-The `ephemeral` recording modes are validated but refused until ADR 0116
-slice C enforces them.
+The `ephemeral` recording modes (ADR 0116 slice C) act at the history
+handle, before a record is queued. `dm_recording = "ephemeral"` drops every
+ordinary DM (a `Scope::Dm` record with no `replace_key`), inbound and
+outbound, from the gossip inbox, the raw-QUIC path and the outbound
+record. A topic rule with `recording = "ephemeral"` drops messages on the
+topics it wins; it only filters `record_topics`. A dropped record writes no
+row, payload, artifact, FTS entry, canonical projection or backfill source.
+Group history is never dropped. Live delivery is unchanged. Each drop is
+counted (`HistoryCounters::policy_suppressed_dm_total`,
+`policy_suppressed_topic_total`), with no topic or payload label.
+
+DM receipts (ADR 0030): a generic durable (v2) DM cannot be committed under
+`dm_recording = "ephemeral"`, so its durable ACK is withheld before
+dispatch. The receiver counts it (`policy_durable_receipt_withheld_total`)
+and sends nothing back: no typed refusal and no weaker ACK. The v2
+capability advert is unchanged, so the sender sees its ordinary bounded
+retry or timeout, not a 409. A request whose row was committed before the
+policy was set is answered from that row as before: re-dispatched and
+re-ACKed, with no new commit. Typed durable routes keep their own receipts.
+Senders that need delivery to such a node use the non-durable send mode
+(`require_durable_app_ack: false`).
 
 Reaper task every 300 s (constant, `HISTORY_REAPER_INTERVAL_SECS`), evicts
 oldest-first by `seen_at_ms` until under bounds, then `PRAGMA

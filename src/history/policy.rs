@@ -273,6 +273,25 @@ impl HistoryPolicy {
             .count()
     }
 
+    /// ADR 0116 §3: whether ordinary inbound and outbound DMs are kept out
+    /// of history (`dm_recording = "ephemeral"`).
+    #[must_use]
+    pub fn suppresses_ordinary_dms(&self) -> bool {
+        self.dm_recording == DmRecording::Ephemeral
+    }
+
+    /// ADR 0116 §3: whether messages on `topic` are kept out of history,
+    /// i.e. its winning rule says `recording = "ephemeral"`. The rule only
+    /// filters topics `record_topics` already selects; it never subscribes
+    /// to a topic or opts one in.
+    #[must_use]
+    pub fn suppresses_topic(&self, topic: &str) -> bool {
+        !self.topic_rules.is_empty()
+            && self
+                .winning_topic_rule(topic)
+                .is_some_and(|rule| rule.recording == TopicRecording::Ephemeral)
+    }
+
     /// Ordinary-DM recording mode.
     #[must_use]
     pub fn dm_recording(&self) -> DmRecording {

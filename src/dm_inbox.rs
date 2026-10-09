@@ -2211,7 +2211,7 @@ impl InboxPipeline {
             );
             return DurableAckDecision::Withheld("no_durable_representation");
         };
-        match durable_history_logical_request(
+        let lookup = match durable_history_logical_request(
             &history,
             sender_agent_id,
             request_id,
@@ -2219,7 +2219,9 @@ impl InboxPipeline {
         )
         .await
         {
-            Ok(DurableLogicalRequestLookup::Missing | DurableLogicalRequestLookup::Exact) => {}
+            Ok(
+                found @ (DurableLogicalRequestLookup::Missing | DurableLogicalRequestLookup::Exact),
+            ) => found,
             Ok(DurableLogicalRequestLookup::Conflict) => {
                 tracing::warn!(
                     target: "dm.trace",
@@ -2255,6 +2257,34 @@ impl InboxPipeline {
                 );
                 return DurableAckDecision::Withheld("history_lookup_failed");
             }
+        };
+
+        // ADR 0116 §3 / ADR 0030 §1: a generic durable DM is never
+        // acknowledged without its commit. Under `dm_recording =
+        // "ephemeral"` the commit is suppressed, so a request with no
+        // committed row (`Missing`) is withheld here, BEFORE dispatch. The
+        // reason is counted locally only. No typed refusal is sent (no
+        // `AckSemanticsUnavailable`), no weaker ACK, and the v2 advert
+        // stays; the sender sees its ordinary bounded retry or timeout.
+        //
+        // Ruling Q4 (an interpretation of the Validation "pre-policy
+        // committed duplicate" cell): an `Exact` lookup means the commit
+        // was made before the policy, so the request is not suppressed. It
+        // takes main's path below: re-dispatch (at-least-once) and a v2
+        // ACK from the existing row, with no new commit attempted.
+        let policy_suppresses_commit = history.policy().suppresses_ordinary_dms();
+        if policy_suppresses_commit && lookup == DurableLogicalRequestLookup::Missing {
+            history
+                .counters()
+                .policy_durable_receipt_withheld_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_durable_policy_ephemeral",
+                request_id = %hex::encode(request_id),
+                "v2 ACK withheld before dispatch: the local history policy does not record ordinary DMs (ADR 0116 §3)"
+            );
+            return DurableAckDecision::Withheld("history_policy_ephemeral");
         }
 
         // 4. Dispatch.
@@ -2273,27 +2303,33 @@ impl InboxPipeline {
 
         // 5. Commit awaited. This is the step the v2 receipt is actually
         //    about: the ACK below may not exist unless this returned.
-        match history.record_committed(record).await {
-            Ok(outcome) if exact_durable_history_outcome(outcome) => {}
-            Ok(outcome) => {
-                tracing::warn!(
-                    target: "dm.trace",
-                    stage = "inbound_durable_commit_inexact",
-                    request_id = %hex::encode(request_id),
-                    ?outcome,
-                    "v2 ACK withheld: history commit did not yield exactly one durable row"
-                );
-                return DurableAckDecision::Withheld("commit_inexact");
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "dm.trace",
-                    stage = "inbound_durable_commit_failed",
-                    request_id = %hex::encode(request_id),
-                    %error,
-                    "v2 ACK withheld: durable history commit failed"
-                );
-                return DurableAckDecision::Withheld("commit_failed");
+        //    ADR 0116 §3 (ruling Q4): under an ephemeral DM policy only an
+        //    `Exact` lookup reaches this point. Its pre-policy row is the
+        //    commit the receipt needs, so no new commit is attempted; the
+        //    handle would refuse one, and none is fabricated.
+        if !policy_suppresses_commit {
+            match history.record_committed(record).await {
+                Ok(outcome) if exact_durable_history_outcome(outcome) => {}
+                Ok(outcome) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "inbound_durable_commit_inexact",
+                        request_id = %hex::encode(request_id),
+                        ?outcome,
+                        "v2 ACK withheld: history commit did not yield exactly one durable row"
+                    );
+                    return DurableAckDecision::Withheld("commit_inexact");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "inbound_durable_commit_failed",
+                        request_id = %hex::encode(request_id),
+                        %error,
+                        "v2 ACK withheld: durable history commit failed"
+                    );
+                    return DurableAckDecision::Withheld("commit_failed");
+                }
             }
         }
 

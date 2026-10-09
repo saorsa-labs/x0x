@@ -221,7 +221,16 @@ impl HistoryHandle {
     }
 
     /// Enqueue a record (never blocks; sheds on full — ADR-0023 §5).
+    ///
+    /// ADR 0116 §3: a record the local policy suppresses is dropped here,
+    /// before it is enqueued, and counted. That is an ordinary DM under
+    /// `dm_recording = "ephemeral"`, or a message on a topic whose winning
+    /// rule is `ephemeral`. It writes no row, payload, artifact, FTS entry,
+    /// canonical projection or replay source.
     pub fn record(&self, record: HistoryRecord) {
+        if self.suppressed_by_policy(&record) {
+            return;
+        }
         self.writer.record(record);
     }
 
@@ -229,8 +238,46 @@ impl HistoryHandle {
     ///
     /// This is reserved for protocol surfaces whose success receipt promises
     /// durable local history. Hot paths should continue using [`Self::record`].
+    ///
+    /// ADR 0116 §3: a record the local policy suppresses is not written,
+    /// and the call returns [`HistoryError::PolicySuppressed`], never a
+    /// success, so a durable receipt can never be built on it.
     pub async fn record_committed(&self, record: HistoryRecord) -> HistoryResult<InsertOutcome> {
+        if self.suppressed_by_policy(&record) {
+            return Err(HistoryError::PolicySuppressed);
+        }
         self.writer.record_committed(record).await
+    }
+
+    /// ADR 0116 §3, the shared write boundary: does the local policy keep
+    /// `record` out of history? Counts it when it does.
+    ///
+    /// - Ordinary DM: `Scope::Dm` with no `replace_key` (ruling Q5). That
+    ///   covers every DM producer: the gossip inbox, the raw-QUIC path and
+    ///   the outbound DM record. A Replaceable row in DM scope, such as an
+    ///   imported agent card, is not a DM and is kept.
+    /// - Topic message: `Scope::Topic` whose winning rule is `ephemeral`.
+    /// - Group rows are never suppressed (quarantine ingest stays
+    ///   tag-and-retain).
+    ///
+    /// The counters carry no topic or payload.
+    fn suppressed_by_policy(&self, record: &HistoryRecord) -> bool {
+        let dm = matches!(record.scope, Scope::Dm(_))
+            && record.replace_key.is_none()
+            && self.policy.suppresses_ordinary_dms();
+        let topic = !dm
+            && matches!(&record.scope, Scope::Topic(name) if self.policy.suppresses_topic(name));
+        if !(dm || topic) {
+            return false;
+        }
+        let counters = self.writer.counters();
+        let counter = if dm {
+            &counters.policy_suppressed_dm_total
+        } else {
+            &counters.policy_suppressed_topic_total
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Read access to the store. Synchronous — call from `spawn_blocking`
