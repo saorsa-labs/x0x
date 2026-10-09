@@ -740,6 +740,7 @@ mod participation_diagnostics_tests {
             keys,
             [
                 "incoming_record_merges",
+                "incomplete_retained_images_pruned",
                 "rejected_authorization_version",
                 "rejected_cooldown",
                 "rejected_no_retained",

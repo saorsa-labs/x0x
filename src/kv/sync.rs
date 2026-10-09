@@ -35,6 +35,7 @@ struct StateSyncCounters {
     requests_received: AtomicU64,
     requests_answered: AtomicU64,
     retained_pages_served: AtomicU64,
+    incomplete_retained_images_pruned: AtomicU64,
     rejected_verify: AtomicU64,
     rejected_unauthorized_request: AtomicU64,
     rejected_unauthorized_control: AtomicU64,
@@ -53,6 +54,8 @@ pub struct StateSyncSnapshot {
     pub requests_received: u64,
     pub requests_answered: u64,
     pub retained_pages_served: u64,
+    /// Incomplete paged retained images discarded after the inflight TTL.
+    pub incomplete_retained_images_pruned: u64,
     pub rejected_verify: u64,
     pub rejected_unauthorized_request: u64,
     pub rejected_unauthorized_control: u64,
@@ -72,6 +75,7 @@ impl StateSyncCounters {
             requests_received: get(&self.requests_received),
             requests_answered: get(&self.requests_answered),
             retained_pages_served: get(&self.retained_pages_served),
+            incomplete_retained_images_pruned: get(&self.incomplete_retained_images_pruned),
             rejected_verify: get(&self.rejected_verify),
             rejected_unauthorized_request: get(&self.rejected_unauthorized_request),
             rejected_unauthorized_control: get(&self.rejected_unauthorized_control),
@@ -325,6 +329,159 @@ fn treekem_page_authorization(binding: [u8; 32], epoch: u64) -> [u8; 32] {
     hasher.update(&binding);
     hasher.update(&epoch.to_le_bytes());
     *hasher.finalize().as_bytes()
+}
+
+/// Pieces the listener needs to count a pruned retained image and ask for
+/// the full state again. ADR 0047 already republishes full state on
+/// `StateRequest`. This uses that recovery when the inflight TTL discards a
+/// partial image. It is not a post-convergence digest beacon.
+struct RetainedPruneRepair<'a> {
+    pages: &'a Arc<std::sync::Mutex<RetainedPagePool>>,
+    counters: &'a StateSyncCounters,
+    pubsub: &'a PubSubManager,
+    state_sync_topic: &'a str,
+    local_peer_id: PeerId,
+    store_id: &'a KvStoreId,
+    secure: Option<&'a SharedKvSecureContext>,
+    treekem: Option<&'a SharedTreeKemKvProtector>,
+    refresh: Option<&'a SecureRefreshFn>,
+    gate: Option<&'a GssPublicationGate>,
+    signing: Option<&'a Arc<AuthorSigning>>,
+    encrypted: bool,
+    cancel: &'a tokio_util::sync::CancellationToken,
+}
+
+/// Count incomplete retained images the inflight TTL dropped, warn, and
+/// publish one `StateRequest` so a holder serves the image again.
+///
+/// A parked bootstrap requester does not send this. The request is the
+/// repair for a known loss, not a periodic digest.
+async fn reap_pruned_retained_images(repair: &RetainedPruneRepair<'_>) {
+    let dropped = {
+        let Ok(mut pool) = repair.pages.lock() else {
+            return;
+        };
+        pool.take_pruned_incomplete()
+    };
+    if dropped == 0 {
+        return;
+    }
+    repair
+        .counters
+        .incomplete_retained_images_pruned
+        .fetch_add(dropped, Ordering::Relaxed);
+    tracing::warn!(
+        store_id = %repair.store_id,
+        dropped,
+        "pruned incomplete retained image after the inflight TTL; re-requesting full state"
+    );
+    if repair.cancel.is_cancelled() {
+        return;
+    }
+    let request = KvSyncMessage::StateRequest {
+        requester: repair.local_peer_id,
+    };
+    let _publication_guard = if repair.encrypted {
+        match repair.gate {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let publication_deadline = gss_deadline(_publication_guard.is_some());
+    let serialized = if let (Some(protector), Some(signing)) = (repair.treekem, repair.signing) {
+        KvStoreSync::seal_treekem_control(
+            protector,
+            signing,
+            repair.store_id,
+            repair.local_peer_id,
+            &request,
+        )
+        .await
+    } else if let (Some(ctx), Some(signing)) = (repair.secure, repair.signing) {
+        if repair.encrypted {
+            within_gss_deadline(
+                KvStoreSync::seal_control_message(
+                    ctx,
+                    repair.refresh,
+                    signing,
+                    repair.store_id,
+                    repair.local_peer_id,
+                    &request,
+                ),
+                publication_deadline,
+            )
+            .await
+            .flatten()
+        } else {
+            KvStoreSync::sign_public_control_message(
+                ctx,
+                repair.refresh,
+                signing,
+                repair.store_id,
+                repair.local_peer_id,
+                &request,
+            )
+            .await
+        }
+    } else {
+        bincode::serialize(&request).ok()
+    };
+    let Some(serialized) = serialized else {
+        repair
+            .counters
+            .request_seal_failed
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            store_id = %repair.store_id,
+            "retained-image re-request could not be sealed"
+        );
+        return;
+    };
+    let wire = bytes::Bytes::from(serialized);
+    if repair.secure.is_some() && repair.treekem.is_none() && !repair.encrypted {
+        trace_group_signed_record(
+            "state_request_publish_attempted",
+            "control",
+            repair.store_id,
+            &wire,
+        );
+    }
+    let result = tokio::select! {
+        biased;
+        () = repair.cancel.cancelled() => return,
+        result = publish_with_gss_deadline(
+            repair.pubsub,
+            repair.state_sync_topic.to_string(),
+            wire.clone(),
+            publication_deadline,
+        ) => result,
+    };
+    if repair.secure.is_some() && repair.treekem.is_none() && !repair.encrypted {
+        trace_group_signed_record(
+            if result.is_ok() {
+                "state_request_publish_api_ok"
+            } else {
+                "state_request_publish_failed"
+            },
+            "control",
+            repair.store_id,
+            &wire,
+        );
+    }
+    if let Err(error) = result {
+        tracing::warn!(
+            store_id = %repair.store_id,
+            %error,
+            "retained-image re-request publish failed"
+        );
+    } else {
+        repair
+            .counters
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
@@ -2447,12 +2604,58 @@ impl KvStoreSync {
         let listener_served = Arc::clone(&served_evidence);
         let listener_counters = Arc::clone(&self.state_sync_counters);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
+        let listener_pubsub = Arc::clone(&self.pubsub);
+        let listener_signing = self.author_signing.clone();
+        let listener_gate = self.gss_publication_gate.clone();
+        let listener_state_topic = self.state_sync_topic();
         // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
         // termination is recorded only after this future — and every
         // capture it holds, including the persist context — is destroyed
         // (see `TrackedLoopFuture`).
         let listener_loop = async move {
             loop {
+                // #1117: a partial retained image that ages out is counted
+                // and re-requested here, before the next recv wait. The
+                // same reap runs when the inflight deadline fires with no
+                // further page. This is not the ADR 0092 digest beacon.
+                reap_pruned_retained_images(&RetainedPruneRepair {
+                    pages: &listener_pages,
+                    counters: &listener_counters,
+                    pubsub: listener_pubsub.as_ref(),
+                    state_sync_topic: &listener_state_topic,
+                    local_peer_id: listener_local_peer_id,
+                    store_id: &listener_store_id,
+                    secure: listener_secure.as_ref(),
+                    treekem: listener_treekem.as_ref(),
+                    refresh: listener_refresh.as_ref(),
+                    gate: listener_gate.as_ref(),
+                    signing: listener_signing.as_ref(),
+                    encrypted: listener_is_encrypted,
+                    cancel: &listener_cancel,
+                })
+                .await;
+                let prune_at = listener_pages
+                    .lock()
+                    .ok()
+                    .and_then(|pool| pool.next_prune_deadline());
+                let prune_wait = async {
+                    match prune_at {
+                        Some(deadline) => {
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            // A deadline that is already due must not spin
+                            // the select. One millisecond lets `>` TTL elapse.
+                            let wait = if remaining.is_zero() {
+                                std::time::Duration::from_millis(1)
+                            } else {
+                                remaining
+                            };
+                            tokio::time::sleep(wait).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(prune_wait);
                 let msg = tokio::select! {
                     // Cancel-first (#757): an unbiased select picks at
                     // random when a queued message and the cancel are both
@@ -2462,6 +2665,7 @@ impl KvStoreSync {
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
                     () = listener_cancel.cancelled() => return,
+                    () = &mut prune_wait, if prune_at.is_some() => continue,
                     msg = sub.recv() => msg,
                 };
                 let Some(msg) = msg else {
@@ -4110,6 +4314,49 @@ impl KvStoreSync {
         .await
     }
 
+    /// Age every incomplete retained image past the inflight TTL and run the
+    /// production prune repair. Tests use this instead of sleeping 120s.
+    #[cfg(test)]
+    pub(crate) async fn expire_and_reap_retained_images_for_test(&self) {
+        if let Ok(mut pool) = self.retained_pages.lock() {
+            pool.expire_pending_for_test();
+        }
+        self.reap_pruned_retained_images_now().await;
+    }
+
+    #[cfg(test)]
+    async fn reap_pruned_retained_images_now(&self) {
+        let (store_id, encrypted) = {
+            let store = self.store.read().await;
+            (*store.id(), store.is_encrypted())
+        };
+        let state_sync_topic = self.state_sync_topic();
+        reap_pruned_retained_images(&RetainedPruneRepair {
+            pages: &self.retained_pages,
+            counters: &self.state_sync_counters,
+            pubsub: self.pubsub.as_ref(),
+            state_sync_topic: &state_sync_topic,
+            local_peer_id: self.local_peer_id,
+            store_id: &store_id,
+            secure: self.secure.as_ref(),
+            treekem: self.treekem_secure.as_ref(),
+            refresh: self.secure_refresh.as_ref(),
+            gate: self.gss_publication_gate.as_ref(),
+            signing: self.author_signing.as_ref(),
+            encrypted,
+            cancel: &self.cancel,
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_retained_page_count_for_test(&self) -> usize {
+        self.retained_pages
+            .lock()
+            .map(|pool| pool.pending_page_count_for_test())
+            .unwrap_or(0)
+    }
+
     /// True while a background receive section holds the lifecycle lock.
     #[cfg(test)]
     pub(crate) fn receive_section_active_for_test(&self) -> bool {
@@ -5432,6 +5679,185 @@ mod tests {
         assert_eq!(counters.requests_answered, 0);
         assert_eq!(counters.rejected_other, 0);
         sync.stop().await.expect("stop");
+    }
+
+    /// #1117 prune half: one dropped page of a multi-page retained image is
+    /// counted when the inflight TTL discards it, and that drop re-requests
+    /// the full state so the replica converges. The post-convergence digest
+    /// beacon is ADR 0092 and is not this path.
+    #[tokio::test]
+    async fn incomplete_retained_image_prune_counts_the_drop_and_rerequests() {
+        let node = make_node().await;
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "11".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(17);
+        let mut source = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            context.clone(),
+        )
+        .expect("holder store");
+        source
+            .put(
+                "kept".to_string(),
+                b"yes".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(1),
+                )
+                .expect("large entry");
+        }
+        source.remove("kept").expect("tombstone");
+        source
+            .put(
+                "kept".to_string(),
+                b"yes".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("restore kept");
+        let target = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            context.clone(),
+        )
+        .expect("reader store");
+        let topic = "group/1117-retained-prune";
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+        let mut holder = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("holder sync");
+        holder.set_secure_context(secure.clone(), None);
+        holder.set_author_signing((*signing).clone());
+        let mut reader = KvStoreSync::new(
+            target,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(owner),
+        )
+        .expect("reader sync");
+        reader.set_secure_context(secure.clone(), None);
+        reader.set_author_signing((*signing).clone());
+        // The repair request is the only state request in this test. Both
+        // stores are group-signed, so each would otherwise bootstrap.
+        holder.silence_bootstrap();
+        reader.silence_bootstrap();
+        holder.start().await.expect("start holder");
+        reader.start().await.expect("start reader");
+
+        let retained = {
+            let store = holder.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames");
+        assert!(
+            frames.len() > 2,
+            "history must span a manifest and more than one data page, got {}",
+            frames.len()
+        );
+        let expected_buffered_pages = frames.len() - 2;
+        for (index, frame) in frames.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            let wire = KvStoreSync::sign_publication(
+                &holder.store,
+                &secure,
+                None,
+                &signing,
+                KvMutationKind::RetainedState,
+                peer(1),
+                frame.clone(),
+            )
+            .await
+            .expect("sign retained frame");
+            pubsub
+                .publish(topic.to_string(), bytes::Bytes::from(wire))
+                .await
+                .expect("publish retained frame");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reader.pending_retained_page_count_for_test() < expected_buffered_pages {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial retained image was not buffered");
+        assert!(
+            reader.read().await.get("large-0").is_none(),
+            "a missing page must not apply the image"
+        );
+        assert_eq!(
+            reader
+                .state_sync_snapshot()
+                .incomplete_retained_images_pruned,
+            0
+        );
+        assert_eq!(reader.state_sync_snapshot().requests_sent, 0);
+
+        reader.expire_and_reap_retained_images_for_test().await;
+
+        let after = reader.state_sync_snapshot();
+        assert_eq!(
+            after.incomplete_retained_images_pruned, 1,
+            "the TTL drop must be counted"
+        );
+        assert_eq!(
+            after.requests_sent, 1,
+            "the drop must re-request the full retained state"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if reader.read().await.get("large-0").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("re-requested retained image did not converge");
+        assert_eq!(
+            reader.read().await.get("large-0").expect("converged").value,
+            vec![0; crate::kv::entry::MAX_INLINE_SIZE]
+        );
+        assert!(holder.state_sync_snapshot().requests_received >= 1);
+        assert!(holder.state_sync_snapshot().requests_answered >= 1);
     }
 
     #[tokio::test]
