@@ -167,6 +167,8 @@ async fn issue1275_direct_metadata_listener_apply_is_not_aborted_mid_write() -> 
 /// The per-group metadata topic listener (`ensure_named_group_metadata_listener`)
 /// receives the same rename on a local topic, with the same expectations.
 /// The shutdown drain collects this listener from `group_metadata_tasks`.
+/// A listener installed after the drain took the registries (as a shielded
+/// apply that is still running could) is refused, so none outlives the stop.
 /// Socket test (the gossip runtime needs a bound endpoint): loopback only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue1275_group_metadata_listener_apply_is_not_aborted_mid_write() -> Result<()> {
@@ -195,5 +197,16 @@ async fn issue1275_group_metadata_listener_apply_is_not_aborted_mid_write() -> R
         "the listener's apply must finish its write at shutdown: {outcome:?}"
     );
     assert_eq!(in_memory_name(&state).await.as_deref(), Some(RENAMED));
+
+    ensure_named_group_metadata_listener(Arc::clone(&state), GROUP).await;
+    assert!(
+        !state.group_metadata_tasks.read().await.contains_key(GROUP),
+        "no metadata listener is installed after the drain"
+    );
+    spawn_public_message_listener(Arc::clone(&state), "1275-late-public".to_string()).await;
+    assert!(
+        state.public_message_tasks.read().await.is_empty(),
+        "no public-message listener is installed after the drain"
+    );
     Ok(())
 }

@@ -1918,13 +1918,18 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                dispatch_join_result_message(
+                // #1275: the dispatch runs a result's apply shielded and
+                // awaits it, so results still apply in arrival order.
+                if !dispatch_join_result_message(
                     &join_result_state,
                     &msg.sender,
                     msg.verified,
                     join_msg,
                 )
-                .await;
+                .await
+                {
+                    break;
+                }
             }
         }));
     }
@@ -1997,13 +2002,26 @@ pub async fn serve_with_options(
                 if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
                 {
                     if response.message_type == "treekem_catchup_response" {
-                        handle_treekem_catchup_response(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            response,
-                        )
-                        .await;
+                        // #1275: the response's events are applied and
+                        // persisted, so the apply runs shielded; awaiting it
+                        // keeps the responses in arrival order.
+                        let apply_state = Arc::clone(&catchup_state);
+                        let sender = msg.sender;
+                        let verified = msg.verified;
+                        let applied = catchup_state
+                            .run_shielded(Box::pin(async move {
+                                handle_treekem_catchup_response(
+                                    &apply_state,
+                                    &sender,
+                                    verified,
+                                    response,
+                                )
+                                .await;
+                            }))
+                            .await;
+                        if applied.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -2042,13 +2060,25 @@ pub async fn serve_with_options(
                 );
                 // The legacy unprefixed wire form carries no durable
                 // receipt, so the admission outcome has nowhere to go.
-                let _ = admit_public_group_bootstrap(
-                    &bootstrap_state,
-                    msg.sender,
-                    Some(msg.machine_id),
-                    bootstrap,
-                )
-                .await;
+                // #1275: the admission installs and persists the group, so
+                // it runs shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let sender = msg.sender;
+                let machine_id = msg.machine_id;
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        let _ = admit_public_group_bootstrap(
+                            &apply_state,
+                            sender,
+                            Some(machine_id),
+                            bootstrap,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2122,7 +2152,24 @@ pub async fn serve_with_options(
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
-                handle_predecessor_relay_typed_payload(&relay_state, &local_agent_hex, typed).await;
+                // #1275: the handler applies the event and persists the
+                // roster and the relay obligation, so it runs shielded and
+                // is awaited in arrival order.
+                let apply_state = Arc::clone(&relay_state);
+                let local_agent_hex = local_agent_hex.clone();
+                let handled = relay_state
+                    .run_shielded(Box::pin(async move {
+                        handle_predecessor_relay_typed_payload(
+                            &apply_state,
+                            &local_agent_hex,
+                            typed,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if handled.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2154,7 +2201,18 @@ pub async fn serve_with_options(
                     );
                     continue;
                 };
-                apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
+                // #1275: the merge persists the store's snapshot, so it runs
+                // shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&kv_delta_state);
+                let sender = typed.sender;
+                let applied = kv_delta_state
+                    .run_shielded(Box::pin(async move {
+                        apply_direct_kv_store_delta(&apply_state, sender, delta_msg).await;
+                    }))
+                    .await;
+                if applied.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2227,7 +2285,19 @@ pub async fn serve_with_options(
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
-                handle_public_group_bootstrap_typed_payload(&bootstrap_state, typed).await;
+                // #1275: the admission installs and persists the group
+                // before it completes the ACK, so it runs shielded and is
+                // awaited in arrival order. A refused payload is dropped
+                // with its completion: no ACK, so the sender re-offers.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        handle_public_group_bootstrap_typed_payload(&apply_state, typed).await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2879,7 +2949,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         }
     }
     // #1269 r2: admitted applies that persist group state (a pulled control
-    // blob's apply, the owner-certificate join retry) run to completion. An
+    // blob's apply, the owner-certificate join retry, and since #1275 the
+    // listeners' event applies) run to completion. An
     // abort inside an atomic write or its journal step would leave the
     // persisted state torn, or leave a blocking write running after the
     // instance locks are released. They are awaited before the Agent stops,
@@ -4484,7 +4555,9 @@ async fn run_member_certificate_bridge(
     state: Arc<AppState>,
     mut events: broadcast::Receiver<x0x::VerifiedCertificate>,
 ) {
-    reconcile_member_certificates_from_cache(&state).await;
+    if !reconcile_member_certificates_shielded(&state).await {
+        return;
+    }
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
         tokio::select! {
@@ -4496,18 +4569,48 @@ async fn run_member_certificate_bridge(
                 break;
             }
             received = events.recv() => match received {
-                Ok(event) => apply_verified_certificate_event(&state, &event).await,
+                Ok(event) => {
+                    // #1275: shielded, like the reconciles (see below).
+                    let apply_state = Arc::clone(&state);
+                    let applied = state
+                        .run_shielded(Box::pin(async move {
+                            apply_verified_certificate_event(&apply_state, &event).await;
+                        }))
+                        .await;
+                    if applied.is_none() {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,
                         "verified-certificate ring overflowed; re-running full member-certificate reconcile"
                     );
-                    reconcile_member_certificates_from_cache(&state).await;
+                    if !reconcile_member_certificates_shielded(&state).await {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     }
+}
+
+/// #1275: run the full reconcile as a shielded apply. A hydration persists
+/// the roster, and the supervisor aborts this worker as soon as shutdown is
+/// signalled; shielded, that abort only ends the wait, the write completes
+/// and the shutdown drain waits for it. The worker awaits each hydration
+/// before it reads the next event, so they still run one at a time.
+/// `false` (shutdown refused it, or it panicked) ends the worker; the
+/// supervisor then exits on shutdown or restarts it, as after a panic.
+async fn reconcile_member_certificates_shielded(state: &Arc<AppState>) -> bool {
+    let apply_state = Arc::clone(state);
+    state
+        .run_shielded(Box::pin(async move {
+            reconcile_member_certificates_from_cache(&apply_state).await;
+        }))
+        .await
+        .is_some()
 }
 
 /// F1: supervise the bridge worker for the daemon's lifetime, following the
