@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -67,6 +68,7 @@ class FixtureDiagnosticsTests(unittest.TestCase):
         (identity / 'machine.key').write_bytes(b'MACHINE-SECRET')
         (identity / 'other.bin').write_bytes(b'IDENTITY-DIR-SECRET')
         (self.fixture / 'user.key').write_bytes(b'USER-SECRET')
+        (self.fixture / 'agent_kem.key').write_bytes(b'KEM-SECRET')
         (self.fixture / 'api-token').write_text('TOKEN-SECRET')
         (self.fixture / 'named_groups.json').write_text('{"epoch": 2}')
         (self.fixture / 'daemon.stderr.log').write_text('log line\n')
@@ -76,6 +78,7 @@ class FixtureDiagnosticsTests(unittest.TestCase):
                            ('x0x-test-bob/identity/machine.key', 14),
                            ('x0x-test-bob/identity/other.bin', 19),
                            ('x0x-test-bob/user.key', 11),
+                           ('x0x-test-bob/agent_kem.key', 10),
                            ('x0x-test-bob/api-token', 12)):
             self.assertEqual(rows[path]['status'], 'skipped-secret')
             self.assertEqual(rows[path]['source_bytes'], size)
@@ -180,15 +183,44 @@ class FixtureDiagnosticsTests(unittest.TestCase):
         with patch.object(runtime.os, 'open', side_effect=PermissionError('denied')):
             self.assertIsNone(runtime.retain_fixture_diagnostics(self.config, 101))
 
-    def test_workflow_opts_in_only_kv_and_uploads_only_on_failure(self):
+    def test_workflow_opts_in_only_kv_and_groups_and_uploads_only_on_failure(self):
         workflow = Path(__file__).parents[2] / '.github/workflows/integration.yml'
         text = workflow.read_text()
-        kv = text.split('  encrypted-kv-transport:\n', 1)[1].split('  gossip-key-cache-transport:\n', 1)[0]
-        self.assertEqual(text.count("X0X_RETAIN_FIXTURE_DIAGNOSTICS: '1'"), 1)
-        self.assertIn("X0X_RETAIN_FIXTURE_DIAGNOSTICS: '1'", kv)
-        self.assertIn('name: Upload retained fixture diagnostics\n        if: failure()\n'
-                      '        uses: actions/upload-artifact@v5', kv)
-        self.assertIn('path: ${{ runner.temp }}/x0x-fixture-diagnostics-*', kv)
+        parts = re.split(r'^  ([\w-]+):\n', text, flags=re.MULTILINE)
+        jobs = dict(zip(parts[1::2], parts[2::2]))
+        opted_in = {name for name, body in jobs.items()
+                    if 'X0X_RETAIN_FIXTURE_DIAGNOSTICS:' in body}
+        self.assertEqual(opted_in, {'encrypted-kv-transport', 'integration-groups'})
+        self.assertEqual(text.count("X0X_RETAIN_FIXTURE_DIAGNOSTICS: '1'"), 2)
+        for name in sorted(opted_in):
+            with self.subTest(job=name):
+                body = jobs[name]
+                upload = body.split('      - name: Upload retained fixture diagnostics\n', 1)[1]
+                upload = upload.split('      - ', 1)[0]
+                self.assertTrue(upload.startswith('        if: failure()\n'
+                                                 '        uses: actions/upload-artifact@v5\n'))
+                self.assertIn(f'name: {name}-fixture-diagnostics\n', upload)
+                self.assertIn('if-no-files-found: warn\n', upload)
+                self.assertIn('include-hidden-files: true\n', upload)
+                self.assertIn('retention-days: 7\n', upload)
+        self.assertIn('path: ${{ runner.temp }}/x0x-fixture-diagnostics-*',
+                      jobs['encrypted-kv-transport'])
+        groups = jobs['integration-groups']
+        self.assertIn("      X0X_RETAIN_FIXTURE_DIAGNOSTICS: '1'\n",
+                      groups.split('    steps:\n', 1)[0])
+        # The groups job has both a root run and issue #321 RUNNER_TEMP overrides.
+        pattern = '**/x0x-fixture-diagnostics-*'
+        self.assertIn('path: ${{ runner.temp }}/' + pattern + '\n', groups)
+        roots = [self.root, *(self.root / name for name in
+                             re.findall(r'root="\$RUNNER_TEMP/([^"\n]+)"', groups))]
+        self.assertIn(self.root / 'issue321-delegation', roots)
+        expected = set()
+        for root in roots:
+            destination = root / 'x0x-fixture-diagnostics-inert'
+            destination.mkdir(parents=True)
+            expected.add(destination)
+            (root / 'x0x-isolation-inert').mkdir()
+        self.assertEqual(set(self.root.glob(pattern)), expected)
 
 
 if __name__ == '__main__':
