@@ -1865,13 +1865,16 @@ fn evict_oldest_rows_by_count(
 /// longer configured prefix. Returns the fragment (unqualified columns of
 /// `history`, positional `?` parameters) and its parameters in order.
 ///
-/// `substr` on TEXT counts characters, and Rust's `chars()` counts the same
-/// code points, so `substr(scope_id, 1, n) = prefix` is a literal prefix
-/// test; `=` uses BINARY collation, so it is case-sensitive. No LIKE or
-/// GLOB: `_`, `%` and `*` in a prefix are ordinary characters. A longer
-/// prefix can only cover a row this one covers if it starts with this one,
-/// so only those are carved out. Must agree with
-/// [`HistoryPolicy::winning_topic_rule`]; a test holds the two together.
+/// The comparison is on bytes: `substr(CAST(scope_id AS BLOB), 1, n) = p`,
+/// with the prefix bound as a BLOB and `n` its length in bytes. This is
+/// the same relation as the Rust matcher's `as_bytes().starts_with(...)`.
+/// It is literal and case-sensitive (no LIKE or GLOB: `_`, `%`, `*`, `\`
+/// and quotes are ordinary bytes), and it holds across an embedded NUL.
+/// TEXT `substr` would stop at a NUL (Codex review of slice B), which is
+/// why the comparison is not done on TEXT. A longer prefix can only cover
+/// a row this one covers if it starts with this one, so only those are
+/// carved out. Must agree with [`HistoryPolicy::winning_topic_rule`]; a
+/// test holds the two together.
 fn topic_rule_predicate(
     rules: &[CompiledTopicRule],
     index: usize,
@@ -1882,15 +1885,16 @@ fn topic_rule_predicate(
         // Unreachable for an index from `rules`; select nothing.
         return (String::from("0"), params);
     };
-    let char_len = |prefix: &str| i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX);
-    sql.push_str(" AND substr(scope_id, 1, ?) = ?");
-    params.push(rusqlite::types::Value::from(char_len(&rule.prefix)));
-    params.push(rusqlite::types::Value::from(rule.prefix.clone()));
+    let byte_len = |prefix: &str| i64::try_from(prefix.len()).unwrap_or(i64::MAX);
+    let blob = |prefix: &str| rusqlite::types::Value::Blob(prefix.as_bytes().to_vec());
+    sql.push_str(" AND substr(CAST(scope_id AS BLOB), 1, ?) = ?");
+    params.push(rusqlite::types::Value::from(byte_len(&rule.prefix)));
+    params.push(blob(&rule.prefix));
     for other in rules {
         if other.prefix.len() > rule.prefix.len() && other.prefix.starts_with(&rule.prefix) {
-            sql.push_str(" AND substr(scope_id, 1, ?) <> ?");
-            params.push(rusqlite::types::Value::from(char_len(&other.prefix)));
-            params.push(rusqlite::types::Value::from(other.prefix.clone()));
+            sql.push_str(" AND substr(CAST(scope_id AS BLOB), 1, ?) <> ?");
+            params.push(rusqlite::types::Value::from(byte_len(&other.prefix)));
+            params.push(blob(&other.prefix));
         }
     }
     (sql, params)
