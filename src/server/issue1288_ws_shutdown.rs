@@ -2,21 +2,38 @@
 //!
 //! Axum detaches the upgrade callback. The session loop and its children
 //! (writer, direct, call, and keepalive forwarders, shared and per-session
-//! topic forwarders) hold `AppState` or the `Agent` and used to outlive
-//! `shutdown_and_wait`. This test subscribes one client and leaves it
-//! connected, with the reader stalled so the writer's socket send is still
-//! in flight at shutdown. The AppState and Agent strong counts must be 0
-//! when `shutdown_and_wait` returns, and a same-dir relaunch must succeed.
+//! topic forwarders) hold `AppState` or the `Agent`. They close when
+//! `shutdown_notify` fires, but nothing joins them. The production close
+//! grace is a few seconds and can finish during agent teardown, so an
+//! unjoined session has already dropped its owners by the time
+//! `shutdown_and_wait` returns. [`park_session_if_armed`] keeps that
+//! cleanup on an await the shutdown drain must abort.
 //!
 //! The daemon binds loopback only, with no bootstrap peers, mDNS, port
 //! mapping, or peer cache.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Armed by [`arm_session_cleanup_hold`] for one session cleanup.
+static SESSION_CLEANUP_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// The next WebSocket session cleanup should park until its task is aborted.
+pub(super) fn arm_session_cleanup_hold() {
+    SESSION_CLEANUP_HOLD.store(true, Ordering::SeqCst);
+}
+
+/// Parks the calling session task when a hold is armed. One-shot.
+pub(super) async fn park_session_if_armed() {
+    if SESSION_CLEANUP_HOLD.swap(false, Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
+}
 
 const WAIT: Duration = Duration::from_secs(20);
 const LIFECYCLE: Duration = Duration::from_secs(60);
@@ -124,58 +141,13 @@ impl Daemon {
     }
 }
 
-fn shrink_recv_buffer(stream: &std::net::TcpStream) -> Result<()> {
-    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
-    let size: libc::c_int = 1024;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &size as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of_val(&size) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        anyhow::bail!(
-            "setsockopt SO_RCVBUF failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-async fn outbound_dropped(addr: std::net::SocketAddr, token: &str) -> Result<u64> {
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("http://{addr}/diagnostics/ws"))
-        .bearer_auth(token)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .context("GET /diagnostics/ws")?
-        .error_for_status()
-        .context("diagnostics status")?
-        .json()
-        .await
-        .context("diagnostics json")?;
-    body.get("ws_outbound_dropped")
-        .and_then(|value| value.as_u64())
-        .context("ws_outbound_dropped missing")
-}
-
-/// A subscribed client that is still connected, and not reading, at shutdown.
+/// A subscribed client that is still connected at shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1288_connected_ws_session_releases_owner_at_shutdown() -> Result<()> {
     let (daemon, state) = start_daemon().await?;
     let addr = daemon.handle.local_addr();
     let token = state.api_token.clone();
     let topic = "x0x.test.1288.row4";
-
-    let std_stream = std::net::TcpStream::connect(addr).context("tcp connect")?;
-    std_stream.set_nodelay(true)?;
-    shrink_recv_buffer(&std_stream)?;
-    std_stream.set_nonblocking(true)?;
-    let tcp = tokio::net::TcpStream::from_std(std_stream).context("tokio tcp")?;
 
     let mut request = format!("ws://{addr}/ws").into_client_request()?;
     request.headers_mut().insert(
@@ -184,7 +156,7 @@ async fn issue1288_connected_ws_session_releases_owner_at_shutdown() -> Result<(
             .parse()
             .context("authorization header")?,
     );
-    let (socket, _) = tokio::time::timeout(WAIT, tokio_tungstenite::client_async(request, tcp))
+    let (socket, _) = tokio::time::timeout(WAIT, tokio_tungstenite::connect_async(request))
         .await
         .context("websocket upgrade timed out")?
         .context("websocket upgrade")?;
@@ -216,34 +188,12 @@ async fn issue1288_connected_ws_session_releases_owner_at_shutdown() -> Result<(
         "the session did not acknowledge the subscription"
     );
 
-    // Stall the reader. Pings are answered with pongs; once the tiny receive
-    // window and the server send buffer are full, the writer blocks in
-    // `send` and the session's close grace still holds AppState.
-    let ping = r#"{"type":"ping"}"#.to_string();
-    let flood_deadline = tokio::time::Instant::now() + WAIT;
-    let mut dropped = 0u64;
-    let mut sent = 0u32;
-    while dropped == 0 && sent < 100_000 && tokio::time::Instant::now() < flood_deadline {
-        for _ in 0..200 {
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                sink.send(Message::Text(ping.clone())),
-            )
-            .await
-            .context("ping send timed out; the client is still connected")?
-            .context("ping send")?;
-            sent += 1;
-        }
-        dropped = outbound_dropped(addr, &token).await?;
-    }
-    anyhow::ensure!(
-        dropped > 0,
-        "the stalled client never filled the outbound queue (sent {sent} pings); the writer was not in flight"
-    );
+    // Cleanup of this live session parks until the task is aborted. The
+    // client stays connected across shutdown.
+    arm_session_cleanup_hold();
     drop(state);
 
     let outcome = daemon.stop_and_relaunch().await?;
-    // Keep the client connected until shutdown has returned.
     drop((sink, stream));
 
     assert_eq!(

@@ -1048,6 +1048,12 @@ async fn handle_ws_connection(
     }
 
     tracing::info!(session_id = %session_id, "WebSocket session closed");
+    // The close grace above is a few seconds. Agent teardown can outlast it,
+    // so a session the drain never joins has already released `state` when
+    // `shutdown_and_wait` returns. Tests park that last await; the drain
+    // aborts it. Unarmed, this returns immediately.
+    #[cfg(test)]
+    super::issue1288_ws_shutdown::park_session_if_armed().await;
 }
 
 /// Remove a session from a shared topic subscription; clean up if last subscriber.
