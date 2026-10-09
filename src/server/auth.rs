@@ -1305,6 +1305,25 @@ mod tests {
         }
     }
 
+    /// ADR 0116 §3: `GET /history/policy` is owner-only, enforced at the
+    /// route layer like the other durable-owner surfaces. The other history
+    /// reads keep their existing tiers.
+    #[test]
+    fn history_policy_requires_durable_owner_and_other_history_reads_do_not() {
+        assert!(requires_durable_owner(&Method::GET, "/history/policy"));
+        for path in [
+            "/history",
+            "/history/stats",
+            "/history/scopes",
+            "/history/search",
+        ] {
+            assert!(
+                !requires_durable_owner(&Method::GET, path),
+                "GET {path} keeps its tier"
+            );
+        }
+    }
+
     #[test]
     fn grant_routes_require_durable_owner_for_every_method() {
         // ADR-0070 §2: listing grants reveals who may reach the owner's
