@@ -163,6 +163,66 @@ class PanicScanner(unittest.TestCase):
         self.assertIn("src/cfg_all.rs:5:", result.stdout)
         self.assertNotIn("hidden", result.stdout)
 
+    def test_unescaped_multiline_string_does_not_hide_following_production_expect(self):
+        # A string that spans lines without a backslash must stay open until
+        # its closing quote. Counting the brace inside it leaves the test
+        # module open and hides the production expect.
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t() {\n"
+            '        let s = "open\n'
+            "{ brace\n"
+            '";\n'
+            '        value.expect("hidden");\n'
+            "    }\n"
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/multiline_string.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('value.expect("visible")', result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_nested_block_comment_does_not_hide_following_production_expect(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t() {\n"
+            "        /* outer /* inner */ { */\n"
+            '        value.expect("hidden");\n'
+            "    }\n"
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/nested_comment.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('value.expect("visible")', result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_generic_const_brace_does_not_report_test_helper_expect(self):
+        source = (
+            "#[cfg(test)]\n"
+            "fn helper() -> std::array::IntoIter<u8, { 1 }> {\n"
+            '    value.expect("hidden");\n'
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/generic_brace.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('value.expect("visible")', result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_production_expect_on_same_line_as_test_item_close_is_rejected(self):
+        source = (
+            "#[cfg(test)]\n"
+            'mod tests { fn t() { value.expect("hidden"); } } '
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/same_line.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('value.expect("visible")', result.stdout)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
