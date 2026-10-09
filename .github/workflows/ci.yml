@@ -28,6 +28,12 @@ jobs:
       - name: Check installer signing-key fingerprints
         run: python3 scripts/ci/check-installer-fingerprints.py --release
 
+      # #702: nextest comments must not state an unverified ambient-load cause.
+      - name: Check nextest load-attribution comments
+        run: |
+          python3 -B scripts/ci/test_nextest_load_attribution.py -v
+          python3 scripts/ci/check-nextest-load-attribution.py
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
