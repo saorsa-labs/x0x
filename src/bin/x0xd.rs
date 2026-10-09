@@ -684,6 +684,14 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     if let Err(message) = config.groups.validate() {
         anyhow::bail!("invalid [groups] configuration: {message}");
     }
+    // ADR 0116 §1 (ruling Q9): the `[history]` recording and retention rules
+    // are validated here whether or not history is enabled, so a bad rule
+    // refuses startup. Unknown keys elsewhere stay warn-only; an unknown key
+    // inside a new rule object already failed the parse above.
+    config
+        .history
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [history] configuration: {e}"))?;
     Ok((config, findings.warning_lines()))
 }
 

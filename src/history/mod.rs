@@ -12,6 +12,7 @@
 //! second process opening the same database fails loud at open.
 
 pub mod classify;
+pub mod policy;
 pub mod record;
 pub mod store;
 pub mod writer;
@@ -25,6 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HistoryResult;
 
+pub use policy::{
+    ClassLimit, CompiledBounds, CompiledTopicRule, DmRecording, HistoryPolicy, RetainedClass,
+    TopicRecording, TopicRule, MAX_POLICY_RULES, MAX_TOPIC_PREFIX_BYTES,
+};
 pub use record::{Direction, HistoryRecord, MessageClass, Provenance, Scope};
 pub use store::{
     HistoryQuery, HistoryStats, InsertOutcome, PinnedScopes, RetainOutcome, RetentionPolicy,
@@ -64,6 +69,20 @@ pub struct HistoryConfig {
     /// publisher cannot force recording on a receiver.
     #[serde(default)]
     pub record_topics: Vec<String>,
+    /// ADR 0116 §1: how this node records ordinary inbound and outbound
+    /// DMs. Default `inherit` (record as ADR 0023 classifies them).
+    /// Omitted from serialized output while it is the default.
+    #[serde(default, skip_serializing_if = "DmRecording::is_inherit")]
+    pub dm_recording: DmRecording,
+    /// ADR 0116 §1: per-class retention bounds (`[[history.class_limits]]`).
+    /// Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_limits: Vec<ClassLimit>,
+    /// ADR 0116 §1: topic-prefix recording and retention rules
+    /// (`[[history.topic_rules]]`). They only filter topics that
+    /// `record_topics` already selects. Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_rules: Vec<TopicRule>,
 }
 
 fn default_max_bytes() -> u64 {
@@ -80,6 +99,9 @@ impl Default for HistoryConfig {
             scope_limits: Vec::new(),
             db_path: None,
             record_topics: Vec::new(),
+            dm_recording: DmRecording::Inherit,
+            class_limits: Vec::new(),
+            topic_rules: Vec::new(),
         }
     }
 }
@@ -100,6 +122,30 @@ impl HistoryConfig {
             max_age_days: self.max_age_days,
             scope_limits: self.scope_limits.clone(),
         }
+    }
+
+    /// Validate and compile the ADR 0116 rules (`dm_recording`,
+    /// `class_limits`, `topic_rules`). This is the ADR 0116 §1 check only;
+    /// [`Self::validate`] also refuses rules this build cannot enforce.
+    ///
+    /// # Errors
+    /// [`crate::error::HistoryError::InvalidConfig`] names the rule that
+    /// fails validation.
+    pub fn compile_policy(&self) -> HistoryResult<HistoryPolicy> {
+        HistoryPolicy::compile(self.dm_recording, &self.class_limits, &self.topic_rules)
+    }
+
+    /// The check history runs before it opens, and the daemon runs at
+    /// config load whatever `enabled` says (ADR 0116 §1): validate the
+    /// rules, then refuse any rule this build cannot enforce yet.
+    ///
+    /// # Errors
+    /// [`crate::error::HistoryError::InvalidConfig`] names the first rule
+    /// refused.
+    pub fn validate(&self) -> HistoryResult<HistoryPolicy> {
+        let policy = self.compile_policy()?;
+        policy.ensure_enforceable()?;
+        Ok(policy)
     }
 }
 
@@ -164,9 +210,19 @@ pub struct HistoryHandle {
     /// ADR-0068 D1: shared with the reaper, so the daemon can install the
     /// pin source through any handle after `AppState` is built.
     quarantine_pins: Arc<QuarantinePinSlot>,
+    /// ADR 0116 §1: the compiled local recording and retention policy,
+    /// fixed at open. A policy change needs a restart (ADR 0116 §4).
+    policy: Arc<HistoryPolicy>,
 }
 
 impl HistoryHandle {
+    /// ADR 0116 §3: the typed local history policy this store was opened
+    /// with. [`HistoryPolicy::is_unset`] when no ADR 0116 key is set.
+    #[must_use]
+    pub fn policy(&self) -> &HistoryPolicy {
+        &self.policy
+    }
+
     /// Enqueue a record (never blocks; sheds on full — ADR-0023 §5).
     pub fn record(&self, record: HistoryRecord) {
         self.writer.record(record);
@@ -220,6 +276,8 @@ pub(crate) struct OpenedHistory {
     store: Arc<Store>,
     policy: RetentionPolicy,
     quarantine_pins: Arc<QuarantinePinSlot>,
+    /// ADR 0116 §1: validated before the store opened.
+    rules: Arc<HistoryPolicy>,
 }
 
 impl HistoryService {
@@ -249,6 +307,9 @@ impl HistoryService {
         config: &HistoryConfig,
         data_dir: &std::path::Path,
     ) -> HistoryResult<OpenedHistory> {
+        // ADR 0116 §1: refuse a bad rule before history opens: no database
+        // file is created or migrated for a config that will not run.
+        let rules = Arc::new(config.validate()?);
         let db_path = config
             .db_path
             .clone()
@@ -257,6 +318,7 @@ impl HistoryService {
             store: Arc::new(Store::open(&db_path)?),
             policy: config.retention_policy(),
             quarantine_pins: Arc::new(QuarantinePinSlot::default()),
+            rules,
         })
     }
 
@@ -268,12 +330,14 @@ impl HistoryService {
             store,
             policy,
             quarantine_pins,
+            rules,
         } = opened;
         let writer = writer::Writer::spawn(Arc::clone(&store));
         let handle = HistoryHandle {
             writer: writer.handle(),
             store: Arc::clone(&store),
             quarantine_pins: Arc::clone(&quarantine_pins),
+            policy: rules,
         };
         let reaper = reaper::spawn(
             store,
@@ -598,6 +662,61 @@ mod tests {
             }
         );
         assert_opens(body);
+    }
+
+    /// Validation runs before the store opens: a refused config creates no
+    /// database file.
+    #[test]
+    fn adr0116_refused_config_creates_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = open_history_toml(dir.path(), "[[topic_rules]]\nprefix = \"\"\n");
+        assert!(refused.is_err(), "an empty prefix is refused");
+        assert!(
+            !dir.path().join("history.db").exists(),
+            "no history.db is created for a refused config"
+        );
+    }
+
+    /// ADR 0116 §3: the typed policy is reachable from the handle, and an
+    /// unconfigured store reports an unset policy.
+    #[tokio::test]
+    async fn adr0116_handle_exposes_the_compiled_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.path().join("history.db")),
+            topic_rules: vec![TopicRule {
+                prefix: "app.chat".into(),
+                recording: TopicRecording::Inherit,
+                max_bytes: None,
+                max_age_days: None,
+            }],
+            ..HistoryConfig::default()
+        };
+        let service = HistoryService::start(&config, dir.path()).unwrap();
+        let handle = service.handle();
+        assert!(!handle.policy().is_unset());
+        assert_eq!(
+            handle
+                .policy()
+                .winning_topic_rule("app.chat.room")
+                .map(|rule| rule.prefix.as_str()),
+            Some("app.chat")
+        );
+        service.shutdown().await;
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = HistoryService::start(
+            &HistoryConfig {
+                enabled: true,
+                db_path: Some(plain_dir.path().join("history.db")),
+                ..HistoryConfig::default()
+            },
+            plain_dir.path(),
+        )
+        .unwrap();
+        assert!(plain.handle().policy().is_unset());
+        plain.shutdown().await;
     }
 
     /// Validation row 1 (defaults): the new keys are omitted from a
