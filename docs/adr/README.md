@@ -104,7 +104,8 @@ the parts above), ADR 0042 with R8, and Home (ADR 0038, 0060, 0069).
 
 **Amendments already in force:** ADR 0084 amends ADR 0041; ADR 0085 amends
 ADR 0047; ADR 0086 amends ADR 0049; ADR 0069 amends ADR 0038 and refines
-ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
+ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08);
+ADR 0116 amends ADR 0023's local recording and retention policy (D228).
 
 ### Reviews never recorded (D28)
 
@@ -247,7 +248,7 @@ ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
 - [ADR 0114: Authority Re-Welcome for Unconfirmed Join Rows](./0114-authority-re-welcome.md) (proposed 2026-10-04; slice S8 (b) of 0088) — R3 and shared places; current-authority confirmation, inert unconfirmed entries in both legacy stores, staged delivery through the designated admin, and chain-carried atomic repair with a bound mandate; acceptance follows S4, preserving ADR 0107/D60 serving guards and W3-H harness-first gates for #1150, #1149, #1146 and #1191.
 - [ADR 0115: Identity Discovery Authority Comes Only From Agent-Authenticated Evidence](./0115-identity-discovery-authority.md) (accepted 2026-10-07, D212–D215; advisory GHSA-rr9m-cvx5-pmv9; fix shipped in v0.46.5, ADR and tests landed after the advisory (D218)) — I3, I7, I9. Only an agent-authenticated announcement, or one from the agent's authenticated machine, may set a discovery entry's machine, certificate, digest, user, name or agent key; every other valid announcement changes no authority field. Security readers use authority stores, not the routing `machine_id`. Revocation certificates need authenticated provenance, ADR 0043 bundles need the subject's authenticated owner, and `revoked_at` gets a future bound. No wire change; amends ADR 0043 Decisions 2 and 4. D214 quarantines pre-upgrade issuer revocations and bundle tombstones until authenticated evidence confirms the issuer (7-day lapse).
 
-- [ADR 0116: Local History Retention by Class and Topic](./0116-local-history-retention-policy.md) (proposed 2026-10-09; #1264 part 2) — local class and longest-prefix retention limits, receiver-local Ephemeral for ordinary DMs and opted-in topics, and a bounded bearer-authenticated runtime trim API; defaults, ADR 0068 pins and ADR 0030 receipts stay protected. No wire or schema change; downgrade loses new policy enforcement. Amends ADR 0023 upon acceptance. Open: explicit Replaceable expiry.
+- [ADR 0116: Local History Retention by Class and Topic](./0116-local-history-retention-policy.md) (accepted 2026-10-09, D228–D229; #1264 part 2) — local class and longest-prefix retention limits, receiver-local Ephemeral for ordinary DMs and opted-in topics, and a bounded bearer-authenticated runtime trim API; defaults, ADR 0068 pins and ADR 0030 receipts stay protected. No wire or schema change; downgrade loses new policy enforcement. Amends ADR 0023. D229: an explicit matching opt-in limit may expire Replaceable history.
 
 
 **ADR 0093 capability registry** (the canonical allocation table since ADR 0089, accepted 2026-09-30, amended 0093's allocation procedure; ADR 0093 itself is immutable):

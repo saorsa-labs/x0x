@@ -1,12 +1,14 @@
 # ADR 0116: Local History Retention by Class and Topic
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-09 by David Irvine (D228, as written: the Proposed text at b121a1f; D229 answers its open question and is recorded below). David gave the ruling in chat; Claude, the controller, applied the status change at David's instruction.
 - **Date:** 2026-10-09
 - **Decision owners:** David Irvine
 - **Author:** Codex (GPT-6)
-- **Reviewers:** TBD
-- **Supersedes:** none; amends ADR 0023's local recording and retention policy upon acceptance
+- **Reviewers:** OMP (cross-family review of the Proposed text, APPROVE-WITH-NITS, fixes in b121a1f); David Irvine (acceptance)
+- **Supersedes:** none
 - **Superseded by:** none
+- **Amends:** [ADR 0023](./0023-durable-local-history.md) (Accepted, not edited): its local recording and retention policy, as §§1–3 below state.
 - **Related:** [#1264](https://github.com/saorsa-labs/x0x/issues/1264), [#1263 embedder report](https://github.com/saorsa-labs/x0x/issues/1263#issuecomment-6050996198); ADR 0023, ADR 0030, ADR 0068, ADR 0085, ADR 0087; R6, R10, goal E
 
 ## Context
@@ -316,12 +318,15 @@ Use deterministic clocks and byte fixtures. Network tests run only in the
 required isolated Linux test environment. Test the new API's absence on an
 older daemon. Keep each required negative control red when its guard is removed.
 
-## Open Questions for David
+## Rulings at acceptance (David, 2026-10-09)
 
-- Should this first version allow explicit expiry of Replaceable history?
-  The proposal says yes, only under a matching opt-in limit. ADR 0023 calls
-  it current state, while the existing reaper exempts it. Acceptance must
-  confirm that trade-off; unset policy keeps the exemption.
+This answers the one open question of the Proposed text.
+
+1. **D228 (acceptance).** Accepted as written.
+2. **D229 (Replaceable expiry, was the open question).** Yes. An explicit
+   matching opt-in limit may expire Replaceable history in this first
+   version. ADR 0023 calls these rows current state, so expiry happens only
+   under such a limit. Unset policy keeps the existing reaper exemption.
 
 ## Notes for AI-assisted work
 
