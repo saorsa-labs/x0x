@@ -55,6 +55,18 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **ant-quic 0.27.57** (from 0.27.56). Two transport fixes:
+  - Concurrent hole-punch winners for one peer no longer leave a live
+    connection orphaned (saorsa-labs/ant-quic#310).
+  - Raw coordinator, hole-punch and materialized winners now get an
+    application reader, with exactly one reader owner per connection
+    (saorsa-labs/ant-quic#313 Part 1). Before this, in the coordinator race
+    the winning connection could have no reader, so messages the peer sent
+    on it were never delivered.
+  - No wire or public-API change. Reader adoption adds no retirement
+    policy; the losing concurrent hole-punch candidate is now closed as a
+    duplicate instead of staying open and orphaned.
+
 - **Library API (breaking for some embedders; the release that carries this
   is 0.47.0).** `HistoryConfig` gains three
   public fields (`dm_recording`, `class_limits`, `topic_rules`) and
