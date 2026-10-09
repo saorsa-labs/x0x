@@ -1002,6 +1002,19 @@ pub(super) struct AppState {
     /// lock before it runs; a removal or ban aborts and awaits them inside
     /// its critical section, before it commits.
     pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
+    /// #1274 r3: the shutdown drain's completion fence for join-artifact
+    /// egress. One `AbortHandle` per accepted egress task, pushed under the
+    /// `join_artifact_egress` lock when the task is registered, and pruned
+    /// only once the task is finished. A task's own cleanup and the
+    /// removal/ban quiesce edit the registry above, so registry emptiness
+    /// does not prove that a task has released what it captured; a
+    /// finished task has. Tokio drops a task's future, and with it every
+    /// owner the future captured, before it marks the task complete
+    /// (tokio 1.53 `runtime/task/harness.rs`: `poll_future` stores the
+    /// output, replacing the future, and `cancel_task` drops it, both
+    /// before `complete()` sets COMPLETE, which `AbortHandle::is_finished`
+    /// reads). Lock order: `join_artifact_egress`, then this.
+    pub(super) join_artifact_egress_owners: StdMutex<Vec<tokio::task::AbortHandle>>,
     /// ADR 0107 (review r2; r5 G6): fair, coalescing admission for Welcome
     /// `FetchRequest` handlers, which run off the single Welcome listener
     /// loop (they can wait on a group membership lock): one in-flight

@@ -1118,6 +1118,7 @@ pub async fn serve_with_options(
         shielded_tasks: StdMutex::new(Some(Vec::new())),
         shutdown_started: tokio_util::sync::CancellationToken::new(),
         join_artifact_egress: StdMutex::new(HashMap::new()),
+        join_artifact_egress_owners: StdMutex::new(Vec::new()),
         welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
@@ -2974,9 +2975,11 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // or ban already aborts them at any await point, so they are abortable
     // by design. They stay in their registry, which that quiesce uses, so
     // they are not taken here: they share the grace window above, and any
-    // still running at its end is aborted in place and awaited (bounded)
-    // through the registry. `shutdown_started` (cancelled above) closes
-    // their admission under the registry lock.
+    // still running at its end is aborted in place and awaited (bounded).
+    // Both waits read the owners fence, which lists a task until it is
+    // finished and has so dropped every owner it captured (#1274 r3: an
+    // empty registry does not prove that). `shutdown_started` (cancelled
+    // above) closes their admission under the registry lock.
     if tokio::time::timeout_at(
         grace_end,
         routes::named_groups::join_artifact_egress_idle(state),

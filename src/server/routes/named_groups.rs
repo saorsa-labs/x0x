@@ -25535,7 +25535,7 @@ pub(in crate::server) async fn create_join_request(
 /// synchronously once the send has succeeded; the history writer owns that
 /// transaction, so an abort cannot cut it. The task is therefore detached
 /// ([`AppState::spawn_detached`]) and the shutdown drain may abort it. An
-/// aborted offer is lost: no worker redelivers it, as before (the request
+/// aborted offer may be lost; no worker retries it, as before (the request
 /// itself is in the persisted roster and was published on the metadata
 /// topic, but neither guarantees this exact offer is retried). Before this,
 /// a send that waited out an unavailable authority kept the Agent, and its
@@ -36595,6 +36595,18 @@ fn spawn_join_artifact_egress<F>(
             let _ = tokio::time::timeout_at(deadline.into(), body).await;
         }
     });
+    // #1274 r3: the drain's completion fence. Only a finished task leaves
+    // it, so it still lists a task whose cleanup has already removed the
+    // task's handle from the registry below (or whose handle a quiesce has
+    // taken) until the task has dropped everything it captured.
+    {
+        let mut owners = state
+            .join_artifact_egress_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owners.retain(|owner| !owner.is_finished());
+        owners.push(handle.abort_handle());
+    }
     registry.retain(|_, tasks| {
         tasks.retain(|task| !task.is_finished());
         !tasks.is_empty()
@@ -36607,38 +36619,47 @@ fn spawn_join_artifact_egress<F>(
     let _ = registered.send(());
 }
 
-/// #1274: whether any join-artifact egress task is still running.
+/// #1274: whether any accepted join-artifact egress task is not yet
+/// finished, read from the owners fence (`AppState::join_artifact_egress_owners`),
+/// not from the registry: a task leaves the registry from its own cleanup
+/// before that cleanup has dropped its AppState handle (review r3, P2), and
+/// a quiesce takes handles out of it. A finished task has dropped
+/// everything it captured. The registry lock is taken first, so a spawn
+/// that passed its shutdown check has also entered the fence before this
+/// reads it.
 fn join_artifact_egress_running(state: &AppState) -> bool {
-    state
+    let _registry = state
         .join_artifact_egress
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .values()
-        .flatten()
-        .any(|task| !task.is_finished())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut owners = state
+        .join_artifact_egress_owners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    owners.retain(|owner| !owner.is_finished());
+    !owners.is_empty()
 }
 
-/// #1274: resolves once no join-artifact egress task is running. A task
-/// leaves the registry itself when it ends (see
-/// [`JoinArtifactEgressCleanup`]), so the handles are only polled here,
-/// never taken: a removal or ban can still quiesce them meanwhile.
+/// #1274: resolves once every accepted join-artifact egress task is
+/// finished, so none of them still owns this AppState. The registry handles
+/// are never taken here: a removal or ban can still quiesce them meanwhile.
 pub(in crate::server) async fn join_artifact_egress_idle(state: &AppState) {
     while join_artifact_egress_running(state) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// #1274: abort every join-artifact egress task in place. The handles stay
-/// in the registry until each task's cleanup removes them.
+/// #1274: abort every unfinished join-artifact egress task in place,
+/// through the owners fence, so this also reaches a task whose handle a
+/// quiesce has taken out of the registry.
 pub(in crate::server) fn abort_join_artifact_egress(state: &AppState) {
-    for task in state
-        .join_artifact_egress
+    for owner in state
+        .join_artifact_egress_owners
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .values()
-        .flatten()
+        .iter()
     {
-        task.abort();
+        owner.abort();
     }
 }
 
@@ -36681,7 +36702,9 @@ impl Drop for JoinArtifactEgressCleanup {
         }
         // #1274 r3: the registry no longer lists this task and its lock is
         // released, but `self.state` (an AppState owner) drops only after
-        // this body returns.
+        // this body returns. The shutdown drain therefore waits on the
+        // owners fence (`AppState::join_artifact_egress_owners`), which
+        // lists the task until it is finished, not on this registry.
         #[cfg(test)]
         egress_cleanup_test_seam::pause(&self.key);
     }
@@ -40743,6 +40766,7 @@ pub(in crate::server) mod tests {
             shielded_tasks: StdMutex::new(Some(Vec::new())),
             shutdown_started: tokio_util::sync::CancellationToken::new(),
             join_artifact_egress: StdMutex::new(HashMap::new()),
+            join_artifact_egress_owners: StdMutex::new(Vec::new()),
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
