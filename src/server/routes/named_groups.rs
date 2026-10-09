@@ -14631,6 +14631,39 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     );
 }
 
+/// The named-group metadata listener on the direct channel (spawned once by
+/// the server; `rx` is its direct-message subscription). It applies
+/// authority-authored commits that are direct-delivered (see
+/// `spawn_named_group_event_delivery`), through the same apply path as the
+/// per-group metadata topic listener.
+pub(in crate::server) async fn run_direct_metadata_listener(
+    state: Arc<AppState>,
+    mut rx: x0x::direct::DirectMessageReceiver,
+) {
+    loop {
+        let Some(msg) = rx.recv().await else { break };
+        let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
+            continue; // not a named-group metadata event
+        };
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "direct_classified_metadata_event",
+            sender = %hex::encode(msg.sender.as_bytes()),
+            len = msg.payload.len(),
+            verified = msg.verified,
+            event = named_group_metadata_event_kind(&event),
+        );
+        apply_named_group_metadata_event(
+            &state,
+            event,
+            msg.sender,
+            msg.verified,
+            None, // direct DM path — no V2 envelope bytes available
+        )
+        .await;
+    }
+}
+
 /// Spawn every gossip listener a member needs for a named group.
 ///
 /// Members must be subscribed to both the metadata topic *and* the
@@ -39496,6 +39529,7 @@ pub(in crate::server) mod tests {
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
+    pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
