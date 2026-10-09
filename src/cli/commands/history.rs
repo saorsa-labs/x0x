@@ -257,9 +257,12 @@ mod tests {
     /// Every operation older daemons may lack names the registered route
     /// and the registered CLI command, so the unsupported-operation error
     /// points at the real route.
+    /// Every history operation older daemons may lack.
+    const NEWER_OPERATIONS: &[NewerOperation] = &[POLICY];
+
     #[test]
     fn adr0116_unsupported_operations_match_the_api_registry() {
-        for op in [&POLICY] {
+        for op in NEWER_OPERATIONS {
             let entry = crate::api::ENDPOINTS
                 .iter()
                 .find(|e| e.method == op.method && e.path == op.path)

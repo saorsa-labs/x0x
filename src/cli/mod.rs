@@ -498,6 +498,25 @@ pub struct NewerOperation {
     pub path: &'static str,
 }
 
+impl NewerOperation {
+    /// The error for a daemon that predates this operation. The daemon's
+    /// own `error` sentence, when its 404 body has one, is kept.
+    fn unsupported(&self, body: Option<&serde_json::Value>) -> anyhow::Error {
+        let daemon = body
+            .and_then(|b| b.get("error"))
+            .and_then(|e| e.as_str())
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "unsupported operation: `{}` needs {} {}, and this x0xd predates it \
+             (HTTP 404{daemon}). Upgrade x0xd to use this command.",
+            self.command,
+            self.method,
+            self.path,
+        )
+    }
+}
+
 /// Read a daemon response: its JSON body on success, an error otherwise.
 ///
 /// `newer` names an operation that older daemons may lack; see
@@ -508,7 +527,14 @@ async fn response_body(
 ) -> Result<serde_json::Value> {
     let status = resp.status();
     let text = resp.text().await.context("failed to read response body")?;
-    let _ = newer;
+    // ADR 0116 §5: an older daemon has no route for a newer operation. Its
+    // 404 may be empty, JSON or neither, so map it before parsing.
+    if let Some(op) = newer {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+            return Err(op.unsupported(parsed.as_ref()));
+        }
+    }
     let body = if text.trim().is_empty() {
         serde_json::json!({ "ok": status.is_success() })
     } else {
