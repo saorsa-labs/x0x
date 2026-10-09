@@ -344,6 +344,35 @@ async fn sum_counter(sim: &Sim, label: &str, stores: &[Store], field: &str) -> R
     Ok(total)
 }
 
+/// State-sync counters summed across both stores.
+struct SyncTotals {
+    j_requests: u64,
+    p_received: u64,
+    p_answered: u64,
+    p_served: u64,
+    j_merges: u64,
+}
+
+async fn sync_totals(sim: &Sim, stores: &[Store]) -> Result<SyncTotals> {
+    Ok(SyncTotals {
+        j_requests: sum_counter(sim, "J", stores, "requests_sent").await?,
+        p_received: sum_counter(sim, "P", stores, "requests_received").await?,
+        p_answered: sum_counter(sim, "P", stores, "requests_answered").await?,
+        p_served: sum_counter(sim, "P", stores, "retained_pages_served").await?,
+        j_merges: sum_counter(sim, "J", stores, "incoming_record_merges").await?,
+    })
+}
+
+fn since(after: &SyncTotals, before: &SyncTotals) -> SyncTotals {
+    SyncTotals {
+        j_requests: after.j_requests.saturating_sub(before.j_requests),
+        p_received: after.p_received.saturating_sub(before.p_received),
+        p_answered: after.p_answered.saturating_sub(before.p_answered),
+        p_served: after.p_served.saturating_sub(before.p_served),
+        j_merges: after.j_merges.saturating_sub(before.j_merges),
+    }
+}
+
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     mesh(sim, &["O", "P", "A", "J"]).await?;
@@ -394,6 +423,14 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
 
+    // One 120 s bound covers both cold opens and the history reads. Opening
+    // a store starts its sync, so the wiki open must count against the same
+    // budget as the web open and the later poll.
+    let bound_start = sim.fabric().now();
+    let baseline = sync_totals(sim, &stores).await?;
+    let open_mark = sim
+        .fabric()
+        .mark_indexed("J opens wiki and web; the 120s history bound starts");
     for store in &stores {
         let opened = open_named(sim, "J", &group, store.spec.name).await?;
         ensure!(
@@ -403,43 +440,55 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             store.id
         );
     }
-    let open_mark = sim
-        .fabric()
-        .mark_indexed("J opens wiki and web with O and A offline");
-    let mut seen = Observations::default();
-    let waited = sim
-        .until(
-            "J reads the full history from P",
-            READ_BUDGET,
-            async |s: &Sim| match seen.observe(history_checks(s, &stores)).await {
-                Some(checks) => checks.iter().all(|check| check.j_ok),
-                None => true,
-            },
-        )
-        .await;
-    seen.verify("J reads the full history from P")?;
-    let passed = match waited {
-        Ok(()) => true,
-        Err(error) if expired(&error) => false,
-        Err(error) => return Err(error),
+    let elapsed = sim.fabric().now().saturating_sub(bound_start);
+    let left = READ_BUDGET.saturating_sub(elapsed);
+    let passed = if left.is_zero() {
+        false
+    } else {
+        let mut seen = Observations::default();
+        let waited = sim
+            .until(
+                "J reads the full history from P",
+                left,
+                async |s: &Sim| match seen.observe(history_checks(s, &stores)).await {
+                    Some(checks) => checks.iter().all(|check| check.j_ok),
+                    None => true,
+                },
+            )
+            .await;
+        seen.verify("J reads the full history from P")?;
+        match waited {
+            Ok(()) => true,
+            Err(error) if expired(&error) => false,
+            Err(error) => return Err(error),
+        }
     };
     let checks = history_checks(sim, &stores).await?;
-    let j_requests = sum_counter(sim, "J", &stores, "requests_sent").await?;
-    let p_received = sum_counter(sim, "P", &stores, "requests_received").await?;
-    let p_answered = sum_counter(sim, "P", &stores, "requests_answered").await?;
-    let p_served = sum_counter(sim, "P", &stores, "retained_pages_served").await?;
-    let j_merges = sum_counter(sim, "J", &stores, "incoming_record_merges").await?;
+    let fresh = since(&sync_totals(sim, &stores).await?, &baseline);
     let frames = sim
         .fabric()
         .delivered_writes_after(&sim.peer("J")?, &sim.peer("P")?, open_mark);
-    let delivered = passed || p_received > 0 || p_served > 0 || j_merges > 0 || !frames.is_empty();
+    // Setup traffic is in `baseline`. A miss is RED only when new activity
+    // shows that J's request reached P. A pass still needs post-open activity,
+    // so an earlier exchange cannot by itself satisfy the request stage.
+    let reached_p = fresh.p_received > 0 || fresh.p_served > 0 || !frames.is_empty();
+    let delivered = if passed {
+        reached_p || fresh.j_merges > 0
+    } else {
+        fresh.j_requests > 0 && reached_p
+    };
     receipt.request_delivered(
         "j_history_request_reached_p",
         delivered,
         format!(
-            "J requests_sent={j_requests} incoming_record_merges={j_merges}; \
-             P requests_received={p_received} requests_answered={p_answered} \
-             retained_pages_served={p_served}; {} frames J→P after trace #{open_mark}",
+            "since J's open: J requests_sent={} incoming_record_merges={}; \
+             P requests_received={} requests_answered={} retained_pages_served={}; \
+             {} frames J→P after trace #{open_mark}",
+            fresh.j_requests,
+            fresh.j_merges,
+            fresh.p_received,
+            fresh.p_answered,
+            fresh.p_served,
             frames.len()
         ),
         at(sim),
