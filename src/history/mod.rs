@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::HistoryResult;
+use crate::error::{HistoryError, HistoryResult};
 
 pub use policy::{
     ClassLimit, CompiledBounds, CompiledTopicRule, DmRecording, HistoryPolicy, RetainedClass,
@@ -314,8 +314,23 @@ impl HistoryService {
             .db_path
             .clone()
             .unwrap_or_else(|| data_dir.join("history.db"));
+        let store = Store::open(&db_path)?;
+        // Codex review of slice B, round 2 (controller decision): topic-rule
+        // limits match topic names in SQL as UTF-8 bytes, so they need a
+        // UTF-8 database. On a database created with another text encoding
+        // they are refused here, after `Store::open` and with no other file
+        // change. Everything else still opens there, as before.
+        if rules.bounded_topic_rule_count() > 0 && !store.text_encoding_is_utf8() {
+            return Err(HistoryError::InvalidConfig(format!(
+                "[[history.topic_rules]] max_bytes / max_age_days need a UTF-8 history \
+                 database, but {} uses {}. Remove the topic limits, or use a UTF-8 history \
+                 database",
+                db_path.display(),
+                store.text_encoding()
+            )));
+        }
         Ok(OpenedHistory {
-            store: Arc::new(Store::open(&db_path)?),
+            store: Arc::new(store),
             policy: config.retention_policy(),
             quarantine_pins: Arc::new(QuarantinePinSlot::default()),
             rules,
@@ -337,11 +352,12 @@ impl HistoryService {
             writer: writer.handle(),
             store: Arc::clone(&store),
             quarantine_pins: Arc::clone(&quarantine_pins),
-            policy: rules,
+            policy: Arc::clone(&rules),
         };
         let reaper = reaper::spawn(
             store,
             policy,
+            rules,
             handle.counters(),
             HISTORY_REAPER_INTERVAL_SECS,
             quarantine_pins,
@@ -548,15 +564,11 @@ mod tests {
     }
 
     /// Zero and omitted are different for bytes and the same for age.
-    /// `max_bytes = 0` is a real bound (retain no eligible rows), so it passes
-    /// validation; this build then refuses it only because it cannot
-    /// enforce class limits yet. Slice B lifts that refusal.
+    /// `max_bytes = 0` is a real bound (retain no eligible rows), so it is
+    /// accepted; a zero age alone bounds nothing and is refused.
     #[test]
     fn adr0116_zero_bytes_is_a_bound_but_zero_age_is_not() {
-        assert_refused(
-            "[[class_limits]]\nclass = \"durable\"\nmax_bytes = 0\n",
-            "not supported by this build",
-        );
+        assert_opens("[[class_limits]]\nclass = \"durable\"\nmax_bytes = 0\n");
         assert_refused(
             "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 0\n",
             "sets neither max_bytes nor a positive max_age_days",
@@ -618,21 +630,25 @@ mod tests {
         );
     }
 
-    /// This build parses and validates every new rule but enforces none of
-    /// them yet, so it refuses a rule that would change behaviour rather
-    /// than accept it and ignore it. A prefix-only topic rule changes
-    /// nothing on its own and is accepted.
+    /// This build enforces the class and topic retention limits (slice B)
+    /// but not the `ephemeral` recording modes (slice C), so it refuses
+    /// those rather than accept them and ignore them.
     #[test]
     fn adr0116_refuses_rules_this_build_cannot_enforce() {
         for body in [
-            "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 7\n",
-            "[[class_limits]]\nclass = \"replaceable\"\nmax_bytes = 8388608\n",
             "dm_recording = \"ephemeral\"\n",
             "[[topic_rules]]\nprefix = \"app.sync.\"\nrecording = \"ephemeral\"\n",
+            "[[topic_rules]]\nprefix = \"app.sync.\"\nrecording = \"ephemeral\"\nmax_bytes = 1\n",
+        ] {
+            assert_refused(body, "not supported by this build");
+        }
+        for body in [
+            "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 7\n",
+            "[[class_limits]]\nclass = \"replaceable\"\nmax_bytes = 8388608\n",
             "[[topic_rules]]\nprefix = \"app.chat\"\nmax_bytes = 16777216\n",
             "[[topic_rules]]\nprefix = \"app.chat\"\nmax_age_days = 3\n",
         ] {
-            assert_refused(body, "not supported by this build");
+            assert_opens(body);
         }
         assert_opens("dm_recording = \"inherit\"\n");
         assert_opens("[[topic_rules]]\nprefix = \"app.chat\"\nrecording = \"inherit\"\n");
@@ -717,6 +733,143 @@ mod tests {
         .unwrap();
         assert!(plain.handle().policy().is_unset());
         plain.shutdown().await;
+    }
+
+    /// ADR 0116 slice B: the periodic reaper applies the compiled class and
+    /// topic rules (here a 1-day Durable age), not only the global bounds.
+    #[tokio::test]
+    async fn adr0116_reaper_applies_the_compiled_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("history.db")).unwrap());
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        for (payload, seen_at_ms) in [(&b"old row"[..], now - 5 * 86_400_000), (b"new row", now)] {
+            store
+                .insert(&HistoryRecord {
+                    msg_id: HistoryRecord::compute_msg_id(None, payload),
+                    scope: Scope::Dm("ab".repeat(32)),
+                    author_agent: None,
+                    author_machine: None,
+                    author_pubkey: None,
+                    sent_at_ms: seen_at_ms,
+                    seen_at_ms,
+                    direction: Direction::Inbound,
+                    content_type: "text/plain".into(),
+                    payload: payload.to_vec(),
+                    signed_artifact: None,
+                    signature: None,
+                    sig_context: None,
+                    provenance: Provenance::LocalAppDecrypt,
+                    replace_key: None,
+                    thread_root: None,
+                    thread_parent: None,
+                    ingress_sender_agent: None,
+                    logical_request_id: None,
+                })
+                .unwrap();
+        }
+        let config = HistoryConfig {
+            class_limits: vec![ClassLimit {
+                class: RetainedClass::Durable,
+                max_bytes: None,
+                max_age_days: Some(1),
+            }],
+            ..HistoryConfig::default()
+        };
+        let rules = Arc::new(config.validate().unwrap());
+        let reaper = reaper::spawn(
+            Arc::clone(&store),
+            config.retention_policy(),
+            rules,
+            Arc::new(HistoryCounters::default()),
+            1,
+            Arc::new(QuarantinePinSlot::default()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if store.stats().unwrap().rows == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reaper never applied the class age"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        reaper.abort();
+        let _ = reaper.await;
+    }
+
+    /// Codex B review r2 (controller decision): bounded topic rules need a
+    /// UTF-8 database, so `open` refuses them on a database created with
+    /// another text encoding, after `Store::open` and with no other file
+    /// change. Everything else still opens there: no rule, a class limit, a
+    /// prefix-only topic rule.
+    #[test]
+    fn adr0116_open_refuses_topic_limits_on_a_non_utf8_database() {
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("history.db");
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA encoding = '{encoding}'; CREATE TABLE seed(x);"
+                ))
+                .unwrap();
+            }
+            let open = |config: HistoryConfig| {
+                HistoryService::open(
+                    &HistoryConfig {
+                        enabled: true,
+                        db_path: Some(db.clone()),
+                        ..config
+                    },
+                    dir.path(),
+                )
+                .map(drop)
+            };
+            let bounded = HistoryConfig {
+                topic_rules: vec![TopicRule {
+                    prefix: "app.".into(),
+                    recording: TopicRecording::Inherit,
+                    max_bytes: None,
+                    max_age_days: Some(3),
+                }],
+                ..HistoryConfig::default()
+            };
+            match open(bounded) {
+                Err(crate::error::HistoryError::InvalidConfig(message)) => assert!(
+                    message.contains("UTF-8"),
+                    "{encoding}: the refusal names the encoding need: {message}"
+                ),
+                other => panic!("{encoding}: topic limits must be refused, got {other:?}"),
+            }
+            open(HistoryConfig::default()).unwrap();
+            open(HistoryConfig {
+                class_limits: vec![ClassLimit {
+                    class: RetainedClass::Durable,
+                    max_bytes: None,
+                    max_age_days: Some(7),
+                }],
+                ..HistoryConfig::default()
+            })
+            .unwrap();
+            open(HistoryConfig {
+                topic_rules: vec![TopicRule {
+                    prefix: "app.".into(),
+                    recording: TopicRecording::Inherit,
+                    max_bytes: None,
+                    max_age_days: None,
+                }],
+                ..HistoryConfig::default()
+            })
+            .unwrap();
+        }
     }
 
     /// Validation row 1 (defaults): the new keys are omitted from a

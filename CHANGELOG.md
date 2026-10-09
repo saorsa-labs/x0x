@@ -12,10 +12,26 @@ All notable changes to this project will be documented in this file.
   start (even with `enabled = false`), on a rule ADR 0116 §1 rejects: a
   duplicate class or prefix, an unknown key or value, a class entry with no
   bound, an empty or over-long prefix, more than 256 rules, or an
-  overflowing bound. This release does not enforce the rules yet, so it also
-  refuses any rule that would change recording or retention; only a
-  prefix-only topic rule is accepted. With the keys unset nothing changes,
-  and a serialized default `HistoryConfig` is byte-identical.
+  overflowing bound. It also refuses the `ephemeral` recording modes
+  (`dm_recording = "ephemeral"`, `recording = "ephemeral"`), which this
+  release does not enforce yet. With the keys unset nothing changes, and a
+  serialized default `HistoryConfig` is byte-identical.
+- **History retention by class and topic (ADR 0116 slice B, #1264).** The
+  reaper enforces `[[history.class_limits]]` and the `max_bytes` /
+  `max_age_days` of `[[history.topic_rules]]`, in the ADR's order: ages, pin
+  ceilings, class budgets, topic budgets, exact-scope budgets, then the
+  global budget. For Durable rows the shortest positive age wins, and a zero
+  age never disables the global one. Class and topic budgets are additional
+  aggregate ceilings on logical bytes, evicted oldest first. A topic rule
+  covers every topic its literal, case-sensitive prefix wins (the longest
+  prefix wins the whole rule). Replaceable (current-state) rows are evicted
+  only by an explicit Replaceable class limit or a matching topic limit
+  (D229); the global age, the global cap and the exact-scope limits still
+  exempt them. Fork-quarantine pins win over every new rule, and the pinned
+  ceiling is unchanged. With no class or topic bound configured, the reaper
+  runs exactly as before. Topic limits need a UTF-8 history database (every
+  database x0x creates is). On an existing UTF-16 database, history refuses
+  to open with them, and the reaper never applies them there.
 
 ### Changed
 

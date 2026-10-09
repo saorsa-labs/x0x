@@ -176,12 +176,43 @@ ADR 0116 adds three optional keys. `dm_recording` is `inherit` (the default)
 or `ephemeral`. `[[history.class_limits]]` takes `class` (`durable` or
 `replaceable`) and an optional `max_bytes` and `max_age_days`.
 `[[history.topic_rules]]` takes a literal `prefix` and an optional
-`recording`, `max_bytes` and `max_age_days`. This build parses and validates
-them: the library checks before history opens, and the daemon checks at
-config load, even with `enabled = false`. It refuses any rule it cannot
-enforce yet, which is every rule except a prefix-only topic rule.
-Enforcement comes in later releases (ADR 0116 slices B and C). Left unset,
-the keys change nothing.
+`recording`, `max_bytes` and `max_age_days`. The library validates them
+before history opens, and the daemon validates them at config load, even
+with `enabled = false`. Left unset, they change nothing.
+
+The reaper enforces the class limits and the topic-rule limits (ADR 0116
+slice B). Each pass applies, in order:
+1. the global age, then the class and topic ages;
+2. the pin ceilings;
+3. the class budgets (Durable, then Replaceable);
+4. the topic budgets, in prefix byte order;
+5. the exact-scope budgets;
+6. the global budget.
+
+How the rules combine:
+- For a Durable row every positive age applies, so the shortest wins; a
+  zero age adds no bound and never disables the global one. Rows strictly
+  older than a cutoff go.
+- A topic rule selects the topics its literal, case-sensitive prefix wins:
+  the longest matching prefix takes the whole rule.
+- Class and topic budgets are aggregate ceilings on payload plus signed
+  artifact bytes over unpinned rows. They evict oldest first by
+  `(seen_at_ms, id)`, a row larger than the remaining excess included.
+- Replaceable rows go only under a Replaceable class limit or a matching
+  topic limit; the global age, the global cap and the exact-scope limits
+  still exempt them.
+- Fork-quarantine pins win over every new rule, and the pinned ceiling is
+  unchanged.
+- With no class or topic bound configured, no new statement runs.
+- Topic-rule limits match topic names as UTF-8 bytes, so they need a UTF-8
+  database (every database x0x creates is). History refuses to open with
+  topic limits on an existing UTF-16 database. If a direct `Store` caller
+  passes them anyway, the topic phases delete nothing, and the skip is
+  counted (`Store::skipped_topic_rules`) and logged once. Class limits and
+  every other bound still apply.
+
+The `ephemeral` recording modes are validated but refused until ADR 0116
+slice C enforces them.
 
 Reaper task every 300 s (constant, `HISTORY_REAPER_INTERVAL_SECS`), evicts
 oldest-first by `seen_at_ms` until under bounds, then `PRAGMA
