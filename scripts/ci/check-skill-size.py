@@ -31,6 +31,9 @@ PAGES = (
     "docs/skill/stores.md",
     "docs/skill/operations.md",
 )
+# A release and ClawHub ship SKILL.md alone. Topic links must be absolute
+# repository URLs, not paths relative to a checkout.
+TOPIC_URL = "https://github.com/saorsa-labs/x0x/blob/main/"
 # Commands the core must contain so the first three actions do not depend
 # on a topic page. The topic pages may repeat them.
 CORE_MARKERS = (
@@ -39,6 +42,9 @@ CORE_MARKERS = (
     "x0x store create",
     "-X PUT",
     "/stores/",
+    # The scratch example is a local: topic and is not a private store.
+    "local:scratch-pad",
+    "non-sensitive",
 )
 
 
@@ -82,9 +88,14 @@ def check(root: Path) -> list[str]:
             for marker in CORE_MARKERS:
                 if marker not in core_text:
                     errors.append(f"{CORE}: missing first-action marker {marker!r}")
+            if "](docs/skill/" in core_text:
+                errors.append(
+                    f"{CORE}: topic link is relative; use an absolute GitHub URL"
+                )
             for page in PAGES:
-                if page not in core_text:
-                    errors.append(f"{CORE}: does not link {page}")
+                url = TOPIC_URL + page
+                if url not in core_text:
+                    errors.append(f"{CORE}: missing absolute topic URL {url}")
 
     for page in PAGES:
         path = root / page
@@ -117,16 +128,18 @@ name: fixture
 
 # fixture
 
-docs/skill/owner.md
-docs/skill/messaging.md
-docs/skill/stores.md
-docs/skill/operations.md
+https://github.com/saorsa-labs/x0x/blob/main/docs/skill/owner.md
+https://github.com/saorsa-labs/x0x/blob/main/docs/skill/messaging.md
+https://github.com/saorsa-labs/x0x/blob/main/docs/skill/stores.md
+https://github.com/saorsa-labs/x0x/blob/main/docs/skill/operations.md
 
 x0x direct send
 /groups/join
 x0x store create
 -X PUT
 /stores/
+local:scratch-pad
+non-sensitive
 """
 
 
@@ -192,6 +205,19 @@ def self_test() -> int:
         pages["docs/skill/extra.md"] = "# extra\n"
         _write_tree(extra, VALID_CORE, pages)
         expect_fail("sixth skill file", extra, "markdown set")
+
+        relative = base / "relative"
+        _write_tree(
+            relative,
+            VALID_CORE.replace(
+                "https://github.com/saorsa-labs/x0x/blob/main/docs/skill/owner.md",
+                "docs/skill/owner.md",
+                1,
+            )
+            + "\nSee [Owner](docs/skill/owner.md).\n",
+            _valid_pages(),
+        )
+        expect_fail("relative topic link", relative, "topic link is relative")
 
     if failures:
         for failure in failures:
