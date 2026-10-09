@@ -483,6 +483,12 @@ pub enum HistoryError {
     /// Filesystem error touching the database path.
     #[error("history io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A `[history]` rule failed validation (ADR 0116 §1), or this build
+    /// cannot enforce it yet. History refuses to open; the daemon refuses
+    /// to start. The message names the rule.
+    #[error("{0}")]
+    InvalidConfig(String),
 }
 
 impl From<rusqlite::Error> for HistoryError {

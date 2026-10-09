@@ -172,6 +172,17 @@ reports the number skipped by the latest pass through
 `Store::skipped_scope_limits`. The other limits and `max_bytes` still apply
 (#1286).
 
+ADR 0116 adds three optional keys. `dm_recording` is `inherit` (the default)
+or `ephemeral`. `[[history.class_limits]]` takes `class` (`durable` or
+`replaceable`) and an optional `max_bytes` and `max_age_days`.
+`[[history.topic_rules]]` takes a literal `prefix` and an optional
+`recording`, `max_bytes` and `max_age_days`. This build parses and validates
+them: the library checks before history opens, and the daemon checks at
+config load, even with `enabled = false`. It refuses any rule it cannot
+enforce yet, which is every rule except a prefix-only topic rule.
+Enforcement comes in later releases (ADR 0116 slices B and C). Left unset,
+the keys change nothing.
+
 Reaper task every 300 s (constant, `HISTORY_REAPER_INTERVAL_SECS`), evicts
 oldest-first by `seen_at_ms` until under bounds, then `PRAGMA
 incremental_vacuum` (enabled by `auto_vacuum=INCREMENTAL` at creation).

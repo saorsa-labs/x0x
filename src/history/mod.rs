@@ -12,6 +12,7 @@
 //! second process opening the same database fails loud at open.
 
 pub mod classify;
+pub mod policy;
 pub mod record;
 pub mod store;
 pub mod writer;
@@ -25,6 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HistoryResult;
 
+pub use policy::{
+    ClassLimit, CompiledBounds, CompiledTopicRule, DmRecording, HistoryPolicy, RetainedClass,
+    TopicRecording, TopicRule, MAX_POLICY_RULES, MAX_TOPIC_PREFIX_BYTES,
+};
 pub use record::{Direction, HistoryRecord, MessageClass, Provenance, Scope};
 pub use store::{
     HistoryQuery, HistoryStats, InsertOutcome, PinnedScopes, RetainOutcome, RetentionPolicy,
@@ -64,6 +69,20 @@ pub struct HistoryConfig {
     /// publisher cannot force recording on a receiver.
     #[serde(default)]
     pub record_topics: Vec<String>,
+    /// ADR 0116 §1: how this node records ordinary inbound and outbound
+    /// DMs. Default `inherit` (record as ADR 0023 classifies them).
+    /// Omitted from serialized output while it is the default.
+    #[serde(default, skip_serializing_if = "DmRecording::is_inherit")]
+    pub dm_recording: DmRecording,
+    /// ADR 0116 §1: per-class retention bounds (`[[history.class_limits]]`).
+    /// Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_limits: Vec<ClassLimit>,
+    /// ADR 0116 §1: topic-prefix recording and retention rules
+    /// (`[[history.topic_rules]]`). They only filter topics that
+    /// `record_topics` already selects. Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_rules: Vec<TopicRule>,
 }
 
 fn default_max_bytes() -> u64 {
@@ -80,6 +99,9 @@ impl Default for HistoryConfig {
             scope_limits: Vec::new(),
             db_path: None,
             record_topics: Vec::new(),
+            dm_recording: DmRecording::Inherit,
+            class_limits: Vec::new(),
+            topic_rules: Vec::new(),
         }
     }
 }
@@ -100,6 +122,30 @@ impl HistoryConfig {
             max_age_days: self.max_age_days,
             scope_limits: self.scope_limits.clone(),
         }
+    }
+
+    /// Validate and compile the ADR 0116 rules (`dm_recording`,
+    /// `class_limits`, `topic_rules`). This is the ADR 0116 §1 check only;
+    /// [`Self::validate`] also refuses rules this build cannot enforce.
+    ///
+    /// # Errors
+    /// [`crate::error::HistoryError::InvalidConfig`] names the rule that
+    /// fails validation.
+    pub fn compile_policy(&self) -> HistoryResult<HistoryPolicy> {
+        HistoryPolicy::compile(self.dm_recording, &self.class_limits, &self.topic_rules)
+    }
+
+    /// The check history runs before it opens, and the daemon runs at
+    /// config load whatever `enabled` says (ADR 0116 §1): validate the
+    /// rules, then refuse any rule this build cannot enforce yet.
+    ///
+    /// # Errors
+    /// [`crate::error::HistoryError::InvalidConfig`] names the first rule
+    /// refused.
+    pub fn validate(&self) -> HistoryResult<HistoryPolicy> {
+        let policy = self.compile_policy()?;
+        policy.ensure_enforceable()?;
+        Ok(policy)
     }
 }
 
@@ -164,9 +210,19 @@ pub struct HistoryHandle {
     /// ADR-0068 D1: shared with the reaper, so the daemon can install the
     /// pin source through any handle after `AppState` is built.
     quarantine_pins: Arc<QuarantinePinSlot>,
+    /// ADR 0116 §1: the compiled local recording and retention policy,
+    /// fixed at open. A policy change needs a restart (ADR 0116 §4).
+    policy: Arc<HistoryPolicy>,
 }
 
 impl HistoryHandle {
+    /// ADR 0116 §3: the typed local history policy this store was opened
+    /// with. [`HistoryPolicy::is_unset`] when no ADR 0116 key is set.
+    #[must_use]
+    pub fn policy(&self) -> &HistoryPolicy {
+        &self.policy
+    }
+
     /// Enqueue a record (never blocks; sheds on full — ADR-0023 §5).
     pub fn record(&self, record: HistoryRecord) {
         self.writer.record(record);
@@ -220,6 +276,8 @@ pub(crate) struct OpenedHistory {
     store: Arc<Store>,
     policy: RetentionPolicy,
     quarantine_pins: Arc<QuarantinePinSlot>,
+    /// ADR 0116 §1: validated before the store opened.
+    rules: Arc<HistoryPolicy>,
 }
 
 impl HistoryService {
@@ -249,6 +307,9 @@ impl HistoryService {
         config: &HistoryConfig,
         data_dir: &std::path::Path,
     ) -> HistoryResult<OpenedHistory> {
+        // ADR 0116 §1: refuse a bad rule before history opens: no database
+        // file is created or migrated for a config that will not run.
+        let rules = Arc::new(config.validate()?);
         let db_path = config
             .db_path
             .clone()
@@ -257,6 +318,7 @@ impl HistoryService {
             store: Arc::new(Store::open(&db_path)?),
             policy: config.retention_policy(),
             quarantine_pins: Arc::new(QuarantinePinSlot::default()),
+            rules,
         })
     }
 
@@ -268,12 +330,14 @@ impl HistoryService {
             store,
             policy,
             quarantine_pins,
+            rules,
         } = opened;
         let writer = writer::Writer::spawn(Arc::clone(&store));
         let handle = HistoryHandle {
             writer: writer.handle(),
             store: Arc::clone(&store),
             quarantine_pins: Arc::clone(&quarantine_pins),
+            policy: rules,
         };
         let reaper = reaper::spawn(
             store,
@@ -394,5 +458,280 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    // ── ADR 0116 §1: `[history]` rule configuration and validation ──────
+    //
+    // Each case decodes a `[history]` table the way the daemon does (TOML)
+    // and then opens history, the library's path. Validation must refuse a
+    // bad rule at one of those two steps, before any history is open.
+
+    /// Decode `body` as a `[history]` table, then open history in `dir`.
+    /// `Err` names the step that refused and carries its message.
+    fn open_history_toml(dir: &std::path::Path, body: &str) -> Result<(), String> {
+        let decoded: HistoryConfig = toml::from_str(body).map_err(|e| format!("decode: {e}"))?;
+        let config = HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.join("history.db")),
+            ..decoded
+        };
+        HistoryService::open(&config, dir)
+            .map(drop)
+            .map_err(|e| format!("open: {e}"))
+    }
+
+    /// Assert that `body` is refused with a message containing `needle`.
+    fn assert_refused(body: &str, needle: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        match open_history_toml(dir.path(), body) {
+            Ok(()) => panic!("history opened, but this config must be refused ({needle}):\n{body}"),
+            Err(message) => assert!(
+                message.contains(needle),
+                "refused for the wrong reason; wanted {needle:?}, got {message:?}\n{body}"
+            ),
+        }
+    }
+
+    /// Assert that `body` decodes and history opens.
+    fn assert_opens(body: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Err(message) = open_history_toml(dir.path(), body) {
+            panic!("history must open with this config, got {message:?}\n{body}");
+        }
+    }
+
+    #[test]
+    fn adr0116_rejects_a_duplicate_class_limit() {
+        assert_refused(
+            "[[class_limits]]\nclass = \"durable\"\nmax_bytes = 1\n\n\
+             [[class_limits]]\nclass = \"durable\"\nmax_age_days = 7\n",
+            "more than one entry for class \"durable\"",
+        );
+    }
+
+    #[test]
+    fn adr0116_rejects_unknown_keys_in_new_rule_objects() {
+        assert_refused(
+            "[[class_limits]]\nclass = \"durable\"\nmax_bytez = 1\n",
+            "unknown field `max_bytez`",
+        );
+        assert_refused(
+            "[[topic_rules]]\nprefix = \"app.\"\nrecord = \"ephemeral\"\n",
+            "unknown field `record`",
+        );
+    }
+
+    #[test]
+    fn adr0116_rejects_unknown_values() {
+        // `ephemeral` is not a retained class: it cannot carry a budget.
+        assert_refused(
+            "[[class_limits]]\nclass = \"ephemeral\"\nmax_bytes = 1\n",
+            "unknown variant `ephemeral`",
+        );
+        assert_refused("dm_recording = \"never\"\n", "unknown variant `never`");
+        assert_refused(
+            "[[topic_rules]]\nprefix = \"app.\"\nrecording = \"drop\"\n",
+            "unknown variant `drop`",
+        );
+    }
+
+    /// Q8: a class entry must set `max_bytes` or a positive age. A zero or
+    /// omitted age adds no bound, so it does not count.
+    #[test]
+    fn adr0116_rejects_a_class_limit_without_a_bound() {
+        for body in [
+            "[[class_limits]]\nclass = \"durable\"\n",
+            "[[class_limits]]\nclass = \"replaceable\"\nmax_age_days = 0\n",
+        ] {
+            assert_refused(body, "sets neither max_bytes nor a positive max_age_days");
+        }
+    }
+
+    /// Zero and omitted are different for bytes and the same for age.
+    /// `max_bytes = 0` is a real bound (retain no eligible rows), so it passes
+    /// validation; this build then refuses it only because it cannot
+    /// enforce class limits yet. Slice B lifts that refusal.
+    #[test]
+    fn adr0116_zero_bytes_is_a_bound_but_zero_age_is_not() {
+        assert_refused(
+            "[[class_limits]]\nclass = \"durable\"\nmax_bytes = 0\n",
+            "not supported by this build",
+        );
+        assert_refused(
+            "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 0\n",
+            "sets neither max_bytes nor a positive max_age_days",
+        );
+    }
+
+    #[test]
+    fn adr0116_rejects_duplicate_and_empty_topic_prefixes() {
+        assert_refused(
+            "[[topic_rules]]\nprefix = \"app.chat\"\n\n[[topic_rules]]\nprefix = \"app.chat\"\n",
+            "more than one rule for prefix \"app.chat\"",
+        );
+        assert_refused(
+            "[[topic_rules]]\nprefix = \"\"\n",
+            "prefix must not be empty",
+        );
+    }
+
+    /// The prefix bound is 256 UTF-8 BYTES, not characters: `é` is two.
+    #[test]
+    fn adr0116_prefix_length_is_bounded_in_bytes() {
+        let at_limit = format!("{}é", "a".repeat(254)); // 256 bytes
+        let over_limit = format!("{}é", "a".repeat(255)); // 257 bytes, 256 chars
+        assert_opens(&format!("[[topic_rules]]\nprefix = \"{at_limit}\"\n"));
+        assert_refused(
+            &format!("[[topic_rules]]\nprefix = \"{over_limit}\"\n"),
+            "at most 256 UTF-8 bytes",
+        );
+    }
+
+    /// At most 256 new rules in total, class entries included.
+    #[test]
+    fn adr0116_rule_count_is_bounded() {
+        let rules = |n: usize| {
+            (0..n)
+                .map(|i| format!("[[topic_rules]]\nprefix = \"t{i}.\"\n"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_opens(&rules(256));
+        assert_refused(&rules(257), "at most 256 are allowed");
+        assert_refused(
+            &format!(
+                "[[class_limits]]\nclass = \"durable\"\nmax_bytes = 1\n\n{}",
+                rules(256)
+            ),
+            "at most 256 are allowed",
+        );
+    }
+
+    /// A positive age must fit `i64` milliseconds. (A byte budget above
+    /// `i64::MAX` cannot be written in TOML at all; the library-side check
+    /// is covered in `policy.rs`.)
+    #[test]
+    fn adr0116_rejects_an_overflowing_age() {
+        assert_refused(
+            "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 106751991168\n",
+            "overflows",
+        );
+    }
+
+    /// This build parses and validates every new rule but enforces none of
+    /// them yet, so it refuses a rule that would change behaviour rather
+    /// than accept it and ignore it. A prefix-only topic rule changes
+    /// nothing on its own and is accepted.
+    #[test]
+    fn adr0116_refuses_rules_this_build_cannot_enforce() {
+        for body in [
+            "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 7\n",
+            "[[class_limits]]\nclass = \"replaceable\"\nmax_bytes = 8388608\n",
+            "dm_recording = \"ephemeral\"\n",
+            "[[topic_rules]]\nprefix = \"app.sync.\"\nrecording = \"ephemeral\"\n",
+            "[[topic_rules]]\nprefix = \"app.chat\"\nmax_bytes = 16777216\n",
+            "[[topic_rules]]\nprefix = \"app.chat\"\nmax_age_days = 3\n",
+        ] {
+            assert_refused(body, "not supported by this build");
+        }
+        assert_opens("dm_recording = \"inherit\"\n");
+        assert_opens("[[topic_rules]]\nprefix = \"app.chat\"\nrecording = \"inherit\"\n");
+        assert_opens("[[topic_rules]]\nprefix = \"app.chat\"\nmax_age_days = 0\n");
+    }
+
+    /// Validation row 1 (defaults): a `[history]` table written before ADR
+    /// 0116 decodes to the same config and opens as before.
+    #[test]
+    fn adr0116_pre_existing_history_config_is_unchanged() {
+        let body = "enabled = true\nmax_bytes = 1073741824\nmax_age_days = 0\n\
+                    record_topics = [\"app.chat\"]\n\n\
+                    [[scope_limits]]\nscope = \"group:example\"\nmax_bytes = 268435456\n";
+        let decoded: HistoryConfig = toml::from_str(body).unwrap();
+        assert_eq!(
+            decoded,
+            HistoryConfig {
+                enabled: true,
+                max_bytes: 1_073_741_824,
+                max_age_days: 0,
+                scope_limits: vec![ScopeLimit {
+                    scope: "group:example".into(),
+                    max_bytes: 268_435_456,
+                }],
+                record_topics: vec!["app.chat".into()],
+                ..HistoryConfig::default()
+            }
+        );
+        assert_opens(body);
+    }
+
+    /// Validation runs before the store opens: a refused config creates no
+    /// database file.
+    #[test]
+    fn adr0116_refused_config_creates_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = open_history_toml(dir.path(), "[[topic_rules]]\nprefix = \"\"\n");
+        assert!(refused.is_err(), "an empty prefix is refused");
+        assert!(
+            !dir.path().join("history.db").exists(),
+            "no history.db is created for a refused config"
+        );
+    }
+
+    /// ADR 0116 §3: the typed policy is reachable from the handle, and an
+    /// unconfigured store reports an unset policy.
+    #[tokio::test]
+    async fn adr0116_handle_exposes_the_compiled_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.path().join("history.db")),
+            topic_rules: vec![TopicRule {
+                prefix: "app.chat".into(),
+                recording: TopicRecording::Inherit,
+                max_bytes: None,
+                max_age_days: None,
+            }],
+            ..HistoryConfig::default()
+        };
+        let service = HistoryService::start(&config, dir.path()).unwrap();
+        let handle = service.handle();
+        assert!(!handle.policy().is_unset());
+        assert_eq!(
+            handle
+                .policy()
+                .winning_topic_rule("app.chat.room")
+                .map(|rule| rule.prefix.as_str()),
+            Some("app.chat")
+        );
+        service.shutdown().await;
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = HistoryService::start(
+            &HistoryConfig {
+                enabled: true,
+                db_path: Some(plain_dir.path().join("history.db")),
+                ..HistoryConfig::default()
+            },
+            plain_dir.path(),
+        )
+        .unwrap();
+        assert!(plain.handle().policy().is_unset());
+        plain.shutdown().await;
+    }
+
+    /// Validation row 1 (defaults): the new keys are omitted from a
+    /// serialized default config, so its bytes do not change.
+    #[test]
+    fn adr0116_default_config_serializes_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&HistoryConfig::daemon_default()).unwrap(),
+            "{\"enabled\":true,\"max_bytes\":1073741824,\"max_age_days\":0,\
+             \"scope_limits\":[],\"db_path\":null,\"record_topics\":[]}"
+        );
+        assert_eq!(
+            serde_json::to_string(&HistoryConfig::default()).unwrap(),
+            "{\"enabled\":false,\"max_bytes\":1073741824,\"max_age_days\":0,\
+             \"scope_limits\":[],\"db_path\":null,\"record_topics\":[]}"
+        );
     }
 }

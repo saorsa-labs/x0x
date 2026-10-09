@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`[history]` recording and retention rules are parsed and validated (ADR
+  0116 slice A, #1264).** New keys: `dm_recording`, `[[history.class_limits]]`
+  and `[[history.topic_rules]]`. History refuses to open, and x0xd refuses to
+  start (even with `enabled = false`), on a rule ADR 0116 §1 rejects: a
+  duplicate class or prefix, an unknown key or value, a class entry with no
+  bound, an empty or over-long prefix, more than 256 rules, or an
+  overflowing bound. This release does not enforce the rules yet, so it also
+  refuses any rule that would change recording or retention; only a
+  prefix-only topic rule is accepted. With the keys unset nothing changes,
+  and a serialized default `HistoryConfig` is byte-identical.
+
+### Changed
+
+- **Library API (breaking for some embedders; the release that carries this
+  is 0.47.0).** `HistoryConfig` gains three
+  public fields (`dm_recording`, `class_limits`, `topic_rules`) and
+  `HistoryError` gains `InvalidConfig`. Code that lists every
+  `HistoryConfig` field without `..HistoryConfig::default()`, or matches
+  `HistoryError` without a wildcard arm, must be updated.
+
 ### Fixed
 
 - **History retention no longer stops at a bad `scope_limits` entry (#1286).**
