@@ -320,6 +320,17 @@ async fn deliver_public_group_bootstrap(
     state: &AppState,
     obligation: &PublicGroupBootstrapObligation,
 ) -> Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    // #1288: tests park here, still holding the membership lock and the
+    // AppState, the way a v2 application ACK that never arrives does.
+    #[cfg(test)]
+    super::named_groups::detached_send_test_seam::park(
+        &super::named_groups::detached_send_test_seam::public_bootstrap_key(
+            &obligation.group_id,
+            &obligation.recipient_hex,
+        ),
+    )
+    .await;
+
     let recipient = parse_agent_id_hex(&obligation.recipient_hex)
         .map_err(x0x::dm::DmError::EnvelopeConstruction)?;
     if public_group_bootstrap_wire_version(state, &recipient).await
@@ -933,6 +944,12 @@ async fn finish_public_group_bootstrap_obligation_after_ack(
 /// into a hot send loop, and each attempt's backoff has to reach disk before
 /// the next is considered.
 pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<AppState>) {
+    // #1288: a pass that has not started does not start once shutdown has
+    // cancelled the network waits. A pass already inside its write or its
+    // send belongs to the caller's shielded task; this check does not abort it.
+    if state.shutdown_started.is_cancelled() {
+        return;
+    }
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -1050,7 +1067,21 @@ pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<Ap
     let Some(obligation) = due else {
         return;
     };
-    let attempt = deliver_public_group_bootstrap(state, &obligation).await;
+    // #1288: the membership lock stays held from reconciliation through the
+    // ACK and the settlement, so a concurrent frontier mutation cannot land
+    // between them. Shutdown ends the send and skips the settlement write.
+    // The reconciled obligation stays due, and the next start resumes it.
+    let attempt = tokio::select! {
+        biased;
+        () = state.shutdown_started.cancelled() => {
+            tracing::debug!(
+                group_id = %LogHexId::group(&obligation.group_id),
+                "public-group bootstrap delivery stopped; shutdown started"
+            );
+            return;
+        }
+        attempt = deliver_public_group_bootstrap(state, &obligation) => attempt,
+    };
     settle_public_group_bootstrap_attempt(state, &obligation, attempt).await;
 }
 
@@ -1116,9 +1147,13 @@ async fn settle_public_group_bootstrap_attempt(
 /// Nudge the worker so a freshly enqueued obligation does not wait out the
 /// poll interval.
 pub(in crate::server) fn spawn_public_group_bootstrap_delivery(state: &Arc<AppState>) {
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        public_group_bootstrap_outbox_step(&state).await;
+    let task_state = Arc::clone(state);
+    // #1288: the step writes the outbox around a network wait. Shield it so
+    // shutdown awaits that write and never aborts it. A nudge that arrives
+    // after admission has closed is dropped; the obligation is already
+    // durable, and the next start resumes it.
+    state.spawn_shielded(async move {
+        public_group_bootstrap_outbox_step(&task_state).await;
     });
 }
 
