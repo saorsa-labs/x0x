@@ -716,6 +716,11 @@ impl TransportClaims {
         }
     }
 
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<TransportClaim>> {
         self.inner
             .lock()
@@ -755,6 +760,213 @@ fn authenticated_eager_claim(frame: &[u8]) -> Option<(Bytes, TransportMsgId)> {
     verified.then_some((payload, TransportMsgId(message.header.msg_id)))
 }
 
+fn lock_std<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One local subscriber of a shared topic delivery.
+struct LiveSender {
+    id: u64,
+    tx: mpsc::Sender<PubSubNotification>,
+}
+
+/// One PlumTree receiver for a topic, fanned out to every local subscriber.
+///
+/// The forwarder attaches a validated transport id once, then copies that
+/// notification. A per-subscriber claim lookup let the first reader consume
+/// the only id (#869).
+struct TopicDelivery {
+    senders: Mutex<Vec<LiveSender>>,
+    next_sender_id: AtomicU64,
+    changed: tokio::sync::Notify,
+    ready: tokio::sync::watch::Sender<bool>,
+    alive: AtomicBool,
+    stats: Arc<PubSubStats>,
+}
+
+impl TopicDelivery {
+    fn new(stats: Arc<PubSubStats>) -> Arc<Self> {
+        let (ready, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            senders: Mutex::new(Vec::new()),
+            next_sender_id: AtomicU64::new(1),
+            changed: tokio::sync::Notify::new(),
+            ready,
+            alive: AtomicBool::new(true),
+            stats,
+        })
+    }
+
+    fn insert(self: &Arc<Self>, tx: mpsc::Sender<PubSubNotification>) -> u64 {
+        let id = self.next_sender_id.fetch_add(1, Ordering::Relaxed);
+        lock_std(&self.senders).push(LiveSender { id, tx });
+        self.changed.notify_one();
+        id
+    }
+
+    /// Drop this subscriber's sender now, so the forwarder does not keep the
+    /// PlumTree receiver alive until the next payload (#238).
+    fn detach_sender(&self, id: u64) {
+        let mut senders = lock_std(&self.senders);
+        let before = senders.len();
+        senders.retain(|sender| sender.id != id);
+        if senders.len() == before {
+            return;
+        }
+        drop(senders);
+        self.stats
+            .subscriber_task_ended
+            .fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+
+    fn mark_ready(&self) {
+        // `send` drops the value when no receiver exists yet. Joiners
+        // subscribe after the owner has already passed this point.
+        self.ready.send_replace(true);
+    }
+
+    async fn wait_ready(&self) {
+        let mut ready = self.ready.subscribe();
+        loop {
+            if *ready.borrow_and_update() {
+                return;
+            }
+            if ready.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+type TopicDeliveryMap = Mutex<HashMap<TopicId, Arc<TopicDelivery>>>;
+
+struct ClaimedDelivery {
+    slot: Arc<TopicDelivery>,
+    sender_id: u64,
+    /// `true` when this caller must open the PlumTree receiver and run the
+    /// single forwarder. Joiners wait until that receiver is ready.
+    own: bool,
+}
+
+/// Cancels an owner that never started the forwarder, so joiners are not
+/// left waiting on a topic with no PlumTree reader.
+struct OwnerSetup {
+    deliveries: Arc<TopicDeliveryMap>,
+    topic_id: TopicId,
+    slot: Arc<TopicDelivery>,
+    started: bool,
+}
+
+impl Drop for OwnerSetup {
+    fn drop(&mut self) {
+        if self.started {
+            return;
+        }
+        force_close_topic_delivery(&self.deliveries, self.topic_id);
+        self.slot.mark_ready();
+    }
+}
+
+fn force_close_topic_delivery(deliveries: &TopicDeliveryMap, topic_id: TopicId) {
+    let slot = {
+        let mut map = lock_std(deliveries);
+        let Some(slot) = map.remove(&topic_id) else {
+            return;
+        };
+        slot.alive.store(false, Ordering::Release);
+        slot
+    };
+    let senders = std::mem::take(&mut *lock_std(&slot.senders));
+    drop(senders);
+}
+
+/// `true` when this slot has no local subscribers and was removed.
+fn shutdown_delivery_if_idle(
+    deliveries: &TopicDeliveryMap,
+    topic_id: TopicId,
+    slot: &Arc<TopicDelivery>,
+) -> bool {
+    let mut map = lock_std(deliveries);
+    let mut senders = lock_std(&slot.senders);
+    senders.retain(|sender| !sender.tx.is_closed());
+    if !senders.is_empty() {
+        return false;
+    }
+    slot.alive.store(false, Ordering::Release);
+    if map
+        .get(&topic_id)
+        .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        map.remove(&topic_id);
+    }
+    true
+}
+
+fn count_undecoded_deliveries(slot: &TopicDelivery, stats: &PubSubStats, sub_topic: &str) {
+    let waiting = lock_std(&slot.senders).len() as u64;
+    if waiting == 0 {
+        return;
+    }
+    stats.incoming_total.fetch_add(waiting, Ordering::Relaxed);
+    stats
+        .incoming_decode_failed
+        .fetch_add(waiting, Ordering::Relaxed);
+    tracing::warn!(
+        topic = %sub_topic,
+        "[4/6 pubsub] decode_for_delivery returned None, skipping"
+    );
+}
+
+fn deliver_copied_notification(
+    slot: &TopicDelivery,
+    stats: &PubSubStats,
+    sub_topic: &str,
+    notification: &PubSubNotification,
+) {
+    let mut senders = lock_std(&slot.senders);
+    let mut index = 0;
+    while index < senders.len() {
+        stats.incoming_total.fetch_add(1, Ordering::Relaxed);
+        stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            topic = %sub_topic,
+            msg_topic = %notification.message.topic,
+            "[4/6 pubsub] decoded, forwarding to subscriber channel"
+        );
+        match senders[index].tx.try_send(notification.clone()) {
+            Ok(()) => {
+                stats
+                    .delivered_to_subscriber
+                    .fetch_add(1, Ordering::Relaxed);
+                index += 1;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                stats
+                    .slow_subscriber_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                stats
+                    .subscriber_channel_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    topic = %sub_topic,
+                    "[4/6 pubsub] subscriber channel full — dropping slow subscriber"
+                );
+                senders.remove(index);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                stats
+                    .subscriber_channel_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
+                senders.remove(index);
+            }
+        }
+    }
+}
+
 /// Subscription to a topic.
 ///
 /// Receives messages published to its topic through a channel receiver.
@@ -779,6 +991,10 @@ pub struct Subscription {
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
     group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
+    /// Shared per-topic fan-out. `None` for `local:` topics and canceled
+    /// generations. Drop detaches this receiver before the next payload.
+    topic_delivery: Option<Arc<TopicDelivery>>,
+    sender_id: u64,
     #[cfg(test)]
     drop_completed: Arc<AtomicU64>,
 }
@@ -860,6 +1076,9 @@ async fn recv_from_either<T>(
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        if let Some(slot) = self.topic_delivery.take() {
+            slot.detach_sender(self.sender_id);
+        }
         let topic = self.topic.clone();
         let topic_id = self.topic_id;
         let generation = self.generation;
@@ -931,9 +1150,9 @@ impl Drop for Subscription {
 ///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
 ///
 /// Local subscription delivery path:
-///     PlumTree topic receiver → decode x0x payload (v1/v2) → trust filter → subscriber channel
-///     A validated `MessageHeader.msg_id` is attached when the inbound frame
-///     proved one (#869). Absent or ambiguous metadata stays absent.
+///     PlumTree topic receiver → one forwarder attaches a validated
+///     `MessageHeader.msg_id` → that delivery is copied to every local
+///     subscriber (#869). Absent or ambiguous metadata stays absent.
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
@@ -993,6 +1212,9 @@ pub struct PubSubManager {
     local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubNotification>>>>>,
     /// Verified gossip header ids waiting for the matching subscriber delivery (#869).
     transport_claims: Arc<TransportClaims>,
+    /// One PlumTree receiver per topic. The forwarder attaches a validated
+    /// transport id, then copies that delivery to every local subscriber.
+    topic_deliveries: Arc<TopicDeliveryMap>,
     /// Long-lived membership holds so Direct-connect pre-subscribe of a
     /// peer inbox (#380 C4) stays on the subscribed-topic path. The owned
     /// task drains the receiver so a quiet hold cannot fill the channel
@@ -1584,6 +1806,7 @@ impl PubSubManager {
             inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             transport_claims: Arc::new(TransportClaims::default()),
+            topic_deliveries: Arc::new(Mutex::new(HashMap::new())),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
@@ -2022,6 +2245,8 @@ impl PubSubManager {
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+                topic_delivery: None,
+                sender_id: 0,
                 #[cfg(test)]
                 drop_completed: Arc::clone(&self.drop_completed),
             };
@@ -2063,13 +2288,10 @@ impl PubSubManager {
         }
         self.initialize_topic_peers(topic_id).await;
 
-        // The synchronous crate API registers on a detached task. Await the
-        // ready variant so returning this subscription is also the barrier
-        // after which an immediate first publish cannot miss its receiver.
-        let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
+        // The channel exists before the generation check so a canceled
+        // generation returns a closed handle and does not join a newer
+        // generation's PlumTree receiver.
         let (tx, rx) = mpsc::channel(10_000);
-        let contacts = self.contacts.get().cloned();
-        let revocation_set = self.revocation_set.get().cloned();
 
         let active_generation = {
             let _name_guard = self
@@ -2101,6 +2323,7 @@ impl PubSubManager {
                 self.plumtree
                     .set_topic_preferred_eager_set(topic_id, &[])
                     .await;
+                force_close_topic_delivery(&self.topic_deliveries, topic_id);
                 let _ = self.plumtree.unsubscribe(topic_id).await;
                 false
             } else {
@@ -2110,9 +2333,8 @@ impl PubSubManager {
             }
         };
         if !active_generation {
-            // subscribe_ready may have appended a sender to a newer topic.
-            // Drop only this receiver and return a closed local handle.
-            drop(plumtree_rx);
+            // A newer generation owns this topic, or unsubscribe won.
+            // This handle must not join that generation's fan-out.
             drop(tx);
             return Subscription {
                 topic,
@@ -2125,6 +2347,8 @@ impl PubSubManager {
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+                topic_delivery: None,
+                sender_id: 0,
                 #[cfg(test)]
                 drop_completed: Arc::clone(&self.drop_completed),
             };
@@ -2151,100 +2375,94 @@ impl PubSubManager {
             });
         }
 
-        let sub_topic = topic.clone();
-        let stats = Arc::clone(&self.stats);
-        let transport_claims = Arc::clone(&self.transport_claims);
-        tokio::spawn(async move {
-            loop {
-                let received = tokio::select! {
-                    // The subscriber dropping its receiver must end this
-                    // forwarding task PROMPTLY, even on a forever-quiet
-                    // topic — parking on recv() alone only notices the
-                    // closed downstream when the next message arrives, so
-                    // every discarded subscription would pin a task and its
-                    // PlumTree registration indefinitely (issue #238
-                    // round-5 review: registration rollbacks on unique
-                    // topics leaked these unboundedly). Both arms are
-                    // cancel-safe.
-                    () = tx.closed() => {
-                        // Lifecycle, not loss: no message was decoded for this
-                        // event, so counting it as a decode→delivery drop drove
-                        // that metric negative once per discarded subscription
-                        // (issue #600 / H3).
-                        stats
-                            .subscriber_task_ended
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            topic = %sub_topic,
-                            "[4/6 pubsub] subscriber receiver dropped — ending forwarding task"
-                        );
+        let claimed = self.claim_topic_delivery(topic_id, tx);
+        if claimed.own {
+            // One receiver per topic. Returning this owner is the barrier
+            // after which an immediate publish cannot miss the fan-out.
+            // Joiners wait on the same barrier. The id is attached once,
+            // then the notification is copied (#869). Dropping the last
+            // sender ends this task promptly so the PlumTree registration
+            // is not pinned on a quiet topic (#238).
+            let contacts = self.contacts.get().cloned();
+            let revocation_set = self.revocation_set.get().cloned();
+            let mut setup = OwnerSetup {
+                deliveries: Arc::clone(&self.topic_deliveries),
+                topic_id,
+                slot: Arc::clone(&claimed.slot),
+                started: false,
+            };
+            let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
+            let slot = Arc::clone(&claimed.slot);
+            let deliveries = Arc::clone(&self.topic_deliveries);
+            let stats = Arc::clone(&self.stats);
+            let transport_claims = Arc::clone(&self.transport_claims);
+            let sub_topic = topic.clone();
+            tokio::spawn(async move {
+                loop {
+                    if !slot.alive.load(Ordering::Acquire) {
                         return;
                     }
-                    received = plumtree_rx.recv() => received,
-                };
-                let Some((peer, encoded_payload)) = received else {
-                    return;
-                };
-                // Join before decode. A claim that matches this delivery is
-                // consumed even when the x0x envelope is later dropped, so it
-                // cannot stick to a later payload with the same bytes.
-                let transport_msg_id = transport_claims.take_unique(peer, &encoded_payload);
-                stats.incoming_total.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    topic = %sub_topic,
-                    payload_len = encoded_payload.len(),
-                    "[4/6 pubsub] received from PlumTree, decoding"
-                );
-                let Some(message) = decode_for_delivery(
-                    encoded_payload,
-                    contacts.as_ref(),
-                    revocation_set.as_ref(),
-                )
-                .await
-                else {
-                    stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        topic = %sub_topic,
-                        "[4/6 pubsub] decode_for_delivery returned None, skipping"
-                    );
-                    continue;
-                };
-                stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    topic = %sub_topic,
-                    msg_topic = %message.topic,
-                    "[4/6 pubsub] decoded, forwarding to subscriber channel"
-                );
-                let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
-                match tx.try_send(notification) {
-                    Ok(()) => {
-                        stats
-                            .delivered_to_subscriber
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        stats
-                            .slow_subscriber_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .subscriber_channel_closed
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            topic = %sub_topic,
-                            "[4/6 pubsub] subscriber channel full — dropping slow subscriber"
-                        );
-                        break;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        stats
-                            .subscriber_channel_closed
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::info!(topic = %sub_topic, "[4/6 pubsub] subscriber channel closed");
-                        break;
+                    tokio::select! {
+                        biased;
+                        _ = slot.changed.notified() => {
+                            if shutdown_delivery_if_idle(&deliveries, topic_id, &slot) {
+                                tracing::debug!(
+                                    topic = %sub_topic,
+                                    "[4/6 pubsub] subscriber receiver dropped — ending forwarding task"
+                                );
+                                return;
+                            }
+                        }
+                        received = plumtree_rx.recv() => {
+                            let Some((peer, encoded_payload)) = received else {
+                                force_close_topic_delivery(&deliveries, topic_id);
+                                return;
+                            };
+                            // Take the claim once, before this delivery is
+                            // copied. A later decode drop still consumes it
+                            // so it cannot stick to a later payload.
+                            let transport_msg_id =
+                                transport_claims.take_unique(peer, &encoded_payload);
+                            tracing::debug!(
+                                topic = %sub_topic,
+                                payload_len = encoded_payload.len(),
+                                "[4/6 pubsub] received from PlumTree, decoding"
+                            );
+                            match decode_for_delivery(
+                                encoded_payload,
+                                contacts.as_ref(),
+                                revocation_set.as_ref(),
+                            )
+                            .await
+                            {
+                                Some(message) => {
+                                    let notification = PubSubNotification::with_transport_id(
+                                        message,
+                                        transport_msg_id,
+                                    );
+                                    deliver_copied_notification(
+                                        &slot,
+                                        &stats,
+                                        &sub_topic,
+                                        &notification,
+                                    );
+                                }
+                                None => count_undecoded_deliveries(&slot, &stats, &sub_topic),
+                            }
+                            if !slot.alive.load(Ordering::Acquire)
+                                || shutdown_delivery_if_idle(&deliveries, topic_id, &slot)
+                            {
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
+            claimed.slot.mark_ready();
+            setup.started = true;
+        } else {
+            claimed.slot.wait_ready().await;
+        }
 
         Subscription {
             topic,
@@ -2257,6 +2475,8 @@ impl PubSubManager {
             group_topic_by_id: Arc::clone(&self.group_topic_by_id),
             plumtree: Arc::clone(&self.plumtree),
             group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+            topic_delivery: Some(Arc::clone(&claimed.slot)),
+            sender_id: claimed.sender_id,
             #[cfg(test)]
             drop_completed: Arc::clone(&self.drop_completed),
         }
@@ -2558,12 +2778,18 @@ impl PubSubManager {
         if self.refuse_leaf_unsubscribed_passthrough(ordinary_frame, &data) {
             return;
         }
-        // Record a verified header id before PlumTree can deliver the payload.
-        // `Err` means the frame was not admitted, so the claim must not wait.
-        // `Ok` leaves the claim for the subscriber task (duplicates that
-        // return `Ok` without a delivery expire with the claim TTL).
-        let transport_ticket = authenticated_eager_claim(&data)
-            .map(|(payload, msg_id)| self.transport_claims.offer(peer, payload, msg_id));
+        // Record a verified header id before PlumTree can deliver the payload,
+        // and only when a local subscriber will read it. A Full relay with no
+        // subscriber used to decode, hash, and check a signature to cache an
+        // id nobody consumes (#869). `Err` from dispatch releases the ticket.
+        // `Ok` leaves the claim for the one topic forwarder.
+        let transport_ticket =
+            if ordinary_frame.is_some_and(|header| self.has_local_subscriber(header.topic)) {
+                authenticated_eager_claim(&data)
+                    .map(|(payload, msg_id)| self.transport_claims.offer(peer, payload, msg_id))
+            } else {
+                None
+            };
         // #674 C2/C3: first sight of a topic id on the inbound path
         // installs the relay fan-out composite validator. On a Full relay
         // this is the ONLY way an unconsumed topic (never passed through
@@ -2604,6 +2830,40 @@ impl PubSubManager {
                 "Failed to handle PlumTree pubsub message from {}: {e}",
                 crate::logging::LogPeerId::from(peer)
             );
+        }
+    }
+
+    fn has_local_subscriber(&self, topic: TopicId) -> bool {
+        self.subscribed_topic_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&topic)
+    }
+
+    fn claim_topic_delivery(
+        &self,
+        topic_id: TopicId,
+        tx: mpsc::Sender<PubSubNotification>,
+    ) -> ClaimedDelivery {
+        let mut map = lock_std(&self.topic_deliveries);
+        if let Some(slot) = map.get(&topic_id).cloned() {
+            if slot.alive.load(Ordering::Acquire) {
+                let sender_id = slot.insert(tx);
+                return ClaimedDelivery {
+                    slot,
+                    sender_id,
+                    own: false,
+                };
+            }
+            map.remove(&topic_id);
+        }
+        let slot = TopicDelivery::new(Arc::clone(&self.stats));
+        let sender_id = slot.insert(tx);
+        map.insert(topic_id, Arc::clone(&slot));
+        ClaimedDelivery {
+            slot,
+            sender_id,
+            own: true,
         }
     }
 
@@ -2681,6 +2941,9 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&topic_id);
+        // Close local senders while this topic lock is still held, so a
+        // resubscribe cannot join a receiver that PlumTree is about to drop.
+        force_close_topic_delivery(&self.topic_deliveries, topic_id);
         self.clear_group_topic_preference_locked(topic_id).await;
         if let Err(e) = self.plumtree.unsubscribe(topic_id).await {
             tracing::debug!("PlumTree unsubscribe failed for topic '{topic}': {e}");
@@ -9148,5 +9411,97 @@ mod issue869 {
         claims.offer(peer, payload.clone(), id_a);
         assert!(claims.take_unique(other, &payload).is_none());
         assert_eq!(claims.take_unique(peer, &payload), Some(id_a));
+    }
+
+    async fn test_node() -> Arc<NetworkNode> {
+        Arc::new(
+            NetworkNode::new(
+                crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..crate::network::NetworkConfig::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("test node"),
+        )
+    }
+
+    fn eager_frame(payload: &'static [u8], msg_id: [u8; 32]) -> (Bytes, TransportMsgId) {
+        let app = Bytes::from_static(payload);
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
+        let inner = signed_inner_v2(&author, "issue869", &app);
+        let frame = outer_v2_frame(TopicId::from_entity(b"issue869"), inner, msg_id);
+        let (_payload, id) = authenticated_eager_claim(&frame).expect("validated header id");
+        (frame, id)
+    }
+
+    async fn recv_note(sub: &mut Subscription) -> PubSubNotification {
+        tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv_notification())
+            .await
+            .expect("subscription timed out")
+            .expect("subscription closed")
+    }
+
+    #[tokio::test]
+    async fn two_subscriptions_on_one_topic_see_the_same_transport_id() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let mut first = manager.subscribe("issue869".to_string()).await;
+        let mut second = manager.subscribe("issue869".to_string()).await;
+        let peer = PeerId::new([7; 32]);
+        let (frame_a, id_a) = eager_frame(b"one", [0x11; 32]);
+        manager.handle_incoming(peer, None, frame_a).await;
+
+        let left = recv_note(&mut first).await;
+        let right = recv_note(&mut second).await;
+        assert_eq!(left.transport_msg_id, Some(id_a));
+        assert_eq!(
+            right.transport_msg_id,
+            Some(id_a),
+            "the second subscription must see the id the first reader used to consume"
+        );
+        assert_eq!(left.message.payload, right.message.payload);
+        assert_ne!(
+            id_a.as_bytes(),
+            HistoryRecord::compute_msg_id(None, &left.message.payload),
+            "the transport id is not HistoryRecord.msg_id"
+        );
+
+        drop(first);
+        let (frame_b, id_b) = eager_frame(b"two", [0x22; 32]);
+        assert_ne!(id_a, id_b);
+        manager.handle_incoming(peer, None, frame_b).await;
+        let only = recv_note(&mut second).await;
+        assert_eq!(only.transport_msg_id, Some(id_b));
+        assert_eq!(only.message.payload.as_ref(), b"two");
+    }
+
+    #[tokio::test]
+    async fn full_relay_without_local_subscribers_skips_transport_claim() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "relay",
+        )
+        .expect("manager");
+        let (frame, _id) = eager_frame(b"unread", [0x33; 32]);
+        assert!(
+            authenticated_eager_claim(&frame).is_some(),
+            "the fixture itself is a validated eager frame"
+        );
+        manager
+            .handle_incoming(PeerId::new([7; 32]), None, frame)
+            .await;
+        assert_eq!(
+            manager.transport_claims.len(),
+            0,
+            "a Full relay with no local subscriber must not cache a transport id"
+        );
     }
 }
