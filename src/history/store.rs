@@ -6928,6 +6928,124 @@ mod tests {
         assert_eq!(b_tags(&store), expected);
     }
 
+    /// A store over a database file first created with text `encoding` and
+    /// closed, then opened through `Store::open`, the way an externally
+    /// created or restored database arrives (Codex B review r2).
+    fn b_store_with_encoding(encoding: &str) -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA encoding = '{encoding}'; CREATE TABLE seed(x);"
+            ))
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        (store, dir)
+    }
+
+    /// Codex B review r2 (P2): the topic predicate compares UTF-8 bytes, but
+    /// `CAST(scope_id AS BLOB)` yields the database's own text encoding. On
+    /// a UTF-16 database the rule "a" matched the unrelated topic "š"
+    /// (UTF-16LE 61 01) or "愀" (UTF-16BE 61 00), and its age or budget
+    /// deleted it. Bounded topic rules must fail closed on a non-UTF-8
+    /// database: no row is deleted by them, on either path. The UTF-8 arm is
+    /// the control: "a.x" is the rule's row, and the other topic stays.
+    #[test]
+    fn adr0116_b_topic_rules_fail_closed_on_a_non_utf8_database() {
+        for (encoding, unrelated) in [("UTF-8", "š"), ("UTF-16le", "š"), ("UTF-16be", "愀")] {
+            for path in ["age", "budget"] {
+                let (store, _dir) = b_store_with_encoding(encoding);
+                b_insert(
+                    &store,
+                    vec![
+                        b_row("a.x", b_topic("a.x"), 64, 1, None),
+                        b_row(unrelated, b_topic(unrelated), 64, 1, None),
+                    ],
+                );
+                let rule = if path == "age" {
+                    ("a", None, Some(1))
+                } else {
+                    ("a", Some(0), None)
+                };
+                let rules = b_rules(&[], &[rule]);
+                store
+                    .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                    .unwrap();
+                let expected = if encoding == "UTF-8" {
+                    b_sorted(&[unrelated])
+                } else {
+                    b_sorted(&["a.x", unrelated])
+                };
+                assert_eq!(b_tags(&store), expected, "{encoding}, {path} path");
+            }
+        }
+    }
+
+    /// On a non-UTF-8 database every phase that does not match topic names
+    /// behaves as before: here the Durable class age and an exact-scope
+    /// limit. The fixture's survivors are fixed, not page-size dependent.
+    #[test]
+    fn adr0116_b_non_utf8_database_keeps_every_other_phase() {
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let (store, _dir) = b_store_with_encoding(encoding);
+            let now = now_ms();
+            b_insert(
+                &store,
+                vec![
+                    b_row("old", b_dm(), 64, now - 10 * B_DAY_MS, None),
+                    b_row("new", b_dm(), 64, now - B_DAY_MS, None),
+                    b_row("g1", Scope::Group("g".into()), 64, now - B_DAY_MS, None),
+                    b_row("g2", Scope::Group("g".into()), 64, now - B_DAY_MS + 1, None),
+                ],
+            );
+            let policy = RetentionPolicy {
+                scope_limits: vec![ScopeLimit {
+                    scope: "group:g".into(),
+                    max_bytes: 0,
+                }],
+                ..b_no_global()
+            };
+            let rules = b_rules(&[(RetainedClass::Durable, None, Some(7))], &[]);
+            store
+                .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["new"]), "{encoding}");
+        }
+    }
+
+    /// Validation row 1 on a non-UTF-8 database: with no rule it opens and
+    /// retains exactly as before (global age and exact-scope limit).
+    #[test]
+    fn adr0116_b_non_utf8_database_without_rules_is_unchanged() {
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let (store, _dir) = b_store_with_encoding(encoding);
+            let now = now_ms();
+            b_insert(
+                &store,
+                vec![
+                    b_row("old", b_topic("a.x"), 64, now - 40 * B_DAY_MS, None),
+                    b_row("new", b_topic("a.x"), 64, now - B_DAY_MS, None),
+                    b_row("card", b_dm(), 64, 1, Some("agent-card:x")),
+                    b_row("g1", Scope::Group("g".into()), 64, now - B_DAY_MS, None),
+                ],
+            );
+            let policy = RetentionPolicy {
+                max_bytes: u64::MAX,
+                max_age_days: 30,
+                scope_limits: vec![ScopeLimit {
+                    scope: "group:g".into(),
+                    max_bytes: 0,
+                }],
+            };
+            store
+                .retain_with_pins(&policy, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["new", "card"]), "{encoding}");
+        }
+    }
+
     fn b_trace(store: &Store) -> Vec<&'static str> {
         store.test_phase_trace.lock().unwrap().clone()
     }

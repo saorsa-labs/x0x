@@ -790,6 +790,73 @@ mod tests {
         let _ = reaper.await;
     }
 
+    /// Codex B review r2 (controller decision): bounded topic rules need a
+    /// UTF-8 database, so `open` refuses them on a database created with
+    /// another text encoding, after `Store::open` and with no other file
+    /// change. Everything else still opens there: no rule, a class limit, a
+    /// prefix-only topic rule.
+    #[test]
+    fn adr0116_open_refuses_topic_limits_on_a_non_utf8_database() {
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("history.db");
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA encoding = '{encoding}'; CREATE TABLE seed(x);"
+                ))
+                .unwrap();
+            }
+            let open = |config: HistoryConfig| {
+                HistoryService::open(
+                    &HistoryConfig {
+                        enabled: true,
+                        db_path: Some(db.clone()),
+                        ..config
+                    },
+                    dir.path(),
+                )
+                .map(drop)
+            };
+            let bounded = HistoryConfig {
+                topic_rules: vec![TopicRule {
+                    prefix: "app.".into(),
+                    recording: TopicRecording::Inherit,
+                    max_bytes: None,
+                    max_age_days: Some(3),
+                }],
+                ..HistoryConfig::default()
+            };
+            match open(bounded) {
+                Err(crate::error::HistoryError::InvalidConfig(message)) => assert!(
+                    message.contains("UTF-8"),
+                    "{encoding}: the refusal names the encoding need: {message}"
+                ),
+                other => panic!("{encoding}: topic limits must be refused, got {other:?}"),
+            }
+            open(HistoryConfig::default()).unwrap();
+            open(HistoryConfig {
+                class_limits: vec![ClassLimit {
+                    class: RetainedClass::Durable,
+                    max_bytes: None,
+                    max_age_days: Some(7),
+                }],
+                ..HistoryConfig::default()
+            })
+            .unwrap();
+            open(HistoryConfig {
+                topic_rules: vec![TopicRule {
+                    prefix: "app.".into(),
+                    recording: TopicRecording::Inherit,
+                    max_bytes: None,
+                    max_age_days: None,
+                }],
+                ..HistoryConfig::default()
+            })
+            .unwrap();
+        }
+    }
+
     /// Validation row 1 (defaults): the new keys are omitted from a
     /// serialized default config, so its bytes do not change.
     #[test]
