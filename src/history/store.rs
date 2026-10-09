@@ -5616,6 +5616,174 @@ mod tests {
             "32 concurrent passes, one warning: {text}"
         );
     }
+
+    // ── Eviction characterization (ADR 0116 Validation row 1) ───────────
+    //
+    // Pins what main's retention does today to a fixed seeded database
+    // with no ADR 0116 rule: the rows it stores and the rows that survive
+    // four passes. It uses only APIs that exist on main, and it must stay
+    // green through every ADR 0116 slice. The digests leave out
+    // `seen_at_ms`, because the "recent" rows are stamped relative to the
+    // real clock; every other stored column that retention reads is in.
+
+    /// One characterization row tagged `tag`; replaceable under
+    /// `replace_key` when given.
+    fn char_row(
+        tag: &str,
+        scope: Scope,
+        len: usize,
+        seen_at_ms: i64,
+        replace_key: Option<String>,
+    ) -> HistoryRecord {
+        let mut payload = format!("{tag}|").into_bytes();
+        if payload.len() < len {
+            payload.resize(len, b'x');
+        }
+        let mut row = rec(&payload, scope);
+        row.seen_at_ms = seen_at_ms;
+        row.sent_at_ms = seen_at_ms;
+        row.replace_key = replace_key;
+        row
+    }
+
+    /// The fixed fixture: 240 Durable rows over four scopes (a DM, a group
+    /// with an exact-scope limit, a pinned group, a topic), half a century
+    /// old and half a day old; 20 Replaceable agent cards, all old; 30
+    /// unsigned MLS rows, all recent.
+    fn char_fixture(store: &Store) {
+        let now = now_ms();
+        let day = 86_400_000_i64;
+        for i in 0..240_i64 {
+            let scope = match i % 4 {
+                0 => Scope::Dm("ab".repeat(32)),
+                1 => Scope::Group("g1".into()),
+                2 => Scope::Group("pin-stable".into()),
+                _ => Scope::Topic("app.chat".into()),
+            };
+            let seen = if i % 2 == 0 { 1_000 + i } else { now - day + i };
+            let len = 300 + (i as usize % 7) * 50;
+            let row = char_row(&format!("d{i:03}"), scope, len, seen, None);
+            assert_eq!(store.insert(&row).unwrap(), InsertOutcome::Inserted);
+        }
+        for i in 0..20_i64 {
+            let row = char_row(
+                &format!("r{i:02}"),
+                Scope::Dm("cd".repeat(32)),
+                400,
+                1_000 + i,
+                Some(format!("agent-card:{i}")),
+            );
+            assert_eq!(store.insert(&row).unwrap(), InsertOutcome::Inserted);
+        }
+        for i in 0..30_u64 {
+            let mut row = mls_rec("g1", i, format!("m{i:02}|mls plaintext body").as_bytes());
+            row.seen_at_ms = now - day + i as i64;
+            assert_eq!(store.insert(&row).unwrap(), InsertOutcome::Inserted);
+        }
+    }
+
+    /// Digest of every stored row's retention-relevant columns, in
+    /// `msg_id` order, plus the row counts by class.
+    fn char_digest(store: &Store) -> (String, i64, i64) {
+        let guard = lock_conn(&store.conn).unwrap();
+        let mut stmt = guard
+            .prepare(
+                "SELECT msg_id, scope_kind, scope_id, COALESCE(replace_key, ''), \
+                 LENGTH(payload), LENGTH(COALESCE(signed_artifact, x'')), provenance \
+                 FROM history ORDER BY msg_id",
+            )
+            .unwrap();
+        let mut hasher = blake3::Hasher::new();
+        let mut durable = 0_i64;
+        let mut replaceable = 0_i64;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            let (msg_id, kind, scope_id, replace_key, payload_len, artifact_len, provenance) =
+                row.unwrap();
+            if replace_key.is_empty() {
+                durable += 1;
+            } else {
+                replaceable += 1;
+            }
+            hasher.update(&msg_id);
+            hasher.update(
+                format!(
+                    "|{kind}|{scope_id}|{replace_key}|{payload_len}|{artifact_len}|{provenance}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        (hasher.finalize().to_hex().to_string(), durable, replaceable)
+    }
+
+    /// Validation row 1: with no ADR 0116 rule, main's stored rows and
+    /// eviction results for the fixed fixture. Global 30-day age, global
+    /// cap at two thirds of the settled live size, a 12 000-byte limit on
+    /// `group:g1`, and `group:pin-stable` pinned under both spellings.
+    #[test]
+    fn default_policy_eviction_characterization() {
+        let (store, _dir) = open();
+        char_fixture(&store);
+        assert_eq!(
+            char_digest(&store),
+            (CHAR_STORED_DIGEST.to_string(), 270, 20),
+            "stored rows differ from main"
+        );
+        settle(&store);
+        let live = store.live_bytes().unwrap();
+        let policy = RetentionPolicy {
+            max_bytes: live - live / 3,
+            max_age_days: 30,
+            scope_limits: vec![ScopeLimit {
+                scope: "group:g1".into(),
+                max_bytes: 12_000,
+            }],
+        };
+        let pins = PinnedScopes::from_canonical(["group:pin-alias", "group:pin-stable"]);
+        let mut evicted = 0;
+        let mut pinned_evicted = 0;
+        for _ in 0..4 {
+            let outcome = store.retain_with_pins(&policy, &pins).unwrap();
+            evicted += outcome.evicted;
+            pinned_evicted += outcome.pinned_evicted;
+        }
+        let (survivors, durable, replaceable) = char_digest(&store);
+        assert_eq!(
+            (
+                survivors.as_str(),
+                durable,
+                replaceable,
+                evicted,
+                pinned_evicted
+            ),
+            CHAR_EVICTION_RESULT,
+            "eviction results differ from main"
+        );
+    }
+
+    /// Captured on main's retention code (see `default_policy_eviction_characterization`).
+    const CHAR_STORED_DIGEST: &str =
+        "17b2be45fd7ce143dd67e8e55327d7354d6aa4223beff505a40f5d722d109e4c";
+    /// `(survivor digest, durable rows, replaceable rows, evicted, pinned_evicted)`.
+    const CHAR_EVICTION_RESULT: (&str, i64, i64, u64, u64) = (
+        "4a41fb72f8769ed56af29fb5ec9884a476e66dd9724bff5bb5dce0d3d44b8f40",
+        99,
+        20,
+        171,
+        21,
+    );
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
