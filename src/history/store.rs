@@ -18,6 +18,7 @@ use crate::error::{HistoryError, HistoryResult};
 
 use super::policy::{CompiledTopicRule, HistoryPolicy, RetainedClass};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
+use super::trim::{RetainDeleted, RetainError, RetainReport, RetainState, RetainStop, TrimBudget};
 
 /// Current schema version (forward-only migrations).
 const SCHEMA_VERSION: i64 = 4;
@@ -436,6 +437,26 @@ pub struct Store {
     /// order. Absent in production builds.
     #[cfg(test)]
     test_phase_trace: Mutex<Vec<&'static str>>,
+    /// ADR 0116 slice D test hook: the rows of each committed delete
+    /// statement of the latest trim, in order. Absent in production builds.
+    #[cfg(test)]
+    test_trim_batches: Mutex<Vec<u64>>,
+    /// ADR 0116 slice D test hook: the next trim delete statement takes this
+    /// many extra milliseconds INSIDE its statement window (after the
+    /// budget check that admitted it): the in-flight overrun. One-shot.
+    #[cfg(test)]
+    test_trim_slow_ms: AtomicU64,
+    /// ADR 0116 slice D test hook: `n + 1` makes the trim delete statement
+    /// after `n` committed ones fail with a real SQLite error. 0 = off.
+    #[cfg(test)]
+    test_trim_fail_after: AtomicU64,
+    /// ADR 0116 slice D test hook: a trim parks after admission, holding the
+    /// retention lock and the connection, while this is set.
+    #[cfg(test)]
+    test_pause_trim: AtomicBool,
+    /// Set while a trim is parked by `test_pause_trim`.
+    #[cfg(test)]
+    test_trim_parked: AtomicBool,
     /// Dropped after `conn` (fields drop in declaration order, and rusqlite
     /// closes the connection, closing checkpoint included, synchronously in
     /// its `Drop`): in test builds it marks the close complete; zero-sized
@@ -526,6 +547,16 @@ impl Store {
             test_rule_now_ms: std::sync::atomic::AtomicI64::new(0),
             #[cfg(test)]
             test_phase_trace: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_trim_batches: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_trim_slow_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            test_trim_fail_after: AtomicU64::new(0),
+            #[cfg(test)]
+            test_pause_trim: AtomicBool::new(false),
+            #[cfg(test)]
+            test_trim_parked: AtomicBool::new(false),
             _after_close: after_close,
         })
     }
@@ -1804,6 +1835,22 @@ impl Store {
             }
         }
         Ok((written, dups))
+    }
+
+    /// ADR 0116 §4: one bounded trim (RED stub: deletes nothing).
+    pub(crate) fn trim(
+        &self,
+        _policy: &RetentionPolicy,
+        _rules: &HistoryPolicy,
+        _pinned: &PinnedScopes,
+        budget: &TrimBudget<'_>,
+    ) -> Result<RetainReport, RetainError> {
+        Ok(RetainReport::new(
+            RetainState::Complete,
+            RetainDeleted::default(),
+            budget.started.elapsed(),
+            None::<RetainStop>,
+        ))
     }
 }
 
@@ -7304,6 +7351,735 @@ mod tests {
             assert_eq!(b_tags(&store), b_sorted(&["at"]));
         }
     }
+
+    // ── ADR 0116 slice D: the bounded runtime trim (§4) ─────────────────
+
+    fn d_budget(max_rows: u64, budget_ms: u64, cancel: &AtomicBool) -> TrimBudget<'_> {
+        let started = std::time::Instant::now();
+        TrimBudget {
+            max_rows,
+            started,
+            deadline: started + std::time::Duration::from_millis(budget_ms),
+            cancel,
+        }
+    }
+
+    fn d_trim(
+        store: &Store,
+        policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
+        pins: &PinnedScopes,
+        max_rows: u64,
+    ) -> Result<RetainReport, RetainError> {
+        let cancel = AtomicBool::new(false);
+        store.trim(policy, rules, pins, &d_budget(max_rows, 10_000, &cancel))
+    }
+
+    /// The global age bound alone, `days` long; no byte cap.
+    fn d_age(days: u64) -> RetentionPolicy {
+        RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: days,
+            scope_limits: Vec::new(),
+        }
+    }
+
+    fn d_rows(store: &Store) -> i64 {
+        store.table_counts_for_tests().0
+    }
+
+    /// Rows older than any age bound in these fixtures (seeded at a few ms
+    /// after the epoch).
+    fn d_ancient_rows(store: &Store) -> i64 {
+        let guard = lock_conn(&store.conn).unwrap();
+        guard
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE seen_at_ms < 1000000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn d_wait(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// ADR 0116 §4, Validation "Runtime bounds": a trim deletes at most
+    /// `max_rows`, at most 256 rows per transaction, and that includes the
+    /// age bound (the reaper's age bound is one statement). It stops at a
+    /// committed boundary with `more_work`; a later trim completes.
+    #[test]
+    fn adr0116_d_trim_caps_max_rows_and_batches_age_eviction() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 2_000, 16, 101, 1);
+        let none = HistoryPolicy::default();
+        let report = d_trim(&store, &d_age(1), &none, &PinnedScopes::none(), 1_000).unwrap();
+        assert_eq!(report.deleted, 1_000);
+        assert_eq!(report.deleted_by_phase.global_age, 1_000);
+        assert_eq!(report.state, RetainState::MoreWork);
+        assert_eq!(report.stopped_by, Some(RetainStop::RowBudget));
+        assert_eq!(d_rows(&store), 1_000, "every counted row is committed");
+        let batches = store.trim_batches_for_tests();
+        assert_eq!(batches.iter().sum::<u64>(), 1_000);
+        assert!(batches.iter().all(|&b| b <= 256), "{batches:?}");
+        assert_eq!(batches.len(), 4, "{batches:?}");
+
+        let report = d_trim(&store, &d_age(1), &none, &PinnedScopes::none(), 65_536).unwrap();
+        assert_eq!(report.deleted, 1_000);
+        assert_eq!(report.state, RetainState::Complete);
+        assert_eq!(report.stopped_by, None);
+        assert_eq!(d_rows(&store), 0);
+        assert!(store.trim_batches_for_tests().iter().all(|&b| b <= 256));
+    }
+
+    /// The class and topic ages are batched the same way.
+    #[test]
+    fn adr0116_d_rule_ages_are_batched() {
+        for rules in [
+            b_rules(&[(RetainedClass::Durable, None, Some(1))], &[]),
+            b_rules(&[], &[("app", None, Some(1))]),
+        ] {
+            let (store, _dir) = open();
+            seed_tiny_rows(&store, &Scope::Topic("app.x".into()), 600, 16, 102, 1);
+            let report = d_trim(
+                &store,
+                &b_no_global(),
+                &rules,
+                &PinnedScopes::none(),
+                65_536,
+            )
+            .unwrap();
+            assert_eq!(report.deleted_by_phase.rule_ages, 600);
+            assert_eq!(report.deleted, 600);
+            assert_eq!(report.state, RetainState::Complete);
+            assert_eq!(store.trim_batches_for_tests(), vec![256, 256, 88]);
+        }
+    }
+
+    /// §4: pin-ceiling deletions count against `max_rows`, and the ceiling
+    /// path still stops at the ceiling, never below it.
+    #[test]
+    fn adr0116_d_pin_ceiling_deletions_count_against_max_rows() {
+        let (store, _dir) = open();
+        let pinned = Scope::Group("pin".into());
+        seed_tiny_rows(&store, &pinned, 300, 100, 103, now_ms() - 60_000);
+        let policy = RetentionPolicy {
+            max_bytes: 64_000,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        assert_eq!(Store::pinned_ceiling(&policy, &pinned), 4_000);
+        let pins = PinnedScopes::from_canonical(["group:pin"]);
+        let none = HistoryPolicy::default();
+        let report = d_trim(&store, &policy, &none, &pins, 50).unwrap();
+        assert_eq!(report.pin_ceiling_deleted, 50);
+        assert_eq!(report.deleted_by_phase.pin_ceilings, 50);
+        assert_eq!(report.deleted, 50);
+        assert_eq!(report.stopped_by, Some(RetainStop::RowBudget));
+        assert_eq!(report.state, RetainState::MoreWork);
+
+        let report = d_trim(&store, &policy, &none, &pins, 65_536).unwrap();
+        assert_eq!(report.pin_ceiling_deleted, 210);
+        assert_eq!(scope_payload_bytes(&store, &pinned), 4_000);
+    }
+
+    /// §4 phase fairness: repeated small trims cannot starve later phases.
+    /// A 500-row age backlog comes first in phase order; with `max_rows = 1`
+    /// a trim that always restarted at the first phase would spend every
+    /// call there. The cursor gives each phase its turn.
+    #[test]
+    fn adr0116_d_repeated_small_trims_reach_every_phase() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        seed_tiny_rows(&store, &Scope::Topic("aged".into()), 500, 16, 104, 1);
+        let mut rows = Vec::new();
+        for i in 0..30_i64 {
+            let key = format!("state-key:{i}");
+            rows.push(b_row(
+                &format!("r{i}"),
+                b_topic("state"),
+                100,
+                now - 10_000 + i,
+                Some(key.as_str()),
+            ));
+        }
+        for i in 0..50_i64 {
+            rows.push(b_row(
+                &format!("s{i}"),
+                b_topic("scoped"),
+                100,
+                now - 10_000 + i,
+                None,
+            ));
+        }
+        b_insert(&store, rows);
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 1,
+            scope_limits: vec![ScopeLimit {
+                scope: "topic:scoped".into(),
+                max_bytes: 1_000,
+            }],
+        };
+        let rules = b_rules(&[(RetainedClass::Replaceable, Some(500), None)], &[]);
+        let mut total = RetainDeleted::default();
+        for call in 0..30 {
+            let report = d_trim(&store, &policy, &rules, &PinnedScopes::none(), 1).unwrap();
+            assert_eq!(report.deleted, 1, "call {call}");
+            let d = report.deleted_by_phase;
+            total.global_age += d.global_age;
+            total.class_budgets += d.class_budgets;
+            total.scope_budgets += d.scope_budgets;
+        }
+        assert!(
+            total.global_age >= 5 && total.class_budgets >= 5 && total.scope_budgets >= 5,
+            "every phase with work gets turns: {total:?}"
+        );
+    }
+
+    /// §4: caller cancellation stops new batches at the next boundary. The
+    /// batch in flight when the caller leaves completes and is counted.
+    #[test]
+    fn adr0116_d_cancellation_stops_at_the_next_boundary() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 2_000, 16, 105, 1);
+        store.slow_next_trim_delete_for_tests(300);
+        let cancel = AtomicBool::new(false);
+        let none = HistoryPolicy::default();
+        let report = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            store.trim(
+                &d_age(1),
+                &none,
+                &PinnedScopes::none(),
+                &d_budget(65_536, 10_000, &cancel),
+            )
+        })
+        .unwrap();
+        assert_eq!(report.stopped_by, Some(RetainStop::Cancelled));
+        assert_eq!(report.state, RetainState::MoreWork);
+        assert_eq!(
+            report.deleted, 256,
+            "only the batch in flight when the caller left"
+        );
+        assert_eq!(d_rows(&store), 1_744);
+    }
+
+    /// §4: an SQLite failure reports the counts of the batches committed
+    /// before it, and those batches stay committed (no rollback is claimed
+    /// or performed).
+    #[test]
+    fn adr0116_d_sqlite_failure_reports_the_committed_batches() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 2_000, 16, 106, 1);
+        store.fail_trim_delete_after_for_tests(2);
+        let none = HistoryPolicy::default();
+        let Err(RetainError::Failed { error, committed }) =
+            d_trim(&store, &d_age(1), &none, &PinnedScopes::none(), 65_536)
+        else {
+            panic!("the injected SQLite error must fail the trim");
+        };
+        assert!(matches!(error, HistoryError::Database(_)), "{error}");
+        assert_eq!(committed.deleted, 512);
+        assert_eq!(committed.deleted_by_phase.global_age, 512);
+        assert_eq!(committed.state, RetainState::MoreWork);
+        assert_eq!(
+            d_rows(&store),
+            1_488,
+            "committed batches are not rolled back"
+        );
+    }
+
+    /// §4 and Validation "Runtime bounds": the time budget is checked before
+    /// each statement. One statement already in flight may overrun it (here
+    /// an injected 300 ms statement against a 50 ms budget); no statement
+    /// starts after it.
+    #[test]
+    fn adr0116_d_one_slow_statement_overruns_the_time_budget_and_no_other_starts() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 2_000, 16, 107, 1);
+        store.slow_next_trim_delete_for_tests(300);
+        let cancel = AtomicBool::new(false);
+        let none = HistoryPolicy::default();
+        let report = store
+            .trim(
+                &d_age(1),
+                &none,
+                &PinnedScopes::none(),
+                &d_budget(65_536, 50, &cancel),
+            )
+            .unwrap();
+        assert_eq!(report.stopped_by, Some(RetainStop::TimeBudget));
+        assert_eq!(report.state, RetainState::MoreWork);
+        assert_eq!(report.deleted, 256, "the in-flight statement completes");
+        assert_eq!(
+            store.trim_batches_for_tests(),
+            vec![256],
+            "and nothing starts after"
+        );
+        assert!(
+            report.elapsed_ms >= 300,
+            "the documented overrun: {report:?}"
+        );
+        assert!(
+            report.elapsed_ms < 3_000,
+            "bounded by that one statement: {report:?}"
+        );
+        assert_eq!(d_rows(&store), 1_744);
+    }
+
+    /// §4 admission: one retention operation per store, shared with the
+    /// reaper. While a reaper pass or another trim holds the store, a trim
+    /// returns `Busy` at once instead of queueing.
+    #[test]
+    fn adr0116_d_trim_is_busy_while_a_pass_or_another_trim_holds_the_store() {
+        let (store, _dir) = open();
+        let none = HistoryPolicy::default();
+        // Every parked operation is released BEFORE any assertion, so a
+        // failing assertion can never leave a scoped thread parked.
+        store.pause_pass_for_tests();
+        let (busy, waited) = std::thread::scope(|s| {
+            let pass =
+                s.spawn(|| store.retain_with_rules(&b_no_global(), &none, &PinnedScopes::none()));
+            d_wait("the pass to hold admission", || {
+                !store.retention_admission_free_for_tests()
+            });
+            let started = std::time::Instant::now();
+            let busy = d_trim(&store, &b_no_global(), &none, &PinnedScopes::none(), 10);
+            let waited = started.elapsed();
+            store.unpause_pass_for_tests();
+            pass.join().unwrap().unwrap();
+            (busy, waited)
+        });
+        assert!(matches!(busy, Err(RetainError::Busy)), "{busy:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "never queued: {waited:?}"
+        );
+
+        store.pause_trim_for_tests(true);
+        let (busy, parked) = std::thread::scope(|s| {
+            let first =
+                s.spawn(|| d_trim(&store, &b_no_global(), &none, &PinnedScopes::none(), 10));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !store.trim_parked_for_tests() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let parked = store.trim_parked_for_tests();
+            let busy = d_trim(&store, &b_no_global(), &none, &PinnedScopes::none(), 10);
+            store.pause_trim_for_tests(false);
+            first.join().unwrap().unwrap();
+            (busy, parked)
+        });
+        assert!(parked, "the first trim parked holding admission");
+        assert!(matches!(busy, Err(RetainError::Busy)), "{busy:?}");
+    }
+
+    /// Validation "Runtime bounds": reaper serialisation under concurrent
+    /// writers. Ruling Q2: the reaper waits for a trim's admission (it never
+    /// gets `Busy`), a writer waits for the held connection, and both
+    /// complete after the trim. Then trims, reaper passes and a writer
+    /// stream run together without error and converge.
+    #[test]
+    fn adr0116_d_trims_and_reaper_passes_serialise_under_concurrent_writers() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 3_000, 16, 108, 1);
+        let policy = d_age(1);
+        let none = HistoryPolicy::default();
+        store.pause_trim_for_tests(true);
+        let pass_done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let trim = s.spawn(|| d_trim(&store, &policy, &none, &PinnedScopes::none(), 100));
+            d_wait("the trim to park", || store.trim_parked_for_tests());
+            let pass = s.spawn(|| {
+                let outcome = store.retain_with_rules(&policy, &none, &PinnedScopes::none());
+                pass_done.store(true, Ordering::Relaxed);
+                outcome
+            });
+            let writer =
+                s.spawn(|| store.insert(&b_row("fresh", b_topic("new"), 64, now_ms(), None)));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !pass_done.load(Ordering::Relaxed),
+                "the reaper waits for the trim"
+            );
+            assert!(
+                !writer.is_finished(),
+                "the writer waits for the held connection"
+            );
+            store.pause_trim_for_tests(false);
+            assert_eq!(trim.join().unwrap().unwrap().deleted, 100);
+            assert_eq!(
+                pass.join().unwrap().unwrap().evicted,
+                2_900,
+                "the pass ran after the trim, on what the trim left"
+            );
+            assert_eq!(writer.join().unwrap().unwrap(), InsertOutcome::Inserted);
+        });
+
+        seed_tiny_rows(&store, &Scope::Topic("old2".into()), 2_000, 16, 109, 1);
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                for i in 0..200 {
+                    let row = b_row(&format!("w{i}"), b_topic("live"), 64, now_ms(), None);
+                    assert_eq!(store.insert(&row).unwrap(), InsertOutcome::Inserted);
+                }
+            });
+            let reaper = s.spawn(|| {
+                for _ in 0..3 {
+                    store
+                        .retain_with_rules(&policy, &none, &PinnedScopes::none())
+                        .unwrap();
+                }
+            });
+            let trimmer = s.spawn(|| {
+                for _ in 0..100_000 {
+                    match d_trim(&store, &policy, &none, &PinnedScopes::none(), 128) {
+                        Ok(report) if report.state == RetainState::Complete => return,
+                        Ok(report) => assert!(
+                            store.trim_batches_for_tests().iter().all(|&b| b <= 128),
+                            "{report:?}"
+                        ),
+                        Err(RetainError::Busy) => std::thread::yield_now(),
+                        Err(e) => panic!("trim failed: {e}"),
+                    }
+                }
+                panic!("the trims never completed");
+            });
+            writer.join().unwrap();
+            reaper.join().unwrap();
+            trimmer.join().unwrap();
+        });
+        assert_eq!(d_ancient_rows(&store), 0, "every aged row is gone");
+        assert_eq!(d_rows(&store), 201, "every live row is kept");
+    }
+
+    /// §4: `blocked_by_protected_rows` when no eligible policy work remains
+    /// but pinned or exempt rows keep a configured bound exceeded.
+    #[test]
+    fn adr0116_d_protected_only_overshoot_is_blocked_not_more_work() {
+        let none = HistoryPolicy::default();
+        let now = now_ms();
+        // (a) Exempt (Replaceable) rows alone keep an exact-scope limit
+        //     exceeded.
+        {
+            let (store, _dir) = open();
+            let rows = (0..20_i64)
+                .map(|i| {
+                    let key = format!("card-key:{i}");
+                    b_row(
+                        &format!("c{i}"),
+                        b_topic("cards"),
+                        100,
+                        now - 1_000 + i,
+                        Some(key.as_str()),
+                    )
+                })
+                .collect();
+            b_insert(&store, rows);
+            let policy = RetentionPolicy {
+                max_bytes: u64::MAX,
+                max_age_days: 0,
+                scope_limits: vec![ScopeLimit {
+                    scope: "topic:cards".into(),
+                    max_bytes: 500,
+                }],
+            };
+            let report = d_trim(&store, &policy, &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(
+                report.state,
+                RetainState::BlockedByProtectedRows,
+                "(a) {report:?}"
+            );
+            assert_eq!((report.deleted, report.stopped_by), (0, None));
+        }
+        // (b) A pinned group keeps its own exact-scope limit exceeded while
+        //     inside its pin ceiling.
+        {
+            let (store, _dir) = open();
+            let rows = (0..30_i64)
+                .map(|i| {
+                    b_row(
+                        &format!("p{i}"),
+                        Scope::Group("pin".into()),
+                        100,
+                        now - 1_000 + i,
+                        None,
+                    )
+                })
+                .collect();
+            b_insert(&store, rows);
+            let policy = RetentionPolicy {
+                max_bytes: u64::MAX,
+                max_age_days: 0,
+                scope_limits: vec![ScopeLimit {
+                    scope: "group:pin".into(),
+                    max_bytes: 1_000,
+                }],
+            };
+            let pins = PinnedScopes::from_canonical(["group:pin"]);
+            let report = d_trim(&store, &policy, &none, &pins, 65_536).unwrap();
+            assert_eq!(
+                report.state,
+                RetainState::BlockedByProtectedRows,
+                "(b) {report:?}"
+            );
+            assert_eq!(report.deleted, 0);
+            assert_eq!(scope_row_count(&store, &Scope::Group("pin".into())), 30);
+        }
+        // (c) Pinned rows alone keep the whole-database budget exceeded.
+        {
+            let (store, _dir) = open();
+            let rows = (0..10_i64)
+                .map(|i| {
+                    b_row(
+                        &format!("q{i}"),
+                        Scope::Group("pin".into()),
+                        100,
+                        now - 1_000 + i,
+                        None,
+                    )
+                })
+                .collect();
+            b_insert(&store, rows);
+            let policy = RetentionPolicy {
+                max_bytes: 16_000,
+                max_age_days: 0,
+                scope_limits: Vec::new(),
+            };
+            assert!(
+                store.live_bytes().unwrap() > policy.max_bytes,
+                "fixture precondition"
+            );
+            let pins = PinnedScopes::from_canonical(["group:pin"]);
+            let report = d_trim(&store, &policy, &none, &pins, 65_536).unwrap();
+            assert_eq!(
+                report.state,
+                RetainState::BlockedByProtectedRows,
+                "(c) {report:?}"
+            );
+            assert_eq!(report.deleted, 0);
+        }
+        // (d) Control: nothing over any bound.
+        {
+            let (store, _dir) = open();
+            b_insert(&store, vec![b_row("ok", b_topic("t"), 100, now, None)]);
+            let report = d_trim(&store, &d_age(1), &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(report.state, RetainState::Complete, "(d) {report:?}");
+        }
+    }
+
+    /// §4: `blocked_by_protected_rows` is never returned while eligible
+    /// work remains: every trim before the backlog is gone says `more_work`.
+    #[test]
+    fn adr0116_d_never_blocked_while_eligible_work_remains() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        let rows = (0..20_i64)
+            .map(|i| {
+                let key = format!("card-key:{i}");
+                b_row(
+                    &format!("c{i}"),
+                    b_topic("cards"),
+                    100,
+                    now - 1_000 + i,
+                    Some(key.as_str()),
+                )
+            })
+            .collect();
+        b_insert(&store, rows);
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 1_000, 16, 110, 1);
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 1,
+            scope_limits: vec![ScopeLimit {
+                scope: "topic:cards".into(),
+                max_bytes: 500,
+            }],
+        };
+        let none = HistoryPolicy::default();
+        let mut states = Vec::new();
+        for _ in 0..50 {
+            let report = d_trim(&store, &policy, &none, &PinnedScopes::none(), 100).unwrap();
+            states.push(report.state);
+            if report.state != RetainState::MoreWork {
+                break;
+            }
+        }
+        let (last, before) = states.split_last().unwrap();
+        assert_eq!(*last, RetainState::BlockedByProtectedRows, "{states:?}");
+        assert!(
+            before.iter().all(|s| *s == RetainState::MoreWork),
+            "{states:?}"
+        );
+        assert_eq!(
+            before.len(),
+            10,
+            "1 000 aged rows at 100 per call: {states:?}"
+        );
+        assert_eq!(d_ancient_rows(&store), 0);
+    }
+
+    /// §4 keeps part 1's settled-index rule: without the settled
+    /// certificate the global budget deletes nothing and the trim reports
+    /// reclamation pending. Ruling Q3: trims never advance
+    /// `unsettled_passes`; they only read it, so after three unsettled
+    /// REAPER passes a trim takes the forced path, within `max_rows`.
+    #[test]
+    fn adr0116_d_global_budget_waits_for_the_settled_index_and_never_moves_the_counter() {
+        let (store, _dir) = open();
+        seed_tiny_rows(
+            &store,
+            &Scope::Topic("bulk".into()),
+            2_000,
+            200,
+            111,
+            now_ms() - 60_000,
+        );
+        let policy = RetentionPolicy {
+            max_bytes: store.live_bytes().unwrap() / 2,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        let none = HistoryPolicy::default();
+        store.force_unsettled_passes_for_tests();
+        for _ in 0..5 {
+            let report = d_trim(&store, &policy, &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(
+                report.deleted, 0,
+                "no global eviction without the certificate"
+            );
+            assert_eq!(report.state, RetainState::MoreWork);
+            assert_eq!(report.stopped_by, Some(RetainStop::Reclamation));
+            assert_eq!(
+                store.unsettled_passes_for_tests(),
+                0,
+                "a trim never advances it"
+            );
+        }
+        for _ in 0..3 {
+            store.retain(&policy).unwrap();
+        }
+        assert_eq!(store.unsettled_passes_for_tests(), 3);
+        let report = d_trim(&store, &policy, &none, &PinnedScopes::none(), 100).unwrap();
+        assert_eq!(
+            report.deleted_by_phase.global_budget, 100,
+            "the forced path, capped"
+        );
+        assert_eq!(report.state, RetainState::MoreWork);
+        assert!(store.trim_batches_for_tests().iter().all(|&b| b <= 100));
+        assert_eq!(
+            store.unsettled_passes_for_tests(),
+            3,
+            "read, never changed (Q3)"
+        );
+    }
+
+    /// ADR 0068 through the trim (ruling Q6, row 27): pinned rows survive a
+    /// trim under both spellings. Pins are whatever the caller passes on
+    /// each call, so a cleared marker applies the ordinary rules from the
+    /// next call on.
+    #[test]
+    fn adr0116_d_pinned_rows_survive_a_trim_and_pins_refresh_per_call() {
+        let (store, _dir) = open();
+        let old = now_ms() - 30 * B_DAY_MS;
+        b_insert(
+            &store,
+            vec![
+                b_row("pinned_d", Scope::Group("pin-stable".into()), 64, old, None),
+                b_row("free_d", Scope::Group("free".into()), 64, old, None),
+            ],
+        );
+        let rules = b_rules(&[(RetainedClass::Durable, None, Some(1))], &[]);
+        for pins in [
+            PinnedScopes::from_canonical(["group:pin-stable"]),
+            PinnedScopes::from_canonical(["group:pin-alias", "group:pin-stable"]),
+        ] {
+            d_trim(&store, &d_age(1), &rules, &pins, 65_536).unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["pinned_d"]));
+        }
+        d_trim(&store, &d_age(1), &rules, &PinnedScopes::none(), 65_536).unwrap();
+        assert!(
+            b_tags(&store).is_empty(),
+            "the marker cleared: ordinary rules apply"
+        );
+    }
+
+    /// A trim applies the same policy as the reaper: on a mixed fixture an
+    /// unbounded trim leaves exactly the rows a reaper pass leaves.
+    #[test]
+    fn adr0116_d_an_unbounded_trim_leaves_what_a_reaper_pass_leaves() {
+        let now = now_ms();
+        let fixture = |store: &Store| {
+            let mut rows = Vec::new();
+            for i in 0..40_i64 {
+                rows.push(b_row(&format!("aged{i}"), b_topic("x"), 50, 1 + i, None));
+                rows.push(b_row(
+                    &format!("app{i}"),
+                    b_topic("app.feed"),
+                    80,
+                    now - 5_000 + i,
+                    None,
+                ));
+                rows.push(b_row(
+                    &format!("s{i}"),
+                    b_topic("s"),
+                    60,
+                    now - 5_000 + i,
+                    None,
+                ));
+                rows.push(b_row(
+                    &format!("p{i}"),
+                    Scope::Group("p".into()),
+                    70,
+                    1 + i,
+                    None,
+                ));
+                let key = format!("mix-key:{i}");
+                rows.push(b_row(
+                    &format!("r{i}"),
+                    b_dm(),
+                    90,
+                    now - 5_000 + i,
+                    Some(key.as_str()),
+                ));
+            }
+            b_insert(store, rows);
+        };
+        let policy = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 1,
+            scope_limits: vec![ScopeLimit {
+                scope: "topic:s".into(),
+                max_bytes: 600,
+            }],
+        };
+        let rules = b_rules(
+            &[(RetainedClass::Replaceable, Some(1_000), None)],
+            &[("app", Some(1_200), None)],
+        );
+        let pins = PinnedScopes::from_canonical(["group:p"]);
+        let (reaped, _a) = open();
+        fixture(&reaped);
+        reaped.retain_with_rules(&policy, &rules, &pins).unwrap();
+        let (trimmed, _b) = open();
+        fixture(&trimmed);
+        let report = d_trim(&trimmed, &policy, &rules, &pins, 65_536).unwrap();
+        assert_ne!(report.state, RetainState::MoreWork, "{report:?}");
+        assert!(report.deleted > 0);
+        assert_eq!(b_tags(&trimmed), b_tags(&reaped));
+    }
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
@@ -7499,6 +8275,44 @@ impl Store {
     /// The C-1264-1 §3 consecutive-unsettled counter, for assertions.
     pub(crate) fn unsettled_passes_for_tests(&self) -> u32 {
         self.unsettled_passes.load(Ordering::Relaxed)
+    }
+
+    /// ADR 0116 slice D: the rows of each committed delete statement of the
+    /// latest trim.
+    pub(crate) fn trim_batches_for_tests(&self) -> Vec<u64> {
+        self.test_trim_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// ADR 0116 slice D: the next trim delete statement runs `ms` longer,
+    /// inside its statement window.
+    pub(crate) fn slow_next_trim_delete_for_tests(&self, ms: u64) {
+        self.test_trim_slow_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// ADR 0116 slice D: after `committed` delete statements, the next trim
+    /// delete statement fails with a real SQLite error.
+    pub(crate) fn fail_trim_delete_after_for_tests(&self, committed: u64) {
+        self.test_trim_fail_after
+            .store(committed.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// ADR 0116 slice D: park (or release) trims after admission.
+    pub(crate) fn pause_trim_for_tests(&self, pause: bool) {
+        self.test_pause_trim.store(pause, Ordering::Relaxed);
+    }
+
+    /// ADR 0116 slice D: is a trim parked holding admission?
+    pub(crate) fn trim_parked_for_tests(&self) -> bool {
+        self.test_trim_parked.load(Ordering::Relaxed)
+    }
+
+    /// ADR 0116 slice D: is the retention admission free right now? Takes
+    /// and drops the lock: use only to wait for an operation to finish.
+    pub(crate) fn retention_admission_free_for_tests(&self) -> bool {
+        self.retention.try_lock().is_ok()
     }
 }
 

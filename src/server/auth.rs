@@ -1327,6 +1327,16 @@ mod tests {
         }
     }
 
+    /// ADR 0116 §4: the runtime trim needs the durable token (sessions and
+    /// riders get 403 at the route layer). Other history POST/DELETE paths
+    /// keep their tiers.
+    #[test]
+    fn history_retain_requires_durable_owner() {
+        assert!(requires_durable_owner(&Method::POST, "/history/retain"));
+        assert!(!requires_durable_owner(&Method::GET, "/history/retain"));
+        assert!(!requires_durable_owner(&Method::DELETE, "/history"));
+    }
+
     #[test]
     fn grant_routes_require_durable_owner_for_every_method() {
         // ADR-0070 §2: listing grants reveals who may reach the owner's

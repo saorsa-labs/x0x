@@ -15,6 +15,7 @@ pub mod classify;
 pub mod policy;
 pub mod record;
 pub mod store;
+pub mod trim;
 pub mod writer;
 
 mod reaper;
@@ -35,6 +36,10 @@ pub use store::{
     HistoryQuery, HistoryStats, InsertOutcome, PinnedScopes, RetainOutcome, RetentionPolicy,
     ScopeLimit, ScopeSummary, Store, StoredRecord, HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR,
     HISTORY_QUARANTINE_PIN_BASE_DIVISOR, HISTORY_QUARANTINE_PIN_MULTIPLIER, MAX_QUERY_LIMIT,
+};
+pub use trim::{
+    RetainDeleted, RetainError, RetainOptions, RetainReport, RetainState, RetainStop,
+    RETAIN_DEFAULT_BUDGET_MS, RETAIN_DEFAULT_MAX_ROWS, RETAIN_MAX_BUDGET_MS, RETAIN_MAX_ROWS,
 };
 pub use writer::{HistoryCounters, WriterHandle, WRITER_QUEUE_CAPACITY};
 
@@ -307,6 +312,63 @@ impl HistoryHandle {
     /// consults. Returns `false` if one is already installed.
     pub fn install_quarantine_pins(&self, pins: Arc<dyn QuarantinePins>) -> bool {
         self.quarantine_pins.install(pins)
+    }
+
+    /// ADR 0116 §4: one bounded runtime trim of this store under its own
+    /// startup policy, the same service `POST /history/retain` and
+    /// `x0x history retain` use.
+    ///
+    /// - It refreshes the fork-quarantine pins from the installed pin source
+    ///   for this call. A library with no pin source pins nothing (ADR
+    ///   0068's no-pin contract).
+    /// - It shares admission with the reaper: while a reaper pass or another
+    ///   trim holds the store it returns [`RetainError::Busy`] at once,
+    ///   rather than queueing.
+    /// - The SQLite work runs on the blocking pool. Dropping the returned
+    ///   future cancels the trim at its next committed boundary.
+    /// - Use it before `serve()` to trim without opening SQLite yourself.
+    ///
+    /// # Errors
+    /// [`RetainError::InvalidOptions`] for an out-of-range budget,
+    /// [`RetainError::Busy`], or [`RetainError::Failed`] with the counts of
+    /// the batches committed before an SQLite failure.
+    pub async fn retain(&self, options: RetainOptions) -> Result<RetainReport, RetainError> {
+        options.validate()?;
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(u64::from(options.budget_ms));
+        let pinned = self.quarantine_pins.pinned().await;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cancel_on_drop = trim::CancelOnDrop(Arc::clone(&cancel));
+        let store = Arc::clone(&self.store);
+        let retention = Arc::clone(&self.retention);
+        let rules = Arc::clone(&self.policy);
+        let max_rows = u64::from(options.max_rows);
+        let joined = tokio::task::spawn_blocking(move || {
+            store.trim(
+                &retention,
+                &rules,
+                &pinned,
+                &trim::TrimBudget {
+                    max_rows,
+                    started,
+                    deadline,
+                    cancel: &cancel,
+                },
+            )
+        })
+        .await;
+        match joined {
+            Ok(result) => result,
+            Err(join) => Err(RetainError::Failed {
+                error: HistoryError::Database(format!("history trim task did not finish: {join}")),
+                committed: RetainReport::new(
+                    RetainState::MoreWork,
+                    RetainDeleted::default(),
+                    started.elapsed(),
+                    None,
+                ),
+            }),
+        }
     }
 }
 
@@ -1210,5 +1272,188 @@ mod tests {
             "{\"enabled\":false,\"max_bytes\":1073741824,\"max_age_days\":0,\
              \"scope_limits\":[],\"db_path\":null,\"record_topics\":[]}"
         );
+    }
+
+    // ── ADR 0116 slice D: HistoryHandle::retain (§4) ────────────────────
+
+    fn d_old_rows(store: &Store, scope: &Scope, n: usize) {
+        let rows: Vec<HistoryRecord> = (0..n)
+            .map(|i| {
+                c_row(
+                    scope.clone(),
+                    &format!("old row {i} in {}", scope.canonical()),
+                    Direction::Inbound,
+                    Provenance::LocalAppDecrypt,
+                    None,
+                )
+            })
+            .collect();
+        store.insert_batch(&rows).unwrap();
+    }
+
+    fn d_aged() -> HistoryConfig {
+        HistoryConfig {
+            max_age_days: 1,
+            ..HistoryConfig::default()
+        }
+    }
+
+    /// §4: the body knobs are `max_rows` 1–65 536 (default 4 096) and
+    /// `budget_ms` 1–10 000 (default 2 000); anything else is refused
+    /// before any work.
+    #[tokio::test]
+    async fn adr0116_d_handle_retain_validates_its_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), HistoryConfig::default());
+        let handle = service.handle();
+        for (max_rows, budget_ms) in [(0, 2_000), (65_537, 2_000), (4_096, 0), (4_096, 10_001)] {
+            let result = handle
+                .retain(RetainOptions {
+                    max_rows,
+                    budget_ms,
+                })
+                .await;
+            assert!(
+                matches!(result, Err(RetainError::InvalidOptions(_))),
+                "{max_rows}/{budget_ms}: {result:?}"
+            );
+        }
+        for options in [
+            RetainOptions {
+                max_rows: 1,
+                budget_ms: 1,
+            },
+            RetainOptions {
+                max_rows: 65_536,
+                budget_ms: 10_000,
+            },
+            RetainOptions::default(),
+        ] {
+            assert!(handle.retain(options).await.is_ok(), "{options:?}");
+        }
+        assert_eq!(
+            RetainOptions::default(),
+            RetainOptions {
+                max_rows: 4_096,
+                budget_ms: 2_000
+            }
+        );
+        service.shutdown().await;
+    }
+
+    /// §4: the SQLite work runs off the async executor. On a single-thread
+    /// runtime the test's own polling loop keeps running while the trim is
+    /// parked holding the store, which it could not do if the trim ran on
+    /// that thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn adr0116_d_handle_retain_runs_its_sqlite_work_off_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), d_aged());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        d_old_rows(&store, &Scope::Topic("old".into()), 300);
+        store.pause_trim_for_tests(true);
+        let task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.retain(RetainOptions::default()).await })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.trim_parked_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trim never parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        store.pause_trim_for_tests(false);
+        let report = task.await.unwrap().unwrap();
+        assert_eq!(report.deleted, 300);
+        assert_eq!(report.state, RetainState::Complete);
+        service.shutdown().await;
+    }
+
+    /// §4: caller cancellation. Dropping the `retain` future stops the trim
+    /// at its next committed boundary; the batch in flight completes.
+    #[tokio::test]
+    async fn adr0116_d_dropping_the_retain_future_cancels_at_the_next_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), d_aged());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        d_old_rows(&store, &Scope::Topic("old".into()), 2_000);
+        store.slow_next_trim_delete_for_tests(300);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.retain(RetainOptions {
+                max_rows: 65_536,
+                budget_ms: 10_000,
+            }),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller left before the trim finished");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let probe = Arc::clone(&store);
+        let rows = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !probe.retention_admission_free_for_tests() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the trim never stopped"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            probe.table_counts_for_tests().0
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows, 1_744, "only the batch in flight completed");
+        service.shutdown().await;
+    }
+
+    struct DPins(std::sync::Mutex<Vec<String>>);
+
+    impl QuarantinePins for DPins {
+        fn pinned_scopes(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + '_>> {
+            let scopes = self.0.lock().unwrap().clone();
+            Box::pin(async move { scopes })
+        }
+    }
+
+    /// §4 pins: a library with no pin source pins nothing (ADR 0068's
+    /// contract). With a source installed the pins are read on every call,
+    /// so a pinned group survives and, once its marker clears, the next call
+    /// trims it.
+    #[tokio::test]
+    async fn adr0116_d_handle_retain_reads_the_live_pin_source_on_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), d_aged());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        d_old_rows(&store, &Scope::Group("g".into()), 3);
+        let report = handle.retain(RetainOptions::default()).await.unwrap();
+        assert_eq!(report.deleted, 3, "no pin source: nothing is pinned");
+        service.shutdown().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), d_aged());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        let pins = Arc::new(DPins(std::sync::Mutex::new(vec!["group:g".into()])));
+        assert!(handle.install_quarantine_pins(Arc::clone(&pins) as Arc<dyn QuarantinePins>));
+        d_old_rows(&store, &Scope::Group("g".into()), 3);
+        let report = handle.retain(RetainOptions::default()).await.unwrap();
+        assert_eq!(report.deleted, 0, "the pinned group survives");
+        assert_eq!(store.table_counts_for_tests().0, 3);
+        pins.0.lock().unwrap().clear();
+        let report = handle.retain(RetainOptions::default()).await.unwrap();
+        assert_eq!(
+            report.deleted, 3,
+            "the marker cleared: the next call trims it"
+        );
+        service.shutdown().await;
     }
 }

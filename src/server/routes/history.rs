@@ -2789,6 +2789,20 @@ mod adr0066_fork_quarantine_tests {
     }
 }
 
+/// ADR 0116 §4: the body limit of `POST /history/retain`.
+pub(in crate::server) const HISTORY_RETAIN_BODY_LIMIT: usize = 1024;
+
+/// POST /history/retain (ADR 0116 §4). RED stub, not wired.
+pub(in crate::server) async fn history_retain(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Extension(_actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    _body: axum::body::Bytes,
+) -> axum::response::Response {
+    api_error(StatusCode::NOT_IMPLEMENTED, "ADR 0116 slice D red stub").into_response()
+}
+
 #[cfg(test)]
 mod adr0116_policy_tests {
     //! ADR 0116 §3, slice E: `GET /history/policy`. The route is owner-only
@@ -2809,7 +2823,7 @@ mod adr0116_policy_tests {
         ScopeLimit, TopicRecording, TopicRule,
     };
 
-    async fn state_with(
+    pub(super) async fn state_with(
         dir: &std::path::Path,
         history: Option<HistoryConfig>,
     ) -> anyhow::Result<Arc<AppState>> {
@@ -2829,7 +2843,7 @@ mod adr0116_policy_tests {
         super::super::named_groups::tests::secure_endpoint_test_state_at(dir, agent).await
     }
 
-    fn enabled(dir: &std::path::Path, config: HistoryConfig) -> HistoryConfig {
+    pub(super) fn enabled(dir: &std::path::Path, config: HistoryConfig) -> HistoryConfig {
         HistoryConfig {
             enabled: true,
             db_path: Some(dir.join("history.db")),
@@ -2868,7 +2882,7 @@ mod adr0116_policy_tests {
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    async fn rider(state: &AppState) -> String {
+    pub(super) async fn rider(state: &AppState) -> String {
         let mut store = state.rider_tokens.lock().await;
         let (token, _record) = store
             .issue(
@@ -2887,7 +2901,7 @@ mod adr0116_policy_tests {
     }
 
     /// A fork-quarantined group whose roster key differs from its stable id.
-    async fn quarantine_under(state: &AppState, map_key: &str, stable_id: &str) {
+    pub(super) async fn quarantine_under(state: &AppState, map_key: &str, stable_id: &str) {
         let creator = state.agent.agent_id();
         let mut info = x0x::groups::GroupInfo::new(
             map_key.to_string(),
@@ -3220,6 +3234,344 @@ mod adr0116_policy_tests {
                 "written_total"
             ]
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adr0116_retain_tests {
+    //! ADR 0116 §4, slice D: `POST /history/retain`, driven through the
+    //! production auth middleware with the production body-limit layering
+    //! (the route's 1 KiB limit inside the router-wide 1 MiB one).
+
+    use super::adr0116_policy_tests::{enabled, quarantine_under, rider, state_with};
+    use super::discovery_auth_tests::{text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+    use x0x::history::{HistoryConfig, PinnedScopes, RetainOptions};
+
+    fn retain_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/history/retain",
+                post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
+                    HISTORY_RETAIN_BODY_LIMIT,
+                )),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn post_with(
+        app: &axum::Router,
+        uri: &str,
+        bearer: Option<&str>,
+        body: impl Into<Vec<u8>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method("POST").uri(uri);
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
+        let request = request
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.into()))
+            .expect("request builds");
+        let response = app.clone().oneshot(request).await.expect("router answers");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn aged(dir: &std::path::Path) -> HistoryConfig {
+        enabled(
+            dir,
+            HistoryConfig {
+                max_age_days: 1,
+                ..HistoryConfig::daemon_default()
+            },
+        )
+    }
+
+    fn old_rows(state: &AppState, scope: &Scope, n: usize) {
+        let history = state.agent.history().expect("history on");
+        let rows: Vec<_> = (0..n)
+            .map(|i| {
+                text_row(
+                    scope.clone(),
+                    &format!("old {i} {}", scope.canonical()),
+                    1_000,
+                )
+            })
+            .collect();
+        history.store().insert_batch(&rows).expect("rows insert");
+    }
+
+    /// Validation "Runtime bounds": the full token matrix. The durable
+    /// bearer trims; sessions and riders get 403; a missing or unknown token
+    /// 401; the durable token is never taken from the query string.
+    #[tokio::test]
+    async fn adr0116_retain_token_matrix() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let session = state.sessions.issue(std::time::Instant::now());
+        let rider = rider(&state).await;
+        let cases = [
+            (
+                "/history/retain".to_string(),
+                Some(DURABLE),
+                StatusCode::OK,
+                "durable owner",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some(session.as_str()),
+                StatusCode::FORBIDDEN,
+                "session",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some(rider.as_str()),
+                StatusCode::FORBIDDEN,
+                "rider",
+            ),
+            (
+                "/history/retain".to_string(),
+                None,
+                StatusCode::UNAUTHORIZED,
+                "no token",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some("not-a-token"),
+                StatusCode::UNAUTHORIZED,
+                "unknown token",
+            ),
+            (
+                format!("/history/retain?token={DURABLE}"),
+                None,
+                StatusCode::UNAUTHORIZED,
+                "query token",
+            ),
+        ];
+        for (uri, bearer, expected, who) in cases {
+            assert_eq!(
+                post_with(&app, &uri, bearer, "{}").await.0,
+                expected,
+                "{who}"
+            );
+        }
+        Ok(())
+    }
+
+    /// §4 and ruling Q12: the body takes only `max_rows` and `budget_ms`;
+    /// an empty body means `{}`. Malformed or out-of-range values are 400
+    /// (never axum's 415 or 422); a body over 1 KiB is 413.
+    #[tokio::test]
+    async fn adr0116_retain_body_validation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let bad = [
+            "not json",
+            "{",
+            "[]",
+            "[1, 2]",
+            "null",
+            "\"x\"",
+            "{\"max_rows\":0}",
+            "{\"max_rows\":65537}",
+            "{\"budget_ms\":0}",
+            "{\"budget_ms\":10001}",
+            "{\"max_rows\":\"10\"}",
+            "{\"max_rows\":-1}",
+            "{\"max_rows\":1.5}",
+            "{\"max_rows\":4294967296}",
+            "{\"scope\":\"group:x\"}",
+            "{\"force\":true}",
+            "{\"sql\":\"DELETE FROM history\"}",
+            "{\"max_rows\":10,\"policy\":{}}",
+        ];
+        for body in bad {
+            let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+            assert_eq!(json["ok"], false, "{body}");
+        }
+        let mut exactly_1024 = String::from("{\"max_rows\":1");
+        while exactly_1024.len() < 1023 {
+            exactly_1024.push(' ');
+        }
+        exactly_1024.push('}');
+        assert_eq!(exactly_1024.len(), 1024);
+        let good = [
+            String::new(),
+            "  \n".to_string(),
+            "{}".to_string(),
+            "{\"max_rows\":1,\"budget_ms\":10000}".to_string(),
+            "{\"max_rows\":65536,\"budget_ms\":1}".to_string(),
+            "{\"max_rows\":null}".to_string(),
+            exactly_1024,
+        ];
+        for body in good {
+            let (status, json) =
+                post_with(&app, "/history/retain", Some(DURABLE), body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body:?}: {json}");
+            assert_eq!(json["ok"], true);
+        }
+        let oversized = format!("{{\"max_rows\":1{}}}", " ".repeat(1_100));
+        assert_eq!(
+            post_with(&app, "/history/retain", Some(DURABLE), oversized)
+                .await
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        Ok(())
+    }
+
+    /// §4: disabled history is 409 `history_disabled`.
+    #[tokio::test]
+    async fn adr0116_retain_disabled_history_is_409() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), None).await?;
+        let app = retain_router(Arc::clone(&state));
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_disabled");
+        Ok(())
+    }
+
+    /// §4: while the reaper holds the store, a trim is 409
+    /// `history_retention_busy` at once, not queued.
+    #[tokio::test]
+    async fn adr0116_retain_busy_is_409() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let store = Arc::clone(state.agent.history().expect("history on").store());
+        store.pause_pass_for_tests();
+        let pass = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.retain_with_rules(
+                    &x0x::history::RetentionPolicy {
+                        max_bytes: u64::MAX,
+                        max_age_days: 0,
+                        scope_limits: Vec::new(),
+                    },
+                    &x0x::history::HistoryPolicy::default(),
+                    &PinnedScopes::none(),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.retention_admission_free_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        store.unpause_pass_for_tests();
+        pass.join().expect("pass thread").expect("pass runs");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_retention_busy");
+        Ok(())
+    }
+
+    /// Ruling Q6 (ADR 0066 coverage row 27): the trim runs through the
+    /// daemon's live pin source, so a fork-quarantined group's rows, under
+    /// either spelling, survive a trim that removes the same rows elsewhere.
+    #[tokio::test]
+    async fn adr0116_retain_pinned_rows_survive_a_trim() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        quarantine_under(&state, "alias-key", "stable-id").await;
+        assert!(
+            ReaperQuarantinePins::install(&state),
+            "the daemon's pin source"
+        );
+        let app = retain_router(Arc::clone(&state));
+        old_rows(&state, &Scope::Group("stable-id".into()), 3);
+        old_rows(&state, &Scope::Group("alias-key".into()), 2);
+        old_rows(&state, &Scope::Group("free".into()), 4);
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["deleted"], 4, "{json}");
+        let store = state.agent.history().expect("history on").store();
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            5,
+            "both spellings survive"
+        );
+        Ok(())
+    }
+
+    /// Validation "Runtime bounds", REST/library parity: the 200 body is the
+    /// library's `RetainReport` plus `ok`.
+    #[tokio::test]
+    async fn adr0116_retain_rest_and_library_report_the_same_result() -> anyhow::Result<()> {
+        let rest_dir = tempfile::tempdir()?;
+        let rest = state_with(rest_dir.path(), Some(aged(rest_dir.path()))).await?;
+        old_rows(&rest, &Scope::Topic("t".into()), 300);
+        let app = retain_router(Arc::clone(&rest));
+        let (status, mut json) =
+            post_with(&app, "/history/retain", Some(DURABLE), "{\"max_rows\":100}").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let lib_dir = tempfile::tempdir()?;
+        let lib = state_with(lib_dir.path(), Some(aged(lib_dir.path()))).await?;
+        old_rows(&lib, &Scope::Topic("t".into()), 300);
+        let report = lib
+            .agent
+            .history()
+            .expect("history on")
+            .retain(RetainOptions {
+                max_rows: 100,
+                ..RetainOptions::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut expected = serde_json::to_value(report)?;
+        assert_eq!(json["ok"], true);
+        for body in [&mut json, &mut expected] {
+            let map = body.as_object_mut().expect("an object");
+            map.remove("ok");
+            map.remove("elapsed_ms");
+        }
+        assert_eq!(json, expected);
+        assert_eq!(json["state"], "more_work");
+        assert_eq!(json["deleted"], 100);
+        assert_eq!(json["stopped_by"], "row_budget");
+        Ok(())
+    }
+
+    /// §4: an SQLite failure is a typed 500 carrying the counts of the
+    /// batches committed before it, and never claims a rollback.
+    #[tokio::test]
+    async fn adr0116_retain_sqlite_failure_is_a_typed_500_with_counts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        old_rows(&state, &Scope::Topic("t".into()), 600);
+        let store = Arc::clone(state.agent.history().expect("history on").store());
+        store.fail_trim_delete_after_for_tests(1);
+        let app = retain_router(Arc::clone(&state));
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["reason"], "history_retention_failed");
+        assert_eq!(json["committed"]["deleted"], 256, "{json}");
+        let message = json["error"].as_str().unwrap_or_default();
+        assert!(message.contains("not rolled back"), "{message}");
+        assert_eq!(store.table_counts_for_tests().0, 344);
         Ok(())
     }
 }
