@@ -161,10 +161,42 @@ impl SessionConnection {
 ///
 /// `next` mints process-unique SG token generations; it is unrelated to ant's
 /// connection generation namespace stored alongside in each entry.
-#[derive(Default)]
+///
+/// `teardown` is the node's teardown token (#1262). Once it is cancelled the
+/// registry resolves no session and accepts no insert (#1277). The check
+/// runs under the registry lock, which the teardown clear also takes, and
+/// the coordinator cancels the token before the teardown worker starts. So
+/// an insert either precedes the clear (and the clear removes it) or sees
+/// the cancelled token and is refused: no entry can follow the clear.
 struct AuthenticatedSessions {
     next: u64,
     peers: HashMap<AntPeerId, SessionEntry>,
+    teardown: tokio_util::sync::CancellationToken,
+}
+
+impl AuthenticatedSessions {
+    fn new(teardown: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            next: 0,
+            peers: HashMap::new(),
+            teardown,
+        }
+    }
+
+    /// Whether network teardown has started. Callers hold the registry lock.
+    fn closed(&self) -> bool {
+        self.teardown.is_cancelled()
+    }
+}
+
+/// Drop every retained session handle. Network teardown calls this before
+/// and after the transport shutdown (#1277).
+fn clear_session_registry(registry: &Mutex<AuthenticatedSessions>) {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .peers
+        .clear();
 }
 
 /// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
@@ -238,6 +270,7 @@ impl std::fmt::Debug for AuthenticatedSessions {
         f.debug_struct("AuthenticatedSessions")
             .field("next", &self.next)
             .field("live_entries", &self.peers.len())
+            .field("closed", &self.closed())
             .finish()
     }
 }
@@ -2397,6 +2430,12 @@ impl NetworkNode {
             pool_max_connections,
             CONNECTION_POOL_IDLE_EVICT_AFTER,
         ));
+        let shutdown_state = Arc::new(NetworkShutdownCoordinator::new());
+        // The registry shares the teardown token so it refuses inserts once
+        // teardown has started (#1277).
+        let authenticated_sessions = Arc::new(Mutex::new(AuthenticatedSessions::new(
+            shutdown_state.teardown.clone(),
+        )));
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -2421,7 +2460,7 @@ impl NetworkNode {
             transport_signing_key,
             bootstrap_cache,
             connection_pool,
-            authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
+            authenticated_sessions,
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -2429,7 +2468,7 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
-            shutdown_state: Arc::new(NetworkShutdownCoordinator::new()),
+            shutdown_state,
             #[cfg(test)]
             shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2753,7 +2792,8 @@ impl NetworkNode {
     }
 
     /// Current `(ant generation, SG token)` for a peer with a live, open QUIC
-    /// connection, minting/reusing a registry entry as needed.
+    /// connection, minting/reusing a registry entry as needed. Returns `None`
+    /// once network teardown has started (#1277).
     ///
     /// A returned entry proves: a non-sentinel current ant generation, a
     /// non-closed retained QUIC connection whose stable id matches the one
@@ -2780,6 +2820,14 @@ impl NetworkNode {
             return None;
         }
         let mut sessions = registry.lock().ok()?;
+        // #1277: once teardown has started, resolve nothing and insert
+        // nothing. A send that took its `LinkNode` before teardown can reach
+        // here after the teardown clear while its connection is still open;
+        // this check, under the lock the clear takes, keeps that connection
+        // out of the registry.
+        if sessions.closed() {
+            return None;
+        }
         if let Some(entry) = sessions.peers.get_mut(ant_peer) {
             if entry.connection.stable_id() == connection.stable_id()
                 && entry.ant_generation == ant_generation
@@ -4399,12 +4447,10 @@ impl NetworkNode {
                     let mut node_guard = node.write().await;
                     node_guard.take()
                 };
-                // Drop retained session-registry connections alongside the
-                authenticated_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .peers
-                    .clear();
+                // Drop the retained session-registry connections before the
+                // transport shuts down. The registry has refused inserts
+                // since teardown started (#1277), so nothing re-enters it.
+                clear_session_registry(&authenticated_sessions);
                 #[cfg(test)]
                 {
                     let pause = registry_clear_pause
@@ -4421,9 +4467,12 @@ impl NetworkNode {
                         "network node was absent before shutdown established a result".to_string(),
                     );
                 };
-                node.try_shutdown()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let released = node.try_shutdown().await;
+                // Belt and braces (#1277): clear again once the transport is
+                // down, whatever its result, so no session handle outlives
+                // teardown even if an insert path ever skips the check.
+                clear_session_registry(&authenticated_sessions);
+                released.map_err(|error| error.to_string())?;
                 #[cfg(test)]
                 if let Some(error) = shutdown_failure
                     .lock()
