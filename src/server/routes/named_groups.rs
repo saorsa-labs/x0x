@@ -36567,6 +36567,19 @@ fn spawn_join_artifact_egress<F>(
             .join_artifact_egress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // #1274: once the shutdown drain has started (it cancels this token
+        // before it reads the registry), no new egress registers: the task
+        // is aborted before its body can run, and nothing is sent.
+        if state.shutdown_started.is_cancelled() {
+            handle.abort();
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                recipient = %LogHexId::agent(recipient),
+                kind,
+                "shutdown has begun; join-artifact egress not started"
+            );
+            return;
+        }
         registry.retain(|_, tasks| {
             tasks.retain(|task| !task.is_finished());
             !tasks.is_empty()
@@ -36577,6 +36590,41 @@ fn spawn_join_artifact_egress<F>(
             .push(handle);
     }
     let _ = registered.send(());
+}
+
+/// #1274: whether any join-artifact egress task is still running.
+fn join_artifact_egress_running(state: &AppState) -> bool {
+    state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .flatten()
+        .any(|task| !task.is_finished())
+}
+
+/// #1274: resolves once no join-artifact egress task is running. A task
+/// leaves the registry itself when it ends (see
+/// [`JoinArtifactEgressCleanup`]), so the handles are only polled here,
+/// never taken: a removal or ban can still quiesce them meanwhile.
+pub(in crate::server) async fn join_artifact_egress_idle(state: &AppState) {
+    while join_artifact_egress_running(state) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// #1274: abort every join-artifact egress task in place. The handles stay
+/// in the registry until each task's cleanup removes them.
+pub(in crate::server) fn abort_join_artifact_egress(state: &AppState) {
+    for task in state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .flatten()
+    {
+        task.abort();
+    }
 }
 
 /// ADR 0107 (r5, G9): removes its own task's handle from the egress registry
