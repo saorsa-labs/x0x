@@ -2366,7 +2366,19 @@ pub async fn serve_with_options(
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                        public_group_bootstrap_outbox_step(&bootstrap_state).await;
+                        // #1288: the step persists the outbox around its send.
+                        // Run that pass shielded so the drain awaits the
+                        // write. `None` means admission has closed.
+                        let step_state = Arc::clone(&bootstrap_state);
+                        if bootstrap_state
+                            .run_shielded(async move {
+                                public_group_bootstrap_outbox_step(&step_state).await;
+                            })
+                            .await
+                            .is_none()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -3004,8 +3016,9 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         }
     }
     // #1269 r2: admitted applies that persist group state (a pulled control
-    // blob's apply, the owner-certificate join retry, and since #1275 the
-    // listeners' event applies) run to completion. An
+    // blob's apply, the owner-certificate join retry, since #1275 the
+    // listeners' event applies, and since #1288 the public-group bootstrap
+    // outbox step) run to completion. An
     // abort inside an atomic write or its journal step would leave the
     // persisted state torn, or leave a blocking write running after the
     // instance locks are released. They are awaited before the Agent stops,

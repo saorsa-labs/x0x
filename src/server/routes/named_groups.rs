@@ -17248,6 +17248,12 @@ pub(in crate::server) mod detached_send_test_seam {
     pub(in crate::server) fn key_package_catchup_key(group_id: &str, member_hex: &str) -> String {
         format!("kp-catchup:{group_id}:{member_hex}")
     }
+
+    /// #1288: the signed-public bootstrap delivery to `recipient_hex` for
+    /// `group_id`, parked inside the outbox step's send.
+    pub(in crate::server) fn public_bootstrap_key(group_id: &str, recipient_hex: &str) -> String {
+        format!("public-bootstrap:{group_id}:{recipient_hex}")
+    }
 }
 
 /// Fan-out a persisted public group message as a race: gossip topic publish
@@ -40006,6 +40012,7 @@ pub(in crate::server) mod tests {
     mod issue1269_shutdown_apply_boundary;
     mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
+    mod issue1288_bootstrap_outbox_shutdown;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
