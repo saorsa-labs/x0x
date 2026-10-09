@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{HistoryError, HistoryResult};
 
+use super::policy::HistoryPolicy;
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
@@ -836,6 +837,22 @@ impl Store {
             warning.emit();
         }
         result
+    }
+
+    /// ADR 0116 §2: [`Self::retain_with_pins`] plus the class and topic
+    /// retention rules of `rules`.
+    ///
+    /// RED SEAM (slice B, test commit): `rules` is not applied yet. This
+    /// forwards to [`Self::retain_with_pins`] so the slice B tests compile
+    /// against the base and fail on their assertions.
+    pub fn retain_with_rules(
+        &self,
+        policy: &RetentionPolicy,
+        rules: &HistoryPolicy,
+        pinned: &PinnedScopes,
+    ) -> HistoryResult<RetainOutcome> {
+        let _ = rules;
+        self.retain_with_pins(policy, pinned)
     }
 
     /// The body of [`Store::retain_with_pins`]: one whole pass under the
@@ -5784,6 +5801,756 @@ mod tests {
         171,
         21,
     );
+
+    // ── ADR 0116 slice B: class and topic retention in the reaper ───────
+
+    use crate::history::policy::{
+        ClassLimit, DmRecording, RetainedClass, TopicRecording, TopicRule,
+    };
+    //
+    // Fixture rows carry a unique tag before `|` in their payload, so a
+    // test reads the survivors back by tag. Without an artifact a row's
+    // logical bytes are its payload length, which these tests set
+    // exactly. Ages are measured against the real clock with day-sized
+    // margins, so the run time of a pass cannot change an outcome.
+
+    const B_DAY_MS: i64 = 86_400_000;
+
+    /// A row tagged `tag` in `scope`, `len` payload bytes, seen at
+    /// `seen_at_ms`; replaceable under `replace_key` when given.
+    fn b_row(
+        tag: &str,
+        scope: Scope,
+        len: usize,
+        seen_at_ms: i64,
+        replace_key: Option<&str>,
+    ) -> HistoryRecord {
+        let mut payload = format!("{tag}|").into_bytes();
+        if payload.len() < len {
+            payload.resize(len, b'x');
+        }
+        let mut row = rec(&payload, scope);
+        row.seen_at_ms = seen_at_ms;
+        row.sent_at_ms = seen_at_ms;
+        row.replace_key = replace_key.map(str::to_string);
+        row
+    }
+
+    fn b_insert(store: &Store, rows: Vec<HistoryRecord>) {
+        for row in rows {
+            assert_eq!(store.insert(&row).unwrap(), InsertOutcome::Inserted);
+        }
+    }
+
+    /// Tags of the rows still stored, sorted.
+    fn b_tags(store: &Store) -> Vec<String> {
+        let guard = lock_conn(&store.conn).unwrap();
+        let mut stmt = guard.prepare("SELECT payload FROM history").unwrap();
+        let mut tags: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|payload| {
+                let payload = payload.unwrap();
+                let end = payload
+                    .iter()
+                    .position(|b| *b == b'|')
+                    .unwrap_or(payload.len());
+                String::from_utf8_lossy(&payload[..end]).into_owned()
+            })
+            .collect();
+        tags.sort();
+        tags
+    }
+
+    fn b_sorted(tags: &[&str]) -> Vec<String> {
+        let mut tags: Vec<String> = tags.iter().map(|t| (*t).to_string()).collect();
+        tags.sort();
+        tags
+    }
+
+    /// A compiled policy from `(class, max_bytes, max_age_days)` and
+    /// `(prefix, max_bytes, max_age_days)` entries.
+    fn b_rules(
+        classes: &[(RetainedClass, Option<u64>, Option<u64>)],
+        topics: &[(&str, Option<u64>, Option<u64>)],
+    ) -> HistoryPolicy {
+        let class_limits: Vec<ClassLimit> = classes
+            .iter()
+            .map(|&(class, max_bytes, max_age_days)| ClassLimit {
+                class,
+                max_bytes,
+                max_age_days,
+            })
+            .collect();
+        let topic_rules: Vec<TopicRule> = topics
+            .iter()
+            .map(|&(prefix, max_bytes, max_age_days)| TopicRule {
+                prefix: prefix.to_string(),
+                recording: TopicRecording::Inherit,
+                max_bytes,
+                max_age_days,
+            })
+            .collect();
+        HistoryPolicy::compile(DmRecording::Inherit, &class_limits, &topic_rules).unwrap()
+    }
+
+    /// No global age and no global cap: only the rules under test bite.
+    fn b_no_global() -> RetentionPolicy {
+        RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        }
+    }
+
+    fn b_dm() -> Scope {
+        Scope::Dm("aa".repeat(32))
+    }
+
+    fn b_topic(name: &str) -> Scope {
+        Scope::Topic(name.to_string())
+    }
+
+    /// Validation row 2: for Durable rows every positive age applies
+    /// (global, class, the winning topic rule) and the shortest wins.
+    /// Replaceable rows are not touched by a Durable or global age.
+    #[test]
+    fn adr0116_b_shortest_positive_age_wins() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        b_insert(
+            &store,
+            vec![
+                b_row("d2", b_dm(), 64, now - 2 * B_DAY_MS, None),
+                b_row("d8", b_dm(), 64, now - 8 * B_DAY_MS, None),
+                b_row("d31", b_dm(), 64, now - 31 * B_DAY_MS, None),
+                b_row("t2", b_topic("app.chat"), 64, now - 2 * B_DAY_MS, None),
+                b_row("t4", b_topic("app.chat"), 64, now - 4 * B_DAY_MS, None),
+                b_row("o4", b_topic("other"), 64, now - 4 * B_DAY_MS, None),
+                b_row("o8", b_topic("other"), 64, now - 8 * B_DAY_MS, None),
+                b_row("r40", b_dm(), 64, now - 40 * B_DAY_MS, Some("agent-card:x")),
+            ],
+        );
+        let policy = RetentionPolicy {
+            max_age_days: 30,
+            ..b_no_global()
+        };
+        let rules = b_rules(
+            &[(RetainedClass::Durable, None, Some(7))],
+            &[("app.", None, Some(3))],
+        );
+        store
+            .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(
+            b_tags(&store),
+            b_sorted(&["d2", "t2", "o4", "r40"]),
+            "global 30 d, class 7 d and topic 3 d each apply; the shortest wins"
+        );
+    }
+
+    /// Validation row 2: a local zero cannot disable the global age.
+    #[test]
+    fn adr0116_b_local_zero_age_never_disables_global() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        b_insert(
+            &store,
+            vec![
+                b_row("old", b_topic("app.chat"), 64, now - 31 * B_DAY_MS, None),
+                b_row("new", b_topic("app.chat"), 64, now - B_DAY_MS, None),
+            ],
+        );
+        let policy = RetentionPolicy {
+            max_age_days: 30,
+            ..b_no_global()
+        };
+        let rules = b_rules(
+            &[(RetainedClass::Durable, Some(u64::from(u32::MAX)), Some(0))],
+            &[("app.", None, Some(0))],
+        );
+        store
+            .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["new"]));
+    }
+
+    /// Validation row 2: a class budget is an additional aggregate
+    /// ceiling over every Durable row; Replaceable rows are not in it.
+    #[test]
+    fn adr0116_b_class_budget_is_an_additional_ceiling() {
+        let (store, _dir) = open();
+        let mut rows = Vec::new();
+        for i in 0..10_i64 {
+            let scope = if i % 2 == 0 {
+                b_dm()
+            } else {
+                b_topic("app.chat")
+            };
+            rows.push(b_row(&format!("d{i}"), scope, 1_000, 10 + i, None));
+        }
+        rows.push(b_row("r0", b_dm(), 1_000, 1, Some("agent-card:a")));
+        rows.push(b_row("r1", b_dm(), 1_000, 2, Some("agent-card:b")));
+        b_insert(&store, rows);
+        let rules = b_rules(&[(RetainedClass::Durable, Some(3_000), None)], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(
+            b_tags(&store),
+            b_sorted(&["d7", "d8", "d9", "r0", "r1"]),
+            "the oldest Durable rows go until the class fits 3000 bytes"
+        );
+    }
+
+    /// Validation row 2: one budget covers every topic the winning prefix
+    /// selects, oldest first across them.
+    #[test]
+    fn adr0116_b_topic_budget_spans_all_topics_of_the_winning_prefix() {
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row("a1", b_topic("app.a"), 1_000, 1, None),
+                b_row("b2", b_topic("app.b"), 1_000, 2, None),
+                b_row("a3", b_topic("app.a"), 1_000, 3, None),
+                b_row("b4", b_topic("app.b"), 1_000, 4, None),
+                b_row("a5", b_topic("app.a"), 1_000, 5, None),
+                b_row("b6", b_topic("app.b"), 1_000, 6, None),
+                b_row("z1", b_topic("zzz"), 1_000, 1, None),
+                b_row("m1", b_dm(), 1_000, 1, None),
+            ],
+        );
+        let rules = b_rules(&[], &[("app.", Some(2_000), None)]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["a5", "b6", "z1", "m1"]));
+    }
+
+    /// Validation row 2: the longest prefix wins the WHOLE rule; a field it
+    /// omits does not come from a shorter prefix.
+    #[test]
+    fn adr0116_b_longer_prefix_never_inherits_shorter_rule() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        b_insert(
+            &store,
+            vec![
+                b_row(
+                    "chat5",
+                    b_topic("app.chat.room"),
+                    64,
+                    now - 5 * B_DAY_MS,
+                    None,
+                ),
+                b_row("sync5", b_topic("app.sync"), 64, now - 5 * B_DAY_MS, None),
+            ],
+        );
+        let rules = b_rules(
+            &[],
+            &[
+                ("app.", None, Some(3)),
+                ("app.chat", Some(u64::from(u32::MAX)), None),
+            ],
+        );
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["chat5"]));
+    }
+
+    /// Validation row 2: prefixes are literal, case-sensitive bytes; `_`
+    /// and `%` are not SQL wildcards here.
+    #[test]
+    fn adr0116_b_prefix_matching_is_literal() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        let old = now - 5 * B_DAY_MS;
+        b_insert(
+            &store,
+            vec![
+                b_row("underscore", b_topic("app_x"), 64, old, None),
+                b_row("percent", b_topic("app%y"), 64, old, None),
+                b_row("wild_u", b_topic("appXchat"), 64, old, None),
+                b_row("wild_p", b_topic("appchat"), 64, old, None),
+                b_row("upper", b_topic("APP_x"), 64, old, None),
+                b_row("short", b_topic("app"), 64, old, None),
+            ],
+        );
+        let rules = b_rules(&[], &[("app_", None, Some(1)), ("app%", None, Some(1))]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(
+            b_tags(&store),
+            b_sorted(&["wild_u", "wild_p", "upper", "short"])
+        );
+    }
+
+    /// The reaper's SQL assignment of a topic to its winning rule agrees
+    /// with the Rust matcher (`HistoryPolicy::winning_topic_rule`), for
+    /// both the age path and the budget path, including multi-byte
+    /// prefixes. Rule `k` alone gets a bound; the others are prefix-only
+    /// carve-outs, so exactly the topics rule `k` wins are evicted.
+    #[test]
+    fn adr0116_b_sql_topic_assignment_matches_the_rust_matcher() {
+        let topics = [
+            "a", "ab", "abc", "a_b", "a%", "a.x", "é", "é.", "é.x", "éa", "b", "A", "ab.", "abz",
+        ];
+        let prefixes = ["a", "ab", "a_", "é", "é."];
+        for path in ["age", "budget"] {
+            for k in 0..prefixes.len() {
+                let topic_rules: Vec<(&str, Option<u64>, Option<u64>)> = prefixes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, prefix)| match (i == k, path) {
+                        (true, "age") => (*prefix, None, Some(1)),
+                        (true, _) => (*prefix, Some(0), None),
+                        (false, _) => (*prefix, None, None),
+                    })
+                    .collect();
+                let rules = b_rules(&[], &topic_rules);
+                let (store, _dir) = open();
+                let old = now_ms() - 5 * B_DAY_MS;
+                b_insert(
+                    &store,
+                    topics
+                        .iter()
+                        .map(|t| b_row(t, b_topic(t), 64, old, None))
+                        .collect(),
+                );
+                store
+                    .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                    .unwrap();
+                let survivors = b_tags(&store);
+                let expected: Vec<String> = {
+                    let mut kept: Vec<String> = topics
+                        .iter()
+                        .filter(|t| {
+                            rules
+                                .winning_topic_rule(t)
+                                .is_none_or(|rule| rule.prefix != prefixes[k])
+                        })
+                        .map(|t| (*t).to_string())
+                        .collect();
+                    kept.sort();
+                    kept
+                };
+                assert_eq!(
+                    survivors, expected,
+                    "{path} path, rule {:?}: SQL and Rust disagree on which topics it wins",
+                    prefixes[k]
+                );
+            }
+        }
+    }
+
+    /// Validation row 2: equal `seen_at_ms` breaks on row id, oldest first.
+    #[test]
+    fn adr0116_b_eviction_ties_break_on_id() {
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row("first", b_dm(), 1_000, 7, None),
+                b_row("second", b_dm(), 1_000, 7, None),
+                b_row("third", b_dm(), 1_000, 7, None),
+            ],
+        );
+        let rules = b_rules(&[(RetainedClass::Durable, Some(1_000), None)], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["third"]));
+    }
+
+    /// Validation row 2: a row larger than the remaining excess is
+    /// eligible, so a class or topic cap does not stall on it.
+    #[test]
+    fn adr0116_b_oversized_row_does_not_stall_a_class_or_topic_cap() {
+        for (classes, topics) in [
+            (vec![(RetainedClass::Durable, Some(1_000), None)], vec![]),
+            (vec![], vec![("app.", Some(1_000), None)]),
+        ] {
+            let (store, _dir) = open();
+            b_insert(
+                &store,
+                vec![
+                    b_row("big", b_topic("app.x"), 5_000, 1, None),
+                    b_row("s1", b_topic("app.x"), 100, 2, None),
+                    b_row("s2", b_topic("app.x"), 100, 3, None),
+                    b_row("s3", b_topic("app.x"), 100, 4, None),
+                ],
+            );
+            let rules = b_rules(&classes, &topics);
+            store
+                .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                .unwrap();
+            assert_eq!(b_tags(&store), b_sorted(&["s1", "s2", "s3"]));
+        }
+    }
+
+    /// Validation row 3: with no Replaceable opt-in, current-state rows
+    /// survive the global age, the global cap and every Durable rule.
+    #[test]
+    fn adr0116_b_default_replaceable_rows_survive_ordinary_reaping() {
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row("card", b_dm(), 2_000, 1, Some("agent-card:x")),
+                b_row(
+                    "gcard",
+                    Scope::Group("g".into()),
+                    2_000,
+                    1,
+                    Some("group-card:g"),
+                ),
+                b_row("d", b_dm(), 2_000, 1, None),
+            ],
+        );
+        let policy = RetentionPolicy {
+            max_bytes: 1,
+            max_age_days: 1,
+            scope_limits: vec![ScopeLimit {
+                scope: b_dm().canonical(),
+                max_bytes: 0,
+            }],
+        };
+        let rules = b_rules(&[(RetainedClass::Durable, Some(0), Some(1))], &[]);
+        for _ in 0..3 {
+            store
+                .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+                .unwrap();
+        }
+        assert_eq!(b_tags(&store), b_sorted(&["card", "gcard"]));
+    }
+
+    /// Validation row 3 / D229: an explicit Replaceable class limit expires
+    /// current-state rows, by age and by bytes. Durable rows are not in it.
+    #[test]
+    fn adr0116_b_replaceable_class_limit_expires_current_state() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        b_insert(
+            &store,
+            vec![
+                b_row(
+                    "r_old",
+                    b_dm(),
+                    64,
+                    now - 10 * B_DAY_MS,
+                    Some("agent-card:old"),
+                ),
+                b_row(
+                    "r_new",
+                    b_dm(),
+                    64,
+                    now - 2 * B_DAY_MS,
+                    Some("agent-card:new"),
+                ),
+                b_row("d_old", b_dm(), 64, now - 10 * B_DAY_MS, None),
+            ],
+        );
+        let rules = b_rules(&[(RetainedClass::Replaceable, None, Some(7))], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["r_new", "d_old"]));
+
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row("r1", b_dm(), 1_000, 1, Some("agent-card:1")),
+                b_row("r2", b_dm(), 1_000, 2, Some("agent-card:2")),
+                b_row("r3", b_dm(), 1_000, 3, Some("agent-card:3")),
+                b_row("d1", b_dm(), 1_000, 0, None),
+            ],
+        );
+        let rules = b_rules(&[(RetainedClass::Replaceable, Some(1_500), None)], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["r3", "d1"]));
+    }
+
+    /// Validation row 3: a topic limit applies to the Replaceable rows of
+    /// its topics, with no Replaceable class entry. Unrelated current-state
+    /// rows survive.
+    #[test]
+    fn adr0116_b_topic_limit_hits_matching_replaceable_rows_only() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        let old = now - 10 * B_DAY_MS;
+        b_insert(
+            &store,
+            vec![
+                b_row(
+                    "topic_state",
+                    b_topic("app.state"),
+                    64,
+                    old,
+                    Some("app-state:1"),
+                ),
+                b_row("agent_card", b_dm(), 64, old, Some("agent-card:x")),
+                b_row("other_state", b_topic("zzz"), 64, old, Some("zzz-state:1")),
+            ],
+        );
+        let rules = b_rules(&[], &[("app.", None, Some(7))]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["agent_card", "other_state"]));
+    }
+
+    /// Validation row 3 / Q7: opting Replaceable rows in to their class
+    /// limit does not expose them to the global age or the global cap.
+    #[test]
+    fn adr0116_b_replaceable_opt_in_is_not_exposed_to_global_age_or_cap() {
+        let (store, _dir) = open();
+        b_insert(
+            &store,
+            vec![
+                b_row("card", b_dm(), 2_000, 1, Some("agent-card:x")),
+                b_row("d", b_dm(), 2_000, 1, None),
+            ],
+        );
+        let policy = RetentionPolicy {
+            max_bytes: 1,
+            max_age_days: 1,
+            scope_limits: Vec::new(),
+        };
+        let rules = b_rules(
+            &[(
+                RetainedClass::Replaceable,
+                Some(u64::from(u32::MAX)),
+                Some(36_500),
+            )],
+            &[],
+        );
+        for _ in 0..3 {
+            store
+                .retain_with_rules(&policy, &rules, &PinnedScopes::none())
+                .unwrap();
+        }
+        assert_eq!(b_tags(&store), b_sorted(&["card"]));
+    }
+
+    /// Validation row 5: a pinned group survives every new phase, under
+    /// either spelling of its id; unpinned rows under the same rules go.
+    #[test]
+    fn adr0116_b_pinned_group_survives_every_new_phase_both_spellings() {
+        for spelling in ["group:pin-stable", "group:pin-alias"] {
+            let (store, _dir) = open();
+            let now = now_ms();
+            let old = now - 30 * B_DAY_MS;
+            b_insert(
+                &store,
+                vec![
+                    b_row("pinned_d", Scope::Group("pin-stable".into()), 64, old, None),
+                    b_row(
+                        "pinned_r",
+                        Scope::Group("pin-stable".into()),
+                        64,
+                        old,
+                        Some("group-card:pin-stable"),
+                    ),
+                    b_row("free_d", Scope::Group("free".into()), 64, old, None),
+                    b_row(
+                        "free_r",
+                        Scope::Group("free".into()),
+                        64,
+                        old,
+                        Some("group-card:free"),
+                    ),
+                ],
+            );
+            // The alias spelling is pinned alongside the stable id, as the
+            // daemon's pin source reports it.
+            let pins = if spelling == "group:pin-alias" {
+                PinnedScopes::from_canonical(["group:pin-alias", "group:pin-stable"])
+            } else {
+                PinnedScopes::from_canonical([spelling])
+            };
+            let rules = b_rules(
+                &[
+                    (RetainedClass::Durable, Some(0), Some(1)),
+                    (RetainedClass::Replaceable, Some(0), Some(1)),
+                ],
+                &[],
+            );
+            store
+                .retain_with_rules(&b_no_global(), &rules, &pins)
+                .unwrap();
+            assert_eq!(
+                b_tags(&store),
+                b_sorted(&["pinned_d", "pinned_r"]),
+                "pins listed as {spelling}"
+            );
+        }
+    }
+
+    /// Validation row 5: new rules never lower the pinned ceiling; only the
+    /// unchanged ceiling path evicts a pinned scope's rows.
+    #[test]
+    fn adr0116_b_new_rules_never_lower_the_pinned_ceiling() {
+        let run = |rules: &HistoryPolicy| {
+            let (store, _dir) = open();
+            let mut rows = Vec::new();
+            for i in 0..50_i64 {
+                rows.push(b_row(
+                    &format!("p{i:02}"),
+                    Scope::Group("pin".into()),
+                    1_000,
+                    i,
+                    None,
+                ));
+            }
+            b_insert(&store, rows);
+            // 50 000 bytes against a ceiling of min(4 × 10 000, 640 000 / 16)
+            // = 40 000 (base = 640 000 / 64).
+            let policy = RetentionPolicy {
+                max_bytes: 640_000,
+                max_age_days: 0,
+                scope_limits: Vec::new(),
+            };
+            let pins = PinnedScopes::from_canonical(["group:pin"]);
+            let outcome = store.retain_with_rules(&policy, rules, &pins).unwrap();
+            (outcome.pinned_evicted, b_tags(&store))
+        };
+        let without = run(&HistoryPolicy::default());
+        let with = run(&b_rules(&[(RetainedClass::Durable, Some(0), Some(1))], &[]));
+        assert!(without.0 > 0, "the fixture is over its pinned ceiling");
+        assert_eq!(with, without, "the same ceiling and the same survivors");
+    }
+
+    /// Validation row 5: once the marker clears, the next pass applies the
+    /// ordinary rules to the group.
+    #[test]
+    fn adr0116_b_cleared_marker_next_pass_applies_class_rules() {
+        let (store, _dir) = open();
+        let old = now_ms() - 30 * B_DAY_MS;
+        b_insert(
+            &store,
+            vec![b_row("g", Scope::Group("q".into()), 64, old, None)],
+        );
+        let rules = b_rules(&[(RetainedClass::Durable, None, Some(1))], &[]);
+        store
+            .retain_with_rules(
+                &b_no_global(),
+                &rules,
+                &PinnedScopes::from_canonical(["group:q"]),
+            )
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["g"]), "pinned: kept");
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert!(
+            b_tags(&store).is_empty(),
+            "marker cleared: the class age applies"
+        );
+    }
+
+    /// Validation row 5: unsigned MLS rows (no artifact, no canonical id)
+    /// are Durable, so the class age and the exact-scope budget expire them.
+    #[test]
+    fn adr0116_b_unsigned_mls_rows_expire_under_class_and_scope_bounds() {
+        let (store, _dir) = open();
+        let now = now_ms();
+        let mut old = mls_rec("mls-g", 1, b"mls-old|plaintext");
+        old.seen_at_ms = now - 10 * B_DAY_MS;
+        let mut new = mls_rec("mls-g", 1, b"mls-new|plaintext");
+        new.seen_at_ms = now - B_DAY_MS;
+        b_insert(&store, vec![old, new]);
+        let rules = b_rules(&[(RetainedClass::Durable, None, Some(7))], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert_eq!(b_tags(&store), b_sorted(&["mls-new"]));
+
+        let scoped = RetentionPolicy {
+            scope_limits: vec![ScopeLimit {
+                scope: "group:mls-g".into(),
+                max_bytes: 0,
+            }],
+            ..b_no_global()
+        };
+        store
+            .retain_with_rules(&scoped, &HistoryPolicy::default(), &PinnedScopes::none())
+            .unwrap();
+        assert!(
+            b_tags(&store).is_empty(),
+            "the exact-scope budget still applies"
+        );
+    }
+
+    /// Validation row 5: with no pin source (a library embedding), nothing
+    /// is pinned and the class rules apply to every group.
+    #[test]
+    fn adr0116_b_absent_pin_source_pins_nothing() {
+        let (store, _dir) = open();
+        let old = now_ms() - 30 * B_DAY_MS;
+        b_insert(
+            &store,
+            vec![b_row("g", Scope::Group("any".into()), 64, old, None)],
+        );
+        let rules = b_rules(&[(RetainedClass::Durable, None, Some(1))], &[]);
+        store
+            .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+            .unwrap();
+        assert!(b_tags(&store).is_empty());
+    }
+
+    /// Validation row 1: with no ADR 0116 rule, `retain_with_rules` is
+    /// `retain_with_pins`. On the characterization fixture it gives the
+    /// same outcome every pass, the same survivors, and main's pinned
+    /// result (`CHAR_EVICTION_RESULT`).
+    #[test]
+    fn adr0116_b_unset_rules_match_main_on_the_characterization_fixture() {
+        let (with_rules, _d1) = open();
+        let (with_pins, _d2) = open();
+        char_fixture(&with_rules);
+        char_fixture(&with_pins);
+        settle(&with_rules);
+        settle(&with_pins);
+        let live = with_rules.live_bytes().unwrap();
+        let policy = RetentionPolicy {
+            max_bytes: live - live / 3,
+            max_age_days: 30,
+            scope_limits: vec![ScopeLimit {
+                scope: "group:g1".into(),
+                max_bytes: 12_000,
+            }],
+        };
+        let pins = PinnedScopes::from_canonical(["group:pin-alias", "group:pin-stable"]);
+        let mut evicted = 0;
+        let mut pinned_evicted = 0;
+        for pass in 0..4 {
+            let a = with_rules
+                .retain_with_rules(&policy, &HistoryPolicy::default(), &pins)
+                .unwrap();
+            let b = with_pins.retain_with_pins(&policy, &pins).unwrap();
+            assert_eq!(a, b, "pass {pass}: same outcome as retain_with_pins");
+            evicted += a.evicted;
+            pinned_evicted += a.pinned_evicted;
+        }
+        let (survivors, durable, replaceable) = char_digest(&with_rules);
+        assert_eq!(char_digest(&with_pins).0, survivors);
+        assert_eq!(
+            (
+                survivors.as_str(),
+                durable,
+                replaceable,
+                evicted,
+                pinned_evicted
+            ),
+            CHAR_EVICTION_RESULT,
+            "unset rules must give main's eviction results"
+        );
+    }
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
