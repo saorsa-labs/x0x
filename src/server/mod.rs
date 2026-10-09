@@ -2883,13 +2883,21 @@ const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 
 /// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
 /// server-owned task (the startup tasks in `bg_tasks`, the AppState handle
-/// maps, the detached registry, the join-attempt registry and, in place,
-/// the join-artifact egress registry), then await, never abort, the
-/// shielded group-state applies.
+/// maps, the REST `/subscribe` forwarders, the detached registry, the
+/// join-attempt registry and, in place, the join-artifact egress registry),
+/// then await, never abort, the shielded group-state applies.
 async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
+    // #1288 row 2: REST `/subscribe` forwarders. A topic in
+    // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
+    // which holds `history.db`. Dropping the map would detach that task and
+    // leave the database locked after `shutdown_and_wait`. Admission is
+    // `shutdown_started`, cancelled above and checked under this lock by
+    // `subscribe`. These tasks only forward, so the grace window below
+    // aborts any still blocked on receive.
+    bg_tasks.extend(routes::take_rest_subscribe_forwarders(state).await);
     bg_tasks.extend(
         std::mem::take(&mut *state.group_metadata_tasks.write().await)
             .into_values()
