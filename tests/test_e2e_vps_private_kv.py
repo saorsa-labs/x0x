@@ -237,15 +237,34 @@ class PrivateKvHarnessTests(unittest.TestCase):
 
     def test_private_join_waits_for_exact_local_group_after_owner_roster(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
-        owner.request = mock.Mock(side_effect=[
-            (200, {"members": []}),
-            (200, {"members": [{"agent_id": "2" * 64}]}),
-        ])
-        member.request = mock.Mock(side_effect=[
-            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}),
-            (200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}),
-            (200, {"group_id": "private-id", "membership_state": "active"}),
-        ])
+        sealed: dict[str, str] = {}
+        owner_reads = {"n": 0}
+        local_reads = {"n": 0}
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                sealed["payload"] = body["payload_b64"]
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 2,
+                             "secure_plane": "treekem"}
+            owner_reads["n"] += 1
+            if owner_reads["n"] == 1:
+                return 200, {"members": []}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                return 200, {"ok": True, "payload_b64": sealed["payload"], "secret_epoch": 2,
+                             "secure_plane": "treekem"}
+            local_reads["n"] += 1
+            if local_reads["n"] == 1:
+                return 200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}
+            return 200, {"group_id": "private-id", "membership_state": "active"}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
         scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
         clock = [100.0]
         with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -258,15 +277,37 @@ class PrivateKvHarnessTests(unittest.TestCase):
         self.assertEqual("accepted", readiness["outcome"])
         self.assertEqual("active", readiness["local_membership_state"])
         self.assertEqual(2, readiness["probe_count"])
+        self.assertTrue(readiness["epoch_key_installed"])
+        self.assertEqual("decrypted", readiness["decrypt_class"])
+        self.assertEqual(2, readiness["secret_epoch"])
+        self.assertNotIn("Y2lwaGVy", json.dumps(readiness))
 
     def test_private_join_requires_local_readiness_when_owner_is_ready_first(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
-        owner.request = mock.Mock(return_value=(200, {"members": [{"agent_id": "2" * 64}]}))
-        member.request = mock.Mock(side_effect=[
-            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}),
-            (200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}),
-            (200, {"group_id": "private-id", "membership_state": "active"}),
-        ])
+        sealed: dict[str, str] = {}
+        local_reads = {"n": 0}
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                sealed["payload"] = body["payload_b64"]
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 4,
+                             "secure_plane": "treekem"}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                return 200, {"ok": True, "payload_b64": sealed["payload"], "secret_epoch": 4,
+                             "secure_plane": "treekem"}
+            local_reads["n"] += 1
+            if local_reads["n"] == 1:
+                return 200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}
+            return 200, {"group_id": "private-id", "membership_state": "active"}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
         scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
         clock = [100.0]
         with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -276,7 +317,196 @@ class PrivateKvHarnessTests(unittest.TestCase):
         self.assertEqual("accepted", readiness["outcome"])
         self.assertEqual(2, readiness["probe_count"])
         self.assertEqual(2, readiness["local_probe_count"])
-        self.assertEqual(3, member.request.call_count)
+        self.assertEqual(["/groups/join", "/groups/private-id", "/groups/private-id",
+                          "/groups/private-id/secure/decrypt"],
+                         [call.args[1] for call in member.request.call_args_list])
+        self.assertTrue(readiness["epoch_key_installed"])
+
+    def test_private_join_readiness_rejects_active_roster_without_welcome_key(self):
+        # #1214: roster + local active passed while the joiner had logged
+        # "failed to fetch TreeKEM Welcome blob". That is not key readiness.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(side_effect=lambda method, path, body=None: (
+            (200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 3,
+                   "secure_plane": "treekem"})
+            if str(path).endswith("/secure/encrypt") else
+            (200, {"members": [{"agent_id": "2" * 64}]})))
+        member.request = mock.Mock(side_effect=lambda method, path, body=None: (
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"})
+            if method == "POST" and path == "/groups/join" else
+            (424, {"ok": False, "error": "TreeKEM group not loaded — restart or re-share required"})
+            if str(path).endswith("/secure/decrypt") else
+            (200, {"group_id": "private-id", "membership_state": "active"})
+            if path == "/groups/private-id" else
+            (200, {"last_join_outcome": {"outcome": "timed_out"}})))
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        clock = [100.0]
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep",
+                                  side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertEqual("active", readiness["local_membership_state"])
+        self.assertFalse(readiness["epoch_key_installed"])
+        self.assertEqual("treekem_not_loaded", readiness["decrypt_class"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
+        self.assertNotIn("Y2lwaGVy", json.dumps(readiness))
+
+    def test_private_key_proof_does_not_decrypt_after_the_seal_spends_the_deadline(self):
+        # The seal itself can consume the readiness deadline. Decrypt must not start.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+        decrypts = []
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                clock[0] = 103.0
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 5,
+                             "secure_plane": "treekem"}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                decrypts.append(path)
+                return 200, {"ok": True, "payload_b64": "c2VhbGVk", "secret_epoch": 5}
+            if path == "/groups/private-id":
+                return 200, {"group_id": "private-id", "membership_state": "active"}
+            return 200, {"last_join_outcome": {"outcome": "timed_out"}}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual([], decrypts)
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertFalse(readiness["epoch_key_installed"])
+        self.assertEqual("not_attempted", readiness["decrypt_class"])
+        self.assertEqual(5, readiness["secret_epoch"])
+        self.assertEqual(200, readiness["encrypt_status"])
+        self.assertNotIn("decrypt_status", readiness)
+        self.assertNotIn("Y2lwaGVy", json.dumps(readiness))
+
+    def test_private_join_timeout_preserves_a_late_installed_key(self):
+        # A decrypt that succeeds as the deadline lands is still a key observation.
+        # The timeout outcome says it was too late; it must not claim the key was absent.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+        sealed: dict[str, str] = {}
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                sealed["payload"] = body["payload_b64"]
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 6,
+                             "secure_plane": "treekem"}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                clock[0] = 102.0
+                return 200, {"ok": True, "payload_b64": sealed["payload"], "secret_epoch": 6,
+                             "secure_plane": "treekem"}
+            if path == "/groups/private-id":
+                return 200, {"group_id": "private-id", "membership_state": "active"}
+            return 200, {"last_join_outcome": {"outcome": "timed_out"}}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
+        self.assertTrue(readiness["epoch_key_installed"])
+        self.assertEqual("decrypted", readiness["decrypt_class"])
+        self.assertEqual(6, readiness["secret_epoch"])
+        self.assertNotIn("Y2lwaGVy", json.dumps(readiness))
+
+    def test_private_join_readiness_accepts_after_a_failed_welcome_then_a_decrypt(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+        sealed: dict[str, str] = {}
+        decrypts = {"n": 0}
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                sealed["payload"] = body["payload_b64"]
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 7,
+                             "secure_plane": "treekem"}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                decrypts["n"] += 1
+                if decrypts["n"] == 1:
+                    return 424, {"ok": False,
+                                 "error": "TreeKEM group not loaded — restart or re-share required"}
+                return 200, {"ok": True, "payload_b64": sealed["payload"], "secret_epoch": 7,
+                             "secure_plane": "treekem"}
+            return 200, {"group_id": "private-id", "membership_state": "active"}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=3)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep",
+                                  side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual(2, decrypts["n"])
+        self.assertEqual("accepted", readiness["outcome"])
+        self.assertTrue(readiness["epoch_key_installed"])
+        self.assertEqual("decrypted", readiness["decrypt_class"])
+        self.assertEqual(7, readiness["secret_epoch"])
+
+    def test_private_join_readiness_rejects_a_mismatched_plaintext(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+
+        def owner_request(method, path, body=None):
+            if str(path).endswith("/secure/encrypt"):
+                return 200, {"ok": True, "ciphertext_b64": "Y2lwaGVy", "secret_epoch": 8,
+                             "secure_plane": "treekem"}
+            return 200, {"members": [{"agent_id": "2" * 64}]}
+
+        def member_request(method, path, body=None):
+            if method == "POST" and path == "/groups/join":
+                return 201, {"ok": True, "group_id": "private-id",
+                             "join_state": "pending_authority_commit"}
+            if str(path).endswith("/secure/decrypt"):
+                return 200, {"ok": True, "payload_b64": "bm90LXRoZS1zZWFs", "secret_epoch": 8}
+            if path == "/groups/private-id":
+                return 200, {"group_id": "private-id", "membership_state": "active"}
+            return 200, {"last_join_outcome": {"outcome": "timed_out"}}
+
+        owner.request = mock.Mock(side_effect=owner_request)
+        member.request = mock.Mock(side_effect=member_request)
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep",
+                                  side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertFalse(readiness["epoch_key_installed"])
+        self.assertEqual("wrong_plaintext", readiness["decrypt_class"])
+        self.assertNotIn("bm90LXRoZS1zZWFs", json.dumps(readiness))
 
     def test_private_join_rejects_active_local_wrong_group(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
