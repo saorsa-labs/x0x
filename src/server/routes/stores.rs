@@ -853,8 +853,14 @@ struct GssGroupStoreBinding {
 /// write restores the pre-operation ratchet before releasing the mutex, so a
 /// record is never acknowledged or published from state that only existed in
 /// memory.
+///
+/// The protector holds the daemon state only weakly (#1250, #1269): the
+/// store's sync owns the protector, and the daemon state owns the store
+/// (`kv_stores`, or `task_lists` for a group task list), so a strong capture
+/// is a cycle that keeps the state, the Agent and its history database alive
+/// after shutdown. Once the state is gone every operation fails closed.
 struct TreeKemGroupStoreProtector {
-    state: Arc<AppState>,
+    state: std::sync::Weak<AppState>,
     group_key: String,
     stable_group_id: String,
     authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
@@ -874,7 +880,7 @@ pub(in crate::server) fn treekem_task_list_protector(
         info,
     )?);
     Some(Arc::new(TreeKemGroupStoreProtector {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         group_key: group_key.to_string(),
         stable_group_id: info.stable_group_id().to_string(),
         authorization,
@@ -889,12 +895,19 @@ impl TreeKemGroupStoreProtector {
         authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
     ) -> Self {
         Self {
-            state: Arc::clone(state),
+            state: Arc::downgrade(state),
             group_key: binding.group_key.clone(),
             stable_group_id: binding.stable_group_id.clone(),
             authorization,
             invalid: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The daemon state, or a fail-closed refusal once it is gone.
+    fn state(&self) -> x0x::kv::Result<Arc<AppState>> {
+        self.state.upgrade().ok_or_else(|| {
+            x0x::kv::KvError::Unauthorized("TreeKEM group store is retired".to_string())
+        })
     }
 
     async fn current_info(&self) -> x0x::kv::Result<x0x::groups::GroupInfo> {
@@ -903,7 +916,8 @@ impl TreeKemGroupStoreProtector {
                 "TreeKEM group store is retired".to_string(),
             ));
         }
-        let groups = self.state.named_groups.read().await;
+        let state = self.state()?;
+        let groups = state.named_groups.read().await;
         // ADR-0067 hard requirement: BOTH spellings. This was a bare
         // `groups.get(&self.group_key)`. It failed closed rather than open
         // (the `stable_group_id()` comparison below catches a mismatch), but a
@@ -973,15 +987,16 @@ impl TreeKemGroupStoreProtector {
     async fn live_group(
         &self,
     ) -> x0x::kv::Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
-        self.state
+        let state = self.state()?;
+        let live = state
             .treekem_groups
             .read()
             .await
             .get(&self.group_key)
-            .cloned()
-            .ok_or_else(|| {
-                x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
-            })
+            .cloned();
+        live.ok_or_else(|| {
+            x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
+        })
     }
 
     fn map_crypto_error(error: impl std::fmt::Display) -> x0x::kv::KvError {
@@ -994,11 +1009,14 @@ impl TreeKemGroupStoreProtector {
         snapshot: &[u8],
         group: &mut x0x::mls::TreeKemMlsGroup,
     ) {
-        match super::named_groups::restore_local_treekem_group_from_snapshot(
-            &self.state,
-            info,
-            snapshot,
-        ) {
+        let Ok(state) = self.state() else {
+            // The daemon is gone: nothing can use this ratchet again.
+            self.invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        match super::named_groups::restore_local_treekem_group_from_snapshot(&state, info, snapshot)
+        {
             Ok(restored) => *group = restored,
             Err(error) => {
                 self.invalid
@@ -1023,8 +1041,8 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         payload: &[u8],
         reader_only: bool,
     ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
         let _membership_guard = membership.lock().await;
         let live = self.live_group().await?;
         let mut group = live.lock().await;
@@ -1059,12 +1077,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 return Err(Self::map_crypto_error(error));
             }
         };
-        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
-            &self.state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        if let Err(error) =
+            super::named_groups::persist_treekem_snapshot_bound(&state, &self.group_key, &group)
+                .await
         {
             self.rollback(&info, &rollback, &mut group).await;
             return Err(x0x::kv::KvError::Gossip(format!(
@@ -1094,8 +1109,8 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "TreeKEM record binding mismatch".to_string(),
             ));
         }
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
         let _membership_guard = membership.lock().await;
         let live = self.live_group().await?;
         let mut group = live.lock().await;
@@ -1135,12 +1150,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "TreeKEM mutation author is not currently authorized".to_string(),
             ));
         }
-        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
-            &self.state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        if let Err(error) =
+            super::named_groups::persist_treekem_snapshot_bound(&state, &self.group_key, &group)
+                .await
         {
             self.rollback(&info, &rollback, &mut group).await;
             return Err(x0x::kv::KvError::Gossip(format!(
@@ -1188,8 +1200,8 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "read-side TreeKEM record cannot mutate a store".to_string(),
             ));
         }
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
         let _membership_guard = membership.lock().await;
         let info = self.current_info().await?;
         if opened.authorization_binding != Self::authorization_binding(&info)
@@ -1438,13 +1450,21 @@ fn public_kv_refresh(
     topic: String,
     creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
-    let state = Arc::clone(state);
+    // Weak (#1269): the store's sync owns this closure and the daemon state
+    // owns the store, so a strong capture would keep the state (and the
+    // Agent and its history database) alive after shutdown. Once the state
+    // is gone the context is invalidated (fail closed).
+    let state = Arc::downgrade(state);
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
-        let state = Arc::clone(&state);
+        let state = state.clone();
         let group_key = group_key.clone();
         let topic = topic.clone();
         Box::pin(async move {
+            let Some(state) = state.upgrade() else {
+                ctx.invalidate();
+                return;
+            };
             let valid = {
                 let groups = state.named_groups.read().await;
                 refresh_public_store_binding(

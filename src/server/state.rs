@@ -959,6 +959,30 @@ pub(super) struct AppState {
     /// One cancellable owner-side stream per staged Welcome.
     /// `None` closes admission during shutdown under the same lock as replacement.
     pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// #1269: detached best-effort tasks that capture the Agent or this
+    /// AppState: named-group event direct deliveries (immediate and
+    /// delayed), the terminal-event and delegation-carrier redelivery
+    /// schedules, legacy join work, control-blob fetches and sends, the
+    /// owner-side join-result and Welcome fetch handlers, and the delayed
+    /// card and chat publishes of `POST /groups`. None of them persists
+    /// anything. `None` closes admission during shutdown; the shutdown tail
+    /// drains them with the other server tasks (grace, then abort), so none
+    /// of them keeps the Agent and its exclusive `history.db` connection
+    /// alive after `shutdown_and_wait`.
+    pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    /// #1269 r2: admitted applies that persist group state (a pulled
+    /// control blob's apply, the owner-certificate join retry). Shutdown
+    /// never aborts them: an abort inside an atomic write or its journal
+    /// step would leave the persisted state torn, or leave a blocking write
+    /// running after the daemon released its locks. `None` closes
+    /// admission (an apply that has not started is refused); the shutdown
+    /// tail then awaits the admitted ones, bounded, before the Agent stops.
+    pub(super) shielded_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    /// #1269 r2: cancelled when the shutdown drain starts. A network wait
+    /// inside a shielded apply (the joiner's Welcome fetch) selects on it,
+    /// so the apply takes its ordinary failure path instead of waiting out
+    /// a peer that can no longer answer while shutdown waits for it.
+    pub(super) shutdown_started: tokio_util::sync::CancellationToken,
     /// ADR 0107 (review r2): every in-flight join-artifact egress task
     /// (join-result send, control-blob staging and chunk sends), keyed by
     /// `(group id, recipient hex)`. Registered under the group's membership
@@ -1282,6 +1306,75 @@ pub(super) struct AppState {
     /// clear or append another instance's evidence (#759 item 4).
     #[cfg(test)]
     pub(super) named_group_test_recorders: NamedGroupTestRecorders,
+}
+
+impl AppState {
+    /// #1269: spawn `task` and register it in [`AppState::detached_tasks`],
+    /// so the shutdown tail drains it (grace, then abort). Once shutdown has
+    /// closed admission, `task` is dropped unrun and `false` is returned.
+    pub(super) fn spawn_detached<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tasks) = guard.as_mut() else {
+            return false;
+        };
+        // Reap finished tasks so the registry holds only live ones.
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(task));
+        true
+    }
+
+    /// #1269: whether shutdown has closed detached-task admission.
+    pub(super) fn detached_admission_closed(&self) -> bool {
+        self.detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// #1269 r2: spawn an apply that persists group state and register it in
+    /// [`AppState::shielded_tasks`]. Shutdown awaits it and never aborts it.
+    /// Once shutdown has closed admission, `task` is dropped unrun (the apply
+    /// never starts) and `false` is returned.
+    pub(super) fn spawn_shielded<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .shielded_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tasks) = guard.as_mut() else {
+            return false;
+        };
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(task));
+        true
+    }
+
+    /// #1269 r2: run `task` as a shielded apply and wait for its output. If
+    /// the caller is aborted or times out while it waits, the apply still
+    /// runs to completion. `None` when shutdown refused it before it
+    /// started.
+    pub(super) async fn run_shielded<F>(&self, task: F) -> Option<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let admitted = self.spawn_shielded(async move {
+            let _ = done_tx.send(task.await);
+        });
+        if !admitted {
+            return None;
+        }
+        done_rx.await.ok()
+    }
 }
 
 /// ADR 0107 (review r2): in-flight join-artifact egress tasks keyed by
