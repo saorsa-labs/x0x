@@ -67,8 +67,8 @@ use routes::{
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
     handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
     history_diagnostics, history_list, history_message, history_policy, history_purge,
-    history_scopes, history_search, history_stats, identity_revocations, identity_revoke,
-    import_agent_card, import_group_card, ingest_public_message, introduction,
+    history_retain, history_scopes, history_search, history_stats, identity_revocations,
+    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
     join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
     list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
     list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
@@ -2614,6 +2614,15 @@ pub async fn serve_with_options(
         .route("/history/stats", get(history_stats))
         // ADR 0116 §3: owner-only policy read (durable token, see auth.rs).
         .route("/history/policy", get(history_policy))
+        // ADR 0116 §4: the bounded runtime trim (durable token, see auth.rs).
+        // Its 1 KiB body limit sits inside the router-wide 1 MiB one and
+        // overrides it for this route (larger bodies are 413).
+        .route(
+            "/history/retain",
+            post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
+                routes::HISTORY_RETAIN_BODY_LIMIT,
+            )),
+        )
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/state-sync", get(state_sync_diagnostics))

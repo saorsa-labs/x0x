@@ -743,6 +743,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/history/retain",
+        cli_name: "history retain",
+        description: "Trim local history now under its startup policy, within a row and time budget (ADR 0116, owner-only)",
+        category: "history",
+        request: RequestSpec::Fields(&[RequestField::body("max_rows", false), RequestField::body("budget_ms", false)]),
+    },
+    EndpointDef {
         method: Method::Delete,
         path: "/history",
         cli_name: "history purge",

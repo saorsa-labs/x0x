@@ -64,7 +64,7 @@ pub(super) use groups::{
 };
 pub(super) use history::{
     history_diagnostics, history_list, history_message, history_policy, history_purge,
-    history_scopes, history_search, history_stats,
+    history_retain, history_scopes, history_search, history_stats, HISTORY_RETAIN_BODY_LIMIT,
 };
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,

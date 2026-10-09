@@ -563,6 +563,9 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("GET /history/search", RouteClass::Covered(&[13])),
     ("GET /history/stats", RouteClass::Covered(&[13])),
     ("DELETE /history", RouteClass::Covered(&[14])),
+    // ADR 0116 §4 (ruling Q6): the runtime trim runs through the retention
+    // service and the daemon's live pin source, ADR 0068 row 27.
+    ("POST /history/retain", RouteClass::Covered(&[27])),
     ("GET /diagnostics/history", RouteClass::Covered(&[26])),
     // The §1 map gap slice 2 recorded, ABSORBED by slice 4: this is the
     // group plane's own ADR-0023 read (it queries the same history store
@@ -1037,7 +1040,9 @@ fn adr0066_every_group_data_plane_route_is_classified() {
     );
 
     // Every classification must point at rows that exist, so a typo'd row
-    // number cannot launder a route as covered.
+    // number cannot launder a route as covered. The ADR-0068 extension rows
+    // (27, 28) are rows too: `POST /history/retain` cites row 27 (ADR 0116
+    // ruling Q6).
     for (key, class) in ROUTE_CLASSIFICATION {
         if let RouteClass::Covered(rows) = class {
             assert!(
@@ -1046,7 +1051,10 @@ fn adr0066_every_group_data_plane_route_is_classified() {
             );
             for row in *rows {
                 assert!(
-                    COVERAGE_MAP.iter().any(|entry| entry.row == *row),
+                    COVERAGE_MAP
+                        .iter()
+                        .chain(ADR0068_ROWS.iter())
+                        .any(|entry| entry.row == *row),
                     "{key} cites §1 row {row}, which does not exist"
                 );
             }

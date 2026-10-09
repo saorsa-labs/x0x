@@ -369,6 +369,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // ADR 0116 §4: the runtime history trim.
+                    | "/history/retain"
             ) || is_two_segment_action(path, "delegate")
         }
         Method::DELETE => is_sync_device_path(path),
@@ -1325,6 +1327,16 @@ mod tests {
                 "GET {path} keeps its tier"
             );
         }
+    }
+
+    /// ADR 0116 §4: the runtime trim needs the durable token (sessions and
+    /// riders get 403 at the route layer). Other history POST/DELETE paths
+    /// keep their tiers.
+    #[test]
+    fn history_retain_requires_durable_owner() {
+        assert!(requires_durable_owner(&Method::POST, "/history/retain"));
+        assert!(!requires_durable_owner(&Method::GET, "/history/retain"));
+        assert!(!requires_durable_owner(&Method::DELETE, "/history"));
     }
 
     #[test]
