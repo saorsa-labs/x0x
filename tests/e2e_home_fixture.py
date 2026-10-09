@@ -559,6 +559,7 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
              for i, (label, host) in enumerate(zip(args.nodes, hosts))}
     custody = SyntheticProcessCustody(remote, args.daemon_binary, run_id)
     tunnels: list[TunnelHandle] = []
+    open_tunnels: dict[str, TunnelHandle] = {}
     resources["custody"], resources["tunnels"] = custody, tunnels
     clients: dict[str, Api] = {}
     owner = args.nodes[0]
@@ -575,10 +576,15 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     for label, node in nodes.items():
         run_setup_step(evidence, custody, node, "start", lambda node=node: _start_daemon(custody, node))
 
+        # A token timeout must reuse the tunnel already opened for this node.
+        # Reading the token first would race the daemon writing api-token.
         def open_api(label: str = label, node: Node = node) -> None:
-            tunnel = start_ssh_tunnel(node.host, args.local_port_base + len(tunnels),
-                                      remote_port=node.api_port)
-            tunnels.append(tunnel)
+            tunnel = open_tunnels.get(label)
+            if tunnel is None:
+                tunnel = start_ssh_tunnel(node.host, args.local_port_base + len(tunnels),
+                                          remote_port=node.api_port)
+                tunnels.append(tunnel)
+                open_tunnels[label] = tunnel
             clients[label] = Api(f"http://127.0.0.1:{tunnel.local_port}", custody.token(node))
         run_setup_step(evidence, custody, node, "readiness probe", open_api)
     receipts: dict[str, tuple[str, str]] = {}
@@ -629,7 +635,12 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                    lambda: enroll_peer(evidence, owner_api, owner, owner, None))
 
     def certify_same_owner_device(label: str) -> None:
-        def identify() -> None:
+        # Card reads stay before stop. A certificate-write timeout retries only
+        # the write, so it does not query the daemon that was already stopped.
+        node = nodes[label]
+        held: dict[str, Any] = {}
+
+        def read_card() -> None:
             card_status, response = clients[label].request("GET", "/agent/card")
             card = response.get("card") if isinstance(response, dict) else None
             public_key = card.get("agent_public_key") if isinstance(card, dict) else None
@@ -641,23 +652,40 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                            status=card_status)
             device_agent, device_machine = clients[label].agent_id(), machine_id(clients[label])
             trust_peer(evidence, clients[label], label, owner, owner_agent)
-            custody.stop(label)
+            held["public_key"] = public_key
+            held["device_agent"] = device_agent
+            held["device_machine"] = device_machine
+        run_setup_step(evidence, custody, node, "identity", read_card)
+
+        def stop_device() -> None:
+            if label not in custody.offline:
+                custody.stop(label)
+        run_setup_step(evidence, custody, node, "identity", stop_device)
+
+        def issue_certificate() -> None:
             issue_status, issued = owner_api.request("POST", "/owner/agents/issue",
-                                                     {"agent_public_key": public_key, "mode": "acp",
+                                                     {"agent_public_key": held["public_key"], "mode": "acp",
                                                       "label": f"home-e2e-{label}"})
             certificate = (issued.get("certificate") or {}).get("storage_b64")
             evidence.check(f"owner certifies {label}", issue_status == 200 and isinstance(certificate, str),
                            status=issue_status)
-            trust_peer(evidence, owner_api, owner, label, device_agent)
-            enroll_peer(evidence, owner_api, owner, label, device_machine)
-            custody.write_certificate(nodes[label], certificate)
-        run_setup_step(evidence, custody, nodes[label], "identity", identify)
+            trust_peer(evidence, owner_api, owner, label, held["device_agent"])
+            enroll_peer(evidence, owner_api, owner, label, held["device_machine"])
+            held["certificate"] = certificate
+        run_setup_step(evidence, custody, node, "identity", issue_certificate)
+
+        def install_certificate() -> None:
+            custody.write_certificate(node, held["certificate"])
+        run_setup_step(evidence, custody, node, "identity", install_certificate)
         try:
             fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])
         except subprocess.TimeoutExpired as error:
             fingerprint = _resume_setup_after_timeout(
                 evidence, custody, nodes[label], "identity", error,
                 lambda: _copy_installed_owner_key(custody, nodes[owner], nodes[label]))
+        except Exception as error:
+            _bind_setup_step(error, "identity", label)
+            raise
 
         def confirm_key() -> None:
             evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
