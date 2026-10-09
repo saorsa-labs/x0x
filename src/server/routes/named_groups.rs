@@ -10782,6 +10782,12 @@ async fn request_member_key_package_catchup(
                 continue;
             }
         };
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::key_package_catchup_key(
+            group_id,
+            member_agent_id,
+        ))
+        .await;
         if let Err(e) = state
             .agent
             .send_direct_with_config(&peer, payload, direct_message_send_config())
@@ -17127,6 +17133,109 @@ fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     config
 }
 
+/// #1274: test-only pause for a background send. A test arms a key; the
+/// next send with that key parks right before it hands its bytes to the
+/// transport, still holding everything its task captured, until the test
+/// releases it or the task is aborted. This stands in for a send held up by
+/// back-pressure or an unavailable peer. Keys are per test, so parallel
+/// tests in one process never touch each other's pause.
+#[cfg(test)]
+pub(in crate::server) mod detached_send_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct SendPause {
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    /// One armed pause. Dropping it releases the send (and disarms the key
+    /// if no send took it), so a failed assertion never leaves a task
+    /// parked for the rest of the test process.
+    pub(in crate::server) struct ArmedSendPause {
+        key: String,
+        pause: Arc<SendPause>,
+    }
+
+    impl ArmedSendPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ArmedSendPause {
+        fn drop(&mut self) {
+            self.pause.released.store(true, Ordering::SeqCst);
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<SendPause>>>> = Mutex::new(None);
+
+    /// Park the next send whose key is `key` (one-shot).
+    pub(in crate::server) fn arm(key: &str) -> ArmedSendPause {
+        let pause = Arc::new(SendPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), Arc::clone(&pause));
+        ArmedSendPause {
+            key: key.to_string(),
+            pause,
+        }
+    }
+
+    pub(in crate::server) async fn park(key: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(key));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The fan-out race's gossip publish of a public message on `topic`.
+    pub(in crate::server) fn public_gossip_key(topic: &str) -> String {
+        format!("public-gossip:{topic}")
+    }
+
+    /// The fan-out race's unicast of a public message of `group_id` to
+    /// `recipient_hex`.
+    pub(in crate::server) fn public_unicast_key(group_id: &str, recipient_hex: &str) -> String {
+        format!("public-unicast:{group_id}:{recipient_hex}")
+    }
+
+    /// The one-shot predecessor-relay offer to `creator_hex` for `group_id`.
+    pub(in crate::server) fn predecessor_fallback_key(group_id: &str, creator_hex: &str) -> String {
+        format!("predecessor-fallback:{group_id}:{creator_hex}")
+    }
+
+    /// The member-keyed KeyPackage catch-up request for `member_hex` in
+    /// `group_id`.
+    pub(in crate::server) fn key_package_catchup_key(group_id: &str, member_hex: &str) -> String {
+        format!("kp-catchup:{group_id}:{member_hex}")
+    }
+}
+
 /// Fan-out a persisted public group message as a race: gossip topic publish
 /// starts immediately and does not wait for per-member unicast to finish or
 /// fail (issue #310). First success wins per recipient because
@@ -17150,6 +17259,8 @@ fn spawn_group_public_message_fanout_race(
             group_id = %LogHexId::group(&gossip_group),
             "public group message gossip publish starting (raced with unicast)"
         );
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::public_gossip_key(&topic)).await;
         if let Err(e) = gossip_state
             .agent
             .publish(&topic, gossip_bytes.clone())
@@ -17245,6 +17356,12 @@ fn spawn_group_public_message_delivery(
     let recipient_label = recipient_hex.to_string();
     let group_id = msg.group_id.clone();
     tokio::spawn(async move {
+        #[cfg(test)]
+        detached_send_test_seam::park(&detached_send_test_seam::public_unicast_key(
+            &group_id,
+            &recipient_label,
+        ))
+        .await;
         match agent
             .send_direct_with_config(
                 &recipient,
@@ -25355,7 +25472,14 @@ pub(in crate::server) async fn create_join_request(
                     let agent = Arc::clone(&state.agent);
                     let creator = creator_hex.clone();
                     let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
+                    #[cfg(test)]
+                    let pause_key = detached_send_test_seam::predecessor_fallback_key(
+                        &event_group_id,
+                        &creator,
+                    );
                     tokio::spawn(async move {
+                        #[cfg(test)]
+                        detached_send_test_seam::park(&pause_key).await;
                         if let Err(e) = agent
                             .send_direct_with_config(
                                 &creator_id,
@@ -39613,6 +39737,7 @@ pub(in crate::server) mod tests {
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
+    mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
