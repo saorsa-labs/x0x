@@ -182,9 +182,14 @@ controls its own copy, including its outbound history copy.
 
 Preserve ADR 0030: never acknowledge a generic durable DM without its
 required commit. If receiver policy suppresses that commit, withhold the
-durable ACK before new dispatch and report the local policy reason. Do not
-silently use a weaker ACK. The sender sees its existing bounded retry or
-timeout result. A typed route may still acknowledge its own completed
+durable ACK before new dispatch and record the local policy reason in the
+counters below. Send no typed refusal, including `AckSemanticsUnavailable`.
+Do not silently use a weaker ACK. The sender sees its existing bounded
+retry or timeout result. The ADR 0030 capability advert is unchanged: a
+node with history enabled still advertises durable-ACK protocol version 2
+while its local policy suppresses generic durable commits. Strict v2
+senders therefore see a timeout, not the 409
+`recipient_ack_semantics_unavailable` refusal. A typed route may still acknowledge its own completed
 durable effect under its existing contract. Embedders that use transient
 DMs must explicitly select the existing non-durable send mode when needed.
 
@@ -232,7 +237,10 @@ Return 200 with committed deletion counts, pin-ceiling counts, elapsed
 time, and `state`: `complete`, `more_work`, or `blocked_by_protected_rows`.
 `complete` means this observed pass has no eligible policy work pending;
 it promises neither physical file shrinkage nor a limit on future writes.
-Reclamation still pending returns `more_work`. SQLite failure returns a
+Reclamation still pending returns `more_work`.
+`blocked_by_protected_rows` means no eligible policy work remains, but
+pinned or exempt rows still keep a configured bound exceeded. It is
+never returned while eligible work remains. SQLite failure returns a
 typed 500 with counts for prior committed batches. Never claim rollback
 of those batches. Caller cancellation stops new batches at the next
 boundary. The periodic reaper can continue later.
@@ -299,7 +307,8 @@ These are implementation gates, not claims that this documentation adds tests.
 | Ephemeral paths | Exercise inbound/outbound DM, topic, library and committed-write paths. Live non-durable delivery succeeds while row, FTS and canonical tables remain empty after restart. Remove the policy gate as a negative control and observe a stored row. |
 | Pins and MLS | Old unpinned MLS rows expire without canonical IDs. Pinned groups survive all new phases, including alias IDs and runtime trim. Only the unchanged ceiling evicts its own rows. Clear the marker and observe normal retention. Test absent-pin-source behavior separately. |
 | Receipts | Suppressed generic durable DMs get no durable or downgraded ACK and no new dispatch. Typed durable completion retains its own receipt contract. Exercise retries, restart and a pre-policy committed duplicate without fabricating a new commit. |
-| Runtime bounds | REST/CLI/library parity, full token matrix, invalid bodies, busy and disabled results. Large fixtures prove row limits, bounded transactions, partial progress, phase fairness, cancellation, error counts and reaper serialization under concurrent writers. Inject a slow statement to prove the documented time overrun. |
+| Policy read and counters | `GET /history/policy` passes the full token matrix, works with history disabled and reports the protected-group exception. Each suppression path increments its bounded counter. No metric label carries a topic or payload. |
+| Runtime bounds | REST/CLI/library parity, full token matrix, invalid bodies, busy and disabled results. A fixture whose only bound overshoot is protected rows returns `blocked_by_protected_rows`, never `more_work`. Large fixtures prove row limits, bounded transactions, partial progress, phase fairness, cancellation, error counts and reaper serialization under concurrent writers. Inject a slow statement to prove the documented time overrun. |
 | Storage and downgrade | Use a released schema-4 fixture with provenance and hashes. Upgrade, trim, open with the released older binary, then upgrade again. Check retained rows, unchanged schema, derived-index consistency and explicit loss of new policy enforcement. Unknown newer schemas still fail closed without file changes. |
 | Efficiency and compatibility | Preserve part 1's FTS convergence/WAL regressions and part 2's backfill cursor tests. Compare default-policy delivery on sealed candidate and mixed-version meshes in both directions under pressure. Explicit opt-out changes local history only, except the stated durable-receipt refusal. |
 
