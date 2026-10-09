@@ -2826,12 +2826,44 @@ pub(in crate::server) async fn download_legacy_page_import(
     }
 }
 
-/// Post-merge retained-image length for one legacy import, before any
-/// canonical write.
+/// Test seam immediately before the destination write lock.
 ///
-/// `None` means the trial merge failed. The real merge then reports that
-/// error. A length above the retained-image cap cannot be published, so the
-/// caller refuses it first.
+/// The import notifies `entered`, then waits on `release`, only for this
+/// idempotency key. Other imports do not wait. Growth injected here is
+/// visible to the locked retained-image measurement.
+#[cfg(test)]
+struct LegacyImportGap {
+    key: &'static str,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static LEGACY_IMPORT_GAP: std::sync::Mutex<Option<std::sync::Arc<LegacyImportGap>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn legacy_import_gap_point(idempotency_key: &str) {
+    let gap = LEGACY_IMPORT_GAP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(gap) = gap else {
+        return;
+    };
+    if gap.key != idempotency_key {
+        return;
+    }
+    gap.entered.notify_one();
+    gap.release.notified().await;
+}
+
+/// Post-merge retained-image length for a destination that is not open yet.
+///
+/// The caller uses this only before open, so a refusal does not create an
+/// empty snapshot. An already-open destination is measured later, under the
+/// write lock that commits the merge. `None` means the trial merge failed;
+/// the locked merge then reports that error.
 async fn legacy_import_retained_image_len(
     state: &AppState,
     binding: &GssGroupStoreBinding,
@@ -3009,6 +3041,124 @@ async fn recover_intended_legacy_source(
         owner,
         digest,
         bytes,
+    })
+}
+
+struct LegacyImportApplied {
+    conflicts: Vec<String>,
+    before: String,
+    after: String,
+}
+
+struct LegacyImportCommit<'a> {
+    idempotency_key: &'a str,
+    group_id: &'a str,
+    app: &'a str,
+    authority_binding: &'a str,
+    persist_intent: bool,
+}
+
+/// Trial-merge, measure, and commit one legacy import under the destination
+/// write lock.
+///
+/// The retained-image length is the merged store held by that lock. Above
+/// the cap, nothing is journalled and the destination is left unchanged.
+/// Under the cap, the intent is written before the destination is replaced,
+/// still under the same lock. Persistence runs after the lock is dropped:
+/// `persist` takes its own store read lock.
+async fn commit_legacy_import_under_cap(
+    state: &AppState,
+    handle: &x0x::KvStoreHandle,
+    source: &LoadedLegacyStore,
+    commit: LegacyImportCommit<'_>,
+) -> Result<LegacyImportApplied, GroupStoreResponse> {
+    handle
+        .sync
+        .authorize_local_write(&handle.agent_id)
+        .await
+        .map_err(|error| match error {
+            x0x::kv::KvError::Unauthorized(message) => forbidden(message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    handle.sync.ensure_durable().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("kv store durability degraded before legacy import: {error}"),
+        )
+    })?;
+    // Growth injected here is included in the measurement below. The
+    // destination lock is still free, so the injector can write.
+    #[cfg(test)]
+    legacy_import_gap_point(commit.idempotency_key).await;
+
+    let mut destination = handle.sync.write().await;
+    let conflicts = destination.legacy_import_conflicts(&source.store);
+    let before = hex::encode(destination.served_digest());
+    let mut trial = destination.clone();
+    trial
+        .merge_legacy_signed_history(
+            &source.store,
+            source.owner,
+            handle.agent_id,
+            handle.peer_id(),
+        )
+        .map_err(|error| match error {
+            x0x::kv::KvError::Unauthorized(message) => forbidden(message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    let image = bincode::serialize(&trial).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import retained image could not be measured: {error}"),
+        )
+    })?;
+    let limit = x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+    if image.len() > limit {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "legacy import would retain {} bytes, above the {limit} byte group image limit",
+                image.len()
+            ),
+        ));
+    }
+    if commit.persist_intent {
+        super::super::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            super::super::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: commit.idempotency_key.to_string(),
+                group_id: commit.group_id.to_string(),
+                app: commit.app.to_string(),
+                source_store_id: source.store_id_hex.clone(),
+                source_digest: source.digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding: commit.authority_binding.to_string(),
+                source_snapshot: source.bytes.clone(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
+                ),
+            )
+        })?;
+    }
+    *destination = trial;
+    let after = hex::encode(destination.served_digest());
+    drop(destination);
+    handle.sync.persist().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import applied in memory but destination persistence failed: {error}"),
+        )
+    })?;
+    Ok(LegacyImportApplied {
+        conflicts,
+        before,
+        after,
     })
 }
 
@@ -3208,10 +3358,12 @@ pub(in crate::server) async fn import_legacy_page_store(
             );
         }
     }
-    // #1118: measure the post-merge retained image before the intent journal
-    // and before the canonical merge. A snapshot inside the 20 MiB file gate
-    // can still exceed the 16 MiB image cap, and publication then stays pending.
-    if existing_receipt.is_none() {
+    // #1118: a destination that is not open yet is measured from its
+    // snapshot, or from the empty store open would create, before that open
+    // creates a file. An already-open destination is measured under the
+    // write lock that commits the merge. A snapshot inside the 20 MiB file
+    // gate can still exceed the 16 MiB image cap.
+    if existing_receipt.is_none() && !state.kv_stores.read().await.contains_key(&binding.topic) {
         if let Some(source) = source.as_ref() {
             match legacy_import_retained_image_len(
                 &state,
@@ -3238,39 +3390,6 @@ pub(in crate::server) async fn import_legacy_page_store(
                 }
                 Ok(None) => {}
             }
-        }
-    }
-    if existing_intent.is_none() && existing_receipt.is_none() {
-        // Durable intent BEFORE any canonical mutation: bind the reviewed
-        // snapshot to this idempotency key first, so a crash or receipt
-        // append failure after the merge can still finish this exact import.
-        let Some(source) = source.as_ref() else {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "legacy source unavailable",
-            );
-        };
-        if let Err(error) = super::super::legacy_store_migration::write_intent(
-            &state.kv_store_state_dir,
-            super::super::legacy_store_migration::LegacyImportIntentInput {
-                idempotency_key: request.idempotency_key.clone(),
-                group_id: binding.stable_group_id.clone(),
-                app: app.to_string(),
-                source_store_id: source.store_id_hex.clone(),
-                source_digest: source.digest.clone(),
-                endorser: hex::encode(state.agent.agent_id().as_bytes()),
-                authority_binding: authority_binding.clone(),
-                source_snapshot: source.bytes.clone(),
-            },
-        )
-        .await
-        {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
-                ),
-            );
         }
     }
     let (handle, created) = if public {
@@ -3305,18 +3424,23 @@ pub(in crate::server) async fn import_legacy_page_store(
                 "legacy source unavailable",
             );
         };
-        let conflicts = handle.legacy_import_conflicts(&source.store).await;
-        let before = handle.retained_content_digest_hex().await;
-        if let Err(error) = handle
-            .import_legacy_signed_history(&source.store, source.owner)
-            .await
+        let applied = match commit_legacy_import_under_cap(
+            &state,
+            &handle,
+            &source,
+            LegacyImportCommit {
+                idempotency_key: &request.idempotency_key,
+                group_id: &binding.stable_group_id,
+                app,
+                authority_binding: &authority_binding,
+                persist_intent: existing_intent.is_none(),
+            },
+        )
+        .await
         {
-            return match error {
-                x0x::error::IdentityError::Unauthorized(message) => forbidden(message),
-                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-            };
-        }
-        let after = handle.retained_content_digest_hex().await;
+            Ok(applied) => applied,
+            Err(response) => return response,
+        };
         let receipt = super::super::legacy_store_migration::new_receipt(
             super::super::legacy_store_migration::LegacyImportReceiptInput {
                 idempotency_key: request.idempotency_key.clone(),
@@ -3326,8 +3450,8 @@ pub(in crate::server) async fn import_legacy_page_store(
                 source_digest: source.digest,
                 endorser: hex::encode(state.agent.agent_id().as_bytes()),
                 authority_binding,
-                destination_digest_before: before,
-                destination_digest_after: after,
+                destination_digest_before: applied.before,
+                destination_digest_after: applied.after,
             },
         );
         if let Err(error) =
@@ -3346,7 +3470,7 @@ pub(in crate::server) async fn import_legacy_page_store(
             &request.idempotency_key,
         )
         .await;
-        (receipt, conflicts)
+        (receipt, applied.conflicts)
     };
     drop(membership_guard);
     if let Err(error) = handle.publish_retained_group_history().await {
@@ -4139,6 +4263,144 @@ mod tests {
             .is_none(),
             "refusal must not persist an import intent"
         );
+    }
+
+    /// #1118: growth that lands before the destination write lock must be
+    /// included in the retained-image measurement. The seam pauses
+    /// immediately before that lock, so the live store can cross the cap
+    /// before the merge is committed.
+    #[tokio::test]
+    async fn issue1118_growth_during_import_gap_is_refused_before_merge() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "1c".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let gap = std::sync::Arc::new(LegacyImportGap {
+            key: "gap-growth",
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LEGACY_IMPORT_GAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::clone(&gap));
+        struct ReleaseGap(std::sync::Arc<LegacyImportGap>);
+        impl Drop for ReleaseGap {
+            fn drop(&mut self) {
+                self.0.release.notify_one();
+                *LEGACY_IMPORT_GAP
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+        }
+        let _release_gap = ReleaseGap(std::sync::Arc::clone(&gap));
+        let state_for_import = Arc::clone(&state);
+        let group_for_import = group_id.clone();
+        let source_for_import = source_id.clone();
+        let digest_for_import = digest.clone();
+        let import = tokio::spawn(async move {
+            import_legacy_page_store(
+                State(state_for_import),
+                Path((group_for_import, "wiki".to_string(), source_for_import)),
+                Extension(owner_actor()),
+                Json(ImportLegacyStoreRequest {
+                    source_digest: digest_for_import,
+                    idempotency_key: "gap-growth".to_string(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), gap.entered.notified())
+            .await
+            .expect("import reaches the post-check gap");
+        {
+            let mut store = dest_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("grown-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        dest_handle.peer_id(),
+                    )
+                    .expect("grow the live destination during the gap");
+            }
+        }
+        gap.release.notify_one();
+        let (code, body) = import.await.expect("import task");
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert!(
+            body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("group image limit")),
+            "{body:?}"
+        );
+        assert_ne!(body.0["imported_locally"], true, "{body:?}");
+        assert!(
+            dest_handle
+                .get("legacy-only")
+                .await
+                .expect("destination read")
+                .is_none(),
+            "the gap growth must be included in the cap check, so the source is not merged"
+        );
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts")
+                .is_empty()
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "gap-growth"
+        )
+        .await
+        .expect("intent")
+        .is_none());
     }
 
     #[tokio::test]
