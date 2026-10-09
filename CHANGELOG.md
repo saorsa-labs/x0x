@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **History retention no longer stops at a bad `scope_limits` entry (#1286).**
+  One `[[history.scope_limits]]` entry whose `scope` did not parse made every
+  retention pass fail at that entry. The limits after it, the whole-database
+  `max_bytes` cap and the canonical-id cleanup never ran, so `history.db`
+  could grow without bound. The reaper now skips such an entry, logs one
+  warning per store, and enforces everything else. History still opens with
+  the entry, as before. `Store::skipped_scope_limits()` reports how many
+  entries the latest pass skipped.
+
 ## [v0.46.6] - 2026-10-09
 
 ### Changed

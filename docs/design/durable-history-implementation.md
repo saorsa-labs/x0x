@@ -165,6 +165,13 @@ scope = "group:<stable_id>"
 max_bytes = 268435456
 ```
 
+A `scope_limits` entry whose `scope` does not parse (it must be
+`dm:<agent>`, `group:<id>` or `topic:<name>`) is not in force. History still
+opens with it. The reaper skips the entry, logs one warning per store, and
+reports the number skipped by the latest pass through
+`Store::skipped_scope_limits`. The other limits and `max_bytes` still apply
+(#1286).
+
 Reaper task every 300 s (constant, `HISTORY_REAPER_INTERVAL_SECS`), evicts
 oldest-first by `seen_at_ms` until under bounds, then `PRAGMA
 incremental_vacuum` (enabled by `auto_vacuum=INCREMENTAL` at creation).
