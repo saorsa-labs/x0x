@@ -2876,6 +2876,9 @@ async fn legacy_import_retained_image_len(
     let (destination, peer) =
         destination_for_legacy_budget(state, binding, public, treekem).await?;
     let mut trial = destination;
+    // A live destination's clone shares the sequence allocator. This
+    // measurement must not `fetch_max` it when the import is later refused.
+    trial.detach_seq_counter();
     if trial
         .merge_legacy_signed_history(source, source_owner, endorser, peer)
         .is_err()
@@ -3094,7 +3097,11 @@ async fn commit_legacy_import_under_cap(
     let mut destination = handle.sync.write().await;
     let conflicts = destination.legacy_import_conflicts(&source.store);
     let before = hex::encode(destination.served_digest());
+    // Independent allocator: the merge floors the trial's counter only.
+    // `*destination = trial` below is what installs that counter, and only
+    // after the image fits and the intent is durable.
     let mut trial = destination.clone();
+    trial.detach_seq_counter();
     trial
         .merge_legacy_signed_history(
             &source.store,
@@ -4184,6 +4191,8 @@ mod tests {
         let projected = {
             let source_store = source_handle.sync.read().await.clone();
             let mut trial = dest_handle.sync.read().await.clone();
+            // A shared clone would floor the live allocator before the route.
+            trial.detach_seq_counter();
             trial
                 .merge_legacy_signed_history(
                     &source_store,
@@ -4262,6 +4271,155 @@ mod tests {
             .expect("intent")
             .is_none(),
             "refusal must not persist an import intent"
+        );
+    }
+
+    /// #1118: a refused over-cap import must not advance the live sequence
+    /// allocator. The source carries a same-peer tag at `u64::MAX - 2`, which
+    /// the merge would otherwise `fetch_max` through the shared counter.
+    #[tokio::test]
+    async fn issue1118_refused_import_leaves_sequence_allocator_unchanged() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "1d".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let counter_before_fixture = dest_handle.sync.read().await.seq_counter_value();
+        {
+            let mut store = source_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("page-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        source_handle.peer_id(),
+                    )
+                    .expect("large legacy page");
+            }
+            // One reserved sequence lands the retained tag at `u64::MAX - 2`,
+            // the highest floor the merge still accepts.
+            store.restore_seq_counter(u64::MAX - 3);
+            store
+                .put(
+                    "allocator-floor".to_string(),
+                    b"floor".to_vec(),
+                    "text/plain".to_string(),
+                    dest_handle.peer_id(),
+                )
+                .expect("near-exhaustion retained tag");
+            assert_eq!(store.seq_counter_value(), u64::MAX - 2);
+        }
+        source_handle
+            .sync
+            .persist()
+            .await
+            .expect("persist oversize legacy source");
+        // The projection must not share the destination allocator. A plain
+        // clone would `fetch_max` the live counter before the route runs.
+        let projected = {
+            let source_store = source_handle.sync.read().await.clone();
+            let mut trial = dest_handle.sync.read().await.clone();
+            trial.detach_seq_counter();
+            trial
+                .merge_legacy_signed_history(
+                    &source_store,
+                    state.agent.agent_id(),
+                    state.agent.agent_id(),
+                    dest_handle.peer_id(),
+                )
+                .expect("trial merge of the fixture");
+            bincode::serialize(&trial)
+                .expect("projected retained image")
+                .len()
+        };
+        assert!(
+            projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
+            "post-merge image {projected} must exceed the retained-image cap"
+        );
+        let counter_before = dest_handle.sync.read().await.seq_counter_value();
+        assert_eq!(
+            counter_before, counter_before_fixture,
+            "the fixture projection must not advance the live allocator"
+        );
+
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let (code, body) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "allocator-floor".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert_eq!(
+            dest_handle.sync.read().await.seq_counter_value(),
+            counter_before,
+            "a 413 refusal must not fetch_max the live sequence allocator"
+        );
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        dest_handle
+            .put(
+                "after-refusal".to_string(),
+                b"one".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("first write after a refused near-exhaustion floor");
+        dest_handle
+            .put(
+                "after-refusal-2".to_string(),
+                b"two".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("second write must still reserve sequences; a floor of u64::MAX - 2 leaves room for only one put");
+        assert!(
+            dest_handle.sync.read().await.seq_counter_value() < u64::MAX - 2,
+            "subsequent writes must not be spending a refused near-exhaustion floor"
         );
     }
 
