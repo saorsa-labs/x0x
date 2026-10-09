@@ -3845,6 +3845,232 @@ mod tests {
         assert_eq!(err, SyncError::SessionTimeout);
         peer_hello.abort();
     }
+
+    /// Loopback only: no bootstrap peers, no mDNS, no port mapping. Nothing
+    /// outside the two devices is dialed, and no identity announcement runs.
+    fn loopback_owner_sync_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            bootstrap_nodes: Vec::new(),
+            port_mapping_enabled: false,
+            mdns_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
+    /// A live owner device with the stream accept loop running and its
+    /// enrollment store installed. `join_network` is not called, so the
+    /// discovery cache stays empty for the life of the process.
+    async fn live_owner_device(
+        dir: &Path,
+        name: &str,
+        owner_seed: [u8; 32],
+    ) -> (Arc<crate::Agent>, Arc<OwnerSyncService>) {
+        let owner = UserKeypair::from_seed(&owner_seed).expect("owner key");
+        let agent = crate::Agent::builder()
+            .with_machine_key(dir.join(format!("{name}-machine.key")))
+            .with_agent_key_path(dir.join(format!("{name}-agent.key")))
+            .with_agent_cert_path(dir.join(format!("{name}-agent.cert")))
+            .with_user_key(owner)
+            .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
+            .with_peer_cache_dir(dir.join(format!("{name}-peers")))
+            .with_network_config(loopback_owner_sync_config())
+            .build()
+            .await
+            .expect("owner device");
+        let agent = Arc::new(agent);
+        agent.start_stream_accept_loop();
+        let service = OwnerSyncService::new(Arc::clone(&agent), &dir.join(name))
+            .await
+            .expect("owner sync service");
+        agent.install_owner_device_store(Arc::clone(service.store()));
+        (agent, service)
+    }
+
+    async fn loopback_addr(agent: &crate::Agent) -> std::net::SocketAddr {
+        let network = agent.network().expect("network");
+        let addr = network.bound_addr().await.expect("bound address");
+        if addr.ip().is_unspecified() {
+            std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+        } else {
+            addr
+        }
+    }
+
+    async fn remember_peer(agent: &crate::Agent, peer: MachineId, addr: std::net::SocketAddr) {
+        let cache = agent
+            .network()
+            .and_then(|network| network.bootstrap_cache())
+            .expect("bootstrap cache");
+        cache
+            .add_from_connection(ant_quic::PeerId(peer.0), vec![addr], None)
+            .await;
+    }
+
+    async fn knows_agent_on(agent: &crate::Agent, machine: MachineId) -> bool {
+        agent
+            .discovered_agents()
+            .await
+            .expect("discovery cache")
+            .iter()
+            .any(|discovered| discovered.machine_id == machine)
+    }
+
+    fn has_display_name(records: &[VersionedRecord], display: &str) -> bool {
+        records.iter().any(|record| {
+            matches!(
+                &record.value,
+                SyncValue::MachineNames {
+                    display_name: Some(name),
+                    ..
+                } if name == display
+            )
+        })
+    }
+
+    async fn wait_for_successful_session(
+        mut sessions: tokio::sync::watch::Receiver<u64>,
+        before: u64,
+        direction: &str,
+    ) {
+        let wait = tokio::time::timeout(Duration::from_secs(20), async {
+            while *sessions.borrow_and_update() == before {
+                sessions.changed().await.expect("session watch");
+            }
+        })
+        .await;
+        assert!(
+            wait.is_ok(),
+            "{direction}: no owner-sync session completed (R12 logged stream reset 0xA17C0244)"
+        );
+    }
+
+    /// WHY (#843): two owner devices that stay up, enroll each other, and
+    /// have never restarted must finish an owner-sync session in each
+    /// direction. R12 logged `Tier-1 sync session failed (fail closed)`
+    /// with `sync io error: stream reset by peer` (0xA17C0244) on every
+    /// such session. Neither device learns the other's agent, so the
+    /// session uses the verified enrollment alone.
+    ///
+    /// On the pre-#1044 dial the initiator stops at `machine not in
+    /// discovery cache` and no session completes. When the responder
+    /// drops the stream, the initiator's error is the stream reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mutually_enrolled_devices_complete_owner_sync_both_ways_without_restart() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x84; 32];
+        let (alice, alice_sync) = live_owner_device(dir.path(), "alice", seed).await;
+        let (bob, bob_sync) = live_owner_device(dir.path(), "bob", seed).await;
+        let alice_id = alice.machine_id();
+        let bob_id = bob.machine_id();
+        assert_ne!(alice_id, bob_id, "distinct machines");
+
+        let signed_enrollment = |peer: MachineId| {
+            let owner = UserKeypair::from_seed(&seed).expect("owner key");
+            OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign enrollment")
+        };
+        alice_sync
+            .store()
+            .enroll(signed_enrollment(bob_id))
+            .await
+            .expect("alice enrolls bob");
+        bob_sync
+            .store()
+            .enroll(signed_enrollment(alice_id))
+            .await
+            .expect("bob enrolls alice");
+
+        remember_peer(&alice, bob_id, loopback_addr(&bob).await).await;
+        remember_peer(&bob, alice_id, loopback_addr(&alice).await).await;
+        assert!(
+            !knows_agent_on(&alice, bob_id).await,
+            "alice already knows bob's agent; the session would not use enrollment alone"
+        );
+        assert!(
+            !knows_agent_on(&bob, alice_id).await,
+            "bob already knows alice's agent; the session would not use enrollment alone"
+        );
+
+        let alice_owner = UserKeypair::from_seed(&seed).expect("owner key");
+        let bob_owner = UserKeypair::from_seed(&seed).expect("owner key");
+        alice_sync
+            .store()
+            .mint(
+                SyncKind::MachineNames,
+                &hex::encode(alice_id.0),
+                &SyncValue::MachineNames {
+                    display_name: Some("alice-device".into()),
+                    machine_name: Some("alice-mac".into()),
+                },
+                &alice_owner,
+                alice_id,
+            )
+            .await
+            .expect("alice mints her name");
+        bob_sync
+            .store()
+            .mint(
+                SyncKind::MachineNames,
+                &hex::encode(bob_id.0),
+                &SyncValue::MachineNames {
+                    display_name: Some("bob-device".into()),
+                    machine_name: Some("bob-mac".into()),
+                },
+                &bob_owner,
+                bob_id,
+            )
+            .await
+            .expect("bob mints his name");
+
+        let before_bob = *bob_sync.store().successful_sessions_rx().borrow();
+        let bob_sessions = bob_sync.store().successful_sessions_rx();
+        let alice_to_bob =
+            tokio::time::timeout(Duration::from_secs(30), alice_sync.dial_and_sync(&bob_id))
+                .await
+                .unwrap_or_else(|_| panic!("alice→bob timed out"));
+        alice_to_bob.unwrap_or_else(|(class, error)| {
+            panic!("alice→bob failed ({class}): {error}");
+        });
+        wait_for_successful_session(bob_sessions, before_bob, "alice→bob").await;
+
+        let before_alice = *alice_sync.store().successful_sessions_rx().borrow();
+        let alice_sessions = alice_sync.store().successful_sessions_rx();
+        let bob_to_alice =
+            tokio::time::timeout(Duration::from_secs(30), bob_sync.dial_and_sync(&alice_id))
+                .await
+                .unwrap_or_else(|_| panic!("bob→alice timed out"));
+        bob_to_alice.unwrap_or_else(|(class, error)| {
+            panic!("bob→alice failed ({class}): {error}");
+        });
+        wait_for_successful_session(alice_sessions, before_alice, "bob→alice").await;
+
+        for (service, peer, who) in [(&alice_sync, bob_id, "alice"), (&bob_sync, alice_id, "bob")] {
+            let statuses = service.store().session_statuses().await;
+            assert_eq!(
+                statuses.get(&peer.0).map(|status| status.last_session_ok),
+                Some(true),
+                "{who}: last session with the other owner device must have succeeded"
+            );
+            let records = service.store().records_snapshot().await;
+            assert!(
+                has_display_name(&records, "alice-device"),
+                "{who} is missing alice's name after both directions"
+            );
+            assert!(
+                has_display_name(&records, "bob-device"),
+                "{who} is missing bob's name after both directions"
+            );
+        }
+
+        assert!(
+            !knows_agent_on(&alice, bob_id).await,
+            "an identity announcement arrived; the test no longer uses enrollment alone"
+        );
+        assert!(
+            !knows_agent_on(&bob, alice_id).await,
+            "an identity announcement arrived; the test no longer uses enrollment alone"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4675,231 +4901,5 @@ mod home_pointer_election_tests {
         // Stale entries are pruned: memory is bounded by recent machines.
         assert!(limiter.allow(&MachineId([3; 32]), t0 + interval * 3));
         assert_eq!(limiter.last.len(), 1, "expired entries must be pruned");
-    }
-
-    /// Loopback only: no bootstrap peers, no mDNS, no port mapping. Nothing
-    /// outside the two devices is dialed, and no identity announcement runs.
-    fn loopback_owner_sync_config() -> crate::network::NetworkConfig {
-        crate::network::NetworkConfig {
-            bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-            bootstrap_nodes: Vec::new(),
-            port_mapping_enabled: false,
-            mdns_enabled: false,
-            ..crate::network::NetworkConfig::default()
-        }
-    }
-
-    /// A live owner device with the stream accept loop running and its
-    /// enrollment store installed. `join_network` is not called, so the
-    /// discovery cache stays empty for the life of the process.
-    async fn live_owner_device(
-        dir: &Path,
-        name: &str,
-        owner_seed: [u8; 32],
-    ) -> (Arc<crate::Agent>, Arc<OwnerSyncService>) {
-        let owner = UserKeypair::from_seed(&owner_seed).expect("owner key");
-        let agent = crate::Agent::builder()
-            .with_machine_key(dir.join(format!("{name}-machine.key")))
-            .with_agent_key_path(dir.join(format!("{name}-agent.key")))
-            .with_agent_cert_path(dir.join(format!("{name}-agent.cert")))
-            .with_user_key(owner)
-            .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
-            .with_peer_cache_dir(dir.join(format!("{name}-peers")))
-            .with_network_config(loopback_owner_sync_config())
-            .build()
-            .await
-            .expect("owner device");
-        let agent = Arc::new(agent);
-        agent.start_stream_accept_loop();
-        let service = OwnerSyncService::new(Arc::clone(&agent), &dir.join(name))
-            .await
-            .expect("owner sync service");
-        agent.install_owner_device_store(Arc::clone(service.store()));
-        (agent, service)
-    }
-
-    async fn loopback_addr(agent: &crate::Agent) -> std::net::SocketAddr {
-        let network = agent.network().expect("network");
-        let addr = network.bound_addr().await.expect("bound address");
-        if addr.ip().is_unspecified() {
-            std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
-        } else {
-            addr
-        }
-    }
-
-    async fn remember_peer(agent: &crate::Agent, peer: MachineId, addr: std::net::SocketAddr) {
-        let cache = agent
-            .network()
-            .and_then(|network| network.bootstrap_cache())
-            .expect("bootstrap cache");
-        cache
-            .add_from_connection(ant_quic::PeerId(peer.0), vec![addr], None)
-            .await;
-    }
-
-    async fn knows_agent_on(agent: &crate::Agent, machine: MachineId) -> bool {
-        agent
-            .discovered_agents()
-            .await
-            .expect("discovery cache")
-            .iter()
-            .any(|discovered| discovered.machine_id == machine)
-    }
-
-    fn has_display_name(records: &[VersionedRecord], display: &str) -> bool {
-        records.iter().any(|record| {
-            matches!(
-                &record.value,
-                SyncValue::MachineNames {
-                    display_name: Some(name),
-                    ..
-                } if name == display
-            )
-        })
-    }
-
-    async fn wait_for_successful_session(
-        mut sessions: tokio::sync::watch::Receiver<u64>,
-        before: u64,
-        direction: &str,
-    ) {
-        let wait = tokio::time::timeout(Duration::from_secs(20), async {
-            while *sessions.borrow_and_update() == before {
-                sessions.changed().await.expect("session watch");
-            }
-        })
-        .await;
-        assert!(
-            wait.is_ok(),
-            "{direction}: no owner-sync session completed (R12 logged stream reset 0xA17C0244)"
-        );
-    }
-
-    /// WHY (#843): two owner devices that stay up, enroll each other, and
-    /// have never restarted must finish an owner-sync session in each
-    /// direction. R12 logged `Tier-1 sync session failed (fail closed)`
-    /// with `sync io error: stream reset by peer` (0xA17C0244) on every
-    /// such session. Neither device learns the other's agent, so the
-    /// session uses the verified enrollment alone.
-    ///
-    /// On the pre-#1044 dial the initiator stops at `machine not in
-    /// discovery cache` and no session completes. When the responder
-    /// drops the stream, the initiator's error is the stream reset.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn mutually_enrolled_devices_complete_owner_sync_both_ways_without_restart() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let seed = [0x84; 32];
-        let (alice, alice_sync) = live_owner_device(dir.path(), "alice", seed).await;
-        let (bob, bob_sync) = live_owner_device(dir.path(), "bob", seed).await;
-        let alice_id = alice.machine_id();
-        let bob_id = bob.machine_id();
-        assert_ne!(alice_id, bob_id, "distinct machines");
-
-        let signed_enrollment = |peer: MachineId| {
-            let owner = UserKeypair::from_seed(&seed).expect("owner key");
-            OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign enrollment")
-        };
-        alice_sync
-            .store()
-            .enroll(signed_enrollment(bob_id))
-            .await
-            .expect("alice enrolls bob");
-        bob_sync
-            .store()
-            .enroll(signed_enrollment(alice_id))
-            .await
-            .expect("bob enrolls alice");
-
-        remember_peer(&alice, bob_id, loopback_addr(&bob).await).await;
-        remember_peer(&bob, alice_id, loopback_addr(&alice).await).await;
-        assert!(
-            !knows_agent_on(&alice, bob_id).await,
-            "alice already knows bob's agent; the session would not use enrollment alone"
-        );
-        assert!(
-            !knows_agent_on(&bob, alice_id).await,
-            "bob already knows alice's agent; the session would not use enrollment alone"
-        );
-
-        let alice_owner = UserKeypair::from_seed(&seed).expect("owner key");
-        let bob_owner = UserKeypair::from_seed(&seed).expect("owner key");
-        alice_sync
-            .store()
-            .mint(
-                SyncKind::MachineNames,
-                &hex::encode(alice_id.0),
-                &SyncValue::MachineNames {
-                    display_name: Some("alice-device".into()),
-                    machine_name: Some("alice-mac".into()),
-                },
-                &alice_owner,
-                alice_id,
-            )
-            .await
-            .expect("alice mints her name");
-        bob_sync
-            .store()
-            .mint(
-                SyncKind::MachineNames,
-                &hex::encode(bob_id.0),
-                &SyncValue::MachineNames {
-                    display_name: Some("bob-device".into()),
-                    machine_name: Some("bob-mac".into()),
-                },
-                &bob_owner,
-                bob_id,
-            )
-            .await
-            .expect("bob mints his name");
-
-        let before_bob = *bob_sync.store().successful_sessions_rx().borrow();
-        let bob_sessions = bob_sync.store().successful_sessions_rx();
-        let alice_to_bob =
-            tokio::time::timeout(Duration::from_secs(30), alice_sync.dial_and_sync(&bob_id))
-                .await
-                .unwrap_or_else(|_| panic!("alice→bob timed out"));
-        alice_to_bob.unwrap_or_else(|(class, error)| {
-            panic!("alice→bob failed ({class}): {error}");
-        });
-        wait_for_successful_session(bob_sessions, before_bob, "alice→bob").await;
-
-        let before_alice = *alice_sync.store().successful_sessions_rx().borrow();
-        let alice_sessions = alice_sync.store().successful_sessions_rx();
-        let bob_to_alice =
-            tokio::time::timeout(Duration::from_secs(30), bob_sync.dial_and_sync(&alice_id))
-                .await
-                .unwrap_or_else(|_| panic!("bob→alice timed out"));
-        bob_to_alice.unwrap_or_else(|(class, error)| {
-            panic!("bob→alice failed ({class}): {error}");
-        });
-        wait_for_successful_session(alice_sessions, before_alice, "bob→alice").await;
-
-        for (service, peer, who) in [(&alice_sync, bob_id, "alice"), (&bob_sync, alice_id, "bob")] {
-            let statuses = service.store().session_statuses().await;
-            assert_eq!(
-                statuses.get(&peer.0).map(|status| status.last_session_ok),
-                Some(true),
-                "{who}: last session with the other owner device must have succeeded"
-            );
-            let records = service.store().records_snapshot().await;
-            assert!(
-                has_display_name(&records, "alice-device"),
-                "{who} is missing alice's name after both directions"
-            );
-            assert!(
-                has_display_name(&records, "bob-device"),
-                "{who} is missing bob's name after both directions"
-            );
-        }
-
-        assert!(
-            !knows_agent_on(&alice, bob_id).await,
-            "an identity announcement arrived; the test no longer uses enrollment alone"
-        );
-        assert!(
-            !knows_agent_on(&bob, alice_id).await,
-            "an identity announcement arrived; the test no longer uses enrollment alone"
-        );
     }
 }
