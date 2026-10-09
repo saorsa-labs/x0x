@@ -971,12 +971,16 @@ pub(super) struct AppState {
     /// alive after `shutdown_and_wait`.
     pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// #1269 r2: admitted applies that persist group state (a pulled
-    /// control blob's apply, the owner-certificate join retry). Shutdown
-    /// never aborts them: an abort inside an atomic write or its journal
-    /// step would leave the persisted state torn, or leave a blocking write
-    /// running after the daemon released its locks. `None` closes
-    /// admission (an apply that has not started is refused); the shutdown
-    /// tail then awaits the admitted ones, bounded, before the Agent stops.
+    /// control blob's apply, the owner-certificate join retry) and, since
+    /// #1275, every apply a server listener runs for an event it received
+    /// (named-group metadata, join results, catch-up responses, group
+    /// bootstraps, predecessor relays, KV-store deltas, certificate
+    /// hydrations). Shutdown never aborts them: an abort inside an atomic
+    /// write or its journal step would leave the persisted state torn, or
+    /// leave a blocking write running after the daemon released its locks.
+    /// `None` closes admission (an apply that has not started is refused);
+    /// the shutdown tail then awaits the admitted ones, bounded, before the
+    /// Agent stops.
     pub(super) shielded_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// #1269 r2: cancelled when the shutdown drain starts. A network wait
     /// inside a shielded apply (the joiner's Welcome fetch) selects on it,
