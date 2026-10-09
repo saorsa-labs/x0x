@@ -2826,6 +2826,131 @@ pub(in crate::server) async fn download_legacy_page_import(
     }
 }
 
+/// Post-merge retained-image length for one legacy import, before any
+/// canonical write.
+///
+/// `None` means the trial merge failed. The real merge then reports that
+/// error. A length above the retained-image cap cannot be published, so the
+/// caller refuses it first.
+async fn legacy_import_retained_image_len(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    source: &x0x::kv::KvStore,
+    source_owner: AgentId,
+    endorser: AgentId,
+    public: bool,
+    treekem: bool,
+) -> Result<Option<usize>, GroupStoreResponse> {
+    let (destination, peer) =
+        destination_for_legacy_budget(state, binding, public, treekem).await?;
+    let mut trial = destination;
+    if trial
+        .merge_legacy_signed_history(source, source_owner, endorser, peer)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let image = bincode::serialize(&trial).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import retained image could not be measured: {error}"),
+        )
+    })?;
+    Ok(Some(image.len()))
+}
+
+/// Live destination when it is open. Otherwise the snapshot on disk, or the
+/// empty store the opener would create. This reads. It does not open or write.
+async fn destination_for_legacy_budget(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    public: bool,
+    treekem: bool,
+) -> Result<(x0x::kv::KvStore, saorsa_gossip_types::PeerId), GroupStoreResponse> {
+    if let Some(handle) = state.kv_stores.read().await.get(&binding.topic).cloned() {
+        let peer = handle.peer_id();
+        let store = handle.sync.read().await.clone();
+        return Ok((store, peer));
+    }
+    let path = x0x::kv_snapshot_path(&state.kv_store_state_dir, &binding.store_id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let store = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+                api_error(
+                    StatusCode::CONFLICT,
+                    format!("destination snapshot cannot be measured: {error}"),
+                )
+            })?;
+            Ok((store, saorsa_gossip_types::PeerId::new([0; 32])))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let store = empty_legacy_import_destination(state, binding, public, treekem).await?;
+            Ok((store, saorsa_gossip_types::PeerId::new([0; 32])))
+        }
+        Err(error) => Err(api_error(
+            StatusCode::CONFLICT,
+            format!("destination snapshot cannot be measured: {error}"),
+        )),
+    }
+}
+
+async fn empty_legacy_import_destination(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    public: bool,
+    treekem: bool,
+) -> Result<x0x::kv::KvStore, GroupStoreResponse> {
+    let groups = state.named_groups.read().await;
+    let info = groups
+        .get(&binding.group_key)
+        .ok_or_else(|| not_found("group not found"))?;
+    let group_id = binding.stable_group_id.as_bytes().to_vec();
+    let store = if public {
+        let context = std::sync::Arc::new(
+            x0x::groups::PublicGroupKvContext::from_group(info)
+                .ok_or_else(|| bad_request("group is not SignedPublic"))?,
+        );
+        x0x::kv::KvStore::new_group_signed(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            context,
+        )
+    } else if treekem {
+        let authorization = std::sync::Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(info)
+                .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM group unavailable"))?,
+        );
+        let secure: std::sync::Arc<dyn x0x::kv::encrypted::KvSecureContext> = authorization;
+        x0x::kv::KvStore::new_treekem_encrypted(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            secure,
+        )
+    } else {
+        let secure = std::sync::Arc::new(
+            x0x::groups::GssKvSecureContext::from_group(info)
+                .ok_or_else(|| api_error(StatusCode::CONFLICT, "group secret unavailable"))?,
+        );
+        x0x::kv::KvStore::new_encrypted(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            secure,
+        )
+    };
+    store.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import destination could not be measured: {error}"),
+        )
+    })
+}
+
 /// Rebuild the reviewed legacy source from a durable pre-merge intent.
 ///
 /// The preserved bytes must still match the intent's recorded digest and the
@@ -3081,6 +3206,38 @@ pub(in crate::server) async fn import_legacy_page_store(
                 StatusCode::CONFLICT,
                 format!("legacy source content is invalid: {error}"),
             );
+        }
+    }
+    // #1118: measure the post-merge retained image before the intent journal
+    // and before the canonical merge. A snapshot inside the 20 MiB file gate
+    // can still exceed the 16 MiB image cap, and publication then stays pending.
+    if existing_receipt.is_none() {
+        if let Some(source) = source.as_ref() {
+            match legacy_import_retained_image_len(
+                &state,
+                &binding,
+                &source.store,
+                source.owner,
+                state.agent.agent_id(),
+                public,
+                treekem,
+            )
+            .await
+            {
+                Err(response) => return response,
+                Ok(Some(image_len)) => {
+                    let limit = x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+                    if image_len > limit {
+                        return api_error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "legacy import would retain {image_len} bytes, above the {limit} byte group image limit"
+                            ),
+                        );
+                    }
+                }
+                Ok(None) => {}
+            }
         }
     }
     if existing_intent.is_none() && existing_receipt.is_none() {
@@ -3831,6 +3988,157 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+
+    /// #1118: a legacy snapshot between the 16 MiB retained-image cap and the
+    /// 20 MiB file gate must be refused before merge. The fixture stays inside
+    /// the file gate, so the old check cannot be what refuses it.
+    #[tokio::test]
+    async fn issue1118_oversize_legacy_import_is_refused_before_merge() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "18".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        {
+            let mut store = source_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("page-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        source_handle.peer_id(),
+                    )
+                    .expect("large legacy page");
+            }
+        }
+        source_handle
+            .sync
+            .persist()
+            .await
+            .expect("persist oversize legacy source");
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_len = tokio::fs::metadata(&source_path)
+            .await
+            .expect("source snapshot")
+            .len();
+        assert!(
+            source_len <= LEGACY_PAGE_SNAPSHOT_MAX_BYTES,
+            "fixture must pass the 20 MiB file gate, got {source_len}"
+        );
+        assert!(
+            source_len > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64,
+            "fixture snapshot must sit above the retained-image cap, got {source_len}"
+        );
+
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let projected = {
+            let source_store = source_handle.sync.read().await.clone();
+            let mut trial = dest_handle.sync.read().await.clone();
+            trial
+                .merge_legacy_signed_history(
+                    &source_store,
+                    state.agent.agent_id(),
+                    state.agent.agent_id(),
+                    dest_handle.peer_id(),
+                )
+                .expect("trial merge of the fixture");
+            bincode::serialize(&trial)
+                .expect("projected retained image")
+                .len()
+        };
+        assert!(
+            projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
+            "post-merge image {projected} must exceed the retained-image cap"
+        );
+
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let (code, body) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "oversize-image".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert!(
+            body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("group image limit")),
+            "{body:?}"
+        );
+        assert_ne!(body.0["imported_locally"], true, "{body:?}");
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        assert!(
+            dest_handle
+                .get("page-000")
+                .await
+                .expect("destination read")
+                .is_none(),
+            "refusal must not merge the legacy pages"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts")
+                .is_empty(),
+            "refusal must not leave a pending publication receipt"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "oversize-image",
+            )
+            .await
+            .expect("intent")
+            .is_none(),
+            "refusal must not persist an import intent"
+        );
     }
 
     #[tokio::test]
