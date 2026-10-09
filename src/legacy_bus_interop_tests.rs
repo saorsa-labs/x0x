@@ -3863,3 +3863,431 @@ fn validate_measurement_rejects_data_plane_traffic_on_reserved_control_topic() {
         }
     }
 }
+
+// #1220: the D5/O5 controlled-load oracle only requires positive eager/IHAVE
+// dissemination on D5 and zero egress on O5. Counting each deferred EAGER
+// retry twice, or not at all, still passes that check. The helpers below
+// reconcile the exact attempt count and encoded frame length for every peer
+// in a scenario that contains a known number of deferred retries.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EagerAttempt {
+    peer: [u8; 32],
+    /// Encoded wire length passed to `record_outbound` for this attempt.
+    frame_len: u64,
+    /// True when this attempt is a deferred EAGER retry, not the first send.
+    deferred_retry: bool,
+}
+
+type EagerPeerTally = std::collections::BTreeMap<[u8; 32], (u64, u64)>;
+
+fn known_deferred_retry_attempts() -> Vec<EagerAttempt> {
+    // Two peers, one deferred retry each, distinct frame lengths so a
+    // per-peer mismatch cannot hide inside an unchanged total.
+    vec![
+        EagerAttempt {
+            peer: [0x11; 32],
+            frame_len: 1_280,
+            deferred_retry: false,
+        },
+        EagerAttempt {
+            peer: [0x11; 32],
+            frame_len: 1_280,
+            deferred_retry: true,
+        },
+        EagerAttempt {
+            peer: [0x22; 32],
+            frame_len: 1_024,
+            deferred_retry: false,
+        },
+        EagerAttempt {
+            peer: [0x22; 32],
+            frame_len: 1_088,
+            deferred_retry: true,
+        },
+    ]
+}
+
+fn eager_attempt_totals(attempts: &[EagerAttempt]) -> Result<EagerPeerTally, String> {
+    if !attempts.iter().any(|attempt| attempt.deferred_retry) {
+        return Err("scenario has no deferred EAGER retry".into());
+    }
+    let mut per_peer = EagerPeerTally::new();
+    for attempt in attempts {
+        if attempt.frame_len == 0 {
+            return Err(format!(
+                "peer {} has a zero-length EAGER frame",
+                hex::encode(attempt.peer)
+            ));
+        }
+        let (msgs, bytes) = per_peer.entry(attempt.peer).or_insert((0, 0));
+        *msgs = msgs
+            .checked_add(1)
+            .ok_or_else(|| format!("attempt overflow for {}", hex::encode(attempt.peer)))?;
+        *bytes = bytes
+            .checked_add(attempt.frame_len)
+            .ok_or_else(|| format!("frame length overflow for {}", hex::encode(attempt.peer)))?;
+    }
+    Ok(per_peer)
+}
+
+/// Record `retry_copies` of each deferred retry and one copy of every other
+/// attempt. `1` is the honest meter, `2` doubles every retry, `0` drops them.
+fn meter_record(attempts: &[EagerAttempt], retry_copies: u64) -> EagerPeerTally {
+    let mut recorded = EagerPeerTally::new();
+    for attempt in attempts {
+        let copies = if attempt.deferred_retry {
+            retry_copies
+        } else {
+            1
+        };
+        let (msgs, bytes) = recorded.entry(attempt.peer).or_insert((0, 0));
+        *msgs += copies;
+        *bytes += copies * attempt.frame_len;
+    }
+    recorded
+}
+
+struct GatedTransport {
+    local: saorsa_gossip_types::PeerId,
+    remotes: Vec<saorsa_gossip_types::PeerId>,
+    released: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+    frames: Mutex<Vec<(saorsa_gossip_types::PeerId, Bytes)>>,
+}
+
+impl GatedTransport {
+    fn eager_frames(&self) -> Vec<(saorsa_gossip_types::PeerId, Bytes)> {
+        self.frames
+            .lock()
+            .expect("frame lock")
+            .iter()
+            .filter(|(_, frame)| {
+                saorsa_gossip_pubsub::peek_message_kind(frame)
+                    == Some(saorsa_gossip_types::MessageKind::Eager)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn release_sends(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl saorsa_gossip_transport::GossipTransport for GatedTransport {
+    async fn dial(
+        &self,
+        _peer: saorsa_gossip_types::PeerId,
+        _addr: std::net::SocketAddr,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn dial_bootstrap(
+        &self,
+        _addr: std::net::SocketAddr,
+    ) -> anyhow::Result<saorsa_gossip_types::PeerId> {
+        Ok(self.local)
+    }
+
+    async fn listen(&self, _bind: std::net::SocketAddr) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer: saorsa_gossip_types::PeerId,
+        stream_type: saorsa_gossip_transport::GossipStreamType,
+        data: Bytes,
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            stream_type,
+            saorsa_gossip_transport::GossipStreamType::PubSub
+        );
+        self.frames.lock().expect("frame lock").push((peer, data));
+        loop {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            if self.released.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+        Ok(())
+    }
+
+    async fn receive_message(
+        &self,
+    ) -> anyhow::Result<(
+        saorsa_gossip_types::PeerId,
+        saorsa_gossip_transport::GossipStreamType,
+        Bytes,
+    )> {
+        Err(anyhow::anyhow!(
+            "deferred-retry meter test delivers no inbound frames"
+        ))
+    }
+
+    async fn connected_peer_ids(&self) -> Vec<saorsa_gossip_types::PeerId> {
+        self.remotes.clone()
+    }
+
+    fn local_peer_id(&self) -> saorsa_gossip_types::PeerId {
+        self.local
+    }
+}
+
+fn reconcile_eager_retry_meter(
+    attempts: &[EagerAttempt],
+    recorded: &EagerPeerTally,
+) -> Result<(), String> {
+    let expected = eager_attempt_totals(attempts)?;
+    if expected.len() != recorded.len() {
+        return Err(format!(
+            "EAGER peer set mismatch: expected {} peers, recorded {}",
+            expected.len(),
+            recorded.len()
+        ));
+    }
+    for (peer, (msgs, bytes)) in &expected {
+        let Some((got_msgs, got_bytes)) = recorded.get(peer) else {
+            return Err(format!(
+                "missing EAGER meter for peer {}",
+                hex::encode(peer)
+            ));
+        };
+        if got_msgs != msgs || got_bytes != bytes {
+            return Err(format!(
+                "peer {} EAGER meter msgs={got_msgs} bytes={got_bytes} != {msgs} attempts totaling {bytes} encoded bytes",
+                hex::encode(peer)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn eager_retry_meter_matches_known_deferred_retries() {
+    let attempts = known_deferred_retry_attempts();
+    let recorded = meter_record(&attempts, 1);
+    reconcile_eager_retry_meter(&attempts, &recorded)
+        .expect("one record per deferred retry must match");
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.deferred_retry)
+            .count(),
+        2
+    );
+    assert_eq!(recorded[&[0x11; 32]], (2, 2_560));
+    assert_eq!(recorded[&[0x22; 32]], (2, 2_112));
+}
+
+#[test]
+fn eager_retry_meter_rejects_doubled_deferred_retry() {
+    let attempts = known_deferred_retry_attempts();
+    let recorded = meter_record(&attempts, 2);
+    let err = reconcile_eager_retry_meter(&attempts, &recorded)
+        .expect_err("a doubled deferred EAGER retry must fail the meter");
+    assert!(
+        err.contains(&hex::encode([0x11_u8; 32])),
+        "error must name the peer whose retry was doubled; got: {err}"
+    );
+}
+
+#[test]
+fn eager_retry_meter_rejects_dropped_deferred_retry() {
+    let attempts = known_deferred_retry_attempts();
+    let recorded = meter_record(&attempts, 0);
+    // The initial sends are still positive, which is why the D5 "> 0" check
+    // cannot see a missing retry.
+    let bytes: u64 = recorded.values().map(|(_, bytes)| *bytes).sum();
+    assert!(bytes > 0, "dropped retries must leave the initial sends");
+    let err = reconcile_eager_retry_meter(&attempts, &recorded)
+        .expect_err("a dropped deferred EAGER retry must fail the meter");
+    assert!(
+        err.contains(&hex::encode([0x11_u8; 32])),
+        "error must name the peer whose retry was dropped; got: {err}"
+    );
+}
+
+/// In-process pubsub with a transport that never dials. One IWANT reply is
+/// claim-skipped while the local data permit is held, then retried once.
+/// The outbound EAGER meter must show that retry exactly once, at the
+/// encoded frame length the transport was given.
+#[tokio::test]
+async fn deferred_eager_retry_records_each_peer_frame_once() {
+    let local = saorsa_gossip_types::PeerId::new([0x10; 32]);
+    let peer_a = saorsa_gossip_types::PeerId::new([0x11; 32]);
+    let peer_b = saorsa_gossip_types::PeerId::new([0x22; 32]);
+    let topic = saorsa_gossip_types::TopicId::new([0x51; 32]);
+    let transport = Arc::new(GatedTransport {
+        local,
+        remotes: vec![peer_a, peer_b],
+        released: std::sync::atomic::AtomicBool::new(false),
+        release: tokio::sync::Notify::new(),
+        frames: Mutex::new(Vec::new()),
+    });
+    let pubsub = Arc::new(saorsa_gossip_pubsub::PlumtreePubSub::new(
+        local,
+        Arc::clone(&transport),
+        saorsa_gossip_identity::MlDsaKeyPair::generate().expect("signing key"),
+    ));
+    pubsub
+        .initialize_topic_peers(topic, vec![peer_a, peer_b])
+        .await;
+
+    let eager_meter = |pubsub: &saorsa_gossip_pubsub::PlumtreePubSub<GatedTransport>| {
+        pubsub
+            .outbound_by_topic_stats()
+            .get(&topic.to_string())
+            .map(|row| (row.eager.msgs, row.eager.bytes))
+            .unwrap_or((0, 0))
+    };
+
+    let publisher = Arc::clone(&pubsub);
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish_local_with_fanout(topic, Bytes::from_static(b"issue-1220-deferred-retry"))
+            .await
+    });
+
+    let initial = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frames = transport.eager_frames();
+            if frames.len() >= 2 {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("two initial EAGER attempts");
+    assert_eq!(
+        initial.len(),
+        2,
+        "exactly two initial EAGER frames before the retry"
+    );
+    let initial_bytes: u64 = initial
+        .iter()
+        .map(|(_, frame)| u64::try_from(frame.len()).expect("frame length"))
+        .sum();
+    assert_eq!(
+        eager_meter(&pubsub),
+        (2, initial_bytes),
+        "initial attempts are metered once at their encoded lengths"
+    );
+
+    let msg_id = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(&initial[0].1)
+        .expect("initial EAGER header")
+        .0
+        .msg_id;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        pubsub.handle_iwant(peer_a, topic, vec![msg_id]),
+    )
+    .await
+    .expect("IWANT reply must defer while the local data permit is held")
+    .expect("IWANT handled");
+    assert_eq!(
+        transport.eager_frames().len(),
+        2,
+        "a deferred reply must not send EAGER while the permit is held"
+    );
+    assert_eq!(
+        eager_meter(&pubsub),
+        (2, initial_bytes),
+        "deferral itself must not record an EAGER attempt"
+    );
+
+    transport.release_sends();
+    let fanout = tokio::time::timeout(Duration::from_secs(5), publish)
+        .await
+        .expect("publish finished after the permit was released")
+        .expect("publish task")
+        .expect("publish");
+    assert_eq!(
+        (fanout.attempted, fanout.succeeded),
+        (2, 2),
+        "both eager peers were attempted and the sends completed: {fanout:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if transport.eager_frames().len() >= 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the deferred EAGER retry");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let frames = transport.eager_frames();
+    assert_eq!(
+        frames.len(),
+        3,
+        "exactly one deferred retry after the two initial attempts"
+    );
+
+    let mut attempts = Vec::new();
+    for (index, (peer, frame)) in frames.iter().enumerate() {
+        let header = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(frame)
+            .expect("EAGER header")
+            .0;
+        assert_eq!(header.msg_id, msg_id, "retry carries the same message");
+        attempts.push(EagerAttempt {
+            peer: peer.to_bytes(),
+            frame_len: u64::try_from(frame.len()).expect("frame length"),
+            deferred_retry: index >= initial.len(),
+        });
+    }
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.deferred_retry)
+            .count(),
+        1
+    );
+    assert_eq!(attempts.last().expect("retry").peer, peer_a.to_bytes());
+
+    let (msgs, bytes) = eager_meter(&pubsub);
+    let mut per_peer = EagerPeerTally::new();
+    for attempt in &attempts {
+        let row = per_peer.entry(attempt.peer).or_insert((0, 0));
+        row.0 += 1;
+        row.1 += attempt.frame_len;
+    }
+    assert_eq!(
+        per_peer[&peer_a.to_bytes()].0,
+        2,
+        "peer A: one initial EAGER plus one deferred retry"
+    );
+    assert_eq!(
+        per_peer[&peer_b.to_bytes()].0,
+        1,
+        "peer B: the initial EAGER only"
+    );
+    let peer_bytes: u64 = per_peer.values().map(|(_, peer_bytes)| *peer_bytes).sum();
+    assert_eq!(
+        (msgs, bytes),
+        (3, peer_bytes),
+        "EAGER meter must count each peer frame once, at its encoded length"
+    );
+    reconcile_eager_retry_meter(&attempts, &per_peer)
+        .expect("wire frames are one deferred retry plus the two initial sends");
+    let _ = pubsub.shutdown().await;
+    assert_eq!(
+        transport.eager_frames().len(),
+        3,
+        "shutdown must not record another EAGER retry"
+    );
+}
