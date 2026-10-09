@@ -130,10 +130,19 @@ class Scenario(SharedScenario):
             readiness_label=f"{member} Home seat reaches owner and local readiness",
             operation="home_join_readiness")
 
-    def _private_epoch_key_installed(self, inviter: str, member: str, gid: str) -> dict[str, Any]:
-        """One seal-then-decrypt attempt. Facts never include ciphertext or plaintext."""
+    def _private_epoch_key_installed(self, inviter: str, member: str, gid: str,
+                                     deadline: float) -> dict[str, Any]:
+        """One seal-then-decrypt attempt. Facts never include ciphertext or plaintext.
+
+        Each request waits on its own. Once ``deadline`` has passed, the next
+        request is not started, including the decrypt after a seal that itself
+        spent the deadline.
+        """
         payload = base64.b64encode(uuid.uuid4().bytes).decode()
         facts: dict[str, Any] = {"epoch_key_installed": False}
+        if time.monotonic() >= deadline:
+            facts["decrypt_class"] = "not_attempted"
+            return facts
         try:
             status, body = self.c[inviter].request(
                 "POST", f"/groups/{enc(gid)}/secure/encrypt", {"payload_b64": payload})
@@ -148,6 +157,9 @@ class Scenario(SharedScenario):
             facts["decrypt_class"] = "seal_unusable"
             return facts
         facts["secret_epoch"] = epoch
+        if time.monotonic() >= deadline:
+            facts["decrypt_class"] = "not_attempted"
+            return facts
         sealed: dict[str, Any] = {"ciphertext_b64": ciphertext, "secret_epoch": epoch}
         nonce = body.get("nonce_b64")
         if isinstance(nonce, str) and nonce:
@@ -238,7 +250,8 @@ class Scenario(SharedScenario):
                 # #1214: private readiness also needs the joiner's epoch key.
                 # Home leaves require_epoch_key false and accepts here.
                 if require_epoch_key:
-                    last_key_facts = self._private_epoch_key_installed(owner, member, gid)
+                    last_key_facts = self._private_epoch_key_installed(
+                        owner, member, gid, deadline)
                     if time.monotonic() >= deadline or not last_key_facts.get("epoch_key_installed"):
                         if time.monotonic() >= deadline:
                             deadline_reached = True
@@ -296,9 +309,8 @@ class Scenario(SharedScenario):
                      "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
                      "last_error_class": last_error, "outcome": "timeout"}
         if last_key_facts is not None:
-            timed_out.update({key: value for key, value in last_key_facts.items()
-                              if key != "epoch_key_installed"})
-            timed_out["epoch_key_installed"] = False
+            # Keep the observed key fact. outcome and deadline_reached say it was too late.
+            timed_out.update(last_key_facts)
         self.e.record_poll(
             timed_out,
             operation=operation, node=member, owner=owner,
