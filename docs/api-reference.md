@@ -1020,6 +1020,12 @@ upgraded matters more than the stronger receipt: a durable send to a peer
 running 0.37.x — or to any peer without durable history enabled — answers
 **409 `recipient_ack_semantics_unavailable`** instead of delivering.
 
+A recipient that sets `[history] dm_recording = "ephemeral"` (ADR 0116)
+still advertises durable ACKs but does not commit ordinary DMs. It
+withholds the durable ACK and sends no refusal, so a durable send to it
+ends in the ordinary ACK timeout, not a 409. Use
+`require_durable_app_ack: false` to reach such a recipient.
+
 Two consequences worth planning for:
 
 - A durable send never uses the raw-QUIC fast path, because raw QUIC yields a

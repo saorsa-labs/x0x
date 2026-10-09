@@ -168,6 +168,12 @@ impl Direction {
 }
 
 /// One durable (or replaceable) history row (ADR-0023 §3).
+///
+/// ADR 0116 §3 (ruling Q5): a record with `scope: Scope::Dm(_)` and no
+/// `replace_key` is an *ordinary DM*. The local `dm_recording =
+/// "ephemeral"` policy drops it at the history handle. A producer that
+/// stores anything other than DM communication under a DM scope must give
+/// it a `replace_key` (as the agent-card import does) or use another scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRecord {
     /// Dedupe key across redundant delivery channels.

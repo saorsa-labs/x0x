@@ -136,16 +136,13 @@ impl HistoryConfig {
     }
 
     /// The check history runs before it opens, and the daemon runs at
-    /// config load whatever `enabled` says (ADR 0116 §1): validate the
-    /// rules, then refuse any rule this build cannot enforce yet.
+    /// config load whatever `enabled` says (ADR 0116 §1).
     ///
     /// # Errors
     /// [`crate::error::HistoryError::InvalidConfig`] names the first rule
     /// refused.
     pub fn validate(&self) -> HistoryResult<HistoryPolicy> {
-        let policy = self.compile_policy()?;
-        policy.ensure_enforceable()?;
-        Ok(policy)
+        self.compile_policy()
     }
 }
 
@@ -224,7 +221,16 @@ impl HistoryHandle {
     }
 
     /// Enqueue a record (never blocks; sheds on full — ADR-0023 §5).
+    ///
+    /// ADR 0116 §3: a record the local policy suppresses is dropped here,
+    /// before it is enqueued, and counted. That is an ordinary DM under
+    /// `dm_recording = "ephemeral"`, or a message on a topic whose winning
+    /// rule is `ephemeral`. It writes no row, payload, artifact, FTS entry,
+    /// canonical projection or replay source.
     pub fn record(&self, record: HistoryRecord) {
+        if self.suppressed_by_policy(&record) {
+            return;
+        }
         self.writer.record(record);
     }
 
@@ -232,8 +238,46 @@ impl HistoryHandle {
     ///
     /// This is reserved for protocol surfaces whose success receipt promises
     /// durable local history. Hot paths should continue using [`Self::record`].
+    ///
+    /// ADR 0116 §3: a record the local policy suppresses is not written,
+    /// and the call returns [`HistoryError::PolicySuppressed`], never a
+    /// success, so a durable receipt can never be built on it.
     pub async fn record_committed(&self, record: HistoryRecord) -> HistoryResult<InsertOutcome> {
+        if self.suppressed_by_policy(&record) {
+            return Err(HistoryError::PolicySuppressed);
+        }
         self.writer.record_committed(record).await
+    }
+
+    /// ADR 0116 §3, the shared write boundary: does the local policy keep
+    /// `record` out of history? Counts it when it does.
+    ///
+    /// - Ordinary DM: `Scope::Dm` with no `replace_key` (ruling Q5). That
+    ///   covers every DM producer: the gossip inbox, the raw-QUIC path and
+    ///   the outbound DM record. A Replaceable row in DM scope, such as an
+    ///   imported agent card, is not a DM and is kept.
+    /// - Topic message: `Scope::Topic` whose winning rule is `ephemeral`.
+    /// - Group rows are never suppressed (quarantine ingest stays
+    ///   tag-and-retain).
+    ///
+    /// The counters carry no topic or payload.
+    fn suppressed_by_policy(&self, record: &HistoryRecord) -> bool {
+        let dm = matches!(record.scope, Scope::Dm(_))
+            && record.replace_key.is_none()
+            && self.policy.suppresses_ordinary_dms();
+        let topic = !dm
+            && matches!(&record.scope, Scope::Topic(name) if self.policy.suppresses_topic(name));
+        if !(dm || topic) {
+            return false;
+        }
+        let counters = self.writer.counters();
+        let counter = if dm {
+            &counters.policy_suppressed_dm_total
+        } else {
+            &counters.policy_suppressed_topic_total
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Read access to the store. Synchronous — call from `spawn_blocking`
@@ -630,19 +674,14 @@ mod tests {
         );
     }
 
-    /// This build enforces the class and topic retention limits (slice B)
-    /// but not the `ephemeral` recording modes (slice C), so it refuses
-    /// those rather than accept them and ignore them.
+    /// Slice C enforces the `ephemeral` recording modes, so every valid rule
+    /// opens; none is refused for being unenforced.
     #[test]
-    fn adr0116_refuses_rules_this_build_cannot_enforce() {
+    fn adr0116_every_valid_rule_opens() {
         for body in [
             "dm_recording = \"ephemeral\"\n",
             "[[topic_rules]]\nprefix = \"app.sync.\"\nrecording = \"ephemeral\"\n",
             "[[topic_rules]]\nprefix = \"app.sync.\"\nrecording = \"ephemeral\"\nmax_bytes = 1\n",
-        ] {
-            assert_refused(body, "not supported by this build");
-        }
-        for body in [
             "[[class_limits]]\nclass = \"durable\"\nmax_age_days = 7\n",
             "[[class_limits]]\nclass = \"replaceable\"\nmax_bytes = 8388608\n",
             "[[topic_rules]]\nprefix = \"app.chat\"\nmax_bytes = 16777216\n",
@@ -870,6 +909,280 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    // ── ADR 0116 slice C: Ephemeral at the shared write boundary ─────────
+    //
+    // Every history producer (raw-QUIC and gossip-inbox DMs, outbound DMs,
+    // topic subscriptions, the durable-commit path) goes through
+    // `HistoryHandle::record` / `record_committed`, so the gate is tested
+    // there, with records shaped exactly as each producer builds them.
+
+    fn c_row(
+        scope: Scope,
+        text: &str,
+        direction: Direction,
+        provenance: Provenance,
+        replace_key: Option<&str>,
+    ) -> HistoryRecord {
+        let payload = text.as_bytes().to_vec();
+        HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(None, &payload),
+            scope,
+            author_agent: None,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1_000,
+            seen_at_ms: 1_000,
+            direction,
+            content_type: "text/plain".into(),
+            payload,
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance,
+            replace_key: replace_key.map(str::to_string),
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    /// An inbound DM as the gossip inbox and the raw-QUIC path record it.
+    fn c_inbound_dm(text: &str) -> HistoryRecord {
+        c_row(
+            Scope::Dm("ab".repeat(32)),
+            text,
+            Direction::Inbound,
+            Provenance::VerifiedEnvelope,
+            None,
+        )
+    }
+
+    /// An outbound DM as `record_dm_outbound` records it.
+    fn c_outbound_dm(text: &str) -> HistoryRecord {
+        c_row(
+            Scope::Dm("cd".repeat(32)),
+            text,
+            Direction::Outbound,
+            Provenance::LocalSend,
+            None,
+        )
+    }
+
+    fn c_group(id: &str, text: &str) -> HistoryRecord {
+        c_row(
+            Scope::Group(id.into()),
+            text,
+            Direction::Inbound,
+            Provenance::LocalAppDecrypt,
+            None,
+        )
+    }
+
+    fn c_topic(name: &str, text: &str) -> HistoryRecord {
+        c_row(
+            Scope::Topic(name.into()),
+            text,
+            Direction::Inbound,
+            Provenance::VerifiedEnvelope,
+            None,
+        )
+    }
+
+    fn c_start(dir: &std::path::Path, config: HistoryConfig) -> HistoryService {
+        HistoryService::start(
+            &HistoryConfig {
+                enabled: true,
+                db_path: Some(dir.join("history.db")),
+                ..config
+            },
+            dir,
+        )
+        .unwrap()
+    }
+
+    /// Commit a group barrier row through the same writer queue (so every
+    /// earlier `record` has been processed), shut the service down, reopen
+    /// the database as a restart would, and return it.
+    async fn c_restart(dir: &std::path::Path, service: HistoryService) -> Store {
+        service
+            .handle()
+            .record_committed(c_group("barrier", "group barrier row"))
+            .await
+            .unwrap();
+        service.shutdown().await;
+        Store::open(&dir.join("history.db")).unwrap()
+    }
+
+    fn c_search(store: &Store, needle: &str) -> usize {
+        store
+            .search(needle, &HistoryQuery::default())
+            .unwrap()
+            .len()
+    }
+
+    fn c_dm_ephemeral() -> HistoryConfig {
+        HistoryConfig {
+            dm_recording: DmRecording::Ephemeral,
+            ..HistoryConfig::default()
+        }
+    }
+
+    /// Validation row 4: under `dm_recording = "ephemeral"` an ordinary DM,
+    /// inbound or outbound, writes no history row, no FTS document and no
+    /// canonical projection; after a restart only the group barrier row is
+    /// there. The suppression is counted, without a label.
+    #[tokio::test]
+    async fn adr0116_c_dm_ephemeral_writes_no_dm_row_fts_or_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), c_dm_ephemeral());
+        let handle = service.handle();
+        handle.record(c_inbound_dm("inbound secret words"));
+        handle.record(c_outbound_dm("outbound secret words"));
+        let counters = handle.counters();
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(
+            store.table_counts_for_tests(),
+            (1, 1, 0),
+            "(history rows, FTS documents, canonical rows): only the barrier"
+        );
+        assert_eq!(c_search(&store, "secret"), 0, "no FTS entry for a DM");
+        assert_eq!(c_search(&store, "barrier"), 1);
+        assert_eq!(
+            counters
+                .policy_suppressed_dm_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    /// Validation row 4, negative control: the same records with the
+    /// policy unset are stored and indexed.
+    #[tokio::test]
+    async fn adr0116_c_negative_control_dm_rows_are_stored_without_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), HistoryConfig::default());
+        let handle = service.handle();
+        handle.record(c_inbound_dm("inbound secret words"));
+        handle.record(c_outbound_dm("outbound secret words"));
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(store.table_counts_for_tests(), (3, 3, 0));
+        assert_eq!(c_search(&store, "secret"), 2);
+    }
+
+    /// Ruling Q5: only ORDINARY DMs (`Scope::Dm` with no `replace_key`) are
+    /// suppressed. An imported agent card is a Replaceable row in DM scope
+    /// (`routes/identity.rs`) and is still stored.
+    #[tokio::test]
+    async fn adr0116_c_agent_card_in_dm_scope_is_still_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), c_dm_ephemeral());
+        let handle = service.handle();
+        handle.record(c_row(
+            Scope::Dm("ef".repeat(32)),
+            "agent card body",
+            Direction::Inbound,
+            Provenance::VerifiedEnvelope,
+            Some("agent-card:ef"),
+        ));
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(store.table_counts_for_tests().0, 2, "card + barrier");
+        assert_eq!(c_search(&store, "card"), 1);
+    }
+
+    /// ADR 0116 §3: group history has no Ephemeral opt-out. Neither the DM
+    /// policy nor a topic rule whose prefix happens to match a group id
+    /// suppresses a group row.
+    #[tokio::test]
+    async fn adr0116_c_group_rows_are_never_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HistoryConfig {
+            topic_rules: vec![TopicRule {
+                prefix: "app.".into(),
+                recording: TopicRecording::Ephemeral,
+                max_bytes: None,
+                max_age_days: None,
+            }],
+            ..c_dm_ephemeral()
+        };
+        let service = c_start(dir.path(), config);
+        let handle = service.handle();
+        handle.record(c_group("app.x", "group message words"));
+        handle
+            .record_committed(c_group("app.y", "committed group words"))
+            .await
+            .unwrap();
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(store.table_counts_for_tests().0, 3);
+    }
+
+    /// Validation row 4, topic path: the winning `ephemeral` rule keeps a
+    /// topic's messages out of history; a longer `inherit` rule carves its
+    /// topics back in, and a topic no rule matches is recorded as before.
+    #[tokio::test]
+    async fn adr0116_c_topic_rule_ephemeral_keeps_its_topics_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HistoryConfig {
+            topic_rules: vec![
+                TopicRule {
+                    prefix: "app.".into(),
+                    recording: TopicRecording::Ephemeral,
+                    max_bytes: None,
+                    max_age_days: None,
+                },
+                TopicRule {
+                    prefix: "app.chat".into(),
+                    recording: TopicRecording::Inherit,
+                    max_bytes: None,
+                    max_age_days: None,
+                },
+            ],
+            ..HistoryConfig::default()
+        };
+        let service = c_start(dir.path(), config);
+        let handle = service.handle();
+        handle.record(c_topic("app.sync", "sync presence words"));
+        handle.record(c_topic("app.chat.room", "chat room words"));
+        handle.record(c_topic("other", "other topic words"));
+        let counters = handle.counters();
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(c_search(&store, "presence"), 0, "app.sync is ephemeral");
+        assert_eq!(c_search(&store, "room"), 1, "app.chat carves back in");
+        assert_eq!(c_search(&store, "other"), 1, "no rule: recorded");
+        assert_eq!(
+            counters
+                .policy_suppressed_topic_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Validation row 4, committed-write path: a suppressed record is never
+    /// reported as committed. `record_committed` returns `PolicySuppressed`
+    /// and writes nothing, so no caller can turn it into a durable receipt.
+    #[tokio::test]
+    async fn adr0116_c_suppressed_committed_write_is_an_error_never_a_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), c_dm_ephemeral());
+        let handle = service.handle();
+        let result = handle
+            .record_committed(c_inbound_dm("must not commit"))
+            .await;
+        assert!(
+            matches!(result, Err(crate::error::HistoryError::PolicySuppressed)),
+            "got {result:?}"
+        );
+        drop(handle);
+        let store = c_restart(dir.path(), service).await;
+        assert_eq!(c_search(&store, "commit"), 0);
+        assert_eq!(store.table_counts_for_tests().0, 1, "only the barrier");
     }
 
     /// Validation row 1 (defaults): the new keys are omitted from a

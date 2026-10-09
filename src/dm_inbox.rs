@@ -2211,7 +2211,7 @@ impl InboxPipeline {
             );
             return DurableAckDecision::Withheld("no_durable_representation");
         };
-        match durable_history_logical_request(
+        let lookup = match durable_history_logical_request(
             &history,
             sender_agent_id,
             request_id,
@@ -2219,7 +2219,9 @@ impl InboxPipeline {
         )
         .await
         {
-            Ok(DurableLogicalRequestLookup::Missing | DurableLogicalRequestLookup::Exact) => {}
+            Ok(
+                found @ (DurableLogicalRequestLookup::Missing | DurableLogicalRequestLookup::Exact),
+            ) => found,
             Ok(DurableLogicalRequestLookup::Conflict) => {
                 tracing::warn!(
                     target: "dm.trace",
@@ -2255,6 +2257,34 @@ impl InboxPipeline {
                 );
                 return DurableAckDecision::Withheld("history_lookup_failed");
             }
+        };
+
+        // ADR 0116 §3 / ADR 0030 §1: a generic durable DM is never
+        // acknowledged without its commit. Under `dm_recording =
+        // "ephemeral"` the commit is suppressed, so a request with no
+        // committed row (`Missing`) is withheld here, BEFORE dispatch. The
+        // reason is counted locally only. No typed refusal is sent (no
+        // `AckSemanticsUnavailable`), no weaker ACK, and the v2 advert
+        // stays; the sender sees its ordinary bounded retry or timeout.
+        //
+        // Ruling Q4 (an interpretation of the Validation "pre-policy
+        // committed duplicate" cell): an `Exact` lookup means the commit
+        // was made before the policy, so the request is not suppressed. It
+        // takes main's path below: re-dispatch (at-least-once) and a v2
+        // ACK from the existing row, with no new commit attempted.
+        let policy_suppresses_commit = history.policy().suppresses_ordinary_dms();
+        if policy_suppresses_commit && lookup == DurableLogicalRequestLookup::Missing {
+            history
+                .counters()
+                .policy_durable_receipt_withheld_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_durable_policy_ephemeral",
+                request_id = %hex::encode(request_id),
+                "v2 ACK withheld before dispatch: the local history policy does not record ordinary DMs (ADR 0116 §3)"
+            );
+            return DurableAckDecision::Withheld("history_policy_ephemeral");
         }
 
         // 4. Dispatch.
@@ -2273,27 +2303,33 @@ impl InboxPipeline {
 
         // 5. Commit awaited. This is the step the v2 receipt is actually
         //    about: the ACK below may not exist unless this returned.
-        match history.record_committed(record).await {
-            Ok(outcome) if exact_durable_history_outcome(outcome) => {}
-            Ok(outcome) => {
-                tracing::warn!(
-                    target: "dm.trace",
-                    stage = "inbound_durable_commit_inexact",
-                    request_id = %hex::encode(request_id),
-                    ?outcome,
-                    "v2 ACK withheld: history commit did not yield exactly one durable row"
-                );
-                return DurableAckDecision::Withheld("commit_inexact");
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "dm.trace",
-                    stage = "inbound_durable_commit_failed",
-                    request_id = %hex::encode(request_id),
-                    %error,
-                    "v2 ACK withheld: durable history commit failed"
-                );
-                return DurableAckDecision::Withheld("commit_failed");
+        //    ADR 0116 §3 (ruling Q4): under an ephemeral DM policy only an
+        //    `Exact` lookup reaches this point. Its pre-policy row is the
+        //    commit the receipt needs, so no new commit is attempted; the
+        //    handle would refuse one, and none is fabricated.
+        if !policy_suppresses_commit {
+            match history.record_committed(record).await {
+                Ok(outcome) if exact_durable_history_outcome(outcome) => {}
+                Ok(outcome) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "inbound_durable_commit_inexact",
+                        request_id = %hex::encode(request_id),
+                        ?outcome,
+                        "v2 ACK withheld: history commit did not yield exactly one durable row"
+                    );
+                    return DurableAckDecision::Withheld("commit_inexact");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "inbound_durable_commit_failed",
+                        request_id = %hex::encode(request_id),
+                        %error,
+                        "v2 ACK withheld: durable history commit failed"
+                    );
+                    return DurableAckDecision::Withheld("commit_failed");
+                }
             }
         }
 
@@ -5895,5 +5931,377 @@ mod tests {
             Some(m2.machine_id()),
             "an attested move must update A's connected machine"
         );
+    }
+
+    // ── ADR 0116 slice C: the ADR 0030 receipt rule under dm_recording ────
+
+    use crate::history::DmRecording;
+
+    fn attach_history_with(
+        harness: &mut InboxHarness,
+        dm_recording: DmRecording,
+    ) -> crate::history::HistoryService {
+        let config = crate::history::HistoryConfig {
+            db_path: Some(harness._tempdir.path().join("history.db")),
+            dm_recording,
+            ..crate::history::HistoryConfig::daemon_default()
+        };
+        let service = crate::history::HistoryService::start(&config, harness._tempdir.path())
+            .expect("history service");
+        harness.pipeline.history = Some(service.handle());
+        service
+    }
+
+    /// An inbox process restart: the in-memory replay cache is lost and
+    /// history reopens over the same database, under `dm_recording`.
+    async fn restart_inbox(
+        harness: &mut InboxHarness,
+        service: crate::history::HistoryService,
+        dm_recording: DmRecording,
+    ) -> crate::history::HistoryService {
+        harness.pipeline.history = None;
+        service.shutdown().await;
+        harness.pipeline.cache = Arc::new(crate::dm::RecentDeliveryCache::with_defaults());
+        attach_history_with(harness, dm_recording)
+    }
+
+    /// One signed v2 envelope, reused for every retry so the retry carries
+    /// the same bytes, as a real sender's resend does.
+    fn signed_durable_envelope(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: MachineId,
+        request_byte: u8,
+        payload: &[u8],
+    ) -> DmEnvelope {
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            harness,
+            sender,
+            machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, sender);
+        envelope
+    }
+
+    async fn deliver_durable(
+        harness: &InboxHarness,
+        envelope: DmEnvelope,
+        payload: &[u8],
+        machine: MachineId,
+        sender: &AgentKeypair,
+    ) -> DurableAckDecision {
+        harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload.to_vec(),
+                TrustDecision::Accept,
+                machine,
+                true,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await
+    }
+
+    async fn assert_no_ack(acks: &mut Subscription) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), acks.recv())
+                .await
+                .is_err(),
+            "no ACK of any kind (durable, downgraded v1 or typed refusal) may be published"
+        );
+    }
+
+    fn counter(harness: &InboxHarness, pick: fn(&crate::history::HistoryCounters) -> u64) -> u64 {
+        pick(
+            &harness
+                .pipeline
+                .history
+                .as_ref()
+                .expect("history handle")
+                .counters(),
+        )
+    }
+
+    fn receipts_withheld(c: &crate::history::HistoryCounters) -> u64 {
+        c.policy_durable_receipt_withheld_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn dms_suppressed(c: &crate::history::HistoryCounters) -> u64 {
+        c.policy_suppressed_dm_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// ADR 0116 §3 / ADR 0030 (Validation "Receipts"): with `dm_recording =
+    /// "ephemeral"` a NEW generic durable DM gets no durable ACK, no
+    /// downgraded v1 ACK and no typed refusal, and it is not dispatched.
+    /// The local reason is counted and nothing is committed or cached.
+    #[tokio::test]
+    async fn adr0116_c_new_durable_dm_is_withheld_before_dispatch() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE1; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history_with(&mut harness, DmRecording::Ephemeral);
+        let mut acks = watch_acks_to(&harness, &sender).await;
+        let envelope = signed_durable_envelope(&harness, &sender, machine, 0xE1, b"durable hello");
+
+        let decision =
+            deliver_durable(&harness, envelope, b"durable hello", machine, &sender).await;
+
+        assert_eq!(
+            decision,
+            DurableAckDecision::Withheld("history_policy_ephemeral")
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_no_ack(&mut acks).await;
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert!(committed_rows(&history, &sender, 0xE1).is_empty());
+        assert_eq!(counter(&harness, receipts_withheld), 1);
+        assert!(
+            harness
+                .pipeline
+                .cache
+                .lookup(&crate::dm::DedupeKey::new(
+                    *sender.agent_id().as_bytes(),
+                    [0xE1; 16]
+                ))
+                .is_none(),
+            "a withheld request leaves no completion behind"
+        );
+    }
+
+    /// The same, through the full inbox entry point: no other branch of the
+    /// pipeline delivers or acknowledges the suppressed DM.
+    #[tokio::test]
+    async fn adr0116_c_full_inbox_path_withholds_a_new_durable_dm() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE2; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history_with(&mut harness, DmRecording::Ephemeral);
+        let mut acks = watch_acks_to(&harness, &sender).await;
+        let message = durable_payload_message(&harness, &sender, machine, 0xE2, b"durable hello");
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_no_ack(&mut acks).await;
+        assert_eq!(counter(&harness, receipts_withheld), 1);
+    }
+
+    /// Validation "Receipts": retries and a restart do not turn a
+    /// suppressed DM into a receipt or a dispatch.
+    #[tokio::test]
+    async fn adr0116_c_withheld_dm_stays_withheld_on_retry_and_restart() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE3; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let service = attach_history_with(&mut harness, DmRecording::Ephemeral);
+        let envelope = signed_durable_envelope(&harness, &sender, machine, 0xE3, b"durable hello");
+        for attempt in 0..2 {
+            let decision = deliver_durable(
+                &harness,
+                envelope.clone(),
+                b"durable hello",
+                machine,
+                &sender,
+            )
+            .await;
+            assert_eq!(
+                decision,
+                DurableAckDecision::Withheld("history_policy_ephemeral"),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(counter(&harness, receipts_withheld), 2);
+        let _service = restart_inbox(&mut harness, service, DmRecording::Ephemeral).await;
+        let decision =
+            deliver_durable(&harness, envelope, b"durable hello", machine, &sender).await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Withheld("history_policy_ephemeral"),
+            "after restart"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert!(committed_rows(&history, &sender, 0xE3).is_empty());
+    }
+
+    /// Ruling Q4, an interpretation of the Validation cell "a pre-policy
+    /// committed duplicate without fabricating a new commit". A DM
+    /// committed before the policy was set already has its required commit,
+    /// so it is not "suppressed". After a restart under `ephemeral`, its
+    /// retry takes main's Exact path: re-dispatched (at-least-once, ADR 0030
+    /// §1) and re-ACKed v2 from the existing row. No new row is written and
+    /// no commit is attempted.
+    #[tokio::test]
+    async fn adr0116_c_pre_policy_committed_duplicate_keeps_mains_exact_path() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE4; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let service = attach_history_with(&mut harness, DmRecording::Inherit);
+        let envelope = signed_durable_envelope(&harness, &sender, machine, 0xE4, b"durable hello");
+        let acked = DurableAckDecision::Acked {
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            accepted: true,
+        };
+        assert_eq!(
+            deliver_durable(
+                &harness,
+                envelope.clone(),
+                b"durable hello",
+                machine,
+                &sender
+            )
+            .await,
+            acked,
+            "committed before the policy"
+        );
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("first dispatch")
+            .expect("delivery stream");
+
+        let _service = restart_inbox(&mut harness, service, DmRecording::Ephemeral).await;
+        let mut acks = watch_acks_to(&harness, &sender).await;
+        assert_eq!(
+            deliver_durable(&harness, envelope, b"durable hello", machine, &sender).await,
+            acked,
+            "the pre-policy commit still backs a v2 receipt"
+        );
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("Exact re-dispatch")
+            .expect("delivery stream");
+        assert_eq!(next_ack_outcome(&mut acks).await, DmAckOutcome::Accepted);
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert_eq!(
+            committed_rows(&history, &sender, 0xE4).len(),
+            1,
+            "no new row"
+        );
+        assert_eq!(counter(&harness, receipts_withheld), 0);
+        assert_eq!(
+            counter(&harness, dms_suppressed),
+            0,
+            "no commit was attempted"
+        );
+    }
+
+    /// Validation "Receipts": a typed durable route keeps its own receipt
+    /// contract under the policy. Its durable effect lives in its own store.
+    #[tokio::test]
+    async fn adr0116_c_typed_durable_route_keeps_its_own_receipt() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE5; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history_with(&mut harness, DmRecording::Ephemeral);
+        let (tx, mut rx) = mpsc::channel::<DmTypedPayload>(8);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            durable_completion: true,
+            prefix: b"X0X-KV-DELTA-V1\n".to_vec(),
+            sender: tx,
+            validator: None,
+        }];
+        let handler = tokio::spawn(async move {
+            if let Some(typed) = rx.recv().await {
+                if let Some(done) = typed.completion {
+                    let _ = done.send(Ok(DmTypedPayloadCompletion::Inserted));
+                }
+            }
+        });
+        let mut payload = b"X0X-KV-DELTA-V1\n".to_vec();
+        payload.extend_from_slice(b"{\"k\":1}");
+        let envelope = signed_durable_envelope(&harness, &sender, machine, 0xE5, &payload);
+        let decision = deliver_durable(&harness, envelope, &payload, machine, &sender).await;
+        handler.abort();
+        assert_eq!(
+            decision,
+            DurableAckDecision::Acked {
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                accepted: true,
+            }
+        );
+        assert_eq!(counter(&harness, receipts_withheld), 0);
+    }
+
+    /// Validation "Ephemeral paths": a non-durable (v1) DM is still
+    /// delivered live and completes under v1, but nothing reaches history:
+    /// no row, no FTS document and no projection after a restart.
+    #[tokio::test]
+    async fn adr0116_c_v1_dm_is_delivered_live_without_a_history_row() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE6; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let service = attach_history_with(&mut harness, DmRecording::Ephemeral);
+        let message = payload_message(&harness, &sender, machine, 0xE6);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("v1 delivery timeout")
+            .expect("v1 delivery stream closed");
+        assert_eq!(delivered.sender, sender.agent_id());
+        assert!(harness
+            .pipeline
+            .cache
+            .lookup(&crate::dm::DedupeKey::new(
+                *sender.agent_id().as_bytes(),
+                [0xE6; 16]
+            ))
+            .is_some_and(|cached| cached.protocol_version == DM_PROTOCOL_V1));
+        let suppressed = counter(&harness, dms_suppressed);
+        let _service = restart_inbox(&mut harness, service, DmRecording::Ephemeral).await;
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert_eq!(history.store().table_counts_for_tests(), (0, 0, 0));
+        assert_eq!(suppressed, 1, "the suppressed DM is counted");
+    }
+
+    /// ADR 0116 §3: the ADR 0030 capability advert is unchanged. A node with
+    /// history enabled advertises durable-ACK v2 even while its policy
+    /// suppresses generic durable commits, so a strict v2 sender sees a
+    /// timeout, not the 409 `recipient_ack_semantics_unavailable` refusal.
+    #[tokio::test]
+    async fn adr0116_c_v2_advert_is_unchanged_under_dm_ephemeral() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = crate::Agent::builder()
+            .with_machine_key(dir.path().join("machine"))
+            .with_agent_key_path(dir.path().join("agent"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: vec![],
+                port_mapping_enabled: false,
+                mdns_enabled: false,
+                ..Default::default()
+            })
+            .with_history(crate::history::HistoryConfig {
+                enabled: true,
+                db_path: Some(dir.path().join("history.db")),
+                dm_recording: DmRecording::Ephemeral,
+                ..crate::history::HistoryConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent with an ephemeral DM policy");
+        agent
+            .start_dm_inbox(
+                Arc::new(AgentKemKeypair::generate().expect("kem")),
+                DmInboxConfig::default(),
+            )
+            .await
+            .expect("inbox");
+        let caps = agent.current_dm_capabilities();
+        agent.shutdown().await;
+        assert!(caps.gossip_inbox);
+        assert_eq!(caps.max_protocol_version, DM_PROTOCOL_DURABLE_ACK);
     }
 }

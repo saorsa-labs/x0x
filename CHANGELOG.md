@@ -12,10 +12,8 @@ All notable changes to this project will be documented in this file.
   start (even with `enabled = false`), on a rule ADR 0116 §1 rejects: a
   duplicate class or prefix, an unknown key or value, a class entry with no
   bound, an empty or over-long prefix, more than 256 rules, or an
-  overflowing bound. It also refuses the `ephemeral` recording modes
-  (`dm_recording = "ephemeral"`, `recording = "ephemeral"`), which this
-  release does not enforce yet. With the keys unset nothing changes, and a
-  serialized default `HistoryConfig` is byte-identical.
+  overflowing bound. With the keys unset nothing changes, and a serialized
+  default `HistoryConfig` is byte-identical.
 - **History retention by class and topic (ADR 0116 slice B, #1264).** The
   reaper enforces `[[history.class_limits]]` and the `max_bytes` /
   `max_age_days` of `[[history.topic_rules]]`, in the ADR's order: ages, pin
@@ -32,6 +30,20 @@ All notable changes to this project will be documented in this file.
   runs exactly as before. Topic limits need a UTF-8 history database (every
   database x0x creates is). On an existing UTF-16 database, history refuses
   to open with them, and the reaper never applies them there.
+- **Ephemeral DMs and topics (ADR 0116 slice C, #1264).** `dm_recording =
+  "ephemeral"` keeps every ordinary inbound and outbound DM out of this
+  node's history, and a topic rule with `recording = "ephemeral"` keeps its
+  topics out. Nothing is written for them (no row, FTS entry or canonical
+  projection); live delivery is unchanged, and group history is never
+  dropped. Under the DM policy a generic durable (v2) DM's ACK is withheld
+  before dispatch, with no refusal sent and the v2 advert unchanged, so a
+  strict durable sender times out instead of getting a 409. A DM committed
+  before the policy was set is still answered from its row. New bounded
+  counters `HistoryCounters::policy_suppressed_dm_total`,
+  `policy_suppressed_topic_total` and
+  `policy_durable_receipt_withheld_total` record this locally. A new
+  `HistoryError::PolicySuppressed` is returned by `record_committed` for a
+  suppressed record.
 
 ### Changed
 
