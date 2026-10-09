@@ -457,6 +457,18 @@ pub struct Store {
     /// Set while a trim is parked by `test_pause_trim`.
     #[cfg(test)]
     test_trim_parked: AtomicBool,
+    /// ADR 0116 slice D r2 test hook: when armed, the label of every trim
+    /// and reclamation statement, in the order they start.
+    #[cfg(test)]
+    test_stmt_trace: Mutex<Option<Vec<&'static str>>>,
+    /// Slice D r2 test hook: when the statement with this label completes,
+    /// set this flag (a trim's cancel flag). One-shot.
+    #[cfg(test)]
+    test_cancel_after: Mutex<Option<(&'static str, std::sync::Arc<AtomicBool>)>>,
+    /// Slice D r2 test hook: when the `n`th statement with this label
+    /// completes, sleep this many milliseconds (it overran). One-shot.
+    #[cfg(test)]
+    test_slow_after: Mutex<Option<(&'static str, u32, u64)>>,
     /// ADR 0116 §4: the one bounded phase cursor of this store's trims, the
     /// unit the next trim starts at (`None`: the first). In memory only;
     /// touched only under the retention lock.
@@ -571,6 +583,12 @@ impl Store {
             test_pause_trim: AtomicBool::new(false),
             #[cfg(test)]
             test_trim_parked: AtomicBool::new(false),
+            #[cfg(test)]
+            test_stmt_trace: Mutex::new(None),
+            #[cfg(test)]
+            test_cancel_after: Mutex::new(None),
+            #[cfg(test)]
+            test_slow_after: Mutex::new(None),
             trim_cursor: Mutex::new(None),
             _after_close: after_close,
         })
@@ -1405,6 +1423,7 @@ impl Store {
                 // the next statement in budget.
                 return Ok(false);
             }
+            self.stmt_start("checkpoint");
             Self::checkpoint_wal(conn)?;
             if worked || vacuumed > 0 {
                 continue;
@@ -1430,6 +1449,7 @@ impl Store {
             if vacuum_skipped_after || std::time::Instant::now() >= deadline {
                 return Ok(false);
             }
+            self.stmt_start("checkpoint");
             Self::checkpoint_wal(conn)?;
             if flattened || vacuumed_after > 0 {
                 continue;
@@ -1468,14 +1488,17 @@ impl Store {
             // read this as a no-op observation (R4-A round 6).
             return Ok(true);
         }
+        self.stmt_start("fts_structure");
         let structure_before = Self::fts_structure(conn)?;
         if std::time::Instant::now() >= deadline {
             return Ok(true);
         }
+        self.stmt_start("fts_merge");
         conn.execute(
             "INSERT INTO history_fts(history_fts, rank) VALUES('merge', ?1)",
             rusqlite::params![rank],
         )?;
+        self.stmt_done("fts_merge");
         #[cfg(test)]
         {
             self.test_merge_slices.fetch_add(1, Ordering::Relaxed);
@@ -1487,6 +1510,7 @@ impl Store {
             // reclamation statements and must not start (R4-A).
             return Ok(true);
         }
+        self.stmt_start("checkpoint");
         Self::checkpoint_wal(conn)?;
         #[cfg(test)]
         self.observe_wal_for_tests();
@@ -1498,6 +1522,7 @@ impl Store {
         if std::time::Instant::now() >= deadline {
             return Ok(true);
         }
+        self.stmt_start("fts_structure");
         Ok(Self::fts_structure(conn)? != structure_before)
     }
 
@@ -1544,6 +1569,7 @@ impl Store {
         if std::time::Instant::now() >= deadline {
             return Ok((0, true));
         }
+        self.stmt_start("auto_vacuum_probe");
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
         if auto_vacuum != 2 {
             return Ok((0, false));
@@ -1553,15 +1579,18 @@ impl Store {
             if std::time::Instant::now() >= deadline {
                 return Ok((vacuumed, true));
             }
+            self.stmt_start("vacuum_page_count");
             let before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             // R4-A (round 7 review): the leading read may have used up the
             // budget; the vacuum step is a new reclamation write.
             if std::time::Instant::now() >= deadline {
                 return Ok((vacuumed, true));
             }
+            self.stmt_start("incremental_vacuum");
             conn.execute_batch(&format!(
                 "PRAGMA incremental_vacuum({VACUUM_PAGES_PER_SLICE});"
             ))?;
+            self.stmt_done("incremental_vacuum");
             #[cfg(test)]
             self.observe_wal_for_tests();
             // R4-A (round 7): the page-count read after a vacuum step and
@@ -1572,6 +1601,7 @@ impl Store {
             if std::time::Instant::now() >= deadline {
                 return Ok((vacuumed, true));
             }
+            self.stmt_start("vacuum_page_count");
             let after: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             if after >= before {
                 break;
@@ -1581,6 +1611,7 @@ impl Store {
                 if std::time::Instant::now() >= deadline {
                     return Ok((vacuumed, true));
                 }
+                self.stmt_start("checkpoint");
                 Self::checkpoint_wal(conn)?;
                 #[cfg(test)]
                 self.observe_wal_for_tests();
@@ -1974,10 +2005,12 @@ impl Store {
         // pass or trim does them.
         if run.deleted.total() > 0 && run.gate().is_ok() {
             run.statements += 1;
+            self.stmt_start("cleanup");
             cleanup_canonical_ids(&conn).map_err(|e| run.failed(e))?;
         }
         if run.gate().is_ok() {
             run.statements += 1;
+            self.stmt_start("checkpoint");
             Self::checkpoint_wal(&conn).map_err(|e| run.failed(e))?;
         }
         Ok(run.report(state, stop))
@@ -2218,7 +2251,7 @@ impl Store {
             let mut values = params.to_vec();
             values.push(rusqlite::types::Value::from(cutoff));
             values.push(sql_count(limit));
-            let n = self.trim_delete(conn, &delete, &values, run)?;
+            let n = self.trim_delete(conn, "age_delete", &delete, &values, run)?;
             run.add(bucket, n);
             if n < u64::try_from(limit).unwrap_or(u64::MAX) {
                 break;
@@ -2232,6 +2265,7 @@ impl Store {
         values.push(rusqlite::types::Value::from(cutoff));
         let held = self.trim_query(
             conn,
+            "age_protected_probe",
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM history WHERE {predicate} AND seen_at_ms < ?{})",
                 run.include
@@ -2260,7 +2294,13 @@ impl Store {
         let id = rusqlite::types::Value::from(scope.id().to_string());
         loop {
             trim_gate!(run.gate());
-            let used = self.trim_query(conn, SCOPE_BYTES_SQL, &[kind.clone(), id.clone()], run)?;
+            let used = self.trim_query(
+                conn,
+                "pin_measure",
+                SCOPE_BYTES_SQL,
+                &[kind.clone(), id.clone()],
+                run,
+            )?;
             let excess = u64::try_from(used).unwrap_or(0).saturating_sub(ceiling);
             if excess == 0 {
                 return Ok(UnitEnd::Done(Observation::None));
@@ -2268,6 +2308,7 @@ impl Store {
             let limit = trim_gate!(run.gate_delete());
             let n = self.trim_delete(
                 conn,
+                "pin_delete",
                 "DELETE FROM history WHERE id IN (\
                    SELECT id FROM (\
                      SELECT id, SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))) \
@@ -2318,7 +2359,9 @@ impl Store {
         );
         loop {
             trim_gate!(run.gate());
-            let used = u64::try_from(self.trim_query(conn, &measure, params, run)?).unwrap_or(0);
+            let used =
+                u64::try_from(self.trim_query(conn, "budget_measure", &measure, params, run)?)
+                    .unwrap_or(0);
             if used <= max_bytes {
                 return Ok(UnitEnd::Done(Observation::None));
             }
@@ -2326,7 +2369,7 @@ impl Store {
             let mut values = params.to_vec();
             values.push(sql_bytes(used - max_bytes));
             values.push(sql_count(limit));
-            let n = self.trim_delete(conn, &delete, &values, run)?;
+            let n = self.trim_delete(conn, "budget_delete", &delete, &values, run)?;
             run.add(bucket, n);
             if n == 0 {
                 // Unreachable while the measured rows are the candidates.
@@ -2350,7 +2393,13 @@ impl Store {
         let id = rusqlite::types::Value::from(scope.id().to_string());
         loop {
             trim_gate!(run.gate());
-            let used = self.trim_query(conn, SCOPE_BYTES_SQL, &[kind.clone(), id.clone()], run)?;
+            let used = self.trim_query(
+                conn,
+                "scope_measure",
+                SCOPE_BYTES_SQL,
+                &[kind.clone(), id.clone()],
+                run,
+            )?;
             if u64::try_from(used).unwrap_or(0) <= max_bytes {
                 return Ok(UnitEnd::Done(Observation::None));
             }
@@ -2360,6 +2409,7 @@ impl Store {
             let limit = trim_gate!(run.gate_delete());
             let n = self.trim_delete(
                 conn,
+                "scope_delete",
                 "DELETE FROM history WHERE id IN (\
                    SELECT id FROM history \
                    WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL \
@@ -2393,9 +2443,7 @@ impl Store {
                 return Ok(UnitEnd::Stop(stop));
             }
         }
-        trim_gate!(run.gate());
-        run.statements += 1;
-        let live = live_bytes_u64(conn)?;
+        let live = trim_gate!(self.trim_live_bytes(conn, run)?);
         if self.unsettled_passes.load(Ordering::Relaxed) as usize
             >= UNSETTLED_PASSES_BEFORE_FORCED_EVICT
             && live > policy.max_bytes
@@ -2428,9 +2476,7 @@ impl Store {
                 };
                 return Ok(UnitEnd::Stop(stop));
             }
-            trim_gate!(run.gate());
-            run.statements += 1;
-            let live = live_bytes_u64(conn)?;
+            let live = trim_gate!(self.trim_live_bytes(conn, run)?);
             if live <= policy.max_bytes {
                 return Ok(UnitEnd::Done(Observation::Settled));
             }
@@ -2440,7 +2486,13 @@ impl Store {
                 let sized = usize::try_from(excess / marginal.max(1)).unwrap_or(usize::MAX);
                 limit = limit.min(sized.saturating_add(1));
             }
-            let n = self.trim_delete(conn, &delete, &[sql_bytes(excess), sql_count(limit)], run)?;
+            let n = self.trim_delete(
+                conn,
+                "global_delete",
+                &delete,
+                &[sql_bytes(excess), sql_count(limit)],
+                run,
+            )?;
             run.add(TrimBucket::GlobalBudget, n);
             if n == 0 {
                 // Settled and over the cap with no eligible row: pinned or
@@ -2452,9 +2504,7 @@ impl Store {
             settled =
                 self.maintain_until_settled(conn, run.budget.deadline, Some(run.budget.cancel))?;
             if settled {
-                trim_gate!(run.gate());
-                run.statements += 1;
-                let after = live_bytes_u64(conn)?;
+                let after = trim_gate!(self.trim_live_bytes(conn, run)?);
                 learned_marginal = Some(live.saturating_sub(after) / n);
             }
         }
@@ -2473,9 +2523,14 @@ impl Store {
         if let Err(stop) = run.gate() {
             return Ok(Some(stop));
         }
-        let rows =
-            u64::try_from(self.trim_query(conn, "SELECT COUNT(*) FROM history", &[], run)?)
-                .unwrap_or(0);
+        let rows = u64::try_from(self.trim_query(
+            conn,
+            "forced_count",
+            "SELECT COUNT(*) FROM history",
+            &[],
+            run,
+        )?)
+        .unwrap_or(0);
         if rows == 0 {
             return Ok(None);
         }
@@ -2492,7 +2547,7 @@ impl Store {
                 Ok(limit) => limit.min(usize::try_from(remaining).unwrap_or(usize::MAX)),
                 Err(stop) => return Ok(Some(stop)),
             };
-            let n = self.trim_delete(conn, &delete, &[sql_count(limit)], run)?;
+            let n = self.trim_delete(conn, "forced_delete", &delete, &[sql_count(limit)], run)?;
             run.add(TrimBucket::GlobalBudget, n);
             if n == 0 {
                 return Ok(None);
@@ -2508,13 +2563,14 @@ impl Store {
             }
             if run.gate().is_ok() {
                 run.statements += 1;
+                self.stmt_start("checkpoint");
                 Self::checkpoint_wal(conn)?;
             }
-            if let Err(stop) = run.gate() {
-                return Ok(Some(stop));
-            }
-            run.statements += 1;
-            if live_bytes_u64(conn)? <= policy.max_bytes {
+            let live = match self.trim_live_bytes(conn, run)? {
+                Ok(live) => live,
+                Err(stop) => return Ok(Some(stop)),
+            };
+            if live <= policy.max_bytes {
                 return Ok(None);
             }
         }
@@ -2525,11 +2581,13 @@ impl Store {
     fn trim_delete(
         &self,
         conn: &Connection,
+        label: &'static str,
         sql: &str,
         params: &[rusqlite::types::Value],
         run: &mut TrimRun<'_>,
     ) -> HistoryResult<u64> {
         run.statements += 1;
+        self.stmt_start(label);
         #[cfg(test)]
         self.trim_delete_hooks_for_tests(conn)?;
         let n = conn.execute(sql, rusqlite::params_from_iter(params.iter()))? as u64;
@@ -2539,20 +2597,71 @@ impl Store {
                 batches.push(n);
             }
         }
+        self.stmt_done(label);
         Ok(n)
     }
 
     /// One trim measure statement returning an integer.
-    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn trim_query(
         &self,
         conn: &Connection,
+        label: &'static str,
         sql: &str,
         params: &[rusqlite::types::Value],
         run: &mut TrimRun<'_>,
     ) -> HistoryResult<i64> {
         run.statements += 1;
-        Ok(conn.query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?)
+        self.stmt_start(label);
+        let value = conn.query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+        self.stmt_done(label);
+        Ok(value)
+    }
+
+    /// The global budget's live measure inside a trim (`live_db_bytes`):
+    /// `page_count`, `freelist_count` and `page_size`, three statements.
+    fn trim_live_bytes(
+        &self,
+        conn: &Connection,
+        run: &mut TrimRun<'_>,
+    ) -> HistoryResult<Result<u64, RetainStop>> {
+        if let Err(stop) = run.gate() {
+            return Ok(Err(stop));
+        }
+        let page_count = self.trim_query(conn, "live_page_count", "PRAGMA page_count", &[], run)?;
+        let freelist = self.trim_query(
+            conn,
+            "live_freelist_count",
+            "PRAGMA freelist_count",
+            &[],
+            run,
+        )?;
+        let page_size = self.trim_query(conn, "live_page_size", "PRAGMA page_size", &[], run)?;
+        Ok(Ok(u64::try_from(
+            page_count
+                .saturating_sub(freelist)
+                .saturating_mul(page_size),
+        )
+        .unwrap_or(0)))
+    }
+
+    /// Test builds: a trim or reclamation statement with this label is
+    /// about to start. A no-op in production.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn stmt_start(&self, _label: &'static str) {
+        #[cfg(test)]
+        if let Ok(mut trace) = self.test_stmt_trace.lock() {
+            if let Some(trace) = trace.as_mut() {
+                trace.push(_label);
+            }
+        }
+    }
+
+    /// Test builds: the statement with this label has completed (runs the
+    /// one-shot statement hooks). A no-op in production.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn stmt_done(&self, _label: &'static str) {
+        #[cfg(test)]
+        self.stmt_done_hooks_for_tests(_label);
     }
 }
 
@@ -2715,11 +2824,6 @@ fn sql_count(rows: usize) -> rusqlite::types::Value {
 /// A byte count bound into SQL.
 fn sql_bytes(bytes: u64) -> rusqlite::types::Value {
     rusqlite::types::Value::from(i64::try_from(bytes).unwrap_or(i64::MAX))
-}
-
-/// [`live_db_bytes`] as an unsigned count.
-fn live_bytes_u64(conn: &Connection) -> HistoryResult<u64> {
-    Ok(u64::try_from(live_db_bytes(conn)?).unwrap_or(0))
 }
 
 /// Effective query limit: default 100, clamped to [`MAX_QUERY_LIMIT`].
@@ -8939,6 +9043,254 @@ mod tests {
         );
     }
 
+    // ── ADR 0116 slice D round 2 (Codex review) ─────────────────────────
+
+    /// Codex D r1 P2-1: the trim's live-size measure is three statements
+    /// (`page_count`, `freelist_count`, `page_size`), and the time budget is
+    /// checked before EACH. A budget spent by one of them starts neither of
+    /// the others, wherever the trim measures: the first measure, the
+    /// settled remeasure and the forced path's remeasure.
+    #[test]
+    fn adr0116_d_r2_no_live_size_pragma_starts_after_the_budget() {
+        let none = HistoryPolicy::default();
+        let uncapped = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        // (a) The first measure, overrun by `page_count`, then by
+        //     `freelist_count`.
+        for (slow, expected) in [
+            ("live_page_count", vec!["live_page_count"]),
+            (
+                "live_freelist_count",
+                vec!["live_page_count", "live_freelist_count"],
+            ),
+        ] {
+            let (store, _dir) = open();
+            store.trace_statements_for_tests();
+            store.slow_after_statement_for_tests(slow, 1, 300);
+            let cancel = AtomicBool::new(false);
+            let report = store
+                .trim(
+                    &uncapped,
+                    &none,
+                    &PinnedScopes::none(),
+                    &d_budget(65_536, 100, &cancel),
+                )
+                .unwrap();
+            assert_eq!(report.stopped_by, Some(RetainStop::TimeBudget), "{slow}");
+            assert_eq!(store.statement_trace_for_tests(), expected, "{slow}");
+        }
+        let live_measures = |trace: &[&str]| {
+            trace
+                .iter()
+                .filter(|label| **label == "live_page_count")
+                .count()
+        };
+        // (b) The settled remeasure: the trim's second `page_count`.
+        {
+            let (store, _dir) = open();
+            store.trace_statements_for_tests();
+            store.slow_after_statement_for_tests("live_page_count", 2, 1_500);
+            let cancel = AtomicBool::new(false);
+            let report = store
+                .trim(
+                    &uncapped,
+                    &none,
+                    &PinnedScopes::none(),
+                    &d_budget(65_536, 1_000, &cancel),
+                )
+                .unwrap();
+            let trace = store.statement_trace_for_tests();
+            assert_eq!(
+                trace.last(),
+                Some(&"live_page_count"),
+                "(b) {report:?} {trace:?}"
+            );
+            assert_eq!(live_measures(&trace), 2, "(b) {trace:?}");
+            assert_ne!(report.state, RetainState::Complete, "(b) {report:?}");
+        }
+        // (c) The forced path's remeasure, after its first batch.
+        {
+            let (store, _dir) = open();
+            seed_tiny_rows(
+                &store,
+                &Scope::Topic("bulk".into()),
+                2_000,
+                200,
+                203,
+                now_ms() - 60_000,
+            );
+            let policy = RetentionPolicy {
+                max_bytes: store.live_bytes().unwrap() / 2,
+                max_age_days: 0,
+                scope_limits: Vec::new(),
+            };
+            store.force_unsettled_passes_for_tests();
+            for _ in 0..3 {
+                store.retain(&policy).unwrap();
+            }
+            store.trace_statements_for_tests();
+            store.slow_after_statement_for_tests("live_page_count", 2, 1_500);
+            let cancel = AtomicBool::new(false);
+            let report = store
+                .trim(
+                    &policy,
+                    &none,
+                    &PinnedScopes::none(),
+                    &d_budget(65_536, 1_000, &cancel),
+                )
+                .unwrap();
+            let trace = store.statement_trace_for_tests();
+            assert_eq!(report.deleted_by_phase.global_budget, 256, "(c) {report:?}");
+            assert_eq!(
+                report.stopped_by,
+                Some(RetainStop::TimeBudget),
+                "(c) {report:?}"
+            );
+            assert_eq!(trace.last(), Some(&"live_page_count"), "(c) {trace:?}");
+            assert_eq!(live_measures(&trace), 2, "(c) {trace:?}");
+        }
+    }
+
+    /// Codex D r1 P2-2: cancellation reaches the reclamation statements. A
+    /// caller that cancels while a merge statement or a vacuum step runs
+    /// starts no further statement: the trim stops at that boundary.
+    #[test]
+    fn adr0116_d_r2_cancel_during_reclamation_starts_no_further_statement() {
+        let none = HistoryPolicy::default();
+        let uncapped = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        for point in ["fts_merge", "incremental_vacuum"] {
+            let (store, _dir) = open();
+            let now = now_ms();
+            b_insert(
+                &store,
+                (0..50_i64)
+                    .map(|i| b_row(&format!("t{i}"), b_topic("t"), 64, now - 1_000 + i, None))
+                    .collect(),
+            );
+            store.trace_statements_for_tests();
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            store.cancel_after_statement_for_tests(point, std::sync::Arc::clone(&cancel));
+            let report = store
+                .trim(
+                    &uncapped,
+                    &none,
+                    &PinnedScopes::none(),
+                    &d_budget(65_536, 10_000, &cancel),
+                )
+                .unwrap();
+            let trace = store.statement_trace_for_tests();
+            assert!(trace.contains(&point), "{point} ran: {trace:?}");
+            assert_eq!(report.stopped_by, Some(RetainStop::Cancelled), "{point}");
+            assert_eq!(
+                trace.last(),
+                Some(&point),
+                "nothing starts after {point}: {trace:?}"
+            );
+        }
+    }
+
+    /// Codex D r1 P2-4: `blocked_by_protected_rows` needs protected history.
+    /// A store with no history, or one drained of every eligible row, still
+    /// over a cap below its minimum footprint has no policy work left:
+    /// `complete`, which promises no file shrinkage. Control: one
+    /// Replaceable row keeps the same cap `blocked`.
+    #[test]
+    fn adr0116_d_r2_an_empty_or_drained_store_over_a_low_cap_is_complete() {
+        let none = HistoryPolicy::default();
+        let cap0 = RetentionPolicy {
+            max_bytes: 0,
+            max_age_days: 0,
+            scope_limits: Vec::new(),
+        };
+        {
+            let (store, _dir) = open();
+            let report = d_trim(&store, &cap0, &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(
+                report.state,
+                RetainState::Complete,
+                "empty store: {report:?}"
+            );
+            assert_eq!((report.deleted, report.stopped_by), (0, None));
+        }
+        {
+            let (store, _dir) = open();
+            seed_tiny_rows(
+                &store,
+                &Scope::Topic("t".into()),
+                300,
+                64,
+                204,
+                now_ms() - 60_000,
+            );
+            let report = d_trim(&store, &cap0, &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(report.deleted_by_phase.global_budget, 300, "{report:?}");
+            assert_eq!(
+                report.state,
+                RetainState::Complete,
+                "drained store: {report:?}"
+            );
+            assert_eq!(d_rows(&store), 0);
+        }
+        {
+            let (store, _dir) = open();
+            b_insert(
+                &store,
+                vec![b_row("card", b_dm(), 64, now_ms(), Some("agent-card:only"))],
+            );
+            let report = d_trim(&store, &cap0, &none, &PinnedScopes::none(), 65_536).unwrap();
+            assert_eq!(
+                report.state,
+                RetainState::BlockedByProtectedRows,
+                "an exempt row: {report:?}"
+            );
+            assert_eq!(d_rows(&store), 1);
+        }
+    }
+
+    /// A real slow SQLite statement (after Codex's probe in the D r1
+    /// review): a TEMP trigger hexes a 400 KB random blob for every deleted
+    /// row. Against a 50 ms budget the one DELETE in flight completes and is
+    /// the only overrun: no statement starts after it.
+    #[test]
+    fn adr0116_d_r2_a_real_slow_sqlite_statement_is_the_only_overrun() {
+        let (store, _dir) = open();
+        seed_tiny_rows(&store, &Scope::Topic("old".into()), 600, 16, 205, 1);
+        lock_conn(&store.conn)
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER x0x_slow_delete BEFORE DELETE ON history \
+                 BEGIN SELECT length(hex(randomblob(400000))); END;",
+            )
+            .unwrap();
+        store.trace_statements_for_tests();
+        let cancel = AtomicBool::new(false);
+        let none = HistoryPolicy::default();
+        let report = store
+            .trim(
+                &d_age(1),
+                &none,
+                &PinnedScopes::none(),
+                &d_budget(65_536, 50, &cancel),
+            )
+            .unwrap();
+        assert_eq!(
+            report.stopped_by,
+            Some(RetainStop::TimeBudget),
+            "{report:?}"
+        );
+        assert_eq!(report.deleted, 256);
+        assert_eq!(store.statement_trace_for_tests(), vec!["age_delete"]);
+        assert!(report.elapsed_ms > 50, "the statement overran: {report:?}");
+        assert_eq!(d_rows(&store), 344);
+    }
+
     /// A trim applies the same policy as the reaper: on a mixed fixture an
     /// unbounded trim leaves exactly the rows a reaper pass leaves.
     #[test]
@@ -9261,6 +9613,83 @@ impl Store {
             n => self.test_trim_fail_after.store(n - 1, Ordering::Relaxed),
         }
         Ok(())
+    }
+
+    /// ADR 0116 slice D r2: the one-shot hooks of a completed statement.
+    fn stmt_done_hooks_for_tests(&self, label: &'static str) {
+        let slow = {
+            let mut slot = self
+                .test_slow_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_mut() {
+                Some((at, nth, _)) if *at == label && *nth > 1 => {
+                    *nth -= 1;
+                    None
+                }
+                Some((at, _, ms)) if *at == label => {
+                    let ms = *ms;
+                    *slot = None;
+                    Some(ms)
+                }
+                _ => None,
+            }
+        };
+        if let Some(ms) = slow {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        let cancel = {
+            let mut slot = self
+                .test_cancel_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_ref() {
+                Some((at, _)) if *at == label => slot.take().map(|(_, flag)| flag),
+                _ => None,
+            }
+        };
+        if let Some(flag) = cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// ADR 0116 slice D r2: record the label of every statement from now on.
+    pub(crate) fn trace_statements_for_tests(&self) {
+        *self
+            .test_stmt_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+    }
+
+    /// ADR 0116 slice D r2: the statements recorded so far, in start order.
+    pub(crate) fn statement_trace_for_tests(&self) -> Vec<&'static str> {
+        self.test_stmt_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// ADR 0116 slice D r2: the `nth` statement labelled `label` takes `ms`
+    /// extra milliseconds after it completes (it overran).
+    pub(crate) fn slow_after_statement_for_tests(&self, label: &'static str, nth: u32, ms: u64) {
+        *self
+            .test_slow_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((label, nth.max(1), ms));
+    }
+
+    /// ADR 0116 slice D r2: when the statement labelled `label` completes,
+    /// set `flag`.
+    pub(crate) fn cancel_after_statement_for_tests(
+        &self,
+        label: &'static str,
+        flag: std::sync::Arc<AtomicBool>,
+    ) {
+        *self
+            .test_cancel_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((label, flag));
     }
 
     /// ADR 0116 slice D: is the retention admission free right now? Takes

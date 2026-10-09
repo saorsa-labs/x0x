@@ -1475,4 +1475,87 @@ mod tests {
         );
         service.shutdown().await;
     }
+
+    /// Codex D r1 P2-3: a caller that leaves must not lose the ADR 0068
+    /// counter. The pin-ceiling rows a trim committed are counted in
+    /// `quarantine_pinned_evictions` by the blocking operation itself,
+    /// whether the caller left during a pin batch or after one committed.
+    #[tokio::test]
+    async fn adr0116_d_r2_a_dropped_trim_still_counts_its_committed_pin_rows() {
+        for during_the_batch in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let service = c_start(
+                dir.path(),
+                HistoryConfig {
+                    max_bytes: 64_000,
+                    ..HistoryConfig::default()
+                },
+            );
+            let handle = service.handle();
+            let store = Arc::clone(handle.store());
+            let pins = Arc::new(DPins(std::sync::Mutex::new(vec!["group:pin".into()])));
+            assert!(handle.install_quarantine_pins(pins as Arc<dyn QuarantinePins>));
+            // 300 rows of 100 bytes against a 4 000-byte pin ceiling: 260
+            // rows over it, a 256-row batch then a 4-row one.
+            let rows: Vec<HistoryRecord> = (0..300)
+                .map(|i| {
+                    c_row(
+                        Scope::Group("pin".into()),
+                        &format!("{i:0>100}"),
+                        Direction::Inbound,
+                        Provenance::LocalAppDecrypt,
+                        None,
+                    )
+                })
+                .collect();
+            store.insert_batch(&rows).unwrap();
+            if during_the_batch {
+                store.slow_next_trim_delete_for_tests(300);
+            } else {
+                store.slow_after_statement_for_tests("pin_delete", 1, 300);
+            }
+            let dropped = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                handle.retain(RetainOptions {
+                    max_rows: 65_536,
+                    budget_ms: 10_000,
+                }),
+            )
+            .await;
+            assert!(dropped.is_err(), "the caller left mid-trim");
+            let counters = handle.counters();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while counters
+                .quarantine_pinned_evictions
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < 256
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                counters
+                    .quarantine_pinned_evictions
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                256,
+                "during the batch = {during_the_batch}"
+            );
+            let probe = Arc::clone(&store);
+            let left = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !probe.retention_admission_free_for_tests() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the trim never stopped"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                probe.table_counts_for_tests().0
+            })
+            .await
+            .unwrap();
+            assert_eq!(left, 44, "one batch committed, the next never started");
+            service.shutdown().await;
+        }
+    }
 }
