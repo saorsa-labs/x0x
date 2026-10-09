@@ -9,7 +9,7 @@
 //! shared-data-dir posture).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -304,6 +304,28 @@ pub struct RetainOutcome {
     pub pinned_scopes: u64,
 }
 
+/// Issue #1286: the one warning a store emits when a pass skips an
+/// unparseable `scope_limits` entry. Built inside the pass and emitted by
+/// [`Store::retain_with_pins`] after the pass has released its locks.
+struct SkippedScopeLimitsWarning {
+    /// Entries the pass skipped.
+    skipped: usize,
+    /// At most 16 of them, as written in the config.
+    shown: Vec<String>,
+}
+
+impl SkippedScopeLimitsWarning {
+    fn emit(self) {
+        tracing::warn!(
+            skipped = self.skipped,
+            scopes = ?self.shown,
+            "[history] skipping [[history.scope_limits]] entries whose scope does not parse \
+             (expected dm:<agent>, group:<id> or topic:<name>); the other limits and the \
+             whole-database budget still apply (#1286). Logged once per store."
+        );
+    }
+}
+
 /// Synchronous SQLite-backed history store.
 pub struct Store {
     /// Dropped first: in test builds it runs an optional hook while the
@@ -325,6 +347,18 @@ pub struct Store {
     /// certificate), read by the forced-eviction escape hatch in
     /// [`Store::enforce_global_budget`].
     unsettled_passes: AtomicU32,
+    /// Issue #1286: how many `scope_limits` entries the most recent pass
+    /// skipped because their scope string does not parse. A gauge,
+    /// overwritten by each pass. The reaper passes the same policy every
+    /// time, so for the daemon a non-zero value means "this many configured
+    /// limits are not in force". A direct [`Store::retain`] caller may pass a
+    /// different policy each time; the gauge always describes the latest
+    /// pass. Read through [`Store::skipped_scope_limits`].
+    skipped_scope_limits: AtomicU64,
+    /// Issue #1286: the skip is logged once per store, not once per pass.
+    /// Claimed inside a pass (passes are serialised); the warning itself is
+    /// emitted after the pass has released its locks.
+    skipped_scope_limits_logged: AtomicBool,
     /// Round-4 test hook: [`Store::maintain_until_settled`] reports
     /// "budget ran out before the index settled" without running
     /// statements, making the forced-eviction path deterministically
@@ -425,6 +459,8 @@ impl Store {
             conn: Mutex::new(conn),
             retention: Mutex::new(()),
             unsettled_passes: AtomicU32::new(0),
+            skipped_scope_limits: AtomicU64::new(0),
+            skipped_scope_limits_logged: AtomicBool::new(false),
             #[cfg(test)]
             test_never_settles: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -786,6 +822,33 @@ impl Store {
         policy: &RetentionPolicy,
         pinned: &PinnedScopes,
     ) -> HistoryResult<RetainOutcome> {
+        // Issue #1286 round 2: a skip warning claimed during the pass is
+        // emitted here, after `retain_pass` has returned and so released
+        // both the retention mutex and the connection. Tracing calls
+        // subscribers synchronously. Emitting under either lock would let a
+        // subscriber that reads this store deadlock, and let a blocked log
+        // sink stall every reader, writer and reaper. The pass's own lock
+        // coverage is unchanged: one held connection from phase 1 through
+        // the cleanup.
+        let mut skip_warning = None;
+        let result = self.retain_pass(policy, pinned, &mut skip_warning);
+        if let Some(warning) = skip_warning {
+            warning.emit();
+        }
+        result
+    }
+
+    /// The body of [`Store::retain_with_pins`]: one whole pass under the
+    /// retention mutex and one held connection (C-1264-1), both released
+    /// when this returns. A #1286 skip warning the pass claims is handed
+    /// back through `skip_warning`, also when a later phase fails, for the
+    /// caller to emit outside the locks.
+    fn retain_pass(
+        &self,
+        policy: &RetentionPolicy,
+        pinned: &PinnedScopes,
+        skip_warning: &mut Option<SkippedScopeLimitsWarning>,
+    ) -> HistoryResult<RetainOutcome> {
         let mut outcome = RetainOutcome {
             pinned_scopes: pinned.len() as u64,
             ..RetainOutcome::default()
@@ -877,13 +940,25 @@ impl Store {
         //    deadline-gated — every configured scope is served in every
         //    pass (main's loop order, main's cost), which is what removes
         //    the round-5/6 starvation class outright.
+        //
+        //    Issue #1286: an entry whose scope string does not parse is
+        //    skipped, counted and logged once per store, and the pass goes
+        //    on. A `?` here used to end the pass at the bad entry, so the
+        //    limits after it, phase 4 and the cleanup never ran, and one
+        //    typo in the config removed the whole-database cap. `open`
+        //    still accepts such a config, as before.
+        let mut skipped: Vec<&str> = Vec::new();
         for limit in &policy.scope_limits {
-            let scope = Scope::parse(&limit.scope)?;
+            let Ok(scope) = Scope::parse(&limit.scope) else {
+                skipped.push(&limit.scope);
+                continue;
+            };
             if pinned.contains(&scope) {
                 continue;
             }
             outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
         }
+        *skip_warning = self.record_skipped_scope_limits(&skipped);
 
         // 4. Whole-database byte budget (issue #1264 part 1).
         self.enforce_global_budget(&guard, policy, &exclude, deadline, &mut outcome)?;
@@ -1433,6 +1508,47 @@ impl Store {
         .optional()
         .map_err(|e| HistoryError::Database(format!("fts structure read failed: {e}")))
         .map(|row| row.unwrap_or_default())
+    }
+
+    /// Issue #1286: how many `scope_limits` entries the most recent
+    /// retention pass skipped because their scope string does not parse
+    /// (it must be `dm:<agent>`, `group:<id>` or `topic:<name>`). Zero means
+    /// every configured limit was in force in that pass.
+    #[must_use]
+    pub fn skipped_scope_limits(&self) -> u64 {
+        self.skipped_scope_limits.load(Ordering::Relaxed)
+    }
+
+    /// Record phase 3's skipped `scope_limits` entries: overwrite the gauge,
+    /// and claim this store's one warning the first time any pass skips an
+    /// entry. It runs inside the pass, where passes are serialised, so the
+    /// claim is made once. It emits nothing: the caller emits the returned
+    /// warning after the pass has released its locks.
+    ///
+    /// One warning per store: the reaper passes the same policy every time,
+    /// so a second warning would repeat the first. A direct `retain` caller
+    /// that later passes a different bad entry gets no second warning, but
+    /// the gauge still reports every pass.
+    fn record_skipped_scope_limits(&self, skipped: &[&str]) -> Option<SkippedScopeLimitsWarning> {
+        self.skipped_scope_limits
+            .store(skipped.len() as u64, Ordering::Relaxed);
+        if skipped.is_empty()
+            || self
+                .skipped_scope_limits_logged
+                .swap(true, Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(SkippedScopeLimitsWarning {
+            skipped: skipped.len(),
+            // Operator-supplied strings from the config; keep a bounded
+            // number of them.
+            shown: skipped
+                .iter()
+                .take(16)
+                .map(|scope| (*scope).to_owned())
+                .collect(),
+        })
     }
 
     /// ADR-0068 D1: the byte ceiling for one pinned scope.
@@ -5169,6 +5285,335 @@ mod tests {
             wal_frames(&store),
             0,
             "an in-budget pass still truncates the WAL"
+        );
+    }
+
+    /// Issue #1286: one unparseable `scope_limits` entry must not stop the
+    /// retention pass. On main `a36fc49`, phase 3 ran `Scope::parse(..)?`
+    /// and returned `Err` at the bad entry, in every pass. The valid limit
+    /// after it, the whole-database byte budget (phase 4) and the
+    /// end-of-pass canonical-id cleanup therefore never ran, and
+    /// `history.db` grew without bound.
+    ///
+    /// Fixture: an over-cap store. The bad entry is listed FIRST, so every
+    /// later step sits behind it. The oldest rows are a filler scope, which
+    /// only the global budget evicts. A newer limited scope sits over its
+    /// own valid limit. An orphaned canonical-id row, planted after the
+    /// fixture settles (the delete trigger never sees it), is removed only
+    /// by the end-of-pass cleanup.
+    #[test]
+    fn unparseable_scope_limit_does_not_stop_the_retention_pass() {
+        let (store, _dir) = open();
+        let filler = Scope::Dm("cd".repeat(32));
+        let limited = Scope::Dm("ab".repeat(32));
+        seed_tiny_rows(&store, &filler, 3_000, 200, 0x1286_0001, 1_000);
+        seed_tiny_rows(&store, &limited, 600, 64, 0x1286_0002, 100_000);
+        settle(&store);
+        {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .execute(
+                    "INSERT INTO history_canonical_ids \
+                     (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+                     VALUES (?1, ?2, 1, 'orphan-1286')",
+                    rusqlite::params![&[0x12_u8; 32][..], &[0x86_u8; 32][..]],
+                )
+                .unwrap();
+        }
+
+        let limit = 30_000_u64;
+        assert!(
+            scope_payload_bytes(&store, &limited) > limit,
+            "precondition: the limited scope starts over its limit"
+        );
+        let filler_before = scope_row_count(&store, &filler);
+        let live = store.live_bytes().unwrap();
+        // A quarter of the live store must go: far more than the limited
+        // scope can free, so only phase 4 can meet this cap.
+        let cap = live - live / 4;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "not-a-scope".into(),
+                    max_bytes: 0,
+                },
+                ScopeLimit {
+                    scope: limited.canonical(),
+                    max_bytes: limit,
+                },
+            ],
+        };
+
+        let mut met = false;
+        for pass in 0..16 {
+            let result = store.retain(&policy);
+            assert!(
+                result.is_ok(),
+                "pass {pass} failed on an unparseable scope_limits entry (#1286): {result:?}"
+            );
+            if store.live_bytes().unwrap() <= cap {
+                met = true;
+                break;
+            }
+        }
+        assert!(
+            met,
+            "the whole-database budget behind the bad entry must be enforced"
+        );
+        assert!(
+            scope_row_count(&store, &filler) < filler_before,
+            "phase 4 evicted the oldest (filler) rows"
+        );
+        assert!(
+            scope_payload_bytes(&store, &limited) <= limit,
+            "the valid limit after the bad entry must apply"
+        );
+        assert!(
+            scope_row_count(&store, &limited) > 0,
+            "the limited scope is cut to its limit, not emptied"
+        );
+        let orphans: i64 = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row(
+                    "SELECT COUNT(*) FROM history_canonical_ids WHERE scope_id = 'orphan-1286'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(orphans, 0, "the end-of-pass canonical-id cleanup must run");
+        assert_eq!(store.skipped_scope_limits(), 1, "the bad entry is counted");
+    }
+
+    /// A `tracing` writer that keeps everything written to it, so a test can
+    /// assert on warnings.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Issue #1286: every pass counts the skipped entries, and the store
+    /// logs the skip once, not once per pass. A clean policy counts zero and
+    /// logs nothing.
+    #[test]
+    fn unparseable_scope_limits_are_counted_each_pass_and_logged_once() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        );
+        let (store, _dir) = open();
+        let scope = Scope::Dm("ef".repeat(32));
+        seed_tiny_rows(&store, &scope, 10, 64, 0x1286_0003, 1_000);
+        let valid = ScopeLimit {
+            scope: scope.canonical(),
+            max_bytes: u64::MAX,
+        };
+        let clean = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![valid.clone()],
+        };
+        store.retain(&clean).unwrap();
+        assert_eq!(
+            store.skipped_scope_limits(),
+            0,
+            "a clean policy skips nothing"
+        );
+        assert!(
+            !log.text().contains("#1286"),
+            "a clean policy logs nothing: {}",
+            log.text()
+        );
+
+        let bad = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "dm:".into(),
+                    max_bytes: 0,
+                },
+                valid,
+                ScopeLimit {
+                    scope: "chan:x".into(),
+                    max_bytes: 0,
+                },
+            ],
+        };
+        for pass in 0..3 {
+            store.retain(&bad).unwrap();
+            assert_eq!(
+                store.skipped_scope_limits(),
+                2,
+                "pass {pass} counts both bad entries"
+            );
+        }
+        assert_eq!(
+            scope_row_count(&store, &scope),
+            10,
+            "a skipped entry's max_bytes = 0 applies to no scope"
+        );
+        let text = log.text();
+        assert_eq!(
+            text.matches("#1286").count(),
+            1,
+            "logged once per store, not once per pass: {text}"
+        );
+        assert!(
+            text.contains("\"dm:\"") && text.contains("\"chan:x\""),
+            "the warning names the bad entries: {text}"
+        );
+
+        store.retain(&clean).unwrap();
+        assert_eq!(
+            store.skipped_scope_limits(),
+            0,
+            "the gauge follows the latest pass"
+        );
+    }
+
+    /// A `tracing` layer that, when the #1286 skip warning fires, checks
+    /// whether the store's two locks are free and then reads the store
+    /// through `stats()`, as a subscriber that inspects history would.
+    ///
+    /// It uses `try_lock`, not `lock`: a `std` mutex already held by this
+    /// thread would deadlock, and the RED arm must fail, not hang.
+    struct LockProbe {
+        store: std::sync::Arc<Store>,
+        /// One `(retention free, connection free, stats() succeeded)` per
+        /// warning.
+        seen: std::sync::Arc<Mutex<Vec<(bool, bool, bool)>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LockProbe {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() != tracing::Level::WARN || meta.target() != "x0x::history::store" {
+                return;
+            }
+            let retention_free = self.store.retention.try_lock().is_ok();
+            let conn_free = self.store.conn.try_lock().is_ok();
+            let stats_ok = retention_free && conn_free && self.store.stats().is_ok();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((retention_free, conn_free, stats_ok));
+        }
+    }
+
+    /// Issue #1286 round 2 (Codex P2): tracing calls the subscriber
+    /// synchronously, so the skip warning must be emitted after the pass has
+    /// released BOTH the retention mutex and the connection. Otherwise a
+    /// subscriber that reads the store deadlocks, and a blocked log sink
+    /// stalls readers, writers and the reaper, and the first bad entry can
+    /// still stop the cap.
+    #[test]
+    fn skip_warning_is_emitted_with_no_store_lock_held() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (store, _dir) = open();
+        let store = std::sync::Arc::new(store);
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(LockProbe {
+                store: std::sync::Arc::clone(&store),
+                seen: std::sync::Arc::clone(&seen),
+            }));
+        let bad = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![ScopeLimit {
+                scope: "not-a-scope".into(),
+                max_bytes: 0,
+            }],
+        };
+        store.retain(&bad).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the skip warning fires once: {seen:?}");
+        assert_eq!(
+            seen[0],
+            (true, true, true),
+            "when the warning is emitted: (retention lock free, connection lock free, \
+             stats() succeeded)"
+        );
+    }
+
+    /// Issue #1286 round 2: concurrent passes on one store claim the single
+    /// warning between them. Each thread has its own subscriber, and every
+    /// subscriber writes to one shared buffer.
+    #[test]
+    fn concurrent_passes_log_the_skip_once() {
+        let (store, _dir) = open();
+        let store = std::sync::Arc::new(store);
+        let log = CapturedLog::default();
+        let bad = RetentionPolicy {
+            max_bytes: u64::MAX,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "dm:".into(),
+                    max_bytes: 0,
+                },
+                ScopeLimit {
+                    scope: "chan:x".into(),
+                    max_bytes: 0,
+                },
+            ],
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let writer = log.clone();
+                let bad = bad.clone();
+                std::thread::spawn(move || {
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false)
+                        .with_max_level(tracing::Level::WARN)
+                        .finish();
+                    tracing::subscriber::with_default(subscriber, || {
+                        for _ in 0..4 {
+                            store.retain(&bad).unwrap();
+                            assert_eq!(store.skipped_scope_limits(), 2);
+                        }
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let text = log.text();
+        assert_eq!(
+            text.matches("#1286").count(),
+            1,
+            "32 concurrent passes, one warning: {text}"
         );
     }
 }
