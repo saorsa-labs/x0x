@@ -25530,12 +25530,16 @@ pub(in crate::server) async fn create_join_request(
 /// request handler before the 201 returns, and retried from the outbox by
 /// the requester-offer worker; no detached task ever owns that write. This
 /// fallback runs only after that write failed, so there is no obligation to
-/// keep: it is one direct send and persists nothing. It is therefore
-/// detached ([`AppState::spawn_detached`]) and the shutdown drain may abort
-/// it, which loses no more than the one-shot it already was (the request
-/// itself is in the persisted roster and on the metadata topic). Before
-/// this, a send that waited out an unavailable authority kept the Agent,
-/// and its `history.db` connection, alive after `shutdown_and_wait`.
+/// keep: it is one direct send. Its only local write is the outbound DM
+/// history row that `Agent::send_direct_with_history` enqueues
+/// synchronously once the send has succeeded; the history writer owns that
+/// transaction, so an abort cannot cut it. The task is therefore detached
+/// ([`AppState::spawn_detached`]) and the shutdown drain may abort it. An
+/// aborted offer is lost: no worker redelivers it, as before (the request
+/// itself is in the persisted roster and was published on the metadata
+/// topic, but neither guarantees this exact offer is retried). Before this,
+/// a send that waited out an unavailable authority kept the Agent, and its
+/// `history.db` connection, alive after `shutdown_and_wait`.
 fn spawn_predecessor_relay_fallback_offer(
     state: &AppState,
     group_id: &str,
@@ -36532,6 +36536,16 @@ const WELCOME_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 /// removal or ban that quiesces this recipient can never miss it. Every body
 /// re-checks eligibility under the group's membership lock before it hands
 /// bytes to the transport; receipt waits run outside that lock.
+///
+/// #1274: the shutdown check, the spawn and the registration happen under
+/// the egress registry lock, so they are atomic against the shutdown drain,
+/// which cancels `shutdown_started` before it reads the registry. An egress
+/// accepted before that is registered, so the drain waits for it and then
+/// aborts it; one asked for after it is refused before anything is spawned
+/// or cloned, and its body is dropped by this call (review r2, P2: a task
+/// spawned and then aborted would keep its captures, including this
+/// AppState, until the runtime ran the cancellation, possibly after the
+/// drain had already seen an idle registry).
 fn spawn_join_artifact_egress<F>(
     state: &Arc<AppState>,
     group_id: &str,
@@ -36542,9 +36556,28 @@ fn spawn_join_artifact_egress<F>(
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let mut registry = state
+        .join_artifact_egress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.shutdown_started.is_cancelled() {
+        drop(registry);
+        // Dropped here, outside the registry lock: nothing it captured
+        // outlives this call, and nothing is sent.
+        drop(body);
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            recipient = %LogHexId::agent(recipient),
+            kind,
+            "shutdown has begun; join-artifact egress not started"
+        );
+        return;
+    }
     let (registered, ready) = oneshot::channel::<()>();
     let cleanup_state = Arc::clone(state);
     let registry_key = (group_id.to_string(), recipient.to_string());
+    // Spawned under the registry lock. Until `ready` fires the task only
+    // waits, so it never contends for that lock.
     let handle = tokio::spawn(async move {
         if ready.await.is_ok() {
             // r5 (G9): the task leaves the registry itself when it ends —
@@ -36562,33 +36595,15 @@ fn spawn_join_artifact_egress<F>(
             let _ = tokio::time::timeout_at(deadline.into(), body).await;
         }
     });
-    {
-        let mut registry = state
-            .join_artifact_egress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // #1274: once the shutdown drain has started (it cancels this token
-        // before it reads the registry), no new egress registers: the task
-        // is aborted before its body can run, and nothing is sent.
-        if state.shutdown_started.is_cancelled() {
-            handle.abort();
-            tracing::debug!(
-                group_id = %LogHexId::group(group_id),
-                recipient = %LogHexId::agent(recipient),
-                kind,
-                "shutdown has begun; join-artifact egress not started"
-            );
-            return;
-        }
-        registry.retain(|_, tasks| {
-            tasks.retain(|task| !task.is_finished());
-            !tasks.is_empty()
-        });
-        registry
-            .entry((group_id.to_string(), recipient.to_string()))
-            .or_default()
-            .push(handle);
-    }
+    registry.retain(|_, tasks| {
+        tasks.retain(|task| !task.is_finished());
+        !tasks.is_empty()
+    });
+    registry
+        .entry((group_id.to_string(), recipient.to_string()))
+        .or_default()
+        .push(handle);
+    drop(registry);
     let _ = registered.send(());
 }
 

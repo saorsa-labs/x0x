@@ -2905,7 +2905,9 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // detached admission; the attempt registry is drained after it, so
     // `spawn_attempt_task_under_guard` (which checks admission under the
     // registry lock) either registered its task before this drain or spawns
-    // nothing. None of this work persists anything: the deliveries and
+    // nothing. None of this work owns a write that an abort could cut (a
+    // successful direct send at most enqueues its outbound DM history row,
+    // synchronously, for the history writer): the deliveries and
     // publishes are best-effort copies of what the metadata topic and the
     // join-result fetch carry (the public fan-out re-sends a message already
     // published and cached; the predecessor fallback runs only after its

@@ -969,11 +969,14 @@ pub(super) struct AppState {
     /// one-shot predecessor-relay offer used when the durable offer
     /// obligation could not be persisted, the member-keyed KeyPackage
     /// catch-up requests, the KV-store delta direct deliveries and the
-    /// outgoing file-chunk streams. None of them persists anything. `None`
-    /// closes admission during shutdown; the shutdown tail drains them with
-    /// the other server tasks (grace, then abort), so none of them keeps the
-    /// Agent and its exclusive `history.db` connection alive after
-    /// `shutdown_and_wait`.
+    /// outgoing file-chunk streams. None of them owns a write that an abort
+    /// could cut: the most a send leaves behind is the outbound DM history
+    /// row that `Agent::send_direct_with_history` enqueues synchronously
+    /// after a successful send, and the history writer owns that
+    /// transaction. `None` closes admission during shutdown; the shutdown
+    /// tail drains them with the other server tasks (grace, then abort), so
+    /// none of them keeps the Agent and its exclusive `history.db`
+    /// connection alive after `shutdown_and_wait`.
     pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// #1269 r2: admitted applies that persist group state (a pulled
     /// control blob's apply, the owner-certificate join retry) and, since
