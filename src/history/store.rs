@@ -5171,6 +5171,105 @@ mod tests {
             "an in-budget pass still truncates the WAL"
         );
     }
+
+    /// Issue #1286: one unparseable `scope_limits` entry must not stop the
+    /// retention pass. On main `a36fc49`, phase 3 ran `Scope::parse(..)?`
+    /// and returned `Err` at the bad entry, in every pass. The valid limit
+    /// after it, the whole-database byte budget (phase 4) and the
+    /// end-of-pass canonical-id cleanup therefore never ran, and
+    /// `history.db` grew without bound.
+    ///
+    /// Fixture: an over-cap store. The bad entry is listed FIRST, so every
+    /// later step sits behind it. The oldest rows are a filler scope, which
+    /// only the global budget evicts. A newer limited scope sits over its
+    /// own valid limit. An orphaned canonical-id row, planted after the
+    /// fixture settles (the delete trigger never sees it), is removed only
+    /// by the end-of-pass cleanup.
+    #[test]
+    fn unparseable_scope_limit_does_not_stop_the_retention_pass() {
+        let (store, _dir) = open();
+        let filler = Scope::Dm("cd".repeat(32));
+        let limited = Scope::Dm("ab".repeat(32));
+        seed_tiny_rows(&store, &filler, 3_000, 200, 0x1286_0001, 1_000);
+        seed_tiny_rows(&store, &limited, 600, 64, 0x1286_0002, 100_000);
+        settle(&store);
+        {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .execute(
+                    "INSERT INTO history_canonical_ids \
+                     (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+                     VALUES (?1, ?2, 1, 'orphan-1286')",
+                    rusqlite::params![&[0x12_u8; 32][..], &[0x86_u8; 32][..]],
+                )
+                .unwrap();
+        }
+
+        let limit = 30_000_u64;
+        assert!(
+            scope_payload_bytes(&store, &limited) > limit,
+            "precondition: the limited scope starts over its limit"
+        );
+        let filler_before = scope_row_count(&store, &filler);
+        let live = store.live_bytes().unwrap();
+        // A quarter of the live store must go: far more than the limited
+        // scope can free, so only phase 4 can meet this cap.
+        let cap = live - live / 4;
+        let policy = RetentionPolicy {
+            max_bytes: cap,
+            max_age_days: 0,
+            scope_limits: vec![
+                ScopeLimit {
+                    scope: "not-a-scope".into(),
+                    max_bytes: 0,
+                },
+                ScopeLimit {
+                    scope: limited.canonical(),
+                    max_bytes: limit,
+                },
+            ],
+        };
+
+        let mut met = false;
+        for pass in 0..16 {
+            let result = store.retain(&policy);
+            assert!(
+                result.is_ok(),
+                "pass {pass} failed on an unparseable scope_limits entry (#1286): {result:?}"
+            );
+            if store.live_bytes().unwrap() <= cap {
+                met = true;
+                break;
+            }
+        }
+        assert!(
+            met,
+            "the whole-database budget behind the bad entry must be enforced"
+        );
+        assert!(
+            scope_row_count(&store, &filler) < filler_before,
+            "phase 4 evicted the oldest (filler) rows"
+        );
+        assert!(
+            scope_payload_bytes(&store, &limited) <= limit,
+            "the valid limit after the bad entry must apply"
+        );
+        assert!(
+            scope_row_count(&store, &limited) > 0,
+            "the limited scope is cut to its limit, not emptied"
+        );
+        let orphans: i64 = {
+            let guard = lock_conn(&store.conn).unwrap();
+            guard
+                .query_row(
+                    "SELECT COUNT(*) FROM history_canonical_ids WHERE scope_id = 'orphan-1286'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(orphans, 0, "the end-of-pass canonical-id cleanup must run");
+    }
 }
 
 // W3-H S3 (#1164), the restart drain: a harness must know when a store's
