@@ -26,7 +26,7 @@ async fn state_with_unsaved_group() -> Result<(Arc<AppState>, tempfile::TempDir,
     Ok((state, dir, group_key))
 }
 
-async fn wait_reached(pause: &atomic_write_test_seam::WritePause) -> bool {
+pub(super) async fn wait_reached(pause: &atomic_write_test_seam::WritePause) -> bool {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !pause.reached() {
         if tokio::time::Instant::now() >= deadline {
@@ -38,7 +38,7 @@ async fn wait_reached(pause: &atomic_write_test_seam::WritePause) -> bool {
 }
 
 /// Temp files of an unfinished atomic write next to `path`.
-fn leftover_temp_files(path: &FsPath) -> Vec<String> {
+pub(super) fn leftover_temp_files(path: &FsPath) -> Vec<String> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
@@ -54,7 +54,7 @@ fn leftover_temp_files(path: &FsPath) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn persisted_has(path: &FsPath, group_key: &str) -> bool {
+pub(super) fn persisted_has(path: &FsPath, group_key: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|json| json.contains(group_key))
 }
 

@@ -14533,6 +14533,15 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     if tasks.contains_key(group_id) {
         return;
     }
+    // #1275: a shielded apply (see `AppState::run_shielded`) can still run
+    // after the shutdown drain has taken this registry. A listener it
+    // installed then would never be drained, and its shutdown watch would
+    // never fire (it subscribes after the stop), so it would keep the
+    // AppState alive past shutdown. The drain cancels `shutdown_started`
+    // before it takes the registry under this lock, so this check is exact.
+    if state.shutdown_started.is_cancelled() {
+        return;
+    }
 
     let metadata_topic = {
         let groups = state.named_groups.read().await;
@@ -14584,24 +14593,41 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         continue;
                     }
                     if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
-                        handle_group_cert_fetch_response(
-                            &state_for_task,
-                            rest,
-                            msg.verified,
-                            &task_group_id,
-                        )
-                        .await;
+                        // #1275: a response can hydrate a member seat, which
+                        // persists the roster, so it runs shielded like the
+                        // metadata apply below.
+                        let apply_state = Arc::clone(&state_for_task);
+                        let raw = rest.to_vec();
+                        let verified = msg.verified;
+                        let topic_group = task_group_id.clone();
+                        let handled = state_for_task
+                            .run_shielded(Box::pin(async move {
+                                handle_group_cert_fetch_response(
+                                    &apply_state,
+                                    &raw,
+                                    verified,
+                                    &topic_group,
+                                )
+                                .await
+                            }))
+                            .await;
+                        if handled.is_none() {
+                            break;
+                        }
                         continue;
                     }
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
-                    let apply_result = apply_named_group_metadata_event(
+                    let Some(apply_result) = apply_listener_metadata_event(
                         &state_for_task,
                         event,
                         sender,
                         msg.verified,
-                        msg.raw_envelope.as_deref(),
+                        msg.raw_envelope.as_deref().map(<[u8]>::to_vec),
                     )
-                    .await;
+                    .await
+                    else {
+                        break;
+                    };
                     if apply_result.should_exit {
                         let groups = state_for_task.named_groups.read().await;
                         let local_agent = hex::encode(state_for_task.agent.agent_id().as_bytes());
@@ -14629,6 +14655,81 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
             handle,
         },
     );
+}
+
+/// #1275: apply one metadata event that a server listener received, as a
+/// shielded apply ([`AppState::run_shielded`]). The apply persists roster and
+/// TreeKEM state. Run inline, it would end with its listener, which the
+/// shutdown drain aborts after its 2 s grace (and a group's removal aborts at
+/// once), possibly in the middle of an atomic write: a synced temp file is
+/// left behind and the disk lags memory. Shielded, an abort of the listener
+/// only ends this wait. An apply that has started runs to completion, and
+/// the drain waits for it before the Agent stops.
+///
+/// Order: the listener awaits each apply before it receives its next
+/// message, so it still applies its events one at a time, in arrival order,
+/// as it did inline. An aborted listener applies nothing further.
+///
+/// `None`: the apply did not run to completion, because shutdown refused it
+/// before it started, or because it panicked. The caller stops listening,
+/// as it would have died with a panicking inline apply.
+pub(in crate::server) async fn apply_listener_metadata_event(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    envelope_bytes: Option<Vec<u8>>,
+) -> Option<ApplyMetadataResult> {
+    let apply_state = Arc::clone(state);
+    // Boxed: the apply future is large; keep it off this caller's frame.
+    state
+        .run_shielded(Box::pin(async move {
+            apply_named_group_metadata_event(
+                &apply_state,
+                event,
+                sender,
+                verified,
+                envelope_bytes.as_deref(),
+            )
+            .await
+        }))
+        .await
+}
+
+/// The named-group metadata listener on the direct channel (spawned once by
+/// the server; `rx` is its direct-message subscription). It applies
+/// authority-authored commits that are direct-delivered (see
+/// `spawn_named_group_event_delivery`), through the same apply path as the
+/// per-group metadata topic listener, shielded (#1275).
+pub(in crate::server) async fn run_direct_metadata_listener(
+    state: Arc<AppState>,
+    mut rx: x0x::direct::DirectMessageReceiver,
+) {
+    loop {
+        let Some(msg) = rx.recv().await else { break };
+        let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
+            continue; // not a named-group metadata event
+        };
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "direct_classified_metadata_event",
+            sender = %hex::encode(msg.sender.as_bytes()),
+            len = msg.payload.len(),
+            verified = msg.verified,
+            event = named_group_metadata_event_kind(&event),
+        );
+        let applied = apply_listener_metadata_event(
+            &state,
+            event,
+            msg.sender,
+            msg.verified,
+            None, // direct DM path — no V2 envelope bytes available
+        )
+        .await;
+        if applied.is_none() {
+            break;
+        }
+    }
 }
 
 /// Spawn every gossip listener a member needs for a named group.
@@ -17494,11 +17595,14 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
             }
         }
     });
-    state
-        .public_message_tasks
-        .write()
-        .await
-        .insert(group_id, handle);
+    let mut tasks = state.public_message_tasks.write().await;
+    // #1275: as for the metadata listener, a listener spawned by a shielded
+    // apply after the shutdown drain took this registry is never drained.
+    if state.shutdown_started.is_cancelled() {
+        handle.abort();
+        return;
+    }
+    tasks.insert(group_id, handle);
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -37039,27 +37143,39 @@ const JOIN_RESULT_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
 /// provisionally validated (the sender is the member asked for, the group is
 /// known), admitted by [`FairAdmission`] (one in-flight handler per
 /// `(group, member)`, a per-group share, a global cap), and handled off the
-/// listener under a timeout. Every other message is handled inline as
-/// before.
+/// listener under a timeout. Every other message is handled in order on the
+/// listener, as a shielded apply (#1275). Returns `false` when the listener
+/// must stop: shutdown refused such an apply, or it panicked.
 pub(in crate::server) async fn dispatch_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
     verified: bool,
     msg: JoinResultMessage,
-) {
+) -> bool {
     let JoinResultMessage::FetchRequest {
         group_id,
         member_agent_id,
         ..
     } = &msg
     else {
-        handle_join_result_message(state, sender, verified, msg).await;
-        return;
+        // #1275: a result seats the joiner (roster and TreeKEM persistence)
+        // and a refusal finalizes its attempt under the persistence lock,
+        // so they run shielded: an abort of this listener cannot cut them
+        // off. The listener awaits each, so they still apply in order.
+        // `false` (shutdown refused it, or it panicked) stops the listener.
+        let apply_state = Arc::clone(state);
+        let sender = *sender;
+        return state
+            .run_shielded(Box::pin(async move {
+                handle_join_result_message(&apply_state, &sender, verified, msg).await;
+            }))
+            .await
+            .is_some();
     };
     let sender_hex = hex::encode(sender.as_bytes());
     if sender_hex != *member_agent_id {
         tracing::warn!(group_id = %LogHexId::group(group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(member_agent_id), "ignoring unauthorized join-result fetch");
-        return;
+        return true;
     }
     let stable_group = {
         let roster = state.named_groups.read().await;
@@ -37068,7 +37184,7 @@ pub(in crate::server) async fn dispatch_join_result_message(
     };
     let Some(stable_group) = stable_group else {
         tracing::debug!(group_id = %LogHexId::group(group_id), "join-result fetch for an unknown group; dropped");
-        return;
+        return true;
     };
     let ticket = match state.join_result_fetch_admission.try_admit(
         &join_result_key(&stable_group, member_agent_id),
@@ -37082,7 +37198,7 @@ pub(in crate::server) async fn dispatch_join_result_message(
                 ?refusal,
                 "join-result fetch not admitted; the joiner retries"
             );
-            return;
+            return true;
         }
     };
     let task_state = Arc::clone(state);
@@ -37108,6 +37224,7 @@ pub(in crate::server) async fn dispatch_join_result_message(
             ),
         }
     });
+    true
 }
 
 /// #1269 r2: the message of a caught panic payload, for the fetch-handler
@@ -39496,6 +39613,7 @@ pub(in crate::server) mod tests {
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
+    pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;

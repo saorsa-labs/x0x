@@ -47,10 +47,9 @@ use routes::{
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
     add_named_group_member, add_task, agent_info, agent_reachability, agent_sign,
     agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
-    apply_direct_kv_store_delta, apply_named_group_metadata_event,
-    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
-    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
-    causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
+    apply_direct_kv_store_delta, apply_named_group_metadata_event_inner_serialized, apply_upgrade,
+    approve_join_request, ban_group_member, bootstrap_cache_stats, broadcast_current_manifest,
+    cancel_join_request, causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
     connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
@@ -76,20 +75,20 @@ use routes::{
     load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
-    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
-    now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
-    owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
+    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
+    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
-    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
-    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
-    send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
+    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
+    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
+    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -1919,13 +1918,18 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                dispatch_join_result_message(
+                // #1275: the dispatch runs a result's apply shielded and
+                // awaits it, so results still apply in arrival order.
+                if !dispatch_join_result_message(
                     &join_result_state,
                     &msg.sender,
                     msg.verified,
                     join_msg,
                 )
-                .await;
+                .await
+                {
+                    break;
+                }
             }
         }));
     }
@@ -1998,13 +2002,26 @@ pub async fn serve_with_options(
                 if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
                 {
                     if response.message_type == "treekem_catchup_response" {
-                        handle_treekem_catchup_response(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            response,
-                        )
-                        .await;
+                        // #1275: the response's events are applied and
+                        // persisted, so the apply runs shielded; awaiting it
+                        // keeps the responses in arrival order.
+                        let apply_state = Arc::clone(&catchup_state);
+                        let sender = msg.sender;
+                        let verified = msg.verified;
+                        let applied = catchup_state
+                            .run_shielded(Box::pin(async move {
+                                handle_treekem_catchup_response(
+                                    &apply_state,
+                                    &sender,
+                                    verified,
+                                    response,
+                                )
+                                .await;
+                            }))
+                            .await;
+                        if applied.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -2043,13 +2060,25 @@ pub async fn serve_with_options(
                 );
                 // The legacy unprefixed wire form carries no durable
                 // receipt, so the admission outcome has nowhere to go.
-                let _ = admit_public_group_bootstrap(
-                    &bootstrap_state,
-                    msg.sender,
-                    Some(msg.machine_id),
-                    bootstrap,
-                )
-                .await;
+                // #1275: the admission installs and persists the group, so
+                // it runs shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let sender = msg.sender;
+                let machine_id = msg.machine_id;
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        let _ = admit_public_group_bootstrap(
+                            &apply_state,
+                            sender,
+                            Some(machine_id),
+                            bootstrap,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2062,35 +2091,10 @@ pub async fn serve_with_options(
     // shared apply handler re-validates the signed commit, enforces the same
     // authorization checks, and is idempotent, so applying via both the direct
     // and gossip channels is safe.
-    {
-        let meta_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
-            let mut rx = meta_state.agent.subscribe_direct();
-            loop {
-                let Some(msg) = rx.recv().await else { break };
-                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
-                else {
-                    continue; // not a named-group metadata event
-                };
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "direct_classified_metadata_event",
-                    sender = %hex::encode(msg.sender.as_bytes()),
-                    len = msg.payload.len(),
-                    verified = msg.verified,
-                    event = named_group_metadata_event_kind(&event),
-                );
-                apply_named_group_metadata_event(
-                    &meta_state,
-                    event,
-                    msg.sender,
-                    msg.verified,
-                    None, // direct DM path — no V2 envelope bytes available
-                )
-                .await;
-            }
-        }));
-    }
+    bg_tasks.push(tokio::spawn(run_direct_metadata_listener(
+        Arc::clone(&state),
+        state.agent.subscribe_direct(),
+    )));
 
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
@@ -2148,7 +2152,24 @@ pub async fn serve_with_options(
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
-                handle_predecessor_relay_typed_payload(&relay_state, &local_agent_hex, typed).await;
+                // #1275: the handler applies the event and persists the
+                // roster and the relay obligation, so it runs shielded and
+                // is awaited in arrival order.
+                let apply_state = Arc::clone(&relay_state);
+                let local_agent_hex = local_agent_hex.clone();
+                let handled = relay_state
+                    .run_shielded(Box::pin(async move {
+                        handle_predecessor_relay_typed_payload(
+                            &apply_state,
+                            &local_agent_hex,
+                            typed,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if handled.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2180,7 +2201,18 @@ pub async fn serve_with_options(
                     );
                     continue;
                 };
-                apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
+                // #1275: the merge persists the store's snapshot, so it runs
+                // shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&kv_delta_state);
+                let sender = typed.sender;
+                let applied = kv_delta_state
+                    .run_shielded(Box::pin(async move {
+                        apply_direct_kv_store_delta(&apply_state, sender, delta_msg).await;
+                    }))
+                    .await;
+                if applied.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2253,7 +2285,19 @@ pub async fn serve_with_options(
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
-                handle_public_group_bootstrap_typed_payload(&bootstrap_state, typed).await;
+                // #1275: the admission installs and persists the group
+                // before it completes the ACK, so it runs shielded and is
+                // awaited in arrival order. A refused payload is dropped
+                // with its completion: no ACK, so the sender re-offers.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        handle_public_group_bootstrap_typed_payload(&apply_state, typed).await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2905,7 +2949,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         }
     }
     // #1269 r2: admitted applies that persist group state (a pulled control
-    // blob's apply, the owner-certificate join retry) run to completion. An
+    // blob's apply, the owner-certificate join retry, and since #1275 the
+    // listeners' event applies) run to completion. An
     // abort inside an atomic write or its journal step would leave the
     // persisted state torn, or leave a blocking write running after the
     // instance locks are released. They are awaited before the Agent stops,
@@ -4510,7 +4555,9 @@ async fn run_member_certificate_bridge(
     state: Arc<AppState>,
     mut events: broadcast::Receiver<x0x::VerifiedCertificate>,
 ) {
-    reconcile_member_certificates_from_cache(&state).await;
+    if !reconcile_member_certificates_shielded(&state).await {
+        return;
+    }
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
         tokio::select! {
@@ -4522,18 +4569,48 @@ async fn run_member_certificate_bridge(
                 break;
             }
             received = events.recv() => match received {
-                Ok(event) => apply_verified_certificate_event(&state, &event).await,
+                Ok(event) => {
+                    // #1275: shielded, like the reconciles (see below).
+                    let apply_state = Arc::clone(&state);
+                    let applied = state
+                        .run_shielded(Box::pin(async move {
+                            apply_verified_certificate_event(&apply_state, &event).await;
+                        }))
+                        .await;
+                    if applied.is_none() {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,
                         "verified-certificate ring overflowed; re-running full member-certificate reconcile"
                     );
-                    reconcile_member_certificates_from_cache(&state).await;
+                    if !reconcile_member_certificates_shielded(&state).await {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     }
+}
+
+/// #1275: run the full reconcile as a shielded apply. A hydration persists
+/// the roster, and the supervisor aborts this worker as soon as shutdown is
+/// signalled; shielded, that abort only ends the wait, the write completes
+/// and the shutdown drain waits for it. The worker awaits each hydration
+/// before it reads the next event, so they still run one at a time.
+/// `false` (shutdown refused it, or it panicked) ends the worker; the
+/// supervisor then exits on shutdown or restarts it, as after a panic.
+async fn reconcile_member_certificates_shielded(state: &Arc<AppState>) -> bool {
+    let apply_state = Arc::clone(state);
+    state
+        .run_shielded(Box::pin(async move {
+            reconcile_member_certificates_from_cache(&apply_state).await;
+        }))
+        .await
+        .is_some()
 }
 
 /// F1: supervise the bridge worker for the daemon's lifetime, following the
@@ -5028,6 +5105,65 @@ mod member_certificate_bridge_tests {
             "an idempotent sweep must not re-stamp the member"
         );
         assert_eq!(second.certificate, first.certificate);
+    }
+
+    /// #1275: the supervisor aborts the bridge worker as soon as shutdown
+    /// is signalled, before the drain's grace even starts. A hydration the
+    /// worker has started persists the roster, so it must not be cut off in
+    /// the middle of that write: the drain waits for it, the write
+    /// completes, and no temp file is left. The write is parked after its
+    /// temp file is synced and before the rename (the #1269 write pause).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue1275_hydration_is_not_aborted_mid_write_at_shutdown() {
+        use crate::server::routes::named_groups::atomic_write_test_seam;
+        use crate::server::routes::named_groups::tests::issue1275_listener_apply_shield::stop_while_write_parked;
+
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let member_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert = x0x::identity::AgentCertificate::issue(&user, &member_kp).unwrap();
+        let agent_hex = hex::encode(member_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        let (group_id, info) =
+            group_with_digest_only_members(&[(member_kp.agent_id(), cert.clone())]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        // Nothing is on disk yet: the file gets the group (and the member)
+        // only through the hydration's write.
+        let path = state.named_groups_path.clone();
+        let pause = atomic_write_test_seam::arm(&path);
+        let rx = state.agent.subscribe_verified_certificates();
+        let supervisor = tokio::spawn(supervise_member_certificate_bridge(Arc::clone(&state), rx));
+        state
+            .agent
+            .insert_discovered_agent_for_testing(cached_cert_entry(
+                member_kp.agent_id(),
+                cert.clone(),
+            ))
+            .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pause.reached() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hydration parks in its roster write"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The supervisor sees shutdown and aborts its worker at once.
+        let _ = state.shutdown_notify.send(true);
+        let outcome = stop_while_write_parked(&state, vec![supervisor], &pause, &path, &agent_hex)
+            .await
+            .unwrap();
+        assert!(
+            outcome.apply_completed(),
+            "the hydration must finish its roster write at shutdown: {outcome:?}"
+        );
+        let member = member_of(&state, &group_id, &agent_hex).await;
+        assert!(member.certificate.as_ref().is_some_and(|c| *c == cert));
     }
 
     /// WHY (r4 / addendum item 5): the supervisor must RESPAWN a bridge
