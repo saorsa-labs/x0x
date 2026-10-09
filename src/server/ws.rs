@@ -86,6 +86,12 @@ enum WsOutbound {
         topic: String,
         payload: String,
         origin: Option<String>,
+        /// Validated gossip `MessageHeader.msg_id`, 64 lowercase hex characters.
+        ///
+        /// Omitted when that metadata is absent. This is not `HistoryRecord.msg_id`
+        /// and not the ADR 0029 application id (`msg_id` on `mention` frames).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transport_msg_id: Option<String>,
         /// ADR-0066 §3d: set on ADR-0023 BACKFILL frames replayed for a
         /// fork-quarantined group's topic. Live gossip frames leave it
         /// `None` — they are the raw topic plane the ADR's row-25 note
@@ -1000,6 +1006,28 @@ async fn cleanup_ws_topic_if_empty(state: &AppState, topic: &str, session_id: &s
     }
 }
 
+/// Live gossip `message` frame.
+///
+/// `transport_msg_id` is copied from the notification. History backfill does
+/// not use this helper: a stored row has no validated gossip header id.
+fn live_topic_message(
+    topic: String,
+    note: &crate::gossip::pubsub::PubSubNotification,
+) -> WsOutbound {
+    WsOutbound::Message {
+        topic,
+        payload: BASE64.encode(&note.message.payload),
+        origin: note
+            .message
+            .sender
+            .map(|sender| hex::encode(sender.as_bytes())),
+        transport_msg_id: note.transport_msg_id.map(|id| id.to_hex()),
+        // Raw live gossip plane: outside ADR-0066 row 25, and the one
+        // per-frame path that takes no marker lock.
+        quarantine: None,
+    }
+}
+
 /// Dispatch an inbound WebSocket JSON command.
 async fn handle_ws_command(
     state: &Arc<AppState>,
@@ -1073,18 +1101,8 @@ async fn handle_ws_command(
                                 let btx = broadcast_tx.clone();
                                 let topic_clone = topic.clone();
                                 tokio::spawn(async move {
-                                    while let Some(msg) = gossip_sub.recv().await {
-                                        let out = WsOutbound::Message {
-                                            topic: topic_clone.clone(),
-                                            payload: BASE64.encode(&msg.payload),
-                                            origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
-                                            // Raw live gossip plane: outside
-                                            // ADR-0066 row 25 (see the
-                                            // `Message::quarantine` note), and
-                                            // the one truly per-frame path —
-                                            // it takes no marker lock.
-                                            quarantine: None,
-                                        };
+                                    while let Some(note) = gossip_sub.recv_notification().await {
+                                        let out = live_topic_message(topic_clone.clone(), &note);
                                         let _ = btx.send(out);
                                     }
                                 })
@@ -1139,6 +1157,8 @@ async fn handle_ws_command(
                                         topic: topic.clone(),
                                         payload: BASE64.encode(&r.payload),
                                         origin: r.author_agent.clone(),
+                                        // History replay has no gossip header id.
+                                        transport_msg_id: None,
                                         // Every replayed frame is annotated,
                                         // per the ADR's §3d fixture clause.
                                         // A session checks its CURRENT seat
@@ -1869,12 +1889,68 @@ mod tests {
             topic: "some.topic".to_string(),
             payload: String::new(),
             origin: None,
+            transport_msg_id: None,
             quarantine: None,
         });
         assert_not_annotated(&WsOutbound::Live {
             topic: "some.topic".to_string(),
             quarantine: None,
         });
+    }
+
+    /// The live frame copies a validated transport id and omits the key when
+    /// that metadata is absent. The field name is not `msg_id`, which remains
+    /// the ADR 0029 / mention id and is not `HistoryRecord.msg_id`.
+    #[test]
+    fn issue869_live_frame_carries_transport_id_or_omits_it() {
+        let payload = b"same-bytes";
+        let transport = crate::gossip::pubsub::TransportMsgId([0x11; 32]);
+        let history = crate::history::HistoryRecord::compute_msg_id(None, payload);
+        assert_ne!(
+            transport.as_bytes(),
+            history,
+            "transport id and history id are different values"
+        );
+        let note = crate::gossip::pubsub::PubSubNotification::with_transport_id(
+            crate::gossip::PubSubMessage {
+                topic: "t".into(),
+                payload: bytes::Bytes::copy_from_slice(payload),
+                sender: None,
+                sender_public_key: None,
+                verified: true,
+                trust_level: None,
+                raw_envelope: None,
+            },
+            Some(transport),
+        );
+        let live = live_topic_message("t".into(), &note);
+        let json = frame_json(&live);
+        let transport_hex = transport.to_hex();
+        let history_hex = hex::encode(history);
+        assert_eq!(
+            json["transport_msg_id"].as_str(),
+            Some(transport_hex.as_str())
+        );
+        assert!(
+            !json.contains_key("msg_id"),
+            "live frame must not use the history or ADR 0029 field name: {json:?}"
+        );
+        assert_ne!(
+            json["transport_msg_id"].as_str(),
+            Some(history_hex.as_str()),
+            "live frame id is not HistoryRecord.msg_id"
+        );
+
+        let absent = crate::gossip::pubsub::PubSubNotification::with_transport_id(
+            note.message.clone(),
+            None,
+        );
+        let omitted = frame_json(&live_topic_message("t".into(), &absent));
+        assert!(
+            !omitted.contains_key("transport_msg_id"),
+            "absent metadata omits the key: {omitted:?}"
+        );
+        assert!(!omitted.contains_key("msg_id"));
     }
 
     /// WHY: the ADR's §3d fixture clause — "a WS subscriber receives

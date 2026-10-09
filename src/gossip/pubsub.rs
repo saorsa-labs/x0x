@@ -559,6 +559,10 @@ impl SigningContext {
 /// Messages may be signed (v2 or v3) or unsigned (v1 legacy). The `sender` and
 /// `verified` fields indicate the authentication state. A subscription only
 /// yields gossip messages with a `sender` whose signature verified (#1114).
+///
+/// The gossip transport id is not a field of this struct. It rides on
+/// [`PubSubNotification`] so it stays distinct from this envelope, from
+/// `HistoryRecord.msg_id`, and from the ADR 0029 application id.
 #[derive(Debug, Clone)]
 pub struct PubSubMessage {
     /// The topic this message was published on.
@@ -582,6 +586,175 @@ pub struct PubSubMessage {
     pub raw_envelope: Option<Bytes>,
 }
 
+/// SG key-cache v3 marker. Those frames are not a legacy `GossipMessage`.
+/// This path cannot check their signature, so it does not treat their header
+/// id as authenticated metadata.
+const SG_KEY_CACHE_V3_MARKER: &[u8] = b"\xffSGKC\x03";
+
+/// How long a verified header id may wait for its subscriber delivery.
+/// A claim that never meets a delivery expires instead of attaching to a
+/// later payload that happens to share the same bytes.
+const TRANSPORT_CLAIM_TTL: Duration = Duration::from_secs(5);
+
+/// Bound on outstanding verified header ids. The oldest claim is dropped.
+const TRANSPORT_CLAIM_CAP: usize = 256;
+
+/// Authenticated gossip `MessageHeader.msg_id` for one subscriber delivery.
+///
+/// This is not `HistoryRecord.msg_id` and not the ADR 0029 application id.
+/// x0x copies it from a signature-checked header. It does not hash the payload
+/// to fill the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransportMsgId(pub(crate) [u8; 32]);
+
+impl TransportMsgId {
+    #[cfg(test)]
+    pub(crate) fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(crate) fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// One subscriber delivery, plus the validated transport id when it is known.
+#[derive(Debug, Clone)]
+pub(crate) struct PubSubNotification {
+    pub message: PubSubMessage,
+    /// Present only when a validated `MessageHeader.msg_id` was joined to
+    /// this delivery. `None` when that metadata is absent or ambiguous.
+    pub transport_msg_id: Option<TransportMsgId>,
+}
+
+impl PubSubNotification {
+    fn bare(message: PubSubMessage) -> Self {
+        Self {
+            message,
+            transport_msg_id: None,
+        }
+    }
+
+    pub(crate) fn with_transport_id(
+        message: PubSubMessage,
+        transport_msg_id: Option<TransportMsgId>,
+    ) -> Self {
+        Self {
+            message,
+            transport_msg_id,
+        }
+    }
+}
+
+struct TransportClaim {
+    ticket: u64,
+    peer: PeerId,
+    payload: Bytes,
+    msg_id: TransportMsgId,
+    at: Instant,
+}
+
+/// Verified header ids waiting for the matching `(peer, payload)` delivery.
+///
+/// saorsa-gossip 0.5.87 delivers `(PeerId, Bytes)` and drops the header
+/// (saorsa-gossip #100). x0x checks the inbound frame first and joins a
+/// single matching claim at delivery time. Zero claims, or more than one,
+/// produce no id: a payload hash is not a substitute, and two header ids
+/// must not be collapsed into one guess.
+#[derive(Default)]
+struct TransportClaims {
+    next_ticket: AtomicU64,
+    inner: Mutex<Vec<TransportClaim>>,
+}
+
+impl TransportClaims {
+    fn offer(&self, peer: PeerId, payload: Bytes, msg_id: TransportMsgId) -> u64 {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let mut claims = self.lock();
+        let now = Instant::now();
+        prune_transport_claims(&mut claims, now);
+        if claims.len() >= TRANSPORT_CLAIM_CAP {
+            claims.remove(0);
+        }
+        claims.push(TransportClaim {
+            ticket,
+            peer,
+            payload,
+            msg_id,
+            at: now,
+        });
+        ticket
+    }
+
+    fn release(&self, ticket: u64) {
+        self.lock().retain(|claim| claim.ticket != ticket);
+    }
+
+    /// Return the id when exactly one live claim matches.
+    ///
+    /// Several matches are discarded. The delivery then carries no
+    /// authenticated id.
+    fn take_unique(&self, peer: PeerId, payload: &Bytes) -> Option<TransportMsgId> {
+        let mut claims = self.lock();
+        let now = Instant::now();
+        prune_transport_claims(&mut claims, now);
+        let matched: Vec<usize> = claims
+            .iter()
+            .enumerate()
+            .filter(|(_, claim)| claim.peer == peer && claim.payload == payload)
+            .map(|(index, _)| index)
+            .collect();
+        match matched.len() {
+            0 => None,
+            1 => Some(claims.remove(matched[0]).msg_id),
+            _ => {
+                for index in matched.into_iter().rev() {
+                    claims.remove(index);
+                }
+                None
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<TransportClaim>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn prune_transport_claims(claims: &mut Vec<TransportClaim>, now: Instant) {
+    claims.retain(|claim| now.saturating_duration_since(claim.at) < TRANSPORT_CLAIM_TTL);
+}
+
+/// Validated eager payload and its header id, or `None` when the frame is
+/// not a signature-checked legacy EAGER with a payload-covering header.
+///
+/// ADR-014 `RejectV1` frames (header-only signatures) and key-cache v3 frames
+/// return `None`. Callers must not invent an id from the payload bytes.
+fn authenticated_eager_claim(frame: &[u8]) -> Option<(Bytes, TransportMsgId)> {
+    if frame.starts_with(SG_KEY_CACHE_V3_MARKER) {
+        return None;
+    }
+    let message: saorsa_gossip_pubsub::GossipMessage = postcard::from_bytes(frame).ok()?;
+    if message.header.version != 2 || message.header.kind != MessageKind::Eager {
+        return None;
+    }
+    let payload = message.payload.clone()?;
+    let expected = message.header.payload_hash?;
+    if blake3::hash(payload.as_ref()).as_bytes() != &expected {
+        return None;
+    }
+    let header_bytes = postcard::to_stdvec(&message.header).ok()?;
+    let verified = saorsa_gossip_identity::MlDsaKeyPair::verify(
+        &message.public_key,
+        &header_bytes,
+        &message.signature,
+    )
+    .unwrap_or(false);
+    verified.then_some((payload, TransportMsgId(message.header.msg_id)))
+}
+
 /// Subscription to a topic.
 ///
 /// Receives messages published to its topic through a channel receiver.
@@ -594,7 +767,7 @@ pub struct Subscription {
     /// domain-separated id, not `TopicId::from_entity(name)`).
     topic_id: Option<TopicId>,
     /// Channel receiver for messages on this topic.
-    receiver: mpsc::Receiver<PubSubMessage>,
+    receiver: mpsc::Receiver<PubSubNotification>,
     /// Reference to per-topic subscriber counts for cleanup on drop.
     topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
     generation: u64,
@@ -657,12 +830,19 @@ impl Subscription {
     ///
     /// The next message, or `None` if the subscription has been canceled.
     pub async fn recv(&mut self) -> Option<PubSubMessage> {
+        self.recv_notification().await.map(|note| note.message)
+    }
+
+    /// Next delivery, including a validated transport id when one was joined.
+    pub(crate) async fn recv_notification(&mut self) -> Option<PubSubNotification> {
         self.receiver.recv().await
     }
 
     /// Receive from either subscription until both are closed and drained.
     pub(crate) async fn recv_from_either(&mut self, other: &mut Self) -> Option<PubSubMessage> {
-        recv_from_either(&mut self.receiver, &mut other.receiver).await
+        recv_from_either(&mut self.receiver, &mut other.receiver)
+            .await
+            .map(|note| note.message)
     }
 }
 
@@ -752,6 +932,8 @@ impl Drop for Subscription {
 ///
 /// Local subscription delivery path:
 ///     PlumTree topic receiver → decode x0x payload (v1/v2) → trust filter → subscriber channel
+///     A validated `MessageHeader.msg_id` is attached when the inbound frame
+///     proved one (#869). Absent or ambiguous metadata stays absent.
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
@@ -808,7 +990,9 @@ pub struct PubSubManager {
     /// Subscriber channels for `local:` topics (issue #89). These topics
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
-    local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+    local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubNotification>>>>>,
+    /// Verified gossip header ids waiting for the matching subscriber delivery (#869).
+    transport_claims: Arc<TransportClaims>,
     /// Long-lived membership holds so Direct-connect pre-subscribe of a
     /// peer inbox (#380 C4) stays on the subscribed-topic path. The owned
     /// task drains the receiver so a quiet hold cannot fill the channel
@@ -1399,6 +1583,7 @@ impl PubSubManager {
             stats: Arc::new(PubSubStats::default()),
             inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
+            transport_claims: Arc::new(TransportClaims::default()),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
@@ -1968,6 +2153,7 @@ impl PubSubManager {
 
         let sub_topic = topic.clone();
         let stats = Arc::clone(&self.stats);
+        let transport_claims = Arc::clone(&self.transport_claims);
         tokio::spawn(async move {
             loop {
                 let received = tokio::select! {
@@ -1996,9 +2182,13 @@ impl PubSubManager {
                     }
                     received = plumtree_rx.recv() => received,
                 };
-                let Some((_peer, encoded_payload)) = received else {
+                let Some((peer, encoded_payload)) = received else {
                     return;
                 };
+                // Join before decode. A claim that matches this delivery is
+                // consumed even when the x0x envelope is later dropped, so it
+                // cannot stick to a later payload with the same bytes.
+                let transport_msg_id = transport_claims.take_unique(peer, &encoded_payload);
                 stats.incoming_total.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     topic = %sub_topic,
@@ -2025,7 +2215,8 @@ impl PubSubManager {
                     msg_topic = %message.topic,
                     "[4/6 pubsub] decoded, forwarding to subscriber channel"
                 );
-                match tx.try_send(message) {
+                let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
+                match tx.try_send(notification) {
                     Ok(()) => {
                         stats
                             .delivered_to_subscriber
@@ -2304,9 +2495,12 @@ impl PubSubManager {
             trust_level: None,
             raw_envelope: None,
         };
+        // `local:` publishes never enter PlumTree, so they have no
+        // `MessageHeader`. The notification omits the transport id.
+        let notification = PubSubNotification::bare(message);
         let mut topics = self.local_topics.write().await;
         if let Some(senders) = topics.get_mut(&topic) {
-            senders.retain(|tx| match tx.try_send(message.clone()) {
+            senders.retain(|tx| match tx.try_send(notification.clone()) {
                 Ok(()) => {
                     self.stats
                         .delivered_to_subscriber
@@ -2364,6 +2558,12 @@ impl PubSubManager {
         if self.refuse_leaf_unsubscribed_passthrough(ordinary_frame, &data) {
             return;
         }
+        // Record a verified header id before PlumTree can deliver the payload.
+        // `Err` means the frame was not admitted, so the claim must not wait.
+        // `Ok` leaves the claim for the subscriber task (duplicates that
+        // return `Ok` without a delivery expire with the claim TTL).
+        let transport_ticket = authenticated_eager_claim(&data)
+            .map(|(payload, msg_id)| self.transport_claims.offer(peer, payload, msg_id));
         // #674 C2/C3: first sight of a topic id on the inbound path
         // installs the relay fan-out composite validator. On a Full relay
         // this is the ONLY way an unconsumed topic (never passed through
@@ -2397,6 +2597,9 @@ impl PubSubManager {
             None => self.plumtree.handle_message(peer, data).await,
         };
         if let Err(e) = dispatch_result {
+            if let Some(ticket) = transport_ticket {
+                self.transport_claims.release(ticket);
+            }
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
                 crate::logging::LogPeerId::from(peer)
@@ -8819,5 +9022,131 @@ mod sg76_marker_gate_tests {
             saorsa_gossip_pubsub::inspect_message_header(V3_MARKER),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod issue869 {
+    use super::test_support::{outer_v2_frame, signed_inner_v2};
+    use super::*;
+    use crate::history::HistoryRecord;
+    use crate::identity::AgentKeypair;
+
+    fn sample_message(payload: &[u8]) -> PubSubMessage {
+        PubSubMessage {
+            topic: "issue869".into(),
+            payload: Bytes::copy_from_slice(payload),
+            sender: None,
+            sender_public_key: None,
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    fn signed_pair() -> (Bytes, Bytes, Bytes) {
+        let app = Bytes::from_static(b"same-bytes");
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
+        let inner = signed_inner_v2(&author, "issue869", &app);
+        let topic = TopicId::from_entity(b"issue869");
+        let frame_a = outer_v2_frame(topic, inner.clone(), [0x11; 32]);
+        let frame_b = outer_v2_frame(topic, inner.clone(), [0x22; 32]);
+        (app, frame_a, frame_b)
+    }
+
+    #[test]
+    fn one_transport_id_survives_repeated_local_delivery() {
+        let (_app, frame_a, _frame_b) = signed_pair();
+        let (_payload, id) = authenticated_eager_claim(&frame_a).expect("validated header id");
+        let note = PubSubNotification::with_transport_id(sample_message(b"same-bytes"), Some(id));
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(note.clone()).expect("first local delivery");
+        tx.try_send(note).expect("repeated local delivery");
+        let first = rx.try_recv().expect("first notification");
+        let second = rx.try_recv().expect("second notification");
+        assert_eq!(first.transport_msg_id, Some(id));
+        assert_eq!(
+            second.transport_msg_id, first.transport_msg_id,
+            "one transport message keeps its id across repeated local delivery"
+        );
+        assert_eq!(first.message.payload, second.message.payload);
+    }
+
+    #[test]
+    fn same_payload_distinct_header_ids_stay_distinct() {
+        let (app, frame_a, frame_b) = signed_pair();
+        let (payload_a, id_a) = authenticated_eager_claim(&frame_a).expect("id a");
+        let (payload_b, id_b) = authenticated_eager_claim(&frame_b).expect("id b");
+        assert_eq!(
+            payload_a, payload_b,
+            "the two frames carry the same payload"
+        );
+        assert_ne!(id_a, id_b, "distinct header ids stay distinct");
+        assert_eq!(id_a.as_bytes(), [0x11; 32]);
+        assert_eq!(id_b.as_bytes(), [0x22; 32]);
+        let history = HistoryRecord::compute_msg_id(None, &app);
+        assert_ne!(id_a.as_bytes(), history);
+        assert_ne!(id_b.as_bytes(), history);
+        assert_ne!(id_a.as_bytes(), *blake3::hash(&payload_a).as_bytes());
+        let first = PubSubNotification::with_transport_id(sample_message(&app), Some(id_a));
+        let second = PubSubNotification::with_transport_id(sample_message(&app), Some(id_b));
+        assert_eq!(first.message.payload, second.message.payload);
+        assert_ne!(first.transport_msg_id, second.transport_msg_id);
+    }
+
+    #[test]
+    fn absent_or_unvalidated_header_omits_the_transport_id() {
+        let bare = PubSubNotification::bare(sample_message(b"same-bytes"));
+        assert!(bare.transport_msg_id.is_none());
+        let (_app, frame_a, _frame_b) = signed_pair();
+        let mut bad = frame_a.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x5a;
+        assert!(
+            authenticated_eager_claim(&bad).is_none(),
+            "a broken signature is not an authenticated id"
+        );
+        let mut v3 = SG_KEY_CACHE_V3_MARKER.to_vec();
+        v3.extend_from_slice(&frame_a);
+        assert!(
+            authenticated_eager_claim(&v3).is_none(),
+            "an unverified v3 frame does not yield an authenticated id"
+        );
+        let claims = TransportClaims::default();
+        let peer = PeerId::new([7; 32]);
+        assert!(claims.take_unique(peer, &frame_a).is_none());
+    }
+
+    #[test]
+    fn overlapping_claims_omit_rather_than_guess_an_id() {
+        let (_app, frame_a, frame_b) = signed_pair();
+        let (payload, id_a) = authenticated_eager_claim(&frame_a).expect("id a");
+        let (_payload_b, id_b) = authenticated_eager_claim(&frame_b).expect("id b");
+        let claims = TransportClaims::default();
+        let peer = PeerId::new([7; 32]);
+        let other = PeerId::new([8; 32]);
+
+        let first = claims.offer(peer, payload.clone(), id_a);
+        assert_eq!(claims.take_unique(peer, &payload), Some(id_a));
+        claims.offer(peer, payload.clone(), id_b);
+        assert_eq!(claims.take_unique(peer, &payload), Some(id_b));
+
+        claims.offer(peer, payload.clone(), id_a);
+        claims.offer(peer, payload.clone(), id_b);
+        assert_eq!(
+            claims.take_unique(peer, &payload),
+            None,
+            "two header ids for one payload are not collapsed or hashed"
+        );
+        assert!(claims.take_unique(peer, &payload).is_none());
+
+        let ticket = claims.offer(peer, payload.clone(), id_a);
+        claims.release(ticket);
+        assert!(claims.take_unique(peer, &payload).is_none());
+        assert_ne!(first, ticket);
+
+        claims.offer(peer, payload.clone(), id_a);
+        assert!(claims.take_unique(other, &payload).is_none());
+        assert_eq!(claims.take_unique(peer, &payload), Some(id_a));
     }
 }

@@ -2254,7 +2254,7 @@ Server → client (complete outbound frame set):
 
 ```json
 {"type":"connected","session_id":"uuid","agent_id":"hex64..."}
-{"type":"message","topic":"topic-a","payload":"aGVsbG8=","origin":"hex64..."}
+{"type":"message","topic":"topic-a","payload":"aGVsbG8=","origin":"hex64...","transport_msg_id":"hex64..."}
 {"type":"direct_message","sender":"hex64...","machine_id":"hex64...","payload":"aGVsbG8=","received_at":1234567890,"verified":true,"trust_decision":"Accept"}
 {"type":"live","topic":"topic-a"}
 {"type":"subscribed","topics":["topic-a","topic-b"]}
@@ -2269,7 +2269,7 @@ Server → client (complete outbound frame set):
 | `type` | Fields | Emitted when |
 |---|---|---|
 | `connected` | `session_id`, `agent_id` | Session registered (`/ws` and `/ws/direct`) |
-| `message` | `topic`, `payload` (base64), `origin?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself |
+| `message` | `topic`, `payload` (base64), `origin?`, `transport_msg_id?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself. `transport_msg_id` is the validated gossip `MessageHeader.msg_id` (64 lowercase hex) when that metadata is present. The key is absent when the metadata is absent. It is not `HistoryRecord.msg_id` and not the ADR 0029 application `msg_id` |
 | `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` requests best-effort history rows first) |
 | `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | A requested best-effort backfill attempt has transitioned to live frames (ADR-0023); this does not confirm that history existed, its query succeeded, or every replay row reached the client |
 | `subscribed` / `unsubscribed` | `topics[]` | After the corresponding client command |
@@ -2281,14 +2281,19 @@ Server → client (complete outbound frame set):
 subscribe-time anti-entropy can re-serve messages from the sender's roughly
 60-second cache, so applications should expect duplicate frames. Under
 backpressure, `feed_droppable` may also drop topic frames from the bounded
-outbound queue (`ws_outbound_dropped`). The event has no stable top-level
-transport `msg_id` and promises neither exactly-once delivery nor a complete
-feed; do not assume at-least-once delivery. Applications needing exactly-once
-effects must carry their own unique application ID to suppress duplicates and
-use a separate reconciliation path for missed messages. A decoded signed-group
-payload may provide a canonical application message ID for that format.
-`HistoryRecord.msg_id` identifies a local history-store record and is a
-separate identity; it is not the missing transport ID for this event.
+outbound queue (`ws_outbound_dropped`). A live frame carries
+`transport_msg_id` when the inbound gossip frame had a validated
+`MessageHeader.msg_id`. x0x copies that id. It does not derive one from the
+payload bytes. When that metadata is absent, or two validated ids match the
+same delivery, the frame omits `transport_msg_id` (the key is absent, not
+null). That id is not the local `HistoryRecord.msg_id` and not the ADR 0029
+application id (`msg_id` on a decoded signed-group message, and on `mention`
+frames). History backfill frames omit `transport_msg_id`. The event promises
+neither exactly-once delivery nor a complete feed; do not assume at-least-once
+delivery. Applications needing exactly-once effects must carry their own
+unique application ID to suppress duplicates and use a separate reconciliation
+path for missed messages. A decoded signed-group payload may provide a
+canonical application message ID for that format.
 
 **Fork-quarantine annotation (ADR-0066 §3d).** When a group is
 fork-quarantined on this node, its group-scoped frames are **labelled, never
