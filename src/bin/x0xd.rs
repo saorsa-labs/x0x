@@ -985,4 +985,35 @@ mod tests {
             "config name derives its plane-scoped default"
         );
     }
+
+    /// ADR 0116 §1 and ruling Q9: the daemon validates the `[history]`
+    /// rules when it loads its config, whether or not history is enabled.
+    /// A bad rule refuses startup; it is not dropped with a warning like an
+    /// unknown key.
+    #[tokio::test]
+    async fn invalid_history_rule_refuses_startup_even_with_history_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+        std::fs::write(
+            &path,
+            "[history]\nenabled = false\n\n[[history.class_limits]]\nclass = \"durable\"\n",
+        )
+        .expect("write config");
+        let error = super::load_config(&path_str)
+            .await
+            .expect_err("an invalid [history] rule must refuse startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("[history]")
+                && message.contains("sets neither max_bytes nor a positive max_age_days"),
+            "refused for the wrong reason: {message}"
+        );
+
+        std::fs::write(&path, "[history]\nenabled = false\n").expect("rewrite config");
+        assert!(
+            super::load_config(&path_str).await.is_ok(),
+            "a config without the new rules still loads"
+        );
+    }
 }
