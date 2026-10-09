@@ -60,6 +60,16 @@ pub struct HistoryCounters {
     pub quarantine_pinned_scopes: AtomicU64,
     /// Write-transaction failures (batch lost, logged).
     pub write_errors: AtomicU64,
+    /// ADR 0116 §3: ordinary DM records the local `dm_recording =
+    /// "ephemeral"` policy kept out of history. Cumulative; no label.
+    pub policy_suppressed_dm_total: AtomicU64,
+    /// ADR 0116 §3: topic records a winning `recording = "ephemeral"` topic
+    /// rule kept out of history. Cumulative; never labelled with a topic.
+    pub policy_suppressed_topic_total: AtomicU64,
+    /// ADR 0116 §3 / ADR 0030: generic durable DM receipts withheld because
+    /// the local policy suppresses their commit. The local reason is
+    /// recorded here only; nothing is sent to the peer. Cumulative.
+    pub policy_durable_receipt_withheld_total: AtomicU64,
 }
 
 /// Producer-side handle: cheap to clone, never blocks.

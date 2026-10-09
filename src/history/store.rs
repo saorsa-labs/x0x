@@ -7384,6 +7384,23 @@ pub(crate) mod close_watch {
 
 #[cfg(test)]
 impl Store {
+    /// ADR 0116 slice C test hook: `(history rows, FTS documents, canonical
+    /// projection rows)`. FTS documents are counted from the index's own
+    /// `docsize` shadow table, not the external content table.
+    pub(crate) fn table_counts_for_tests(&self) -> (i64, i64, i64) {
+        let guard = lock_conn(&self.conn).unwrap_or_else(|e| panic!("{e}"));
+        let count = |sql: &str| -> i64 {
+            guard
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+        (
+            count("SELECT COUNT(*) FROM history"),
+            count("SELECT COUNT(*) FROM history_fts_docsize"),
+            count("SELECT COUNT(*) FROM history_canonical_ids"),
+        )
+    }
+
     /// Test builds: the watch that reports when this store's connection
     /// has closed.
     pub(crate) fn close_watch(&self) -> std::sync::Arc<close_watch::CloseWatch> {
