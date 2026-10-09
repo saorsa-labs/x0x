@@ -1098,5 +1098,126 @@ esac
         self.assertIn("daemon listening", stderr.getvalue())
         self.assertNotEqual("", stderr.getvalue().strip())
 
+    def _secret_markers(self):
+        return ("bearer-secret-value", "private-key-secret-value",
+                "token-secret-value", "split-secret-value")
+
+    def _secret_timeout_command(self):
+        """A command whose 500-character tail keeps a token value and drops token=."""
+        command = ("C" * 80) + "token=" + ("token-secret-value" * 30) + (
+            " Authorization: Bearer bearer-secret-value"
+            " private_key=private-key-secret-value")
+        tail = command[-500:]
+        self.assertIn("token-secret-value", tail)
+        self.assertNotIn("token=", tail)
+        self.assertIn("bearer-secret-value", tail)
+        self.assertIn("private-key-secret-value", tail)
+        return command
+
+    def _secret_daemon_capture(self):
+        """Script output that starts mid-line, with the introducer already cut off."""
+        secret = b"split-secret-value"
+        filler = b"F" * 4096
+        kept = (secret + b" leftover\n"
+                b"Authorization: Bearer bearer-secret-value\n"
+                b"private_key=private-key-secret-value\n"
+                b"token=token-secret-value\n"
+                b"daemon ready\n")
+        self.assertLess(len(kept), 4096)
+        body = filler + kept + (b"Z" * (4096 - len(kept)))
+        self.assertEqual(8192, len(body))
+        self.assertTrue(body[-4096:].startswith(secret))
+        log = b"token=" + body
+        with tempfile.TemporaryDirectory(prefix="home-secret-log-") as root:
+            Path(root, "fixture.marker").write_text("marker\n")
+            logs = Path(root, "logs")
+            logs.mkdir()
+            (logs / "daemon.log").write_bytes(log)
+            command = self.h.Remote.command(self.h.DAEMON_LOG_SCRIPT, [root, "marker"], input_bytes=False)
+            result = subprocess.run(command, shell=True, input=self.h.DAEMON_LOG_SCRIPT.encode(),
+                                    capture_output=True, timeout=5, check=True)
+        captured = result.stdout
+        self.assertIn(secret, captured)
+        self.assertIn(b"bearer-secret-value", captured)
+        self.assertIn(b"daemon ready", captured)
+        self.assertNotIn(b"token=", captured.split(secret, 1)[0][-12:])
+        return captured
+
+    def _run_secret_timeout(self, *, fail_twice):
+        command = self._secret_timeout_command()
+        stderr_bytes = (b"token=token-secret-value "
+                        b"Authorization: Bearer bearer-secret-value "
+                        b"private_key=private-key-secret-value\n")
+        remote = mock.Mock()
+        remote.run.return_value = self._secret_daemon_capture()
+        custody = self.h.SyntheticProcessCustody(remote, "/x0xd", "d" * 32)
+        node = self.node("home-a1")
+        calls = {"n": 0}
+
+        def action():
+            calls["n"] += 1
+            if fail_twice or calls["n"] == 1:
+                raise subprocess.TimeoutExpired(command, 15, stderr=stderr_bytes)
+            return "ready"
+
+        def run(_args, _remote, evidence, resources):
+            resources["custody"] = custody
+            self.h.run_setup_step(evidence, custody, node, "start", action)
+            return True
+
+        captured_err = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="home-secret-report-") as root:
+            report = Path(root) / "report.json"
+            argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                    "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                    "--cli-binary", "/x0x", "--report", str(report)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(self.h, "run_fixture", side_effect=run), \
+                 contextlib.redirect_stderr(captured_err):
+                self.h.main()
+            raw = report.read_text(encoding="utf-8")
+        return json.loads(raw), raw, captured_err.getvalue()
+
+    def _assert_secrets_absent(self, raw, stderr):
+        for secret in self._secret_markers():
+            self.assertNotIn(secret, raw, secret)
+            self.assertNotIn(secret, stderr, secret)
+
+    def test_secret_bearing_timeout_retry_redacts_report_and_stderr(self):
+        """A setup timeout that then succeeds must not keep bearer, key, or token values."""
+        data, raw, stderr = self._run_secret_timeout(fail_twice=False)
+        self._assert_secrets_absent(raw, stderr)
+        retried = [row for row in data["assertions"] if row["label"] == "home-a1 setup retried start"]
+        self.assertEqual(1, len(retried), data["assertions"])
+        row = retried[0]
+        self.assertTrue(row["passed"])
+        self.assertIn("<redacted>", row["command"])
+        self.assertIn("<redacted>", row["stderr"])
+        self.assertIn("<redacted>", row["daemon_log"])
+        self.assertIn("daemon ready", row["daemon_log"])
+        self.assertNotIn("fixture setup step start TimeoutExpired", raw)
+
+    def test_secret_bearing_timeout_failure_redacts_report_and_stderr(self):
+        """A second setup timeout must redact the retry row, the failure row, and stderr."""
+        data, raw, stderr = self._run_secret_timeout(fail_twice=True)
+        self._assert_secrets_absent(raw, stderr)
+        retried = [row for row in data["assertions"] if row["label"] == "home-a1 setup retried start"]
+        failed = [row for row in data["assertions"]
+                  if row["label"] == "fixture setup step start TimeoutExpired"]
+        self.assertEqual(1, len(retried), data["assertions"])
+        self.assertEqual(1, len(failed), data["assertions"])
+        for row in (retried[0], failed[0]):
+            self.assertIn("<redacted>", row["command"])
+            self.assertIn("<redacted>", row["stderr"])
+            self.assertIn("<redacted>", row["daemon_log"])
+            self.assertIn("daemon ready", row["daemon_log"])
+            for secret in self._secret_markers():
+                self.assertNotIn(secret, row["command"], secret)
+                self.assertNotIn(secret, row["stderr"], secret)
+                self.assertNotIn(secret, row["daemon_log"], secret)
+        self.assertIn("setup step start on home-a1", stderr)
+        self.assertIn("daemon ready", stderr)
+        self.assertIn("<redacted>", stderr)
+
 
 if __name__ == "__main__": unittest.main()

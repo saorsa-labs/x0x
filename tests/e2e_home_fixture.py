@@ -357,13 +357,19 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
 
 
 SETUP_STEPS = ("start", "readiness probe", "identity", "join")
-# Bounded tail. Stdin and command stdout stay out: those can carry a token or key.
-DAEMON_LOG_SCRIPT = r'''set -eu
+# The fetch is larger than the retained tail so a cut line can be dropped
+# before retention. Stdin and command stdout stay out: those can carry a token or key.
+LOG_FETCH = 8192
+LOG_RETAIN = 4096
+DAEMON_LOG_SCRIPT = rf'''set -eu
 root=$1 marker=$2
 [ "$(cat "$root/fixture.marker")" = "$marker" ]
 if [ ! -s "$root/logs/daemon.log" ]; then printf '%s\n' '<empty>'; exit 0; fi
-tail -c 4096 "$root/logs/daemon.log"
+wc -c < "$root/logs/daemon.log"
+tail -c {LOG_FETCH} "$root/logs/daemon.log"
 '''
+# Introducer plus the secret value. Replacing the value makes a second pass a no-op.
+_SECRET_VALUE = re.compile(r"(?i)(authorization:\s*bearer\s+|private_key\s*=\s*|token\s*=\s*)(\S+)")
 
 
 class SetupStepError(subprocess.TimeoutExpired):
@@ -376,7 +382,7 @@ class SetupStepError(subprocess.TimeoutExpired):
         self.step, self.node, self.retried = step, node, retried
         self.command = _nonempty_text(command, limit=500)
         self.stderr_text = _nonempty_text(stderr, limit=2000)
-        self.daemon_log = _nonempty_text(daemon_log)
+        self.daemon_log = _nonempty_text(daemon_log, limit=LOG_RETAIN)
         super().__init__(self.command, 0)
         self.args = (self.diagnostic(),)
 
@@ -388,17 +394,41 @@ class SetupStepError(subprocess.TimeoutExpired):
         return self.diagnostic()
 
 
-def _nonempty_text(value: bytes | str | None, *, limit: int = 4096) -> str:
+def _redact_secrets(text: str) -> str:
+    """Drop bearer, private_key, and token values before any tail is retained."""
+    return _SECRET_VALUE.sub(r"\1<redacted>", text)
+
+
+def _nonempty_text(value: bytes | str | None, *, limit: int = LOG_RETAIN, truncated: bool = False) -> str:
     if isinstance(value, bytes):
         text = value.decode("utf-8", errors="replace")
     elif value is None:
         text = ""
     else:
         text = str(value)
-    text = text.replace("\x00", "").strip()
+    text = text.replace("\x00", "")
+    if truncated:
+        # tail(1) can begin inside a secret, after the introducer has been cut off.
+        newline = text.find("\n")
+        text = "" if newline < 0 else text[newline + 1:]
+    text = _redact_secrets(text).strip()
     if not text:
         return "<empty>"
     return text[-limit:]
+
+
+def _captured_log_body(raw: bytes) -> tuple[bytes, bool]:
+    """Split a leading byte-count line. Truncated means the file was longer than the fetch."""
+    if not raw or raw.startswith(b"<empty>"):
+        return raw, False
+    newline = raw.find(b"\n")
+    if newline < 0:
+        return raw, False
+    header = raw[:newline].strip()
+    if not header.isdigit():
+        return raw, False
+    body = raw[newline + 1:]
+    return body, int(header) > len(body)
 
 
 def _timeout_command(error: subprocess.TimeoutExpired) -> str:
@@ -420,7 +450,10 @@ def capture_daemon_log(custody: Any, node: Node) -> str:
         raw = remote.run(node.host, DAEMON_LOG_SCRIPT, [node.root, marker], capture=True, timeout=10)
     except Exception as error:
         return f"<capture failed: {type(error).__name__}>"
-    return _nonempty_text(raw)
+    if not isinstance(raw, bytes):
+        raw = str(raw).encode()
+    body, truncated = _captured_log_body(raw)
+    return _nonempty_text(body, limit=LOG_RETAIN, truncated=truncated)
 
 
 def setup_timeout_diagnostic(custody: Any, node: Node, error: subprocess.TimeoutExpired) -> dict[str, str]:
