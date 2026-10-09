@@ -839,15 +839,18 @@ impl crate::Agent {
 
     /// Outbound call gate: the callee must pass the same identity gate as
     /// `gate_peer_outbound` and, when the connect ACL is Enabled, be
-    /// pair-listed — otherwise its media could never reach us.
+    /// listed — by an exact pair, an owner principal, or a Connect grant
+    /// against a grant principal.
     ///
     /// ADR-0070 / #1120: a callee that fails only on trust is admitted when
     /// it holds a live, unrevoked, unexpired `ShareGrant` carrying `Call`
     /// for this daemon's agent. The lookup is `OwnerTrust::grant_access`,
     /// the same one [`Self::call_gate_inbound`] uses. Revocation, cert
     /// expiry, ADR-0043 pairing, `Blocked`, a machine-pin mismatch and an
-    /// Enabled connect ACL are not bypassed. A `Call` grant is not an ACL
-    /// bypass, and it does not open a stream or a media lane.
+    /// Enabled connect ACL are not bypassed by `Call` alone. A current
+    /// `Connect` grant is the `principal = "grant"` listing, the same
+    /// selector the inbound call gate uses. A `Call` grant does not open a
+    /// stream or a media lane.
     pub(crate) async fn call_gate_outbound(&self, callee: &AgentId) -> Result<(), CallRefusal> {
         // ADR 0115: the machine is the one `gate_peer_outbound` would use.
         // Resolution stays here so the verdict below can be driven without
@@ -969,18 +972,39 @@ impl crate::Agent {
         };
         // ADR-0070 §1: an owner-trusted callee is listed by a
         // `principal = "owner"` ACL entry, exactly as on the inbound path.
+        // ADR-0070 §2: a current Connect grant lists the callee when the
+        // ACL has a `principal = "grant"` entry. A callee admitted by a
+        // Call grant is not Connect-grant-only, matching the inbound call
+        // gate, so a Disabled policy does not refuse them for that reason.
         let owner_trusted: &[AgentId] = if pair.owner_trusted {
             std::slice::from_ref(callee)
         } else {
             &[]
         };
-        crate::streams::stream_acl_gate(
-            &policy,
-            std::slice::from_ref(callee),
-            owner_trusted,
-            machine,
-        )
-        .map_err(|err| CallRefusal::from_gate_error(&err))
+        let agents = std::slice::from_ref(callee);
+        let has_connect_grant = !access.connect_ports.is_empty();
+        let acl_result = if has_connect_grant {
+            // Same grant-only rule as the inbound call gate: a Call grant
+            // is itself the rule for ringing, so a Disabled policy does not
+            // refuse the callee for lacking a Connect-only identity.
+            let grant_only: &[AgentId] =
+                if pair.decision != crate::trust::TrustDecision::Accept && !access.call {
+                    agents
+                } else {
+                    &[]
+                };
+            crate::streams::stream_acl_gate_with_grants(
+                &policy,
+                agents,
+                owner_trusted,
+                agents,
+                grant_only,
+                machine,
+            )
+        } else {
+            crate::streams::stream_acl_gate(&policy, agents, owner_trusted, machine)
+        };
+        acl_result.map_err(|err| CallRefusal::from_gate_error(&err))
     }
 }
 
@@ -1680,14 +1704,46 @@ mod tests {
             }
         }
 
-        fn acl(entries: Vec<ConnectAllowEntry>) -> ConnectPolicy {
+        fn acl(
+            entries: Vec<ConnectAllowEntry>,
+            grant_allow: Vec<crate::connect::ConnectOwnerEntry>,
+        ) -> ConnectPolicy {
             ConnectPolicy::Enabled(ConnectAcl {
                 loaded_from: std::path::PathBuf::from("/test/connect-acl.toml"),
                 loaded_at_unix_ms: 0,
                 allow: entries,
                 owner_allow: Vec::new(),
-                grant_allow: Vec::new(),
+                grant_allow,
             })
+        }
+
+        /// A `principal = "grant"` entry for loopback SSH. The call gate
+        /// treats any such entry as the grant selector; it does not check
+        /// the port. Port 22 is the Connect cap the regression carries.
+        fn grant_ssh() -> crate::connect::ConnectOwnerEntry {
+            crate::connect::ConnectOwnerEntry {
+                description: None,
+                targets: vec!["127.0.0.1:22".parse().expect("addr")],
+            }
+        }
+
+        fn call_and_connect() -> Vec<ShareCap> {
+            vec![ShareCap::Call, ShareCap::Connect { ports: vec![22] }]
+        }
+
+        async fn both(
+            w: &World,
+            trust: &OwnerTrust,
+            policy: ConnectPolicy,
+            expected: Result<(), CallRefusal>,
+            what: &str,
+        ) {
+            assert_eq!(
+                w.ring(trust, policy.clone()).await,
+                expected,
+                "inbound {what}"
+            );
+            assert_eq!(w.dial(trust, policy).await, expected, "outbound {what}");
         }
 
         fn listed(agent: AgentId, machine: MachineId) -> ConnectAllowEntry {
@@ -1796,17 +1852,20 @@ mod tests {
                 .await;
             let other = AgentKeypair::generate().expect("other").agent_id();
             assert_eq!(
-                w.ring(&trust, acl(vec![listed(other, w.mb)])).await,
+                w.ring(&trust, acl(vec![listed(other, w.mb)], Vec::new()))
+                    .await,
                 Err(CallRefusal::NotInConnectAcl)
             );
             assert_eq!(
-                w.ring(&trust, acl(vec![listed(w.b1, w.mb)])).await,
+                w.ring(&trust, acl(vec![listed(w.b1, w.mb)], Vec::new()))
+                    .await,
                 Ok(()),
                 "control: a listed grantee is admitted"
             );
             let none = w.daemon(&[]).await;
             assert_eq!(
-                w.ring(&none, acl(vec![listed(w.b1, w.mb)])).await,
+                w.ring(&none, acl(vec![listed(w.b1, w.mb)], Vec::new()))
+                    .await,
                 Err(CallRefusal::Untrusted),
                 "control: listing alone does not replace trust or the grant"
             );
@@ -1918,11 +1977,13 @@ mod tests {
                 .await;
             let other = AgentKeypair::generate().expect("other").agent_id();
             assert_eq!(
-                w.dial(&trust, acl(vec![listed(other, w.mb)])).await,
+                w.dial(&trust, acl(vec![listed(other, w.mb)], Vec::new()))
+                    .await,
                 Err(CallRefusal::NotInConnectAcl)
             );
             assert_eq!(
-                w.dial(&trust, acl(vec![listed(w.b1, w.mb)])).await,
+                w.dial(&trust, acl(vec![listed(w.b1, w.mb)], Vec::new()))
+                    .await,
                 Ok(()),
                 "control: a listed grantee is admitted"
             );
@@ -2021,6 +2082,124 @@ mod tests {
                 w.dial(&trust, ConnectPolicy::default()).await,
                 Err(CallRefusal::NotVerified)
             );
+        }
+
+        // WHY: a Call grant plus Connect { ports: [22] } is listed by a
+        // `principal = "grant"` ACL entry on both gates, with no exact
+        // pair. Outbound used to drop that Connect permission and return
+        // `NotInConnectAcl` while inbound admitted. Fails on the outbound
+        // assert while `call_gate_outbound_with` calls `stream_acl_gate`.
+        #[tokio::test]
+        async fn call_and_connect_grant_satisfies_grant_acl() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(call_and_connect(), now - 60, now + 3_600)])
+                .await;
+            let access = trust
+                .grant_access(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb)
+                .await;
+            assert!(
+                access.call && access.allows_connect_port(22),
+                "control: the grant confers Call and Connect port 22"
+            );
+            let policy = acl(Vec::new(), vec![grant_ssh()]);
+            both(
+                &w,
+                &trust,
+                policy,
+                Ok(()),
+                "grant principal lists the grantee",
+            )
+            .await;
+        }
+
+        // WHY: Call alone is not a Connect grant. A `principal = "grant"`
+        // entry and no pair listing still refuse both gates.
+        #[tokio::test]
+        async fn call_only_grant_does_not_use_grant_acl() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            let policy = acl(Vec::new(), vec![grant_ssh()]);
+            both(
+                &w,
+                &trust,
+                policy,
+                Err(CallRefusal::NotInConnectAcl),
+                "Call does not satisfy principal = grant",
+            )
+            .await;
+        }
+
+        // WHY: a Connect grant lists nothing when the ACL has no
+        // `principal = "grant"` entry. Both gates stay `NotInConnectAcl`.
+        #[tokio::test]
+        async fn connect_grant_without_grant_acl_entry_is_refused() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(call_and_connect(), now - 60, now + 3_600)])
+                .await;
+            let policy = acl(Vec::new(), Vec::new());
+            both(
+                &w,
+                &trust,
+                policy,
+                Err(CallRefusal::NotInConnectAcl),
+                "an empty grant_allow lists nobody",
+            )
+            .await;
+        }
+
+        // WHY: an expired Call+Connect grant confers neither cap, so a
+        // grant ACL entry does not admit either gate.
+        #[tokio::test]
+        async fn expired_call_and_connect_grant_does_not_use_grant_acl() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(call_and_connect(), now - 7_200, now - 60)])
+                .await;
+            let policy = acl(Vec::new(), vec![grant_ssh()]);
+            both(
+                &w,
+                &trust,
+                policy,
+                Err(CallRefusal::Untrusted),
+                "an expired grant is not a grant principal",
+            )
+            .await;
+        }
+
+        // WHY: revoking the Call+Connect grant on x0x.revocation.v3 removes
+        // the grant-ACL admit on the next evaluation, both directions.
+        #[tokio::test]
+        async fn revoked_call_and_connect_grant_does_not_use_grant_acl() {
+            let w = World::new().await;
+            let now = real_now();
+            let grant = w.grant(call_and_connect(), now - 60, now + 3_600);
+            let trust = w.daemon(std::slice::from_ref(&grant)).await;
+            let policy = acl(Vec::new(), vec![grant_ssh()]);
+            both(
+                &w,
+                &trust,
+                policy.clone(),
+                Ok(()),
+                "control: the live grant satisfies the grant ACL",
+            )
+            .await;
+            w.revoke(&grant).await;
+            both(
+                &w,
+                &trust,
+                policy,
+                Err(CallRefusal::Untrusted),
+                "a revoked grant is not a grant principal",
+            )
+            .await;
         }
     }
 }
