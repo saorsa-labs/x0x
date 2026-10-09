@@ -1,6 +1,6 @@
 //! `x0x history …` — ADR-0023 durable-history commands.
 
-use crate::cli::DaemonClient;
+use crate::cli::{DaemonClient, NewerOperation};
 use anyhow::Result;
 
 /// Build the shared `(key, value)` query list for list/search.
@@ -164,8 +164,15 @@ pub async fn stats(client: &DaemonClient) -> Result<()> {
 /// Prints the local history policy in force: rules, defaults, protected
 /// groups and counters. Needs the durable API token.
 pub async fn policy(client: &DaemonClient) -> Result<()> {
-    client.run_get("/history/policy").await
+    client.run_newer(&POLICY, None).await
 }
+
+/// `x0x history policy`: older daemons lack the route (ADR 0116 §5).
+pub(crate) const POLICY: NewerOperation = NewerOperation {
+    command: "x0x history policy",
+    method: crate::api::Method::Get,
+    path: "/history/policy",
+};
 
 /// `x0x history purge` — DELETE /history
 ///
@@ -245,5 +252,117 @@ mod tests {
     fn list_always_sends_its_scope() {
         let q = common_query(Some("dm:abc"), &None, &None, &None, &None);
         assert_eq!(q, vec![("scope", "dm:abc")]);
+    }
+
+    /// Every operation older daemons may lack names the registered route
+    /// and the registered CLI command, so the unsupported-operation error
+    /// points at the real route.
+    #[test]
+    fn adr0116_unsupported_operations_match_the_api_registry() {
+        for op in [&POLICY] {
+            let entry = crate::api::ENDPOINTS
+                .iter()
+                .find(|e| e.method == op.method && e.path == op.path)
+                .unwrap_or_else(|| panic!("{} {} is not registered", op.method, op.path));
+            assert_eq!(format!("x0x {}", entry.cli_name), op.command);
+        }
+    }
+
+    /// Serve `router` on a loopback port and point a CLI client at it.
+    /// Loopback only: the sandbox and CI forbid anything else.
+    async fn daemon_at(router: axum::Router) -> (DaemonClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = DaemonClient::new(
+            None,
+            Some(&addr.to_string()),
+            crate::cli::OutputFormat::Json,
+        )
+        .expect("client");
+        (client, server)
+    }
+
+    /// A daemon from before ADR 0116: it serves `/health` and has no
+    /// `/history/policy` route, so axum answers an empty 404.
+    fn older_daemon() -> axum::Router {
+        axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+        )
+    }
+
+    /// WHY (ADR 0116 §5 and its validation line "test the new API's absence
+    /// on an older daemon", Codex E r1 P2): `x0x history policy` against an
+    /// older daemon must report an unsupported operation, not `unknown
+    /// error (HTTP 404)`.
+    #[tokio::test]
+    async fn adr0116_unsupported_policy_on_an_older_daemon() {
+        let (client, server) = daemon_at(older_daemon()).await;
+        let rendered = policy(&client)
+            .await
+            .expect_err("an older daemon cannot serve the policy")
+            .to_string();
+        server.abort();
+        assert!(
+            rendered.contains("unsupported operation")
+                && rendered.contains("`x0x history policy`")
+                && rendered.contains("GET /history/policy")
+                && rendered.contains("predates"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unknown error"), "{rendered}");
+    }
+
+    /// The same with an older daemon whose unknown routes answer a JSON 404.
+    #[tokio::test]
+    async fn adr0116_unsupported_policy_json_404_on_an_older_daemon() {
+        let router = older_daemon().fallback(|| async {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({ "ok": false, "error": "not found" })),
+            )
+        });
+        let (client, server) = daemon_at(router).await;
+        let rendered = policy(&client)
+            .await
+            .expect_err("an older daemon cannot serve the policy")
+            .to_string();
+        server.abort();
+        assert!(
+            rendered.contains("unsupported operation")
+                && rendered.contains("`x0x history policy`")
+                && rendered.contains("predates"),
+            "{rendered}"
+        );
+    }
+
+    /// Control: a daemon that has the route but refuses the caller keeps
+    /// its own error. A 403 is never reported as an older daemon.
+    #[tokio::test]
+    async fn adr0116_unsupported_policy_keeps_a_403() {
+        let router = older_daemon().route(
+            "/history/policy",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "ok": false,
+                        "error": "durable API token required",
+                    })),
+                )
+            }),
+        );
+        let (client, server) = daemon_at(router).await;
+        let rendered = policy(&client)
+            .await
+            .expect_err("a 403 is an error")
+            .to_string();
+        server.abort();
+        assert_eq!(rendered, "durable API token required (HTTP 403)");
     }
 }
