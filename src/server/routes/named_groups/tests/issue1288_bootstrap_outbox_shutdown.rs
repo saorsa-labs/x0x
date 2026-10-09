@@ -11,8 +11,8 @@
 //! Each test starts a loopback daemon, holds that in-flight state at
 //! shutdown, and checks the #1274 bar: AppState and Agent strong counts are
 //! 0 when `shutdown_and_wait` returns, and an immediate same-dir relaunch
-//! succeeds. The write test also checks that the parked outbox write
-//! finishes with a valid sidecar and no temp file left beside it.
+//! succeeds. The write test seeds a durable obligation, then checks before
+//! relaunch that the parked write removed it and left no temp file.
 //!
 //! The daemons bind loopback only (`127.0.0.1:0`) with no bootstrap peers,
 //! mDNS, port mapping or peer cache; no test traffic leaves the process.
@@ -81,15 +81,24 @@ struct Daemon {
     agent_weak: std::sync::Weak<x0x::Agent>,
 }
 
-/// What a shutdown left behind.
+/// A daemon that has stopped and still owns its data directory.
+struct StoppedDaemon {
+    /// Strong counts of the AppState and the Agent when `shutdown_and_wait`
+    /// returned.
+    at_return: (usize, usize),
+    config: crate::server::DaemonConfig,
+    /// Kept so a test can read the sidecar before relaunch. Dropping it
+    /// removes the data directory.
+    _root: tempfile::TempDir,
+}
+
+/// What a shutdown and the following same-dir relaunch left behind.
 struct ShutdownOutcome {
     /// Strong counts of the AppState and the Agent when `shutdown_and_wait`
     /// returned.
     at_return: (usize, usize),
     /// The same-dir relaunch, attempted at once.
     relaunch: std::result::Result<(), String>,
-    /// Kept so a test can read the sidecar after the relaunch. Dropping it
-    /// removes the data directory.
     _root: tempfile::TempDir,
 }
 
@@ -114,10 +123,11 @@ async fn start_daemon(tag: &str) -> Result<(Daemon, Arc<AppState>)> {
 }
 
 impl Daemon {
-    /// Shut the daemon down, read both strong counts as soon as
-    /// `shutdown_and_wait` returns, and relaunch on the same directories at
-    /// once. The caller must have dropped its own AppState handles.
-    async fn stop_and_relaunch(self) -> Result<ShutdownOutcome> {
+    /// Shut the daemon down and read both strong counts as soon as
+    /// `shutdown_and_wait` returns. The caller must have dropped its own
+    /// AppState handles. The data directory stays alive so a test can read
+    /// the sidecar before any relaunch.
+    async fn stop(self) -> Result<StoppedDaemon> {
         let Daemon {
             _root,
             config,
@@ -129,7 +139,27 @@ impl Daemon {
             .await
             .context("shutdown returns within 60 s")?
             .context("shutdown")?;
-        let at_return = (state_weak.strong_count(), agent_weak.strong_count());
+        Ok(StoppedDaemon {
+            at_return: (state_weak.strong_count(), agent_weak.strong_count()),
+            config,
+            _root,
+        })
+    }
+
+    /// Shut the daemon down and relaunch on the same directories at once.
+    async fn stop_and_relaunch(self) -> Result<ShutdownOutcome> {
+        self.stop().await?.relaunch().await
+    }
+}
+
+impl StoppedDaemon {
+    /// Relaunch on the same directories.
+    async fn relaunch(self) -> Result<ShutdownOutcome> {
+        let StoppedDaemon {
+            at_return,
+            config,
+            _root,
+        } = self;
         let relaunch = match tokio::time::timeout(
             LIFECYCLE,
             crate::server::serve_with_options(config, loopback_daemon_options()),
@@ -266,27 +296,48 @@ async fn issue1288_signed_public_add_parked_in_bootstrap_send_releases_owner() -
     Ok(())
 }
 
+/// Write one obligation to the outbox sidecar and sync it. This is the
+/// before-image the parked reconcile must replace.
+fn write_durable_outbox_seed(
+    path: &std::path::Path,
+    obligation: &crate::server::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation,
+) -> Result<()> {
+    let json = serde_json::to_string(&serde_json::json!({
+        "version": 1,
+        "entries": [serde_json::to_value(obligation).context("encode the seed obligation")?],
+    }))
+    .context("encode the seed sidecar")?;
+    let mut file = std::fs::File::create(path).context("create the seed sidecar")?;
+    std::io::Write::write_all(&mut file, json.as_bytes()).context("write the seed sidecar")?;
+    file.sync_all().context("sync the seed sidecar")?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
+    Ok(())
+}
+
 /// A bootstrap-outbox write parked between the synced temp file and the
-/// rename must finish across shutdown: the sidecar is valid JSON, the
-/// reconciled contents are what landed, and no temp file remains.
-///
-/// The debt is memory-only and owed to an agent who is not a member. The
-/// timer's next pass drops it and persists that. No roster save shares this
-/// write, and the durability-confirmation flag is left alone: a durable
-/// roster save clears that flag.
+/// rename must finish across shutdown. The sidecar already holds an
+/// obligation the roster does not justify. The parked reconcile removes
+/// that obligation. The test reads the sidecar before relaunch: startup
+/// loads the outbox and reconciles it again, so a read after relaunch can
+/// hide a write that never landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1288_bootstrap_outbox_write_parked_before_rename_completes() -> Result<()> {
     let (daemon, state) = start_daemon("write").await?;
     let group_id = create_public_group(&state).await?;
     let path = state.public_group_bootstrap_outbox_path.clone();
-    let pause = atomic_write_test_seam::arm(&path);
+    // Hold the membership lock the step takes before it reconciles, so the
+    // seed is on disk before that write starts.
+    let membership = group_membership_lock(&state, &group_id).await;
+    let membership_guard = membership.lock().await;
     let recipient = x0x::identity::AgentId(rand::random());
     let recipient_hex = hex::encode(recipient.as_bytes());
     {
         // The live roster does not list this recipient, so the next pass
-        // drops the debt and writes that. `prepare` only needs a group the
-        // reconciler can find; a freshly created public group has no sealed
-        // commit yet, and the drop path does not require one.
+        // drops the debt and rewrites the sidecar. `prepare` only needs a
+        // group the reconciler can find; a freshly created public group has
+        // no sealed commit yet, and the drop path does not require one.
         let group = state
             .named_groups
             .read()
@@ -299,12 +350,20 @@ async fn issue1288_bootstrap_outbox_write_parked_before_rename_completes() -> Re
             group,
         )
         .map_err(|error| anyhow::anyhow!(error))?;
+        write_durable_outbox_seed(&path, &obligation)?;
+        let seeded = std::fs::read_to_string(&path).context("read the seeded sidecar")?;
+        assert!(
+            seeded.contains(&recipient_hex),
+            "the durable seed must contain the obligation the reconcile removes: {seeded}"
+        );
         state
             .public_group_bootstrap_outbox
             .write()
             .await
             .insert(obligation.key.clone(), obligation);
     }
+    let pause = atomic_write_test_seam::arm(&path);
+    drop(membership_guard);
     wait_parked(
         || pause.reached(),
         "the bootstrap outbox reconciliation write",
@@ -313,7 +372,7 @@ async fn issue1288_bootstrap_outbox_write_parked_before_rename_completes() -> Re
     let shutdown_started = state.shutdown_started.clone();
     drop(state);
 
-    let shutdown = tokio::spawn(async move { daemon.stop_and_relaunch().await });
+    let shutdown = tokio::spawn(async move { daemon.stop().await });
     tokio::time::timeout(LIFECYCLE, shutdown_started.cancelled())
         .await
         .context("the drain cancels shutdown_started")?;
@@ -323,11 +382,17 @@ async fn issue1288_bootstrap_outbox_write_parked_before_rename_completes() -> Re
         "shutdown must still be waiting on the parked outbox write"
     );
     pause.release();
-    let outcome = tokio::time::timeout(LIFECYCLE, shutdown)
+    let stopped = tokio::time::timeout(LIFECYCLE, shutdown)
         .await
         .context("shutdown task")?
         .context("shutdown task join")??;
-    assert_released(&outcome, "parked bootstrap outbox write");
+    assert_eq!(
+        stopped.at_return,
+        (0, 0),
+        "parked bootstrap outbox write: the AppState and Agent strong counts must be 0 when \
+         shutdown_and_wait returns (counts {:?})",
+        stopped.at_return
+    );
     assert_eq!(
         leftover_temp_files(&path),
         Vec::<String>::new(),
@@ -336,13 +401,19 @@ async fn issue1288_bootstrap_outbox_write_parked_before_rename_completes() -> Re
     let sidecar = std::fs::read_to_string(&path).context("read bootstrap outbox sidecar")?;
     let parsed: serde_json::Value =
         serde_json::from_str(&sidecar).context("bootstrap outbox sidecar is valid JSON")?;
+    let entries = parsed
+        .get("entries")
+        .and_then(|entries| entries.as_array())
+        .context("the sidecar keeps an entries array")?;
     assert!(
-        parsed.get("entries").is_some(),
-        "the sidecar keeps its shape: {sidecar}"
+        entries.is_empty(),
+        "reconciliation must persist the dropped obligation before relaunch: {sidecar}"
     );
     assert!(
         !sidecar.contains(&recipient_hex),
-        "reconciliation must persist the dropped obligation: {sidecar}"
+        "the removed recipient must be gone from the sidecar before relaunch: {sidecar}"
     );
+    let outcome = stopped.relaunch().await?;
+    assert_released(&outcome, "parked bootstrap outbox write");
     Ok(())
 }
