@@ -963,19 +963,25 @@ pub(super) struct AppState {
     /// AppState: named-group event direct deliveries (immediate and
     /// delayed), the terminal-event and delegation-carrier redelivery
     /// schedules, legacy join work, control-blob fetches and sends, the
-    /// owner-side join-result and Welcome fetch handlers, and the delayed
-    /// card and chat publishes of `POST /groups`. None of them persists
-    /// anything. `None` closes admission during shutdown; the shutdown tail
-    /// drains them with the other server tasks (grace, then abort), so none
-    /// of them keeps the Agent and its exclusive `history.db` connection
-    /// alive after `shutdown_and_wait`.
+    /// owner-side join-result and Welcome fetch handlers, the delayed card
+    /// and chat publishes of `POST /groups`, and since #1274 the public
+    /// message fan-out race (gossip publish and member unicasts), the
+    /// one-shot predecessor-relay offer used when the durable offer
+    /// obligation could not be persisted, the member-keyed KeyPackage
+    /// catch-up requests, the KV-store delta direct deliveries and the
+    /// outgoing file-chunk streams. None of them persists anything. `None`
+    /// closes admission during shutdown; the shutdown tail drains them with
+    /// the other server tasks (grace, then abort), so none of them keeps the
+    /// Agent and its exclusive `history.db` connection alive after
+    /// `shutdown_and_wait`.
     pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     /// #1269 r2: admitted applies that persist group state (a pulled
     /// control blob's apply, the owner-certificate join retry) and, since
     /// #1275, every apply a server listener runs for an event it received
     /// (named-group metadata, join results, catch-up responses, group
     /// bootstraps, predecessor relays, KV-store deltas, certificate
-    /// hydrations). Shutdown never aborts them: an abort inside an atomic
+    /// hydrations), and since #1274 the owner-sync profile catch-up write.
+    /// Shutdown never aborts them: an abort inside an atomic
     /// write or its journal step would leave the persisted state torn, or
     /// leave a blocking write running after the daemon released its locks.
     /// `None` closes admission (an apply that has not started is refused);

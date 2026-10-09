@@ -2885,20 +2885,27 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
     // #1269: detached best-effort tasks (delayed direct deliveries, the
     // redelivery schedules, control-blob fetches, the owner-side join-result
-    // and Welcome fetch handlers, delayed publishes) and the joiner's
-    // join-attempt polls and sends hold the Agent or this AppState. Left
-    // running, one asleep before a delayed delivery keeps the Agent, and its
-    // exclusive `history.db` connection, alive after the supervisor returns,
-    // and a same-dir relaunch is refused. Taking `Some` closes detached
-    // admission; the attempt registry is drained after it, so
+    // and Welcome fetch handlers, delayed publishes; since #1274 also the
+    // public-message fan-out race, the one-shot predecessor-relay fallback
+    // offer, the member-keyed KeyPackage catch-up requests, the KV-store
+    // delta direct deliveries and the outgoing file-chunk streams) and the
+    // joiner's join-attempt polls and sends hold the Agent or this AppState.
+    // Left running, one asleep before a delayed delivery keeps the Agent, and
+    // its exclusive `history.db` connection, alive after the supervisor
+    // returns, and a same-dir relaunch is refused. Taking `Some` closes
+    // detached admission; the attempt registry is drained after it, so
     // `spawn_attempt_task_under_guard` (which checks admission under the
     // registry lock) either registered its task before this drain or spawns
     // nothing. None of this work persists anything: the deliveries and
     // publishes are best-effort copies of what the metadata topic and the
-    // join-result fetch carry, the redelivery schedules are deliberately not
-    // persisted, and the join-attempt registry is in-memory and dies with
-    // this AppState anyway (recovery after a joiner restart is ADR 0107's
-    // durable carry remnant). Work that does persist runs shielded (below).
+    // join-result fetch carry (the public fan-out re-sends a message already
+    // published and cached; the predecessor fallback runs only after its
+    // durable obligation could not be written, and that write is the request
+    // handler's own, never a detached task's), the redelivery schedules are
+    // deliberately not persisted, and the join-attempt registry is in-memory
+    // and dies with this AppState anyway (recovery after a joiner restart is
+    // ADR 0107's durable carry remnant). Work that does persist runs shielded
+    // (below).
     bg_tasks.extend(
         state
             .detached_tasks

@@ -166,7 +166,14 @@ impl SyncDaemonView for DaemonView {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        tokio::spawn(async move {
+        // #1274: the catch-up persists the profile, so it runs shielded
+        // (`AppState::spawn_shielded`): the shutdown drain waits for a write
+        // in progress instead of leaving it to outlive the daemon with this
+        // AppState (and `history.db`) held, and refuses one that has not
+        // started, as if the sync had arrived after the stop.
+        let task_state = Arc::clone(&state);
+        state.spawn_shielded(async move {
+            let state = task_state;
             let mut profile = state.profile.write().await;
             let mut changed = false;
             if let Some(human) = human_name {

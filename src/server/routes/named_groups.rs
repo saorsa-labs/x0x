@@ -9059,12 +9059,26 @@ async fn resolve_member_treekem_kp_for_removal_locked(
     }
     // Local recovery miss — request the package from peers that witnessed the
     // join (fire-and-forget) and tell the client to retry once it lands.
+    //
+    // #1274: the catch-up only sends requests; its one write is the
+    // in-memory request throttle. The response is applied, and persisted,
+    // by the catch-up listener, whose apply is shielded (#1275). So the
+    // request task is detached and the shutdown drain may abort it; the
+    // client's retry asks again after a restart. Before this, sequential
+    // requests to unavailable witnesses kept this AppState, and with it
+    // `history.db`, alive after `shutdown_and_wait`.
     let bg_state = Arc::clone(state);
     let bg_group = group_id.to_string();
     let bg_member = agent_id_hex.to_string();
-    tokio::spawn(async move {
+    if !state.spawn_detached(async move {
         request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
-    });
+    }) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(agent_id_hex),
+            "shutdown has begun; member-keyed KeyPackage catch-up not requested"
+        );
+    }
     Err((
         StatusCode::FAILED_DEPENDENCY,
         Json(serde_json::json!({
@@ -17240,6 +17254,15 @@ pub(in crate::server) mod detached_send_test_seam {
 /// starts immediately and does not wait for per-member unicast to finish or
 /// fail (issue #310). First success wins per recipient because
 /// [`cache_public_message`] no-ops on an already-cached signature.
+///
+/// #1274: every leg is a send. The caller has already published the message
+/// and cached it locally (history row included) before this runs, so the
+/// race persists nothing and only adds copies of a message that is already
+/// on the wire. Its tasks are detached ([`AppState::spawn_detached`]): the
+/// shutdown drain gives them the server grace and then aborts them, so a
+/// publish or unicast held up by back-pressure or an unavailable peer can
+/// no longer keep the Agent, and its `history.db` connection, alive after
+/// `shutdown_and_wait`. A leg that shutdown refuses is never started.
 fn spawn_group_public_message_fanout_race(
     state: Arc<AppState>,
     topic: String,
@@ -17253,7 +17276,7 @@ fn spawn_group_public_message_fanout_race(
     let gossip_bytes = bytes;
     let gossip_group = msg.group_id.clone();
     let gossip_outstanding = Arc::clone(&unicast_outstanding);
-    tokio::spawn(async move {
+    state.spawn_detached(async move {
         tracing::info!(
             target: "x0x::groups",
             group_id = %LogHexId::group(&gossip_group),
@@ -17316,10 +17339,14 @@ fn spawn_group_public_message_delivery(
                 recipient = %LogHexId::agent(recipient_hex),
                 "X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL=timeout; hanging public-message unicast (test-only, #310)"
             );
-            tokio::spawn(async move {
+            // #1274: drained like the real unicast it stands in for.
+            let hung = Arc::clone(&outstanding);
+            if !state.spawn_detached(async move {
                 tokio::time::sleep(Duration::from_secs(24)).await;
+                hung.fetch_sub(1, Ordering::Relaxed);
+            }) {
                 outstanding.fetch_sub(1, Ordering::Relaxed);
-            });
+            }
             return;
         }
         GroupPublicUnicastInject::KeyUnavailable => {
@@ -17355,7 +17382,12 @@ fn spawn_group_public_message_delivery(
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let group_id = msg.group_id.clone();
-    tokio::spawn(async move {
+    let task_outstanding = Arc::clone(&outstanding);
+    // #1274: a send only (see `spawn_group_public_message_fanout_race`), so
+    // it is detached and the shutdown drain may abort it. A send that
+    // shutdown refuses is never started and no longer counts as outstanding.
+    let admitted = state.spawn_detached(async move {
+        let outstanding = task_outstanding;
         #[cfg(test)]
         detached_send_test_seam::park(&detached_send_test_seam::public_unicast_key(
             &group_id,
@@ -17388,6 +17420,9 @@ fn spawn_group_public_message_delivery(
         }
         outstanding.fetch_sub(1, Ordering::Relaxed);
     });
+    if !admitted {
+        outstanding.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub(in crate::server) async fn ingest_public_message(
@@ -25464,36 +25499,13 @@ pub(in crate::server) async fn create_join_request(
                     "#908: failed to persist the requester offer obligation; falling back to a one-shot send"
                 );
                 if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
-                    let mut dm_payload = Vec::with_capacity(
-                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len(),
-                    );
-                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-                    dm_payload.extend_from_slice(&envelope);
-                    let agent = Arc::clone(&state.agent);
-                    let creator = creator_hex.clone();
-                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
-                    #[cfg(test)]
-                    let pause_key = detached_send_test_seam::predecessor_fallback_key(
+                    spawn_predecessor_relay_fallback_offer(
+                        &state,
                         &event_group_id,
-                        &creator,
+                        &creator_hex,
+                        creator_id,
+                        &envelope,
                     );
-                    tokio::spawn(async move {
-                        #[cfg(test)]
-                        detached_send_test_seam::park(&pause_key).await;
-                        if let Err(e) = agent
-                            .send_direct_with_config(
-                                &creator_id,
-                                dm_payload,
-                                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                creator = %LogHexId::agent(&creator),
-                                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
-                            );
-                        }
-                    });
                 }
             }
         }
@@ -25507,6 +25519,65 @@ pub(in crate::server) async fn create_join_request(
             "group_id": id,
         })),
     )
+}
+
+/// The pre-#908 one-shot offer of a requester-signed predecessor envelope to
+/// the authority (ADR 0028), used only when `create_join_request` could not
+/// persist the durable offer obligation.
+///
+/// #1274: the durable path and this fallback are kept apart. The obligation
+/// is written by `insert_requester_offer_obligation`, awaited inline in the
+/// request handler before the 201 returns, and retried from the outbox by
+/// the requester-offer worker; no detached task ever owns that write. This
+/// fallback runs only after that write failed, so there is no obligation to
+/// keep: it is one direct send and persists nothing. It is therefore
+/// detached ([`AppState::spawn_detached`]) and the shutdown drain may abort
+/// it, which loses no more than the one-shot it already was (the request
+/// itself is in the persisted roster and on the metadata topic). Before
+/// this, a send that waited out an unavailable authority kept the Agent,
+/// and its `history.db` connection, alive after `shutdown_and_wait`.
+fn spawn_predecessor_relay_fallback_offer(
+    state: &AppState,
+    group_id: &str,
+    creator_hex: &str,
+    creator_id: AgentId,
+    envelope: &[u8],
+) {
+    let mut dm_payload =
+        Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
+    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+    dm_payload.extend_from_slice(envelope);
+    let agent = Arc::clone(&state.agent);
+    let creator = creator_hex.to_string();
+    let fallback_digest: [u8; 32] = blake3::hash(envelope).into();
+    let group = group_id.to_string();
+    #[cfg(test)]
+    let pause_key = detached_send_test_seam::predecessor_fallback_key(group_id, creator_hex);
+    let admitted = state.spawn_detached(async move {
+        #[cfg(test)]
+        detached_send_test_seam::park(&pause_key).await;
+        if let Err(e) = agent
+            .send_direct_with_config(
+                &creator_id,
+                dm_payload,
+                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
+            )
+            .await
+        {
+            tracing::warn!(
+                group_id = %LogHexId::group(&group),
+                creator = %LogHexId::agent(&creator),
+                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+            );
+        }
+    });
+    if !admitted {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            creator = %LogHexId::agent(creator_hex),
+            "ADR 0028: shutdown has begun; the one-shot predecessor offer is not sent"
+        );
+    }
 }
 
 /// POST /groups/:id/requests/:request_id/approve — approve request (admin+).

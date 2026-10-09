@@ -680,12 +680,26 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
         return;
     };
 
-    // Spawn async task to stream chunks
-    let state = Arc::clone(state);
-    let transfer_id = transfer_id.to_string();
-    tokio::spawn(async move {
-        stream_file_chunks(&state, &transfer_id, &path, &sha256, &agent_id).await;
-    });
+    // Spawn async task to stream chunks.
+    //
+    // #1274: the stream only reads the source file, sends chunks and keeps
+    // the in-memory transfer status, so it is detached
+    // (`AppState::spawn_detached`) and the shutdown drain may abort it, as a
+    // process exit would. Before this, a long transfer or a stalled
+    // receiver's ACK wait kept this AppState, and with it `history.db`,
+    // alive after `shutdown_and_wait`.
+    let task_state = Arc::clone(state);
+    let task_transfer_id = transfer_id.to_string();
+    if !state.spawn_detached(async move {
+        stream_file_chunks(&task_state, &task_transfer_id, &path, &sha256, &agent_id).await;
+    }) {
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            t.status = x0x::files::TransferStatus::Failed;
+            t.error = Some("daemon is shutting down".to_string());
+            t.completed_at_unix_ms = Some(file_transfer_now().1);
+        }
+    }
 }
 
 /// Stream file chunks to the receiver via direct messaging.
