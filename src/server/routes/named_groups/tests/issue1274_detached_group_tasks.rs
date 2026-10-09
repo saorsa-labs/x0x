@@ -331,36 +331,62 @@ async fn issue1274_join_artifact_egress_at_shutdown_releases_owner() -> Result<(
     Ok(())
 }
 
-/// Once the shutdown drain has started, a new join-artifact egress is not
-/// registered and its body never runs. Inert: no daemon, no socket.
+/// Once the shutdown drain has started, a new join-artifact egress is
+/// refused before anything is spawned (review r2, P2): the call itself
+/// drops the body and keeps no AppState handle of its own, so nothing a
+/// refused egress captured can outlive the call. An egress that was spawned
+/// and then aborted would still own its captures until the runtime ran the
+/// cancellation, after the drain may already have reported the egress
+/// registry idle. The checks run at once, with no await between the call
+/// and them; on this current-thread runtime no other task can run in
+/// between. Inert: no daemon, no socket.
 #[tokio::test]
-async fn issue1274_join_artifact_egress_after_shutdown_start_is_refused() -> Result<()> {
+async fn issue1274_join_artifact_egress_refused_after_shutdown_start_releases_at_once() -> Result<()>
+{
     let (state, _dir) = secure_endpoint_test_state().await?;
     state.shutdown_started.cancel();
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // What a real egress body captures (the AppState), plus a probe that
+    // only the body owns.
+    let probe = Arc::new(());
+    let probe_weak = Arc::downgrade(&probe);
     let body_ran = Arc::clone(&ran);
+    let body_state = Arc::clone(&state);
+    let owners_with_body = Arc::strong_count(&state);
     spawn_join_artifact_egress(
         &state,
         &random_hex(32),
         &random_hex(32),
-        "join_result",
+        "secure_share",
         Instant::now() + PENDING_JOIN_RESULT_TTL,
         async move {
+            let _probe = probe;
+            let _held = body_state;
             body_ran.store(true, std::sync::atomic::Ordering::SeqCst);
         },
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        !ran.load(std::sync::atomic::Ordering::SeqCst),
-        "no egress body runs after shutdown has started"
-    );
+    let probe_owners = probe_weak.strong_count();
+    let state_owners = Arc::strong_count(&state);
     let registered = state
         .join_artifact_egress
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .flatten()
-        .any(|task| !task.is_finished());
-    assert!(!registered, "no egress task is left in the registry");
+        .count();
+    let ran = ran.load(std::sync::atomic::Ordering::SeqCst);
+    // Expected: the body's probe has no owner, the AppState lost the body's
+    // handle and gained none, nothing is registered and the body never ran.
+    assert_eq!(
+        (
+            probe_owners,
+            state_owners as i64 - owners_with_body as i64,
+            registered,
+            ran
+        ),
+        (0, -1, 0, false),
+        "a refused egress must release what it captured within the call \
+         (probe owners, AppState owner delta, registered, body ran)"
+    );
     Ok(())
 }
