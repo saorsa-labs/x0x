@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.6] - 2026-10-09
+
 ### Changed
 
 - **ant-quic 0.27.56** (from 0.27.54, via 0.27.55). Node shutdown now releases the UDP
@@ -22,6 +24,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Relaunch is no longer blocked by `database is locked` after a group join (#1269, #1250).**
+  Background group tasks are drained at shutdown, and group-store hooks no longer
+  hold AppState in a reference cycle, so AppState, the Agent and `history.db` are
+  released when `shutdown_and_wait` returns. State-writing group applies are
+  shielded from the shutdown abort, so they are never cut off mid-write; this
+  covers listener-driven applies too (#1275). After teardown starts, a send can no
+  longer re-insert a session into the session registry (#1277).
+- **Boot no longer stalls on a large history.db (#1263 part 2).** The canonical-id
+  backfill keeps a progress cursor, so each row is examined once instead of on
+  every start, and the open runs off the async worker.
+- **The history byte cap converges without deleting most of history (#1264 part 1).**
+  The reaper measures live pages, reclaims FTS tombstones and free pages first
+  under a time budget, then deletes close to the minimum number of oldest rows.
+- **A surviving group member keeps its encrypted store after another member is
+  removed (#1266).** A read during the rekey gap no longer retires the store, and a
+  record that arrived during the gap is recovered with a bounded state request once
+  the new key arrives. This also fixes an AppState reference cycle through the GSS
+  store hook.
 - **In-process shutdown releases the UDP socket and no longer stalls (#1262, #1263 part 1).**
   An embedded daemon (`x0x::server::serve`) running beside other daemons in one
   process could fail graceful shutdown with `shutdown socket release timeout ...
