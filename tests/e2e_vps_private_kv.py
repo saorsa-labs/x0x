@@ -5,10 +5,16 @@ The harness reuses the ordinary #565 tunnel, API, polling, evidence, and service
 custody primitives. It never addresses a production unit. Both scenarios are
 selected explicitly with ``--scenario``; missing Home ownership/seating support
 is a failed prerequisite, never a skip or a substitute group.
+
+Private join readiness (#1214) is the owner roster, local ``active`` state, and
+a decrypt of a message the inviter sealed after both of those. A TreeKEM Welcome
+that was never installed leaves the joiner unable to decrypt, so the check
+times out. Home seating keeps the roster and local-active check only.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import json
 import time
@@ -42,6 +48,21 @@ def settled_home(client: Api, label: str, timeout: float) -> tuple[int, dict[str
                                     and result[1].get("state") == HOME_PROVISIONING_PENDING))
 
 
+def private_decrypt_class(status: Any, body: Any, expected_b64: str) -> str:
+    """Fixed class for one decrypt attempt. The class is never body text."""
+    payload = body if isinstance(body, dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), str) else ""
+    reason = payload.get("reason") if isinstance(payload.get("reason"), str) else ""
+    if status == 200 and not reason:
+        matched = payload.get("ok") is not False and payload.get("payload_b64") == expected_b64
+        return "decrypted" if matched else "wrong_plaintext"
+    if status == 424 and not reason and error.startswith("TreeKEM group not loaded"):
+        return "treekem_not_loaded"
+    if status == 400 and not reason and error.startswith("treekem decrypt failed"):
+        return "treekem_decrypt_failed"
+    return "not_decrypted"
+
+
 def machine_id(client: Api) -> str:
     status, body = client.request("GET", "/agent")
     value = body.get("machine_id")
@@ -53,11 +74,13 @@ def machine_id(client: Api) -> str:
 class Scenario(SharedScenario):
     def join_private(self, owner: str, member: str, gid: str, invite: str | None = None) -> None:
         invite = invite or self.invite(owner, member, gid)
+        # #1214: roster + local active is not the Welcome key. Require a decrypt.
         self._join_with_local_readiness(
             owner, member, gid, {"invite": invite},
             accepted_label=f"{member} joined expected group",
             readiness_label=f"{member} private join reaches owner and local readiness",
-            operation="private_join_readiness")
+            operation="private_join_readiness",
+            require_epoch_key=True)
 
     def home(self, owner: str) -> tuple[str, str]:
         status, body = settled_home(self.c[owner], owner, self.timeout)
@@ -107,9 +130,45 @@ class Scenario(SharedScenario):
             readiness_label=f"{member} Home seat reaches owner and local readiness",
             operation="home_join_readiness")
 
+    def _private_epoch_key_installed(self, inviter: str, member: str, gid: str) -> dict[str, Any]:
+        """One seal-then-decrypt attempt. Facts never include ciphertext or plaintext."""
+        payload = base64.b64encode(uuid.uuid4().bytes).decode()
+        facts: dict[str, Any] = {"epoch_key_installed": False}
+        try:
+            status, body = self.c[inviter].request(
+                "POST", f"/groups/{enc(gid)}/secure/encrypt", {"payload_b64": payload})
+        except Exception as error:
+            facts["encrypt_error_class"] = type(error).__name__
+            facts["decrypt_class"] = "seal_unusable"
+            return facts
+        facts["encrypt_status"] = status if isinstance(status, int) else None
+        body = body if isinstance(body, dict) else {}
+        ciphertext, epoch = body.get("ciphertext_b64"), body.get("secret_epoch")
+        if status != 200 or not isinstance(ciphertext, str) or not ciphertext or type(epoch) is not int:
+            facts["decrypt_class"] = "seal_unusable"
+            return facts
+        facts["secret_epoch"] = epoch
+        sealed: dict[str, Any] = {"ciphertext_b64": ciphertext, "secret_epoch": epoch}
+        nonce = body.get("nonce_b64")
+        if isinstance(nonce, str) and nonce:
+            sealed["nonce_b64"] = nonce
+        try:
+            dstatus, dbody = self.c[member].request(
+                "POST", f"/groups/{enc(gid)}/secure/decrypt", sealed)
+        except Exception as error:
+            facts["decrypt_error_class"] = type(error).__name__
+            facts["decrypt_class"] = "not_decrypted"
+            return facts
+        facts["decrypt_status"] = dstatus if isinstance(dstatus, int) else None
+        decrypt_class = private_decrypt_class(dstatus, dbody, payload)
+        facts["decrypt_class"] = decrypt_class
+        facts["epoch_key_installed"] = decrypt_class == "decrypted"
+        return facts
+
     def _join_with_local_readiness(self, owner: str, member: str, gid: str,
                                    join_body: dict[str, Any], accepted_label: str,
-                                   readiness_label: str, operation: str) -> None:
+                                   readiness_label: str, operation: str,
+                                   require_epoch_key: bool = False) -> None:
         status, body = self.c[member].request("POST", "/groups/join", join_body)
         body = body if isinstance(body, dict) else {}
         join_state = body.get("join_state")
@@ -131,6 +190,7 @@ class Scenario(SharedScenario):
         first_sample_utc = last_sample_utc = None
         last_error: str | None = None
         deadline_reached = False
+        last_key_facts: dict[str, Any] | None = None
 
         def safe_request(client: Any, method: str, path: str) -> tuple[Any, str | None]:
             try:
@@ -175,17 +235,32 @@ class Scenario(SharedScenario):
                 deadline_reached = True
                 break
             if owner_ready and local_ready:
+                # #1214: private readiness also needs the joiner's epoch key.
+                # Home leaves require_epoch_key false and accepts here.
+                if require_epoch_key:
+                    last_key_facts = self._private_epoch_key_installed(owner, member, gid)
+                    if time.monotonic() >= deadline or not last_key_facts.get("epoch_key_installed"):
+                        if time.monotonic() >= deadline:
+                            deadline_reached = True
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            time.sleep(min(1.0, remaining))
+                        continue
                 elapsed = round(time.monotonic() - started, 3)
+                accepted = {"label": readiness_label, "elapsed_seconds": elapsed,
+                            "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                            "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                            "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+                            "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                            "local_membership_state": "active", "outcome": "accepted",
+                            "local_observed_group_id": safe_identifier(local_body.get("group_id")),
+                            "observed_member_count": len(rows) if rows is not None else None,
+                            "expected_member_present": True, "last_error_class": last_error}
+                if last_key_facts is not None:
+                    accepted.update(last_key_facts)
                 self.e.record_poll(
-                    {"label": readiness_label, "elapsed_seconds": elapsed,
-                     "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
-                     "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
-                     "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
-                     "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
-                     "local_membership_state": "active", "outcome": "accepted",
-                     "local_observed_group_id": safe_identifier(local_body.get("group_id")),
-                     "observed_member_count": len(rows) if rows is not None else None,
-                     "expected_member_present": True, "last_error_class": last_error},
+                    accepted,
                     operation=operation, node=member, owner=owner,
                     group_id=safe_identifier(gid), deadline_seconds=self.timeout,
                     observed_member_count=len(rows) if rows is not None else None,
@@ -207,20 +282,25 @@ class Scenario(SharedScenario):
                             and terminal_value in {"refused", "timed_out"} else
                             ("other" if terminal_value is not None else None))
         elapsed = round(diagnostic_started - started, 3)
+        timed_out = {"label": readiness_label, "elapsed_seconds": elapsed,
+                     "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                     "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+                     "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_membership_state": state_label(local_body),
+                     "local_observed_group_id": safe_identifier(local_body.get("group_id")),
+                     "terminal_join_status": join_status[0] if isinstance(join_status, tuple) else None,
+                     "terminal_join_outcome": terminal_outcome,
+                     "terminal_join_status_error_class": terminal_error,
+                     "deadline_reached_before_acceptance": deadline_reached,
+                     "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
+                     "last_error_class": last_error, "outcome": "timeout"}
+        if last_key_facts is not None:
+            timed_out.update({key: value for key, value in last_key_facts.items()
+                              if key != "epoch_key_installed"})
+            timed_out["epoch_key_installed"] = False
         self.e.record_poll(
-            {"label": readiness_label, "elapsed_seconds": elapsed,
-             "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
-             "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
-             "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
-             "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
-             "local_membership_state": state_label(local_body),
-             "local_observed_group_id": safe_identifier(local_body.get("group_id")),
-             "terminal_join_status": join_status[0] if isinstance(join_status, tuple) else None,
-             "terminal_join_outcome": terminal_outcome,
-             "terminal_join_status_error_class": terminal_error,
-             "deadline_reached_before_acceptance": deadline_reached,
-             "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
-             "last_error_class": last_error, "outcome": "timeout"},
+            timed_out,
             operation=operation, node=member, owner=owner,
             group_id=safe_identifier(gid), deadline_seconds=self.timeout,
             observed_member_count=(len(owner_body.get("members"))
