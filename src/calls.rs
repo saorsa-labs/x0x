@@ -27,6 +27,11 @@
 //! ringing, counted, and surfaced locally as `call.state{ended: refused}`.
 //! [`crate::calls::CallRegistry::on_invite`] is the single enforcement point that turns
 //! a gate verdict into "ring" or "refuse".
+//!
+//! The outbound gate applies those same checks before an invite or an
+//! accept is sent. A callee that fails only on trust is admitted when it
+//! holds a live `Call` ShareGrant (#1120). Revocation, expiry, pairing
+//! and an Enabled connect ACL stay in force.
 
 use std::collections::HashMap;
 
@@ -832,37 +837,150 @@ impl crate::Agent {
         Ok(())
     }
 
-    /// Outbound call gate: the callee must pass the same identity gate
-    /// (`gate_peer_outbound`) and, when the connect ACL is Enabled, be
+    /// Outbound call gate: the callee must pass the same identity gate as
+    /// `gate_peer_outbound` and, when the connect ACL is Enabled, be
     /// pair-listed — otherwise its media could never reach us.
+    ///
+    /// ADR-0070 / #1120: a callee that fails only on trust is admitted when
+    /// it holds a live, unrevoked, unexpired `ShareGrant` carrying `Call`
+    /// for this daemon's agent. The lookup is `OwnerTrust::grant_access`,
+    /// the same one [`Self::call_gate_inbound`] uses. Revocation, cert
+    /// expiry, ADR-0043 pairing, `Blocked`, a machine-pin mismatch and an
+    /// Enabled connect ACL are not bypassed. A `Call` grant is not an ACL
+    /// bypass, and it does not open a stream or a media lane.
     pub(crate) async fn call_gate_outbound(&self, callee: &AgentId) -> Result<(), CallRefusal> {
-        let machine = self
-            .gate_peer_outbound(callee)
-            .await
-            .map_err(|e| CallRefusal::from_gate_error(&e))?;
+        // ADR 0115: the machine is the one `gate_peer_outbound` would use.
+        // Resolution stays here so the verdict below can be driven without
+        // a network.
+        let routing = {
+            let cache = self.identity_discovery_cache.read().await;
+            match cache.get(callee) {
+                Some(entry) => entry.machine_id,
+                None => return Err(CallRefusal::NotVerified),
+            }
+        };
+        let Some(machine) = self.authorized_routing_machine(callee, Some(routing)).await else {
+            return Err(CallRefusal::NotVerified);
+        };
+        Self::call_gate_outbound_with(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.connect_policy,
+            &self.owner_trust,
+            callee,
+            &machine,
+        )
+        .await
+    }
+
+    /// [`Self::call_gate_outbound`] for a machine the ADR 0115 routing
+    /// check already authorised. Unit tests drive this directly.
+    ///
+    /// Gate order matches `gate_peer_outbound`: revocation, then cert
+    /// expiry, then trust, then ADR-0043 pairing, then the connect ACL.
+    /// The trust step promotes `Unknown` and `AcceptWithFlag` to `Accept`
+    /// when `grant_access` reports a live `Call` cap (#1120).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_gate_outbound_with(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<
+            std::sync::RwLock<std::sync::Arc<crate::connect::ConnectPolicy>>,
+        >,
+        owner_trust: &crate::owner_trust::OwnerTrust,
+        callee: &AgentId,
+        machine: &MachineId,
+    ) -> Result<(), CallRefusal> {
+        let cert_not_after = {
+            let cache = discovery_cache.read().await;
+            match cache.get(callee) {
+                Some(entry) => entry.cert_not_after,
+                None => return Err(CallRefusal::NotVerified),
+            }
+        };
+        let expired = crate::identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
+        let pair = owner_trust
+            .evaluate_pair(
+                contact_store,
+                discovery_cache,
+                revocation_set,
+                callee,
+                machine,
+            )
+            .await;
+        let access = owner_trust
+            .grant_access(
+                contact_store,
+                discovery_cache,
+                revocation_set,
+                callee,
+                machine,
+            )
+            .await;
+        // #1120: the same promotion as the inbound call gate.
+        // `with_owner_trust` raises Unknown and AcceptWithFlag only.
+        // Blocked and a machine-pin mismatch stay denied. `grant_access`
+        // is already empty for those denials, and for a revoked, expired
+        // or unbound grant.
+        let trust_decision = pair.decision.with_owner_trust(access.call);
+        let (revoked_agent, revoked_machine) = {
+            let revoked = revocation_set.read().await;
+            (
+                revoked.is_agent_revoked(callee),
+                revoked.is_machine_revoked(machine),
+            )
+        };
+        if let Err(err) = crate::streams::stream_gate(
+            callee,
+            Some(trust_decision),
+            revoked_agent,
+            revoked_machine,
+            expired,
+        ) {
+            return Err(CallRefusal::from_gate_error(&err));
+        }
+        let pairing = {
+            let revoked = revocation_set.read().await;
+            let placements = move_state.read().await;
+            crate::key_move::enforce_pairing(&revoked, placements.placement_view(), callee, machine)
+        };
+        if let Some(denial) = pairing {
+            tracing::info!(
+                target: "x0x::streams",
+                agent = %hex::encode(callee.as_bytes()),
+                machine = %hex::encode(machine.as_bytes()),
+                outcome = "deny_pairing",
+                reason = ?denial,
+                "outbound call pairing denied (ADR-0043 B/P gate)"
+            );
+            return Err(CallRefusal::NotVerified);
+        }
         let policy = {
-            let guard = self
-                .connect_policy
+            let guard = connect_policy
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
         // ADR-0070 §1: an owner-trusted callee is listed by a
         // `principal = "owner"` ACL entry, exactly as on the inbound path.
-        let owner_trusted = self
-            .owner_trust
-            .evaluate_pair(
-                &self.contact_store,
-                &self.identity_discovery_cache,
-                &self.revocation_set,
-                callee,
-                &machine,
-            )
-            .await
-            .owner_trusted;
-        let owner_trusted: &[AgentId] = if owner_trusted { &[*callee] } else { &[] };
-        crate::streams::stream_acl_gate(&policy, &[*callee], owner_trusted, &machine)
-            .map_err(|e| CallRefusal::from_gate_error(&e))
+        let owner_trusted: &[AgentId] = if pair.owner_trusted {
+            std::slice::from_ref(callee)
+        } else {
+            &[]
+        };
+        crate::streams::stream_acl_gate(
+            &policy,
+            std::slice::from_ref(callee),
+            owner_trusted,
+            machine,
+        )
+        .map_err(|err| CallRefusal::from_gate_error(&err))
     }
 }
 
@@ -1413,6 +1531,21 @@ mod tests {
                 trust
             }
 
+            /// Record B1 in the contact store at `level`.
+            async fn set_trust(&self, level: TrustLevel) {
+                let mut contacts = self.contacts.write().await;
+                contacts.add(Contact {
+                    agent_id: self.b1,
+                    trust_level: level,
+                    label: None,
+                    added_at: 0,
+                    last_seen: None,
+                    identity_type: IdentityType::Anonymous,
+                    machines: Vec::new(),
+                    dm_capabilities: None,
+                });
+            }
+
             /// The inbound call verdict for B1 ringing A1 from MB.
             async fn ring(
                 &self,
@@ -1430,6 +1563,26 @@ mod tests {
                     &self.b1,
                     &self.mb,
                     true,
+                )
+                .await
+            }
+
+            /// The outbound call verdict for A1 calling B1 on MB.
+            async fn dial(
+                &self,
+                trust: &OwnerTrust,
+                policy: ConnectPolicy,
+            ) -> Result<(), CallRefusal> {
+                let policy = Arc::new(std::sync::RwLock::new(Arc::new(policy)));
+                crate::Agent::call_gate_outbound_with(
+                    &self.cache,
+                    &self.contacts,
+                    &self.revocations,
+                    &self.move_state,
+                    &policy,
+                    trust,
+                    &self.b1,
+                    &self.mb,
                 )
                 .await
             }
@@ -1594,6 +1747,139 @@ mod tests {
                 w.ring(&none, acl(vec![listed(w.b1, w.mb)])).await,
                 Err(CallRefusal::Untrusted),
                 "control: listing alone does not replace trust or the grant"
+            );
+        }
+
+        // WHY: #1120 — a stranger holding a live Call grant is admitted on
+        // the outbound gate, the same promotion the inbound gate already
+        // applies. The control shows the same callee with no grant is
+        // refused on trust, so the admit comes from the grant. Fails while
+        // `call_gate_outbound_with` ignores `grant_access.call`.
+        #[tokio::test]
+        async fn outbound_call_grantee_is_admitted() {
+            let w = World::new().await;
+            let now = real_now();
+            let none = w.daemon(&[]).await;
+            assert_eq!(
+                w.dial(&none, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted),
+                "control: an ungranted stranger is refused on trust"
+            );
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(w.dial(&trust, ConnectPolicy::default()).await, Ok(()));
+        }
+
+        // WHY: a Trusted contact is admitted with no grant. This locks the
+        // pre-#1120 path so the Call promotion cannot become the only way
+        // out.
+        #[tokio::test]
+        async fn outbound_trusted_contact_is_admitted_without_a_grant() {
+            let w = World::new().await;
+            w.set_trust(TrustLevel::Trusted).await;
+            let none = w.daemon(&[]).await;
+            assert_eq!(w.dial(&none, ConnectPolicy::default()).await, Ok(()));
+        }
+
+        // WHY: revoking the Call grant on x0x.revocation.v3 removes the
+        // outbound admit at the next evaluation, with no restart.
+        #[tokio::test]
+        async fn outbound_call_grantee_is_refused_after_revocation() {
+            let w = World::new().await;
+            let now = real_now();
+            let grant = w.grant(vec![ShareCap::Call], now - 60, now + 3_600);
+            let trust = w.daemon(std::slice::from_ref(&grant)).await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: a live grant admits the outbound call"
+            );
+            w.revoke(&grant).await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY: a Call grant whose expiry has passed confers nothing on the
+        // outbound gate.
+        #[tokio::test]
+        async fn outbound_call_grantee_is_refused_after_expiry() {
+            let w = World::new().await;
+            let now = real_now();
+            let live = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.dial(&live, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: the same grantee with a live grant is admitted"
+            );
+            let expired = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 7_200, now - 60)])
+                .await;
+            assert_eq!(
+                w.dial(&expired, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY: only the Call cap admits an outbound call. A live Dm grant
+        // is refused, so the promotion is keyed on `Call`.
+        #[tokio::test]
+        async fn outbound_dm_only_grant_is_refused() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Dm], now - 60, now + 3_600)])
+                .await;
+            let access = trust
+                .grant_access(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb)
+                .await;
+            assert!(access.dm && !access.call, "control: the Dm grant is live");
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY: a Call grant is not an outbound ACL bypass. With the connect
+        // ACL Enabled and B1 unlisted, the result is `NotInConnectAcl`.
+        // Pair-listing B1 admits it.
+        #[tokio::test]
+        async fn outbound_call_grant_does_not_override_acl_denial() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            let other = AgentKeypair::generate().expect("other").agent_id();
+            assert_eq!(
+                w.dial(&trust, acl(vec![listed(other, w.mb)])).await,
+                Err(CallRefusal::NotInConnectAcl)
+            );
+            assert_eq!(
+                w.dial(&trust, acl(vec![listed(w.b1, w.mb)])).await,
+                Ok(()),
+                "control: a listed grantee is admitted"
+            );
+        }
+
+        // WHY: Blocked wins over a live Call grant. The grant must not
+        // promote an explicit local denial.
+        #[tokio::test]
+        async fn outbound_call_grant_does_not_override_block() {
+            let w = World::new().await;
+            let now = real_now();
+            w.set_trust(TrustLevel::Blocked).await;
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted),
+                "a Blocked callee stays refused"
             );
         }
     }
