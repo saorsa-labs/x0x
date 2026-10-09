@@ -57,10 +57,30 @@ class LoadAttributionCheck(unittest.TestCase):
         self.assertTrue(any("the trigger here is ambient load" in err for err in errors), errors)
         self.assertTrue(any("starving the dial's timing window" in err for err in errors), errors)
         self.assertTrue(any(err.startswith("#316:") for err in errors), errors)
+        self.assertTrue(any(err.startswith("ADR 0030 slice 3:") for err in errors), errors)
         self.assertTrue(any(err.startswith("#510:") for err in errors), errors)
 
     def test_qualified_comments_pass(self) -> None:
         self.assertEqual(CHECK.attribution_errors(FIXED), [])
+
+    def test_missing_adr0030_qualification_fails(self) -> None:
+        dropped = FIXED.replace(
+            "# ADR 0030 slice 3. The ambient-load attribution is unverified (#702).",
+            "# ADR 0030 slice 3.",
+        )
+        errors = CHECK.attribution_errors(dropped)
+        self.assertTrue(
+            any(err.startswith("ADR 0030 slice 3: comment must contain") for err in errors),
+            errors,
+        )
+
+    def test_reservation_value_and_spacing_still_pass(self) -> None:
+        varied = FIXED.replace("threads-required = 4", "threads-required=8")
+        varied = varied.replace(
+            'filter = "binary(gossip_plane_isolation)"',
+            'filter="binary(gossip_plane_isolation)"',
+        )
+        self.assertEqual(CHECK.attribution_errors(varied), [])
 
     def test_reinserted_claim_fails(self) -> None:
         tainted = FIXED.replace(

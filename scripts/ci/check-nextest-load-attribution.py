@@ -8,6 +8,7 @@ trigger. Issue #702 records that this attribution was not measured.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -60,18 +61,26 @@ def _stanzas(text: str) -> list[tuple[str, str]]:
     return found
 
 
+# The wording check follows the filter, not the reservation. A later edit to
+# threads-required, or different spacing around `=`, must not fail CI.
+_FILTER_RE = re.compile(r'(?m)^filter\s*=\s*"([^"]*)"\s*$')
+
+
+def _filter_values(body: str) -> list[str]:
+    return [value.strip() for value in _FILTER_RE.findall(body)]
+
+
 def _is_316(body: str) -> bool:
-    return (
-        "direct_send_with_require_ack_round_trips_to_live_peer" in body
-        and "threads-required = 4" in body
+    return any(
+        "direct_send_with_require_ack_round_trips_to_live_peer" in value
+        for value in _filter_values(body)
     )
 
 
 def _is_adr0030(body: str) -> bool:
-    return (
-        'filter = "binary(gossip_plane_isolation)"' in body
-        and "threads-required = 4" in body
-    )
+    # The broader slice-1 override also names this binary. Only the override
+    # whose whole filter is this binary carries the #702 qualification.
+    return "binary(gossip_plane_isolation)" in _filter_values(body)
 
 
 def _is_510(body: str) -> bool:
