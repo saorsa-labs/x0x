@@ -15,29 +15,405 @@ NC='\033[0m' # No Color
 
 FOUND_ISSUES=0
 
-# Function to check if a file line is in a test module or function
-is_in_test_code() {
-    local file="$1"
-    local line_num="$2"
+# Lines that belong to a test-only item, keyed as "path:line".
+# Populated once by load_test_regions.
+declare -A IN_TEST=()
 
-    # Check if file contains #[cfg(test)] or #[test] before the line.
-    # Also honour the inner `#![cfg(test)]` attribute, which gates an entire
-    # file as test-only (e.g. src/cli/commands/test_support.rs); once seen it
-    # applies to every subsequent line in the file.
-    awk -v line="$line_num" '
-        NR <= line {
-            if (/^[[:space:]]*#!\[cfg\(test\)\]/) {
-                in_test = 1
-            }
-            if (/^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[test\]/) {
-                in_test = 1
-            }
-            if (in_test && /^[[:space:]]*mod [a-z_]+ \{/) {
-                test_module = 1
-            }
-        }
-        END { if (in_test || test_module) exit 0; else exit 1; }
-    ' "$file"
+# A line is test-only when it sits in a #[cfg(test)], #[cfg(all(..., test, ...))],
+# #[test], or #[tokio::test] item, or after #![cfg(test)]. The item ends when
+# its brace body closes, or at ';' / ',' when it has no body. Strings,
+# characters, and comments do not move the brace depth, so a format string
+# that continues with a backslash cannot close the item early.
+load_test_regions() {
+    local tmp
+    tmp=$(mktemp)
+    if ! python3 - "$tmp" << 'PY'
+from __future__ import annotations
+
+import os
+import sys
+
+BLOCK_WORDS = {
+    "fn",
+    "struct",
+    "enum",
+    "impl",
+    "mod",
+    "trait",
+    "union",
+    "const",
+    "static",
+    "type",
+    "use",
+    "extern",
+    "macro_rules",
+    "async",
+    "unsafe",
+    "pub",
+}
+
+
+def test_lines(text: str) -> set[int]:
+    """Return 1-based line numbers that are inside test-only source."""
+    lines = text.splitlines()
+    marked: set[int] = set()
+
+    depth = 0
+    paren = 0
+    bracket = 0
+    angle = 0
+    in_block = False
+    in_raw = False
+    raw_hashes = 0
+    in_string = False
+    file_test = False
+
+    active = False
+    floor = 0
+    paren_floor = 0
+    bracket_floor = 0
+    phase = "header"  # header | body | after
+    mode = ""  # "" | block | expr
+
+    def end_item() -> None:
+        nonlocal active, phase, mode
+        active = False
+        phase = "header"
+        mode = ""
+
+    def start_item() -> None:
+        nonlocal active, floor, paren_floor, bracket_floor, phase, mode
+        active = True
+        floor = depth
+        paren_floor = paren
+        bracket_floor = bracket
+        phase = "header"
+        mode = ""
+
+    def at_item_level() -> bool:
+        return depth == floor and paren == paren_floor and bracket == bracket_floor
+
+    for idx, line in enumerate(lines):
+        if file_test:
+            marked.add(idx + 1)
+            continue
+
+        line_in_test = active and phase != "after"
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+
+            if in_raw:
+                if ch == '"' and line[i + 1 : i + 1 + raw_hashes] == "#" * raw_hashes:
+                    in_raw = False
+                    i += 1 + raw_hashes
+                    continue
+                i += 1
+                continue
+
+            if in_string:
+                if ch == "\\":
+                    if i + 1 >= n:
+                        break
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_string = False
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if in_block:
+                if ch == "*" and nxt == "/":
+                    in_block = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+
+            if ch == "/" and nxt == "/":
+                break
+            if ch == "/" and nxt == "*":
+                in_block = True
+                i += 2
+                continue
+
+            if ch == '"':
+                hashes = _raw_hashes(line, i)
+                if hashes >= 0:
+                    in_raw = True
+                    raw_hashes = hashes
+                    i += 1
+                    continue
+                in_string = True
+                i += 1
+                continue
+
+            if ch == "'":
+                i = _skip_tick(line, i)
+                continue
+
+            if ch == "#":
+                kind = _attr_kind(line, i)
+                if active and phase == "after":
+                    end_item()
+                if kind == "file":
+                    file_test = True
+                    line_in_test = True
+                    break
+                if kind in {"cfg", "test"} and not active:
+                    start_item()
+                    line_in_test = True
+                i += 1
+                continue
+
+            if active and phase == "after":
+                if ch.isspace():
+                    i += 1
+                    continue
+                if _word_at(line, i) == "else":
+                    phase = "header"
+                    mode = ""
+                    line_in_test = True
+                    i += 4
+                    continue
+                end_item()
+                continue
+
+            if ch == "{":
+                if active and phase == "header" and at_item_level():
+                    phase = "body"
+                    line_in_test = True
+                depth += 1
+                i += 1
+                continue
+
+            if ch == "}":
+                if depth > 0:
+                    depth -= 1
+                if active and phase == "body" and depth == floor and paren == paren_floor and bracket == bracket_floor:
+                    phase = "after"
+                    line_in_test = True
+                elif active and phase == "header" and depth < floor and paren == paren_floor and bracket == bracket_floor:
+                    end_item()
+                i += 1
+                continue
+
+            if ch == "(":
+                paren += 1
+                i += 1
+                continue
+            if ch == ")":
+                if active and phase == "header" and paren <= paren_floor and depth == floor and bracket == bracket_floor:
+                    end_item()
+                    continue
+                if paren > 0:
+                    paren -= 1
+                i += 1
+                continue
+            if ch == "[":
+                bracket += 1
+                i += 1
+                continue
+            if ch == "]":
+                if active and phase == "header" and bracket <= bracket_floor and depth == floor and paren == paren_floor:
+                    end_item()
+                    continue
+                if bracket > 0:
+                    bracket -= 1
+                i += 1
+                continue
+            if ch == "<":
+                angle += 1
+                i += 1
+                continue
+            if ch == ">":
+                if angle > 0:
+                    angle -= 1
+                i += 1
+                continue
+
+            if ch == ";" and active and phase == "header" and at_item_level():
+                end_item()
+                line_in_test = True
+                i += 1
+                continue
+
+            if (
+                ch == ","
+                and active
+                and phase == "header"
+                and mode == "expr"
+                and angle == 0
+                and at_item_level()
+            ):
+                end_item()
+                line_in_test = True
+                i += 1
+                continue
+
+            if ch.isalpha() or ch == "_":
+                word = _word_at(line, i)
+                if (
+                    active
+                    and phase == "header"
+                    and mode == ""
+                    and at_item_level()
+                    and angle == 0
+                ):
+                    mode = "block" if word in BLOCK_WORDS else "expr"
+                if active:
+                    line_in_test = True
+                i += len(word)
+                continue
+
+            if active and phase != "after":
+                line_in_test = True
+            i += 1
+
+        if in_string and not _odd_trailing_backslash(line):
+            in_string = False
+
+        if line_in_test:
+            marked.add(idx + 1)
+
+    return marked
+
+
+def _word_at(line: str, i: int) -> str:
+    j = i + 1
+    while j < len(line) and (line[j].isalnum() or line[j] == "_"):
+        j += 1
+    return line[i:j]
+
+
+def _attr_kind(line: str, i: int) -> str:
+    if line[:i].strip() != "":
+        return ""
+    rest = line[i:]
+    if rest.startswith("#![cfg(test)]"):
+        return "file"
+    if rest.startswith("#[cfg(test)]"):
+        return "cfg"
+    if rest.startswith("#[test]") or rest.startswith("#[test("):
+        return "test"
+    if rest.startswith("#[tokio::test]") or rest.startswith("#[tokio::test("):
+        return "test"
+    if _cfg_all_requires_test(rest):
+        return "cfg"
+    return ""
+
+
+def _odd_trailing_backslash(line: str) -> bool:
+    count = 0
+    j = len(line) - 1
+    while j >= 0 and line[j] == "\\":
+        count += 1
+        j -= 1
+    return count % 2 == 1
+
+
+def _cfg_all_requires_test(rest: str) -> bool:
+    """True when every build of this attribute requires cfg(test)."""
+    prefix = "#[cfg(all("
+    if not rest.startswith(prefix):
+        return False
+    depth = 1
+    atoms: list[str] = []
+    current: list[str] = []
+    for ch in rest[len(prefix) :]:
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                atoms.append("".join(current).strip())
+                break
+            current.append(ch)
+        elif ch == "," and depth == 1:
+            atoms.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    return "test" in atoms
+
+
+def _raw_hashes(line: str, quote: int) -> int:
+    j = quote - 1
+    hashes = 0
+    while j >= 0 and line[j] == "#":
+        hashes += 1
+        j -= 1
+    if j < 0 or line[j] != "r":
+        return -1
+    j -= 1
+    for _ in range(2):
+        if j >= 0 and line[j] in "bc":
+            j -= 1
+        else:
+            break
+    if j >= 0 and (line[j].isalnum() or line[j] == "_"):
+        return -1
+    return hashes
+
+
+def _skip_tick(line: str, i: int) -> int:
+    n = len(line)
+    if i + 1 >= n:
+        return i + 1
+    if line[i + 1] == "\\":
+        j = i + 2
+        if j < n and line[j] in "ux":
+            j += 1
+            while j < n and line[j] != "'":
+                j += 1
+            return min(n, j + 1)
+        return min(n, i + 4)
+    if i + 2 < n and line[i + 2] == "'":
+        return i + 3
+    j = i + 1
+    while j < n and (line[j].isalnum() or line[j] == "_"):
+        j += 1
+    return j
+
+
+def _emit(root, out):
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != "target"]
+        for name in filenames:
+            if not name.endswith(".rs"):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, ".").replace(os.sep, "/")
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+            for number in test_lines(text):
+                out.write(f"{rel}\t{number}\n")
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    _emit("src", handle)
+    _emit("x0x", handle)
+PY
+    then
+        rm -f "$tmp"
+        echo "panic scanner could not classify #[cfg(test)] regions" >&2
+        exit 1
+    fi
+    while IFS=$'\t' read -r file num; do
+        [[ -n "$file" && -n "$num" ]] || continue
+        IN_TEST["${file}:${num}"]=1
+    done < "$tmp"
+    rm -f "$tmp"
+}
+
+is_in_test_code() {
+    [[ -n "${IN_TEST["$1:$2"]+x}" ]]
 }
 
 # Function to scan and report
@@ -126,6 +502,8 @@ check_no_nul_bytes() {
 }
 
 check_no_nul_bytes
+
+load_test_regions
 
 # Scan for problematic patterns
 scan_pattern "\.unwrap()" ".unwrap() calls"

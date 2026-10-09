@@ -64,6 +64,105 @@ class PanicScanner(unittest.TestCase):
     def test_tests_path_is_accepted(self):
         self.assert_clean(self.scan("src/tests.rs", 'fn f() { value.expect("test"); }\n'))
 
+    def test_production_expect_after_closed_cfg_test_module_is_rejected(self):
+        # The scanner used to keep the test flag set after the first
+        # #[cfg(test)], so this production expect was invisible.
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            '    fn t() { value.expect("hidden"); }\n'
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/after_cfg.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('src/after_cfg.rs:5:fn prod() { value.expect("visible"); }', result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+        self.assertIn("FOUND: .expect() calls in production code", result.stdout)
+
+    def test_expect_inside_cfg_test_module_is_accepted(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            '    fn t() { value.expect("hidden"); }\n'
+            "}\n"
+            "fn prod() { let _ = ready?; }\n"
+        )
+        self.assert_clean(self.scan("src/module.rs", source))
+
+    def test_production_expect_after_cfg_test_use_is_rejected(self):
+        source = (
+            "#[cfg(test)]\n"
+            "use std::fs;\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/early_use.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("src/early_use.rs:3:", result.stdout)
+        self.assertNotIn("std::fs", result.stdout)
+        self.assertIn('value.expect("visible")', result.stdout)
+
+    def test_tokio_test_does_not_hide_following_production_expect(self):
+        source = (
+            "#[cfg(test)]\n"
+            "use std::future::Future;\n"
+            "#[tokio::test]\n"
+            'async fn t() { value.expect("hidden"); }\n'
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/tokio_test.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("src/tokio_test.rs:5:", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_cfg_test_block_does_not_hide_following_production_expect(self):
+        source = (
+            "fn prod() {\n"
+            "    #[cfg(test)]\n"
+            "    {\n"
+            '        value.expect("hidden");\n'
+            "    }\n"
+            '    value.expect("visible");\n'
+            "}\n"
+        )
+        result = self.scan("src/statement.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("src/statement.rs:6:", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_escaped_newline_string_does_not_hide_following_production_expect(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn dump() -> String {\n"
+            '        let _ = value.expect("hidden");\n'
+            "        format!(\n"
+            '            "x = {{\\n\\\n'
+            "             \\targuments = {{\\n{args}\\t}}\\n\\\n"
+            '             }}\\n",\n'
+            "        )\n"
+            "    }\n"
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/format_string.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("visible", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_cfg_all_test_module_does_not_hide_following_production_expect(self):
+        source = (
+            "#[cfg(all(test, unix))]\n"
+            "mod tests {\n"
+            '    fn t() { value.expect("hidden"); }\n'
+            "}\n"
+            'fn prod() { value.expect("visible"); }\n'
+        )
+        result = self.scan("src/cfg_all.rs", source)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("src/cfg_all.rs:5:", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
