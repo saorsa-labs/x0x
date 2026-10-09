@@ -204,6 +204,12 @@ How the rules combine:
 - Fork-quarantine pins win over every new rule, and the pinned ceiling is
   unchanged.
 - With no class or topic bound configured, no new statement runs.
+- Topic-rule limits match topic names as UTF-8 bytes, so they need a UTF-8
+  database (every database x0x creates is). History refuses to open with
+  topic limits on an existing UTF-16 database. If a direct `Store` caller
+  passes them anyway, the topic phases delete nothing, and the skip is
+  counted (`Store::skipped_topic_rules`) and logged once. Class limits and
+  every other bound still apply.
 
 The `ephemeral` recording modes are validated but refused until ADR 0116
 slice C enforces them.

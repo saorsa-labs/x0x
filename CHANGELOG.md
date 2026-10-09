@@ -29,7 +29,9 @@ All notable changes to this project will be documented in this file.
   (D229); the global age, the global cap and the exact-scope limits still
   exempt them. Fork-quarantine pins win over every new rule, and the pinned
   ceiling is unchanged. With no class or topic bound configured, the reaper
-  runs exactly as before.
+  runs exactly as before. Topic limits need a UTF-8 history database (every
+  database x0x creates is). On an existing UTF-16 database, history refuses
+  to open with them, and the reaper never applies them there.
 
 ### Changed
 

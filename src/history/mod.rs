@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::HistoryResult;
+use crate::error::{HistoryError, HistoryResult};
 
 pub use policy::{
     ClassLimit, CompiledBounds, CompiledTopicRule, DmRecording, HistoryPolicy, RetainedClass,
@@ -314,8 +314,23 @@ impl HistoryService {
             .db_path
             .clone()
             .unwrap_or_else(|| data_dir.join("history.db"));
+        let store = Store::open(&db_path)?;
+        // Codex review of slice B, round 2 (controller decision): topic-rule
+        // limits match topic names in SQL as UTF-8 bytes, so they need a
+        // UTF-8 database. On a database created with another text encoding
+        // they are refused here, after `Store::open` and with no other file
+        // change. Everything else still opens there, as before.
+        if rules.bounded_topic_rule_count() > 0 && !store.text_encoding_is_utf8() {
+            return Err(HistoryError::InvalidConfig(format!(
+                "[[history.topic_rules]] max_bytes / max_age_days need a UTF-8 history \
+                 database, but {} uses {}. Remove the topic limits, or use a UTF-8 history \
+                 database",
+                db_path.display(),
+                store.text_encoding()
+            )));
+        }
         Ok(OpenedHistory {
-            store: Arc::new(Store::open(&db_path)?),
+            store: Arc::new(store),
             policy: config.retention_policy(),
             quarantine_pins: Arc::new(QuarantinePinSlot::default()),
             rules,

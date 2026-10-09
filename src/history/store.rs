@@ -327,6 +327,29 @@ impl SkippedScopeLimitsWarning {
     }
 }
 
+/// ADR 0116 §2 (Codex review of slice B, round 2): the one warning a
+/// store emits when a pass skips its bounded topic rules because the
+/// database text encoding is not UTF-8. Emitted by
+/// [`Store::retain_with_rules`] after the pass has released its locks.
+struct SkippedTopicRulesWarning {
+    /// Bounded topic rules skipped.
+    skipped: usize,
+    /// The database's text encoding.
+    encoding: String,
+}
+
+impl SkippedTopicRulesWarning {
+    fn emit(self) {
+        tracing::warn!(
+            skipped = self.skipped,
+            encoding = %self.encoding,
+            "[history] skipping the [[history.topic_rules]] retention limits: they need a \
+             UTF-8 history database. They deleted nothing; every other limit and the \
+             whole-database budget still apply. Logged once per store."
+        );
+    }
+}
+
 /// Synchronous SQLite-backed history store.
 pub struct Store {
     /// Dropped first: in test builds it runs an optional hook while the
@@ -360,6 +383,16 @@ pub struct Store {
     /// Claimed inside a pass (passes are serialised); the warning itself is
     /// emitted after the pass has released its locks.
     skipped_scope_limits_logged: AtomicBool,
+    /// The database's text encoding (`PRAGMA encoding`: `UTF-8`, `UTF-16le`
+    /// or `UTF-16be`), read once at open. It is fixed when the file is
+    /// created; x0x creates UTF-8 files, but `open` also accepts an
+    /// existing UTF-16 one.
+    text_encoding: String,
+    /// ADR 0116 §2: bounded topic rules the most recent pass skipped
+    /// because the database is not UTF-8. A gauge, overwritten each pass.
+    skipped_topic_rules: AtomicU64,
+    /// The topic-rule skip is logged once per store.
+    skipped_topic_rules_logged: AtomicBool,
     /// Round-4 test hook: [`Store::maintain_until_settled`] reports
     /// "budget ran out before the index settled" without running
     /// statements, making the forced-eviction path deterministically
@@ -463,6 +496,7 @@ impl Store {
         migrate(&conn)?;
         ensure_indexes(&conn)?;
         backfill_canonical_ids(&conn)?;
+        let text_encoding: String = conn.query_row("PRAGMA encoding", [], |r| r.get(0))?;
         let (before_close, after_close) = close_watch::signals();
         Ok(Self {
             _before_close: before_close,
@@ -471,6 +505,9 @@ impl Store {
             unsettled_passes: AtomicU32::new(0),
             skipped_scope_limits: AtomicU64::new(0),
             skipped_scope_limits_logged: AtomicBool::new(false),
+            text_encoding,
+            skipped_topic_rules: AtomicU64::new(0),
+            skipped_topic_rules_logged: AtomicBool::new(false),
             #[cfg(test)]
             test_never_settles: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -866,8 +903,12 @@ impl Store {
         // coverage is unchanged: one held connection from phase 1 through
         // the cleanup.
         let mut skip_warning = None;
-        let result = self.retain_pass(policy, rules, pinned, &mut skip_warning);
+        let mut topic_warning = None;
+        let result = self.retain_pass(policy, rules, pinned, &mut skip_warning, &mut topic_warning);
         if let Some(warning) = skip_warning {
+            warning.emit();
+        }
+        if let Some(warning) = topic_warning {
             warning.emit();
         }
         result
@@ -884,6 +925,7 @@ impl Store {
         rules: &HistoryPolicy,
         pinned: &PinnedScopes,
         skip_warning: &mut Option<SkippedScopeLimitsWarning>,
+        topic_warning: &mut Option<SkippedTopicRulesWarning>,
     ) -> HistoryResult<RetainOutcome> {
         #[cfg(test)]
         if let Ok(mut trace) = self.test_phase_trace.lock() {
@@ -956,12 +998,36 @@ impl Store {
         // (ruling Q1); budgets delete in bounded transactions.
         let rule_bounds = rules.has_retention_bounds();
 
+        // Codex review of slice B, round 2: the topic predicate compares
+        // UTF-8 bytes, and `CAST(scope_id AS BLOB)` yields the database's
+        // own encoding. On a non-UTF-8 database it would select the wrong
+        // rows, so the bounded topic rules FAIL CLOSED: their phases delete
+        // nothing. The skip is counted and logged once per store, after the
+        // locks are released. They are skipped rather than turned into an
+        // error because an error would end the pass before the
+        // whole-database budget and the cleanup, the #1286 failure. Class
+        // limits, pins, exact scopes and the global budget never match
+        // topic names and run as before. `HistoryService::open` refuses
+        // such a config outright; this guard covers direct `Store` callers.
+        let topic_rules_in_force = self.text_encoding_is_utf8();
+        *topic_warning = self.record_skipped_topic_rules(if topic_rules_in_force {
+            0
+        } else {
+            rules.bounded_topic_rule_count()
+        });
+
         // 1b. Class and topic ages. Each positive age is applied on its
         //     own, so the shortest one that covers a row decides; a zero
         //     age is no bound and cannot disable the global one above.
         //     Strictly older than the cutoff, as main's age.
         if rule_bounds {
-            outcome.evicted += apply_rule_ages(&guard, rules, &exclude, self.rule_now_ms())?;
+            outcome.evicted += apply_rule_ages(
+                &guard,
+                rules,
+                &exclude,
+                self.rule_now_ms(),
+                topic_rules_in_force,
+            )?;
             self.trace_phase("rule_ages");
         }
 
@@ -1002,8 +1068,10 @@ impl Store {
         if rule_bounds {
             outcome.evicted += apply_class_budgets(&guard, rules, &exclude)?;
             self.trace_phase("class_budgets");
-            outcome.evicted += apply_topic_budgets(&guard, rules, &exclude)?;
-            self.trace_phase("topic_budgets");
+            if topic_rules_in_force {
+                outcome.evicted += apply_topic_budgets(&guard, rules, &exclude)?;
+                self.trace_phase("topic_budgets");
+            }
         }
 
         // 3. Per-scope byte budgets. A pinned scope is governed by its
@@ -1607,6 +1675,47 @@ impl Store {
         }
     }
 
+    /// The database's text encoding, as `PRAGMA encoding` reports it
+    /// (`UTF-8`, `UTF-16le` or `UTF-16be`). Fixed when the file was created.
+    #[must_use]
+    pub fn text_encoding(&self) -> &str {
+        &self.text_encoding
+    }
+
+    /// Whether the ADR 0116 topic-rule limits can be enforced on this
+    /// database: their SQL compares UTF-8 bytes.
+    #[must_use]
+    pub fn text_encoding_is_utf8(&self) -> bool {
+        self.text_encoding.eq_ignore_ascii_case("UTF-8")
+    }
+
+    /// ADR 0116 §2: how many bounded topic rules the most recent retention
+    /// pass skipped because the database is not UTF-8. Zero on a UTF-8
+    /// database.
+    #[must_use]
+    pub fn skipped_topic_rules(&self) -> u64 {
+        self.skipped_topic_rules.load(Ordering::Relaxed)
+    }
+
+    /// Record the topic-rule skip of this pass: overwrite the gauge and
+    /// claim this store's one warning, which the caller emits after the
+    /// locks are released.
+    fn record_skipped_topic_rules(&self, skipped: usize) -> Option<SkippedTopicRulesWarning> {
+        self.skipped_topic_rules
+            .store(skipped as u64, Ordering::Relaxed);
+        if skipped == 0
+            || self
+                .skipped_topic_rules_logged
+                .swap(true, Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(SkippedTopicRulesWarning {
+            skipped,
+            encoding: self.text_encoding.clone(),
+        })
+    }
+
     /// Issue #1286: how many `scope_limits` entries the most recent
     /// retention pass skipped because their scope string does not parse
     /// (it must be `dm:<agent>`, `group:<id>` or `topic:<name>`). Zero means
@@ -1916,6 +2025,7 @@ fn apply_rule_ages(
     rules: &HistoryPolicy,
     exclude: &str,
     now: i64,
+    topic_rules_in_force: bool,
 ) -> HistoryResult<u64> {
     let mut evicted = 0_u64;
     for class in [RetainedClass::Durable, RetainedClass::Replaceable] {
@@ -1928,6 +2038,9 @@ fn apply_rule_ages(
                 rusqlite::params![now.saturating_sub(age)],
             )? as u64;
         }
+    }
+    if !topic_rules_in_force {
+        return Ok(evicted);
     }
     for (index, rule) in rules.topic_rules().iter().enumerate() {
         let Some(age) = rule.bounds.max_age_ms else {
@@ -6979,6 +7092,46 @@ mod tests {
                     b_sorted(&["a.x", unrelated])
                 };
                 assert_eq!(b_tags(&store), expected, "{encoding}, {path} path");
+            }
+        }
+    }
+
+    /// The non-UTF-8 topic-rule skip is counted every pass and warned about
+    /// once per store, with both store locks free when the warning is
+    /// emitted (the #1286 round-2 rule). A UTF-8 store counts zero and
+    /// warns nothing.
+    #[test]
+    fn adr0116_b_topic_rule_skip_is_counted_and_logged_once_with_no_lock_held() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        for encoding in ["UTF-16le", "UTF-8"] {
+            let (store, _dir) = b_store_with_encoding(encoding);
+            let store = std::sync::Arc::new(store);
+            let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let _subscriber =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(LockProbe {
+                    store: std::sync::Arc::clone(&store),
+                    seen: std::sync::Arc::clone(&seen),
+                }));
+            let rules = b_rules(
+                &[],
+                &[
+                    ("a", None, Some(1)),
+                    ("b", Some(0), None),
+                    ("c", None, None),
+                ],
+            );
+            for _ in 0..3 {
+                store
+                    .retain_with_rules(&b_no_global(), &rules, &PinnedScopes::none())
+                    .unwrap();
+            }
+            let seen = seen.lock().unwrap().clone();
+            if encoding == "UTF-8" {
+                assert_eq!(store.skipped_topic_rules(), 0);
+                assert!(seen.is_empty(), "no warning on UTF-8: {seen:?}");
+            } else {
+                assert_eq!(store.skipped_topic_rules(), 2, "the two bounded rules");
+                assert_eq!(seen, vec![(true, true, true)], "one warning, locks free");
             }
         }
     }

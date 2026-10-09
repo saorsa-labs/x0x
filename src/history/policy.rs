@@ -262,6 +262,17 @@ impl HistoryPolicy {
             || self.topic_rules.iter().any(|rule| !rule.bounds.is_empty())
     }
 
+    /// How many topic rules set a retention bound. These are the rules
+    /// the reaper matches against topic names in SQL, which needs a UTF-8
+    /// database.
+    #[must_use]
+    pub fn bounded_topic_rule_count(&self) -> usize {
+        self.topic_rules
+            .iter()
+            .filter(|rule| !rule.bounds.is_empty())
+            .count()
+    }
+
     /// Ordinary-DM recording mode.
     #[must_use]
     pub fn dm_recording(&self) -> DmRecording {
