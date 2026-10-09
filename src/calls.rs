@@ -1546,6 +1546,68 @@ mod tests {
                 });
             }
 
+            /// Move the cached certificate expiry into the past. The
+            /// certificate object itself stays valid, so a User grant can
+            /// still match.
+            async fn expire_cached_cert(&self) {
+                let mut cache = self.cache.write().await;
+                let entry = cache.get_mut(&self.b1).expect("cached callee");
+                let now = real_now();
+                entry.cert_not_after =
+                    Some(now.saturating_sub(crate::identity::EXPIRY_CLOCK_SKEW_SECS + 1));
+            }
+
+            /// Pin B1 to a machine other than MB. Trust evaluation then
+            /// returns a machine-pin mismatch.
+            async fn pin_to_other_machine(&self) {
+                let mut contacts = self.contacts.write().await;
+                contacts.add(Contact {
+                    agent_id: self.b1,
+                    trust_level: TrustLevel::Trusted,
+                    label: None,
+                    added_at: 0,
+                    last_seen: None,
+                    identity_type: IdentityType::Pinned,
+                    machines: vec![crate::contacts::MachineRecord {
+                        machine_id: MachineId([0x11; 32]),
+                        label: None,
+                        first_seen: 0,
+                        last_seen: 0,
+                        pinned: true,
+                    }],
+                    dm_capabilities: None,
+                });
+            }
+
+            /// Cache an owner-signed placement that pins B1 to a machine
+            /// other than MB. The Call grant stays live; the ADR-0043
+            /// pairing check denies the pair.
+            async fn pin_placement_elsewhere(&self) {
+                let cert = self
+                    .cache
+                    .read()
+                    .await
+                    .get(&self.b1)
+                    .and_then(|entry| entry.agent_certificate.clone())
+                    .expect("callee certificate");
+                let record = crate::key_move::PlacementRecord::sign(
+                    self.b1,
+                    self.user_b.public_key().as_bytes(),
+                    crate::key_move::Placement::Pinned(MachineId([0xEE; 32])),
+                    1,
+                    real_now(),
+                    self.user_b.secret_key(),
+                )
+                .expect("sign placement");
+                let authority =
+                    crate::key_move::PlacementAuthority::cert_issuer(&cert).expect("authority");
+                self.move_state
+                    .write()
+                    .await
+                    .cache_placement(record, authority)
+                    .expect("cache placement");
+            }
+
             /// The inbound call verdict for B1 ringing A1 from MB.
             async fn ring(
                 &self,
@@ -1880,6 +1942,84 @@ mod tests {
                 w.dial(&trust, ConnectPolicy::default()).await,
                 Err(CallRefusal::Untrusted),
                 "a Blocked callee stays refused"
+            );
+        }
+
+        // WHY: a live Call grant does not override certificate expiry.
+        // The cached `cert_not_after` is what `stream_gate` sees, and that
+        // check runs before trust. The grant stays live (the certificate
+        // object is still valid), so dropping the expiry input would admit
+        // the callee.
+        #[tokio::test]
+        async fn outbound_call_grant_does_not_override_cert_expiry() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: a live grant admits before the certificate expires"
+            );
+            w.expire_cached_cert().await;
+            let access = trust
+                .grant_access(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb)
+                .await;
+            assert!(access.call, "control: the Call grant is still live");
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::NotVerified)
+            );
+        }
+
+        // WHY: a machine-pin mismatch stays refused. `with_owner_trust`
+        // does not promote `RejectMachineMismatch`, so a live Call grant
+        // cannot place the call. Fails (`Ok`) if that denial is promoted.
+        #[tokio::test]
+        async fn outbound_call_grant_does_not_override_machine_pin_mismatch() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: the same grant admits before the pin"
+            );
+            w.pin_to_other_machine().await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted),
+                "a pin mismatch stays refused"
+            );
+        }
+
+        // WHY: a live Call grant does not override an ADR-0043 placement
+        // denial. The grant still confers `call` after the placement is
+        // cached, and the gate must return `NotVerified`. Dropping the
+        // pairing check would admit the callee.
+        #[tokio::test]
+        async fn outbound_call_grant_does_not_override_pairing_denial() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: a live grant admits before the placement denial"
+            );
+            w.pin_placement_elsewhere().await;
+            let access = trust
+                .grant_access(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb)
+                .await;
+            assert!(access.call, "control: the Call grant is still live");
+            assert_eq!(
+                w.dial(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::NotVerified)
             );
         }
     }
