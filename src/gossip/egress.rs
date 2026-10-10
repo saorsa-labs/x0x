@@ -58,6 +58,10 @@ pub(super) struct PubSubTransport {
     /// Test stand-in for a live QUIC session. Production always asks the node.
     #[cfg(test)]
     session_override: Mutex<Option<AuthenticatedSession>>,
+    /// Pauses one Eager send whose header topic matches, then clears itself.
+    /// The caller holds only that topic's turn, so another topic proceeds.
+    #[cfg(test)]
+    pub remote_send_pause: Mutex<RemoteSendPause>,
 }
 
 #[cfg(test)]
@@ -66,6 +70,13 @@ pub(super) struct Recorder {
     pub peers: Vec<PeerId>,
     pub sends: Vec<(PeerId, Bytes)>,
 }
+
+#[cfg(test)]
+type RemoteSendPause = Option<(
+    TopicId,
+    Arc<tokio::sync::Barrier>,
+    Arc<tokio::sync::Barrier>,
+)>;
 
 impl PubSubTransport {
     pub fn new(network: Arc<NetworkNode>) -> Self {
@@ -79,6 +90,34 @@ impl PubSubTransport {
             recorder: std::sync::Mutex::new(None),
             #[cfg(test)]
             session_override: Mutex::new(None),
+            #[cfg(test)]
+            remote_send_pause: Mutex::new(None),
+        }
+    }
+
+    /// Hold one matching Eager send. The mutex is released before the wait.
+    /// A later send on the same topic does not wait.
+    #[cfg(test)]
+    async fn wait_remote_send_pause(&self, data: &[u8]) {
+        let gates = {
+            let mut pause = self
+                .remote_send_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let matches = pause.as_ref().is_some_and(|(topic, _, _)| {
+                postcard::take_from_bytes::<MessageHeader>(data).is_ok_and(|(header, _)| {
+                    header.topic == *topic && header.kind == MessageKind::Eager
+                })
+            });
+            if matches {
+                pause.take().map(|(_, entered, release)| (entered, release))
+            } else {
+                None
+            }
+        };
+        if let Some((entered, release)) = gates {
+            entered.wait().await;
+            release.wait().await;
         }
     }
 
@@ -169,6 +208,8 @@ impl GossipTransport for PubSubTransport {
         stream: GossipStreamType,
         data: Bytes,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.wait_remote_send_pause(&data).await;
         if postcard::take_from_bytes::<MessageHeader>(&data).is_ok_and(|(header, _)| {
             header.kind == MessageKind::Eager
                 && self
