@@ -223,6 +223,211 @@ class PanicScanner(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn('value.expect("visible")', result.stdout)
 
+    def _call(self, kind, label):
+        if kind == "unwrap":
+            return f"{label}.unwrap()"
+        if kind == "expect":
+            return f'{label}.expect("{label}")'
+        if kind == "panic":
+            return f'panic!("{label}")'
+        raise AssertionError(kind)
+
+    def _assert_rejected(self, result, kind):
+        found = {
+            "unwrap": "FOUND: .unwrap() calls in production code",
+            "expect": "FOUND: .expect() calls in production code",
+            "panic": "FOUND: panic! macro",
+        }[kind]
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(self._call(kind, "visible"), result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+        self.assertIn(found, result.stdout)
+
+    def test_production_unwrap_is_rejected(self):
+        result = self.scan("src/production.rs", "fn f() { visible.unwrap(); }\n")
+        self._assert_rejected(result, "unwrap")
+
+    def test_production_panic_is_rejected(self):
+        result = self.scan("src/production.rs", 'fn f() { panic!("visible"); }\n')
+        self._assert_rejected(result, "panic")
+
+    def test_unwrap_inside_cfg_test_module_is_accepted(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t() { hidden.unwrap(); }\n"
+            "}\n"
+            "fn prod() { let _ = ready?; }\n"
+        )
+        result = self.scan("src/module.rs", source)
+        self.assert_clean(result)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_panic_inside_cfg_test_module_is_accepted(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            '    fn t() { panic!("hidden"); }\n'
+            "}\n"
+            "fn prod() { let _ = ready?; }\n"
+        )
+        result = self.scan("src/module.rs", source)
+        self.assert_clean(result)
+        self.assertNotIn("hidden", result.stdout)
+
+    def test_production_unwrap_after_closed_cfg_test_module_is_rejected(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t() { hidden.unwrap(); }\n"
+            "}\n"
+            "fn prod() { visible.unwrap(); }\n"
+        )
+        result = self.scan("src/after_cfg.rs", source)
+        self._assert_rejected(result, "unwrap")
+
+    def test_production_panic_after_closed_cfg_test_module_is_rejected(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            '    fn t() { panic!("hidden"); }\n'
+            "}\n"
+            'fn prod() { panic!("visible"); }\n'
+        )
+        result = self.scan("src/after_cfg.rs", source)
+        self._assert_rejected(result, "panic")
+
+    def test_const_comparison_does_not_hide_following_production_call(self):
+        # `<` in `if 1 < 2` is a comparison. Counting it as a generic made the
+        # brace-skipper ignore the function body, so the test region never closed.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> [u8; if 1 < 2 { 1 } else { 0 }] { [0; 1] }\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_cmp.rs", source)
+                self._assert_rejected(result, kind)
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> [u8; if 1 < 2 { 1 } else { 0 }] {\n"
+                    f"    {hidden}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_cmp_body.rs", source)
+                self._assert_rejected(result, kind)
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> [u8; if 1 <= 2 { 1 } else { 0 }] { [0; 1] }\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_le.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_ident_comparison_in_const_expr_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> [u8; if a < b { 1 } else { 0 }] {\n"
+                    f"    {hidden}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_cmp_ident.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_const_comparison_test_helper_call_is_accepted(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> [u8; if 1 < 2 { 1 } else { 0 }] {\n"
+                    f"    {hidden};\n"
+                    "}\n"
+                    "fn prod() { let _ = ready?; }\n"
+                )
+                result = self.scan("src/const_cmp_only.rs", source)
+                self.assert_clean(result)
+                self.assertNotIn("hidden", result.stdout)
+
+    def test_comparison_inside_const_generic_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> std::array::IntoIter<u8, { if 1 < 2 { 1 } else { 0 } }> {\n"
+                    f"    {hidden}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_generic_cmp.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_nested_inner_cfg_test_does_not_hide_following_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "mod support {\n"
+                    "    #![cfg(test)]\n"
+                    f"    fn helper() {{ {hidden}; }}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/nested_inner.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_nested_inner_cfg_test_helper_call_is_accepted(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                source = (
+                    "mod support {\n"
+                    "    #![cfg(test)]\n"
+                    f"    fn helper() {{ {hidden}; }}\n"
+                    "}\n"
+                    "fn prod() { let _ = ready?; }\n"
+                )
+                result = self.scan("src/nested_inner_only.rs", source)
+                self.assert_clean(result)
+                self.assertNotIn("hidden", result.stdout)
+
+    def test_cfg_all_quoted_comma_is_production(self):
+        # `--cfg 'custom="a,test,b"'` does not make this function test-only.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                visible = self._call(kind, "visible")
+                source = f'#[cfg(all(custom = "a,test,b"))]\nfn prod() {{ {visible}; }}\n'
+                result = self.scan("src/cfg_quoted.rs", source)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(visible, result.stdout)
+
+    def test_cfg_all_test_with_quoted_comma_still_hides_test_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    '#[cfg(all(test, feature = "a,b"))]\n'
+                    "mod tests {\n"
+                    f"    fn t() {{ {hidden}; }}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/cfg_all_quoted.rs", source)
+                self._assert_rejected(result, kind)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

@@ -20,11 +20,14 @@ FOUND_ISSUES=0
 declare -A IN_TEST=()
 
 # A match is test-only when its byte offset sits in a #[cfg(test)],
-# #[cfg(all(..., test, ...))], #[test], or #[tokio::test] item, or after
-# #![cfg(test)]. The item ends when its brace body closes, or at ';' / ','
-# when it has no body. Strings stay open until the closing quote, block
-# comments nest, and a brace inside a generic argument is not the body.
-# Code after the closing brace on the same line is still production.
+# #[cfg(all(..., test, ...))], #[test], or #[tokio::test] item, or after a
+# crate-level #![cfg(test)]. A nested #![cfg(test)] ends with its module.
+# The item ends when its brace body closes, or at ';' / ',' when it has no
+# body. Strings stay open until the closing quote, block comments nest, and
+# '<' counts as a generic only in type position. A comparison does not.
+# A brace that begins a const-generic argument is not the item body. Code
+# after the closing brace on the same line is still production. A comma
+# inside a quoted cfg value is not a predicate separator.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
@@ -72,6 +75,9 @@ def test_lines(text: str) -> dict[int, str]:
     raw_hashes = 0
     in_string = False
     file_test = False
+    bracket_stack: list[dict[str, object]] = []
+    const_expr = 0
+    type_mode = False
 
     active = False
     floor = 0
@@ -81,10 +87,33 @@ def test_lines(text: str) -> dict[int, str]:
     mode = ""  # "" | block | expr
 
     def end_item() -> None:
-        nonlocal active, phase, mode
+        nonlocal active, phase, mode, type_mode
         active = False
         phase = "header"
         mode = ""
+        type_mode = False
+
+    def in_value_expr() -> bool:
+        if const_expr > 0:
+            return True
+        if any(frame["expr"] for frame in bracket_stack):
+            return True
+        return not type_mode
+
+    def opens_generic(at: str, i: int) -> bool:
+        # '<=' is a comparison. Turbofish '::<' is always a generic.
+        # In a value expression, every other '<' is an operator. In type
+        # position, '<' after a path or delimiter starts type arguments.
+        if i + 1 < len(at) and at[i + 1] == "=":
+            return False
+        kind, text = _prev_sig(at, i)
+        if text == "::":
+            return True
+        if in_value_expr():
+            return False
+        if kind == "ident" or text in "><,([{":
+            return True
+        return kind == "start"
 
     def start_item() -> None:
         nonlocal active, floor, paren_floor, bracket_floor, phase, mode
@@ -203,10 +232,21 @@ def test_lines(text: str) -> dict[int, str]:
                     stop_marking(i)
                     end_item()
                 if kind == "file":
-                    file_test = True
-                    mark[0] = 0
-                    i = n
-                    break
+                    # Crate-level inner attributes cover the rest of the file.
+                    # A nested #![cfg(test)] applies only to its enclosing item.
+                    if depth == 0:
+                        file_test = True
+                        mark[0] = 0
+                        i = n
+                        break
+                    if not active:
+                        start_item()
+                        floor = depth - 1
+                        phase = "body"
+                        mode = "block"
+                        ensure_marking(0)
+                    i += len("#![cfg(test)]")
+                    continue
                 if kind in {"cfg", "test"} and not active:
                     start_item()
                     ensure_marking(i)
@@ -227,20 +267,61 @@ def test_lines(text: str) -> dict[int, str]:
                 end_item()
                 continue
 
+            if ch == "-" and nxt == ">":
+                type_mode = True
+                i += 2
+                continue
+
+            if ch == ":":
+                if nxt == ":":
+                    i += 2
+                    continue
+                type_mode = True
+                i += 1
+                continue
+
+            if ch == "=":
+                # Associated-type bindings (`Item = Vec<u8>`) stay in type
+                # position. An `=` outside angle brackets ends a type.
+                if angle == 0:
+                    type_mode = False
+                i += 2 if nxt in "=>" else 1
+                continue
+
             if ch == "{":
-                # A brace inside a generic argument of a block item is not the body.
-                if angle > 0 and mode == "block" and phase == "header":
+                if const_expr > 0:
+                    const_expr += 1
+                    if active and phase != "after":
+                        ensure_marking(i)
+                    i += 1
+                    continue
+                # `{` starts a const-generic argument only directly after `<` or `,`.
+                # `if 1 < 2 { 1 }` is an expression block, and it is the real body
+                # when it sits at item level.
+                if (
+                    angle > 0
+                    and mode == "block"
+                    and phase == "header"
+                    and _const_generic_brace(line, i)
+                ):
+                    const_expr = 1
+                    if active:
+                        ensure_marking(i)
                     i += 1
                     continue
                 if active and phase == "header" and at_item_level():
                     phase = "body"
                     ensure_marking(i)
+                type_mode = False
                 depth += 1
                 i += 1
                 continue
 
             if ch == "}":
-                if angle > 0 and mode == "block" and phase == "header":
+                if const_expr > 0:
+                    const_expr -= 1
+                    if active and phase != "after":
+                        ensure_marking(i)
                     i += 1
                     continue
                 if depth > 0:
@@ -288,6 +369,7 @@ def test_lines(text: str) -> dict[int, str]:
                 i += 1
                 continue
             if ch == "[":
+                bracket_stack.append({"expr": False, "depth": depth, "paren": paren})
                 bracket += 1
                 i += 1
                 continue
@@ -302,24 +384,45 @@ def test_lines(text: str) -> dict[int, str]:
                     stop_marking(i)
                     end_item()
                     continue
+                if bracket_stack:
+                    bracket_stack.pop()
                 if bracket > 0:
                     bracket -= 1
                 i += 1
                 continue
             if ch == "<":
-                angle += 1
+                if opens_generic(line, i):
+                    angle += 1
+                elif nxt == "=":
+                    i += 2
+                    continue
                 i += 1
                 continue
             if ch == ">":
+                if nxt == "=":
+                    i += 2
+                    continue
                 if angle > 0:
                     angle -= 1
                 i += 1
                 continue
 
-            if ch == ";" and active and phase == "header" and at_item_level():
+            if ch == ";":
+                if (
+                    bracket_stack
+                    and const_expr == 0
+                    and depth == bracket_stack[-1]["depth"]
+                    and paren == bracket_stack[-1]["paren"]
+                ):
+                    bracket_stack[-1]["expr"] = True
+                elif angle == 0 and const_expr == 0:
+                    type_mode = False
+                if active and phase == "header" and at_item_level() and const_expr == 0:
+                    i += 1
+                    stop_marking(i)
+                    end_item()
+                    continue
                 i += 1
-                stop_marking(i)
-                end_item()
                 continue
 
             if (
@@ -345,6 +448,27 @@ def test_lines(text: str) -> dict[int, str]:
                     and angle == 0
                 ):
                     mode = "block" if word in BLOCK_WORDS else "expr"
+                if word in {
+                    "fn",
+                    "struct",
+                    "enum",
+                    "impl",
+                    "trait",
+                    "type",
+                    "const",
+                    "static",
+                    "union",
+                    "as",
+                }:
+                    type_mode = True
+                elif word == "for":
+                    j = i + len(word)
+                    while j < n and line[j].isspace():
+                        j += 1
+                    # `for<'a>` is a type binder. `for x in` is a loop.
+                    type_mode = j < n and line[j] == "<"
+                elif word in {"if", "while", "loop", "match", "return", "let"}:
+                    type_mode = False
                 if active and phase != "after":
                     ensure_marking(i)
                 i += len(word)
@@ -378,6 +502,32 @@ def _span_spec(spans: list[list[int]], nbytes: int) -> str:
         return "*"
     return ",".join(f"{start}-{end}" for start, end in merged)
 
+def _prev_sig(line: str, i: int) -> tuple[str, str]:
+    j = i - 1
+    while j >= 0 and line[j].isspace():
+        j -= 1
+    if j < 0:
+        return "start", ""
+    ch = line[j]
+    if ch == ":" and j > 0 and line[j - 1] == ":":
+        return "punct", "::"
+    if ch in "<>()[]{},;:=+-*/%&|^!":
+        return "punct", ch
+    if ch.isdigit():
+        return "num", ch
+    if ch.isalnum() or ch == "_":
+        k = j
+        while k >= 0 and (line[k].isalnum() or line[k] == "_"):
+            k -= 1
+        return "ident", line[k + 1 : j + 1]
+    return "other", ch
+
+
+def _const_generic_brace(line: str, i: int) -> bool:
+    _kind, text = _prev_sig(line, i)
+    return text in {"<", ","}
+
+
 def _word_at(line: str, i: int) -> str:
     j = i + 1
     while j < len(line) and (line[j].isalnum() or line[j] == "_"):
@@ -410,22 +560,44 @@ def _cfg_all_requires_test(rest: str) -> bool:
     depth = 1
     atoms: list[str] = []
     current: list[str] = []
+    in_str = False
+    quote = ""
+    escaped = False
     for ch in rest[len(prefix) :]:
+        if in_str:
+            current.append(ch)
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
+        if ch in "\"'":
+            in_str = True
+            quote = ch
+            current.append(ch)
+            continue
         if ch == "(":
             depth += 1
             current.append(ch)
         elif ch == ")":
             depth -= 1
             if depth == 0:
+                if in_str:
+                    return False
                 atoms.append("".join(current).strip())
-                break
+                return "test" in atoms
             current.append(ch)
         elif ch == "," and depth == 1:
             atoms.append("".join(current).strip())
             current = []
         else:
             current.append(ch)
-    return "test" in atoms
+    # Unclosed attribute: scan it rather than treating it as test-only.
+    return False
 
 
 def _raw_hashes(line: str, quote: int) -> int:
