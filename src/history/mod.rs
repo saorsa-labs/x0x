@@ -317,6 +317,10 @@ impl HistoryHandle {
         self.writer.shutdown_incomplete()
     }
 
+    pub(super) fn mark_writer_shutdown_incomplete(&self) {
+        self.writer.mark_shutdown_incomplete();
+    }
+
     /// ADR-0068 D1: install the fork-quarantine pin source the reaper
     /// consults. Returns `false` if one is already installed.
     pub fn install_quarantine_pins(&self, pins: Arc<dyn QuarantinePins>) -> bool {
@@ -550,10 +554,27 @@ impl HistoryService {
         // cancelled JoinError once the runtime drops the aborted future.
         let _ = self.reaper.await;
         if let Some(writer) = self.writer.take() {
-            // Writer drain is blocking (joins an OS thread), bounded by the
-            // drain grace. `false` means the thread is still in custody and
-            // the shared handle reports `writer_shutdown_incomplete`.
-            let _ = tokio::task::spawn_blocking(move || writer.shutdown()).await;
+            // The grace covers submission and queueing, not only the time
+            // after a blocking worker starts. Tokio queues `spawn_blocking`
+            // once `max_blocking_threads` is reached, so awaiting the job
+            // with no outer deadline waits for that queue with no bound.
+            // On expiry the handle is dropped, not awaited: a later pool
+            // cleanup must not wait out a second grace. The closure still
+            // owns the writer until it runs; `shutdown_until` then retains
+            // the thread immediately because this same deadline has passed.
+            let budget = writer::SHUTDOWN_DRAIN_GRACE;
+            let deadline = std::time::Instant::now() + budget;
+            let join = tokio::task::spawn_blocking(move || writer.shutdown_until(deadline));
+            // `SHUTDOWN_SUBMIT_SLACK` only covers the last sleep inside a
+            // worker that already started. A job still queued at `deadline`
+            // is not awaited: dropping `join` detaches it, and that later
+            // run retains immediately because `deadline` has passed.
+            if tokio::time::timeout(budget + writer::SHUTDOWN_SUBMIT_SLACK, join)
+                .await
+                .is_err()
+            {
+                self.handle.mark_writer_shutdown_incomplete();
+            }
         }
     }
 }

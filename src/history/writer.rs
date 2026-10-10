@@ -34,7 +34,16 @@ const BATCH_MAX: usize = 64;
 const BATCH_WINDOW: Duration = Duration::from_millis(50);
 
 /// Grace period for draining queued records at shutdown.
-const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(5);
+///
+/// The clock starts when shutdown is submitted, including time spent queued
+/// on the Tokio blocking pool. It does not start again when a worker runs.
+pub(super) const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long past [`SHUTDOWN_DRAIN_GRACE`] the submitter waits so a worker
+/// already inside [`Writer::shutdown_until`] can retain its thread before
+/// the wait gives up. This is timer slop, not a second grace: the closure
+/// still uses the original deadline.
+pub(super) const SHUTDOWN_SUBMIT_SLACK: Duration = Duration::from_millis(200);
 
 /// Shared, lock-free counters surfaced by `/diagnostics/history`.
 #[derive(Debug, Default)]
@@ -127,6 +136,10 @@ impl WriterHandle {
     pub fn shutdown_incomplete(&self) -> bool {
         self.shutdown_incomplete.load(Ordering::SeqCst)
     }
+
+    pub(super) fn mark_shutdown_incomplete(&self) {
+        self.shutdown_incomplete.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The writer thread plus its shutdown control.
@@ -185,8 +198,9 @@ impl Writer {
         self.handle.clone()
     }
 
-    /// Drain-then-stop. Bounded by `SHUTDOWN_DRAIN_GRACE`; queued records
-    /// beyond the grace are abandoned and counted — never `abort()`.
+    /// Drain-then-stop. Bounded by `SHUTDOWN_DRAIN_GRACE` from this call;
+    /// queued records beyond the grace are abandoned and counted — never
+    /// `abort()`.
     ///
     /// The join uses that same grace. A thread blocked in SQLite past that
     /// grace is left running: the `JoinHandle` stays owned and the in-flight
@@ -194,25 +208,60 @@ impl Writer {
     /// writer is incomplete and [`WriterHandle::shutdown_incomplete`] is set,
     /// so the caller must not report a finished shutdown.
     #[must_use]
-    pub fn shutdown(mut self) -> bool {
+    pub fn shutdown(self) -> bool {
+        self.shutdown_until(std::time::Instant::now() + SHUTDOWN_DRAIN_GRACE)
+    }
+
+    /// [`Self::shutdown`] against a deadline chosen by the caller.
+    ///
+    /// `HistoryService::shutdown` captures the deadline when it submits the
+    /// blocking job, so time spent queued on the pool counts. A worker that
+    /// starts after `deadline` retains the thread and returns without waiting
+    /// another grace.
+    #[must_use]
+    pub(super) fn shutdown_until(mut self, deadline: std::time::Instant) -> bool {
         // Signal the loop; it drains what it can within the grace window.
         let _ = self.shutdown_tx.send(());
-        let Some(thread) = self.thread.take() else {
+        if self.thread.is_none() {
             return true;
-        };
-        let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_GRACE;
-        while !self.finished.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= deadline {
-                self.handle
-                    .shutdown_incomplete
-                    .store(true, Ordering::SeqCst);
-                retain_unfinished_writer(thread);
+        }
+        // Leave the thread in `self` until join or retain. A panic or a
+        // dropped queued job then hits `Drop`, which retains without waiting.
+        loop {
+            if self.finished.load(Ordering::SeqCst) {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.handle.mark_shutdown_incomplete();
+                if let Some(thread) = self.thread.take() {
+                    retain_unfinished_writer(thread);
+                }
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
         }
-        let _ = thread.join();
-        true
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // A queued `spawn_blocking` shutdown can be dropped by later pool
+        // cleanup before it runs. Retain the thread here and do not join it:
+        // joining would wait out whatever is still inside SQLite.
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = self.shutdown_tx.send(());
+        self.handle.mark_shutdown_incomplete();
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            retain_unfinished_writer(thread);
+        }
     }
 }
 
@@ -547,5 +596,237 @@ mod tests {
         );
         let _ = query.join();
         let _ = shutdown.join();
+    }
+
+    /// A worker that starts after the shutdown deadline retains the thread
+    /// and returns. It does not open a second grace while the read is held.
+    #[test]
+    fn issue1288_writer_shutdown_past_deadline_retains_without_another_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("history.db")).unwrap());
+        let hold = arm_query_lock_park(&store);
+        let release = Release(Arc::clone(&hold));
+        let query_store = Arc::clone(&store);
+        let query = std::thread::spawn(move || {
+            prepare_query_lock_park();
+            let _ = query_store.query(&HistoryQuery {
+                limit: 1,
+                ..HistoryQuery::default()
+            });
+        });
+        let park_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.parked() < 1 {
+            assert!(
+                Instant::now() < park_deadline,
+                "the query did not park inside the connection lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let writer = Writer::spawn(Arc::clone(&store));
+        let probe = writer.handle();
+        let counters = writer.handle().counters();
+        let entered = hold.writer_entered();
+        writer.handle().record(waiting_record());
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.writer_entered() <= entered {
+            assert!(
+                Instant::now() < wait_deadline,
+                "the writer did not reach the connection lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let written = counters.written_total.load(Ordering::Relaxed);
+
+        let started = Instant::now();
+        let completed = writer.shutdown_until(Instant::now());
+        let elapsed = started.elapsed();
+        assert!(
+            !completed,
+            "a writer still blocked after the deadline must not report completion"
+        );
+        assert!(
+            probe.shutdown_incomplete(),
+            "the unfinished writer must stay visible to the caller"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a missed deadline must not wait another grace ({elapsed:?})"
+        );
+        assert_eq!(
+            counters.written_total.load(Ordering::Relaxed),
+            written,
+            "the admitted write must still be waiting"
+        );
+        assert!(!hold.is_released());
+        assert!(
+            reap_finished_writer_threads() >= 1,
+            "the writer thread must still be in custody"
+        );
+
+        drop(release);
+        let cleanup = Instant::now() + Duration::from_secs(2);
+        while !query.is_finished() || reap_finished_writer_threads() > 0 {
+            assert!(
+                Instant::now() < cleanup,
+                "the writer did not finish after the query released the lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            counters.written_total.load(Ordering::Relaxed) > written,
+            "the admitted write must commit after the lock is released"
+        );
+        let _ = query.join();
+    }
+
+    struct PoolGate(Option<mpsc::Sender<()>>);
+
+    impl Drop for PoolGate {
+        fn drop(&mut self) {
+            if let Some(gate) = self.0.take() {
+                let _ = gate.send(());
+            }
+        }
+    }
+
+    /// One blocking thread is stuck, and a read still holds the store past
+    /// the drain grace. Shutdown returns an incomplete result inside that
+    /// grace. Freeing the pool afterwards must not wait another grace.
+    #[test]
+    fn issue1288_saturated_blocking_pool_returns_incomplete_writer_shutdown() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let service = crate::history::HistoryService::start(
+                &crate::history::HistoryConfig {
+                    enabled: true,
+                    db_path: Some(dir.path().join("history.db")),
+                    ..crate::history::HistoryConfig::default()
+                },
+                dir.path(),
+            )
+            .unwrap();
+            let handle = service.handle();
+            let hold = arm_query_lock_park(handle.store());
+            let release = Release(Arc::clone(&hold));
+            let query_store = Arc::clone(handle.store());
+            let query = std::thread::spawn(move || {
+                prepare_query_lock_park();
+                let _ = query_store.query(&HistoryQuery {
+                    limit: 1,
+                    ..HistoryQuery::default()
+                });
+            });
+            let park_deadline = Instant::now() + Duration::from_secs(2);
+            while hold.parked() < 1 {
+                assert!(
+                    Instant::now() < park_deadline,
+                    "the read did not park inside the connection lock"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (gate_tx, gate_rx) = mpsc::channel();
+            let pool_gate = PoolGate(Some(gate_tx));
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = gate_rx.recv();
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the blocking worker did not start");
+
+            let counters = handle.counters();
+            let entered = hold.writer_entered();
+            handle.record(waiting_record());
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while hold.writer_entered() <= entered {
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "the writer did not reach the connection lock"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let written = counters.written_total.load(Ordering::Relaxed);
+
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                SHUTDOWN_DRAIN_GRACE + Duration::from_secs(3),
+                service.shutdown(),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert!(
+                outcome.is_ok(),
+                "shutdown waited for a blocking worker ({elapsed:?})"
+            );
+            assert!(
+                elapsed + Duration::from_secs(1) >= SHUTDOWN_DRAIN_GRACE,
+                "shutdown returned before the grace that covers queueing ({elapsed:?})"
+            );
+            assert!(
+                elapsed < SHUTDOWN_DRAIN_GRACE + Duration::from_secs(2),
+                "shutdown exceeded the grace that covers queueing ({elapsed:?})"
+            );
+            assert!(
+                handle.writer_shutdown_incomplete(),
+                "a queued writer shutdown must be an incomplete result"
+            );
+            assert!(
+                hold.parked() >= 1 && !hold.is_released(),
+                "the read must still be held past the budget"
+            );
+            assert!(
+                !blocker.is_finished(),
+                "the blocking pool must stay saturated past the budget"
+            );
+            assert_eq!(
+                counters.written_total.load(Ordering::Relaxed),
+                written,
+                "the admitted write must still be waiting"
+            );
+
+            // The queued shutdown runs once the pool frees. The read still
+            // holds the writer in SQLite, so a second grace would be visible.
+            let running_before = reap_finished_writer_threads();
+            let cleanup_started = Instant::now();
+            drop(pool_gate);
+            let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+            while reap_finished_writer_threads() <= running_before {
+                assert!(
+                    Instant::now() < cleanup_deadline,
+                    "pool cleanup waited another grace after the budget ({:?})",
+                    cleanup_started.elapsed()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                hold.parked() >= 1 && !hold.is_released(),
+                "the read must stay held while the queued shutdown is cleaned up"
+            );
+
+            drop(release);
+            let finished = Instant::now() + Duration::from_secs(2);
+            while !query.is_finished()
+                || !blocker.is_finished()
+                || reap_finished_writer_threads() > 0
+                || counters.written_total.load(Ordering::Relaxed) <= written
+            {
+                assert!(
+                    Instant::now() < finished,
+                    "the admitted write did not finish after the read released the lock"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = query.join();
+            drop(blocker);
+        });
     }
 }
