@@ -113,20 +113,28 @@ All notable changes to this project will be documented in this file.
     rollback-journal file was converted to WAL;
   - a WAL another writer left uncheckpointed was checkpointed into the main
     file and deleted when the refused connection closed;
-  - a hot rollback journal was rolled back;
   - a version read that failed (busy, I/O) counted as "no schema", so setup
     could write once a lock cleared.
 
-  History now notes the sidecar files first and reads the stored version
-  before any statement that can write. With a rollback journal present, it
-  reads through a read-only connection, which cannot roll a journal back.
-  Any read failure other than "no schema yet" stops the open. A refusal
-  closes without checkpointing a WAL it did not create. A newer database's
-  main file, `-wal`, `-shm` and `-journal` are left exactly as they were.
-  New databases, upgrades and crash recovery of this version's own database
-  are unchanged. (The released v0.46.6 still changes two header bytes when
-  it refuses a newer database; this fix only helps a downgrade to this
-  release or a later one.)
+  History now notes whether a WAL exists, and reads the stored version
+  before any statement that can write. Any read failure other than "no
+  schema yet" stops the open. Until the version is known to be compatible,
+  the connection does not checkpoint a WAL it did not create, on any refusal
+  path. A refused newer or unreadable schema changes no file when the
+  database is in WAL mode (with or without an uncheckpointed WAL) or is a
+  settled rollback-journal database: the main file, `-wal` and `-shm` stay
+  byte-identical.
+
+  **Limit:** a hot rollback journal is recovered first, as SQLite requires
+  before anything can be read, so such a file is refused after its journal
+  has been rolled back. x0x keeps history in WAL mode from first
+  initialization, so a history database has a hot journal only from an
+  interrupted pre-WAL initialization, before any version is committed. That
+  database, and a hot schema-4 database, recover and open as before.
+
+  New databases, upgrades and crash recovery are unchanged. (The released
+  v0.46.6 still changes two header bytes when it refuses a newer database;
+  this fix only helps a downgrade to this release or a later one.)
 - **History retention no longer stops at a bad `scope_limits` entry (#1286).**
   One `[[history.scope_limits]]` entry whose `scope` did not parse made every
   retention pass fail at that entry. The limits after it, the whole-database

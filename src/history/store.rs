@@ -509,6 +509,19 @@ impl Store {
 
     /// Open with an explicit busy timeout (tests use a short one so the
     /// exclusivity probe fails fast).
+    ///
+    /// A database written by a newer schema (or one whose stored version
+    /// cannot be read) is refused (ADR 0116 Validation, "Storage and
+    /// downgrade"). The refusal changes no file when the database is in WAL
+    /// mode, with or without a WAL another writer left uncheckpointed, or
+    /// is a settled rollback-journal database: the main file, `-wal` and
+    /// `-shm` stay byte-identical. The one limit: a HOT rollback journal is
+    /// recovered first, as SQLite requires before anything can be read, so
+    /// such a file is refused after its journal has been rolled back. x0x
+    /// keeps history in WAL mode from first initialization, so a history
+    /// database has a hot rollback journal only from an interrupted pre-WAL
+    /// initialization, before any version is committed (controller decision
+    /// C-0116-F1).
     pub fn open_with_busy_timeout(path: &Path, busy: std::time::Duration) -> HistoryResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -523,23 +536,33 @@ impl Store {
             })?;
         }
         // ADR 0116 Validation, "Storage and downgrade": an unknown newer
-        // schema fails closed WITHOUT changing any file. The whole refusal
-        // path (recovery and close included) must leave the main file and
-        // its sidecars as they were, so first note which sidecars exist,
-        // before this open touches anything.
+        // schema fails closed without changing any file (see the doc above
+        // for the hot-journal limit). Note whether a WAL exists BEFORE this
+        // open touches anything: one this open did not create may hold
+        // another writer's uncheckpointed frames.
         let wal_present = sidecar(path, "-wal").exists();
-        if sidecar(path, "-journal")
-            .metadata()
-            .is_ok_and(|journal| journal.len() > 0)
-        {
-            check_version_beside_a_rollback_journal(path, busy)?;
-        }
         let conn = Connection::open(path).map_err(|e| {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
         let pragma_error =
             |e| HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()));
+        // With such a WAL, the close must not checkpoint it until the
+        // version is known to be compatible: the last connection's close
+        // would fold its frames into the main file and delete it.
+        // NO_CKPT_ON_CLOSE skips both, so a refusal on ANY path (a newer
+        // version, or a version read that fails) leaves both files
+        // byte-identical. It is switched off again once compatibility is
+        // confirmed, so an ordinary open keeps the ordinary close.
+        let no_checkpoint_on_close = |on: bool| {
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                on,
+            )
+        };
+        if wal_present {
+            no_checkpoint_on_close(true).map_err(pragma_error)?;
+        }
         // Exclusive locking first. It does no I/O, and because it comes
         // before the first access, SQLite keeps this connection's WAL index
         // in heap memory and never uses `-shm` ("WAL without shared memory"
@@ -555,7 +578,8 @@ impl Store {
         // `migrate` creates its table. Only a missing `schema_version` table
         // or row means "no schema yet". Any other failure (busy, I/O, a value
         // that does not decode) stops the open here, before setup can write
-        // a file whose version is unknown.
+        // a file whose version is unknown. (A hot rollback journal is rolled
+        // back by this first read: SQLite recovery, the documented limit.)
         let stored = read_schema_version(&conn).map_err(|e| {
             HistoryError::Database(format!(
                 "pragma setup history db {}: schema check: {e}",
@@ -563,21 +587,11 @@ impl Store {
             ))
         })?;
         if let Some(version) = stored.filter(|version| *version > SCHEMA_VERSION) {
-            if wal_present {
-                // A WAL this open did not create may hold another writer's
-                // uncheckpointed frames (a crash). The last connection's
-                // close would checkpoint them into the main file and delete
-                // the WAL; NO_CKPT_ON_CLOSE skips both, so both files stay
-                // byte-identical. Without a WAL beforehand, the ordinary
-                // close only removes the empty one this read created. The
-                // call fails only on an invalid handle; the refusal stands
-                // either way.
-                let _ = conn.set_db_config(
-                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-                    true,
-                );
-            }
             return Err(newer_schema_error(version));
+        }
+        // Compatible (or new): the ordinary close from here on.
+        if wal_present {
+            no_checkpoint_on_close(false).map_err(pragma_error)?;
         }
         // auto_vacuum must be decided before the first table exists. On a
         // database that is already INCREMENTAL the pragma is not a no-op: it
@@ -3881,44 +3895,11 @@ fn read_schema_version(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 }
 
 /// `path` with `suffix` appended to its file name: SQLite's sidecar files
-/// (`-wal`, `-shm`, `-journal`).
+/// (`-wal`, `-shm`).
 fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     std::path::PathBuf::from(name)
-}
-
-/// A non-empty `-journal` beside the database may be a HOT rollback journal:
-/// the first read of a read/write connection would roll it back, which
-/// writes the main file and deletes the journal. x0x keeps history in WAL
-/// mode, so such a journal is another writer's. Read the version through a
-/// READ_ONLY connection instead: SQLite does not let a read-only connection
-/// roll a hot journal back, and reports SQLITE_READONLY_ROLLBACK. Refuse on
-/// a newer version and on any read failure (hot journal, busy, I/O); a
-/// journal that is not hot, beside a version this binary knows, leaves the
-/// open to proceed.
-fn check_version_beside_a_rollback_journal(
-    path: &Path,
-    busy: std::time::Duration,
-) -> HistoryResult<()> {
-    let refuse = |e: rusqlite::Error| {
-        HistoryError::Database(format!(
-            "history db {} has a rollback journal and its schema version cannot be read without \
-             recovering it ({e}); x0x keeps history in WAL mode and will not recover another \
-             writer's journal before it knows the version",
-            path.display()
-        ))
-    };
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(refuse)?;
-    conn.busy_timeout(busy).map_err(refuse)?;
-    match read_schema_version(&conn).map_err(refuse)? {
-        Some(version) if version > SCHEMA_VERSION => Err(newer_schema_error(version)),
-        _ => Ok(()),
-    }
 }
 
 /// Schema v2 adds no columns: it backfills the existing FTS projection for
