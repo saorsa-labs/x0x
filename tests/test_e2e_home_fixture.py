@@ -238,7 +238,7 @@ esac
                                   poll_timeout=20, mixed=False)
 
     def run_model(self, fixture=None, scenario_cls=None, card_reply=None, tunnel_side_effect=None, *,
-                  binary_shas=None, deployed_shas=None, mixed=False, captured=None):
+                  binary_shas=None, deployed_shas=None, mixed=False, captured=None, binary_swap=None):
         """Run the REAL run_fixture -> run_home -> exercise ordering against a stateful model.
 
         The model encodes the product facts the harness depends on: a Home join is
@@ -265,7 +265,9 @@ esac
         class Custody:
             instance = None
             def __init__(self, *_args):
-                self.offline, self.keys, self.started = set(), {}, set(); Custody.instance = self
+                self.offline, self.keys, self.started = set(), {}, set()
+                self.replaced: dict[str, str] = {}
+                Custody.instance = self
             def prepare(self, *_args): pass
             def create_owner_key(self, node, *_args): self.keys[node.label] = owner_key
             def start(self, node):
@@ -274,6 +276,9 @@ esac
             def stop(self, label):
                 if label not in self.started: raise RuntimeError("unowned")
                 self.offline.add(label); events.append(("stop", label))
+                # A binary replaced while the device is stopped is what the next start runs.
+                if binary_swap and label in binary_swap and label not in self.replaced:
+                    self.replaced[label] = binary_swap[label]
             def restart(self, label): self.stop(label); self.offline.discard(label); events.append(("start", label))
             def write_certificate(self, node, _cert): world["certs"].add(node.label)
             def key_fingerprint(self, node):
@@ -291,6 +296,10 @@ esac
                 if deployed_shas is None:
                     return self.hashes(node)[1]
                 return deployed_shas[node.label]
+            def running_exe_sha(self, node):
+                if node.label in self.replaced:
+                    return self.replaced[node.label]
+                return self.hashes(node)[1]
             def restore(self): return []
 
         def online(label): return label not in Custody.instance.offline
@@ -504,6 +513,25 @@ esac
         self.assertEqual(deployed, row["deployed_binary_sha256"])
         self.assertNotIn(("req", "owner", "GET", "/home"), events)
 
+    def test_writer_binary_replaced_while_stopped_fails_before_the_next_home_step(self):
+        """A binary swapped onto a stopped writer must not reach that writer's Home step."""
+        original, replacement = "ab" * 32, "cd" * 32
+        shas = {label: original for label in self.args().nodes}
+        captured: dict = {}
+        events, _custody, _world, evidence, error = self.run_model(
+            binary_shas=shas, binary_swap={"writer": replacement}, captured=captured)
+        self.assertIsInstance(error, AssertionError)
+        rows = [item for item in evidence.assertions
+                if item["label"] == "writer runs the expected fixture binary"]
+        self.assertEqual([True, False], [item["passed"] for item in rows])
+        row = rows[-1]
+        self.assertFalse(row["passed"])
+        self.assertEqual(original, row["expected_sha256"])
+        self.assertEqual(replacement, row["running_sha256"])
+        self.assertEqual(original, captured["manifest"]["binary_sha256"]["writer"])
+        self.assertFalse(captured["manifest"]["mixed"])
+        self.assertNotIn(("req", "writer", "GET", "/home"), events)
+
     def test_evaluate_custody_receipt_rejects_a_partial_or_non_hex_map(self):
         owner, config = "ab" * 32, "11" * 32
         receipts = {"owner": (config, owner)}
@@ -526,6 +554,30 @@ esac
         remote.run.return_value = b"not-a-sha\n"
         with self.assertRaisesRegex(RuntimeError, "invalid deployed binary sha256"):
             custody.deployed_binary_sha(self.node())
+
+    def test_running_exe_script_hashes_the_owned_process_not_the_receipt(self):
+        with tempfile.TemporaryDirectory(prefix="home-running-exe-") as root:
+            proc = Path(root) / "proc"
+            process = proc / "4242"
+            process.mkdir(parents=True)
+            Path(f"{root}/fixture.marker").write_text("marker\n")
+            Path(f"{root}/binary.sha256").write_text("ab" * 32 + "\n")
+            (process / "exe").write_bytes(b"running-binary")
+            fields = ["0"] * 22
+            fields[4] = "4242"
+            fields[21] = "98765"
+            (process / "stat").write_text(" ".join(fields) + "\n")
+            Path(f"{root}/daemon.pid").write_text("4242 98765\n")
+            script = self.h.running_exe_script(str(proc))
+            command = self.h.Remote.command(script, [root, "marker"], input_bytes=False)
+            result = subprocess.run(command, shell=True, input=script.encode(),
+                                    capture_output=True, timeout=5, check=True)
+            self.assertEqual(hashlib.sha256(b"running-binary").hexdigest(), result.stdout.decode().strip())
+            self.assertNotEqual("ab" * 32, result.stdout.decode().strip())
+            Path(f"{root}/daemon.pid").write_text("4242 1\n")
+            refused = subprocess.run(command, shell=True, input=script.encode(),
+                                     capture_output=True, timeout=5, check=False)
+            self.assertNotEqual(0, refused.returncode)
 
     def test_mixed_flag_is_accepted(self):
         script = Path(__file__).parent / "e2e_home_fixture.py"

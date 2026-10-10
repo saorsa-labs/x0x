@@ -5,7 +5,7 @@ Every daemon, key and token belongs to a fresh /var/tmp/x0x-home-e2e-<uuid>
 root. Existing x0x services and identities are never inspected or modified.
 A single-binary run requires every node to record the same x0xd sha256.
 Pass --mixed to record each node's sha256 and check it against the binary
-deployed to that node.
+deployed to that node. Every later start must still run that recorded binary.
 """
 from __future__ import annotations
 
@@ -86,6 +86,23 @@ while [ ! -s "$root/daemon.pid" ] && [ $i -lt 50 ]; do sleep .1; i=$((i+1)); don
 set -- $(cat "$root/daemon.pid")
 [ "$#" = 2 ] && [ "$1" = "$launcher" ]
 kill -0 "$1"
+'''
+
+def running_exe_script(proc_root: str = "/proc") -> str:
+    """sha256 of the owned daemon executable. The receipt file is not an input."""
+    proc = shlex.quote(proc_root)
+    return rf'''set -eu
+root=$1 marker=$2
+proc={proc}
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ -s "$root/daemon.pid" ]
+set -- $(cat "$root/daemon.pid")
+[ "$#" = 2 ]
+pid=$1 expected_start=$2
+case "$pid:$expected_start" in *[!0-9:]*) exit 41;; esac
+[ -r "$proc/$pid/stat" ]
+[ "$(awk '{{print $22}}' "$proc/$pid/stat")" = "$expected_start" ]
+sha256sum "$proc/$pid/exe" | awk '{{print $1}}'
 '''
 
 def stop_script(proc_root: str = "/proc", *, terminate: bool = True,
@@ -344,6 +361,15 @@ sha256sum "$binary" | awk '{print $1}'
         value = raw.decode().strip()
         if not re.fullmatch(r"[0-9a-f]{64}", value):
             raise RuntimeError("invalid deployed binary sha256")
+        return value
+
+    def running_exe_sha(self, node: Node) -> str:
+        """sha256 of the running owned daemon, not the receipt written at start."""
+        self.validate(node)
+        raw = self.remote.run(node.host, running_exe_script(), [node.root, self.marker], capture=True)
+        value = raw.decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise RuntimeError("invalid running executable sha256")
         return value
 
     def control_blob_witnesses(self) -> list[dict[str, Any]]:
@@ -637,6 +663,16 @@ def evaluate_custody_receipt(receipts: dict[str, tuple[str, str]], deployed: dic
     }
 
 
+def require_expected_binary(evidence: Evidence, custody: Any, node: Node,
+                            expected: dict[str, str]) -> None:
+    """Fail when the owned process is not the binary recorded for this node."""
+    actual = custody.running_exe_sha(node)
+    wanted = expected[node.label]
+    evidence.check(f"{node.label} runs the expected fixture binary",
+                   _sha256_hex(actual) and actual == wanted,
+                   expected_sha256=wanted, running_sha256=actual)
+
+
 def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                 resources: dict[str, Any]) -> bool:
     run_id = uuid.uuid4().hex
@@ -698,6 +734,10 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     }
     evidence.check("fixture custody receipt is reproducible", passed,
                    run_id=run_id, network_id=plane, **facts)
+    # Locked for the whole run. Later starts compare the live executable to this map.
+    expected_sha = {label: facts["binary_sha256"][label] for label in nodes}
+    for label, node in nodes.items():
+        require_expected_binary(evidence, custody, node, expected_sha)
     owner_api = clients[owner]
     # #824: a fresh owner device defers provisioning (at most 90 s) while it
     # waits for owner sync; poll through that documented transient state.
@@ -787,8 +827,10 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
             evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
                            owner_key_sha256=fingerprint)
         run_setup_step(evidence, custody, nodes[label], "identity", confirm_key)
-        run_setup_step(evidence, custody, nodes[label], "start",
-                       lambda label=label: _start_daemon(custody, nodes[label]))
+        def start_certified(label: str = label) -> None:
+            _start_daemon(custody, nodes[label])
+            require_expected_binary(evidence, custody, nodes[label], expected_sha)
+        run_setup_step(evidence, custody, nodes[label], "start", start_certified)
 
         def probe(label: str = label) -> None:
             poll(f"{label} restarts certified", args.poll_timeout,
@@ -845,6 +887,7 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         evidence.check("owner and admin devices stopped before writer restart",
                        is_offline(owner) and is_offline(admin))
         custody.stop(late); stopped.add(late); custody.restart(writer)
+        require_expected_binary(evidence, custody, nodes[writer], expected_sha)
         poll("writer health after isolated restart", 60,
              lambda: clients[writer].request("GET", "/health"),
              lambda result: result[0] == 200 and result[1].get("ok") is True)
