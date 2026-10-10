@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! ADR 0116 Validation "Storage and downgrade" (slice F): a released
 //! schema-4 `history.db`, written by the released v0.46.6 `x0xd` (see
 //! `tests/fixtures/v0466_history_db/PROVENANCE.md`), opens under this

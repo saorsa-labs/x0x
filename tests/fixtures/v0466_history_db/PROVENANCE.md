@@ -84,12 +84,57 @@ the scripted older-binary run.
 6. **Excluded.** The rest of the data dir: keys, `api-token`,
    `instance.lock`, `named_groups.json` and so on.
 
+## The scripted downgrade proof
+
+`downgrade_proof.py` runs the older-binary half of the Validation row.
+Every daemon runs under the sandbox above, with a scratch HOME. The script
+uses the same config for every daemon: `dm_recording = "ephemeral"`, a
+1-byte Replaceable class budget, a 31-byte `fixture.chat` topic budget and
+an ephemeral `fixture.quiet` topic rule. It does not run in CI, because it
+needs both binaries and macOS `sandbox-exec`.
+
+The steps:
+
+- **S1, upgrade (this version's `x0xd`).** It serves all 15 released rows
+  and `GET /history/policy`. `POST /history/retain` deletes the two oldest
+  chat rows and both cards, then reports `complete`. A self-DM and an
+  ephemeral-topic message are not stored. 11 rows remain.
+- **S2, downgrade (the released v0.46.6 `x0xd`, same data dir and
+  config).**
+  - It warns that the three ADR 0116 keys are ignored.
+  - It serves the 11 rows, and full-text search works.
+  - It has neither `/history/policy` nor `/history/retain`.
+  - It records the DM and the ephemeral-topic message.
+  - It does not apply the topic budget. 15 rows.
+- **S3, upgrade again (this version's `x0xd`).** It serves all 15 rows. The
+  trim enforces the topic budget again (1 chat row, 27 bytes), and the rows
+  v0.46.6 recorded stay.
+- **S4, newer schema.** Each binary gets a schema-5 copy and refuses it at
+  start (exit 1). This version leaves the file byte-identical. The released
+  v0.46.6 changes two header bytes (offsets 27 and 95), the bug fixed in
+  this slice.
+- After S1, S2 and S3, `verify_history_db_from_env` checks the file:
+  schema 4, the v0.46.6 schema objects, FTS integrity-check, and canonical
+  consistency.
+
+```
+python3 tests/fixtures/v0466_history_db/downgrade_proof.py \
+  --new-x0xd target/debug/x0xd \
+  --old-x0xd <scratch>/bin/x0x-macos-arm64/x0xd \
+  --sandbox .planning/team-2026-10-05/loopback-only.sb \
+  --fixture tests/fixtures/v0466_history_db/history.db --work <scratch>/proof \
+  --verify "env HOME=<scratch>/home sandbox-exec -f <loopback-only.sb> \
+    cargo nextest run --archive-file <lib archive> --workspace-remap . \
+    --run-ignored only -E 'test(verify_history_db_from_env)' --no-capture"
+```
+
 ## File hashes (sha256)
 
 ```
 9fe7de6ea55496273df545cc1ea282107fa36a06ba701aaf6ce97dc744179baf  ./history.db
 66bcab9c912e6520b4b188acc45e864a104a6d8b673dcbddb31759f9468c6ab8  ./rows.json
 b01ec0681496149120bb84ec408267bb2f8eff14cfcf671ac49a3e2e5ce2e684  ./make_fixture.py
+e0cb3c8d334d5dd6f582f7d31e8712f6ba0315524d11b2066731477d732c5c5d  ./downgrade_proof.py
 ```
 
 `v0466_fixture_matches_its_provenance` checks `history.db` against this hash.

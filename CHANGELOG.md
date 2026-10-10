@@ -83,6 +83,19 @@ All notable changes to this project will be documented in this file.
     policy; the losing concurrent hole-punch candidate is now closed as a
     duplicate instead of staying open and orphaned.
 
+- **Downgrading keeps history readable but drops the ADR 0116 rules (slice
+  F).** The history database stays at schema 4 with the v0.46.6 schema
+  objects, so v0.46.6 opens a database this release has written or trimmed
+  and serves every row, with full-text search and canonical ids intact. It
+  does not know the new `[history]` keys: it logs that `dm_recording`,
+  `class_limits` and `topic_rules` are "not a recognised setting and is
+  ignored", has no `/history/policy` or `/history/retain`, records DMs and
+  topics the rules would suppress, and does not apply class or topic
+  limits. Upgrading again restores them; rows recorded meanwhile stay
+  (recording rules are not retroactive), and the next trim or reaper pass
+  applies the limits. Proven against a released v0.46.6 fixture
+  (`tests/fixtures/v0466_history_db/`).
+
 - **Library API (breaking for some embedders; the release that carries this
   is 0.47.0).** `HistoryConfig` gains three
   public fields (`dm_recording`, `class_limits`, `topic_rules`) and
@@ -92,6 +105,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A newer history database is refused without being changed (ADR 0116
+  slice F).** History refused a `history.db` written by a newer schema, but
+  only after its setup pragmas had touched the file:
+  `PRAGMA auto_vacuum = INCREMENTAL` rewrote the file header (change
+  counter, SQLite version) even on a database that was already incremental,
+  and a rollback-journal file was converted to WAL. History now checks the
+  stored schema version before any statement that can write, and sets
+  `auto_vacuum` only when the mode differs. A newer database's bytes are
+  left exactly as they were; new databases and upgrades are unchanged.
+  (The released v0.46.6 still changes two header bytes when it refuses a
+  newer database; this fix only helps a downgrade to this release or a
+  later one.)
 - **History retention no longer stops at a bad `scope_limits` entry (#1286).**
   One `[[history.scope_limits]]` entry whose `scope` did not parse made every
   retention pass fail at that entry. The limits after it, the whole-database
