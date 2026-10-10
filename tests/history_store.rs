@@ -370,6 +370,7 @@ async fn an_agent_on_a_held_history_db_names_the_lock() {
         "{:?}",
         anyhow::Error::new(error).context("failed to create agent")
     );
+    println!("x0xd start-up error, as printed:\n{shown}");
     assert!(shown.contains("failed to create agent"), "{shown}");
     assert!(shown.contains("locked by another process"), "{shown}");
     assert!(shown.contains(&path.display().to_string()), "{shown}");

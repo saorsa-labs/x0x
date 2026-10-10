@@ -510,6 +510,10 @@ impl Store {
     /// Open with an explicit busy timeout (tests use a short one so the
     /// exclusivity probe fails fast).
     ///
+    /// A database another process (or connection) holds exclusively is
+    /// [`HistoryError::Locked`], naming the path, after one busy-timeout
+    /// window (issue #1315).
+    ///
     /// A database written by a newer schema (or one whose stored version
     /// cannot be read) is refused (ADR 0116 Validation, "Storage and
     /// downgrade"). The refusal changes no file when the database is in WAL
@@ -545,8 +549,12 @@ impl Store {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
-        let pragma_error =
-            |e| HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()));
+        // Issue #1315: a setup statement that meets another connection's
+        // lock (SQLITE_BUSY / SQLITE_LOCKED after the busy timeout) is
+        // `HistoryError::Locked`, the documented variant for a database
+        // another process holds; any other failure stays `Database`. Every
+        // error still stops the open at the same point.
+        let pragma_error = |e| setup_error(path, None, e);
         // With such a WAL, the close must not checkpoint it until the
         // version is known to be compatible: the last connection's close
         // would fold its frames into the main file and delete it.
@@ -581,12 +589,8 @@ impl Store {
         // that does not decode) stops the open here, before setup can write
         // a file whose version is unknown. (A hot rollback journal is rolled
         // back by this first read: SQLite recovery, the documented limit.)
-        let stored = read_schema_version(&conn).map_err(|e| {
-            HistoryError::Database(format!(
-                "pragma setup history db {}: schema check: {e}",
-                path.display()
-            ))
-        })?;
+        let stored =
+            read_schema_version(&conn).map_err(|e| setup_error(path, Some("schema check"), e))?;
         if let Some(version) = stored.filter(|version| *version > SCHEMA_VERSION) {
             return Err(newer_schema_error(version));
         }
@@ -3864,6 +3868,25 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
             )))
         }
         Some(v) => Err(newer_schema_error(v)),
+    }
+}
+
+/// The error of a setup statement in [`Store::open_with_busy_timeout`]
+/// (issue #1315). A database another connection holds exclusively makes the
+/// first statement that touches it fail with SQLITE_BUSY (or SQLITE_LOCKED)
+/// once the busy timeout runs out: that is [`HistoryError::Locked`], naming
+/// the path. Any other failure is [`HistoryError::Database`], with the same
+/// text as before.
+fn setup_error(path: &Path, stage: Option<&str>, e: rusqlite::Error) -> HistoryError {
+    let stage = stage.map(|stage| format!("{stage}: ")).unwrap_or_default();
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            HistoryError::Locked(format!("{} ({stage}{e})", path.display()))
+        }
+        _ => HistoryError::Database(format!(
+            "pragma setup history db {}: {stage}{e}",
+            path.display()
+        )),
     }
 }
 
