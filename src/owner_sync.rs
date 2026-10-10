@@ -3985,20 +3985,14 @@ mod tests {
     /// The fixture starts the real acceptor without the owner-connect
     /// re-announcement. A seccomp watcher fails the test if this process
     /// calls `bind` or `connect` outside loopback, including the `[::]:0`
-    /// probe to `[2001:4860:4860::8888]:80`. An unrelated process in the
-    /// same network namespace holds a wildcard UDP socket for the whole
-    /// test; that socket is not this process's and must not fail the audit.
+    /// probe to `[2001:4860:4860::8888]:80`. This test opens no
+    /// non-loopback socket.
     ///
     /// On the pre-#1044 dial the initiator stops at `machine not in
     /// discovery cache` and no session completes. When the responder
     /// drops the stream, the initiator's error is the stream reset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mutually_enrolled_devices_complete_owner_sync_both_ways_without_restart() {
-        // Started before the syscall filter, so the child does not inherit
-        // this process's audit. Same relationship as another nextest
-        // process in the isolated network namespace.
-        #[cfg(target_os = "linux")]
-        let mut foreign_wildcard = ForeignWildcardListener::spawn();
         install_loopback_socket_boundary();
         let dir = tempfile::tempdir().expect("tmpdir");
         let seed = [0x84; 32];
@@ -4006,8 +4000,6 @@ mod tests {
         let (bob, bob_sync) = live_owner_device(dir.path(), "bob", seed).await;
         assert_acceptor_without_reannounce(&alice_sync).await;
         assert_acceptor_without_reannounce(&bob_sync).await;
-        #[cfg(target_os = "linux")]
-        foreign_wildcard.assert_still_held();
         assert_loopback_sockets("after owner devices start");
         let alice_id = alice.machine_id();
         let bob_id = bob.machine_id();
@@ -4118,19 +4110,33 @@ mod tests {
             !knows_agent_on(&bob, alice_id).await,
             "an identity announcement arrived; the test no longer uses enrollment alone"
         );
-        #[cfg(target_os = "linux")]
-        foreign_wildcard.assert_still_held();
         assert_loopback_sockets("after both owner-sync sessions");
     }
 
+    /// WHY: `/proc/self/net` is the whole network namespace. A parallel
+    /// test can hold `0.0.0.0` UDP there. The session test must not open
+    /// that socket itself. This check opens it only after the namespace
+    /// is verified loopback-only, then the process-scoped audit must
+    /// stay clear.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn foreign_wildcard_in_verified_loopback_namespace_does_not_fail_socket_audit() {
+        require_loopback_only_namespace();
+        let mut foreign = ForeignWildcardListener::spawn();
+        install_loopback_socket_boundary();
+        foreign.assert_still_held();
+        assert_loopback_sockets("unrelated wildcard listener");
+        foreign.assert_still_held();
+    }
+
     /// Another process in this network namespace, bound to `0.0.0.0`.
-    /// `/proc/self/net/udp` lists that socket; the syscall audit must not.
-    #[cfg(target_os = "linux")]
+    /// `spawn` refuses unless the namespace is already loopback-only.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     struct ForeignWildcardListener {
         child: std::process::Child,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     impl Drop for ForeignWildcardListener {
         fn drop(&mut self) {
             let _ = self.child.kill();
@@ -4138,9 +4144,10 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     impl ForeignWildcardListener {
         fn spawn() -> Self {
+            require_loopback_only_namespace();
             let child = std::process::Command::new("/usr/bin/python3")
                 .args([
                     "-c",
@@ -4190,7 +4197,58 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Same rule as the isolation harness: only `lo`, and no default or
+    /// gateway route. A failure here is before any wildcard bind.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn require_loopback_only_namespace() {
+        let links = ip_json(&["-j", "link"]);
+        let names: Vec<&str> = links
+            .as_array()
+            .expect("ip link")
+            .iter()
+            .map(|link| {
+                link.get("ifname")
+                    .and_then(|name| name.as_str())
+                    .expect("ifname")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["lo"],
+            "refusing to open a wildcard socket; interfaces are not loopback-only"
+        );
+        for family in ["-4", "-6"] {
+            for row in ip_json(&[family, "-j", "route", "show", "table", "all"])
+                .as_array()
+                .expect("ip route")
+            {
+                let dev = row.get("dev").and_then(|value| value.as_str());
+                let dst = row.get("dst").and_then(|value| value.as_str());
+                assert!(
+                    dev == Some("lo") && dst != Some("default") && row.get("gateway").is_none(),
+                    "refusing to open a wildcard socket; route is not loopback-only: {row}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn ip_json(args: &[&str]) -> serde_json::Value {
+        let output = std::process::Command::new("/usr/sbin/ip")
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("ip {}: {error}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "ip {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("ip {} json: {error}", args.join(" ")))
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn foreign_wildcard_udp_present() -> bool {
         let own = own_socket_inodes();
         let Ok(text) = std::fs::read_to_string("/proc/self/net/udp") else {
@@ -4208,7 +4266,7 @@ mod tests {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn own_socket_inodes() -> std::collections::HashSet<String> {
         let mut own = std::collections::HashSet::new();
         let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
