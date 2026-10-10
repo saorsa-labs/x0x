@@ -1762,4 +1762,56 @@ mod tests {
         assert_eq!(handle.purge(&scope).await.unwrap(), 2);
         service.shutdown().await;
     }
+
+    /// Issue #1317 round 2 (Codex P2): a purge is not atomic. Its row
+    /// delete commits, and then the canonical-id cleanup and the
+    /// incremental vacuum run. When a later step fails, the rows stay
+    /// deleted, and `Failed.committed` must count them.
+    #[tokio::test]
+    async fn issue1317_purge_failure_after_the_delete_counts_the_deleted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), HistoryConfig::default());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        let scope = Scope::Topic("purge-me".into());
+        let kept = Scope::Topic("keep".into());
+        d_old_rows(&store, &scope, 3);
+        d_old_rows(&store, &kept, 2);
+        let rows_in = |scope: &Scope| {
+            handle
+                .query(&HistoryQuery {
+                    scope: Some(scope.clone()),
+                    limit: 16,
+                    ..HistoryQuery::default()
+                })
+                .unwrap()
+                .len()
+        };
+        assert_eq!((rows_in(&scope), rows_in(&kept)), (3, 2));
+
+        store.fail_purge_cleanup_for_tests(true);
+        let failed = handle.purge(&scope).await;
+        store.fail_purge_cleanup_for_tests(false);
+        match &failed {
+            Err(RetainError::Failed { error, committed }) => {
+                assert!(
+                    error.to_string().contains("injected cleanup failure"),
+                    "{error}"
+                );
+                assert_eq!(committed.deleted, 3, "{failed:?}");
+                assert_eq!(committed.deleted_by_phase, RetainDeleted::default());
+            }
+            other => panic!("expected Failed after the delete: {other:?}"),
+        }
+        // The deletion committed and is not rolled back; the other scope
+        // is untouched; the cleanup did not run (the orphan is still there).
+        assert_eq!((rows_in(&scope), rows_in(&kept)), (0, 2));
+        assert_eq!(store.table_counts_for_tests(), (2, 2, 1));
+
+        // With the fault gone, a purge of the now-empty scope deletes
+        // nothing and its cleanup removes the orphan.
+        assert_eq!(handle.purge(&scope).await.unwrap(), 0);
+        assert_eq!(store.table_counts_for_tests(), (2, 2, 0));
+        service.shutdown().await;
+    }
 }

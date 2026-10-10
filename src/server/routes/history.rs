@@ -3795,4 +3795,56 @@ mod issue1317_purge_tests {
         assert_eq!(json["removed"], 3);
         Ok(())
     }
+
+    /// Round 2 (Codex P2): a purge whose row delete committed and whose
+    /// later cleanup failed is a 500 that counts the deleted rows in
+    /// `removed`. The rows stay deleted.
+    #[tokio::test]
+    async fn history_purge_500_counts_rows_deleted_before_a_cleanup_failure() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let history = state.agent.history().expect("history on");
+        let scope = Scope::Topic("purge-me".into());
+        let rows: Vec<_> = (0..3)
+            .map(|i| text_row(scope.clone(), &format!("row {i}"), 1_000 + i))
+            .collect();
+        let store = Arc::clone(history.store());
+        store.insert_batch(&rows)?;
+
+        store.fail_purge_cleanup_for_tests(true);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/history?scope=topic:purge-me")
+            .header("authorization", format!("Bearer {DURABLE}"))
+            .body(axum::body::Body::empty())?;
+        let response = app.oneshot(request).await?;
+        store.fail_purge_cleanup_for_tests(false);
+        let status = response.status();
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["ok"], false, "{json}");
+        assert_eq!(json["removed"], 3, "{json}");
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("purge: "), "{json}");
+        assert!(error.contains("injected cleanup failure"), "{json}");
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            0,
+            "the committed delete is not rolled back"
+        );
+        Ok(())
+    }
 }

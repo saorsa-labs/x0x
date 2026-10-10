@@ -9791,6 +9791,32 @@ impl Store {
             .store(committed.saturating_add(1), Ordering::Relaxed);
     }
 
+    /// Issue #1317 round 2: make a purge fail AFTER its row delete has
+    /// committed. `true` adds one orphan canonical-id row and a TEMP
+    /// trigger (this connection only; nothing is written to the schema)
+    /// that aborts any delete from `history_canonical_ids`. A purged row
+    /// with no canonical id fires no such delete, so the purge's main
+    /// DELETE commits and its `cleanup_canonical_ids` step fails on the
+    /// orphan. `false` drops the trigger; the orphan stays for the next
+    /// cleanup to remove.
+    pub(crate) fn fail_purge_cleanup_for_tests(&self, fail: bool) {
+        let guard = lock_conn(&self.conn).unwrap_or_else(|e| panic!("{e}"));
+        let sql = if fail {
+            "INSERT INTO history_canonical_ids \
+               (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+             VALUES (zeroblob(32), zeroblob(32), 2, 'issue1317-orphan'); \
+             CREATE TEMP TRIGGER issue1317_fail_purge_cleanup \
+             BEFORE DELETE ON main.history_canonical_ids BEGIN \
+               SELECT RAISE(ABORT, 'injected cleanup failure'); \
+             END;"
+        } else {
+            "DROP TRIGGER IF EXISTS temp.issue1317_fail_purge_cleanup;"
+        };
+        guard
+            .execute_batch(sql)
+            .unwrap_or_else(|e| panic!("purge cleanup hook: {e}"));
+    }
+
     /// ADR 0116 slice D: park (or release) trims after admission.
     pub(crate) fn pause_trim_for_tests(&self, pause: bool) {
         self.test_pause_trim.store(pause, Ordering::Relaxed);
