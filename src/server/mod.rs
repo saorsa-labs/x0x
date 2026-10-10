@@ -2849,6 +2849,15 @@ pub async fn serve_with_options(
         // the drain grace, not an open-ended thread join: a write waiting on
         // that mutex stays on the writer thread, and the await returns.
         let agent_shutdown_result = state.agent.try_shutdown().await;
+        // A writer blocked in SQLite past the drain grace is not a finished
+        // shutdown, even when no WebSocket backfill is outstanding. The
+        // thread stays in custody and still holds `history.db`. Read the
+        // flag before dropping `state`: the agent's history handle shares it
+        // with the writer that just timed out.
+        let writer_shutdown_incomplete = state
+            .agent
+            .history()
+            .is_some_and(|history| history.writer_shutdown_incomplete());
 
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).
@@ -2870,6 +2879,17 @@ pub async fn serve_with_options(
         // behaviour rather than anything worse.
         std::mem::drop(state);
         tracing::info!("Shutdown complete");
+        let server_result = if writer_shutdown_incomplete {
+            let writer = anyhow::anyhow!(
+                "history writer still owns the store after the shutdown grace; the write was left running"
+            );
+            Err(match server_result {
+                Ok(()) => writer,
+                Err(server) => server.context(format!("history writer also remained: {writer}")),
+            })
+        } else {
+            server_result
+        };
         let server_result = if backfill_release_incomplete {
             let backfill = anyhow::anyhow!(
                 "websocket history backfill still owns the store after the shutdown grace; the read was left running"

@@ -308,6 +308,15 @@ impl HistoryHandle {
         self.writer.counters()
     }
 
+    /// Whether the writer was still in SQLite when its shutdown grace ended.
+    ///
+    /// The thread stays in custody and the store stays open. Shutdown must
+    /// not report success while this is `true`.
+    #[must_use]
+    pub fn writer_shutdown_incomplete(&self) -> bool {
+        self.writer.shutdown_incomplete()
+    }
+
     /// ADR-0068 D1: install the fork-quarantine pin source the reaper
     /// consults. Returns `false` if one is already installed.
     pub fn install_quarantine_pins(&self, pins: Arc<dyn QuarantinePins>) -> bool {
@@ -541,7 +550,9 @@ impl HistoryService {
         // cancelled JoinError once the runtime drops the aborted future.
         let _ = self.reaper.await;
         if let Some(writer) = self.writer.take() {
-            // Writer drain is blocking (joins an OS thread).
+            // Writer drain is blocking (joins an OS thread), bounded by the
+            // drain grace. `false` means the thread is still in custody and
+            // the shared handle reports `writer_shutdown_incomplete`.
             let _ = tokio::task::spawn_blocking(move || writer.shutdown()).await;
         }
     }

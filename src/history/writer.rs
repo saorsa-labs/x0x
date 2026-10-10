@@ -77,6 +77,10 @@ pub struct HistoryCounters {
 pub struct WriterHandle {
     tx: mpsc::SyncSender<WriteCommand>,
     counters: Arc<HistoryCounters>,
+    /// Set when [`Writer::shutdown`] returns while the thread is still in
+    /// SQLite. Clones of this handle, including the agent's history handle,
+    /// observe the same flag.
+    shutdown_incomplete: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WriterHandle {
@@ -114,6 +118,15 @@ impl WriterHandle {
     pub fn counters(&self) -> Arc<HistoryCounters> {
         Arc::clone(&self.counters)
     }
+
+    /// Whether shutdown left this writer running past the drain grace.
+    ///
+    /// The thread is still in custody and still holds the store. A caller
+    /// that sees `true` must not report a finished shutdown.
+    #[must_use]
+    pub fn shutdown_incomplete(&self) -> bool {
+        self.shutdown_incomplete.load(Ordering::SeqCst)
+    }
 }
 
 /// The writer thread plus its shutdown control.
@@ -141,6 +154,7 @@ impl Writer {
         let thread_counters = Arc::clone(&counters);
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_finished = Arc::clone(&finished);
+        let shutdown_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("x0x-history-writer".into())
             .spawn(move || {
@@ -154,7 +168,11 @@ impl Writer {
             tracing::error!("[history] failed to spawn writer thread — history disabled");
         }
         Self {
-            handle: WriterHandle { tx, counters },
+            handle: WriterHandle {
+                tx,
+                counters,
+                shutdown_incomplete,
+            },
             thread,
             shutdown_tx,
             finished,
@@ -170,25 +188,31 @@ impl Writer {
     /// Drain-then-stop. Bounded by `SHUTDOWN_DRAIN_GRACE`; queued records
     /// beyond the grace are abandoned and counted — never `abort()`.
     ///
-    /// The join uses that same grace. A thread blocked in `Store::query`'s
-    /// connection mutex (or inside a write that outlives the grace) is left
-    /// running: the `JoinHandle` stays owned, the in-flight write is not
-    /// cancelled, and this call returns so shutdown is not unbounded.
-    pub fn shutdown(mut self) {
+    /// The join uses that same grace. A thread blocked in SQLite past that
+    /// grace is left running: the `JoinHandle` stays owned and the in-flight
+    /// write is not cancelled. This call still returns. `false` means the
+    /// writer is incomplete and [`WriterHandle::shutdown_incomplete`] is set,
+    /// so the caller must not report a finished shutdown.
+    #[must_use]
+    pub fn shutdown(mut self) -> bool {
         // Signal the loop; it drains what it can within the grace window.
         let _ = self.shutdown_tx.send(());
         let Some(thread) = self.thread.take() else {
-            return;
+            return true;
         };
         let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_GRACE;
         while !self.finished.load(Ordering::SeqCst) {
             if std::time::Instant::now() >= deadline {
+                self.handle
+                    .shutdown_incomplete
+                    .store(true, Ordering::SeqCst);
                 retain_unfinished_writer(thread);
-                return;
+                return false;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = thread.join();
+        true
     }
 }
 
@@ -457,6 +481,7 @@ mod tests {
         }
 
         let writer = Writer::spawn(Arc::clone(&store));
+        let probe = writer.handle();
         let counters = writer.handle().counters();
         let entered = hold.writer_entered();
         writer.handle().record(waiting_record());
@@ -473,8 +498,8 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let started = Instant::now();
         let shutdown = std::thread::spawn(move || {
-            writer.shutdown();
-            let _ = done_tx.send(started.elapsed());
+            let completed = writer.shutdown();
+            let _ = done_tx.send((started.elapsed(), completed));
         });
         let outcome = done_rx.recv_timeout(SHUTDOWN_DRAIN_GRACE + Duration::from_secs(3));
         if outcome.is_err() {
@@ -483,7 +508,15 @@ mod tests {
             let _ = shutdown.join();
             panic!("writer shutdown did not return while the query held the connection");
         }
-        let elapsed = outcome.unwrap();
+        let (elapsed, completed) = outcome.unwrap();
+        assert!(
+            !completed,
+            "a writer still blocked in SQLite must not report a completed shutdown"
+        );
+        assert!(
+            probe.shutdown_incomplete(),
+            "the unfinished writer must stay visible to the caller"
+        );
         assert!(
             elapsed + Duration::from_secs(1) >= SHUTDOWN_DRAIN_GRACE,
             "shutdown returned before the join bound ({elapsed:?})"

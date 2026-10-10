@@ -671,6 +671,127 @@ async fn issue1288_ws_backfill_inside_lock_bounds_writer_shutdown() -> Result<()
     Ok(())
 }
 
+/// No WebSocket backfill is running. A query holds the connection mutex and
+/// the writer is blocked in SQLite past the drain grace. Shutdown must
+/// return a bounded error, not `Ok(())`, and leave the thread in custody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1288_writer_past_grace_without_backfill_is_incomplete_shutdown() -> Result<()> {
+    let (daemon, state) = start_daemon().await?;
+    let stats = Arc::clone(&state.ws_outbound_stats);
+    let history = state.agent.history().context("daemon history")?.clone();
+    let hold = crate::history::store::arm_query_lock_park(history.store());
+    let release = QueryLockReleaseGuard(Arc::clone(&hold));
+    let counters = history.counters();
+    let store = Arc::clone(history.store());
+    let query = tokio::task::spawn_blocking(move || {
+        crate::history::store::prepare_query_lock_park();
+        let _ = store.query(&crate::history::HistoryQuery {
+            limit: 1,
+            ..Default::default()
+        });
+    });
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.parked() < 1 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the history query did not park inside the connection lock (parked {})",
+            hold.parked()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        super::ws::unfinished_backfill_reads(&stats),
+        0,
+        "this control must not have a pending websocket backfill"
+    );
+    let entered = hold.writer_entered();
+    history.record(writer_wait_record());
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.writer_entered() <= entered {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the history writer did not reach the connection lock (entered {entered})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let written = counters
+        .written_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    drop(state);
+
+    let Daemon {
+        _root,
+        config: _,
+        handle,
+        state_weak: _,
+        agent_weak: _,
+    } = daemon;
+    let shutdown = tokio::time::timeout(WAIT, handle.shutdown_and_wait()).await;
+    let result = match shutdown {
+        Err(_) => {
+            anyhow::bail!("shutdown did not return within {WAIT:?} while the writer held the store")
+        }
+        Ok(result) => result,
+    };
+    let message = result
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_default();
+    assert!(
+        result.is_err(),
+        "a writer still blocked after the grace must not be a successful release: {result:?}"
+    );
+    assert!(
+        message.contains("history writer"),
+        "the incomplete writer must be the shutdown error, got {message}"
+    );
+    assert!(
+        history.writer_shutdown_incomplete(),
+        "the unfinished writer must stay visible after shutdown returns"
+    );
+    assert_eq!(
+        super::ws::unfinished_backfill_reads(&stats),
+        0,
+        "no websocket backfill was pending"
+    );
+    assert!(
+        hold.parked() >= 1 && !hold.is_released(),
+        "the query must still be inside the connection lock"
+    );
+    assert_eq!(
+        counters
+            .written_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        written,
+        "the admitted write must still be waiting when shutdown returns"
+    );
+    assert!(
+        crate::history::writer::reap_finished_writer_threads() >= 1,
+        "the writer thread must still be in custody"
+    );
+
+    drop(release);
+    let cleanup = tokio::time::Instant::now() + WAIT;
+    while !query.is_finished()
+        || crate::history::writer::reap_finished_writer_threads() > 0
+        || counters
+            .written_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+            <= written
+    {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < cleanup,
+            "the admitted write did not finish after the query released the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(query);
+    drop(_root);
+    Ok(())
+}
+
 /// Completed backfill handles are reclaimed on the next registration.
 /// A read that has not finished stays owned. No daemon is started.
 #[tokio::test]
