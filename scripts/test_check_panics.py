@@ -567,6 +567,100 @@ class PanicScanner(unittest.TestCase):
                 result = self.scan("src/generic_comment_prod.rs", source)
                 self._assert_rejected(result, kind)
 
+    def test_cfg_test_literal_does_not_hide_next_element(self):
+        # `1` never sets expr mode, so the comma must still end the item.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                visible = self._call(kind, "visible")
+                source = (
+                    "fn prod() {\n"
+                    "    let _ = [\n"
+                    "        #[cfg(test)]\n"
+                    "        1,\n"
+                    f"        {visible},\n"
+                    "    ];\n"
+                    "}\n"
+                )
+                result = self.scan("src/literal_elem.rs", source)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(visible, result.stdout)
+
+    def test_cfg_test_non_identifier_expr_is_accepted(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                source = (
+                    "fn prod() {\n"
+                    "    let _ = [\n"
+                    "        #[cfg(test)]\n"
+                    f"        ({hidden}),\n"
+                    "        2,\n"
+                    "    ];\n"
+                    "}\n"
+                )
+                result = self.scan("src/literal_only.rs", source)
+                self.assert_clean(result)
+                self.assertNotIn("hidden", result.stdout)
+
+    def test_return_type_macro_hides_test_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            for form in ("{}", "()"):
+                with self.subTest(kind=kind, form=form):
+                    hidden = self._call(kind, "hidden")
+                    source = (
+                        "macro_rules! unit { () => { () } }\n"
+                        "#[cfg(test)]\n"
+                        f"fn helper() -> unit!{form} {{\n"
+                        f"    {hidden};\n"
+                        "}\n"
+                        "fn prod() {}\n"
+                    )
+                    result = self.scan("src/ret_macro.rs", source)
+                    self.assert_clean(result)
+                    self.assertNotIn("hidden", result.stdout)
+
+    def test_return_type_macro_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            for form in ("{}", "()"):
+                with self.subTest(kind=kind, form=form):
+                    hidden = self._call(kind, "hidden")
+                    visible = self._call(kind, "visible")
+                    source = (
+                        "macro_rules! unit { () => { () } }\n"
+                        "#[cfg(test)]\n"
+                        f"fn helper() -> unit!{form} {{\n"
+                        f"    {hidden};\n"
+                        "}\n"
+                        f"fn prod() {{ {visible}; }}\n"
+                    )
+                    result = self.scan("src/ret_macro_prod.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_const_initializer_block_hides_test_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                source = (
+                    "#[cfg(test)]\n"
+                    f"const X: usize = {{0}} + {{ if false {{ {hidden}; }} 1 }};\n"
+                )
+                result = self.scan("src/const_init.rs", source)
+                self.assert_clean(result)
+                self.assertNotIn("hidden", result.stdout)
+
+    def test_const_initializer_block_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    f"const X: usize = {{0}} + {{ if false {{ {hidden}; }} 1 }};\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/const_init_prod.rs", source)
+                self._assert_rejected(result, kind)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

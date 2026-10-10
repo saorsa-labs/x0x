@@ -23,7 +23,10 @@ declare -A IN_TEST=()
 # #[cfg(all(..., test, ...))], #[test], or #[tokio::test] item, or after a
 # crate-level #![cfg(test)]. A nested #![cfg(test)] ends with its module.
 # The item ends when its brace body closes, or at ';' / ',' when it has no
-# body. Strings stay open until the closing quote, block comments nest, and
+# body, including a literal or other expression that has no identifier.
+# A `!{...}` macro in a signature, and a brace in a const or static
+# initializer, are not the item body. Strings stay open until the closing
+# quote, block comments nest, and
 # '<' counts as a generic only in type position. A comparison does not.
 # A brace that begins a const-generic argument is not the item body, even
 # when whitespace or a comment separates it from the comma. Code after the
@@ -95,13 +98,17 @@ def test_lines(text: str) -> dict[int, str]:
     bracket_floor = 0
     phase = "header"  # header | body | after
     mode = ""  # "" | block | expr
+    # True after `=` in a const/static header. Braces there are initializer
+    # blocks; the item ends at `;`.
+    in_initializer = False
 
     def end_item() -> None:
-        nonlocal active, phase, mode, type_mode
+        nonlocal active, phase, mode, type_mode, in_initializer
         active = False
         phase = "header"
         mode = ""
         type_mode = False
+        in_initializer = False
 
     def in_value_expr() -> bool:
         if const_expr > 0:
@@ -131,13 +138,14 @@ def test_lines(text: str) -> dict[int, str]:
         prev_token = token
 
     def start_item() -> None:
-        nonlocal active, floor, paren_floor, bracket_floor, phase, mode
+        nonlocal active, floor, paren_floor, bracket_floor, phase, mode, in_initializer
         active = True
         floor = depth
         paren_floor = paren
         bracket_floor = bracket
         phase = "header"
         mode = ""
+        in_initializer = False
 
     def at_item_level() -> bool:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
@@ -306,8 +314,16 @@ def test_lines(text: str) -> dict[int, str]:
             if ch == "=":
                 # Associated-type bindings (`Item = Vec<u8>`) stay in type
                 # position. An `=` outside angle brackets ends a type.
+                # `=>` and `==` are not const/static initializers.
                 if angle == 0:
                     type_mode = False
+                    if (
+                        nxt not in "=>"
+                        and active
+                        and phase == "header"
+                        and at_item_level()
+                    ):
+                        in_initializer = True
                 remember("=")
                 i += 2 if nxt in "=>" else 1
                 continue
@@ -333,6 +349,20 @@ def test_lines(text: str) -> dict[int, str]:
                     remember("{")
                     if active:
                         ensure_marking(i)
+                    i += 1
+                    continue
+                # `-> unit!{}` and `const X: T = {0} + {1}` are still the
+                # header. The function body is the following brace, and the
+                # const item runs through its semicolon.
+                if (
+                    active
+                    and phase == "header"
+                    and at_item_level()
+                    and (prev_token == "!" or in_initializer)
+                ):
+                    remember("{")
+                    ensure_marking(i)
+                    depth += 1
                     i += 1
                     continue
                 if active and phase == "header" and at_item_level():
@@ -467,7 +497,7 @@ def test_lines(text: str) -> dict[int, str]:
                 ch == ","
                 and active
                 and phase == "header"
-                and mode == "expr"
+                and mode != "block"
                 and angle == 0
                 and at_item_level()
             ):
