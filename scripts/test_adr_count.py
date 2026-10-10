@@ -70,6 +70,14 @@ class AdrCountTests(unittest.TestCase):
             ],
         )
 
+    def test_transient_file_stays_outside_the_count(self):
+        extra = self.root / "docs/adr/transient/0117-new-decision.md"
+        extra.parent.mkdir()
+        extra.write_text("# ADR 0117\n\n- **Status:** Proposed\n")
+        self.assertEqual(CHECK.validate(self.root), [])
+        count, extras = CHECK.current_records(self.root)
+        self.assertEqual((count, extras), (15, []))
+
     def test_extra_consolidated_record_exceeds_the_limit_of_15(self):
         extra = self.root / "docs/adr/consolidated/hidden/A16-r01-extra.md"
         extra.parent.mkdir()

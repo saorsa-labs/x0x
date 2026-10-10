@@ -75,7 +75,8 @@ allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
 15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
 map keep their exact paths as links and stay outside that count. Only a
 path recorded in `docs/adr-archive/move.json` and present as that archive
-link is excluded. A nested file that reuses a mapped number counts. A legal
+link is excluded. Files under `docs/adr/transient/` do not count (D242).
+A nested file that reuses a mapped number counts. A legal
 run prints the pass line only. It does not name an unplaced record.
 
 A recorded consolidation move may replace a numbered path with a symlink

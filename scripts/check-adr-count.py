@@ -3,7 +3,8 @@
 
 The plan is docs/adr/consolidated/README.md. An exact ``docs/adr/NNNN-*.md``
 path does not count when ``docs/adr-archive/move.json`` records it and that
-path is a symlink to the recorded archive link. A nested file that reuses a
+path is a symlink to the recorded archive link. Files under
+``docs/adr/transient/`` do not count (D242). A nested file that reuses a
 mapped number counts. A legal run prints the pass line only.
 
 This check reads local files only. It never starts x0xd or contacts the network.
@@ -95,7 +96,7 @@ def current_records(root: Path) -> tuple[int, list[str]]:
             if not _is_record(path) or not NUMBERED_FILE.fullmatch(path.name):
                 continue
             relative = path.relative_to(adr_dir)
-            if relative.parts and relative.parts[0] == "consolidated":
+            if relative.parts and relative.parts[0] in {"consolidated", "transient"}:
                 continue
             repo_path = f"docs/adr/{relative.as_posix()}"
             if repo_path in archived:
