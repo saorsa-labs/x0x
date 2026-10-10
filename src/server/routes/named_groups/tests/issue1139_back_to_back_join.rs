@@ -713,17 +713,43 @@ impl Drop for CaptureGuard {
     }
 }
 
-/// The reference frame the production offer encoded for `recipient`.
-/// Absent when that offer never encoded one. `bound` is a failure limit.
+/// An exchange `send_join_artifact` finished. Empty text is a real write.
+/// The in-process stand-in admits with its marker error.
+fn exchange_admitted(error: &str) -> bool {
+    error.is_empty() || error.contains(x0x::dm::PINNED_STANDIN_ADMITTED)
+}
+
+/// Finished class-R exchanges for this recipient and kind, in order.
+/// The text is the error `send_join_artifact` returned.
+fn exchange_errors(authority: &AppState, recipient: &str, kind: &str) -> Vec<String> {
+    authority
+        .named_group_test_recorders
+        .join_artifact_outcomes
+        .lock()
+        .expect("join artifact outcomes")
+        .iter()
+        .filter(|(who, recorded_kind, _)| who == recipient && *recorded_kind == kind)
+        .map(|(_, _, error)| error.clone())
+        .collect()
+}
+
+/// The reference frame the production offer encoded for `recipient`, once
+/// that offer's `join_result_reference` exchange has been admitted. A
+/// refusal after encoding fails the wait. `bound` is a failure limit.
 async fn emitted_reference_frame(
+    authority: &AppState,
     recipient: &str,
     source: &str,
     bound: Duration,
 ) -> Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + bound;
+    let mut frames = Vec::new();
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("the offer encoded no reference frame for {recipient}");
+            anyhow::bail!(
+                "the offer produced no admitted reference frame for {recipient}; encoded {}",
+                frames.len()
+            );
         }
         for frame in super::super::control_blob::frame_capture::drain_frames() {
             let Ok(super::super::control_blob::ControlBlobMessage::Reference { reference }) =
@@ -737,22 +763,33 @@ async fn emitted_reference_frame(
             if ref_str(&value, "recipient").ok().as_deref() == Some(recipient)
                 && ref_str(&value, "source").ok().as_deref() == Some(source)
             {
-                return Ok(frame);
+                frames.push(frame);
             }
+        }
+        let outcomes = exchange_errors(authority, recipient, "join_result_reference");
+        if !frames.is_empty() && outcomes.len() >= frames.len() {
+            let error = &outcomes[frames.len() - 1];
+            anyhow::ensure!(
+                exchange_admitted(error),
+                "the reference was encoded but the send was not admitted ({error})"
+            );
+            return Ok(frames.pop().expect("reference frame"));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// Move encoded Reference, Fetch, and Chunk frames between the two
-/// in-process handlers. Chunk bytes are the payload the authority's Fetch
-/// arm encoded. A chunk is delivered only after this pull's Fetch for that
-/// sequence has been encoded, which is after the joiner installed its
-/// waiter. `translate` keeps the joiner on `joiner_ref` while the authority
-/// serves `serve`: the Fetch digest is restored so the staged blob is
-/// found, and the emitted chunk's `data_b64` is delivered unchanged under
-/// `joiner_ref`. The deadline is a failure bound. The returned string is
-/// the pull task's finished result, and every chunk sequence was forwarded.
+/// Move Fetch frames to the authority and admitted chunk frames to the
+/// joiner. A chunk payload is the bytes recorded after
+/// `send_join_artifact` admitted that exchange. The bridge pairs those
+/// payloads, in order, with this pull's `join_result_chunk` outcomes. A
+/// refusal after encoding is an outcome with no admitted payload, and it
+/// fails the pull instead of installing keys. `translate` keeps the joiner
+/// on `joiner_ref` while the authority serves `serve`: the Fetch digest is
+/// restored so the staged blob is found, and the admitted chunk's
+/// `data_b64` is delivered unchanged under `joiner_ref`. The deadline is a
+/// failure bound. The returned string is the pull task's finished result,
+/// and every chunk sequence was forwarded.
 async fn bridge_emitted_pull(
     authority: &Arc<AppState>,
     joiner: &Arc<AppState>,
@@ -780,6 +817,9 @@ async fn bridge_emitted_pull(
     );
     let mut requested = std::collections::HashSet::new();
     let mut delivered = std::collections::HashSet::new();
+    let mut pending_chunks = std::collections::VecDeque::new();
+    let mut outcome_cursor = exchange_errors(authority, &recipient, "join_result_chunk").len();
+    let mut admitted_waiting = 0usize;
     let deadline = tokio::time::Instant::now() + bound;
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -850,7 +890,10 @@ async fn bridge_emitted_pull(
                     &serve_digest,
                 ) =>
                 {
-                    if !requested.contains(&sequence) || !delivered.insert(sequence) {
+                    if !requested.contains(&sequence)
+                        || delivered.contains(&sequence)
+                        || pending_chunks.iter().any(|(seen, _)| *seen == sequence)
+                    {
                         continue;
                     }
                     anyhow::ensure!(
@@ -866,16 +909,37 @@ async fn bridge_emitted_pull(
                     } else {
                         serde_json::from_slice(&frame)?
                     };
-                    super::super::control_blob::handle_control_blob_message(
-                        joiner,
-                        &authority.agent.agent_id(),
-                        true,
-                        outbound,
-                    )
-                    .await;
+                    pending_chunks.push_back((sequence, outbound));
                 }
                 _ => {}
             }
+        }
+        let outcomes = exchange_errors(authority, &recipient, "join_result_chunk");
+        while outcome_cursor < outcomes.len() {
+            let error = &outcomes[outcome_cursor];
+            outcome_cursor += 1;
+            anyhow::ensure!(
+                exchange_admitted(error),
+                "join_result_chunk send was not admitted ({error}); a refusal after encoding must not deliver the chunk"
+            );
+            admitted_waiting += 1;
+        }
+        while admitted_waiting > 0 {
+            let Some((sequence, outbound)) = pending_chunks.pop_front() else {
+                break;
+            };
+            anyhow::ensure!(
+                delivered.insert(sequence),
+                "admitted chunk {sequence} was already delivered"
+            );
+            super::super::control_blob::handle_control_blob_message(
+                joiner,
+                &authority.agent.agent_id(),
+                true,
+                outbound,
+            )
+            .await;
+            admitted_waiting -= 1;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -943,8 +1007,13 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
     let s = build_back_to_back(dir.path()).await?;
     let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
     let authority_hex = hex::encode(s.authority_id.as_bytes());
-    let reference_frame =
-        emitted_reference_frame(&j2_hex, &authority_hex, Duration::from_secs(10)).await?;
+    let reference_frame = emitted_reference_frame(
+        &s._authority,
+        &j2_hex,
+        &authority_hex,
+        Duration::from_secs(10),
+    )
+    .await?;
     let serve = match serde_json::from_slice(&reference_frame)? {
         super::super::control_blob::ControlBlobMessage::Reference { reference } => reference,
         _ => anyhow::bail!("emitted offer was not a reference frame"),

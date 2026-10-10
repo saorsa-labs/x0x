@@ -592,17 +592,24 @@ pub(super) fn encode_message(message: &ControlBlobMessage) -> std::result::Resul
     if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
         return Err("control blob frame exceeds direct-message limit".to_string());
     }
+    // A chunk is recorded only after its admitted send. Encoding alone
+    // must not publish bytes the transport refused.
     #[cfg(test)]
-    frame_capture::record_frame(&bytes);
+    if !matches!(message, ControlBlobMessage::Chunk { .. }) {
+        frame_capture::record_frame(&bytes);
+    }
     Ok(bytes)
 }
 
-/// Test-only copies of the frames [`encode_message`] handed to the
-/// transport, and of the pull task's finished result. The pinned stand-in
-/// admits a reference or chunk and drops its bytes, so a test that wants
-/// those bytes reads them here, where the production handler just encoded
-/// them. Capture is off unless a test arms it. Pull results are recorded
-/// only while capture is armed.
+/// Test-only copies of control-blob frames a test may hand to the other
+/// in-process handler, and of the pull task's finished result. Reference
+/// and fetch frames are copied when encoded. A join-result chunk is copied
+/// only after `send_join_artifact` reports the exchange admitted (an `Ok`
+/// write, or the in-process stand-in's admission marker). The stand-in
+/// then drops the bytes. A refusal after encoding publishes nothing, so a
+/// test cannot deliver a chunk the authority did not admit. Capture is off
+/// unless a test arms it. Pull results are recorded only while capture is
+/// armed.
 #[cfg(test)]
 pub(super) mod frame_capture {
     use std::sync::Mutex;
@@ -1024,7 +1031,7 @@ pub(in crate::server) async fn handle_control_blob_message(
                                 return;
                             }
                         };
-                        if let Err(reason) = super::send_join_artifact(
+                        match super::send_join_artifact(
                             &task_state,
                             &recipient,
                             &payload,
@@ -1035,7 +1042,20 @@ pub(in crate::server) async fn handle_control_blob_message(
                         )
                         .await
                         {
-                            tracing::warn!(reason, "control blob chunk send failed");
+                            Ok(()) => {
+                                #[cfg(test)]
+                                frame_capture::record_frame(&payload);
+                            }
+                            Err(reason) => {
+                                // The stand-in admits by returning its marker
+                                // error, after the seam check. That payload
+                                // is the one the exchange accepted.
+                                #[cfg(test)]
+                                if reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED) {
+                                    frame_capture::record_frame(&payload);
+                                }
+                                tracing::warn!(reason, "control blob chunk send failed");
+                            }
                         }
                     },
                 );
