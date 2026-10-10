@@ -24,9 +24,12 @@ declare -A IN_TEST=()
 # crate-level #![cfg(test)]. A nested #![cfg(test)] ends with its module.
 # The item ends when its brace body closes, or at ';' / ',' when it has no
 # body, including a literal or other expression that has no identifier.
-# A `!{...}` macro in a signature, and a brace in a const or static
-# initializer, are not the item body. Strings stay open until the closing
-# quote, block comments nest, and
+# A complete macro item ends at its token-tree boundary. A `!{...}` macro
+# in a signature is not the function body. A brace is an initializer block
+# only after `=` on a const or static item, so `if let` and `while let`
+# still end at the conditional body. A test header that never reaches a
+# body or a terminator is production: an unclassified span does not hide
+# a call. Strings stay open until the closing quote, block comments nest, and
 # '<' counts as a generic only in type position. A comparison does not.
 # A brace that begins a const-generic argument is not the item body, even
 # when whitespace or a comment separates it from the comma. Code after the
@@ -62,6 +65,29 @@ BLOCK_WORDS = {
     "pub",
 }
 
+# A prefix `!` after these words is an operator. `make!{}` is a macro item.
+NON_MACRO_WORDS = {
+    "if",
+    "while",
+    "for",
+    "loop",
+    "match",
+    "return",
+    "let",
+    "else",
+    "break",
+    "continue",
+    "move",
+    "box",
+    "yield",
+    "await",
+    "in",
+    "as",
+    "where",
+    "mut",
+    "ref",
+}
+
 
 def test_lines(text: str) -> dict[int, str]:
     """Return 1-based lines to a test-span spec.
@@ -91,6 +117,7 @@ def test_lines(text: str) -> dict[int, str]:
     # Previous non-trivia token. Whitespace, newlines, and comments do not
     # clear it, so a const-generic `{` can sit on the next line.
     prev_token = ""
+    last_word = ""
 
     active = False
     floor = 0
@@ -98,17 +125,30 @@ def test_lines(text: str) -> dict[int, str]:
     bracket_floor = 0
     phase = "header"  # header | body | after
     mode = ""  # "" | block | expr
-    # True after `=` in a const/static header. Braces there are initializer
-    # blocks; the item ends at `;`.
+    # True after `=` on a const or static item. Braces there are initializer
+    # blocks; the item ends at `;`. `if let` and `while let` are not initializers.
     in_initializer = False
+    decl_kind = ""  # "" | const | static | fn
+    # A cfg(test) item whose body is the macro token tree (`make!{}`).
+    macro_item = False
+    macro_tree = ""  # "" | brace | paren | bracket
+    line_no = 0
+    # Set while an active header has no classified body yet. If it is still
+    # set at EOF, those lines were never classified and count as production.
+    uncertain_from = 0
 
     def end_item() -> None:
-        nonlocal active, phase, mode, type_mode, in_initializer
+        nonlocal active, phase, mode, type_mode, in_initializer, decl_kind
+        nonlocal macro_item, macro_tree, uncertain_from
         active = False
         phase = "header"
         mode = ""
         type_mode = False
         in_initializer = False
+        decl_kind = ""
+        macro_item = False
+        macro_tree = ""
+        uncertain_from = 0
 
     def in_value_expr() -> bool:
         if const_expr > 0:
@@ -134,11 +174,14 @@ def test_lines(text: str) -> dict[int, str]:
         return False
 
     def remember(token: str) -> None:
-        nonlocal prev_token
+        nonlocal prev_token, last_word
         prev_token = token
+        if token != "ident":
+            last_word = ""
 
     def start_item() -> None:
         nonlocal active, floor, paren_floor, bracket_floor, phase, mode, in_initializer
+        nonlocal decl_kind, macro_item, macro_tree, uncertain_from
         active = True
         floor = depth
         paren_floor = paren
@@ -146,11 +189,16 @@ def test_lines(text: str) -> dict[int, str]:
         phase = "header"
         mode = ""
         in_initializer = False
+        decl_kind = ""
+        macro_item = False
+        macro_tree = ""
+        uncertain_from = line_no
 
     def at_item_level() -> bool:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
 
     for idx, line in enumerate(lines):
+        line_no = idx + 1
         if file_test:
             regions[idx + 1] = "*"
             continue
@@ -270,6 +318,7 @@ def test_lines(text: str) -> dict[int, str]:
                         floor = depth - 1
                         phase = "body"
                         mode = "block"
+                        uncertain_from = 0
                         ensure_marking(0)
                     i += len("#![cfg(test)]")
                     remember("]")
@@ -287,6 +336,10 @@ def test_lines(text: str) -> dict[int, str]:
                 if _word_at(line, i) == "else":
                     phase = "header"
                     mode = ""
+                    # The following body is not known yet. Until `{`, or if
+                    # the file ends here, this tail is unclassified.
+                    uncertain_from = line_no
+                    last_word = "else"
                     remember("ident")
                     ensure_marking(i)
                     i += 4
@@ -317,11 +370,14 @@ def test_lines(text: str) -> dict[int, str]:
                 # `=>` and `==` are not const/static initializers.
                 if angle == 0:
                     type_mode = False
+                    # Only a const or static declaration has an initializer.
+                    # `if let` and `while let` use `=` and then a real body.
                     if (
                         nxt not in "=>"
                         and active
                         and phase == "header"
                         and at_item_level()
+                        and decl_kind in {"const", "static"}
                     ):
                         in_initializer = True
                 remember("=")
@@ -353,13 +409,23 @@ def test_lines(text: str) -> dict[int, str]:
                     continue
                 # `-> unit!{}` and `const X: T = {0} + {1}` are still the
                 # header. The function body is the following brace, and the
-                # const item runs through its semicolon.
+                # const item runs through its semicolon. `make!{}` is the
+                # whole item: its token tree closes below. A prefix `!`
+                # (`if !flag {}`) is not a macro.
                 if (
                     active
                     and phase == "header"
                     and at_item_level()
-                    and (prev_token == "!" or in_initializer)
+                    and (
+                        in_initializer
+                        or (
+                            prev_token == "!"
+                            and (macro_item or mode == "block")
+                        )
+                    )
                 ):
+                    if macro_item and prev_token == "!":
+                        macro_tree = "brace"
                     remember("{")
                     ensure_marking(i)
                     depth += 1
@@ -367,6 +433,7 @@ def test_lines(text: str) -> dict[int, str]:
                     continue
                 if active and phase == "header" and at_item_level():
                     phase = "body"
+                    uncertain_from = 0
                     ensure_marking(i)
                 remember("{")
                 type_mode = False
@@ -381,6 +448,19 @@ def test_lines(text: str) -> dict[int, str]:
                     if active and phase != "after":
                         ensure_marking(i)
                     i += 1
+                    continue
+                if (
+                    macro_tree == "brace"
+                    and active
+                    and phase == "header"
+                    and depth == floor + 1
+                    and paren == paren_floor
+                    and bracket == bracket_floor
+                ):
+                    depth -= 1
+                    i += 1
+                    stop_marking(i)
+                    end_item()
                     continue
                 if depth > 0:
                     depth -= 1
@@ -409,11 +489,32 @@ def test_lines(text: str) -> dict[int, str]:
                 continue
 
             if ch == "(":
+                if (
+                    macro_item
+                    and prev_token == "!"
+                    and active
+                    and phase == "header"
+                    and at_item_level()
+                ):
+                    macro_tree = "paren"
                 remember("(")
                 paren += 1
                 i += 1
                 continue
             if ch == ")":
+                if (
+                    macro_tree == "paren"
+                    and active
+                    and phase == "header"
+                    and paren == paren_floor + 1
+                    and depth == floor
+                    and bracket == bracket_floor
+                ):
+                    paren -= 1
+                    i += 1
+                    stop_marking(i)
+                    end_item()
+                    continue
                 if (
                     active
                     and phase == "header"
@@ -430,12 +531,35 @@ def test_lines(text: str) -> dict[int, str]:
                 i += 1
                 continue
             if ch == "[":
+                if (
+                    macro_item
+                    and prev_token == "!"
+                    and active
+                    and phase == "header"
+                    and at_item_level()
+                ):
+                    macro_tree = "bracket"
                 remember("[")
                 bracket_stack.append({"expr": False, "depth": depth, "paren": paren})
                 bracket += 1
                 i += 1
                 continue
             if ch == "]":
+                if (
+                    macro_tree == "bracket"
+                    and active
+                    and phase == "header"
+                    and bracket == bracket_floor + 1
+                    and depth == floor
+                    and paren == paren_floor
+                ):
+                    if bracket_stack:
+                        bracket_stack.pop()
+                    bracket -= 1
+                    i += 1
+                    stop_marking(i)
+                    end_item()
+                    continue
                 if (
                     active
                     and phase == "header"
@@ -517,6 +641,19 @@ def test_lines(text: str) -> dict[int, str]:
                     and angle == 0
                 ):
                     mode = "block" if word in BLOCK_WORDS else "expr"
+                if (
+                    active
+                    and phase == "header"
+                    and at_item_level()
+                    and angle == 0
+                    and const_expr == 0
+                ):
+                    # `const fn` is a function. Its `{` is the body, not an
+                    # initializer. A bare `const` or `static` is a declaration.
+                    if word == "fn":
+                        decl_kind = "fn"
+                    elif word in {"const", "static"} and decl_kind != "fn":
+                        decl_kind = word
                 if word in {
                     "fn",
                     "struct",
@@ -538,10 +675,30 @@ def test_lines(text: str) -> dict[int, str]:
                     type_mode = j < n and line[j] == "<"
                 elif word in {"if", "while", "loop", "match", "return", "let"}:
                     type_mode = False
+                last_word = word
                 remember("ident")
                 if active and phase != "after":
                     ensure_marking(i)
                 i += len(word)
+                continue
+
+            if ch == "!" and nxt != "=":
+                # `make!{}` is the whole item. `if !flag` and `!=` are not.
+                if (
+                    active
+                    and phase == "header"
+                    and mode == "expr"
+                    and at_item_level()
+                    and angle == 0
+                    and const_expr == 0
+                    and prev_token == "ident"
+                    and last_word not in NON_MACRO_WORDS
+                ):
+                    macro_item = True
+                remember("!")
+                if active and phase != "after":
+                    ensure_marking(i)
+                i += 1
                 continue
 
             if ch.isspace():
@@ -556,6 +713,12 @@ def test_lines(text: str) -> dict[int, str]:
         spec = _span_spec(spans, byte_of[n])
         if spec:
             regions[idx + 1] = spec
+
+    # A header that never reached a body or `;` / `,` was not classified.
+    # Drop its marks so a call there fails the scan.
+    if active and phase == "header" and uncertain_from and not file_test:
+        for number in range(uncertain_from, len(lines) + 1):
+            regions.pop(number, None)
 
     return regions
 
