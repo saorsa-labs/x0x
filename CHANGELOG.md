@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.47.0] - 2026-10-10
+
 ### Added
 
 - **`[history]` recording and retention rules are parsed and validated (ADR
