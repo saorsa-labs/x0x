@@ -2109,8 +2109,11 @@ equivalent is `HistoryHandle::purge(&scope).await`, which returns
 A purge is not atomic. Its row delete commits first; then a canonical-id
 cleanup and an incremental vacuum run. If one of those later steps fails, the
 scope's rows stay deleted (they are not rolled back), and the 500's `removed`
-counts them. `removed` is 0 only when the row delete itself failed. In the
-library, `RetainError::Failed`'s `committed.deleted` carries the same count.
+counts them. `removed` counts the rows removed by the committed DELETE. It is
+0 if that DELETE failed or matched no rows, so 0 does not show which step
+failed. In the library, `RetainError::Failed`'s `committed.deleted` carries
+the same count. When the error says the count is unknown (the blocking task
+did not finish), a 0 is not proof that nothing was deleted.
 
 ### Runtime trim — `POST /history/retain` (ADR 0116 §4)
 
