@@ -303,58 +303,65 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
     remember_treekem_membership_event(&authority, &add_j1.event).await;
     remember_treekem_membership_event(&authority, &add_j2.event).await;
 
-    // Exactly what the authority serves J2's FetchRequest from the stub
-    // revision: stage_join_result's v2 owner attestation plus
-    // intervening_chain_from (named_groups.rs, FetchRequest arm).
-    let chain = intervening_chain_from(&next, base.state_revision, add_j2.commit.revision);
-    assert_eq!(chain.len(), 1, "the authority serves the r+1 link");
-    let head_attestation = HeadAttestation::sign_for_terminal(
-        &stable_group_id,
-        &add_j2.commit,
-        &add_j2.member_hex,
-        match &add_j2.event {
-            NamedGroupMetadataEvent::MemberAdded { treekem_epoch, .. } => *treekem_epoch,
-            _ => None,
-        },
-        owner,
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
-    // A pre-#1139 (legacy) authority serves no intervening events.
-    let j2_legacy_result = JoinResultMessage::Result {
-        event: Box::new(add_j2.event.clone()),
-        chain,
-        head_attestation: Some(Box::new(head_attestation)),
-        roster_certificates_b64: Vec::new(),
-        intervening_events: Vec::new(),
-    };
-    // #1139: what the fixed FetchRequest arm adds from the authority's log.
-    let intervening = super::super::intervening_membership_events(
-        &authority,
-        std::slice::from_ref(&stable_group_id),
-        base.state_revision,
-        add_j2.commit.revision,
-    )
-    .await;
-    let j2_result = match j2_legacy_result.clone() {
-        JoinResultMessage::Result {
-            event,
-            chain,
-            head_attestation,
-            roster_certificates_b64,
-            ..
-        } => JoinResultMessage::Result {
-            event,
-            chain,
-            head_attestation,
-            roster_certificates_b64,
-            intervening_events: intervening,
-        },
-        other => other,
-    };
-
+    // #1163: the joiner's result is whatever the production FetchRequest
+    // arm serves after the seal is staged. A hand-built Result can keep
+    // the carry tests green after that arm stops assembling the chain.
+    let stub_revision = base.state_revision;
     let owner_pin = hex::encode(owner.user_id().as_bytes());
     let j1_attempt = route_join(&j1, &link, &stable_group_id, &owner_pin).await?;
     let j2_attempt = route_join(&j2, &link, &stable_group_id, &owner_pin).await?;
+    super::super::stage_join_result(
+        &authority,
+        &stable_group_id,
+        &add_j2.member_hex,
+        add_j2.event.clone(),
+        Some(j2_attempt.as_str()),
+    )
+    .await;
+    let j2_result = super::adr0107_stuck_join_rearm::serve_result(
+        &authority,
+        &j2,
+        &stable_group_id,
+        &j2_attempt,
+        Some(stub_revision),
+    )
+    .await
+    .ok_or_else(|| anyhow::anyhow!("FetchRequest arm served no join result"))?;
+    let (served_event, served_chain, served_head, served_certs, served_intervening) =
+        match j2_result.clone() {
+            JoinResultMessage::Result {
+                event,
+                chain,
+                head_attestation,
+                roster_certificates_b64,
+                intervening_events,
+            } => (
+                event,
+                chain,
+                head_attestation,
+                roster_certificates_b64,
+                intervening_events,
+            ),
+            other => anyhow::bail!("FetchRequest arm served {other:?}"),
+        };
+    assert_eq!(
+        served_chain.len(),
+        1,
+        "the FetchRequest arm serves the r+1 state link"
+    );
+    assert_eq!(
+        served_intervening.len(),
+        1,
+        "the FetchRequest arm serves the r+1 membership carry"
+    );
+    // A pre-#1139 (legacy) authority serves the same result with no carry.
+    let j2_legacy_result = JoinResultMessage::Result {
+        event: served_event,
+        chain: served_chain,
+        head_attestation: served_head,
+        roster_certificates_b64: served_certs,
+        intervening_events: Vec::new(),
+    };
     Ok(BackToBack {
         j1_attempt,
         j2_attempt,
@@ -407,7 +414,9 @@ async fn deliver_j2_result(s: &BackToBack) {
 
 /// The page the authority's TreeKEM catch-up responder serves for J2's
 /// request (`handle_treekem_catchup_request`: every logged membership
-/// event past J2's revision OR epoch).
+/// event past J2's revision OR epoch). The joiner half of the loop needs
+/// the inline Welcome. The size check reads a separate event the
+/// production admission route logged.
 fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
@@ -415,6 +424,100 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         events: vec![s.add_j1.event.clone(), s.add_j2.event.clone()],
         truncated: false,
     }
+}
+
+/// One seat admitted by `add_named_group_member`, then the `MemberAdded`
+/// that route wrote into the TreeKEM event log. That entry is the catch-up
+/// responder's source: Welcome by reference, roster-certificate sidecar
+/// attached. A helper that clones a fixture event and edits it does not
+/// read this log.
+async fn logged_production_member_added(
+    authority: &Arc<AppState>,
+    group_key: &str,
+) -> Result<NamedGroupMetadataEvent> {
+    let dir = tempfile::tempdir()?;
+    let member = joiner_state(
+        dir.path(),
+        "admit",
+        x0x::identity::AgentKeypair::generate()?,
+    )
+    .await?;
+    let owner = authority
+        .agent
+        .identity()
+        .user_keypair()
+        .expect("owned Home");
+    let cert =
+        x0x::identity::AgentCertificate::issue(owner, member.agent.identity().agent_keypair())?;
+    let member_hex = hex::encode(member.agent.agent_id().as_bytes());
+    authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .insert(
+            member.agent.agent_id(),
+            x0x::DiscoveredAgent {
+                self_name: None,
+                agent_id: member.agent.agent_id(),
+                machine_id: member.agent.machine_id(),
+                user_id: cert.user_id().ok(),
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: cert.not_after(),
+                agent_certificate: Some(cert),
+                agent_public_key: member
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes()
+                    .to_vec(),
+                cert_digest: None,
+            },
+        );
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(
+        member.agent.agent_id(),
+        &agent_treekem_seed(&member.agent, &hex::decode(group_key)?),
+    )?;
+    let response = add_named_group_member(
+        State(Arc::clone(authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_key.to_string()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: member_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: Some(BASE64.encode(prepared.key_package_bytes())),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "production admission failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let logs = authority.treekem_event_log.read().await;
+    logs.values()
+        .flat_map(|events| events.iter())
+        .find(|event| {
+            matches!(
+                event,
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == &member_hex
+            )
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("production admission logged no MemberAdded"))
 }
 
 /// WHY (#1139): pins the mechanism. J2 holds only its OWN join result
@@ -508,15 +611,34 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         "pending_authority_commit"
     );
     // The responder sends this page as ONE plain direct message
-    // (`handle_treekem_catchup_request` → `send_direct_with_config`), but
-    // even a single Home MemberAdded exceeds the DM budget — so on the
-    // wire this page is never delivered today. Injected here to prove
-    // the joiner half of the loop.
+    // (`handle_treekem_catchup_request` → `send_direct_with_config`).
+    // The injected page below still carries an inline Welcome so the
+    // joiner can adopt without a blob pull. The size check measures the
+    // MemberAdded the production admission route logged, sidecar included.
     let page = catchup_page(&s);
+    let logged = logged_production_member_added(&s._authority, &s.group_key).await?;
+    match &logged {
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64,
+            welcome_ref,
+            roster_certificates_b64,
+            ..
+        } => {
+            assert!(
+                treekem_welcome_b64.is_none() && welcome_ref.is_some(),
+                "the logged admission carries a Welcome reference, not an inline Welcome"
+            );
+            assert!(
+                !roster_certificates_b64.is_empty(),
+                "the logged admission carries the roster-certificate sidecar"
+            );
+        }
+        _ => panic!("logged admission is a MemberAdded"),
+    }
     let one_event = serde_json::to_vec(&TreeKemCatchupResponse {
         message_type: page.message_type.clone(),
         group_id: page.group_id.clone(),
-        events: vec![s.add_j1.event.clone()],
+        events: vec![logged],
         truncated: false,
     })?
     .len();
@@ -528,6 +650,460 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     handle_treekem_catchup_response(&s.j2, &s.authority_id, true, page).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    Ok(())
+}
+
+fn flip_digest_byte(digest: &str) -> Result<String> {
+    let mut chars = digest.as_bytes().to_vec();
+    if chars.is_empty() {
+        anyhow::bail!("reference digest is empty");
+    }
+    chars[0] = if chars[0] == b'a' { b'b' } else { b'a' };
+    Ok(String::from_utf8(chars)?)
+}
+
+/// The emitted reference frame with one digest byte changed. The chunk
+/// payloads that follow stay the bytes the authority encoded.
+fn reference_frame_with_flipped_digest(frame: &[u8]) -> Result<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(frame)?;
+    let digest = value
+        .pointer("/reference/digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("emitted reference frame has no digest"))?;
+    let flipped = flip_digest_byte(digest)?;
+    value["reference"]["digest"] = serde_json::Value::String(flipped);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn ref_json(reference: &super::super::control_blob::ControlBlobRef) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(reference)?)
+}
+
+fn ref_str(value: &serde_json::Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("reference is missing {field}"))
+}
+
+fn same_pull(
+    reference: &super::super::control_blob::ControlBlobRef,
+    recipient: &str,
+    source: &str,
+    byte_len: u64,
+    attempt: &str,
+    digest: &str,
+) -> bool {
+    let Ok(value) = ref_json(reference) else {
+        return false;
+    };
+    ref_str(&value, "recipient").ok().as_deref() == Some(recipient)
+        && ref_str(&value, "source").ok().as_deref() == Some(source)
+        && ref_str(&value, "digest").ok().as_deref() == Some(digest)
+        && ref_str(&value, "join_attempt_id").ok().as_deref() == Some(attempt)
+        && value.get("byte_len").and_then(|v| v.as_u64()) == Some(byte_len)
+}
+
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        super::super::control_blob::frame_capture::set_capture(false);
+    }
+}
+
+/// An exchange `send_join_artifact` finished. Empty text is a real write.
+/// The in-process stand-in admits with its marker error.
+fn exchange_admitted(error: &str) -> bool {
+    error.is_empty() || error.contains(x0x::dm::PINNED_STANDIN_ADMITTED)
+}
+
+/// Finished class-R exchanges for this recipient and kind, in order.
+/// The text is the error `send_join_artifact` returned.
+fn exchange_errors(authority: &AppState, recipient: &str, kind: &str) -> Vec<String> {
+    authority
+        .named_group_test_recorders
+        .join_artifact_outcomes
+        .lock()
+        .expect("join artifact outcomes")
+        .iter()
+        .filter(|(who, recorded_kind, _)| who == recipient && *recorded_kind == kind)
+        .map(|(_, _, error)| error.clone())
+        .collect()
+}
+
+/// The reference frame the production offer encoded for `recipient`, once
+/// that offer's `join_result_reference` exchange has been admitted. A
+/// refusal after encoding fails the wait. `bound` is a failure limit.
+async fn emitted_reference_frame(
+    authority: &AppState,
+    recipient: &str,
+    source: &str,
+    bound: Duration,
+) -> Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut frames = Vec::new();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the offer produced no admitted reference frame for {recipient}; encoded {}",
+                frames.len()
+            );
+        }
+        for frame in super::super::control_blob::frame_capture::drain_frames() {
+            let Ok(super::super::control_blob::ControlBlobMessage::Reference { reference }) =
+                serde_json::from_slice(&frame)
+            else {
+                continue;
+            };
+            let Ok(value) = ref_json(&reference) else {
+                continue;
+            };
+            if ref_str(&value, "recipient").ok().as_deref() == Some(recipient)
+                && ref_str(&value, "source").ok().as_deref() == Some(source)
+            {
+                frames.push(frame);
+            }
+        }
+        let outcomes = exchange_errors(authority, recipient, "join_result_reference");
+        if !frames.is_empty() && outcomes.len() >= frames.len() {
+            let error = &outcomes[frames.len() - 1];
+            anyhow::ensure!(
+                exchange_admitted(error),
+                "the reference was encoded but the send was not admitted ({error})"
+            );
+            return Ok(frames.pop().expect("reference frame"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Move Fetch frames to the authority and admitted chunk frames to the
+/// joiner. A chunk payload is the bytes recorded after
+/// `send_join_artifact` admitted that exchange. The bridge pairs those
+/// payloads, in order, with this pull's `join_result_chunk` outcomes. A
+/// refusal after encoding is an outcome with no admitted payload, and it
+/// fails the pull instead of installing keys. `translate` keeps the joiner
+/// on `joiner_ref` while the authority serves `serve`: the Fetch digest is
+/// restored so the staged blob is found, and the admitted chunk's
+/// `data_b64` is delivered unchanged under `joiner_ref`. The deadline is a
+/// failure bound. The returned string is the pull task's finished result,
+/// and every chunk sequence was forwarded.
+async fn bridge_emitted_pull(
+    authority: &Arc<AppState>,
+    joiner: &Arc<AppState>,
+    serve: &super::super::control_blob::ControlBlobRef,
+    joiner_ref: &super::super::control_blob::ControlBlobRef,
+    group_key: &str,
+    translate: bool,
+    bound: Duration,
+) -> Result<&'static str> {
+    let serve_v = ref_json(serve)?;
+    let joiner_v = ref_json(joiner_ref)?;
+    let recipient = ref_str(&serve_v, "recipient")?;
+    let source = ref_str(&serve_v, "source")?;
+    let attempt = ref_str(&serve_v, "join_attempt_id")?;
+    let serve_digest = ref_str(&serve_v, "digest")?;
+    let joiner_digest = ref_str(&joiner_v, "digest")?;
+    let byte_len = serve_v
+        .get("byte_len")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("served reference has no byte_len"))?;
+    let expected = byte_len.div_ceil(x0x::files::DEFAULT_CHUNK_SIZE as u64);
+    anyhow::ensure!(
+        expected > 1,
+        "the oversized join result is one chunk ({byte_len} B); dropping a later chunk would not be visible"
+    );
+    let mut requested = std::collections::HashSet::new();
+    let mut delivered = std::collections::HashSet::new();
+    let mut pending_chunks = std::collections::VecDeque::new();
+    let mut outcome_cursor = exchange_errors(authority, &recipient, "join_result_chunk").len();
+    let mut admitted_waiting = 0usize;
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "pull did not finish within {bound:?}; forwarded sequences {delivered:?} of {expected}; outcome {:?}",
+                super::super::control_blob::frame_capture::outcome(&joiner_digest)
+            );
+        }
+        if translate && join_state(joiner, group_key).await == "active" {
+            anyhow::bail!("the joiner left pending before the digest check finished");
+        }
+        if let Some(outcome) = super::super::control_blob::frame_capture::outcome(&joiner_digest) {
+            anyhow::ensure!(
+                delivered.len() as u64 == expected,
+                "the pull finished after {} emitted chunk frame(s); the blob has {expected}. Dropping a later chunk must fail the pull",
+                delivered.len()
+            );
+            return Ok(outcome);
+        }
+        for frame in super::super::control_blob::frame_capture::drain_frames() {
+            let Ok(message) =
+                serde_json::from_slice::<super::super::control_blob::ControlBlobMessage>(&frame)
+            else {
+                continue;
+            };
+            match message {
+                super::super::control_blob::ControlBlobMessage::Fetch {
+                    reference,
+                    sequence,
+                } if same_pull(
+                    &reference,
+                    &recipient,
+                    &source,
+                    byte_len,
+                    &attempt,
+                    &joiner_digest,
+                ) =>
+                {
+                    if !requested.insert(sequence) {
+                        continue;
+                    }
+                    let outbound = if translate {
+                        super::super::control_blob::ControlBlobMessage::Fetch {
+                            reference: serve.clone(),
+                            sequence,
+                        }
+                    } else {
+                        serde_json::from_slice(&frame)?
+                    };
+                    super::super::control_blob::handle_control_blob_message(
+                        authority,
+                        &joiner.agent.agent_id(),
+                        true,
+                        outbound,
+                    )
+                    .await;
+                }
+                super::super::control_blob::ControlBlobMessage::Chunk {
+                    reference,
+                    sequence,
+                    data_b64,
+                } if same_pull(
+                    &reference,
+                    &recipient,
+                    &source,
+                    byte_len,
+                    &attempt,
+                    &serve_digest,
+                ) =>
+                {
+                    if !requested.contains(&sequence)
+                        || delivered.contains(&sequence)
+                        || pending_chunks.iter().any(|(seen, _)| *seen == sequence)
+                    {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !data_b64.is_empty(),
+                        "emitted chunk {sequence} carried an empty payload"
+                    );
+                    let outbound = if translate {
+                        super::super::control_blob::ControlBlobMessage::Chunk {
+                            reference: joiner_ref.clone(),
+                            sequence,
+                            data_b64,
+                        }
+                    } else {
+                        serde_json::from_slice(&frame)?
+                    };
+                    pending_chunks.push_back((sequence, outbound));
+                }
+                _ => {}
+            }
+        }
+        let outcomes = exchange_errors(authority, &recipient, "join_result_chunk");
+        while outcome_cursor < outcomes.len() {
+            let error = &outcomes[outcome_cursor];
+            outcome_cursor += 1;
+            anyhow::ensure!(
+                exchange_admitted(error),
+                "join_result_chunk send was not admitted ({error}); a refusal after encoding must not deliver the chunk"
+            );
+            admitted_waiting += 1;
+        }
+        while admitted_waiting > 0 {
+            let Some((sequence, outbound)) = pending_chunks.pop_front() else {
+                break;
+            };
+            anyhow::ensure!(
+                delivered.insert(sequence),
+                "admitted chunk {sequence} was already delivered"
+            );
+            super::super::control_blob::handle_control_blob_message(
+                joiner,
+                &authority.agent.agent_id(),
+                true,
+                outbound,
+            )
+            .await;
+            admitted_waiting -= 1;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The joiner's chunk pull sends `Fetch` with the control-blob config.
+/// With no network that send takes the strict raw stand-in once the
+/// authority's machine is bound, and then waits for the chunk the test
+/// hands to the production chunk handler.
+async fn arm_in_process_fetch(joiner: &Arc<AppState>, authority: &Arc<AppState>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    joiner.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[authority.agent.machine_id()], true),
+    );
+    joiner
+        .agent
+        .record_authenticated_binding_for_testing(
+            authority.agent.agent_id(),
+            authority.agent.machine_id(),
+            now,
+        )
+        .await;
+    joiner
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: authority.agent.agent_id(),
+            machine_id: authority.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+/// WHY (#1163): J2 converges only after the oversized result is offered,
+/// fetched, and digest-checked. The frames are the bytes the handlers
+/// encoded. The serve recorder is cleared, so injecting those bytes cannot
+/// pass. A reference whose digest does not match the served chunk payloads
+/// must finish as a digest mismatch and leave J2 pending. The exact
+/// reference then installs the carry. A missing later chunk, or a served
+/// payload that does not match the reference, fails the pull.
+#[tokio::test]
+async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
+    let _capture = CaptureGuard;
+    super::super::control_blob::frame_capture::set_capture(true);
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let authority_hex = hex::encode(s.authority_id.as_bytes());
+    let reference_frame = emitted_reference_frame(
+        &s._authority,
+        &j2_hex,
+        &authority_hex,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let serve = match serde_json::from_slice(&reference_frame)? {
+        super::super::control_blob::ControlBlobMessage::Reference { reference } => reference,
+        _ => anyhow::bail!("emitted offer was not a reference frame"),
+    };
+    s._authority
+        .named_group_test_recorders
+        .join_result_serves
+        .lock()
+        .expect("serve witness")
+        .clear();
+    arm_in_process_fetch(&s.j2, &s._authority).await;
+
+    let flipped_frame = reference_frame_with_flipped_digest(&reference_frame)?;
+    let flipped = match serde_json::from_slice(&flipped_frame)? {
+        super::super::control_blob::ControlBlobMessage::Reference { reference } => reference,
+        _ => anyhow::bail!("flipped offer was not a reference frame"),
+    };
+    super::super::control_blob::handle_control_blob_message(
+        &s.j2,
+        &s.authority_id,
+        true,
+        serde_json::from_slice(&flipped_frame)?,
+    )
+    .await;
+    let mismatched = bridge_emitted_pull(
+        &s._authority,
+        &s.j2,
+        &serve,
+        &flipped,
+        &s.group_key,
+        true,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        mismatched == "control blob length or digest mismatch",
+        "the bad-digest pull finished as {mismatched}"
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "a finished digest mismatch must not install the carry"
+    );
+    assert!(!s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    // The negative pull task has recorded its result. Drop anything it
+    // encoded after that before the exact reference starts its own pull.
+    let _ = super::super::control_blob::frame_capture::drain_frames();
+
+    super::super::control_blob::handle_control_blob_message(
+        &s.j2,
+        &s.authority_id,
+        true,
+        serde_json::from_slice(&reference_frame)?,
+    )
+    .await;
+    let verified = bridge_emitted_pull(
+        &s._authority,
+        &s.j2,
+        &serve,
+        &serve,
+        &s.group_key,
+        false,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        verified == "verified",
+        "the exact reference's pull finished as {verified}; a corrupt served payload must not verify"
+    );
+    let active_bound = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < active_bound
+        && join_state(&s.j2, &s.group_key).await != "active"
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    anyhow::ensure!(
+        tokio::time::Instant::now() < active_bound
+            || join_state(&s.j2, &s.group_key).await == "active",
+        "verified consumption did not install the carry within the failure bound"
+    );
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "active",
+        "the digest-checked blob is what installs the intervening carry"
+    );
+    assert!(
+        s.j2.treekem_groups.read().await.contains_key(&s.group_key),
+        "verified consumption installed TreeKEM keys"
+    );
     Ok(())
 }
 

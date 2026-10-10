@@ -592,7 +592,85 @@ pub(super) fn encode_message(message: &ControlBlobMessage) -> std::result::Resul
     if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
         return Err("control blob frame exceeds direct-message limit".to_string());
     }
+    // A chunk is recorded only after its admitted send. Encoding alone
+    // must not publish bytes the transport refused.
+    #[cfg(test)]
+    if !matches!(message, ControlBlobMessage::Chunk { .. }) {
+        frame_capture::record_frame(&bytes);
+    }
     Ok(bytes)
+}
+
+/// Test-only copies of control-blob frames a test may hand to the other
+/// in-process handler, and of the pull task's finished result. Reference
+/// and fetch frames are copied when encoded. A join-result chunk is copied
+/// only after `send_join_artifact` reports the exchange admitted (an `Ok`
+/// write, or the in-process stand-in's admission marker). The stand-in
+/// then drops the bytes. A refusal after encoding publishes nothing, so a
+/// test cannot deliver a chunk the authority did not admit. Capture is off
+/// unless a test arms it. Pull results are recorded only while capture is
+/// armed.
+#[cfg(test)]
+pub(super) mod frame_capture {
+    use std::sync::Mutex;
+
+    static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FRAMES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    static OUTCOMES: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+
+    pub(in crate::server) fn set_capture(on: bool) {
+        if on {
+            if let Ok(mut frames) = FRAMES.lock() {
+                frames.clear();
+            }
+            if let Ok(mut outcomes) = OUTCOMES.lock() {
+                outcomes.clear();
+            }
+        }
+        CAPTURE.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn record_frame(bytes: &[u8]) {
+        if !CAPTURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut frames) = FRAMES.lock() {
+            frames.push(bytes.to_vec());
+        }
+    }
+
+    /// Frames encoded since the last drain. The caller filters them.
+    pub(in crate::server) fn drain_frames() -> Vec<Vec<u8>> {
+        FRAMES
+            .lock()
+            .map(|mut frames| std::mem::take(&mut *frames))
+            .unwrap_or_default()
+    }
+
+    pub(in crate::server) fn record_outcome(digest: &str, reason: &'static str) {
+        if !CAPTURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut outcomes) = OUTCOMES.lock() {
+            outcomes.push((digest.to_string(), reason));
+            if outcomes.len() > 64 {
+                let drop_n = outcomes.len() - 64;
+                outcomes.drain(0..drop_n);
+            }
+        }
+    }
+
+    /// The latest finished pull result for `digest`, if the pull task has
+    /// recorded one.
+    pub(in crate::server) fn outcome(digest: &str) -> Option<&'static str> {
+        OUTCOMES.lock().ok().and_then(|outcomes| {
+            outcomes
+                .iter()
+                .rev()
+                .find(|(recorded, _)| recorded == digest)
+                .map(|(_, reason)| *reason)
+        })
+    }
 }
 
 async fn send_message(
@@ -843,14 +921,23 @@ pub(in crate::server) async fn handle_control_blob_message(
             // follows persists group state and is shielded (r2).
             state.spawn_detached(async move {
                 let state = task_state;
-                match fetch_blob(&state, &reference, generation).await {
+                let digest = reference.digest.clone();
+                let reason = match fetch_blob(&state, &reference, generation).await {
                     Ok((source, bytes)) => {
                         spawn_blob_apply(&state, reference, source, bytes, permit, lease);
+                        "verified"
                     }
                     Err(reason) => {
                         tracing::warn!(kind = ?reference.kind, byte_len = reference.byte_len, reason, "control blob pull failed");
+                        reason
                     }
-                }
+                };
+                // Recorded as the task's last step, so a test that observes
+                // it is observing a finished pull, not an in-flight one.
+                #[cfg(test)]
+                frame_capture::record_outcome(&digest, reason);
+                #[cfg(not(test))]
+                let _ = (digest, reason);
             });
         }
         ControlBlobMessage::Fetch {
@@ -944,7 +1031,7 @@ pub(in crate::server) async fn handle_control_blob_message(
                                 return;
                             }
                         };
-                        if let Err(reason) = super::send_join_artifact(
+                        match super::send_join_artifact(
                             &task_state,
                             &recipient,
                             &payload,
@@ -955,7 +1042,20 @@ pub(in crate::server) async fn handle_control_blob_message(
                         )
                         .await
                         {
-                            tracing::warn!(reason, "control blob chunk send failed");
+                            Ok(()) => {
+                                #[cfg(test)]
+                                frame_capture::record_frame(&payload);
+                            }
+                            Err(reason) => {
+                                // The stand-in admits by returning its marker
+                                // error, after the seam check. That payload
+                                // is the one the exchange accepted.
+                                #[cfg(test)]
+                                if reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED) {
+                                    frame_capture::record_frame(&payload);
+                                }
+                                tracing::warn!(reason, "control blob chunk send failed");
+                            }
                         }
                     },
                 );
