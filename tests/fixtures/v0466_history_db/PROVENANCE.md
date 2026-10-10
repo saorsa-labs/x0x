@@ -110,9 +110,9 @@ The steps:
   trim enforces the topic budget again (1 chat row, 27 bytes), and the rows
   v0.46.6 recorded stay.
 - **S4, newer schema.** Each binary gets a schema-5 copy and refuses it at
-  start (exit 1). This version leaves the file byte-identical. The released
-  v0.46.6 changes two header bytes (offsets 27 and 95), the bug fixed in
-  this slice.
+  start (exit 1). For this version the script asserts that the file is
+  byte-identical. The released v0.46.6 changes two header bytes (offsets 27
+  and 95), the bug fixed in this slice. That is recorded, not asserted.
 - After S1, S2 and S3, `verify_history_db_from_env` checks the file:
   schema 4, the v0.46.6 schema objects, FTS integrity-check, and canonical
   consistency.
@@ -134,7 +134,7 @@ python3 tests/fixtures/v0466_history_db/downgrade_proof.py \
 9fe7de6ea55496273df545cc1ea282107fa36a06ba701aaf6ce97dc744179baf  ./history.db
 66bcab9c912e6520b4b188acc45e864a104a6d8b673dcbddb31759f9468c6ab8  ./rows.json
 b01ec0681496149120bb84ec408267bb2f8eff14cfcf671ac49a3e2e5ce2e684  ./make_fixture.py
-e0cb3c8d334d5dd6f582f7d31e8712f6ba0315524d11b2066731477d732c5c5d  ./downgrade_proof.py
+2600269734590e28c85c9bfd3de2b6299bc6f4f417fd8881b8b94c8247b8dc0e  ./downgrade_proof.py
 ```
 
 `v0466_fixture_matches_its_provenance` checks `history.db` against this hash.
