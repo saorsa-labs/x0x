@@ -6179,6 +6179,82 @@ mod tests {
         .expect("holder did not see the listener's re-request");
     }
 
+    /// The listener retry arm must publish the second attempt after the
+    /// first publish fails. No further page arrives, and nothing calls
+    /// `reap_pruned_retained_images_now`. Removing the retry select arm
+    /// leaves the listener blocked on recv, so this times out.
+    #[tokio::test]
+    async fn retained_image_repair_listener_retries_after_a_failed_publish() {
+        let retry_after = Duration::from_millis(400);
+        let (holder, reader) = start_partial_retained_image(|reader| {
+            reader.set_retained_prune_wait_override_for_test(Duration::from_millis(20));
+            reader.set_retained_repair_retry_override_for_test(retry_after);
+            reader.fail_next_retained_repair_publishes_for_test(1);
+        })
+        .await;
+        let started = Arc::clone(&reader.retained_repair_started);
+        reader.expire_pending_retained_images_for_test();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("listener did not attempt the first re-request");
+        let failed = reader.state_sync_snapshot();
+        assert_eq!(
+            failed.incomplete_retained_images_pruned, 1,
+            "the TTL drop must be counted before the retry"
+        );
+        assert_eq!(
+            failed.requests_sent, 0,
+            "the failed first publish must not count as sent"
+        );
+        assert_eq!(
+            holder.state_sync_snapshot().requests_received,
+            0,
+            "the holder must not see the failed first publish"
+        );
+
+        tokio::time::timeout(retry_after + Duration::from_secs(2), async {
+            while reader.state_sync_snapshot().requests_sent == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener retry arm did not publish the second request");
+        assert_eq!(reader.state_sync_snapshot().requests_sent, 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while holder.state_sync_snapshot().requests_received == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("holder did not receive the listener retry");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if reader.read().await.get("large-0").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retried retained image did not converge");
+        assert_eq!(
+            reader.read().await.get("large-0").expect("converged").value,
+            vec![0; crate::kv::entry::MAX_INLINE_SIZE]
+        );
+        tokio::time::sleep(retry_after + Duration::from_millis(200)).await;
+        assert_eq!(
+            reader.state_sync_snapshot().requests_sent,
+            1,
+            "a failed first attempt plus one retry must not send a third"
+        );
+        assert_eq!(
+            holder.state_sync_snapshot().requests_received,
+            1,
+            "the holder must see only the retry"
+        );
+        assert!(holder.state_sync_snapshot().requests_answered >= 1);
+    }
+
     /// A published re-request can still be suppressed by the holder's
     /// cooldown. The repair stays pending and sends one more attempt after
     /// that window, then stops.
