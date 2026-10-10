@@ -677,6 +677,11 @@ fn lock_bind_gate(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
     lock_std(gate)
 }
 
+fn live_slot(deliveries: &TopicDeliveryMap, topic_id: TopicId) -> Option<Arc<TopicDelivery>> {
+    let slot = lock_std(deliveries).get(&topic_id).cloned()?;
+    slot.alive.load(Ordering::Acquire).then_some(slot)
+}
+
 /// One local subscriber of a shared topic delivery.
 struct LiveSender {
     id: u64,
@@ -1328,6 +1333,12 @@ pub struct PubSubManager {
     #[cfg(test)]
     subscribe_before_claim_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Pauses after the idle claim and before the receiver is installed.
+    /// A producer started here waits for that claim. It does not enter
+    /// PlumTree with no receiver.
+    #[cfg(test)]
+    after_idle_before_install_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     /// Pauses inside a topic pump, before `dispatch_inbound`, so a test can
     /// run key-cache recovery while a duplicate still holds that pump.
     #[cfg(test)]
@@ -1500,11 +1511,23 @@ const _: () = assert!(
     "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
 );
 
-/// In-flight PlumTree calls for one topic. Subscribe waits until `count`
-/// is zero. Receive workers do not wait on this map.
+/// In-flight PlumTree calls for one topic. `changing` is set while subscribe
+/// or unsubscribe holds the idle claim and has not finished the receiver
+/// change. Receive workers do not wait on this map.
 struct TopicFlight {
     count: usize,
+    changing: bool,
     idle: Arc<tokio::sync::Notify>,
+    settled: Arc<tokio::sync::Notify>,
+}
+
+fn vacant_flight() -> TopicFlight {
+    TopicFlight {
+        count: 0,
+        changing: false,
+        idle: Arc::new(tokio::sync::Notify::new()),
+        settled: Arc::new(tokio::sync::Notify::new()),
+    }
 }
 
 /// Shared bind state. `bind_gate` covers the recovery-counter read and the
@@ -1527,17 +1550,31 @@ struct FlightGuard {
 }
 
 impl FlightGuard {
-    fn enter(shared: &Arc<BindShared>, topic: TopicId) -> Self {
-        let mut flights = lock_std(&shared.flights);
-        let entry = flights.entry(topic).or_insert_with(|| TopicFlight {
-            count: 0,
-            idle: Arc::new(tokio::sync::Notify::new()),
-        });
-        entry.count += 1;
-        Self {
-            shared: Arc::clone(shared),
-            topic,
-            active: true,
+    /// Enter waits out a receiver change. The claim and the increment share
+    /// the map lock, so a producer cannot start in the idle gap.
+    async fn enter(shared: &Arc<BindShared>, topic: TopicId) -> Self {
+        loop {
+            let settled = {
+                let mut flights = lock_std(&shared.flights);
+                let entry = flights.entry(topic).or_insert_with(vacant_flight);
+                if !entry.changing {
+                    entry.count += 1;
+                    return Self {
+                        shared: Arc::clone(shared),
+                        topic,
+                        active: true,
+                    };
+                }
+                Arc::clone(&entry.settled)
+            };
+            let wait = settled.notified();
+            let blocked = lock_std(&shared.flights)
+                .get(&topic)
+                .is_some_and(|entry| entry.changing);
+            if !blocked {
+                continue;
+            }
+            wait.await;
         }
     }
 }
@@ -1555,7 +1592,79 @@ impl Drop for FlightGuard {
         entry.count = entry.count.saturating_sub(1);
         if entry.count == 0 {
             entry.idle.notify_waiters();
+            if !entry.changing {
+                flights.remove(&self.topic);
+            }
         }
+    }
+}
+
+/// Holds the idle claim until the receiver change finishes.
+struct ReceiverChange {
+    shared: Arc<BindShared>,
+    topic: TopicId,
+    active: bool,
+}
+
+impl ReceiverChange {
+    fn end(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mut flights = lock_std(&self.shared.flights);
+        let Some(entry) = flights.get_mut(&self.topic) else {
+            return;
+        };
+        entry.changing = false;
+        entry.settled.notify_waiters();
+        if entry.count == 0 {
+            flights.remove(&self.topic);
+        }
+    }
+}
+
+impl Drop for ReceiverChange {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Drains a payload if this no-receiver producer is cancelled after PlumTree
+/// has enqueued one. A later frame must not stamp that payload.
+struct AbsentReceiverDrain {
+    armed: bool,
+    topic: TopicId,
+    deliveries: Arc<TopicDeliveryMap>,
+    shared: Arc<BindShared>,
+}
+
+impl AbsentReceiverDrain {
+    fn arm(topic: TopicId, deliveries: Arc<TopicDeliveryMap>, shared: Arc<BindShared>) -> Self {
+        Self {
+            armed: true,
+            topic,
+            deliveries,
+            shared,
+        }
+    }
+
+    fn disarm(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let Some(slot) = live_slot(&self.deliveries, self.topic) else {
+            return;
+        };
+        let mut drain = ArmedDrain::omit(slot, self.topic, Arc::clone(&self.shared));
+        drain.disarm_and_bind();
+    }
+}
+
+impl Drop for AbsentReceiverDrain {
+    fn drop(&mut self) {
+        self.disarm();
     }
 }
 
@@ -2176,6 +2285,8 @@ impl PubSubManager {
             #[cfg(test)]
             subscribe_before_claim_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
+            after_idle_before_install_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
             admission_dispatch_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             recovery_dispatch_pause: std::sync::Mutex::new(None),
@@ -2748,9 +2859,11 @@ impl PubSubManager {
         // generation's receiver (#869).
         #[cfg(test)]
         Self::wait_test_pause(&self.subscribe_before_claim_pause).await;
-        // After the claim pause. Idle wait is before the turn, so a
-        // producer can finish its bind. The turn is this topic only.
-        self.wait_until_topic_idle(topic_id).await;
+        // The idle observation and the receiver claim are one map update.
+        // A producer that arrives in this gap waits until the receiver exists.
+        let receiver_change = self.begin_receiver_change(topic_id).await;
+        #[cfg(test)]
+        Self::wait_test_pause(&self.after_idle_before_install_pause).await;
         let turn = self.topic_turn(topic_id);
         let _turn = turn.lock().await;
         let _claim_name = self
@@ -2903,10 +3016,12 @@ impl PubSubManager {
             drop(_turn);
             drop(_claim_name);
             drop(_claim_topic);
+            drop(receiver_change);
         } else {
             drop(_turn);
             drop(_claim_name);
             drop(_claim_topic);
+            drop(receiver_change);
             claimed.admission.wait().await;
         }
 
@@ -3245,32 +3360,35 @@ impl PubSubManager {
             };
         // Ordinary dispatch does not take the topic turn across PlumTree.
         // A remote send must not park the other receive workers (ADR 0009).
-        // The flight count keeps subscribe and unsubscribe from installing
-        // a receiver until this call has bound. Hop-local recovery can
+        // Producer entry waits until a receiver change finishes, then raises
+        // the flight count under the same lock. Hop-local recovery can
         // deliver onto a topic that does not exist yet, so it does not take
         // a turn: it raises the recovery counter under the bind gate, then
         // drains after PlumTree returns and omits the id. Cancelling the
-        // future still drains what was already enqueued.
+        // future still drains what was already enqueued, including when this
+        // call started with no receiver.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
         let dispatch_result = if hop_local {
             self.dispatch_and_drain_recovered(peer, session, data).await
         } else if let Some(topic) = ordinary_frame.map(|header| header.topic) {
-            let _flight = FlightGuard::enter(&self.bind_shared, topic);
+            let _flight = FlightGuard::enter(&self.bind_shared, topic).await;
             if let Some(slot) = self.live_topic_delivery(topic) {
                 self.dispatch_and_bind_topic(slot, topic, peer, session, data)
                     .await
             } else {
-                // This topic's subscribe waits on the flight count, so it
-                // cannot install a receiver while this dispatch is in PlumTree.
+                // The flight count is already raised. Subscribe waits to
+                // install a receiver. Cancel still drains if one appears.
+                let mut late = AbsentReceiverDrain::arm(
+                    topic,
+                    Arc::clone(&self.topic_deliveries),
+                    Arc::clone(&self.bind_shared),
+                );
                 #[cfg(test)]
                 Self::wait_test_pause_once(&self.after_producer_pause).await;
                 let result = self.dispatch_inbound(peer, session, data).await;
-                if let Some(slot) = self.live_topic_delivery(topic) {
-                    let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
-                    slot.pump_unstamped();
-                }
+                late.disarm();
                 result
             }
         } else {
@@ -3423,8 +3541,7 @@ impl PubSubManager {
     }
 
     fn live_topic_delivery(&self, topic_id: TopicId) -> Option<Arc<TopicDelivery>> {
-        let slot = lock_std(&self.topic_deliveries).get(&topic_id).cloned()?;
-        slot.alive.load(Ordering::Acquire).then_some(slot)
+        live_slot(&self.topic_deliveries, topic_id)
     }
 
     async fn wait_until_topic_idle(&self, topic_id: TopicId) {
@@ -3454,9 +3571,9 @@ impl PubSubManager {
         topic_id: TopicId,
         encoded: Bytes,
     ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
-        // The flight count blocks subscribe. The remote send does not hold
-        // the topic turn, so receive workers for this topic are not parked.
-        let _flight = FlightGuard::enter(&self.bind_shared, topic_id);
+        // Entry waits out a receiver change. The remote send does not hold
+        // the topic turn, so receive workers are not parked.
+        let _flight = FlightGuard::enter(&self.bind_shared, topic_id).await;
         if let Some(slot) = self.live_topic_delivery(topic_id) {
             {
                 let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
@@ -3474,14 +3591,53 @@ impl PubSubManager {
             drain.disarm_and_bind();
             result
         } else {
+            let mut late = AbsentReceiverDrain::arm(
+                topic_id,
+                Arc::clone(&self.topic_deliveries),
+                Arc::clone(&self.bind_shared),
+            );
             let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
-            if let Some(slot) = self.live_topic_delivery(topic_id) {
-                let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
-                slot.pump_unstamped();
-            }
+            late.disarm();
             result
+        }
+    }
+
+    /// Claim the idle topic. The claim stays until the guard drops, so a
+    /// producer cannot enter between the zero observation and the receiver
+    /// change.
+    async fn begin_receiver_change(&self, topic_id: TopicId) -> ReceiverChange {
+        loop {
+            let notify = {
+                let mut flights = lock_std(&self.bind_shared.flights);
+                let entry = flights.entry(topic_id).or_insert_with(vacant_flight);
+                if entry.count == 0 && !entry.changing {
+                    entry.changing = true;
+                    return ReceiverChange {
+                        shared: Arc::clone(&self.bind_shared),
+                        topic: topic_id,
+                        active: true,
+                    };
+                }
+                if entry.changing {
+                    Arc::clone(&entry.settled)
+                } else {
+                    Arc::clone(&entry.idle)
+                }
+            };
+            let wait = notify.notified();
+            let ready = {
+                let flights = lock_std(&self.bind_shared.flights);
+                match flights.get(&topic_id) {
+                    Some(entry) => entry.count == 0 && !entry.changing,
+                    None => true,
+                }
+            };
+            if ready {
+                continue;
+            }
+            wait.await;
         }
     }
 
@@ -3582,8 +3738,9 @@ impl PubSubManager {
             .get(topic)
             .copied();
         let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
-        // Idle before the turn, matching subscribe. Only this topic waits.
-        self.wait_until_topic_idle(topic_id).await;
+        // Same claim as subscribe. A producer cannot enter while the
+        // receiver is being removed.
+        let _receiver_change = self.begin_receiver_change(topic_id).await;
         let turn = self.topic_turn(topic_id);
         let _turn = turn.lock().await;
         let _name_guard = self
@@ -10803,6 +10960,165 @@ mod issue869 {
         let note = recv_note(&mut replacement).await;
         assert_eq!(note.message.payload.as_ref(), b"after-replace");
         assert_eq!(note.transport_msg_id, Some(id_c));
+    }
+
+    #[tokio::test]
+    async fn producer_started_after_idle_observation_is_not_labeled_later() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let topic = "issue869-idle-gap";
+        let (idle_entered, idle_release) = arm_pause(&manager.after_idle_before_install_pause);
+        let subscribe_task = {
+            let manager = Arc::clone(&manager);
+            let topic = topic.to_string();
+            tokio::spawn(async move { manager.subscribe(topic).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle_entered.wait())
+            .await
+            .expect("subscribe holds the idle claim");
+
+        let mut publish = {
+            let manager = Arc::clone(&manager);
+            let topic = topic.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"from-a"))
+                    .await
+                    .expect("publish");
+            })
+        };
+        let finished_early =
+            tokio::time::timeout(std::time::Duration::from_millis(400), &mut publish).await;
+        assert!(
+            finished_early.is_err(),
+            "a producer started after the idle claim must wait for the receiver"
+        );
+        let (prod_entered, _prod_release) = arm_pause(&manager.after_producer_pause);
+
+        idle_release.wait().await;
+        let mut sub = tokio::time::timeout(std::time::Duration::from_secs(5), subscribe_task)
+            .await
+            .expect("subscribe finishes")
+            .expect("subscribe task");
+        tokio::time::timeout(std::time::Duration::from_secs(5), prod_entered.wait())
+            .await
+            .expect("producer reaches the bind pause after the receiver exists");
+        publish.abort();
+        let joined = publish.await;
+        assert!(joined.expect_err("abort joins").is_cancelled());
+        *manager.after_producer_pause.lock().unwrap() = None;
+
+        let note = recv_note(&mut sub).await;
+        assert_eq!(note.message.payload.as_ref(), b"from-a");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "a local publish has no inbound header"
+        );
+        let (frame_b, _) = eager_frame_on(topic, b"from-b", [0xB2; 32]);
+        manager
+            .handle_incoming(PeerId::new([4; 32]), None, invalidate(&frame_b))
+            .await;
+        let stamped = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.recv_notification(),
+        )
+        .await;
+        assert!(
+            stamped.is_err(),
+            "an invalid frame must not stamp the cancelled publish"
+        );
+        let (frame_c, id_c) = eager_frame_on(topic, b"after-gap", [0xC3; 32]);
+        manager
+            .handle_incoming(PeerId::new([4; 32]), None, frame_c)
+            .await;
+        let next = recv_note(&mut sub).await;
+        assert_eq!(next.message.payload.as_ref(), b"after-gap");
+        assert_eq!(next.transport_msg_id, Some(id_c));
+    }
+
+    #[tokio::test]
+    async fn dropped_flights_do_not_retain_topic_keys() {
+        let manager = Arc::new(
+            PubSubManager::new_with_participation(
+                test_node().await,
+                None,
+                None,
+                ParticipationMode::Full,
+                "relay",
+            )
+            .expect("manager"),
+        );
+        let topic_a = "issue869-flight-a";
+        let topic_b = "issue869-flight-b";
+        let id_a = TopicId::from_entity(topic_a.as_bytes());
+        let id_b = TopicId::from_entity(topic_b.as_bytes());
+        let (frame_a, _) = eager_frame_on(topic_a, b"nope-a", [0x41; 32]);
+        manager
+            .handle_incoming(PeerId::new([2; 32]), None, invalidate(&frame_a))
+            .await;
+        assert!(
+            !lock_std(&manager.bind_shared.flights).contains_key(&id_a),
+            "a finished flight must not keep the topic key"
+        );
+
+        let (entered, release) = arm_pause(&manager.after_producer_pause);
+        let (frame_b, _) = eager_frame_on(topic_b, b"nope-b", [0x42; 32]);
+        let first = {
+            let manager = Arc::clone(&manager);
+            let frame = invalidate(&frame_b);
+            tokio::spawn(async move {
+                manager
+                    .handle_incoming(PeerId::new([3; 32]), None, frame)
+                    .await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("first flight is in progress");
+        assert_eq!(
+            lock_std(&manager.bind_shared.flights)
+                .get(&id_b)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+
+        let second = {
+            let manager = Arc::clone(&manager);
+            let frame = invalidate(&frame_b);
+            tokio::spawn(async move {
+                manager
+                    .handle_incoming(PeerId::new([5; 32]), None, frame)
+                    .await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .expect("second flight finishes while the first is held")
+            .expect("second task");
+        assert_eq!(
+            lock_std(&manager.bind_shared.flights)
+                .get(&id_b)
+                .map(|entry| entry.count),
+            Some(1),
+            "the remaining flight keeps the key"
+        );
+
+        release.wait().await;
+        first.await.expect("first task");
+        assert!(
+            !lock_std(&manager.bind_shared.flights).contains_key(&id_a),
+            "topic A must stay retired"
+        );
+        assert!(
+            !lock_std(&manager.bind_shared.flights).contains_key(&id_b),
+            "dropping the last flight removes the topic key"
+        );
+        assert!(
+            lock_std(&manager.bind_shared.flights).is_empty(),
+            "rejected topics must not accumulate zero-count entries"
+        );
     }
 
     #[tokio::test]
