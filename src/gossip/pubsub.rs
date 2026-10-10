@@ -1322,6 +1322,16 @@ pub struct PubSubManager {
     #[cfg(test)]
     subscribe_before_claim_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Pauses after a local publish has captured its receiver and before
+    /// PlumTree admission. A test can replace that receiver in this gap.
+    #[cfg(test)]
+    before_admission_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Pauses after a local publish has queued its payload and before the
+    /// drain. Cancelling here still delivers that payload.
+    #[cfg(test)]
+    after_publish_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     /// Pauses after PlumTree has returned and before this task drains.
     /// Cancelling here delivers the queued payload with no transport id.
     #[cfg(test)]
@@ -1497,9 +1507,10 @@ fn drain_all_unstamped(deliveries: &TopicDeliveryMap) {
 
 /// Drains what one producer call queued.
 ///
-/// A completed plain delivery stamps one exclusive payload. Recovery,
-/// cancellation, and a failed verification drain with the id absent. The
-/// drain lock is not held across the PlumTree call.
+/// A completed plain delivery stamps one exclusive payload on the same
+/// receiver it started with. A receiver change, a cached frame, a forged
+/// frame, recovery, and cancellation deliver the payload with the id
+/// absent. The drain lock is not held across the PlumTree call.
 struct ProducerDrain {
     armed: bool,
     /// `true` when this call incremented `plain_inflight` on `slot`.
@@ -1521,35 +1532,61 @@ impl ProducerDrain {
             return;
         }
         self.armed = false;
-        if let Some(slot) = &self.slot {
+        let live = live_slot(&self.deliveries, self.topic);
+        let unchanged = match (&self.slot, &live) {
+            (Some(old), Some(current)) => Arc::ptr_eq(old, current),
+            (None, None) => true,
+            _ => false,
+        };
+        // The accepted payload may sit on the receiver installed while this
+        // call was in PlumTree. Drain that receiver too. Do not stamp when
+        // it is not the receiver this call started with.
+        let mut targets = Vec::new();
+        if let Some(old) = &self.slot {
+            targets.push(Arc::clone(old));
+        }
+        if let Some(current) = &live {
+            let seen = self
+                .slot
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(old, current));
+            if !seen {
+                targets.push(Arc::clone(current));
+            }
+        }
+        for slot in targets {
+            let on_entry_slot = self
+                .slot
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(old, &slot));
             let _drain = lock_std(&slot.drain);
-            let produced = slot.drain_admitted();
+            let mut produced = slot.drain_admitted();
             let alone = slot.plain_inflight.load(Ordering::Acquire) == 1;
             let quiet = self.recovery.load(Ordering::Acquire) == 0;
-            let frame = if stamp && self.counted && alone && quiet && produced.len() == 1 {
-                self.frame.as_deref()
+            if self.counted && on_entry_slot {
+                slot.plain_inflight.fetch_sub(1, Ordering::AcqRel);
+            }
+            let stamp_this = stamp && unchanged && on_entry_slot && self.counted && alone && quiet;
+            let stamped = if stamp_this && produced.len() == 1 {
+                produced.pop()
             } else {
                 None
             };
-            if self.counted {
-                slot.plain_inflight.fetch_sub(1, Ordering::AcqRel);
-            }
-            if let Some(frame) = frame {
-                let payload = produced.into_iter().next().expect("one payload");
-                #[cfg(test)]
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                let transport_msg_id = transport_id_from_admitted_frame(frame);
-                slot.enqueue_stamped(payload, transport_msg_id);
+            if let Some(payload) = stamped {
+                match self.frame.as_deref() {
+                    Some(frame) => {
+                        #[cfg(test)]
+                        self.reads.fetch_add(1, Ordering::Relaxed);
+                        let transport_msg_id = transport_id_from_admitted_frame(frame);
+                        slot.enqueue_stamped(payload, transport_msg_id);
+                    }
+                    None => slot.enqueue_stamped(payload, None),
+                }
             } else {
                 for payload in produced {
                     slot.enqueue_stamped(payload, None);
                 }
             }
-        } else if let Some(slot) = live_slot(&self.deliveries, self.topic) {
-            // A receiver installed while this call had none. Deliver what
-            // PlumTree queued, and do not apply this frame's id.
-            let _drain = lock_std(&slot.drain);
-            slot.pump_unstamped();
         }
     }
 }
@@ -2020,6 +2057,10 @@ impl PubSubManager {
             subscribe_after_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             subscribe_before_claim_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_admission_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_publish_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             after_producer_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -3082,10 +3123,21 @@ impl PubSubManager {
         } else if let Some(topic) = ordinary_frame.map(|header| header.topic) {
             let frame = self.live_topic_delivery(topic).map(|_| Bytes::clone(&data));
             let mut drain = self.producer_drain(topic, frame);
+            // A cached duplicate returns Ok without a new admission. Its
+            // header id must not label a payload another call queued.
+            let duplicates_before = self
+                .plumtree
+                .stage_stats()
+                .eager_duplicate_dropped_pre_verify;
             let result = self.dispatch_inbound(peer, session, data).await;
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
-            drain.finish(result.is_ok());
+            let cached = self
+                .plumtree
+                .stage_stats()
+                .eager_duplicate_dropped_pre_verify
+                != duplicates_before;
+            drain.finish(result.is_ok() && !cached);
             result
         } else {
             self.dispatch_inbound(peer, session, data).await
@@ -3193,9 +3245,14 @@ impl PubSubManager {
     ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
         // Local publish has no inbound header. The id stays absent.
         // The remote send holds no daemon-wide lock. Cancelling after
-        // PlumTree enqueues still drains.
+        // PlumTree enqueues still drains, including when a new receiver
+        // was installed during the call.
         let mut drain = self.producer_drain(topic_id, None);
+        #[cfg(test)]
+        Self::wait_test_pause(&self.before_admission_pause).await;
         let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
+        #[cfg(test)]
+        Self::wait_test_pause(&self.after_publish_pause).await;
         #[cfg(test)]
         Self::wait_test_pause(&self.after_producer_pause).await;
         drain.finish(false);
@@ -10564,5 +10621,176 @@ mod issue869 {
                 .expect("worker finishes")
                 .expect("worker task");
         }
+    }
+
+    #[tokio::test]
+    async fn replaced_receiver_still_delivers_the_accepted_payload() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let topic = "issue869-replace-receiver";
+        let original = manager.subscribe(topic.to_string()).await;
+        let (entered, release) = arm_pause(&manager.before_admission_pause);
+        let publish = {
+            let manager = Arc::clone(&manager);
+            let topic = topic.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"kept-on-new"))
+                    .await
+                    .expect("publish");
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("publish captured the original receiver");
+        manager.unsubscribe(topic).await;
+        drop(original);
+        let mut replacement = manager.subscribe(topic.to_string()).await;
+        release.wait().await;
+        *manager.before_admission_pause.lock().unwrap() = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), publish)
+            .await
+            .expect("publish finishes")
+            .expect("publish task");
+        let note = recv_note(&mut replacement).await;
+        assert_eq!(note.message.payload.as_ref(), b"kept-on-new");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "a receiver change omits the id"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_reaches_the_replacement_receiver() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let topic = "issue869-replace-cancel";
+        let original = manager.subscribe(topic.to_string()).await;
+        let (before_entered, before_release) = arm_pause(&manager.before_admission_pause);
+        let (after_entered, _after_release) = arm_pause(&manager.after_publish_pause);
+        let publish = {
+            let manager = Arc::clone(&manager);
+            let topic = topic.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"kept-cancel"))
+                    .await
+                    .expect("publish");
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), before_entered.wait())
+            .await
+            .expect("publish captured the original receiver");
+        manager.unsubscribe(topic).await;
+        drop(original);
+        let mut replacement = manager.subscribe(topic.to_string()).await;
+        before_release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), after_entered.wait())
+            .await
+            .expect("publish queued on the replacement receiver");
+        publish.abort();
+        let joined = publish.await;
+        assert!(joined.expect_err("abort joins").is_cancelled());
+        *manager.before_admission_pause.lock().unwrap() = None;
+        *manager.after_publish_pause.lock().unwrap() = None;
+        let note = recv_note(&mut replacement).await;
+        assert_eq!(note.message.payload.as_ref(), b"kept-cancel");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "cancellation after a receiver change still omits the id"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_duplicate_does_not_stamp_another_calls_payload() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(
+            PubSubManager::new_with_participation(
+                test_node().await,
+                Some(ctx),
+                None,
+                ParticipationMode::Full,
+                "relay",
+            )
+            .expect("manager"),
+        );
+        let topic = "issue869-cached-id";
+        let peer = PeerId::new([9; 32]);
+        let (frame_b, id_b) = eager_frame_on(topic, b"cached-b", [0x22; 32]);
+        let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+        manager.handle_incoming(peer, None, frame_b.clone()).await;
+        let (before_entered, before_release) = arm_pause(&manager.before_admission_pause);
+        let (queued_entered, queued_release) = arm_pause(&manager.after_publish_pause);
+        let publish = {
+            let manager = Arc::clone(&manager);
+            let topic = topic.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"from-a"))
+                    .await
+                    .expect("publish");
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), before_entered.wait())
+            .await
+            .expect("publish waits before admission");
+        let mut sub = manager.subscribe(topic.to_string()).await;
+        let duplicates_before = manager.stage_stats().eager_duplicate_dropped_pre_verify;
+        let (dup_entered, dup_release) = arm_pause(&manager.after_producer_pause);
+        let duplicate = {
+            let manager = Arc::clone(&manager);
+            let frame = invalidate(&frame_b);
+            tokio::spawn(async move {
+                manager.handle_incoming(peer, None, frame).await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dup_entered.wait())
+            .await
+            .expect("cached duplicate returned before its drain");
+        assert!(
+            manager.stage_stats().eager_duplicate_dropped_pre_verify > duplicates_before,
+            "the forged duplicate must be a cache hit"
+        );
+        before_release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), queued_entered.wait())
+            .await
+            .expect("publish queued its payload");
+        dup_release.wait().await;
+        duplicate.await.expect("duplicate task");
+        let note = recv_note(&mut sub).await;
+        assert_eq!(note.message.payload.as_ref(), b"from-a");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "a cached frame must not label another call's payload"
+        );
+        assert_ne!(note.transport_msg_id, Some(id_b));
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_before,
+            "the cached duplicate is not read for an id"
+        );
+        *manager.before_admission_pause.lock().unwrap() = None;
+        *manager.after_publish_pause.lock().unwrap() = None;
+        *manager.after_producer_pause.lock().unwrap() = None;
+        queued_release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), publish)
+            .await
+            .expect("publish finishes")
+            .expect("publish task");
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.recv_notification(),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "the cached duplicate must not deliver a copy"
+        );
     }
 }
