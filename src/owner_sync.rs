@@ -3983,15 +3983,22 @@ mod tests {
     /// session uses the verified enrollment alone.
     ///
     /// The fixture starts the real acceptor without the owner-connect
-    /// re-announcement. A seccomp watcher fails the test if `bind` or
-    /// `connect` leaves loopback, including the `[::]:0` probe to
-    /// `[2001:4860:4860::8888]:80`.
+    /// re-announcement. A seccomp watcher fails the test if this process
+    /// calls `bind` or `connect` outside loopback, including the `[::]:0`
+    /// probe to `[2001:4860:4860::8888]:80`. An unrelated process in the
+    /// same network namespace holds a wildcard UDP socket for the whole
+    /// test; that socket is not this process's and must not fail the audit.
     ///
     /// On the pre-#1044 dial the initiator stops at `machine not in
     /// discovery cache` and no session completes. When the responder
     /// drops the stream, the initiator's error is the stream reset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mutually_enrolled_devices_complete_owner_sync_both_ways_without_restart() {
+        // Started before the syscall filter, so the child does not inherit
+        // this process's audit. Same relationship as another nextest
+        // process in the isolated network namespace.
+        #[cfg(target_os = "linux")]
+        let mut foreign_wildcard = ForeignWildcardListener::spawn();
         install_loopback_socket_boundary();
         let dir = tempfile::tempdir().expect("tmpdir");
         let seed = [0x84; 32];
@@ -3999,6 +4006,8 @@ mod tests {
         let (bob, bob_sync) = live_owner_device(dir.path(), "bob", seed).await;
         assert_acceptor_without_reannounce(&alice_sync).await;
         assert_acceptor_without_reannounce(&bob_sync).await;
+        #[cfg(target_os = "linux")]
+        foreign_wildcard.assert_still_held();
         assert_loopback_sockets("after owner devices start");
         let alice_id = alice.machine_id();
         let bob_id = bob.machine_id();
@@ -4109,7 +4118,115 @@ mod tests {
             !knows_agent_on(&bob, alice_id).await,
             "an identity announcement arrived; the test no longer uses enrollment alone"
         );
+        #[cfg(target_os = "linux")]
+        foreign_wildcard.assert_still_held();
         assert_loopback_sockets("after both owner-sync sessions");
+    }
+
+    /// Another process in this network namespace, bound to `0.0.0.0`.
+    /// `/proc/self/net/udp` lists that socket; the syscall audit must not.
+    #[cfg(target_os = "linux")]
+    struct ForeignWildcardListener {
+        child: std::process::Child,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForeignWildcardListener {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ForeignWildcardListener {
+        fn spawn() -> Self {
+            let child = std::process::Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import socket, time\n\
+                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+                     s.bind(('0.0.0.0', 0))\n\
+                     time.sleep(180)\n",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("unrelated wildcard listener");
+            let mut hold = Self { child };
+            hold.wait_until_bound();
+            hold
+        }
+
+        fn wait_until_bound(&mut self) {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if let Some(status) = self.child.try_wait().expect("listener status") {
+                    let mut err = String::new();
+                    if let Some(stderr) = self.child.stderr.as_mut() {
+                        use std::io::Read;
+                        let _ = stderr.read_to_string(&mut err);
+                    }
+                    panic!("unrelated wildcard listener exited ({status}): {err}");
+                }
+                if foreign_wildcard_udp_present() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("unrelated process did not bind 0.0.0.0 UDP in this namespace");
+        }
+
+        fn assert_still_held(&mut self) {
+            assert!(
+                self.child.try_wait().expect("listener status").is_none(),
+                "unrelated wildcard listener exited during the session"
+            );
+            assert!(
+                foreign_wildcard_udp_present(),
+                "namespace no longer has a foreign 0.0.0.0 UDP socket"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn foreign_wildcard_udp_present() -> bool {
+        let own = own_socket_inodes();
+        let Ok(text) = std::fs::read_to_string("/proc/self/net/udp") else {
+            return false;
+        };
+        text.lines().skip(1).any(|line| {
+            let mut cols = line.split_whitespace();
+            let Some(local) = cols.nth(1) else {
+                return false;
+            };
+            let Some(inode) = cols.nth(7) else {
+                return false;
+            };
+            local.starts_with("00000000:") && !own.contains(inode)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn own_socket_inodes() -> std::collections::HashSet<String> {
+        let mut own = std::collections::HashSet::new();
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return own;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if let Some(inode) = target
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                own.insert(inode.to_string());
+            }
+        }
+        own
     }
 
     async fn assert_acceptor_without_reannounce(service: &OwnerSyncService) {
@@ -4132,11 +4249,10 @@ mod tests {
         let _ = when;
     }
 
-    /// Watches `bind` and `connect` for the rest of the process. A
-    /// `/proc` sample misses the route probe: `HeartbeatContext::announce`
-    /// drops the socket as soon as `connect` returns. The kernel reports
-    /// every `bind` and `connect` through a seccomp user notification,
-    /// then the call proceeds unchanged.
+    /// Process-scoped audit of `bind` and `connect`. The kernel reports
+    /// every call from this process, then the call proceeds.
+    /// `/proc/self/net` lists every socket in the network namespace,
+    /// including parallel tests, so those tables are not consulted.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     mod socket_boundary {
         use std::sync::{Mutex, Once};
@@ -4175,11 +4291,10 @@ mod tests {
         }
 
         pub(super) fn assert_clear(when: &str) {
-            let mut hits = violations().lock().expect("violations").clone();
-            hits.extend(proc_non_loopback());
+            let hits = violations().lock().expect("violations").clone();
             assert!(
                 hits.is_empty(),
-                "{when}: socket left loopback: {}",
+                "{when}: this process left loopback: {}",
                 hits.join("; ")
             );
         }
@@ -4422,79 +4537,6 @@ mod tests {
             probe[8..24].copy_from_slice(&dns.octets());
             let probe = non_loopback_reason(&probe).expect("route probe");
             assert!(probe.contains("[2001:4860:4860::8888]:80"), "{probe}");
-        }
-
-        fn proc_non_loopback() -> Vec<String> {
-            [
-                "/proc/self/net/udp",
-                "/proc/self/net/udp6",
-                "/proc/self/net/tcp",
-                "/proc/self/net/tcp6",
-            ]
-            .into_iter()
-            .flat_map(|path| proc_file(path).into_iter())
-            .collect()
-        }
-
-        fn proc_file(path: &str) -> Vec<String> {
-            let v6 = path.ends_with('6');
-            let text = match std::fs::read_to_string(path) {
-                Ok(text) => text,
-                Err(error) => return vec![format!("{path}: {error}")],
-            };
-            text.lines()
-                .skip(1)
-                .filter_map(|line| {
-                    let mut cols = line.split_whitespace();
-                    let _slot = cols.next()?;
-                    let local = cols.next()?.rsplit_once(':')?.0;
-                    let remote = cols.next()?.rsplit_once(':')?.0;
-                    if proc_endpoint_ok(local, remote, v6) {
-                        None
-                    } else {
-                        Some(format!("{path} {local} -> {remote}"))
-                    }
-                })
-                .collect()
-        }
-
-        fn proc_endpoint_ok(local: &str, remote: &str, v6: bool) -> bool {
-            if v6 {
-                let (Some(local), Some(remote)) = (parse_v6(local), parse_v6(remote)) else {
-                    return false;
-                };
-                v6_loopback(&local) && (v6_unspecified(&remote) || v6_loopback(&remote))
-            } else {
-                let (Some(local), Some(remote)) = (parse_v4(local), parse_v4(remote)) else {
-                    return false;
-                };
-                local[0] == 127 && (remote == [0, 0, 0, 0] || remote[0] == 127)
-            }
-        }
-
-        fn parse_v4(hex8: &str) -> Option<[u8; 4]> {
-            let word = u32::from_str_radix(hex8, 16).ok()?;
-            Some(word.to_le_bytes())
-        }
-
-        fn parse_v6(hex32: &str) -> Option<[u8; 16]> {
-            if hex32.len() != 32 {
-                return None;
-            }
-            let mut out = [0u8; 16];
-            for (i, chunk) in hex32.as_bytes().chunks(8).enumerate() {
-                let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-                out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-            }
-            Some(out)
-        }
-
-        fn v6_unspecified(ip: &[u8; 16]) -> bool {
-            ip.iter().all(|b| *b == 0)
-        }
-
-        fn v6_loopback(ip: &[u8; 16]) -> bool {
-            ip[..15].iter().all(|b| *b == 0) && ip[15] == 1
         }
     }
 }
