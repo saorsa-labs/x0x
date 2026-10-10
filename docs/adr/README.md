@@ -6,6 +6,11 @@ Read the [15 ADR set](consolidated/README.md) for the direction confirmed by
 David (D198) on 5 October 2026. Its records remain Proposed replacements while the transfer
 checks are open. This index, its status overlay and accepted records continue
 to govern existing work. New docs follow the [style guide](../documentation-style.md).
+The numbered records in the [transfer map](consolidated/TRANSFER.md) keep
+these paths and stay outside the limit of 15. ADR 0115 and ADR 0116 are
+outside that map. They stay in force outside the count.
+`python3 scripts/check-adr-count.py` fails when the current count exceeds 15.
+The plan is the [15 ADR set](consolidated/README.md).
 
 This directory contains architecture decision records for x0x.
 

@@ -85,3 +85,5 @@ or a second consolidated series. Reserved numbered ADRs remain reserved:
 Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
 records, overlay, frozen evidence and team gates remain in force.
 Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
+Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
+The plan is `docs/adr/consolidated/README.md`.

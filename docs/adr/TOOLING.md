@@ -71,6 +71,11 @@ record paths, required section headings, and a leading Proposed status token.
 It rejects unindexed files and early activation. Status annotations are
 allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
 
+`python3 scripts/check-adr-count.py` fails when the current count exceeds
+15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
+map keep their paths and stay outside that count. ADR 0115 and ADR 0116
+stay outside that count.
+
 The check does not validate clause or ruling coverage in TRANSFER.md, link
 targets, source status claims, body/header revision agreement, prose meaning,
 or the writing target. It does not check frozen hashes, accepted revision
