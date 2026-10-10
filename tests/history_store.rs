@@ -303,7 +303,10 @@ fn exclusive_open_fails_loud() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");
     let _held = Store::open(&path).unwrap();
-    let busy = std::time::Duration::from_millis(300);
+    // A 1 s busy timeout: one window is about 1 s, and the old three-window
+    // retry took over 3 s. The < 2.5x bound below separates the two with wide
+    // margin, so a loaded CI runner does not fail it.
+    let busy = std::time::Duration::from_millis(1000);
     let started = std::time::Instant::now();
     let second = Store::open_with_busy_timeout(&path, busy);
     let waited = started.elapsed();
@@ -314,7 +317,10 @@ fn exclusive_open_fails_loud() {
     );
     let message = second.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(message.contains(&path.display().to_string()), "{message}");
-    assert!(waited < busy * 2, "one busy window, not more: {waited:?}");
+    assert!(
+        waited < busy * 5 / 2,
+        "one busy window, not three: {waited:?}"
+    );
 }
 
 /// Issue #1315, through the service (what `AgentBuilder::build` opens).

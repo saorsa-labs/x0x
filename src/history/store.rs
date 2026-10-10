@@ -549,11 +549,12 @@ impl Store {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
-        // Issue #1315: a setup statement that meets another connection's
-        // lock (SQLITE_BUSY / SQLITE_LOCKED after the busy timeout) is
-        // `HistoryError::Locked`, the documented variant for a database
-        // another process holds; any other failure stays `Database`. Every
-        // error still stops the open at the same point.
+        // Issue #1315: a setup statement that meets a lock is
+        // `HistoryError::Locked`. SQLITE_BUSY means another connection holds
+        // the database (after the busy timeout). SQLITE_LOCKED is a
+        // same-connection or shared-cache conflict and need not wait; it is
+        // classed with BUSY on purpose. Any other failure stays `Database`.
+        // Every error still stops the open at the same point.
         let pragma_error = |e| setup_error(path, None, e);
         // With such a WAL, the close must not checkpoint it until the
         // version is known to be compatible: the last connection's close
@@ -3873,10 +3874,11 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
 
 /// The error of a setup statement in [`Store::open_with_busy_timeout`]
 /// (issue #1315). A database another connection holds exclusively makes the
-/// first statement that touches it fail with SQLITE_BUSY (or SQLITE_LOCKED)
-/// once the busy timeout runs out: that is [`HistoryError::Locked`], naming
-/// the path. Any other failure is [`HistoryError::Database`], with the same
-/// text as before.
+/// first statement that touches it fail with SQLITE_BUSY once the busy
+/// timeout runs out. SQLITE_LOCKED (a same-connection or shared-cache
+/// conflict, which need not wait) is classed with it. Both are
+/// [`HistoryError::Locked`], naming the path. Any other failure is
+/// [`HistoryError::Database`], with the same text as before.
 fn setup_error(path: &Path, stage: Option<&str>, e: rusqlite::Error) -> HistoryError {
     let stage = stage.map(|stage| format!("{stage}: ")).unwrap_or_default();
     match e.sqlite_error_code() {
