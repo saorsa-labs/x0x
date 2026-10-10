@@ -334,7 +334,7 @@ async fn writer_service_writes_and_sheds() {
             .load(std::sync::atomic::Ordering::Relaxed),
         100
     );
-    let rows = handle.store().query(&HistoryQuery::default()).unwrap();
+    let rows = handle.query(&HistoryQuery::default()).unwrap();
     assert_eq!(rows.len(), 100);
 
     // Shutdown drains; post-shutdown records shed (counted, never block).
@@ -707,4 +707,61 @@ fn scopes_on_empty_store_and_past_the_end_cursor_are_empty_pages() {
             .is_empty(),
         "the cursor is exclusive — the scope it names is not repeated"
     );
+}
+
+/// Issue #1317: under an Ephemeral policy no public write path stores a
+/// suppressed record. The handle's public writes are `record` and
+/// `record_committed` (the raw store is not public: see the `compile_fail`
+/// doctest on `HistoryHandle`), and both obey the ADR 0116 gate. The public
+/// read methods then find no suppressed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_public_write_stores_a_suppressed_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = HistoryConfig {
+        enabled: true,
+        db_path: Some(dir.path().join("history.db")),
+        dm_recording: x0x::history::DmRecording::Ephemeral,
+        topic_rules: vec![x0x::history::TopicRule {
+            prefix: "quiet.".into(),
+            recording: x0x::history::TopicRecording::Ephemeral,
+            max_bytes: None,
+            max_age_days: None,
+        }],
+        ..HistoryConfig::default()
+    };
+    let service = HistoryService::start(&config, dir.path()).unwrap();
+    let handle = service.handle();
+    let dm = Scope::Dm("ab".repeat(32));
+    let quiet = Scope::Topic("quiet.room".into());
+    handle.record(record(b"dm via record", dm.clone(), 1_000));
+    handle.record(record(b"quiet via record", quiet.clone(), 1_000));
+    assert!(matches!(
+        handle
+            .record_committed(record(b"dm via record_committed", dm.clone(), 1_000))
+            .await,
+        Err(x0x::error::HistoryError::PolicySuppressed)
+    ));
+    assert!(matches!(
+        handle
+            .record_committed(record(b"quiet via record_committed", quiet.clone(), 1_000))
+            .await,
+        Err(x0x::error::HistoryError::PolicySuppressed)
+    ));
+    // A recorded row on the same writer queue: every earlier record was
+    // processed before it commits.
+    handle
+        .record_committed(record(b"barrier", Scope::Topic("loud".into()), 1_000))
+        .await
+        .unwrap();
+    for scope in [dm, quiet] {
+        let rows = handle
+            .query(&HistoryQuery {
+                scope: Some(scope.clone()),
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        assert!(rows.is_empty(), "{scope:?}: {rows:?}");
+    }
+    assert_eq!(handle.stats().unwrap().rows, 1, "only the barrier row");
+    service.shutdown().await;
 }
