@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The current ADR count fails when a record would pass the limit of 15."""
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -77,6 +79,43 @@ class AdrCountTests(unittest.TestCase):
         self.assertEqual(CHECK.validate(self.root), [])
         count, extras = CHECK.current_records(self.root)
         self.assertEqual((count, extras), (15, []))
+
+    def test_invented_archive_record_is_rejected(self):
+        name = "0117-invented.md"
+        payload = b"# Invented\n"
+        archive = self.root / "docs/adr-archive" / name
+        archive.write_bytes(payload)
+        source = self.root / "docs/adr" / name
+        source.symlink_to(f"../adr-archive/{name}")
+        manifest_path = self.root / "docs/adr-archive/move.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["moves"].append(
+            {
+                "from": f"docs/adr/{name}",
+                "to": f"docs/adr-archive/{name}",
+                "link": f"../adr-archive/{name}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        errors = CHECK.validate(self.root)
+        self.assertIn(
+            "docs/adr/0117-invented.md: newly invented archive record is not in "
+            "the approved historical source set.",
+            errors,
+        )
+
+    def test_source_mapping_must_name_a_slot(self):
+        transfer = self.root / "docs/adr/consolidated/TRANSFER.md"
+        text = transfer.read_text(encoding="utf-8")
+        old = "](A02-r01-identity-keys-and-device-enrollment.md)"
+        new = "](A16-r01-not-a-slot.md)"
+        self.assertIn(old, text)
+        transfer.write_text(text.replace(old, new, 1), encoding="utf-8")
+        errors = CHECK.validate(self.root)
+        self.assertTrue(
+            any("source-to-slot mapping must name one slot A01-A15." in error for error in errors)
+        )
 
     def test_extra_consolidated_record_exceeds_the_limit_of_15(self):
         extra = self.root / "docs/adr/consolidated/hidden/A16-r01-extra.md"

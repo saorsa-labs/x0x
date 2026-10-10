@@ -73,11 +73,15 @@ allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
 
 `python3 scripts/check-adr-count.py` fails when the current count exceeds
 15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
-map keep their exact paths as links and stay outside that count. Only a
-path recorded in `docs/adr-archive/move.json` and present as that archive
-link is excluded. Files under `docs/adr/transient/` do not count (D242).
-A nested file that reuses a mapped number counts. A legal
-run prints the pass line only. It does not name an unplaced record.
+map keep their exact paths as links and stay outside that count. The count
+excludes a path only when that path is an approved historical source and
+`docs/adr-archive/move.json` records it as that archive link. A new
+`move.json` entry outside that set is rejected. Files under
+`docs/adr/transient/` do not count (D242). A new decision there is
+`T-<slug>.md`, names one target slot from A01 to A15, and stays Proposed
+until David accepts it. An Accepted transient body stays frozen. A nested
+file that reuses a mapped number counts. A legal run prints the pass line
+only. It does not name an unplaced record.
 
 A recorded consolidation move may replace a numbered path with a symlink
 to `docs/adr-archive/` when `docs/adr-archive/move.json` records the path,

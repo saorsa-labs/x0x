@@ -41,9 +41,11 @@ frozen evidence and active issue gates still govern implementation.
    the approximately 80% ASD-STE100 style target.
 
 The limit applies to current decisions after transfer. Archived records and
-past accepted revisions do not count. During transfer, new or changed
-decisions use the numbered ADR series only, through ADR 0087 (D199). Slot
-revisions stay Proposed. The transition check rejects an Accepted slot.
+past accepted revisions do not count. A new decision is
+`docs/adr/transient/T-<slug>.md` (D242). It names one target slot from A01
+to A15. It stays Proposed until David accepts it. David folds it into that
+slot only when he asks. Slot revisions stay Proposed. The transition check
+rejects an Accepted slot.
 Keep reserved numbers
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
 Slices 0109–0114 continue to acceptance as numbered ADRs. Map their rulings

@@ -19,10 +19,11 @@ This directory contains architecture decision records for x0x.
 ## Transfer rulings (2026-10-05)
 
 D198 confirms the consolidation direction and writing target. David accepted
-the transfer on 10 Oct 2026. The slot files stay Proposed. D199 keeps new or
-changed decisions in the numbered ADR series only, under ADR 0087. The
-reserved numbers and 0109–0114 acceptance lanes stand; slot revisions are
-drafts.
+the transfer on 10 Oct 2026. The slot files stay Proposed. A new decision is
+`docs/adr/transient/T-<slug>.md` (D242). It names one target slot from A01
+to A15. It stays Proposed until David accepts it. David folds it into that
+slot only when he asks. The reserved numbers and 0109–0114 acceptance lanes
+stand; slot revisions are drafts.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
 implementation status does not defer that decision. D197 confirms that

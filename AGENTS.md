@@ -72,10 +72,10 @@ The documentation and communication style is in `docs/documentation-style.md`.
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
 behaviour, public APIs or operational invariants, check `docs/adr/` and its
-status overlay. During transfer, new or changed decisions use the numbered
-ADR series only, through `docs/adr/TEMPLATE.md` and the ADR 0087 process
-(D199). Accepted ADRs are immutable. Supersede them instead. Only David marks
-an ADR Accepted.
+status overlay. A new decision is `docs/adr/transient/T-<slug>.md` (D242).
+It names one target slot from A01 to A15. It stays Proposed until David
+accepts it. David folds it into that slot only when he asks. Accepted ADRs
+are immutable. Supersede them instead. Only David marks an ADR Accepted.
 
 The 15-slot direction, A01 through A15, is confirmed by David (D198).
 David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.

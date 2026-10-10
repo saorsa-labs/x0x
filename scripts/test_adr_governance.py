@@ -2147,6 +2147,105 @@ def main() -> int:
             rc == 1 and "Accepted ADRs are immutable" in out,
         ))
 
+    _TRANSIENT = """\
+# Identity keys note
+
+- **Status:** Proposed
+- **Target slot:** A02
+
+## Decision
+
+Keep the owner key separate.
+"""
+
+    def _commit_all(work: Path, message: str) -> None:
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=work, check=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT)
+        _commit_all(work, "propose transient record")
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: accepting a record passes",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+        path.write_text(accepted.replace(
+            "Keep the owner key separate.", "MUTATED decision body."
+        ))
+        _commit_all(work, "edit accepted transient body")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: editing an Accepted body fails across a later commit",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-identity-keys.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        path.unlink()
+        _commit_all(work, "fold by deleting the accepted record")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: folding that drops Accepted bytes fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "Folding does not change these bytes." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/0117-new-decision.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT)
+        _commit_all(work, "bad transient filename")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: filename must be T-<slug>.md",
+            rc == 1 and "filename must be docs/adr/transient/T-<slug>.md." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT.replace("- **Target slot:** A02\n", ""))
+        _commit_all(work, "missing target slot")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: a record must name one target slot",
+            rc == 1 and "name one target slot from A01 to A15." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Rejected"))
+        _commit_all(work, "rejected lifecycle")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: lifecycle must stay Proposed until David accepts it",
+            rc == 1 and "lifecycle must stay Proposed until David accepts it." in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0

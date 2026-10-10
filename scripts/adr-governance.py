@@ -35,6 +35,10 @@ Enforces:
   symlink to ``docs/adr-archive/`` when ``docs/adr-archive/move.json`` records
   that path, link, and sha256. The archived bytes must stay identical to the
   frozen Accepted snapshot. Any other content change still fails.
+- A new decision lives at ``docs/adr/transient/T-<slug>.md`` (D242). It names
+  one target slot from A01 to A15 and stays Proposed until David accepts it.
+  After acceptance, the body bytes stay frozen across later commits and
+  folding. Deleting or editing those bytes fails.
 """
 from __future__ import annotations
 
@@ -631,6 +635,93 @@ def _frozen_adr_snapshot(
         return (None, None, f"Failed to scan history for {adr_name}: {exc}")
 
 
+TRANSIENT_NAME = re.compile(r"^T-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
+TARGET_SLOT_RE = re.compile(
+    r"(?im)^\s*[-*]\s*\*{0,2}Target slot:?\*{0,2}:?\s*(A(?:0[1-9]|1[0-5]))\b"
+)
+TRANSIENT_STATUSES = {"Proposed", "Accepted"}
+
+
+def _transient_shape_errors(path: str, text: str) -> list[str]:
+    """Check the filename, the one target slot, and the lifecycle."""
+    errors: list[str] = []
+    name = Path(path)
+    if name.parent.as_posix() != "docs/adr/transient" or not TRANSIENT_NAME.match(name.name):
+        errors.append(f"{path}: filename must be docs/adr/transient/T-<slug>.md.")
+    status = status_of(text)
+    if status is None or status_token(status) not in TRANSIENT_STATUSES:
+        errors.append(f"{path}: lifecycle must stay Proposed until David accepts it.")
+    slots = TARGET_SLOT_RE.findall(text)
+    if len(slots) != 1:
+        errors.append(f"{path}: name one target slot from A01 to A15.")
+    return errors
+
+
+def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
+    """Protect transient records. Accepted body bytes survive folding."""
+    errors: list[str] = []
+    head_paths: list[str] = []
+    transient = Path("docs/adr/transient")
+    if transient.exists():
+        for path in sorted(transient.rglob("*.md")):
+            repo_path = path.as_posix()
+            head_paths.append(repo_path)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                errors.append(f"{repo_path}: cannot read transient record ({exc}).")
+                continue
+            errors.extend(_transient_shape_errors(repo_path, text))
+
+    if not base:
+        return errors
+
+    candidates = set(head_paths)
+    for name in changed:
+        if name.startswith("docs/adr/transient/") and name.endswith(".md"):
+            candidates.add(name)
+    try:
+        added = run(
+            [
+                "git",
+                "log",
+                "--no-renames",
+                "--diff-filter=A",
+                "--name-only",
+                "--format=",
+                f"{base}..HEAD",
+            ]
+        ).splitlines()
+    except Exception as exc:
+        errors.append(f"Failed to scan history for transient records: {exc}")
+        added = []
+    for name in added:
+        if name.startswith("docs/adr/transient/") and name.endswith(".md"):
+            candidates.add(name)
+
+    for name in sorted(candidates):
+        snapshot_commit, snapshot_text, snap_error = _frozen_adr_snapshot(name, base)
+        if snap_error:
+            errors.append(snap_error)
+            continue
+        if snapshot_commit is None:
+            continue
+        try:
+            head_text, move_error = adr_content_at("HEAD", name)
+        except Exception as exc:
+            errors.append(f"Failed to read {name} at HEAD: {exc}")
+            continue
+        if move_error:
+            errors.append(move_error)
+            continue
+        if head_text is None or head_text != snapshot_text:
+            errors.append(
+                f"{name}: Accepted transient records are immutable. "
+                f"Folding does not change these bytes."
+            )
+    return errors
+
+
 def main() -> int:
     errors: list[str] = []
     # Do NOT early-return when docs/adr/ is absent.  If the directory was
@@ -987,6 +1078,7 @@ def main() -> int:
                         f"Grounding files freeze with ADR acceptance."
                     )
 
+    errors.extend(transient_record_errors(base, changed))
     errors.extend(recorded_move_errors("HEAD"))
 
     if errors:
