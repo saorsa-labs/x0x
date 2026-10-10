@@ -117,25 +117,23 @@ test-group = "quic-localhost"
 filter = "binary(f2_public_group_bootstrap_wiring) | binary(history_point_lookup_wiring)"
 test-group = "quic-localhost"
 
-# Issue #316: these two loopback tests flake only under full parallel load
-# (never in isolation). Serial-group placement alone proved insufficient —
-# the trigger is ambient suite load starving their timing windows, not
-# group-internal contention — so they also reserve scheduler slots via
-# threads-required. Not retries, not wider deadlines (ADR 0025 — a flake
-# is not an observation).
+# Issue #316: these two loopback tests failed a full parallel run and
+# passed in isolation. Serial-group placement alone was not enough, so
+# they also reserve scheduler slots via threads-required. The ambient-load
+# attribution is unverified (#702). Not retries, not wider deadlines
+# (ADR 0025 — a flake is not an observation).
 [[profile.default.overrides]]
 filter = "test(direct_send_with_require_ack_round_trips_to_live_peer) | test(=tests::suppressed_peer_inbound_redial_is_rejected)"
 test-group = "quic-localhost"
 threads-required = 4
 
-# ADR 0030 slice 3: gossip_plane_isolation was ALREADY in the serial group
-# (see the block below) and still failed a full-parallel run — at the very
-# first `connect_addr`, in 2.4 s versus its normal ~12.4 s, with every dial
-# strategy timing out; 4/4 green in isolation. That is the issue-#316
-# signature exactly: group placement bounds group-internal contention, but
-# the trigger here is ambient load from the ~2600 ungrouped tests starving
-# the dial's timing window. So it needs the same remedy the two #316 tests
-# needed — a scheduler-slot reservation, not merely a group.
+# ADR 0030 slice 3: gossip_plane_isolation was already in the serial group
+# (see the block below) and still failed a full-parallel run, at the first
+# `connect_addr`, in 2.4 s versus its normal ~12.4 s, with every dial
+# strategy timing out. Four of four runs passed in isolation. Group
+# placement bounds group-internal contention. This override reserves a
+# scheduler slot, as the two #316 tests do. The ambient-load attribution
+# is unverified (#702).
 #
 # This block MUST stay ahead of the broader one below: nextest applies the
 # FIRST matching override, so appending these settings after that block
@@ -160,8 +158,9 @@ test-group = "quic-localhost"
 # Issue #510: cap concurrent execution of the deadline-carrying membership
 # cluster tests at two. This bounds their overlap with one another while
 # leaving unrelated suite tests eligible to run concurrently. Deadlines,
-# assertions and test selection remain unchanged; this resource limit does
-# not by itself establish the cause of a convergence timeout.
+# assertions and test selection remain unchanged. This resource limit does
+# not establish the cause of a convergence timeout. The ambient-load
+# attribution is unverified (#702).
 [test-groups.membership-cluster]
 max-threads = 2
 
