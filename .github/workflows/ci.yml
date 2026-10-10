@@ -489,6 +489,10 @@ jobs:
           --expect w3h_red_1207_ready_hello_no_mapping_stays_red=RED
           --require w3h_811_late_joiner_reads_history_from_plain_member
           --expect w3h_811_late_joiner_reads_history_from_plain_member=GREEN
+          --require w3h_811_control_web_request_dropped_is_infra
+          --expect w3h_811_control_web_request_dropped_is_infra=INFRA
+          --require w3h_811_control_web_history_withheld_is_red
+          --expect w3h_811_control_web_history_withheld_is_red=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
