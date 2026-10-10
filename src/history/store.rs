@@ -352,6 +352,18 @@ impl SkippedTopicRulesWarning {
 }
 
 /// Synchronous SQLite-backed history store.
+///
+/// The low-level offline API (issue #1317): a tool that owns a history
+/// file opens it here and uses it directly. It does not apply the
+/// recording policy (ADR 0116 §2). Only its retention passes
+/// ([`Self::retain_with_rules`] and the others) take the retention
+/// admission; [`Self::purge`] and the writes do not. A running agent or
+/// daemon does not hand out its `Store`: use [`super::HistoryHandle`]
+/// there, whose write methods apply the policy and whose
+/// [`super::HistoryHandle::purge`] and [`super::HistoryHandle::retain`]
+/// take the admission. A running history service holds its database
+/// exclusively, so an offline open of that file fails until the service
+/// stops.
 pub struct Store {
     /// Dropped first: in test builds it runs an optional hook while the
     /// connection is still open; zero-sized and inert otherwise
@@ -2048,15 +2060,63 @@ impl Store {
     }
 
     /// Delete every row in `scope`. Returns rows removed. Local-only.
+    ///
+    /// Not atomic. The row delete commits first; then the canonical-id
+    /// cleanup and `PRAGMA incremental_vacuum` run. If a later step fails,
+    /// the rows stay deleted and this error does not say how many.
+    /// [`super::HistoryHandle::purge`] reports that count.
     pub fn purge(&self, scope: &Scope) -> HistoryResult<u64> {
-        let guard = lock_conn(&self.conn)?;
-        let n = guard.execute(
-            "DELETE FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
-            rusqlite::params![scope.kind(), scope.id()],
-        )?;
-        cleanup_canonical_ids(&guard)?;
-        guard.execute_batch("PRAGMA incremental_vacuum;")?;
-        Ok(n as u64)
+        self.purge_counting(scope)
+            .map_err(|(error, _deleted)| error)
+    }
+
+    /// The body of [`Self::purge`]. On an error it also returns the rows
+    /// that the committed delete removed: 0 when the delete itself failed
+    /// (one statement, so nothing committed), else every row of the scope.
+    fn purge_counting(&self, scope: &Scope) -> Result<u64, (HistoryError, u64)> {
+        let guard = lock_conn(&self.conn).map_err(|error| (error, 0))?;
+        let deleted = guard
+            .execute(
+                "DELETE FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+                rusqlite::params![scope.kind(), scope.id()],
+            )
+            .map_err(|error| (HistoryError::from(error), 0))? as u64;
+        cleanup_canonical_ids(&guard).map_err(|error| (error, deleted))?;
+        guard
+            .execute_batch("PRAGMA incremental_vacuum;")
+            .map_err(|error| (HistoryError::from(error), deleted))?;
+        Ok(deleted)
+    }
+
+    /// Issue #1317: [`Self::purge`] under the retention admission that
+    /// [`Self::trim`] and the reaper share. It does not wait: while a pass
+    /// or a trim holds the admission it returns [`RetainError::Busy`] and
+    /// deletes nothing. The path behind [`super::HistoryHandle::purge`].
+    ///
+    /// # Errors
+    /// [`RetainError::Busy`], or [`RetainError::Failed`] on an SQLite
+    /// failure. The purge is not atomic: when a step after the committed
+    /// row delete fails, those rows stay deleted and `committed.deleted`
+    /// counts them (round 2, Codex P2). It is 0 only when nothing was
+    /// deleted.
+    pub(crate) fn purge_admitted(&self, scope: &Scope) -> Result<u64, RetainError> {
+        let started = std::time::Instant::now();
+        let failed = |error, deleted| RetainError::Failed {
+            error,
+            committed: RetainReport::purged(deleted, started.elapsed()),
+        };
+        let _admission = match self.retention.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(RetainError::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(failed(
+                    HistoryError::Database("retention mutex poisoned".into()),
+                    0,
+                ))
+            }
+        };
+        self.purge_counting(scope)
+            .map_err(|(error, deleted)| failed(error, deleted))
     }
 
     /// Write a batch inside one transaction (writer thread path).
@@ -9883,6 +9943,32 @@ impl Store {
     pub(crate) fn fail_trim_delete_after_for_tests(&self, committed: u64) {
         self.test_trim_fail_after
             .store(committed.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Issue #1317 round 2: make a purge fail AFTER its row delete has
+    /// committed. `true` adds one orphan canonical-id row and a TEMP
+    /// trigger (this connection only; nothing is written to the schema)
+    /// that aborts any delete from `history_canonical_ids`. A purged row
+    /// with no canonical id fires no such delete, so the purge's main
+    /// DELETE commits and its `cleanup_canonical_ids` step fails on the
+    /// orphan. `false` drops the trigger; the orphan stays for the next
+    /// cleanup to remove.
+    pub(crate) fn fail_purge_cleanup_for_tests(&self, fail: bool) {
+        let guard = lock_conn(&self.conn).unwrap_or_else(|e| panic!("{e}"));
+        let sql = if fail {
+            "INSERT INTO history_canonical_ids \
+               (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+             VALUES (zeroblob(32), zeroblob(32), 2, 'issue1317-orphan'); \
+             CREATE TEMP TRIGGER issue1317_fail_purge_cleanup \
+             BEFORE DELETE ON main.history_canonical_ids BEGIN \
+               SELECT RAISE(ABORT, 'injected cleanup failure'); \
+             END;"
+        } else {
+            "DROP TRIGGER IF EXISTS temp.issue1317_fail_purge_cleanup;"
+        };
+        guard
+            .execute_batch(sql)
+            .unwrap_or_else(|e| panic!("purge cleanup hook: {e}"));
     }
 
     /// ADR 0116 slice D: park (or release) trims after admission.

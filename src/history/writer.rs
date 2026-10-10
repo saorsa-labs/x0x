@@ -159,6 +159,11 @@ impl std::fmt::Debug for Writer {
 
 impl Writer {
     /// Spawn the writer thread over `store`.
+    ///
+    /// Part of the low-level offline API (issue #1317), with [`Store`]: a
+    /// writer spawned here does not apply the recording policy (ADR 0116
+    /// §2). A running agent or daemon records through
+    /// [`super::HistoryHandle`], which does.
     #[must_use]
     pub fn spawn(store: Arc<Store>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<WriteCommand>(WRITER_QUEUE_CAPACITY);

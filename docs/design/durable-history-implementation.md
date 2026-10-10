@@ -25,7 +25,11 @@ src/history/
 
 `HistoryService` is owned by `AppState` (daemon) or `Agent` (library, opt-in
 via `AgentBuilder::with_history`). All producers hold a cheap
-`HistoryHandle` (clonable mpsc sender + Arc<Store> for reads).
+`HistoryHandle` (clonable mpsc sender + Arc<Store>). Embedders read through
+the handle's own methods (`query`, `search`, `scopes`, `stats`, …) and purge
+through `HistoryHandle::purge`, which takes the retention admission; the raw
+`Arc<Store>` is crate-only (issue #1317), because it bypasses the recording
+policy and the admission.
 
 ## 3. Schema
 

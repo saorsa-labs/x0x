@@ -1107,6 +1107,13 @@ pub(in crate::server) struct HistoryPurgeParams {
 /// purge closes so nobody — operator or attacker — can delete the evidence
 /// mid-incident. The check runs BEFORE any deletion, so a refused purge
 /// leaves the store untouched.
+///
+/// Issue #1317: the purge takes the retention admission
+/// ([`x0x::history::HistoryHandle::purge`]). While a reaper pass or a trim
+/// holds the store it answers 409 `history_retention_busy` at once and
+/// deletes nothing; it is not queued. The purge is not atomic: a 500
+/// after its row delete committed keeps those rows deleted and counts
+/// them in `removed`.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -1149,14 +1156,31 @@ pub(in crate::server) async fn history_purge(
             return refusal;
         }
     }
-    let store = Arc::clone(history.store());
-    match tokio::task::spawn_blocking(move || store.purge(&scope)).await {
-        Ok(Ok(removed)) => (
+    match history.purge(&scope).await {
+        Ok(removed) => (
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "removed": removed })),
         ),
-        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("purge: {e}")),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
+        Err(x0x::history::RetainError::Busy) => api_error_with_reason(
+            StatusCode::CONFLICT,
+            "another history retention operation is running; try again later",
+            "history_retention_busy",
+        ),
+        // Round 2 (Codex P2): the purge is not atomic. Rows its committed
+        // delete removed stay deleted when a later step fails; `removed`
+        // counts them (0 when the delete itself failed).
+        Err(x0x::history::RetainError::Failed { error, committed }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("purge: {error}"),
+                "removed": committed.deleted,
+            })),
+        ),
+        Err(x0x::history::RetainError::InvalidOptions(message)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("purge: {message}"),
+        ),
     }
 }
 
@@ -3679,6 +3703,158 @@ mod adr0116_retain_tests {
         let message = json["error"].as_str().unwrap_or_default();
         assert!(message.contains("not rolled back"), "{message}");
         assert_eq!(store.table_counts_for_tests().0, 344);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod issue1317_purge_tests {
+    //! Issue #1317: `DELETE /history` takes the retention admission
+    //! through `HistoryHandle::purge`. While a reaper pass or a trim holds
+    //! the store it answers 409 `history_retention_busy` and deletes
+    //! nothing. The ADR 0066 row 14 fork-quarantine refusal is unchanged
+    //! (its own tests).
+
+    use super::adr0116_policy_tests::{enabled, state_with};
+    use super::discovery_auth_tests::{text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+    use x0x::history::{HistoryConfig, PinnedScopes};
+
+    #[tokio::test]
+    async fn history_purge_is_409_while_the_store_is_busy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let history = state.agent.history().expect("history on");
+        let scope = Scope::Topic("purge-me".into());
+        let rows: Vec<_> = (0..3)
+            .map(|i| text_row(scope.clone(), &format!("row {i}"), 1_000 + i))
+            .collect();
+        let store = Arc::clone(history.store());
+        store.insert_batch(&rows)?;
+
+        let delete = |app: axum::Router| async move {
+            let request = Request::builder()
+                .method("DELETE")
+                .uri("/history?scope=topic:purge-me")
+                .header("authorization", format!("Bearer {DURABLE}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds");
+            let response = app.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body reads");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, json)
+        };
+
+        store.pause_pass_for_tests();
+        let pass = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.retain_with_rules(
+                    &x0x::history::RetentionPolicy {
+                        max_bytes: u64::MAX,
+                        max_age_days: 0,
+                        scope_limits: Vec::new(),
+                    },
+                    &x0x::history::HistoryPolicy::default(),
+                    &PinnedScopes::none(),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.retention_admission_free_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let (status, json) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), delete(app.clone()))
+                .await
+                .unwrap_or((StatusCode::REQUEST_TIMEOUT, serde_json::Value::Null));
+        store.unpause_pass_for_tests();
+        pass.join().expect("pass thread").expect("pass runs");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_retention_busy", "{json}");
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            3,
+            "nothing deleted while busy"
+        );
+
+        let (status, json) = delete(app).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["removed"], 3);
+        Ok(())
+    }
+
+    /// Round 2 (Codex P2): a purge whose row delete committed and whose
+    /// later cleanup failed is a 500 that counts the deleted rows in
+    /// `removed`. The rows stay deleted.
+    #[tokio::test]
+    async fn history_purge_500_counts_rows_deleted_before_a_cleanup_failure() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let history = state.agent.history().expect("history on");
+        let scope = Scope::Topic("purge-me".into());
+        let rows: Vec<_> = (0..3)
+            .map(|i| text_row(scope.clone(), &format!("row {i}"), 1_000 + i))
+            .collect();
+        let store = Arc::clone(history.store());
+        store.insert_batch(&rows)?;
+
+        store.fail_purge_cleanup_for_tests(true);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/history?scope=topic:purge-me")
+            .header("authorization", format!("Bearer {DURABLE}"))
+            .body(axum::body::Body::empty())?;
+        let response = app.oneshot(request).await?;
+        store.fail_purge_cleanup_for_tests(false);
+        let status = response.status();
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["ok"], false, "{json}");
+        assert_eq!(json["removed"], 3, "{json}");
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("purge: "), "{json}");
+        assert!(error.contains("injected cleanup failure"), "{json}");
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            0,
+            "the committed delete is not rolled back"
+        );
         Ok(())
     }
 }

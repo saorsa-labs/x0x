@@ -205,6 +205,20 @@ impl QuarantinePinSlot {
 }
 
 /// Cheap-to-clone handle producers and readers hold.
+///
+/// Every public path through the handle obeys the ADR 0116 local policy:
+/// writes go through [`Self::record`] / [`Self::record_committed`] (the
+/// recording gate), and deletes through [`Self::retain`] and [`Self::purge`]
+/// (the retention admission). Reads are the synchronous methods
+/// ([`Self::query`], [`Self::search`], …). The raw store is not public
+/// (issue #1317), so code outside the crate cannot write or delete around
+/// the policy:
+///
+/// ```compile_fail
+/// fn bypass(handle: &x0x::history::HistoryHandle) {
+///     let _store = handle.store();
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct HistoryHandle {
     writer: WriterHandle,
@@ -295,11 +309,140 @@ impl HistoryHandle {
         true
     }
 
-    /// Read access to the store. Synchronous — call from `spawn_blocking`
-    /// on async paths.
+    /// The raw store, for this crate only (issue #1317). It bypasses the
+    /// recording policy (ADR 0116 §2) and the retention admission, so it
+    /// is not public: embedders read through [`Self::query`] and the other
+    /// read methods, and delete through [`Self::purge`] and
+    /// [`Self::retain`]. Synchronous — call from `spawn_blocking` on async
+    /// paths.
     #[must_use]
-    pub fn store(&self) -> &Arc<Store> {
+    pub(crate) fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// Rows of one scope (or across scopes), newest first: [`Store::query`].
+    /// Blocking: call it from `spawn_blocking` on async paths.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn query(&self, q: &HistoryQuery) -> HistoryResult<Vec<StoredRecord>> {
+        self.store.query(q)
+    }
+
+    /// Full-text search: [`Store::search`]. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn search(&self, needle: &str, q: &HistoryQuery) -> HistoryResult<Vec<StoredRecord>> {
+        self.store.search(needle, q)
+    }
+
+    /// The scopes that hold rows, keyset-paginated: [`Store::scopes`].
+    /// Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn scopes(&self, after: Option<&Scope>, limit: usize) -> HistoryResult<Vec<ScopeSummary>> {
+        self.store.scopes(after, limit)
+    }
+
+    /// Row counts and database size: [`Store::stats`]. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn stats(&self) -> HistoryResult<HistoryStats> {
+        self.store.stats()
+    }
+
+    /// One row by its stored `msg_id`: [`Store::get_by_msg_id`]. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn get_by_msg_id(&self, msg_id: [u8; 32]) -> HistoryResult<Option<StoredRecord>> {
+        self.store.get_by_msg_id(msg_id)
+    }
+
+    /// One group row by its canonical (ADR-0029) message id:
+    /// [`Store::get_by_canonical_group_msg_id`]. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn get_by_canonical_group_msg_id(
+        &self,
+        canonical_msg_id: [u8; 32],
+        group_id: &str,
+    ) -> HistoryResult<Option<StoredRecord>> {
+        self.store
+            .get_by_canonical_group_msg_id(canonical_msg_id, group_id)
+    }
+
+    /// The rows of one logical request: [`Store::find_by_logical_request`].
+    /// Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn find_by_logical_request(
+        &self,
+        ingress_sender_agent: &str,
+        logical_request_id: [u8; 16],
+    ) -> HistoryResult<Vec<StoredRecord>> {
+        self.store
+            .find_by_logical_request(ingress_sender_agent, logical_request_id)
+    }
+
+    /// `scope_limits` entries the latest retention pass skipped (#1286).
+    #[must_use]
+    pub fn skipped_scope_limits(&self) -> u64 {
+        self.store.skipped_scope_limits()
+    }
+
+    /// Bounded topic rules the latest pass skipped on a non-UTF-8 database.
+    #[must_use]
+    pub fn skipped_topic_rules(&self) -> u64 {
+        self.store.skipped_topic_rules()
+    }
+
+    /// The database's text encoding (`PRAGMA encoding`).
+    #[must_use]
+    pub fn text_encoding(&self) -> &str {
+        self.store.text_encoding()
+    }
+
+    /// Delete every row of one scope from the local store. Local-only: it
+    /// is never propagated (ADR-0023 non-goal). It is not policy-gated: an
+    /// explicit purge applies to any scope; callers that must refuse a
+    /// fork-quarantined group (ADR 0066 row 14, the REST route) check that
+    /// first.
+    ///
+    /// Issue #1317: it shares the retention admission with the reaper and
+    /// [`Self::retain`]. While a reaper pass or a trim holds the store it
+    /// returns [`RetainError::Busy`] at once, rather than deleting under
+    /// a trim. The SQLite work runs on the blocking pool.
+    ///
+    /// A purge is not atomic. Its row delete commits first; then the
+    /// canonical-id cleanup and an incremental vacuum run. If a later step
+    /// fails, the rows stay deleted.
+    ///
+    /// # Errors
+    /// [`RetainError::Busy`], or [`RetainError::Failed`] on an SQLite
+    /// failure. `committed.deleted` counts the rows that the committed
+    /// delete removed: 0 when the delete itself failed, else every row of
+    /// the scope, also when a later step failed. If the blocking task does
+    /// not finish (it panicked), the count is not known; the error says so.
+    pub async fn purge(&self, scope: &Scope) -> Result<u64, RetainError> {
+        let started = std::time::Instant::now();
+        let store = Arc::clone(&self.store);
+        let scope = scope.clone();
+        match tokio::task::spawn_blocking(move || store.purge_admitted(&scope)).await {
+            Ok(outcome) => outcome,
+            Err(join) => Err(RetainError::Failed {
+                error: HistoryError::Database(format!(
+                    "history purge task did not finish: {join}; rows it deleted, if any, \
+                     are not counted"
+                )),
+                committed: RetainReport::purged(0, started.elapsed()),
+            }),
+        }
     }
 
     /// Writer/reaper counters for `/diagnostics/history`.
@@ -1610,5 +1753,107 @@ mod tests {
             assert_eq!(left, 44, "one batch committed, the next never started");
             service.shutdown().await;
         }
+    }
+
+    /// Issue #1317: `HistoryHandle::purge` shares the retention admission.
+    /// While a trim holds the store it returns `Busy` at once and deletes
+    /// nothing; after the trim it deletes the scope.
+    #[tokio::test]
+    async fn issue1317_purge_is_busy_while_a_trim_holds_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), d_aged());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        let scope = Scope::Topic("purge-me".into());
+        d_old_rows(&store, &scope, 3);
+        d_old_rows(&store, &Scope::Topic("old".into()), 5);
+        store.pause_trim_for_tests(true);
+        let trim = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.retain(RetainOptions::default()).await })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.trim_parked_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trim never parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let started = std::time::Instant::now();
+        // Bounded, so a purge that queues behind the trim fails here
+        // instead of deadlocking the test.
+        let busy =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle.purge(&scope)).await;
+        let waited = started.elapsed();
+        store.pause_trim_for_tests(false);
+        let trimmed = trim.await.unwrap().unwrap();
+        assert!(
+            matches!(busy, Ok(Err(RetainError::Busy))),
+            "{busy:?} ({waited:?})"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "never queued: {waited:?}"
+        );
+        // The trim still found all 8 aged rows, purge-me included: the
+        // refused purge deleted nothing. (The row count cannot be read
+        // while the parked trim holds the connection.)
+        assert_eq!(trimmed.deleted, 8, "the refused purge deleted nothing");
+        d_old_rows(&store, &scope, 2);
+        assert_eq!(handle.purge(&scope).await.unwrap(), 2);
+        service.shutdown().await;
+    }
+
+    /// Issue #1317 round 2 (Codex P2): a purge is not atomic. Its row
+    /// delete commits, and then the canonical-id cleanup and the
+    /// incremental vacuum run. When a later step fails, the rows stay
+    /// deleted, and `Failed.committed` must count them.
+    #[tokio::test]
+    async fn issue1317_purge_failure_after_the_delete_counts_the_deleted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = c_start(dir.path(), HistoryConfig::default());
+        let handle = service.handle();
+        let store = Arc::clone(handle.store());
+        let scope = Scope::Topic("purge-me".into());
+        let kept = Scope::Topic("keep".into());
+        d_old_rows(&store, &scope, 3);
+        d_old_rows(&store, &kept, 2);
+        let rows_in = |scope: &Scope| {
+            handle
+                .query(&HistoryQuery {
+                    scope: Some(scope.clone()),
+                    limit: 16,
+                    ..HistoryQuery::default()
+                })
+                .unwrap()
+                .len()
+        };
+        assert_eq!((rows_in(&scope), rows_in(&kept)), (3, 2));
+
+        store.fail_purge_cleanup_for_tests(true);
+        let failed = handle.purge(&scope).await;
+        store.fail_purge_cleanup_for_tests(false);
+        match &failed {
+            Err(RetainError::Failed { error, committed }) => {
+                assert!(
+                    error.to_string().contains("injected cleanup failure"),
+                    "{error}"
+                );
+                assert_eq!(committed.deleted, 3, "{failed:?}");
+                assert_eq!(committed.deleted_by_phase, RetainDeleted::default());
+            }
+            other => panic!("expected Failed after the delete: {other:?}"),
+        }
+        // The deletion committed and is not rolled back; the other scope
+        // is untouched; the cleanup did not run (the orphan is still there).
+        assert_eq!((rows_in(&scope), rows_in(&kept)), (0, 2));
+        assert_eq!(store.table_counts_for_tests(), (2, 2, 1));
+
+        // With the fault gone, a purge of the now-empty scope deletes
+        // nothing and its cleanup removes the orphan.
+        assert_eq!(handle.purge(&scope).await.unwrap(), 0);
+        assert_eq!(store.table_counts_for_tests(), (2, 2, 0));
+        service.shutdown().await;
     }
 }

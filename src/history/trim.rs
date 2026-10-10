@@ -137,7 +137,9 @@ pub struct RetainReport {
     pub state: RetainState,
     /// Rows deleted in committed transactions.
     pub deleted: u64,
-    /// The same, by phase.
+    /// The same, by phase. All zero in the report of a failed
+    /// [`super::HistoryHandle::purge`]: a purge is not a retention phase,
+    /// so only `deleted` counts its rows.
     pub deleted_by_phase: RetainDeleted,
     /// Rows deleted by the ADR 0068 pin ceilings (also in `deleted`).
     pub pin_ceiling_deleted: u64,
@@ -163,9 +165,26 @@ impl RetainReport {
             stopped_by,
         }
     }
+
+    /// Issue #1317 round 2: the committed work of a purge that failed.
+    /// `deleted` is the rows its committed delete removed (0 if the delete
+    /// itself failed). A purge is not a retention phase, so
+    /// `deleted_by_phase` stays zero. `MoreWork`: its cleanup did not
+    /// finish.
+    pub(crate) fn purged(deleted: u64, elapsed: std::time::Duration) -> Self {
+        Self {
+            deleted,
+            ..Self::new(
+                RetainState::MoreWork,
+                RetainDeleted::default(),
+                elapsed,
+                None,
+            )
+        }
+    }
 }
 
-/// Why a trim was refused or failed.
+/// Why a trim or a purge was refused or failed.
 #[derive(Debug)]
 pub enum RetainError {
     /// A budget is out of range (HTTP 400).
@@ -173,8 +192,9 @@ pub enum RetainError {
     /// Another retention operation holds this store (HTTP 409
     /// `history_retention_busy`). Nothing was queued.
     Busy,
-    /// SQLite failed. `committed` counts the batches committed before the
-    /// failure; they are not rolled back (HTTP 500).
+    /// SQLite failed. `committed` counts the deletions committed before
+    /// the failure (a trim's batches, or a purge's row delete); they are
+    /// not rolled back (HTTP 500).
     Failed {
         /// The failure.
         error: HistoryError,
@@ -190,7 +210,7 @@ impl std::fmt::Display for RetainError {
             Self::Busy => write!(f, "another history retention operation is running"),
             Self::Failed { error, committed } => write!(
                 f,
-                "history trim failed after {} committed deletions: {error}",
+                "history retention operation failed after {} committed deletions: {error}",
                 committed.deleted
             ),
         }

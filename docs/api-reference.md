@@ -1997,7 +1997,7 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
 | GET | `/history/policy` | `x0x history policy` | Local history policy in force (ADR 0116): rules, defaults, protected groups, counters. **Owner-only** (durable token) |
 | POST | `/history/retain` | `x0x history retain [--max-rows N] [--budget-ms MS]` | Trim local history now under its startup policy, within a row and time budget (ADR 0116). **Owner-only** (durable token) |
-| DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
+| DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only). 409 `history_retention_busy` while a retention operation runs |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
 limit clamped to 100. Durable DM sends (`require_durable_app_ack: true`)
@@ -2082,6 +2082,38 @@ These counters appear only here; `/diagnostics/history` is unchanged. An
 older daemon has no such route and answers 404. A client must report that
 the operation is unsupported, and must not fall back to reading the
 database.
+
+### Purge — `DELETE /history` (issue #1317)
+
+```
+DELETE /history?scope=<SCOPE>
+```
+
+Deletes every row of one scope from the local store. It is local-only and
+is not propagated. `scope` is required; there is no purge-everything form.
+
+| Status | When |
+|---|---|
+| 200 | The purge ran: `{"ok": true, "removed": <rows>}` |
+| 400 | `scope` is missing or malformed |
+| 409 `fork_quarantined` | The scope is a fork-quarantined group (ADR-0066 §3a, below). Nothing is deleted |
+| 409 `history_retention_busy` | A reaper pass or a runtime trim holds the store. Nothing is deleted or queued; try again |
+| 500 | SQLite failed: `{"ok": false, "error": "purge: …", "removed": <rows>}`. Rows deleted before the failure stay deleted, and `removed` counts them (below) |
+| 503 | History is disabled on this daemon |
+
+A purge takes the same retention admission as the reaper and
+`POST /history/retain`, so it never deletes under a trim. The library
+equivalent is `HistoryHandle::purge(&scope).await`, which returns
+`RetainError::Busy` in the same case.
+
+A purge is not atomic. Its row delete commits first; then a canonical-id
+cleanup and an incremental vacuum run. If one of those later steps fails, the
+scope's rows stay deleted (they are not rolled back), and the 500's `removed`
+counts them. `removed` counts the rows removed by the committed DELETE. It is
+0 if that DELETE failed or matched no rows, so 0 does not show which step
+failed. In the library, `RetainError::Failed`'s `committed.deleted` carries
+the same count. When the error says the count is unknown (the blocking task
+did not finish), a 0 is not proof that nothing was deleted.
 
 ### Runtime trim — `POST /history/retain` (ADR 0116 §4)
 

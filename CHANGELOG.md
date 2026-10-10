@@ -102,6 +102,26 @@ All notable changes to this project will be documented in this file.
   `HistoryError` gains `InvalidConfig`. Code that lists every
   `HistoryConfig` field without `..HistoryConfig::default()`, or matches
   `HistoryError` without a wildcard arm, must be updated.
+- **`HistoryHandle::store()` is no longer public (library API, breaking;
+  0.47.0; #1317).** The raw `Store` it returned bypassed the ADR 0116
+  recording policy (a direct insert could store a row the policy keeps out)
+  and the retention admission (a purge could run under a trim).
+  `HistoryHandle` now has the reads itself: `query`, `search`, `scopes`,
+  `stats`, `get_by_msg_id`, `get_by_canonical_group_msg_id`,
+  `find_by_logical_request`, `skipped_scope_limits`, `skipped_topic_rules`
+  and `text_encoding`. A new async `HistoryHandle::purge` takes the
+  admission and returns `RetainError::Busy` while a reaper pass or a trim
+  runs. `DELETE /history` uses it and answers 409 `history_retention_busy`
+  then, with nothing deleted or queued; the fork-quarantine refusal is
+  unchanged. A purge is not atomic: if its cleanup or vacuum fails after
+  the row delete committed, the rows stay deleted, and the error counts
+  them (`RetainError::Failed`'s `committed.deleted`; the 500 body's new
+  `removed` field). `Store`, `Writer` and `WriterHandle` stay public as the
+  low-level offline API. Migration: `handle.store().query(q)` becomes
+  `handle.query(q)` (the same for the other reads), and
+  `handle.store().purge(s)` becomes `handle.purge(s).await`. Code that
+  wrote through `store()` must use `record`, `record_committed`, `retain`
+  or `purge`.
 
 ### Fixed
 
