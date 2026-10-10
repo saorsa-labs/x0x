@@ -65,15 +65,43 @@ fn record_topic_message(
     });
 }
 
-/// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.
+/// A live REST `/subscribe` stream.
+///
+/// The shutdown drain owns `forwarder` until that task is finished.
+/// `DELETE /subscribe/:id` aborts the task and waits for it, but it does
+/// not take the `JoinHandle` out of the subscriptions map. A cancelled
+/// DELETE drops only its abort handle and this completion receiver. The
+/// drain still finds the task and joins it, so the task drops its
+/// `HistoryHandle` before `shutdown_and_wait` returns.
 pub(in crate::server) struct RestSubscription {
-    /// Topic the subscription the subscription is for (retained for diagnostics/logging).
+    /// Topic the subscription is for (retained for diagnostics and tests).
     topic: String,
     /// Forwarder task draining the gossip subscription into the SSE broadcast.
     /// Aborting it drops the underlying `Subscription`, which releases the
-    /// gossip topic ref-count and ends delivery — without this, an
-    /// unsubscribed stream would keep forwarding messages to SSE forever.
+    /// gossip topic ref-count and ends delivery. The map keeps this handle
+    /// until the task is finished.
     forwarder: tokio::task::JoinHandle<()>,
+    /// Becomes `true` once the forwarder has dropped the owners it captured,
+    /// including `HistoryHandle` for an opted-in topic. DELETE waits on a
+    /// clone. The subscriptions map keeps `forwarder` until the task is
+    /// finished (`AbortHandle::is_finished`).
+    released: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Sends the forwarder completion signal when the forwarder task drops it.
+///
+/// `send(true)` runs from `Drop`, including when shutdown or DELETE aborts
+/// the task. DELETE treats that signal as a wake-up only. It returns after
+/// the task is finished, which is after the future and its `HistoryHandle`
+/// are dropped.
+struct ForwarderReleased(Option<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for ForwarderReleased {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(true);
+        }
+    }
 }
 
 /// POST /publish request body.
@@ -147,12 +175,16 @@ pub(in crate::server) async fn subscribe(
             if state.shutdown_started.is_cancelled() {
                 return api_error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down");
             }
+            let (release_tx, released) = tokio::sync::watch::channel(false);
             let mut recv_sub = sub;
             let forwarder = tokio::spawn(async move {
+                // First local. Its drop sends the completion signal. DELETE
+                // also waits until the task is finished, which is after this
+                // future — and the `HistoryHandle` it captured — is dropped.
+                let _released = ForwarderReleased(Some(release_tx));
                 // Test-only. A blocking pause is not an await, so abort does
                 // not finish this task until the pause ends and `recv` is
-                // polled. The DELETE test uses that to show the handler
-                // waits for the forwarder.
+                // polled. The DELETE tests use that to hold `HistoryHandle`.
                 #[cfg(test)]
                 tests::rest_forwarder_test_pause::wait(&topic);
                 while let Some(msg) = recv_sub.recv().await {
@@ -190,15 +222,15 @@ pub(in crate::server) async fn subscribe(
                 }
             });
 
-            // Track the forwarder task so the DELETE handler can abort it
-            // and the shutdown drain can join it. Aborting drops the
-            // underlying `Subscription`, releasing the gossip topic
-            // ref-count and stopping SSE delivery.
+            // The map keeps the JoinHandle until the task is finished.
+            // DELETE aborts through an abort handle and waits on
+            // `released`. The shutdown drain takes whatever is still here.
             subs.insert(
                 id.clone(),
                 RestSubscription {
                     topic: req.topic.clone(),
                     forwarder,
+                    released,
                 },
             );
 
@@ -216,27 +248,42 @@ pub(in crate::server) async fn unsubscribe(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let removed = {
-        let mut subs = state.subscriptions.write().await;
-        subs.remove(&id)
+    // The subscriptions map keeps the `JoinHandle` until the task is
+    // finished. This request holds an abort handle and a completion
+    // receiver only. If the request is cancelled while it waits, dropping
+    // those does not detach the task, and the shutdown drain still joins it.
+    let (topic, abort, mut released) = {
+        let subs = state.subscriptions.read().await;
+        let Some(sub) = subs.get(&id) else {
+            return not_found("subscription not found");
+        };
+        sub.forwarder.abort();
+        (
+            sub.topic.clone(),
+            sub.forwarder.abort_handle(),
+            sub.released.clone(),
+        )
     };
-    if let Some(sub) = removed {
-        // Stop the forwarder and wait until it has dropped its
-        // `HistoryHandle`. Aborting without joining would detach the task,
-        // and an opted-in topic would keep `history.db` locked.
-        let topic = sub.topic;
-        let forwarder = sub.forwarder;
-        forwarder.abort();
-        let _ = forwarder.await;
-        tracing::info!(
-            sub_id = %id,
-            topic = %topic,
-            "unsubscribed: forwarder aborted, gossip subscription released"
-        );
-        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
-    } else {
-        not_found("subscription not found")
+    #[cfg(test)]
+    tests::rest_forwarder_test_pause::delete_waiting(&topic);
+    // `RecvError` means the sender dropped during task teardown. Either
+    // result means the forwarder has started dropping its owners. Wait
+    // until the task is finished so those owners are gone before this
+    // handler removes the map entry or returns.
+    let _ = released.wait_for(|done| *done).await;
+    while !abort.is_finished() {
+        tokio::task::yield_now().await;
     }
+    {
+        let mut subs = state.subscriptions.write().await;
+        subs.remove(&id);
+    }
+    tracing::info!(
+        sub_id = %id,
+        topic = %topic,
+        "unsubscribed: forwarder aborted, gossip subscription released"
+    );
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
 /// Take every REST `/subscribe` forwarder for the shutdown drain.
@@ -245,13 +292,24 @@ pub(in crate::server) async fn unsubscribe(
 /// `subscribe` checks that token under this map's write lock, so a
 /// subscribe either inserted its forwarder before this take or it does
 /// not spawn one.
+///
+/// `DELETE /subscribe/:id` leaves each `JoinHandle` here until that task
+/// is finished. A DELETE cancelled during its wait does not remove the
+/// task, so this take still joins it.
 pub(in crate::server) async fn take_rest_subscribe_forwarders(
     state: &AppState,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    std::mem::take(&mut *state.subscriptions.write().await)
+    let taken: Vec<RestSubscription> = std::mem::take(&mut *state.subscriptions.write().await)
         .into_values()
-        .map(|sub| sub.forwarder)
-        .collect()
+        .collect();
+    #[cfg(test)]
+    tests::rest_forwarder_test_pause::forwarders_taken(
+        &taken
+            .iter()
+            .map(|sub| sub.topic.clone())
+            .collect::<Vec<_>>(),
+    );
+    taken.into_iter().map(|sub| sub.forwarder).collect()
 }
 
 #[cfg(test)]
@@ -281,6 +339,8 @@ mod tests {
     const TOPIC: &str = "issue1288.row2.subscribe";
     /// Distinct topic so the DELETE pause cannot stall the other tests.
     const DELETE_TOPIC: &str = "issue1288.row2.delete";
+    /// Distinct topic for the cancelled-DELETE drain control.
+    const DELETE_CANCEL_TOPIC: &str = "issue1288.row2.delete-cancel";
 
     fn loopback_daemon_config(
         root: &std::path::Path,
@@ -301,7 +361,7 @@ mod tests {
             ),
             "history": {
                 "enabled": true,
-                "record_topics": [TOPIC, DELETE_TOPIC]
+                "record_topics": [TOPIC, DELETE_TOPIC, DELETE_CANCEL_TOPIC]
             }
         }))?)
     }
@@ -578,11 +638,131 @@ mod tests {
         Ok(())
     }
 
+    /// `DELETE /subscribe/:id` is cancelled while the forwarder still holds
+    /// `HistoryHandle`. The subscriptions map must still contain that task.
+    /// The shutdown drain must not finish until the pause ends, and the
+    /// same-dir relaunch must then open `history.db`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue1288_cancelled_delete_drain_waits_for_owner() -> Result<()> {
+        let pause = rest_forwarder_test_pause::arm(DELETE_CANCEL_TOPIC);
+        let (daemon, state) = start_daemon("delete-cancel").await?;
+        let response = subscribe(
+            State(Arc::clone(&state)),
+            Json(SubscribeRequest {
+                topic: DELETE_CANCEL_TOPIC.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "POST /subscribe: {body}");
+        let id = body["subscription_id"]
+            .as_str()
+            .context("subscription_id")?
+            .to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !pause.entered() {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "the forwarder did not reach its pause"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let abort = {
+            let subs = state.subscriptions.read().await;
+            subs.get(&id)
+                .context("the subscription is registered")?
+                .forwarder
+                .abort_handle()
+        };
+
+        let delete_waiting = rest_forwarder_test_pause::arm_delete_wait(DELETE_CANCEL_TOPIC);
+        let mut pending = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { unsubscribe(State(state), Path(id)).await.into_response() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), delete_waiting.notified())
+            .await
+            .context("DELETE did not reach its wait while the forwarder was paused")?;
+        pending.abort();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), &mut pending)
+            .await
+            .context("cancelled DELETE did not stop")?
+            .expect_err("cancelled DELETE must not complete as a normal response");
+        assert!(
+            stopped.is_cancelled(),
+            "DELETE failed instead of being cancelled: {stopped:?}"
+        );
+        assert!(
+            state.subscriptions.read().await.contains_key(&id),
+            "cancelled DELETE removed the server-owned forwarder"
+        );
+        assert!(
+            !abort.is_finished(),
+            "the forwarder finished while its cleanup was still held"
+        );
+
+        let drain_took = rest_forwarder_test_pause::arm_drain_took(DELETE_CANCEL_TOPIC);
+        drop(state);
+        let Daemon {
+            _root,
+            config,
+            handle,
+            state_weak,
+            agent_weak,
+        } = daemon;
+        let mut shutdown = tokio::spawn(async move { handle.shutdown_and_wait().await });
+        tokio::time::timeout(LIFECYCLE, drain_took)
+            .await
+            .context("the drain did not take the forwarder while it still held history.db")?
+            .context("drain-took signal dropped")?;
+        assert!(
+            !shutdown.is_finished(),
+            "the drain finished before the forwarder released history.db"
+        );
+
+        drop(pause);
+        tokio::time::timeout(LIFECYCLE, &mut shutdown)
+            .await
+            .context("shutdown returns within 60 s after the forwarder is released")?
+            .context("shutdown task")?
+            .context("shutdown")?;
+        let at_return = (state_weak.strong_count(), agent_weak.strong_count());
+        assert_eq!(
+            at_return,
+            (0, 0),
+            "cancelled DELETE: owners must be gone when shutdown returns"
+        );
+        let relaunch = match tokio::time::timeout(
+            LIFECYCLE,
+            crate::server::serve_with_options(config, loopback_daemon_options()),
+        )
+        .await
+        {
+            Err(_) => Err("the relaunch did not return within 60 s".to_string()),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Ok(Ok(relaunched)) => tokio::time::timeout(LIFECYCLE, relaunched.shutdown_and_wait())
+                .await
+                .map_err(|_| "the relaunched daemon did not stop within 60 s".to_string())
+                .and_then(|stopped| stopped.map_err(|e| format!("{e:#}"))),
+        };
+        assert!(
+            relaunch.is_ok(),
+            "cancelled DELETE: a same-dir relaunch must open history.db ({relaunch:?})"
+        );
+        Ok(())
+    }
+
     /// Blocking pause for one forwarder topic. Abort cannot finish the task
     /// while it is inside [`Pause::wait`], because that wait is not an await.
+    ///
+    /// Pauses, DELETE-wait signals and drain-took signals are keyed by topic
+    /// so the row-2 tests can run in parallel.
     pub(super) mod rest_forwarder_test_pause {
+        use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Condvar, Mutex};
+        use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
         struct Pause {
             topic: String,
@@ -591,7 +771,12 @@ mod tests {
             cv: Condvar,
         }
 
-        static ARMED: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+        static ARMED: LazyLock<Mutex<HashMap<String, Arc<Pause>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        static DELETE_WAITING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        static DRAIN_TOOK: LazyLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
 
         pub(super) struct Armed {
             pause: Arc<Pause>,
@@ -604,10 +789,32 @@ mod tests {
                 release: Mutex::new(false),
                 cv: Condvar::new(),
             });
-            *ARMED
+            ARMED
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(topic.to_string(), Arc::clone(&pause));
             Armed { pause }
+        }
+
+        /// Fires once `DELETE /subscribe/:id` has aborted the forwarder and
+        /// is waiting for it, and has not yet removed the map entry.
+        pub(super) fn arm_delete_wait(topic: &str) -> Arc<tokio::sync::Notify> {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            DELETE_WAITING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(topic.to_string(), Arc::clone(&notify));
+            notify
+        }
+
+        /// Fires when the shutdown drain takes a forwarder for `topic`.
+        pub(super) fn arm_drain_took(topic: &str) -> tokio::sync::oneshot::Receiver<()> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            DRAIN_TOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(topic.to_string(), tx);
+            rx
         }
 
         impl Armed {
@@ -630,8 +837,11 @@ mod tests {
                 let mut slot = ARMED
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &self.pause)) {
-                    *slot = None;
+                if slot
+                    .get(&self.pause.topic)
+                    .is_some_and(|p| Arc::ptr_eq(p, &self.pause))
+                {
+                    slot.remove(&self.pause.topic);
                 }
             }
         }
@@ -641,9 +851,7 @@ mod tests {
                 let slot = ARMED
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slot.as_ref()
-                    .filter(|pause| pause.topic == topic)
-                    .map(Arc::clone)
+                slot.get(topic).map(Arc::clone)
             };
             let Some(pause) = pause else {
                 return;
@@ -658,6 +866,27 @@ mod tests {
                     .cv
                     .wait(go)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        pub(in super::super) fn delete_waiting(topic: &str) {
+            if let Some(notify) = DELETE_WAITING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(topic)
+            {
+                notify.notify_one();
+            }
+        }
+
+        pub(in super::super) fn forwarders_taken(topics: &[String]) {
+            let mut waiting = DRAIN_TOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for topic in topics {
+                if let Some(tx) = waiting.remove(topic) {
+                    let _ = tx.send(());
+                }
             }
         }
     }
