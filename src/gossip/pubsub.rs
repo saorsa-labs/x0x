@@ -560,9 +560,9 @@ impl SigningContext {
 /// `verified` fields indicate the authentication state. A subscription only
 /// yields gossip messages with a `sender` whose signature verified (#1114).
 ///
-/// The gossip transport id is not a field of this struct. It rides on
-/// [`PubSubNotification`] so it stays distinct from this envelope, from
-/// `HistoryRecord.msg_id`, and from the ADR 0029 application id.
+/// The gossip transport id is not a field of this struct. Subscription
+/// delivery carries it beside the message so it stays distinct from this
+/// envelope, from `HistoryRecord.msg_id`, and from the ADR 0029 application id.
 #[derive(Debug, Clone)]
 pub struct PubSubMessage {
     /// The topic this message was published on.
@@ -770,6 +770,28 @@ fn lock_std<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct LiveSender {
     id: u64,
     tx: mpsc::Sender<PubSubNotification>,
+    /// Set for a subscriber that joined after the PlumTree receiver already
+    /// existed. Payloads already queued were published before this subscribe
+    /// and must not be copied to it.
+    skip_buffered: bool,
+    admitted: Arc<AtomicBool>,
+    admit_notify: Arc<tokio::sync::Notify>,
+}
+
+struct SenderAdmission {
+    admitted: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl SenderAdmission {
+    async fn wait(&self) {
+        loop {
+            if self.admitted.load(Ordering::Acquire) {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// One PlumTree receiver for a topic, fanned out to every local subscriber.
@@ -799,11 +821,27 @@ impl TopicDelivery {
         })
     }
 
-    fn insert(self: &Arc<Self>, tx: mpsc::Sender<PubSubNotification>) -> u64 {
+    fn insert(
+        self: &Arc<Self>,
+        tx: mpsc::Sender<PubSubNotification>,
+        skip_buffered: bool,
+    ) -> (u64, SenderAdmission) {
         let id = self.next_sender_id.fetch_add(1, Ordering::Relaxed);
-        lock_std(&self.senders).push(LiveSender { id, tx });
+        let admitted = Arc::new(AtomicBool::new(!skip_buffered));
+        let admit_notify = Arc::new(tokio::sync::Notify::new());
+        let admission = SenderAdmission {
+            admitted: Arc::clone(&admitted),
+            notify: Arc::clone(&admit_notify),
+        };
+        lock_std(&self.senders).push(LiveSender {
+            id,
+            tx,
+            skip_buffered,
+            admitted,
+            admit_notify,
+        });
         self.changed.notify_one();
-        id
+        (id, admission)
     }
 
     /// Drop this subscriber's sender now, so the forwarder does not keep the
@@ -823,21 +861,8 @@ impl TopicDelivery {
     }
 
     fn mark_ready(&self) {
-        // `send` drops the value when no receiver exists yet. Joiners
-        // subscribe after the owner has already passed this point.
+        // `send` drops the value when no receiver exists yet.
         self.ready.send_replace(true);
-    }
-
-    async fn wait_ready(&self) {
-        let mut ready = self.ready.subscribe();
-        loop {
-            if *ready.borrow_and_update() {
-                return;
-            }
-            if ready.changed().await.is_err() {
-                return;
-            }
-        }
     }
 }
 
@@ -847,8 +872,10 @@ struct ClaimedDelivery {
     slot: Arc<TopicDelivery>,
     sender_id: u64,
     /// `true` when this caller must open the PlumTree receiver and run the
-    /// single forwarder. Joiners wait until that receiver is ready.
+    /// single forwarder. Joiners wait until buffered payloads from before
+    /// they subscribed have been kept off their channel.
     own: bool,
+    admission: SenderAdmission,
 }
 
 /// Cancels an owner that never started the forwarder, so joiners are not
@@ -880,7 +907,32 @@ fn force_close_topic_delivery(deliveries: &TopicDeliveryMap, topic_id: TopicId) 
         slot
     };
     let senders = std::mem::take(&mut *lock_std(&slot.senders));
+    // A joiner blocked in `SenderAdmission::wait` must observe shutdown.
+    for sender in &senders {
+        sender.admitted.store(true, Ordering::Release);
+        sender.admit_notify.notify_one();
+    }
     drop(senders);
+}
+
+fn admit_buffered_joiners(slot: &TopicDelivery) {
+    let mut senders = lock_std(&slot.senders);
+    for sender in senders.iter_mut() {
+        if !sender.skip_buffered {
+            continue;
+        }
+        sender.skip_buffered = false;
+        sender.admitted.store(true, Ordering::Release);
+        sender.admit_notify.notify_one();
+    }
+}
+
+fn established_recipient_ids(slot: &TopicDelivery) -> Vec<u64> {
+    lock_std(&slot.senders)
+        .iter()
+        .filter(|sender| !sender.skip_buffered)
+        .map(|sender| sender.id)
+        .collect()
 }
 
 /// `true` when this slot has no local subscribers and was removed.
@@ -905,8 +957,7 @@ fn shutdown_delivery_if_idle(
     true
 }
 
-fn count_undecoded_deliveries(slot: &TopicDelivery, stats: &PubSubStats, sub_topic: &str) {
-    let waiting = lock_std(&slot.senders).len() as u64;
+fn count_undecoded_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64) {
     if waiting == 0 {
         return;
     }
@@ -920,15 +971,53 @@ fn count_undecoded_deliveries(slot: &TopicDelivery, stats: &PubSubStats, sub_top
     );
 }
 
+struct ForwardEnv<'a> {
+    stats: &'a PubSubStats,
+    transport_claims: &'a TransportClaims,
+    contacts: Option<&'a Arc<RwLock<ContactStore>>>,
+    revocation_set: Option<&'a Arc<RwLock<crate::revocation::RevocationSet>>>,
+    sub_topic: &'a str,
+}
+
+async fn forward_plumtree_payload(
+    slot: &TopicDelivery,
+    env: &ForwardEnv<'_>,
+    peer: PeerId,
+    encoded_payload: Bytes,
+) {
+    // Take the claim once, before this delivery is copied. A later decode
+    // drop still consumes it so it cannot stick to a later payload.
+    // Recipients are the subscribers already past the pre-subscribe buffer.
+    let transport_msg_id = env.transport_claims.take_unique(peer, &encoded_payload);
+    let recipients = established_recipient_ids(slot);
+    tracing::debug!(
+        topic = %env.sub_topic,
+        payload_len = encoded_payload.len(),
+        "[4/6 pubsub] received from PlumTree, decoding"
+    );
+    match decode_for_delivery(encoded_payload, env.contacts, env.revocation_set).await {
+        Some(message) => {
+            let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
+            deliver_copied_notification(slot, env.stats, env.sub_topic, &notification, &recipients);
+        }
+        None => count_undecoded_deliveries(env.stats, env.sub_topic, recipients.len() as u64),
+    }
+}
+
 fn deliver_copied_notification(
     slot: &TopicDelivery,
     stats: &PubSubStats,
     sub_topic: &str,
     notification: &PubSubNotification,
+    recipients: &[u64],
 ) {
     let mut senders = lock_std(&slot.senders);
     let mut index = 0;
     while index < senders.len() {
+        if !recipients.contains(&senders[index].id) {
+            index += 1;
+            continue;
+        }
         stats.incoming_total.fetch_add(1, Ordering::Relaxed);
         stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
@@ -2398,14 +2487,46 @@ impl PubSubManager {
             let transport_claims = Arc::clone(&self.transport_claims);
             let sub_topic = topic.clone();
             tokio::spawn(async move {
+                let env = ForwardEnv {
+                    stats: &stats,
+                    transport_claims: &transport_claims,
+                    contacts: contacts.as_ref(),
+                    revocation_set: revocation_set.as_ref(),
+                    sub_topic: &sub_topic,
+                };
                 loop {
                     if !slot.alive.load(Ordering::Acquire) {
                         return;
                     }
                     tokio::select! {
                         biased;
+                        // A joiner is not a recipient of payloads already
+                        // queued: those were published before it subscribed.
+                        // Drain them first, then admit the joiner. Otherwise
+                        // a later subscribe observes an earlier publish.
                         _ = slot.changed.notified() => {
-                            if shutdown_delivery_if_idle(&deliveries, topic_id, &slot) {
+                            loop {
+                                match plumtree_rx.try_recv() {
+                                    Ok((peer, encoded_payload)) => {
+                                        forward_plumtree_payload(
+                                            &slot,
+                                            &env,
+                                            peer,
+                                            encoded_payload,
+                                        )
+                                        .await;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                        force_close_topic_delivery(&deliveries, topic_id);
+                                        return;
+                                    }
+                                }
+                            }
+                            admit_buffered_joiners(&slot);
+                            if !slot.alive.load(Ordering::Acquire)
+                                || shutdown_delivery_if_idle(&deliveries, topic_id, &slot)
+                            {
                                 tracing::debug!(
                                     topic = %sub_topic,
                                     "[4/6 pubsub] subscriber receiver dropped — ending forwarding task"
@@ -2418,37 +2539,13 @@ impl PubSubManager {
                                 force_close_topic_delivery(&deliveries, topic_id);
                                 return;
                             };
-                            // Take the claim once, before this delivery is
-                            // copied. A later decode drop still consumes it
-                            // so it cannot stick to a later payload.
-                            let transport_msg_id =
-                                transport_claims.take_unique(peer, &encoded_payload);
-                            tracing::debug!(
-                                topic = %sub_topic,
-                                payload_len = encoded_payload.len(),
-                                "[4/6 pubsub] received from PlumTree, decoding"
-                            );
-                            match decode_for_delivery(
+                            forward_plumtree_payload(
+                                &slot,
+                                &env,
+                                peer,
                                 encoded_payload,
-                                contacts.as_ref(),
-                                revocation_set.as_ref(),
                             )
-                            .await
-                            {
-                                Some(message) => {
-                                    let notification = PubSubNotification::with_transport_id(
-                                        message,
-                                        transport_msg_id,
-                                    );
-                                    deliver_copied_notification(
-                                        &slot,
-                                        &stats,
-                                        &sub_topic,
-                                        &notification,
-                                    );
-                                }
-                                None => count_undecoded_deliveries(&slot, &stats, &sub_topic),
-                            }
+                            .await;
                             if !slot.alive.load(Ordering::Acquire)
                                 || shutdown_delivery_if_idle(&deliveries, topic_id, &slot)
                             {
@@ -2461,7 +2558,7 @@ impl PubSubManager {
             claimed.slot.mark_ready();
             setup.started = true;
         } else {
-            claimed.slot.wait_ready().await;
+            claimed.admission.wait().await;
         }
 
         Subscription {
@@ -2848,22 +2945,24 @@ impl PubSubManager {
         let mut map = lock_std(&self.topic_deliveries);
         if let Some(slot) = map.get(&topic_id).cloned() {
             if slot.alive.load(Ordering::Acquire) {
-                let sender_id = slot.insert(tx);
+                let (sender_id, admission) = slot.insert(tx, true);
                 return ClaimedDelivery {
                     slot,
                     sender_id,
                     own: false,
+                    admission,
                 };
             }
             map.remove(&topic_id);
         }
         let slot = TopicDelivery::new(Arc::clone(&self.stats));
-        let sender_id = slot.insert(tx);
+        let (sender_id, admission) = slot.insert(tx, false);
         map.insert(topic_id, Arc::clone(&slot));
         ClaimedDelivery {
             slot,
             sender_id,
             own: true,
+            admission,
         }
     }
 
@@ -9478,6 +9577,41 @@ mod issue869 {
         let only = recv_note(&mut second).await;
         assert_eq!(only.transport_msg_id, Some(id_b));
         assert_eq!(only.message.payload.as_ref(), b"two");
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_misses_a_publish_from_before_it_subscribed() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = PubSubManager::new(test_node().await, Some(ctx)).expect("manager");
+        let topic = "issue869-before-subscribe";
+        let mut first = manager.subscribe(topic.to_string()).await;
+        manager
+            .publish(topic.to_string(), Bytes::from_static(b"before"))
+            .await
+            .expect("publish before the second subscribe");
+        let mut second = manager.subscribe(topic.to_string()).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            second.recv_notification(),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "a subscriber must not observe a publish from before it subscribed"
+        );
+        manager
+            .publish(topic.to_string(), Bytes::from_static(b"after"))
+            .await
+            .expect("publish after both subscribed");
+        let followed = recv_note(&mut second).await;
+        assert_eq!(followed.message.payload.as_ref(), b"after");
+        assert!(followed.transport_msg_id.is_none());
+        let first_before = recv_note(&mut first).await;
+        assert_eq!(first_before.message.payload.as_ref(), b"before");
+        let first_after = recv_note(&mut first).await;
+        assert_eq!(first_after.message.payload.as_ref(), b"after");
     }
 
     #[tokio::test]
