@@ -1303,6 +1303,30 @@ async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<&'static s
     Ok(wa_state(&s.j2, &s.group_key).await)
 }
 
+/// A new daemon on the joiner's data directory, with the same agent key.
+/// In-memory join state from `live` is not copied.
+async fn reopen_joiner(live: &Arc<AppState>) -> Result<Arc<AppState>> {
+    let jdir = live
+        .named_groups_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("joiner data dir"))?
+        .to_path_buf();
+    let (public, secret) = live.agent.identity().agent_keypair().to_bytes();
+    let kp = x0x::identity::AgentKeypair::from_bytes(&public, &secret)?;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(jdir.join("machine.key"))
+            .with_agent_key(kp)
+            .with_agent_cert_path(jdir.join("agent.cert"))
+            .with_user_key(x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(jdir.join("contacts.json"))
+            .build()
+            .await?,
+    );
+    secure_endpoint_test_state_at(&jdir, agent).await
+}
+
 fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
     assert!(
         r.new_attempt && r.final_state == "active" && r.treekem,
@@ -1383,6 +1407,63 @@ async fn d39_a_not_member_owner_removes_undelivered_then_fresh_invite_recovers_k
 {
     let (ctx, r) = d39_not_member_remove_reinvite(false).await?;
     wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+/// WHY (#1162): persist the `not_member` row, open a new daemon on that
+/// directory, and recover through the fresh-invite route. The live
+/// process is not the one that answers the invite.
+#[tokio::test]
+async fn d39_a_not_member_restart_then_fresh_invite_recovers_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_stuck_not_member(&s).await?;
+    let saved = tokio::fs::read_to_string(&s.j2.named_groups_path).await?;
+    assert!(
+        saved.contains(&s.group_key) || saved.contains(&s.stable_group_id),
+        "the not_member row was not written to {}",
+        s.j2.named_groups_path.display()
+    );
+    let reopened = reopen_joiner(&s.j2).await?;
+    assert!(
+        !Arc::ptr_eq(&reopened, &s.j2),
+        "recovery must run on the reopened daemon"
+    );
+    assert_eq!(
+        wa_state(&reopened, &s.group_key).await,
+        "not_member",
+        "restart reloaded the persisted not_member row"
+    );
+    let after_removal = wa_owner_removes_j2(&s, false).await?;
+    assert_eq!(
+        wa_state(&reopened, &s.group_key).await,
+        "not_member",
+        "the reopened row stays not_member when the removal is not delivered (live was {after_removal})"
+    );
+    let r = wa_fresh_invite_round_trip_on(&s, &reopened).await?;
+    // `status` and `body` are the route's response, captured before the
+    // simulated authority exchange that recovers the seat.
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "the reopened daemon's fresh-invite route: {r}"
+    );
+    let rest: serde_json::Value = serde_json::from_str(&r.body)
+        .map_err(|e| anyhow::anyhow!("fresh-invite body is not the route JSON ({e}): {r}"))?;
+    assert_eq!(rest["ok"], true, "fresh-invite route: {r}");
+    assert_eq!(
+        rest["group_id"].as_str(),
+        Some(s.group_key.as_str()),
+        "fresh-invite route: {r}"
+    );
+    assert_eq!(
+        rest["join_state"], "pending_authority_commit",
+        "fresh-invite route, before recovery: {r}"
+    );
+    wa_assert_recovered(
+        &format!("restarted not_member, live_after_removal={after_removal}"),
+        &r,
+    );
     Ok(())
 }
 
