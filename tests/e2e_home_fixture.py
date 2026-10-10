@@ -358,7 +358,9 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
 
 SETUP_STEPS = ("start", "readiness probe", "identity", "join")
 # The fetch is larger than the retained tail so a cut line can be dropped
-# before retention. Stdin and command stdout stay out: those can carry a token or key.
+# before retention. The count and the tail are separate reads; a full tail is
+# treated as truncated because the log can grow between them. Stdin and command
+# stdout stay out: those can carry a token or key.
 LOG_FETCH = 8192
 LOG_RETAIN = 4096
 DAEMON_LOG_SCRIPT = rf'''set -eu
@@ -418,7 +420,12 @@ def _nonempty_text(value: bytes | str | None, *, limit: int = LOG_RETAIN, trunca
 
 
 def _captured_log_body(raw: bytes) -> tuple[bytes, bool]:
-    """Split a leading byte-count line. Truncated means the file was longer than the fetch."""
+    """Split a leading byte-count line.
+
+    Truncated means the counted file was longer than the fetched tail, or the
+    tail filled the fetch. A full tail may have grown past the earlier count,
+    so its first line can start after a secret's introducer.
+    """
     if not raw or raw.startswith(b"<empty>"):
         return raw, False
     newline = raw.find(b"\n")
@@ -428,7 +435,7 @@ def _captured_log_body(raw: bytes) -> tuple[bytes, bool]:
     if not header.isdigit():
         return raw, False
     body = raw[newline + 1:]
-    return body, int(header) > len(body)
+    return body, int(header) > len(body) or len(body) >= LOG_FETCH
 
 
 def _timeout_command(error: subprocess.TimeoutExpired) -> str:

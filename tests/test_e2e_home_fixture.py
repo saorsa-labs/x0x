@@ -1115,32 +1115,54 @@ esac
         return command
 
     def _secret_daemon_capture(self):
-        """Script output that starts mid-line, with the introducer already cut off."""
+        """Real log script output when the file grows between the byte count and the tail.
+
+        wc sees a file still inside the fetch. The append lands before tail, so the
+        retained window starts after token= and still holds split-secret-value.
+        """
         secret = b"split-secret-value"
-        filler = b"F" * 4096
-        kept = (secret + b" leftover\n"
-                b"Authorization: Bearer bearer-secret-value\n"
-                b"private_key=private-key-secret-value\n"
-                b"token=token-secret-value\n"
-                b"daemon ready\n")
-        self.assertLess(len(kept), 4096)
-        body = filler + kept + (b"Z" * (4096 - len(kept)))
-        self.assertEqual(8192, len(body))
-        self.assertTrue(body[-4096:].startswith(secret))
-        log = b"token=" + body
+        fetch = self.h.LOG_FETCH
+        initial = b"token=" + (b"A" * (fetch - 2 - len(b"token=")))
+        self.assertEqual(fetch - 2, len(initial))
+        extra = (secret + b"\n"
+                 b"Authorization: Bearer bearer-secret-value\n"
+                 b"private_key=private-key-secret-value\n"
+                 b"token=token-secret-value\n"
+                 b"daemon ready\n")
         with tempfile.TemporaryDirectory(prefix="home-secret-log-") as root:
             Path(root, "fixture.marker").write_text("marker\n")
             logs = Path(root, "logs")
             logs.mkdir()
-            (logs / "daemon.log").write_bytes(log)
+            log_path = logs / "daemon.log"
+            log_path.write_bytes(initial)
+            extra_path = Path(root, "extra")
+            extra_path.write_bytes(extra)
+            bin_dir = Path(root, "bin")
+            bin_dir.mkdir()
+            wrapper = bin_dir / "wc"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                "/usr/bin/wc \"$@\"\n"
+                "status=$?\n"
+                "cat \"$HOME_LOG_EXTRA\" >> \"$HOME_LOG_GROW\"\n"
+                "exit \"$status\"\n")
+            wrapper.chmod(0o755)
             command = self.h.Remote.command(self.h.DAEMON_LOG_SCRIPT, [root, "marker"], input_bytes=False)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["HOME_LOG_GROW"] = str(log_path)
+            env["HOME_LOG_EXTRA"] = str(extra_path)
             result = subprocess.run(command, shell=True, input=self.h.DAEMON_LOG_SCRIPT.encode(),
-                                    capture_output=True, timeout=5, check=True)
+                                    capture_output=True, timeout=5, check=True, env=env)
         captured = result.stdout
-        self.assertIn(secret, captured)
-        self.assertIn(b"bearer-secret-value", captured)
-        self.assertIn(b"daemon ready", captured)
-        self.assertNotIn(b"token=", captured.split(secret, 1)[0][-12:])
+        header, body = captured.split(b"\n", 1)
+        self.assertEqual(len(initial), int(header.strip()))
+        self.assertEqual(fetch, len(body))
+        self.assertFalse(int(header.strip()) > len(body))
+        self.assertIn(secret, body)
+        self.assertIn(b"daemon ready", body)
+        self.assertNotIn(b"token=", body.split(secret, 1)[0][-12:])
+        self.assertIn(secret, body[-4096:])
         return captured
 
     def _run_secret_timeout(self, *, fail_twice):
@@ -1184,7 +1206,10 @@ esac
             self.assertNotIn(secret, stderr, secret)
 
     def test_secret_bearing_timeout_retry_redacts_report_and_stderr(self):
-        """A setup timeout that then succeeds must not keep bearer, key, or token values."""
+        """A setup timeout that then succeeds must not keep bearer, key, or token values.
+
+        Includes a log that grows past the fetch between the byte count and the tail.
+        """
         data, raw, stderr = self._run_secret_timeout(fail_twice=False)
         self._assert_secrets_absent(raw, stderr)
         retried = [row for row in data["assertions"] if row["label"] == "home-a1 setup retried start"]
@@ -1198,7 +1223,10 @@ esac
         self.assertNotIn("fixture setup step start TimeoutExpired", raw)
 
     def test_secret_bearing_timeout_failure_redacts_report_and_stderr(self):
-        """A second setup timeout must redact the retry row, the failure row, and stderr."""
+        """A second setup timeout must redact the retry row, the failure row, and stderr.
+
+        Includes a log that grows past the fetch between the byte count and the tail.
+        """
         data, raw, stderr = self._run_secret_timeout(fail_twice=True)
         self._assert_secrets_absent(raw, stderr)
         retried = [row for row in data["assertions"] if row["label"] == "home-a1 setup retried start"]
