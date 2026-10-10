@@ -79,7 +79,9 @@ pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,
     machines_by_user_handler, pin_machine, unpin_machine,
 };
-pub(super) use messaging::{publish, subscribe, unsubscribe, RestSubscription};
+pub(super) use messaging::{
+    publish, subscribe, take_rest_subscribe_forwarders, unsubscribe, RestSubscription,
+};
 pub(super) use named_groups::{
     add_named_group_member, apply_named_group_metadata_event_inner_serialized,
     approve_join_request, ban_group_member, cancel_join_request, causal_relay_step,

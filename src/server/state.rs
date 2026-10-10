@@ -843,6 +843,12 @@ pub(super) struct AppState {
     /// window consulted by the MemberAdded enforcement arm and surfaced
     /// (derived) in `/diagnostics/groups` capability phases.
     pub(super) groups_config: DaemonGroupsConfig,
+    /// Live REST `/subscribe` forwarders, keyed by subscription id.
+    ///
+    /// #1288 row 2: the shutdown drain takes this map after cancelling
+    /// `shutdown_started`. `subscribe` checks that token under this lock
+    /// and does not admit a forwarder the drain will not join. A topic in
+    /// `[history] record_topics` makes the forwarder hold `history.db`.
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
