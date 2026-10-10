@@ -309,10 +309,14 @@ impl HistoryHandle {
         true
     }
 
-    /// Read access to the store. Synchronous — call from `spawn_blocking`
-    /// on async paths.
+    /// The raw store, for this crate only (issue #1317). It bypasses the
+    /// recording policy (ADR 0116 §2) and the retention admission, so it
+    /// is not public: embedders read through [`Self::query`] and the other
+    /// read methods, and delete through [`Self::purge`] and
+    /// [`Self::retain`]. Synchronous — call from `spawn_blocking` on async
+    /// paths.
     #[must_use]
-    pub fn store(&self) -> &Arc<Store> {
+    pub(crate) fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
@@ -422,22 +426,17 @@ impl HistoryHandle {
         let started = std::time::Instant::now();
         let store = Arc::clone(&self.store);
         let scope = scope.clone();
-        let joined = tokio::task::spawn_blocking(move || store.purge(&scope)).await;
-        let failed = |error| RetainError::Failed {
-            error,
-            committed: RetainReport::new(
-                RetainState::MoreWork,
-                RetainDeleted::default(),
-                started.elapsed(),
-                None,
-            ),
-        };
-        match joined {
-            Ok(Ok(removed)) => Ok(removed),
-            Ok(Err(error)) => Err(failed(error)),
-            Err(join) => Err(failed(HistoryError::Database(format!(
-                "history purge task did not finish: {join}"
-            )))),
+        match tokio::task::spawn_blocking(move || store.purge_admitted(&scope)).await {
+            Ok(outcome) => outcome,
+            Err(join) => Err(RetainError::Failed {
+                error: HistoryError::Database(format!("history purge task did not finish: {join}")),
+                committed: RetainReport::new(
+                    RetainState::MoreWork,
+                    RetainDeleted::default(),
+                    started.elapsed(),
+                    None,
+                ),
+            }),
         }
     }
 

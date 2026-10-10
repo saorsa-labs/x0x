@@ -1107,6 +1107,11 @@ pub(in crate::server) struct HistoryPurgeParams {
 /// purge closes so nobody — operator or attacker — can delete the evidence
 /// mid-incident. The check runs BEFORE any deletion, so a refused purge
 /// leaves the store untouched.
+///
+/// Issue #1317: the purge takes the retention admission
+/// ([`x0x::history::HistoryHandle::purge`]). While a reaper pass or a trim
+/// holds the store it answers 409 `history_retention_busy` at once and
+/// deletes nothing; it is not queued.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -1149,14 +1154,23 @@ pub(in crate::server) async fn history_purge(
             return refusal;
         }
     }
-    let store = Arc::clone(history.store());
-    match tokio::task::spawn_blocking(move || store.purge(&scope)).await {
-        Ok(Ok(removed)) => (
+    match history.purge(&scope).await {
+        Ok(removed) => (
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "removed": removed })),
         ),
-        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("purge: {e}")),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
+        Err(x0x::history::RetainError::Busy) => api_error_with_reason(
+            StatusCode::CONFLICT,
+            "another history retention operation is running; try again later",
+            "history_retention_busy",
+        ),
+        Err(x0x::history::RetainError::Failed { error, .. }) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("purge: {error}"))
+        }
+        Err(x0x::history::RetainError::InvalidOptions(message)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("purge: {message}"),
+        ),
     }
 }
 

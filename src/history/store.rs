@@ -352,6 +352,18 @@ impl SkippedTopicRulesWarning {
 }
 
 /// Synchronous SQLite-backed history store.
+///
+/// The low-level offline API (issue #1317): a tool that owns a history
+/// file opens it here and uses it directly. It does not apply the
+/// recording policy (ADR 0116 §2). Only its retention passes
+/// ([`Self::retain_with_rules`] and the others) take the retention
+/// admission; [`Self::purge`] and the writes do not. A running agent or
+/// daemon does not hand out its `Store`: use [`super::HistoryHandle`]
+/// there, whose write methods apply the policy and whose
+/// [`super::HistoryHandle::purge`] and [`super::HistoryHandle::retain`]
+/// take the admission. A running history service holds its database
+/// exclusively, so an offline open of that file fails until the service
+/// stops.
 pub struct Store {
     /// Dropped first: in test builds it runs an optional hook while the
     /// connection is still open; zero-sized and inert otherwise
@@ -1940,6 +1952,37 @@ impl Store {
         cleanup_canonical_ids(&guard)?;
         guard.execute_batch("PRAGMA incremental_vacuum;")?;
         Ok(n as u64)
+    }
+
+    /// Issue #1317: [`Self::purge`] under the retention admission that
+    /// [`Self::trim`] and the reaper share. It does not wait: while a pass
+    /// or a trim holds the admission it returns [`RetainError::Busy`] and
+    /// deletes nothing. The path behind [`super::HistoryHandle::purge`].
+    ///
+    /// # Errors
+    /// [`RetainError::Busy`], or [`RetainError::Failed`] on an SQLite
+    /// failure (the delete is one statement, so nothing is committed then).
+    pub(crate) fn purge_admitted(&self, scope: &Scope) -> Result<u64, RetainError> {
+        let started = std::time::Instant::now();
+        let failed = |error| RetainError::Failed {
+            error,
+            committed: RetainReport::new(
+                RetainState::MoreWork,
+                RetainDeleted::default(),
+                started.elapsed(),
+                None,
+            ),
+        };
+        let _admission = match self.retention.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(RetainError::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(failed(HistoryError::Database(
+                    "retention mutex poisoned".into(),
+                )))
+            }
+        };
+        self.purge(scope).map_err(failed)
     }
 
     /// Write a batch inside one transaction (writer thread path).
