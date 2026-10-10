@@ -526,15 +526,39 @@ impl Store {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
-        // auto_vacuum must be decided before the first table exists; on an
-        // already-populated db this pragma is a no-op (the setting is baked
-        // into the file header).
-        conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;\n             PRAGMA locking_mode = EXCLUSIVE;\n             PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = NORMAL;",
-        )
-        .map_err(|e| {
-            HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()))
-        })?;
+        let pragma_error =
+            |e| HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()));
+        // Exclusive locking first: it does no I/O, and it makes the first
+        // read below use heap memory for a WAL index, as before (no `-shm`).
+        conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
+            .map_err(pragma_error)?;
+        // ADR 0116 Validation, "Storage and downgrade": an unknown newer
+        // schema fails closed WITHOUT changing the file. So it is refused
+        // here, before any statement that can write: `auto_vacuum` and
+        // `journal_mode` both rewrite the file header, and `migrate` creates
+        // its table. A database with no schema table yet, or one this read
+        // cannot reach (another process holds it), takes the usual path.
+        if let Some(version) = read_schema_version(&conn) {
+            if version > SCHEMA_VERSION {
+                return Err(newer_schema_error(version));
+            }
+        }
+        // auto_vacuum must be decided before the first table exists. On a
+        // database that is already INCREMENTAL the pragma is not a no-op: it
+        // rewrites page 1 (one WAL frame, folded into the file header at
+        // close). So it is issued only when the mode differs.
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap_or(-1);
+        let set_auto_vacuum = if auto_vacuum == 2 {
+            ""
+        } else {
+            "PRAGMA auto_vacuum = INCREMENTAL;\n"
+        };
+        conn.execute_batch(&format!(
+            "{set_auto_vacuum}PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;"
+        ))
+        .map_err(pragma_error)?;
         // Acquire the exclusive lock NOW so a second process fails at open,
         // not at first write.
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
@@ -3788,10 +3812,27 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
                 "no migration path from schema v{v}"
             )))
         }
-        Some(v) => Err(HistoryError::Database(format!(
-            "history.db schema v{v} is newer than this binary (v{SCHEMA_VERSION})"
-        ))),
+        Some(v) => Err(newer_schema_error(v)),
     }
+}
+
+/// The refusal for a database written by a newer binary.
+fn newer_schema_error(version: i64) -> HistoryError {
+    HistoryError::Database(format!(
+        "history.db schema v{version} is newer than this binary (v{SCHEMA_VERSION})"
+    ))
+}
+
+/// The stored schema version, if a plain read can see one. `None` when the
+/// database has no `schema_version` table (or row) yet, or when the read
+/// cannot reach it (for instance another process holds the database):
+/// [`Store::open_with_busy_timeout`] then takes its usual path, which creates
+/// or migrates, or reports the lock.
+fn read_schema_version(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .ok()
 }
 
 /// Schema v2 adds no columns: it backfills the existing FTS projection for
