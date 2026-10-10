@@ -492,15 +492,18 @@ fn all_files(dir: &Path) -> Vec<(String, u64, String)> {
 /// before that writer closes (so before any checkpoint). The copy's main
 /// file still says schema 4; only its WAL says 5.
 fn crash_copy_with_a_live_wal(dir: &Path) -> PathBuf {
+    crash_copy_with_a_live_wal_after(dir, "UPDATE schema_version SET version = 5")
+}
+
+/// [`crash_copy_with_a_live_wal`], committing `statement` instead.
+fn crash_copy_with_a_live_wal_after(dir: &Path, statement: &str) -> PathBuf {
     let work = tempfile::tempdir().unwrap();
     let live = copy_fixture(work.path());
     let writer = rusqlite::Connection::open(&live).unwrap();
     writer
         .execute_batch("PRAGMA wal_autocheckpoint = 0;")
         .unwrap();
-    writer
-        .execute("UPDATE schema_version SET version = 5", [])
-        .unwrap();
+    writer.execute(statement, []).unwrap();
     for name in ["history.db", "history.db-wal", "history.db-shm"] {
         let source = work.path().join(name);
         assert!(source.exists(), "the live writer has {name}");
@@ -594,21 +597,24 @@ fn a_busy_newer_schema_is_not_changed_while_the_lock_clears() {
     assert!(error.contains(&path.display().to_string()), "{error}");
 }
 
-/// A crash copy of a schema-5 rollback-journal database with a HOT journal:
-/// a writer spills uncommitted pages to the main file (its cache holds one
-/// page), and the main file and its `-journal` are copied before the writer
-/// rolls back. Opening it read/write would roll the journal back, a write.
-fn crash_copy_with_a_hot_journal(dir: &Path) -> PathBuf {
+/// A crash copy with a HOT rollback journal. `prepare` makes the live
+/// database (a rollback-journal file); a writer with a one-page cache then
+/// runs `spill` in a transaction, so uncommitted pages reach the main file
+/// after the journal is synced, and the main file and its `-journal` are
+/// copied before that writer rolls back. A read/write open of the copy must
+/// roll the journal back first: SQLite recovery.
+fn crash_copy_with_a_hot_journal(
+    dir: &Path,
+    prepare: impl FnOnce(&Path) -> PathBuf,
+    spill: &str,
+) -> PathBuf {
     let work = tempfile::tempdir().unwrap();
-    let live = copy_fixture(work.path());
-    as_schema_5(&live, true);
+    let live = prepare(work.path());
     let writer = rusqlite::Connection::open(&live).unwrap();
     writer
-        .execute_batch(
-            "PRAGMA cache_size = 1; PRAGMA cache_spill = ON; BEGIN; \
-             UPDATE history SET payload = randomblob(3000);",
-        )
+        .execute_batch("PRAGMA cache_size = 1; PRAGMA cache_spill = ON; BEGIN;")
         .unwrap();
+    writer.execute_batch(spill).unwrap();
     for name in ["history.db", "history.db-journal"] {
         let source = work.path().join(name);
         assert!(source.exists(), "the live writer has {name}");
@@ -616,24 +622,163 @@ fn crash_copy_with_a_hot_journal(dir: &Path) -> PathBuf {
     }
     writer.execute_batch("ROLLBACK;").unwrap();
     drop(writer);
+    let journal = std::fs::metadata(dir.join("history.db-journal"))
+        .unwrap()
+        .len();
+    assert!(journal > 0, "the crash copy's journal is not empty");
     dir.join("history.db")
 }
 
-/// Round 2: the refusal path includes recovery. A hot rollback journal
-/// beside a newer database is not rolled back: the open is refused and the
-/// main file and its journal stay byte-identical.
-#[test]
-fn a_hot_rollback_journal_is_not_recovered_before_the_version_is_known() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = crash_copy_with_a_hot_journal(dir.path());
-    let before = all_files(dir.path());
-    assert_eq!(before.len(), 2, "{before:?}");
+/// A copy of the fixture in rollback-journal mode, at `version`.
+fn fixture_in_rollback_mode(dir: &Path, version: i64) -> PathBuf {
+    let path = copy_fixture(dir);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE schema_version SET version = ?1", [version])
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    path
+}
 
-    let error = Store::open(&path).expect_err("must not open").to_string();
+/// Uncommitted payload updates large enough to spill the one-page cache.
+const SPILL_PAYLOADS: &str = "UPDATE history SET payload = randomblob(3000);";
+
+/// Round 3, positive control 1 (controller decision C-0116-F1): an
+/// interrupted first initialization recovers and opens. The snapshot is a
+/// new database's first rollback transaction caught after its journal sync
+/// with pages already in the main file, the state an interrupted pre-WAL
+/// setup leaves. Store::open lets SQLite roll it back (to an empty file)
+/// and then initializes a fresh schema-4 store.
+#[test]
+fn an_interrupted_first_initialization_recovers_and_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crash_copy_with_a_hot_journal(
+        dir.path(),
+        |work| work.join("history.db"),
+        "CREATE TABLE schema_version (version INTEGER NOT NULL); \
+         INSERT INTO schema_version (version) VALUES (4); \
+         CREATE TABLE filler (x BLOB); \
+         INSERT INTO filler (x) WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL \
+           SELECT i + 1 FROM c WHERE i < 40) SELECT randomblob(3000) FROM c;",
+    );
+    {
+        let store = Store::open(&path).expect("an interrupted initialization recovers and opens");
+        assert_eq!(store.stats().unwrap().rows, 0);
+    }
+    assert!(!dir.path().join("history.db-journal").exists(), "recovered");
+    let facts = read_facts(&path);
+    assert_eq!(facts.schema_version, 4);
+    assert_eq!(facts.master, fixture_master(), "a fresh schema-4 store");
+}
+
+/// Round 3, positive control 2: a hot schema-4 database in rollback-journal
+/// mode recovers, keeps all 15 released rows and passes SQLite's
+/// integrity_check, then opens.
+#[test]
+fn a_hot_schema_4_rollback_journal_recovers_and_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crash_copy_with_a_hot_journal(
+        dir.path(),
+        |work| fixture_in_rollback_mode(work, 4),
+        SPILL_PAYLOADS,
+    );
+    {
+        let store = Store::open(&path).expect("a hot schema-4 journal recovers and opens");
+        let stats = store.stats().unwrap();
+        assert_eq!(
+            (stats.rows, stats.durable_rows, stats.replaceable_rows),
+            (15, 13, 2)
+        );
+        let fox = store.search("fox", &HistoryQuery::default()).unwrap();
+        assert_eq!(fox.len(), 1, "the original payloads are back");
+    }
+    assert!(!dir.path().join("history.db-journal").exists(), "recovered");
+    let integrity: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let facts = assert_consistent(&path, "after recovering a hot schema-4 journal");
+    assert_fixture_rows(&facts);
+}
+
+/// Round 3, the documented limit (C-0116-F1): a hot rollback journal is
+/// recovered first, as SQLite requires, and only then is the schema read.
+/// A newer schema behind a hot journal is therefore refused AFTER recovery:
+/// the journal is rolled back and gone, and the main file is the settled
+/// schema-5 database the crashed transaction started from. (x0x keeps
+/// history in WAL mode from first initialization, so a newer history.db can
+/// carry a hot journal only during its own pre-WAL initialization, before
+/// any version is committed.)
+#[test]
+fn a_hot_journal_on_a_newer_schema_is_recovered_first_then_refused() {
+    let pre_image = tempfile::tempdir().unwrap();
+    let settled = fixture_in_rollback_mode(pre_image.path(), 5);
+    let settled_sha = sha256_file(&settled);
+    let dir = tempfile::tempdir().unwrap();
+    let path = crash_copy_with_a_hot_journal(
+        dir.path(),
+        |work| fixture_in_rollback_mode(work, 5),
+        SPILL_PAYLOADS,
+    );
+    assert_ne!(
+        sha256_file(&path),
+        settled_sha,
+        "the crash copy holds spilled pages"
+    );
+
+    let error = Store::open(&path)
+        .expect_err("schema 5 must not open")
+        .to_string();
+    assert!(error.contains("newer than this binary"), "{error}");
+    assert!(
+        !dir.path().join("history.db-journal").exists(),
+        "recovered first"
+    );
+    let after = all_files(dir.path());
+    assert_eq!(after.len(), 1, "{after:?}");
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((version, integrity.as_str(), rows), (5, "ok", 15));
+    drop(conn);
+    assert_eq!(
+        sha256_file(&path),
+        settled_sha,
+        "recovery restored the settled schema-5 file exactly"
+    );
+}
+
+/// Codex F r2 P2-2: a version that does not decode is refused through the
+/// schema-read error arm, and that arm must not checkpoint a WAL this open
+/// did not write either. The crash copy's WAL holds `version = 'next'`.
+#[test]
+fn an_undecodable_version_leaves_a_crash_wal_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path =
+        crash_copy_with_a_live_wal_after(dir.path(), "UPDATE schema_version SET version = 'next'");
+    let before = all_files(dir.path());
+    assert_eq!(before.len(), 3, "{before:?}");
+    let error = Store::open(&path)
+        .expect_err("an unknown version must not open")
+        .to_string();
     assert_eq!(
         all_files(dir.path()),
         before,
-        "main and -journal untouched ({error})"
+        "main, -wal and -shm untouched ({error})"
     );
-    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("schema check"), "{error}");
 }
