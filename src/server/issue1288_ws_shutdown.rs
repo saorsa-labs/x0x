@@ -658,7 +658,7 @@ async fn issue1288_ws_backfill_inside_lock_bounds_writer_shutdown() -> Result<()
         || counters
             .written_total
             .load(std::sync::atomic::Ordering::Relaxed)
-            < written + 1
+            <= written
     {
         anyhow::ensure!(
             tokio::time::Instant::now() < cleanup,

@@ -509,7 +509,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            counters.written_total.load(Ordering::Relaxed) >= written + 1,
+            counters.written_total.load(Ordering::Relaxed) > written,
             "the admitted write must commit after the lock is released"
         );
         let _ = query.join();
