@@ -1366,9 +1366,7 @@ impl AppState {
             .detached_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(tasks) = guard.as_mut() else {
-            return None;
-        };
+        let tasks = guard.as_mut()?;
         // Reap finished tasks so the registry holds only live ones.
         tasks.retain(|task| !task.is_finished());
         let handle = tokio::spawn(task);
