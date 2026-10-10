@@ -573,7 +573,8 @@ impl Store {
         // the lifetime exclusive lock once open.)
         conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
             .map_err(pragma_error)?;
-        // Then the version, before any statement that can write:
+        // Then the version, before setup writes, apart from hot-journal
+        // recovery (below):
         // `auto_vacuum` and `journal_mode` rewrite the file header, and
         // `migrate` creates its table. Only a missing `schema_version` table
         // or row means "no schema yet". Any other failure (busy, I/O, a value

@@ -105,9 +105,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **A newer history database is refused without being changed (ADR 0116
-  slice F).** History refused a `history.db` written by a newer schema, but
-  the refusal could still change files:
+- **A newer history database in WAL mode, or settled, is refused without
+  being changed (ADR 0116 slice F).** History refused a `history.db`
+  written by a newer schema, but the refusal could still change files:
   - its setup pragmas ran first: `PRAGMA auto_vacuum = INCREMENTAL` rewrote
     the file header even on an already-incremental database, and a
     rollback-journal file was converted to WAL;
@@ -116,13 +116,13 @@ All notable changes to this project will be documented in this file.
   - a version read that failed (busy, I/O) counted as "no schema", so setup
     could write once a lock cleared.
 
-  History now notes whether a WAL exists, and reads the stored version
-  before any statement that can write. Any read failure other than "no
-  schema yet" stops the open. Until the version is known to be compatible,
+  History now notes whether a WAL exists, and reads the stored version before
+  setup writes, apart from hot-journal recovery. Any read failure other than
+  "no schema yet" stops the open. Until the version is known to be compatible,
   the connection does not checkpoint a WAL it did not create, on any refusal
-  path. A refused newer or unreadable schema changes no file when the
-  database is in WAL mode (with or without an uncheckpointed WAL) or is a
-  settled rollback-journal database: the main file, `-wal` and `-shm` stay
+  path. A refused newer or unreadable schema changes no file when the database
+  is in WAL mode (with or without an uncheckpointed WAL) or is a settled
+  rollback-journal database: the main file, `-wal` and `-shm` stay
   byte-identical.
 
   **Limit:** a hot rollback journal is recovered first, as SQLite requires

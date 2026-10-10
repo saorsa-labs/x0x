@@ -4,7 +4,11 @@
 //! `tests/fixtures/v0466_history_db/PROVENANCE.md`), opens under this
 //! version, takes the ADR 0116 trim, and keeps schema 4 and consistent
 //! derived indexes. A newer schema fails closed and leaves the file's bytes
-//! unchanged.
+//! unchanged in the database states the scoped contract on
+//! [`Store::open_with_busy_timeout`] covers (`src/history/store.rs`): a
+//! WAL-mode database, or a settled rollback-journal one. A hot rollback
+//! journal is recovered first, as SQLite requires (controller decision
+//! C-0116-F1).
 //!
 //! Inert: no network and no daemon. Every test works on a copy in a temp
 //! dir; the committed fixture is never opened (opening a WAL database can
