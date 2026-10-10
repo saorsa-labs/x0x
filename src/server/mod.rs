@@ -30,6 +30,8 @@ mod w3h;
 mod ws;
 
 #[cfg(test)]
+mod issue1288_ws_shutdown;
+#[cfg(test)]
 mod shutdown_regression;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
@@ -2834,6 +2836,7 @@ pub async fn serve_with_options(
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
         drain_server_tasks(&state, bg_tasks).await;
+        let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
         //    reaper / DM-inbox / advert / presence, drain the Agent's own
@@ -2841,7 +2844,20 @@ pub async fn serve_with_options(
         //    typed QUIC shutdown path. A successful result proves ant-quic
         //    released its socket; a failure is returned only after the rest of
         //    this supervisor cleanup completes.
+        // #1288: a backfill still inside `Store::query` holds the connection
+        // mutex. This await drains the history writer. The writer's join is
+        // the drain grace, not an open-ended thread join: a write waiting on
+        // that mutex stays on the writer thread, and the await returns.
         let agent_shutdown_result = state.agent.try_shutdown().await;
+        // A writer blocked in SQLite past the drain grace is not a finished
+        // shutdown, even when no WebSocket backfill is outstanding. The
+        // thread stays in custody and still holds `history.db`. Read the
+        // flag before dropping `state`: the agent's history handle shares it
+        // with the writer that just timed out.
+        let writer_shutdown_incomplete = state
+            .agent
+            .history()
+            .is_some_and(|history| history.writer_shutdown_incomplete());
 
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).
@@ -2863,6 +2879,30 @@ pub async fn serve_with_options(
         // behaviour rather than anything worse.
         std::mem::drop(state);
         tracing::info!("Shutdown complete");
+        let server_result = if writer_shutdown_incomplete {
+            let writer = anyhow::anyhow!(
+                "history writer still owns the store after the shutdown grace; the write was left running"
+            );
+            Err(match server_result {
+                Ok(()) => writer,
+                Err(server) => server.context(format!("history writer also remained: {writer}")),
+            })
+        } else {
+            server_result
+        };
+        let server_result = if backfill_release_incomplete {
+            let backfill = anyhow::anyhow!(
+                "websocket history backfill still owns the store after the shutdown grace; the read was left running"
+            );
+            Err(match server_result {
+                Ok(()) => backfill,
+                Err(server) => server.context(format!(
+                    "websocket history backfill also remained: {backfill}"
+                )),
+            })
+        } else {
+            server_result
+        };
         combine_server_shutdown_results(server_result, agent_shutdown_result)
     });
 
@@ -2929,7 +2969,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // and Welcome fetch handlers, delayed publishes; since #1274 also the
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
-    // delta direct deliveries and the outgoing file-chunk streams) and the
+    // delta direct deliveries, the outgoing file-chunk streams, and since
+    // #1288 the WebSocket session loop and its writer and forwarders) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and
     // its exclusive `history.db` connection, alive after the supervisor
@@ -2998,6 +3039,16 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
             }
             let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
         }
+    }
+    // #1288: history backfills outlive the session that started them. The
+    // session join above drops its wait; the blocking query still owns the
+    // store. `Store::query` cannot be cancelled here. The wait is a fresh
+    // `SERVER_TASK_GRACE`, not the session grace that may already have
+    // elapsed. A read still running stays registered (its task holds
+    // `WsOutboundStats`). The supervisor then reports that the owner was
+    // not released. This wait does not drop that handle.
+    if !ws::await_ws_backfill_reads(state, SERVER_TASK_GRACE).await {
+        ws::note_backfill_release_incomplete(&state.ws_outbound_stats);
     }
     // #1274: the ADR 0107 join-artifact egress tasks (join-result and
     // control-blob sends, secure shares) hold this AppState up to their

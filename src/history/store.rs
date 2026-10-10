@@ -501,6 +501,114 @@ macro_rules! trim_gate {
     };
 }
 
+#[cfg(test)]
+mod query_lock_park {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::Store;
+
+    std::thread_local! {
+        static PARK_THIS_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A test hold for one store. The query parks only after `lock_conn`.
+    pub struct QueryLockHold {
+        released: AtomicBool,
+        parked: AtomicUsize,
+        writer_entered: AtomicUsize,
+    }
+
+    impl QueryLockHold {
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+
+        pub fn is_released(&self) -> bool {
+            self.released.load(Ordering::SeqCst)
+        }
+
+        pub fn parked(&self) -> usize {
+            self.parked.load(Ordering::SeqCst)
+        }
+
+        pub fn writer_entered(&self) -> usize {
+            self.writer_entered.load(Ordering::SeqCst)
+        }
+    }
+
+    fn holds() -> &'static std::sync::Mutex<Vec<(usize, Arc<QueryLockHold>)>> {
+        static HOLDS: std::sync::Mutex<Vec<(usize, Arc<QueryLockHold>)>> =
+            std::sync::Mutex::new(Vec::new());
+        &HOLDS
+    }
+
+    fn key(store: &Store) -> usize {
+        store as *const Store as usize
+    }
+
+    /// The next `Store::query` on this thread parks while it holds the
+    /// connection mutex, when [`arm`] armed that store.
+    pub fn prepare_this_thread() {
+        PARK_THIS_QUERY.with(|flag| flag.set(true));
+    }
+
+    /// Arm `store` so a prepared query parks inside the connection lock.
+    /// A writer `insert` on that store counts as waiting once it reaches
+    /// the lock.
+    pub fn arm(store: &Arc<Store>) -> Arc<QueryLockHold> {
+        let hold = Arc::new(QueryLockHold {
+            released: AtomicBool::new(false),
+            parked: AtomicUsize::new(0),
+            writer_entered: AtomicUsize::new(0),
+        });
+        let key = Arc::as_ptr(store) as usize;
+        let mut guard = holds()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|(existing, _)| *existing != key);
+        guard.push((key, Arc::clone(&hold)));
+        hold
+    }
+
+    pub(super) fn park_if_prepared(store: &Store) {
+        let prepared = PARK_THIS_QUERY.with(|flag| flag.replace(false));
+        if !prepared {
+            return;
+        }
+        let hold = {
+            let guard = holds()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .iter()
+                .find(|(existing, _)| *existing == key(store))
+                .map(|(_, hold)| Arc::clone(hold))
+        };
+        let Some(hold) = hold else {
+            return;
+        };
+        hold.parked.fetch_add(1, Ordering::SeqCst);
+        while !hold.released.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    pub(super) fn note_insert_lock(store: &Store) {
+        let guard = holds()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, hold)) = guard.iter().find(|(existing, _)| *existing == key(store)) {
+            hold.writer_entered.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+pub use query_lock_park::{
+    arm as arm_query_lock_park, prepare_this_thread as prepare_query_lock_park, QueryLockHold,
+};
+
 impl Store {
     /// Open (creating if absent) the history database at `path`.
     pub fn open(path: &Path) -> HistoryResult<Self> {
@@ -672,6 +780,8 @@ impl Store {
     /// Insert a record. Dedupe on `msg_id`; replaceable slots supersede.
     pub fn insert(&self, record: &HistoryRecord) -> HistoryResult<InsertOutcome> {
         record.validate()?;
+        #[cfg(test)]
+        query_lock_park::note_insert_lock(self);
         let mut guard = lock_conn(&self.conn)?;
         let tx = guard
             .transaction()
@@ -756,6 +866,8 @@ impl Store {
         params.push(rusqlite::types::Value::from(limit as i64));
 
         let guard = lock_conn(&self.conn)?;
+        #[cfg(test)]
+        query_lock_park::park_if_prepared(self);
         collect_rows(&guard, &sql, params)
     }
 
