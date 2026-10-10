@@ -48,6 +48,28 @@ pub(super) struct WsOutboundStats {
     /// DM/keepalive feeder hit a full outbound queue — the session reader is
     /// stalled. Counted once per session.
     ws_slow_consumer_closes: AtomicU64,
+    /// #1288: direct and topic history backfills. The `JoinHandle` lives here,
+    /// not only in the session future, because aborting the session drops
+    /// that future while `spawn_blocking` can still hold `history.db`.
+    /// Shutdown takes the list and awaits every read before it reports
+    /// owner release. `open` refuses a new read once the drain has taken it.
+    backfill_reads: std::sync::Mutex<WsBackfillReads>,
+}
+
+/// In-flight WebSocket history backfills. See [`WsOutboundStats::backfill_reads`].
+#[derive(Debug)]
+struct WsBackfillReads {
+    open: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for WsBackfillReads {
+    fn default() -> Self {
+        Self {
+            open: true,
+            tasks: Vec::new(),
+        }
+    }
 }
 
 /// State for a single WebSocket connection.
@@ -420,6 +442,46 @@ pub(super) const WS_SLOW_CLOSE_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 /// to prevent).
 const WS_SLOW_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
+/// How long the registered upgrade task waits for axum to hand over the
+/// socket. The task already owns `AppState`; the bound is what drops that
+/// owner if the upgrade never completes. Shutdown aborts the wait sooner.
+const WS_UPGRADE_HANDOFF: Duration = Duration::from_secs(30);
+
+/// Register the session owner, then let axum's untracked upgrade callback
+/// deliver only the socket.
+///
+/// `WebSocketUpgrade::on_upgrade` spawns a task that is not on the drain
+/// and awaits the hyper upgrade before the callback runs. That callback
+/// must not own `AppState`: a shutdown that lands in the wait would return
+/// with the owner still alive. The detached task registered here owns the
+/// state and waits, bounded, for the socket.
+fn detach_ws_session(
+    state: Arc<AppState>,
+    direct_mode: bool,
+    direct_backfill: Option<usize>,
+    durable_owner: bool,
+) -> tokio::sync::oneshot::Sender<axum::extract::ws::WebSocket> {
+    let (socket_tx, socket_rx) = tokio::sync::oneshot::channel();
+    let session_state = Arc::clone(&state);
+    let _ = state.spawn_detached(async move {
+        #[cfg(test)]
+        super::issue1288_ws_shutdown::park_before_registration_if_armed(&session_state).await;
+        let socket = match tokio::time::timeout(WS_UPGRADE_HANDOFF, socket_rx).await {
+            Ok(Ok(socket)) => socket,
+            _ => return,
+        };
+        handle_ws_connection(
+            socket,
+            session_state,
+            direct_mode,
+            direct_backfill,
+            durable_owner,
+        )
+        .await;
+    });
+    socket_tx
+}
+
 /// GET /ws — upgrade to WebSocket (general purpose).
 pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
@@ -428,21 +490,9 @@ pub(super) async fn ws_handler(
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let durable = actor.is_durable_owner();
-    ws.on_upgrade(move |socket| {
-        let state = state;
-        async move {
-            // #1288 row 4: axum detaches this callback. The session has to be
-            // on the shutdown drain, or a client that is still connected
-            // keeps AppState after `shutdown_and_wait` returns.
-            let _admitted = state.spawn_detached(handle_ws_connection(
-                socket,
-                Arc::clone(&state),
-                false,
-                None,
-                durable,
-            ));
-        }
+    let socket_tx = detach_ws_session(state, false, None, actor.is_durable_owner());
+    ws.on_upgrade(move |socket| async move {
+        let _ = socket_tx.send(socket);
     })
 }
 
@@ -463,20 +513,9 @@ pub(super) async fn ws_direct_handler(
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let durable = actor.is_durable_owner();
-    let backfill = params.backfill;
-    ws.on_upgrade(move |socket| {
-        let state = state;
-        async move {
-            // #1288 row 4: same drain registration as `ws_handler`.
-            let _admitted = state.spawn_detached(handle_ws_connection(
-                socket,
-                Arc::clone(&state),
-                true,
-                backfill,
-                durable,
-            ));
-        }
+    let socket_tx = detach_ws_session(state, true, params.backfill, actor.is_durable_owner());
+    ws.on_upgrade(move |socket| async move {
+        let _ = socket_tx.send(socket);
     })
 }
 
@@ -674,6 +713,64 @@ fn spawn_ws_task(
     state.spawn_detached_with_abort(task)
 }
 
+/// Run `job` on the blocking pool and keep its `JoinHandle` until the read
+/// finishes, including when the calling session is aborted.
+///
+/// `None` when shutdown has already closed backfill admission: the read is
+/// not started. The session await is abortable; the registered task is not
+/// dropped by that abort, and [`await_ws_backfill_reads`] joins it.
+async fn ws_history_query<T, F>(
+    state: &AppState,
+    job: F,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut guard = state
+            .ws_outbound_stats
+            .backfill_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.open || state.shutdown_started.is_cancelled() {
+            return None;
+        }
+        guard.tasks.push(tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(job).await;
+            let _ = tx.send(result);
+        }));
+    }
+    rx.await.ok()
+}
+
+/// #1288: join every history backfill the sessions started. Call this only
+/// after those sessions have been aborted and joined, so no new read can
+/// still be registering. The await has no abandon bound: a running
+/// `spawn_blocking` query cannot be cancelled, and shutdown must not report
+/// owner release while that query still owns the store.
+pub(super) async fn await_ws_backfill_reads(state: &AppState) {
+    let tasks = {
+        let mut guard = state
+            .ws_outbound_stats
+            .backfill_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.open = false;
+        std::mem::take(&mut guard.tasks)
+    };
+    #[cfg(test)]
+    if !tasks.is_empty() {
+        super::issue1288_ws_shutdown::mark_backfill_drain_waiting();
+    }
+    for task in tasks {
+        if let Err(error) = task.await {
+            tracing::warn!("WS history backfill did not finish cleanly: {error}");
+        }
+    }
+}
+
 /// Stop children already admitted and drop the session row. Used when a
 /// later child cannot be admitted because shutdown closed the registry.
 async fn abandon_ws_session(
@@ -784,8 +881,14 @@ async fn handle_ws_connection(
                     limit,
                     ..Default::default()
                 };
-                match tokio::task::spawn_blocking(move || store.query(&q)).await {
-                    Ok(Ok(mut rows)) => {
+                match ws_history_query(&state, move || {
+                    #[cfg(test)]
+                    super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                    store.query(&q)
+                })
+                .await
+                {
+                    Some(Ok(Ok(mut rows))) => {
                         rows.reverse(); // newest-first → oldest-first replay
                         let mut hashes = std::collections::HashSet::new();
                         for row in &rows {
@@ -811,11 +914,14 @@ async fn handle_ws_connection(
                         }
                         dm_backfill_hashes = Some(hashes);
                     }
-                    Ok(Err(e)) => {
+                    Some(Ok(Err(e))) => {
                         tracing::warn!(session_id = %session_id, "direct WS backfill query failed: {e}");
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         tracing::warn!(session_id = %session_id, "direct WS backfill join failed: {e}");
+                    }
+                    None => {
+                        tracing::debug!(session_id = %session_id, "direct WS backfill skipped during shutdown");
                     }
                 }
             }
@@ -1213,8 +1319,14 @@ async fn handle_ws_command(
                             limit: spec.limit,
                             ..Default::default()
                         };
-                        match tokio::task::spawn_blocking(move || store.query(&q)).await {
-                            Ok(Ok(mut rows)) => {
+                        match ws_history_query(state, move || {
+                            #[cfg(test)]
+                            super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                            store.query(&q)
+                        })
+                        .await
+                        {
+                            Some(Ok(Ok(mut rows))) => {
                                 // query returns newest-first; emit oldest-first.
                                 rows.reverse();
                                 let mut hashes = std::collections::HashSet::new();
@@ -1243,11 +1355,14 @@ async fn handle_ws_command(
                                 }
                                 backfill_hashes = Some(hashes);
                             }
-                            Ok(Err(e)) => {
+                            Some(Ok(Err(e))) => {
                                 tracing::warn!(topic = %topic, "WS backfill query failed: {e}");
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 tracing::warn!(topic = %topic, "WS backfill join failed: {e}");
+                            }
+                            None => {
+                                tracing::debug!(topic = %topic, "WS backfill skipped during shutdown");
                             }
                         }
                     }

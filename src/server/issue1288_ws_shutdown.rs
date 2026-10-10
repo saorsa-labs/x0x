@@ -12,7 +12,8 @@
 //! The daemon binds loopback only, with no bootstrap peers, mDNS, port
 //! mapping, or peer cache.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,6 +34,114 @@ pub(super) async fn park_session_if_armed() {
     if SESSION_CLEANUP_HOLD.swap(false, Ordering::SeqCst) {
         std::future::pending::<()>().await;
     }
+}
+
+/// Per-daemon upgrade handoff hold. Keyed by the `AppState` allocation so
+/// another test's socket is not parked.
+pub(super) struct UpgradeHold {
+    parked: AtomicUsize,
+}
+
+fn upgrade_holds() -> &'static std::sync::Mutex<Vec<(usize, Arc<UpgradeHold>)>> {
+    static HOLDS: std::sync::Mutex<Vec<(usize, Arc<UpgradeHold>)>> =
+        std::sync::Mutex::new(Vec::new());
+    &HOLDS
+}
+
+/// The next upgrade handoffs for this daemon park before the session starts.
+pub(super) fn arm_upgrade_park(state: &Arc<super::state::AppState>) -> Arc<UpgradeHold> {
+    let hold = Arc::new(UpgradeHold {
+        parked: AtomicUsize::new(0),
+    });
+    let key = Arc::as_ptr(state) as usize;
+    let mut guard = upgrade_holds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|(existing, _)| *existing != key);
+    guard.push((key, Arc::clone(&hold)));
+    hold
+}
+
+/// Parks a registered upgrade task for [`arm_upgrade_park`].
+pub(super) async fn park_before_registration_if_armed(state: &Arc<super::state::AppState>) {
+    let hold = {
+        let key = Arc::as_ptr(state) as usize;
+        let guard = upgrade_holds()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .iter()
+            .find(|(existing, _)| *existing == key)
+            .map(|(_, hold)| Arc::clone(hold))
+    };
+    if let Some(hold) = hold {
+        hold.parked.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Per-store backfill hold. Only the armed store's query parks, so a
+/// parallel unit test's history read is left alone.
+pub(super) struct BackfillHold {
+    released: AtomicBool,
+    parked: AtomicUsize,
+}
+
+fn backfill_holds() -> &'static std::sync::Mutex<Vec<(usize, Arc<BackfillHold>)>> {
+    static HOLDS: std::sync::Mutex<Vec<(usize, Arc<BackfillHold>)>> =
+        std::sync::Mutex::new(Vec::new());
+    &HOLDS
+}
+
+/// History backfills that clone this daemon's store park inside the blocking
+/// query, while that store is still alive.
+pub(super) fn arm_backfill_hold(state: &super::state::AppState) -> Option<Arc<BackfillHold>> {
+    let store = state.agent.history()?.store();
+    let hold = Arc::new(BackfillHold {
+        released: AtomicBool::new(false),
+        parked: AtomicUsize::new(0),
+    });
+    let key = Arc::as_ptr(store) as usize;
+    let mut guard = backfill_holds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|(existing, _)| *existing != key);
+    guard.push((key, Arc::clone(&hold)));
+    Some(hold)
+}
+
+/// Called on the blocking pool with the store the query is about to use.
+pub(super) fn park_backfill_hold(store: &Arc<crate::history::Store>) {
+    let hold = {
+        let key = Arc::as_ptr(store) as usize;
+        let guard = backfill_holds()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .iter()
+            .find(|(existing, _)| *existing == key)
+            .map(|(_, hold)| Arc::clone(hold))
+    };
+    if let Some(hold) = hold {
+        hold.parked.fetch_add(1, Ordering::SeqCst);
+        while !hold.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+static BACKFILL_DRAIN_WAITING: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn reset_backfill_drain_waiting() {
+    BACKFILL_DRAIN_WAITING.store(false, Ordering::SeqCst);
+}
+
+pub(super) fn mark_backfill_drain_waiting() {
+    BACKFILL_DRAIN_WAITING.store(true, Ordering::SeqCst);
+}
+
+fn backfill_drain_waiting() -> bool {
+    BACKFILL_DRAIN_WAITING.load(Ordering::SeqCst)
 }
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -205,6 +314,137 @@ async fn issue1288_connected_ws_session_releases_owner_at_shutdown() -> Result<(
     assert!(
         outcome.relaunch.is_ok(),
         "a same-dir relaunch must succeed (outcome: {outcome:?})"
+    );
+    Ok(())
+}
+
+async fn connect_ws(
+    addr: std::net::SocketAddr,
+    token: &str,
+    path: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let mut request = format!("ws://{addr}{path}").into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}")
+            .parse()
+            .context("authorization header")?,
+    );
+    let (socket, _) = tokio::time::timeout(WAIT, tokio_tungstenite::connect_async(request))
+        .await
+        .context("websocket upgrade timed out")?
+        .context("websocket upgrade")?;
+    Ok(socket)
+}
+
+/// Both upgrade callbacks park before the session starts. The handoff task
+/// is already on the drain, so shutdown releases its AppState and the same
+/// directory reopens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1288_ws_upgrade_parked_before_session_releases_owner() -> Result<()> {
+    let (daemon, state) = start_daemon().await?;
+    let addr = daemon.handle.local_addr();
+    let token = state.api_token.clone();
+    let hold = arm_upgrade_park(&state);
+    let plain = connect_ws(addr, &token, "/ws").await?;
+    let direct = connect_ws(addr, &token, "/ws/direct").await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.parked.load(Ordering::SeqCst) < 2 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the upgrade handoff did not park before the session (parked {})",
+            hold.parked.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(state);
+
+    let outcome = daemon.stop_and_relaunch().await?;
+    drop((plain, direct));
+
+    assert_eq!(
+        outcome.at_return,
+        (0, 0),
+        "an upgrade parked before the session must release AppState and Agent \
+         when shutdown_and_wait returns (outcome: {outcome:?})"
+    );
+    assert!(
+        outcome.relaunch.is_ok(),
+        "a same-dir relaunch must succeed (outcome: {outcome:?})"
+    );
+    Ok(())
+}
+
+/// Direct and topic backfills park on the blocking pool while they hold the
+/// history store. Shutdown must not return until those reads finish, or the
+/// same directory cannot reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1288_ws_backfill_parked_query_reopens_same_dir() -> Result<()> {
+    reset_backfill_drain_waiting();
+    let (daemon, state) = start_daemon().await?;
+    let addr = daemon.handle.local_addr();
+    let token = state.api_token.clone();
+    let hold = arm_backfill_hold(&state).context("daemon history store")?;
+
+    let direct = connect_ws(addr, &token, "/ws/direct?backfill=1").await?;
+    let mut plain = connect_ws(addr, &token, "/ws").await?;
+    let subscribe = serde_json::json!({
+        "type": "subscribe",
+        "topics": ["x0x.test.1288.backfill"],
+        "backfill": { "limit": 1 }
+    })
+    .to_string();
+    plain
+        .send(Message::Text(subscribe))
+        .await
+        .context("subscribe with backfill")?;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.parked.load(Ordering::SeqCst) < 2 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "both history backfills did not park (parked {})",
+            hold.parked.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(state);
+
+    let shutdown = tokio::spawn(async move { daemon.stop_and_relaunch().await });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if backfill_drain_waiting() {
+            break;
+        }
+        if shutdown.is_finished() {
+            let outcome = shutdown.await.context("shutdown task")??;
+            anyhow::bail!(
+                "shutdown returned while a backfill query still held the store \
+                 (outcome: {outcome:?})"
+            );
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the drain did not wait for the parked backfill queries"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    hold.released.store(true, Ordering::SeqCst);
+    let outcome = shutdown.await.context("shutdown task")??;
+    drop((direct, plain));
+
+    assert_eq!(
+        outcome.at_return,
+        (0, 0),
+        "a finished backfill must release AppState and Agent when \
+         shutdown_and_wait returns (outcome: {outcome:?})"
+    );
+    assert!(
+        outcome.relaunch.is_ok(),
+        "a same-dir relaunch must succeed after the backfill releases the store \
+         (outcome: {outcome:?})"
     );
     Ok(())
 }

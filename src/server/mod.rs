@@ -3002,6 +3002,10 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
             let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
         }
     }
+    // #1288: history backfills outlive the session that started them. The
+    // session join above drops its wait; the blocking query still owns the
+    // store until this await finishes.
+    ws::await_ws_backfill_reads(state).await;
     // #1274: the ADR 0107 join-artifact egress tasks (join-result and
     // control-blob sends, secure shares) hold this AppState up to their
     // artifact deadline: a secure share to an unavailable member retries for
