@@ -2836,6 +2836,7 @@ pub async fn serve_with_options(
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
         drain_server_tasks(&state, bg_tasks).await;
+        let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
         //    reaper / DM-inbox / advert / presence, drain the Agent's own
@@ -2865,6 +2866,19 @@ pub async fn serve_with_options(
         // behaviour rather than anything worse.
         std::mem::drop(state);
         tracing::info!("Shutdown complete");
+        let server_result = if backfill_release_incomplete {
+            let backfill = anyhow::anyhow!(
+                "websocket history backfill still owns the store after the shutdown grace; the read was left running"
+            );
+            Err(match server_result {
+                Ok(()) => backfill,
+                Err(server) => server.context(format!(
+                    "websocket history backfill also remained: {backfill}"
+                )),
+            })
+        } else {
+            server_result
+        };
         combine_server_shutdown_results(server_result, agent_shutdown_result)
     });
 
@@ -3004,8 +3018,14 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     }
     // #1288: history backfills outlive the session that started them. The
     // session join above drops its wait; the blocking query still owns the
-    // store until this await finishes.
-    ws::await_ws_backfill_reads(state).await;
+    // store. `Store::query` cannot be cancelled here. The wait is a fresh
+    // `SERVER_TASK_GRACE`, not the session grace that may already have
+    // elapsed. A read still running stays registered (its task holds
+    // `WsOutboundStats`). The supervisor then reports that the owner was
+    // not released. This wait does not drop that handle.
+    if !ws::await_ws_backfill_reads(state, SERVER_TASK_GRACE).await {
+        ws::note_backfill_release_incomplete(&state.ws_outbound_stats);
+    }
     // #1274: the ADR 0107 join-artifact egress tasks (join-result and
     // control-blob sends, secure shares) hold this AppState up to their
     // artifact deadline: a secure share to an unavailable member retries for

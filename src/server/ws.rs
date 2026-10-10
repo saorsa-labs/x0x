@@ -51,9 +51,13 @@ pub(super) struct WsOutboundStats {
     /// #1288: direct and topic history backfills. The `JoinHandle` lives here,
     /// not only in the session future, because aborting the session drops
     /// that future while `spawn_blocking` can still hold `history.db`.
-    /// Shutdown takes the list and awaits every read before it reports
-    /// owner release. `open` refuses a new read once the drain has taken it.
+    /// Each read task holds this `Arc`, so dropping `AppState` does not drop
+    /// a handle that is still running. Shutdown closes `open`, reaps finished
+    /// handles, and waits one grace period. A read still running then stays
+    /// in `tasks` and shutdown reports that the owner was not released.
     backfill_reads: std::sync::Mutex<WsBackfillReads>,
+    /// Set when the shutdown wait ended while a read was still running.
+    backfill_release_incomplete: AtomicBool,
 }
 
 /// In-flight WebSocket history backfills. See [`WsOutboundStats::backfill_reads`].
@@ -713,12 +717,85 @@ fn spawn_ws_task(
     state.spawn_detached_with_abort(task)
 }
 
+fn backfill_reads_mut(stats: &WsOutboundStats) -> std::sync::MutexGuard<'_, WsBackfillReads> {
+    stats
+        .backfill_reads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop handles whose tasks have already finished. The caller holds the
+/// registry lock. Unfinished handles stay, matching
+/// [`AppState::spawn_detached_with_abort`](super::state::AppState::spawn_detached_with_abort).
+fn reap_finished_backfill_tasks(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let pending = std::mem::take(tasks);
+    let (finished, pending): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .partition(tokio::task::JoinHandle::is_finished);
+    *tasks = pending;
+    finished
+}
+
+/// Register one history-backfill owner. Completed handles already in the
+/// registry are dropped under this lock. The spawned task holds `stats` until
+/// `task` finishes, so a later `drop(AppState)` does not detach a read that
+/// still owns the store.
+///
+/// `false` once shutdown has closed admission. `task` is not started.
+pub(super) fn track_backfill_task(
+    stats: &Arc<WsOutboundStats>,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    let mut guard = backfill_reads_mut(stats);
+    if !guard.open {
+        return false;
+    }
+    reap_finished_backfill_tasks(&mut guard.tasks);
+    let kept = Arc::clone(stats);
+    guard.tasks.push(tokio::spawn(async move {
+        let _custody = kept;
+        task.await;
+    }));
+    true
+}
+
+/// Record that the shutdown wait ended while a backfill read was still owned.
+pub(super) fn note_backfill_release_incomplete(stats: &WsOutboundStats) {
+    stats
+        .backfill_release_incomplete
+        .store(true, Ordering::SeqCst);
+}
+
+/// Whether shutdown's backfill wait ended with a read still owned.
+pub(super) fn backfill_release_incomplete(stats: &WsOutboundStats) -> bool {
+    stats.backfill_release_incomplete.load(Ordering::SeqCst)
+}
+
+/// How many registered backfill reads have not finished.
+#[cfg(test)]
+pub(super) fn unfinished_backfill_reads(stats: &WsOutboundStats) -> usize {
+    backfill_reads_mut(stats)
+        .tasks
+        .iter()
+        .filter(|task| !task.is_finished())
+        .count()
+}
+
+/// How many backfill handles the registry currently owns, finished or not.
+#[cfg(test)]
+pub(super) fn backfill_read_registry_len(stats: &WsOutboundStats) -> usize {
+    backfill_reads_mut(stats).tasks.len()
+}
+
 /// Run `job` on the blocking pool and keep its `JoinHandle` until the read
 /// finishes, including when the calling session is aborted.
 ///
 /// `None` when shutdown has already closed backfill admission: the read is
 /// not started. The session await is abortable; the registered task is not
-/// dropped by that abort, and [`await_ws_backfill_reads`] joins it.
+/// dropped by that abort. [`await_ws_backfill_reads`] waits for it up to one
+/// grace period and leaves it owned if it is still running.
 async fn ws_history_query<T, F>(
     state: &AppState,
     job: F,
@@ -727,44 +804,73 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    if state.shutdown_started.is_cancelled() {
+        return None;
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut guard = state
-            .ws_outbound_stats
-            .backfill_reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !guard.open || state.shutdown_started.is_cancelled() {
-            return None;
-        }
-        guard.tasks.push(tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(job).await;
-            let _ = tx.send(result);
-        }));
+    if !track_backfill_task(&state.ws_outbound_stats, async move {
+        let result = tokio::task::spawn_blocking(job).await;
+        let _ = tx.send(result);
+    }) {
+        return None;
     }
     rx.await.ok()
 }
 
-/// #1288: join every history backfill the sessions started. Call this only
+/// #1288: wait for history backfills the sessions started. Call this only
 /// after those sessions have been aborted and joined, so no new read can
-/// still be registering. The await has no abandon bound: a running
-/// `spawn_blocking` query cannot be cancelled, and shutdown must not report
-/// owner release while that query still owns the store.
-pub(super) async fn await_ws_backfill_reads(state: &AppState) {
-    let tasks = {
-        let mut guard = state
-            .ws_outbound_stats
-            .backfill_reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// still be registering.
+///
+/// A running `spawn_blocking` query cannot be cancelled from here. This wait
+/// stops at `bound`. Finished handles are reaped. A read still running stays
+/// in the registry, and the function returns `false` so shutdown does not
+/// report owner release. The read task holds `WsOutboundStats`, so the
+/// handle remains after `AppState` is dropped.
+pub(super) async fn await_ws_backfill_reads(state: &AppState, bound: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    let (finished, waiting) = {
+        let mut guard = backfill_reads_mut(&state.ws_outbound_stats);
         guard.open = false;
-        std::mem::take(&mut guard.tasks)
+        let finished = reap_finished_backfill_tasks(&mut guard.tasks);
+        let waiting = !guard.tasks.is_empty();
+        (finished, waiting)
     };
+    log_finished_backfill_tasks(finished).await;
     #[cfg(test)]
-    if !tasks.is_empty() {
-        super::issue1288_ws_shutdown::mark_backfill_drain_waiting();
+    if waiting {
+        super::issue1288_ws_shutdown::mark_backfill_drain_waiting(state);
     }
-    for task in tasks {
+    if !waiting {
+        return true;
+    }
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            let (finished, released) = {
+                let mut guard = backfill_reads_mut(&state.ws_outbound_stats);
+                let finished = reap_finished_backfill_tasks(&mut guard.tasks);
+                let released = guard.tasks.is_empty();
+                (finished, released)
+            };
+            log_finished_backfill_tasks(finished).await;
+            return released;
+        }
+        tokio::time::sleep_until((now + Duration::from_millis(20)).min(deadline)).await;
+        let (finished, released) = {
+            let mut guard = backfill_reads_mut(&state.ws_outbound_stats);
+            let finished = reap_finished_backfill_tasks(&mut guard.tasks);
+            let released = guard.tasks.is_empty();
+            (finished, released)
+        };
+        log_finished_backfill_tasks(finished).await;
+        if released {
+            return true;
+        }
+    }
+}
+
+async fn log_finished_backfill_tasks(finished: Vec<tokio::task::JoinHandle<()>>) {
+    for task in finished {
         if let Err(error) = task.await {
             tracing::warn!("WS history backfill did not finish cleanly: {error}");
         }

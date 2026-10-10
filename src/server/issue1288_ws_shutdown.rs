@@ -85,6 +85,7 @@ pub(super) async fn park_before_registration_if_armed(state: &Arc<super::state::
 pub(super) struct BackfillHold {
     released: AtomicBool,
     parked: AtomicUsize,
+    drain_waiting: AtomicBool,
 }
 
 fn backfill_holds() -> &'static std::sync::Mutex<Vec<(usize, Arc<BackfillHold>)>> {
@@ -100,6 +101,7 @@ pub(super) fn arm_backfill_hold(state: &super::state::AppState) -> Option<Arc<Ba
     let hold = Arc::new(BackfillHold {
         released: AtomicBool::new(false),
         parked: AtomicUsize::new(0),
+        drain_waiting: AtomicBool::new(false),
     });
     let key = Arc::as_ptr(store) as usize;
     let mut guard = backfill_holds()
@@ -130,18 +132,21 @@ pub(super) fn park_backfill_hold(store: &Arc<crate::history::Store>) {
     }
 }
 
-static BACKFILL_DRAIN_WAITING: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn reset_backfill_drain_waiting() {
-    BACKFILL_DRAIN_WAITING.store(false, Ordering::SeqCst);
-}
-
-pub(super) fn mark_backfill_drain_waiting() {
-    BACKFILL_DRAIN_WAITING.store(true, Ordering::SeqCst);
-}
-
-fn backfill_drain_waiting() -> bool {
-    BACKFILL_DRAIN_WAITING.load(Ordering::SeqCst)
+/// The shutdown drain has closed backfill admission for this daemon's store
+/// and is waiting on at least one read. Keyed by the store so a parallel
+/// test's drain does not release this hold.
+pub(super) fn mark_backfill_drain_waiting(state: &super::state::AppState) {
+    let Some(history) = state.agent.history() else {
+        return;
+    };
+    let store = history.store();
+    let key = Arc::as_ptr(store) as usize;
+    let guard = backfill_holds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, hold)) = guard.iter().find(|(existing, _)| *existing == key) {
+        hold.drain_waiting.store(true, Ordering::SeqCst);
+    }
 }
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -377,12 +382,13 @@ async fn issue1288_ws_upgrade_parked_before_session_releases_owner() -> Result<(
     Ok(())
 }
 
-/// Direct and topic backfills park on the blocking pool while they hold the
-/// history store. Shutdown must not return until those reads finish, or the
-/// same directory cannot reopen.
+/// Direct and topic backfills that finish inside the shutdown grace release
+/// the history store, so the same directory reopens. The reads are released
+/// when this daemon's drain starts waiting.
+/// [`issue1288_ws_backfill_stalled_past_shutdown_budget_keeps_owner`] keeps
+/// one read parked past that grace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1288_ws_backfill_parked_query_reopens_same_dir() -> Result<()> {
-    reset_backfill_drain_waiting();
     let (daemon, state) = start_daemon().await?;
     let addr = daemon.handle.local_addr();
     let token = state.api_token.clone();
@@ -415,7 +421,7 @@ async fn issue1288_ws_backfill_parked_query_reopens_same_dir() -> Result<()> {
     let shutdown = tokio::spawn(async move { daemon.stop_and_relaunch().await });
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        if backfill_drain_waiting() {
+        if hold.drain_waiting.load(Ordering::SeqCst) {
             break;
         }
         if shutdown.is_finished() {
@@ -447,4 +453,113 @@ async fn issue1288_ws_backfill_parked_query_reopens_same_dir() -> Result<()> {
          (outcome: {outcome:?})"
     );
     Ok(())
+}
+
+/// A history read that stays parked past the shutdown grace must not be
+/// dropped and reported as a released owner. Shutdown returns within the
+/// test bound, the result is an error, and the registry still owns the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1288_ws_backfill_stalled_past_shutdown_budget_keeps_owner() -> Result<()> {
+    let (daemon, state) = start_daemon().await?;
+    let addr = daemon.handle.local_addr();
+    let token = state.api_token.clone();
+    let stats = Arc::clone(&state.ws_outbound_stats);
+    let hold = arm_backfill_hold(&state).context("daemon history store")?;
+    let socket = connect_ws(addr, &token, "/ws/direct?backfill=1").await?;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.parked.load(Ordering::SeqCst) < 1 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the history backfill did not park (parked {})",
+            hold.parked.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(state);
+
+    let Daemon {
+        _root,
+        config: _,
+        handle,
+        state_weak: _,
+        agent_weak: _,
+    } = daemon;
+    let shutdown = tokio::time::timeout(WAIT, handle.shutdown_and_wait()).await;
+    let result = match shutdown {
+        Err(_) => {
+            anyhow::bail!("shutdown did not return within {WAIT:?} while a backfill stayed parked")
+        }
+        Ok(result) => result,
+    };
+    assert!(
+        result.is_err(),
+        "a backfill still parked past the grace must not be reported as a released shutdown: {result:?}"
+    );
+    assert!(
+        super::ws::unfinished_backfill_reads(&stats) >= 1,
+        "the stalled read must stay owned after shutdown returns"
+    );
+    assert!(
+        !hold.released.load(Ordering::SeqCst),
+        "the regression must keep the read parked until after shutdown returns"
+    );
+    assert!(
+        hold.parked.load(Ordering::SeqCst) >= 1,
+        "the blocking read must still be inside the park"
+    );
+
+    hold.released.store(true, Ordering::SeqCst);
+    let cleanup = tokio::time::Instant::now() + WAIT;
+    while super::ws::unfinished_backfill_reads(&stats) > 0 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < cleanup,
+            "the stalled read did not finish after it was released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(socket);
+    drop(_root);
+    Ok(())
+}
+
+/// Completed backfill handles are reclaimed on the next registration.
+/// A read that has not finished stays owned. No daemon is started.
+#[tokio::test]
+async fn issue1288_repeated_backfill_reaps_completed_reads() {
+    let stats = Arc::new(super::ws::WsOutboundStats::default());
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    assert!(super::ws::track_backfill_task(&stats, async move {
+        let _ = done_tx.send(());
+    }));
+    done_rx.await.expect("completed read signals");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if super::ws::backfill_read_registry_len(&stats) == 1
+            && super::ws::unfinished_backfill_reads(&stats) == 0
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the completed backfill was not observed finished"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let (park_tx, park_rx) = tokio::sync::oneshot::channel::<()>();
+    assert!(super::ws::track_backfill_task(&stats, async move {
+        let _ = park_rx.await;
+    }));
+    assert_eq!(
+        super::ws::backfill_read_registry_len(&stats),
+        1,
+        "the completed handle must be reclaimed when the next read is registered"
+    );
+    assert_eq!(
+        super::ws::unfinished_backfill_reads(&stats),
+        1,
+        "the pending read must stay owned"
+    );
+    let _ = park_tx.send(());
 }
