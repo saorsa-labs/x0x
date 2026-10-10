@@ -69,6 +69,14 @@ Before this replacement is accepted, the capability map must identify an owning 
 
 Confirm that reliable inbound events are part of every supported agent attachment. Confirm that voice/video and rich text retain their current priority.
 
+## Open questions
+
+ADR 0095 is Accepted and archived. This draft does not edit its text.
+
+David ruled on 10 Oct 2026. He closed ADR 0095 open question 4 (Goal E under rule 5).
+
+Goal E counts in place of an R under rule 5 when the change keeps behaviour the same and the gain is measured with a before-and-after number. The E-D15 checklist still applies. A wire, protocol, API, or dependency change still needs its own ADR first.
+
 ## Existing decision records
 
 Read the [design direction and rulings digest](../../design/x0x-direction.md)

@@ -665,6 +665,8 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
     if transient.exists():
         for path in sorted(transient.rglob("*.md")):
             repo_path = path.as_posix()
+            if repo_path == "docs/adr/transient/README.md":
+                continue
             head_paths.append(repo_path)
             try:
                 text = path.read_text(encoding="utf-8")
@@ -679,6 +681,8 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
     candidates = set(head_paths)
     for name in changed:
         if name.startswith("docs/adr/transient/") and name.endswith(".md"):
+            if name == "docs/adr/transient/README.md":
+                continue
             candidates.add(name)
     try:
         added = run(
@@ -696,6 +700,8 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
         errors.append(f"Failed to scan history for transient records: {exc}")
         added = []
     for name in added:
+        if name == "docs/adr/transient/README.md":
+            continue
         if name.startswith("docs/adr/transient/") and name.endswith(".md"):
             candidates.add(name)
 

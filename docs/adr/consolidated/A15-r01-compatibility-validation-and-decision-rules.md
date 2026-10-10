@@ -23,9 +23,11 @@ Current CI protects accepted ADR text and associated frozen evidence. Code, test
 
 Use stable current IDs [A01](A01-r01-purpose-and-product-limits.md)–A15. Archived records and previous accepted revisions do not count towards the limit.
 
-During transfer, new or changed decisions use the numbered ADR series only,
-through ADR 0087 (D199). Slot revisions are drafts until David accepts the
-transfer. Reserved numbers and slices keep the [numbered decision path](README.md).
+A new or changed decision is `docs/adr/transient/T-<slug>.md` (D242). It
+names one target slot from A01 to A15. Write 300 to 600 words. Use about
+80% ASD-STE100 style. Follow the [style guide](../../documentation-style.md).
+It stays Proposed until David accepts it. David folds it into that slot only
+when he asks. Reserved numbers and slices keep the [numbered decision path](README.md).
 
 After transfer and revision-aware gate support, the proposed model selects
 one accepted revision per active slot. A successor uses that slot's next

@@ -2246,6 +2246,22 @@ Keep the owner key separate.
             rc == 1 and "lifecycle must stay Proposed until David accepts it." in out,
         ))
 
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/README.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "# Transient decisions\n\n"
+            "A new or changed decision goes in `T-<slug>.md` in this directory.\n"
+        )
+        _commit_all(work, "add transient support readme")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: the support README is not a decision record",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0

@@ -3,8 +3,11 @@
 ## Use the 15 slot plan
 
 Read [the consolidation rules](consolidated/README.md) before creating a record.
-During transfer, new or changed decisions use the numbered ADR series only,
-through [the template](TEMPLATE.md) and ADR 0087 (D199). Slot revisions are
+A new or changed decision is [`docs/adr/transient/T-<slug>.md`](transient/README.md)
+(D242). It names one target slot from A01 to A15. Write 300 to 600 words.
+Use about 80% ASD-STE100 style. Follow the [style guide](../documentation-style.md).
+It stays Proposed until David accepts it. David folds it into that slot only
+when he asks. Slot revisions are
 drafts until David accepts the transfer. Do not allocate A16 or start a
 second consolidated series. Keep reserved numbers 0090/0091 (D18), 0097
 (D20), 0098 (D35), and 0084–0105 (D63). Slices 0109–0114 continue to
@@ -50,7 +53,7 @@ Add this project instruction to every AI coding harness profile (`AGENTS.md`, `C
 
 ```text
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
-D199: during transfer, new or changed decisions use the numbered ADR series only, through docs/adr/TEMPLATE.md and ADR 0087.
+D242: a new or changed decision is docs/adr/transient/T-<slug>.md. Name one slot A01-A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow docs/documentation-style.md. Stay Proposed until David accepts it. Fold it into that slot only when David asks.
 A01-A15 slot revisions are drafts until David accepts the transfer. Do not create A16 or a second consolidated series.
 Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue to numbered acceptance. Keep their current gates.
 Use approximately 80% ASD-STE100 style in ADRs, docs and communication with David. Follow docs/documentation-style.md.

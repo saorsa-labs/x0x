@@ -19,10 +19,12 @@ This directory contains architecture decision records for x0x.
 ## Transfer rulings (2026-10-05)
 
 D198 confirms the consolidation direction and writing target. David accepted
-the transfer on 10 Oct 2026. The slot files stay Proposed. A new decision is
-`docs/adr/transient/T-<slug>.md` (D242). It names one target slot from A01
-to A15. It stays Proposed until David accepts it. David folds it into that
-slot only when he asks. The reserved numbers and 0109–0114 acceptance lanes
+the transfer on 10 Oct 2026. The slot files stay Proposed. A new or changed
+decision is `docs/adr/transient/T-<slug>.md` (D242). It names one target
+slot from A01 to A15. Write 300 to 600 words. Use about 80% ASD-STE100
+style. Follow the [style guide](../documentation-style.md). It stays
+Proposed until David accepts it. David folds it into that slot only when
+he asks. The reserved numbers and 0109–0114 acceptance lanes
 stand; slot revisions are drafts.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
@@ -58,6 +60,17 @@ Index entries below that carry an **[overlay: …]** tag are covered here.
 - **To be superseded or amended:** the direction is ruled, but the successor
   ADR is not Accepted yet. The existing ADR still describes shipped
   behaviour; new work follows the ruling.
+
+### ADR 0095 open question 4
+
+David ruled on 10 Oct 2026. He closed open question 4. ADR 0095 is Accepted
+and archived, so its question list stays unchanged. The answer is in
+[A01 Open questions](consolidated/A01-r01-purpose-and-product-limits.md#open-questions).
+
+Goal E counts in place of an R under rule 5 when the change keeps behaviour
+the same and the gain is measured with a before-and-after number. The E-D15
+checklist still applies. A wire, protocol, API, or dependency change still
+needs its own ADR first.
 
 ### Do not start new work: parked, retired, rejected, withdrawn or held
 

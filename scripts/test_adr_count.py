@@ -74,7 +74,7 @@ class AdrCountTests(unittest.TestCase):
 
     def test_transient_file_stays_outside_the_count(self):
         extra = self.root / "docs/adr/transient/0117-new-decision.md"
-        extra.parent.mkdir()
+        extra.parent.mkdir(exist_ok=True)
         extra.write_text("# ADR 0117\n\n- **Status:** Proposed\n")
         self.assertEqual(CHECK.validate(self.root), [])
         count, extras = CHECK.current_records(self.root)
