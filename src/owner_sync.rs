@@ -2372,6 +2372,33 @@ impl OwnerSyncService {
         Ok(service)
     }
 
+    /// #843 fixture: the real `SyncV1` acceptor and enrollment admission,
+    /// without the owner-connect re-announcement. That task calls
+    /// [`crate::Agent::reannounce_identity`], which binds `[::]:0` and
+    /// connects to `[2001:4860:4860::8888]:80`. Production startup still
+    /// uses [`Self::new`].
+    #[cfg(test)]
+    pub(crate) async fn new_without_owner_connect_reannounce(
+        agent: Arc<crate::Agent>,
+        data_dir: &Path,
+    ) -> crate::error::NetworkResult<Arc<Self>> {
+        let acceptor = agent.register_stream_acceptor(crate::streams::StreamProtocol::SyncV1)?;
+        let journal_path = agent.cert_journal_path().map(Path::to_path_buf);
+        let store = OwnerSyncStore::load(data_dir)
+            .await
+            .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
+        let service = Arc::new(Self {
+            agent,
+            store: Arc::new(store),
+            journal_path,
+            view: std::sync::RwLock::new(None),
+            tasks: tokio::sync::Mutex::new(Vec::new()),
+            session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
+        });
+        service.spawn_acceptor_loop(acceptor).await;
+        Ok(service)
+    }
+
     /// #1040: when an enrolled owner machine newly connects, re-announce
     /// this device's identity (so a peer that restarted with an empty
     /// discovery cache learns our agent promptly) and kick a sync pass.
@@ -3846,8 +3873,7 @@ mod tests {
         peer_hello.abort();
     }
 
-    /// Loopback only: no bootstrap peers, no mDNS, no port mapping. Nothing
-    /// outside the two devices is dialed, and no identity announcement runs.
+    /// Loopback bind, no bootstrap peers, no mDNS, no port mapping.
     fn loopback_owner_sync_config() -> crate::network::NetworkConfig {
         crate::network::NetworkConfig {
             bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -3858,9 +3884,10 @@ mod tests {
         }
     }
 
-    /// A live owner device with the stream accept loop running and its
-    /// enrollment store installed. `join_network` is not called, so the
-    /// discovery cache stays empty for the life of the process.
+    /// A live owner device with the `SyncV1` accept loop running and its
+    /// enrollment store installed. The owner-connect re-announcement is
+    /// left off, and `join_network` is not called, so the discovery cache
+    /// stays empty and the IPv6 route probe does not run.
     async fn live_owner_device(
         dir: &Path,
         name: &str,
@@ -3880,9 +3907,12 @@ mod tests {
             .expect("owner device");
         let agent = Arc::new(agent);
         agent.start_stream_accept_loop();
-        let service = OwnerSyncService::new(Arc::clone(&agent), &dir.join(name))
-            .await
-            .expect("owner sync service");
+        let service = OwnerSyncService::new_without_owner_connect_reannounce(
+            Arc::clone(&agent),
+            &dir.join(name),
+        )
+        .await
+        .expect("owner sync service");
         agent.install_owner_device_store(Arc::clone(service.store()));
         (agent, service)
     }
@@ -3952,15 +3982,24 @@ mod tests {
     /// such session. Neither device learns the other's agent, so the
     /// session uses the verified enrollment alone.
     ///
+    /// The fixture starts the real acceptor without the owner-connect
+    /// re-announcement. A seccomp watcher fails the test if `bind` or
+    /// `connect` leaves loopback, including the `[::]:0` probe to
+    /// `[2001:4860:4860::8888]:80`.
+    ///
     /// On the pre-#1044 dial the initiator stops at `machine not in
     /// discovery cache` and no session completes. When the responder
     /// drops the stream, the initiator's error is the stream reset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mutually_enrolled_devices_complete_owner_sync_both_ways_without_restart() {
+        install_loopback_socket_boundary();
         let dir = tempfile::tempdir().expect("tmpdir");
         let seed = [0x84; 32];
         let (alice, alice_sync) = live_owner_device(dir.path(), "alice", seed).await;
         let (bob, bob_sync) = live_owner_device(dir.path(), "bob", seed).await;
+        assert_acceptor_without_reannounce(&alice_sync).await;
+        assert_acceptor_without_reannounce(&bob_sync).await;
+        assert_loopback_sockets("after owner devices start");
         let alice_id = alice.machine_id();
         let bob_id = bob.machine_id();
         assert_ne!(alice_id, bob_id, "distinct machines");
@@ -4070,6 +4109,393 @@ mod tests {
             !knows_agent_on(&bob, alice_id).await,
             "an identity announcement arrived; the test no longer uses enrollment alone"
         );
+        assert_loopback_sockets("after both owner-sync sessions");
+    }
+
+    async fn assert_acceptor_without_reannounce(service: &OwnerSyncService) {
+        assert_eq!(
+            service.tasks.lock().await.len(),
+            1,
+            "SyncV1 acceptor must be the only owner-sync task; the connect re-announcement probes a non-loopback route"
+        );
+    }
+
+    fn install_loopback_socket_boundary() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        socket_boundary::install();
+    }
+
+    fn assert_loopback_sockets(when: &str) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        socket_boundary::assert_clear(when);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let _ = when;
+    }
+
+    /// Watches `bind` and `connect` for the rest of the process. A
+    /// `/proc` sample misses the route probe: `HeartbeatContext::announce`
+    /// drops the socket as soon as `connect` returns. The kernel reports
+    /// every `bind` and `connect` through a seccomp user notification,
+    /// then the call proceeds unchanged.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    mod socket_boundary {
+        use std::sync::{Mutex, Once};
+
+        const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+        const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
+        const SECCOMP_FILTER_FLAG_TSYNC: libc::c_ulong = 1;
+        const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
+        // Required with the two flags above. Without it the kernel cannot
+        // tell a listener fd from a TSYNC thread id and returns EINVAL.
+        const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: libc::c_ulong = 1 << 4;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        const BPF_LD_W_ABS: u16 = 0x20;
+        const BPF_JMP_JEQ_K: u16 = 0x15;
+        const BPF_RET_K: u16 = 0x06;
+        const CONTINUE: u32 = 1;
+
+        fn violations() -> &'static Mutex<Vec<String>> {
+            static VIOLATIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            &VIOLATIONS
+        }
+
+        pub(super) fn install() {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                self_check_classifier();
+                let fd = install_filter();
+                std::thread::Builder::new()
+                    .name("owner-sync-socket-boundary".into())
+                    .spawn(move || supervise(fd))
+                    .expect("socket boundary watcher");
+            });
+            violations().lock().expect("violations").clear();
+        }
+
+        pub(super) fn assert_clear(when: &str) {
+            let mut hits = violations().lock().expect("violations").clone();
+            hits.extend(proc_non_loopback());
+            assert!(
+                hits.is_empty(),
+                "{when}: socket left loopback: {}",
+                hits.join("; ")
+            );
+        }
+
+        fn install_filter() -> libc::c_int {
+            let privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+            assert_eq!(
+                privs,
+                0,
+                "PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut filter = vec![
+                insn(BPF_LD_W_ABS, 0, 0, 4),
+                insn(BPF_JMP_JEQ_K, 0, 3, AUDIT_ARCH_X86_64),
+                insn(BPF_LD_W_ABS, 0, 0, 0),
+                insn(BPF_JMP_JEQ_K, 2, 0, libc::SYS_connect as u32),
+                insn(BPF_JMP_JEQ_K, 1, 0, libc::SYS_bind as u32),
+                insn(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+                insn(BPF_RET_K, 0, 0, SECCOMP_RET_USER_NOTIF),
+            ];
+            let prog = libc::sock_fprog {
+                len: filter.len() as libc::c_ushort,
+                filter: filter.as_mut_ptr(),
+            };
+            let flags = SECCOMP_FILTER_FLAG_TSYNC
+                | SECCOMP_FILTER_FLAG_NEW_LISTENER
+                | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+            // SAFETY: `prog` points at `filter`, which stays live for this
+            // synchronous syscall. The process opts into no-new-privs first,
+            // which is what an unprivileged seccomp filter requires.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    SECCOMP_SET_MODE_FILTER,
+                    flags,
+                    &prog as *const libc::sock_fprog,
+                )
+            };
+            assert!(
+                fd >= 0,
+                "seccomp socket watcher: {}",
+                std::io::Error::last_os_error()
+            );
+            i32::try_from(fd).expect("listener fd")
+        }
+
+        fn insn(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
+            libc::sock_filter { code, jt, jf, k }
+        }
+
+        fn supervise(fd: libc::c_int) {
+            let (notif_size, resp_size, recv, send) = notif_layout();
+            loop {
+                let mut req = vec![0u8; notif_size];
+                // SAFETY: `req` is `notif_size` bytes, the size the kernel
+                // reported for `struct seccomp_notif`. The listener fd stays
+                // open for the process lifetime.
+                let rc = unsafe { libc::ioctl(fd, recv, req.as_mut_ptr()) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(hit) = violation_from_notif(&req) {
+                    violations().lock().expect("violations").push(hit);
+                }
+                let mut resp = vec![0u8; resp_size];
+                resp[..8].copy_from_slice(&req[..8]);
+                resp[20..24].copy_from_slice(&CONTINUE.to_ne_bytes());
+                // SAFETY: `resp` is the kernel-reported response size. The
+                // first qword is the notification id; flags at offset 20
+                // request CONTINUE so the original syscall still runs.
+                let sent = unsafe { libc::ioctl(fd, send, resp.as_ptr()) };
+                if sent < 0 {
+                    let err = std::io::Error::last_os_error();
+                    // ENOENT: the caller went away. Anything else means this
+                    // notification was not released; remember it and keep
+                    // draining so later loopback calls do not sit forever.
+                    if err.raw_os_error() != Some(libc::ENOENT) {
+                        violations()
+                            .lock()
+                            .expect("violations")
+                            .push(format!("watcher send: {err}"));
+                    }
+                }
+            }
+        }
+
+        fn notif_layout() -> (usize, usize, libc::Ioctl, libc::Ioctl) {
+            #[repr(C)]
+            struct Sizes {
+                notif: u16,
+                resp: u16,
+                _data: u16,
+            }
+            let mut sizes = Sizes {
+                notif: 0,
+                resp: 0,
+                _data: 0,
+            };
+            // SAFETY: `sizes` matches the uapi `seccomp_notif_sizes` the
+            // kernel writes for SECCOMP_GET_NOTIF_SIZES.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    SECCOMP_GET_NOTIF_SIZES,
+                    0,
+                    &mut sizes as *mut Sizes,
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "SECCOMP_GET_NOTIF_SIZES: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(sizes.notif >= 80, "seccomp_notif is {} bytes", sizes.notif);
+            assert!(
+                sizes.resp >= 24,
+                "seccomp_notif_resp is {} bytes",
+                sizes.resp
+            );
+            (
+                sizes.notif as usize,
+                sizes.resp as usize,
+                io_wr(0, u32::from(sizes.notif)),
+                io_wr(1, u32::from(sizes.resp)),
+            )
+        }
+
+        fn io_wr(nr: u32, size: u32) -> libc::Ioctl {
+            let dir = 3u32;
+            let typ = u32::from(b'!');
+            libc::Ioctl::from((dir << 30) | (size << 16) | (typ << 8) | nr)
+        }
+
+        fn violation_from_notif(req: &[u8]) -> Option<String> {
+            let nr = i32::from_ne_bytes(req[16..20].try_into().ok()?);
+            let ptr = u64::from_ne_bytes(req[40..48].try_into().ok()?);
+            let len = u64::from_ne_bytes(req[48..56].try_into().ok()?);
+            let op = if nr == libc::SYS_connect as i32 {
+                "connect"
+            } else {
+                "bind"
+            };
+            let bytes = read_sockaddr(ptr, len)?;
+            non_loopback_reason(&bytes).map(|reason| format!("{op} {reason}"))
+        }
+
+        fn read_sockaddr(ptr: u64, len: u64) -> Option<Vec<u8>> {
+            let n = usize::try_from(len).ok()?.clamp(0, 64);
+            if n < 2 || ptr == 0 {
+                return Some(b"unreadable sockaddr".to_vec());
+            }
+            let mut buf = vec![0u8; n];
+            let local = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: n,
+            };
+            let remote = libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: n,
+            };
+            // SAFETY: the calling thread is stopped inside the syscall, so
+            // the sockaddr stays put. `process_vm_readv` returns an error
+            // instead of faulting this thread when the pointer is bad.
+            let rc = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+            if rc == n as isize {
+                Some(buf)
+            } else {
+                Some(b"unreadable sockaddr".to_vec())
+            }
+        }
+
+        fn non_loopback_reason(bytes: &[u8]) -> Option<String> {
+            if bytes.len() < 2 {
+                return Some("short sockaddr".to_string());
+            }
+            if bytes == b"unreadable sockaddr" {
+                return Some("unreadable sockaddr".to_string());
+            }
+            let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+            match family {
+                // Unspecified, unix, and netlink stay on this machine.
+                // Netlink is how the stack reads interfaces; it is not a route.
+                0 | 1 | 16 => None,
+                2 => ipv4_reason(bytes),
+                10 => ipv6_reason(bytes),
+                other => Some(format!("address family {other}")),
+            }
+        }
+
+        fn ipv4_reason(bytes: &[u8]) -> Option<String> {
+            if bytes.len() < 8 {
+                return Some("short IPv4 sockaddr".to_string());
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
+            if ip[0] == 127 {
+                None
+            } else {
+                Some(format!("{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]))
+            }
+        }
+
+        fn ipv6_reason(bytes: &[u8]) -> Option<String> {
+            if bytes.len() < 24 {
+                return Some("short IPv6 sockaddr".to_string());
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[8..24]);
+            if octets[..15].iter().all(|b| *b == 0) && octets[15] == 1 {
+                return None;
+            }
+            if octets[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] && octets[12] == 127 {
+                return None;
+            }
+            let ip = std::net::Ipv6Addr::from(octets);
+            Some(format!("[{ip}]:{port}"))
+        }
+
+        fn self_check_classifier() {
+            let mut v4 = [0u8; 16];
+            v4[0] = 2;
+            v4[4] = 127;
+            v4[7] = 1;
+            assert!(non_loopback_reason(&v4).is_none());
+            let mut wildcard = [0u8; 28];
+            wildcard[0] = 10;
+            let wildcard = non_loopback_reason(&wildcard).expect("wildcard ipv6");
+            assert!(wildcard.contains("[::]:0"), "{wildcard}");
+            let mut probe = [0u8; 28];
+            probe[0] = 10;
+            probe[3] = 80;
+            let dns = std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+            probe[8..24].copy_from_slice(&dns.octets());
+            let probe = non_loopback_reason(&probe).expect("route probe");
+            assert!(probe.contains("[2001:4860:4860::8888]:80"), "{probe}");
+        }
+
+        fn proc_non_loopback() -> Vec<String> {
+            [
+                "/proc/self/net/udp",
+                "/proc/self/net/udp6",
+                "/proc/self/net/tcp",
+                "/proc/self/net/tcp6",
+            ]
+            .into_iter()
+            .flat_map(|path| proc_file(path).into_iter())
+            .collect()
+        }
+
+        fn proc_file(path: &str) -> Vec<String> {
+            let v6 = path.ends_with('6');
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => return vec![format!("{path}: {error}")],
+            };
+            text.lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let mut cols = line.split_whitespace();
+                    let _slot = cols.next()?;
+                    let local = cols.next()?.rsplit_once(':')?.0;
+                    let remote = cols.next()?.rsplit_once(':')?.0;
+                    if proc_endpoint_ok(local, remote, v6) {
+                        None
+                    } else {
+                        Some(format!("{path} {local} -> {remote}"))
+                    }
+                })
+                .collect()
+        }
+
+        fn proc_endpoint_ok(local: &str, remote: &str, v6: bool) -> bool {
+            if v6 {
+                let (Some(local), Some(remote)) = (parse_v6(local), parse_v6(remote)) else {
+                    return false;
+                };
+                v6_loopback(&local) && (v6_unspecified(&remote) || v6_loopback(&remote))
+            } else {
+                let (Some(local), Some(remote)) = (parse_v4(local), parse_v4(remote)) else {
+                    return false;
+                };
+                local[0] == 127 && (remote == [0, 0, 0, 0] || remote[0] == 127)
+            }
+        }
+
+        fn parse_v4(hex8: &str) -> Option<[u8; 4]> {
+            let word = u32::from_str_radix(hex8, 16).ok()?;
+            Some(word.to_le_bytes())
+        }
+
+        fn parse_v6(hex32: &str) -> Option<[u8; 16]> {
+            if hex32.len() != 32 {
+                return None;
+            }
+            let mut out = [0u8; 16];
+            for (i, chunk) in hex32.as_bytes().chunks(8).enumerate() {
+                let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+                out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            Some(out)
+        }
+
+        fn v6_unspecified(ip: &[u8; 16]) -> bool {
+            ip.iter().all(|b| *b == 0)
+        }
+
+        fn v6_loopback(ip: &[u8; 16]) -> bool {
+            ip[..15].iter().all(|b| *b == 0) && ip[15] == 1
+        }
     }
 }
 
