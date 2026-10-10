@@ -32,7 +32,9 @@ Run: python3 scripts/test_adr_governance.py
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -2044,6 +2046,105 @@ def main() -> int:
             rc == 1
             and "Accepted ADRs are immutable" in out
             and "docs/adr/0042-test.md" in out,
+        ))
+
+    # Recorded consolidation move: identical archived bytes pass, and a
+    # later edit of those bytes still fails after the move is the base.
+    def _record_move(work: Path) -> None:
+        src = work / "docs" / "adr" / "0042-test.md"
+        data = src.read_bytes()
+        archive = work / "docs" / "adr-archive"
+        archive.mkdir(parents=True)
+        dest = archive / "0042-test.md"
+        dest.write_bytes(data)
+        src.unlink()
+        src.symlink_to("../adr-archive/0042-test.md")
+        manifest = {
+            "schema_version": 1,
+            "plan": "docs/adr/consolidated/README.md",
+            "moves": [
+                {
+                    "from": "docs/adr/0042-test.md",
+                    "to": "docs/adr-archive/0042-test.md",
+                    "link": "../adr-archive/0042-test.md",
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            ],
+        }
+        (archive / "move.json").write_text(json.dumps(manifest) + "\n")
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=True)
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: identical archive bytes and old path link pass",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=True)
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move"],
+            cwd=work, check=True,
+        )
+        archived = work / "docs" / "adr-archive" / "0042-test.md"
+        archived.write_text(archived.read_text().replace(
+            "Test decision body.", "MUTATED decision body."
+        ))
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "edit archived accepted bytes"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: editing archived Accepted bytes fails closed",
+            rc == 1 and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "accepted ADR on main"],
+            cwd=work, check=True,
+        )
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move on main"],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        archived = work / "docs" / "adr-archive" / "0042-test.md"
+        archived.write_text(archived.read_text().replace(
+            "Test decision body.", "MUTATED decision body."
+        ))
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "edit archive after the move is the base"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: post-move base still rejects an archive edit",
+            rc == 1 and "Accepted ADRs are immutable" in out,
         ))
 
     failed = results.count(False)

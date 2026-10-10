@@ -33,7 +33,8 @@ class AdrCountTests(unittest.TestCase):
         self.assertEqual(CHECK.HOLD, frozenset({"0115", "0116"}))
         self.assertEqual(
             CHECK.hold_note(ROOT),
-            "NOTE: ADR 0115 and ADR 0116 are outside the #1244 map. They stay in force outside this count.",
+            "UNPLACED: ADR 0115 and ADR 0116 are outside the #1244 map and are not part of the 15. "
+            "Plan: docs/adr/consolidated/README.md",
         )
 
     def test_extra_numbered_adr_exceeds_the_limit_of_15(self):

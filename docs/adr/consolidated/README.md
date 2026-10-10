@@ -43,18 +43,20 @@ frozen evidence and active issue gates still govern implementation.
 The limit applies to current decisions after transfer. Archived records and
 past accepted revisions do not count. During transfer, new or changed
 decisions use the numbered ADR series only, through ADR 0087 (D199). Slot
-revisions are drafts until David accepts the transfer. Keep reserved numbers
+revisions stay Proposed. The transition check rejects an Accepted slot.
+Keep reserved numbers
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
 Slices 0109–0114 continue to acceptance as numbered ADRs. Map their rulings
 to the slots without changing that decision path. The transition check does
 not yet support multiple revision files per slot; see [coverage gaps](../TOOLING.md#transition-check-coverage).
 
 `python3 scripts/check-adr-count.py` counts the current records. The limit
-is 15. This file is the plan. A numbered ADR in the [transfer map](TRANSFER.md)
-keeps its path and stays outside the count. Those records still govern until
-David accepts the transfer. ADR 0115 and ADR 0116 are outside that map. They
-stay in force outside the count. Another numbered ADR, or an A16 record,
-makes the count exceed 15 and the check fails.
+is 15. This file is the plan. David accepted the transfer on 10 Oct 2026.
+A numbered ADR in the [transfer map](TRANSFER.md) keeps its `docs/adr/` path
+as a link. Its bytes live in `docs/adr-archive/` and stay outside the count.
+ADR 0115 and ADR 0116 are outside that map. They stay in force outside the
+count. Another numbered ADR, or an A16 record, makes the count exceed 15
+and the check fails.
 
 ## Transfer before activation
 

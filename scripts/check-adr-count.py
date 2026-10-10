@@ -93,7 +93,10 @@ def hold_note(root: Path) -> str | None:
         names = f"{present[0]} and {present[1]}"
     else:
         names = ", ".join(present)
-    return f"NOTE: {names} are outside the #1244 map. They stay in force outside this count."
+    return (
+        f"UNPLACED: {names} are outside the #1244 map and are not part of the {LIMIT}. "
+        f"Plan: {PLAN}"
+    )
 
 
 def main() -> int:

@@ -3,12 +3,14 @@
 ## Consolidation review
 
 Read the [15 ADR set](consolidated/README.md) for the direction confirmed by
-David (D198) on 5 October 2026. Its records remain Proposed replacements while the transfer
-checks are open. This index, its status overlay and accepted records continue
-to govern existing work. New docs follow the [style guide](../documentation-style.md).
-The numbered records in the [transfer map](consolidated/TRANSFER.md) keep
-these paths and stay outside the limit of 15. ADR 0115 and ADR 0116 are
-outside that map. They stay in force outside the count.
+David (D198) on 5 October 2026. David accepted the transfer on 10 Oct 2026.
+The numbered records in the [transfer map](consolidated/TRANSFER.md) are the
+historical archive. They keep these paths as links. Their bytes live in
+[docs/adr-archive](../adr-archive/ARCHIVE.md) and are unchanged. The slot
+files stay Proposed. This index and its status overlay still name the
+accepted records. New docs follow the [style guide](../documentation-style.md).
+ADR 0115 and ADR 0116 are outside that map. They stay in this directory,
+in force, and outside the count of 15.
 `python3 scripts/check-adr-count.py` fails when the current count exceeds 15.
 The plan is the [15 ADR set](consolidated/README.md).
 
@@ -16,10 +18,11 @@ This directory contains architecture decision records for x0x.
 
 ## Transfer rulings (2026-10-05)
 
-D198 confirms the consolidation direction and writing target; the drafts stay
-Proposed until David accepts the transfer. D199 keeps new or changed decisions
-in the numbered ADR series only, under ADR 0087. The reserved numbers and
-0109–0114 acceptance lanes stand; slot revisions are drafts.
+D198 confirms the consolidation direction and writing target. David accepted
+the transfer on 10 Oct 2026. The slot files stay Proposed. D199 keeps new or
+changed decisions in the numbered ADR series only, under ADR 0087. The
+reserved numbers and 0109–0114 acceptance lanes stand; slot revisions are
+drafts.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
 implementation status does not defer that decision. D197 confirms that

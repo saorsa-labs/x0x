@@ -78,12 +78,15 @@ ADR series only, through `docs/adr/TEMPLATE.md` and the ADR 0087 process
 an ADR Accepted.
 
 The 15-slot direction, A01 through A15, is confirmed by David (D198).
-Slot revisions are drafts until David accepts the transfer (D199). Read
+David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.
+Mapped numbered records are the historical archive. Their `docs/adr/` paths
+stay as links, and the bytes live in `docs/adr-archive/`. Read
 `docs/adr/consolidated/README.md` for the transfer rules. Do not create A16
 or a second consolidated series. Reserved numbered ADRs remain reserved:
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
 Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
 records, overlay, frozen evidence and team gates remain in force.
+ADR 0115 and ADR 0116 are outside the transfer map and outside the count.
 Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
 Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
 The plan is `docs/adr/consolidated/README.md`.

@@ -31,9 +31,15 @@ Enforces:
   of snapshot/HEAD happens in the caller; the helper is only consulted on a
   byte difference.  Decoding is strict UTF-8 — a non-UTF-8 ADR file surfaces
   as a governance error rather than silently changing the lifecycle predicate.
+- A recorded consolidation move may replace ``docs/adr/NNNN-*.md`` with a
+  symlink to ``docs/adr-archive/`` when ``docs/adr-archive/move.json`` records
+  that path, link, and sha256. The archived bytes must stay identical to the
+  frozen Accepted snapshot. Any other content change still fails.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -52,6 +58,8 @@ GROUNDING_PATH_RE = re.compile(r"^docs/grounding/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
 STATUS_BULLET_RE = re.compile(r"(?im)^\s*[-*]\s*\*{0,2}Status:?\*{0,2}:?\s*(.+?)\s*$")
 STATUS_SECTION_RE = re.compile(r"(?im)^##\s+Status[ \t]*\n(?:[ \t]*\n)*[ \t]*(.+?)[ \t]*$")
 NON_ADR_FILES = {"README.md", "TEMPLATE.md", "TOOLING.md"}
+MOVE_MANIFEST = "docs/adr-archive/move.json"
+_MOVE_CACHE: dict[str, tuple[dict[str, dict], str | None]] = {}
 
 
 def run(cmd: list[str]) -> str:
@@ -300,6 +308,157 @@ def file_at(ref: str, path: str) -> bytes | None:
         raise
 
 
+def _git_mode(ref: str, path: str) -> str | None:
+    """Return the git file mode at *ref*, or ``None`` when *path* is absent."""
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-tree", ref, "--", path],
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    text = out.decode("utf-8", errors="strict").strip()
+    if not text:
+        return None
+    return text.split()[0]
+
+
+def _moves_at(ref: str) -> tuple[dict[str, dict], str | None]:
+    """Return recorded consolidation moves keyed by the old ``docs/adr`` path."""
+    cached = _MOVE_CACHE.get(ref)
+    if cached is not None:
+        return cached
+    raw = file_at(ref, MOVE_MANIFEST)
+    if raw is None:
+        result: tuple[dict[str, dict], str | None] = ({}, None)
+        _MOVE_CACHE[ref] = result
+        return result
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        result = ({}, f"Cannot read {MOVE_MANIFEST}: {exc}")
+        _MOVE_CACHE[ref] = result
+        return result
+    moves: dict[str, dict] = {}
+    entries = data.get("moves") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        result = ({}, f"{MOVE_MANIFEST}: moves must be a list.")
+        _MOVE_CACHE[ref] = result
+        return result
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("from"), str):
+            moves[entry["from"]] = entry
+    result = (moves, None)
+    _MOVE_CACHE[ref] = result
+    return result
+
+
+def _link_target(from_path: str, link: str) -> str | None:
+    """Resolve a relative symlink target. Reject absolute paths and escapes."""
+    if not link or link.startswith(("/", "\\")) or "\n" in link or "\x00" in link:
+        return None
+    norm = os.path.normpath(str(Path(from_path).parent / link))
+    if norm.startswith("..") or os.path.isabs(norm):
+        return None
+    return Path(norm).as_posix()
+
+
+def adr_content_at(ref: str, adr_name: str) -> tuple[bytes | None, str | None]:
+    """Return ADR body bytes, following one recorded consolidation symlink.
+
+    A symlink is allowed only when ``move.json`` at *ref* records the same
+    link, archive path, and sha256, and the archive blob matches that hash.
+    Any other symlink, or a hash mismatch, is an error. A missing path
+    returns ``(None, None)``.
+    """
+    mode = _git_mode(ref, adr_name)
+    raw = file_at(ref, adr_name)
+    if raw is None:
+        return None, None
+    if mode != "120000":
+        return raw, None
+    moves, err = _moves_at(ref)
+    if err:
+        return None, err
+    entry = moves.get(adr_name)
+    try:
+        link = raw.decode("utf-8")
+    except UnicodeError as exc:
+        return None, f"{adr_name}: consolidation link is not UTF-8 ({exc})."
+    if entry is None:
+        return None, (
+            f"{adr_name}: symlink is not a recorded consolidation move. "
+            f"Accepted ADRs are immutable and cannot be deleted."
+        )
+    if link != entry.get("link"):
+        return None, (
+            f"{adr_name}: consolidation link does not match the recorded move. "
+            f"Accepted ADRs are immutable."
+        )
+    target = _link_target(adr_name, link)
+    if target != entry.get("to"):
+        return None, (
+            f"{adr_name}: consolidation link does not match the recorded move. "
+            f"Accepted ADRs are immutable."
+        )
+    archived = file_at(ref, str(entry["to"]))
+    if archived is None:
+        return None, (
+            f"{adr_name}: recorded archive {entry['to']} is missing. "
+            f"Accepted ADRs are immutable and cannot be deleted."
+        )
+    digest = hashlib.sha256(archived).hexdigest()
+    if digest != entry.get("sha256"):
+        return None, (
+            f"{adr_name}: Accepted ADRs are immutable. "
+            f"Create a new superseding ADR instead of editing this file."
+        )
+    return archived, None
+
+
+def recorded_move_errors(ref: str = "HEAD") -> list[str]:
+    """Check every recorded move's link and exact archive hash."""
+    moves, err = _moves_at(ref)
+    if err:
+        return [err]
+    errors: list[str] = []
+    for src in sorted(moves):
+        entry = moves[src]
+        dest = entry.get("to")
+        if not isinstance(dest, str):
+            errors.append(f"{src}: recorded move is missing its archive path.")
+            continue
+        try:
+            archived = file_at(ref, dest)
+        except Exception as exc:
+            errors.append(f"Failed to read {dest} at {ref}: {exc}")
+            continue
+        if archived is None:
+            errors.append(
+                f"{src}: recorded archive {dest} is missing. "
+                f"Accepted ADRs are immutable and cannot be deleted."
+            )
+            continue
+        digest = hashlib.sha256(archived).hexdigest()
+        if digest != entry.get("sha256"):
+            errors.append(
+                f"{src}: Accepted ADRs are immutable. "
+                f"Create a new superseding ADR instead of editing this file."
+            )
+        mode = _git_mode(ref, src)
+        try:
+            link_raw = file_at(ref, src)
+        except Exception as exc:
+            errors.append(f"Failed to read {src} at {ref}: {exc}")
+            continue
+        link = link_raw.decode("utf-8") if link_raw is not None else ""
+        if mode != "120000" or link != entry.get("link"):
+            errors.append(
+                f"{src}: recorded consolidation move must keep a link at the old path."
+            )
+    return errors
+
+
 def file_at_text(ref: str, path: str) -> str | None:
     """Like :func:`file_at` but returns a decoded ``str``.
 
@@ -326,8 +485,12 @@ def adr_status_for_grounding(grounding_name: str, ref: str = "HEAD") -> str | No
     """
     stem = Path(grounding_name).stem
     adr_path = f"docs/adr/{stem}.md"
-    text = file_at_text(ref, adr_path)
-    if text is None:
+    raw, err = adr_content_at(ref, adr_path)
+    if err or raw is None:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
         return None
     st = status_of(text)
     return status_token(st) if st else None
@@ -357,9 +520,23 @@ def _frozen_grounding_snapshot(
     as amendable or advancing to a later, already-mutated snapshot.
     """
     try:
+        adr_path = f"docs/adr/{Path(grounding_name).stem}.md"
         # Fast path: ADR is already Accepted at the comparison base.
-        if adr_status_for_grounding(grounding_name, base) == "Accepted":
-            return (base, file_at(base, grounding_name), None)
+        # Resolve a recorded consolidation symlink before reading status.
+        raw, err = adr_content_at(base, adr_path)
+        if err:
+            return (None, None, err)
+        if raw is not None:
+            try:
+                st = status_of(raw.decode("utf-8"))
+            except UnicodeError as exc:
+                return (
+                    None,
+                    None,
+                    f"Failed to scan history for {adr_path}: not valid UTF-8 ({exc})",
+                )
+            if st and status_token(st) == "Accepted":
+                return (base, file_at(base, grounding_name), None)
 
         # Walk base..HEAD in chronological order to locate the transition.
         commits = run(
@@ -367,7 +544,20 @@ def _frozen_grounding_snapshot(
         ).splitlines()
 
         for commit in commits:
-            if adr_status_for_grounding(grounding_name, commit) == "Accepted":
+            raw, err = adr_content_at(commit, adr_path)
+            if err:
+                return (None, None, err)
+            if raw is None:
+                continue
+            try:
+                st = status_of(raw.decode("utf-8"))
+            except UnicodeError as exc:
+                return (
+                    None,
+                    None,
+                    f"Failed to scan history for {adr_path}: not valid UTF-8 ({exc})",
+                )
+            if st and status_token(st) == "Accepted":
                 return (commit, file_at(commit, grounding_name), None)
 
         return (None, None, None)
@@ -397,7 +587,10 @@ def _frozen_adr_snapshot(
     """
     try:
         # Fast path: ADR is already Accepted at the comparison base.
-        adr_bytes = file_at(base, adr_name)
+        # A recorded consolidation symlink resolves to the archived bytes.
+        adr_bytes, content_error = adr_content_at(base, adr_name)
+        if content_error:
+            return (None, None, content_error)
         if adr_bytes is not None:
             try:
                 adr_text = adr_bytes.decode("utf-8")
@@ -417,7 +610,9 @@ def _frozen_adr_snapshot(
         ).splitlines()
 
         for commit in commits:
-            raw = file_at(commit, adr_name)
+            raw, content_error = adr_content_at(commit, adr_name)
+            if content_error:
+                return (None, None, content_error)
             if raw is not None:
                 try:
                     raw_text = raw.decode("utf-8")
@@ -552,9 +747,12 @@ def main() -> int:
                 # ADR is never Accepted in the compared history → amendable.
                 continue
             try:
-                head_text = file_at("HEAD", adr_name)
+                head_text, move_error = adr_content_at("HEAD", adr_name)
             except Exception as exc:
                 errors.append(f"Failed to read {adr_name} at HEAD: {exc}")
+                continue
+            if move_error:
+                errors.append(move_error)
                 continue
             if head_text is None:
                 # ADR exists on disk but not at HEAD?  Should not happen for
@@ -788,6 +986,8 @@ def main() -> int:
                         f"{adr_ref}. "
                         f"Grounding files freeze with ADR acceptance."
                     )
+
+    errors.extend(recorded_move_errors("HEAD"))
 
     if errors:
         print("ADR governance failed:")
