@@ -32,7 +32,9 @@ Run: python3 scripts/test_adr_governance.py
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -2044,6 +2046,220 @@ def main() -> int:
             rc == 1
             and "Accepted ADRs are immutable" in out
             and "docs/adr/0042-test.md" in out,
+        ))
+
+    # Recorded consolidation move: identical archived bytes pass, and a
+    # later edit of those bytes still fails after the move is the base.
+    def _record_move(work: Path) -> None:
+        src = work / "docs" / "adr" / "0042-test.md"
+        data = src.read_bytes()
+        archive = work / "docs" / "adr-archive"
+        archive.mkdir(parents=True)
+        dest = archive / "0042-test.md"
+        dest.write_bytes(data)
+        src.unlink()
+        src.symlink_to("../adr-archive/0042-test.md")
+        manifest = {
+            "schema_version": 1,
+            "plan": "docs/adr/consolidated/README.md",
+            "moves": [
+                {
+                    "from": "docs/adr/0042-test.md",
+                    "to": "docs/adr-archive/0042-test.md",
+                    "link": "../adr-archive/0042-test.md",
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            ],
+        }
+        (archive / "move.json").write_text(json.dumps(manifest) + "\n")
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=True)
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: identical archive bytes and old path link pass",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=True)
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move"],
+            cwd=work, check=True,
+        )
+        archived = work / "docs" / "adr-archive" / "0042-test.md"
+        archived.write_text(archived.read_text().replace(
+            "Test decision body.", "MUTATED decision body."
+        ))
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "edit archived accepted bytes"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: editing archived Accepted bytes fails closed",
+            rc == 1 and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "accepted ADR on main"],
+            cwd=work, check=True,
+        )
+        _record_move(work)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "record consolidation move on main"],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        archived = work / "docs" / "adr-archive" / "0042-test.md"
+        archived.write_text(archived.read_text().replace(
+            "Test decision body.", "MUTATED decision body."
+        ))
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "edit archive after the move is the base"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "recorded move: post-move base still rejects an archive edit",
+            rc == 1 and "Accepted ADRs are immutable" in out,
+        ))
+
+    _TRANSIENT = """\
+# Identity keys note
+
+- **Status:** Proposed
+- **Target slot:** A02
+
+## Decision
+
+Keep the owner key separate.
+"""
+
+    def _commit_all(work: Path, message: str) -> None:
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=work, check=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT)
+        _commit_all(work, "propose transient record")
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: accepting a record passes",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+        path.write_text(accepted.replace(
+            "Keep the owner key separate.", "MUTATED decision body."
+        ))
+        _commit_all(work, "edit accepted transient body")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: editing an Accepted body fails across a later commit",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-identity-keys.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        path.unlink()
+        _commit_all(work, "fold by deleting the accepted record")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: folding that drops Accepted bytes fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "Folding does not change these bytes." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/0117-new-decision.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT)
+        _commit_all(work, "bad transient filename")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: filename must be T-<slug>.md",
+            rc == 1 and "filename must be docs/adr/transient/T-<slug>.md." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT.replace("- **Target slot:** A02\n", ""))
+        _commit_all(work, "missing target slot")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: a record must name one target slot",
+            rc == 1 and "name one target slot from A01 to A15." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(_TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Rejected"))
+        _commit_all(work, "rejected lifecycle")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: lifecycle must stay Proposed until David accepts it",
+            rc == 1 and "lifecycle must stay Proposed until David accepts it." in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/README.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "# Transient decisions\n\n"
+            "A new or changed decision goes in `T-<slug>.md` in this directory.\n"
+        )
+        _commit_all(work, "add transient support readme")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: the support README is not a decision record",
+            rc == 0 and "ADR governance passed" in out,
         ))
 
     failed = results.count(False)

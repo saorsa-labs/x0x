@@ -3,18 +3,29 @@
 ## Consolidation review
 
 Read the [15 ADR set](consolidated/README.md) for the direction confirmed by
-David (D198) on 5 October 2026. Its records remain Proposed replacements while the transfer
-checks are open. This index, its status overlay and accepted records continue
-to govern existing work. New docs follow the [style guide](../documentation-style.md).
+David (D198) on 5 October 2026. David accepted the transfer on 10 Oct 2026.
+The numbered records in the [transfer map](consolidated/TRANSFER.md) are the
+historical archive. They keep these paths as links. Their bytes live in
+[docs/adr-archive](../adr-archive/ARCHIVE.md) and are unchanged. The slot
+files stay Proposed. This index and its status overlay still name the
+accepted records. New docs follow the [style guide](../documentation-style.md).
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. Both are
+in the transfer map. Their bytes are archived with the other mapped records.
+`python3 scripts/check-adr-count.py` fails when the current count exceeds 15.
+The plan is the [15 ADR set](consolidated/README.md).
 
 This directory contains architecture decision records for x0x.
 
 ## Transfer rulings (2026-10-05)
 
-D198 confirms the consolidation direction and writing target; the drafts stay
-Proposed until David accepts the transfer. D199 keeps new or changed decisions
-in the numbered ADR series only, under ADR 0087. The reserved numbers and
-0109–0114 acceptance lanes stand; slot revisions are drafts.
+D198 confirms the consolidation direction and writing target. David accepted
+the transfer on 10 Oct 2026. The slot files stay Proposed. A new or changed
+decision is `docs/adr/transient/T-<slug>.md` (D242). It names one target
+slot from A01 to A15. Write 300 to 600 words. Use about 80% ASD-STE100
+style. Follow the [style guide](../documentation-style.md). It stays
+Proposed until David accepts it. David folds it into that slot only when
+he asks. The reserved numbers and 0109–0114 acceptance lanes
+stand; slot revisions are drafts.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
 implementation status does not defer that decision. D197 confirms that
@@ -49,6 +60,17 @@ Index entries below that carry an **[overlay: …]** tag are covered here.
 - **To be superseded or amended:** the direction is ruled, but the successor
   ADR is not Accepted yet. The existing ADR still describes shipped
   behaviour; new work follows the ruling.
+
+### ADR 0095 open question 4
+
+David ruled on 10 Oct 2026. He closed open question 4. ADR 0095 is Accepted
+and archived, so its question list stays unchanged. The answer is in
+[A01 Open questions](consolidated/A01-r01-purpose-and-product-limits.md#open-questions).
+
+Goal E counts in place of an R under rule 5 when the change keeps behaviour
+the same and the gain is measured with a before-and-after number. The E-D15
+checklist still applies. A wire, protocol, API, or dependency change still
+needs its own ADR first.
 
 ### Do not start new work: parked, retired, rejected, withdrawn or held
 

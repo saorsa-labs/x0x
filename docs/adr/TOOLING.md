@@ -3,8 +3,11 @@
 ## Use the 15 slot plan
 
 Read [the consolidation rules](consolidated/README.md) before creating a record.
-During transfer, new or changed decisions use the numbered ADR series only,
-through [the template](TEMPLATE.md) and ADR 0087 (D199). Slot revisions are
+A new or changed decision is [`docs/adr/transient/T-<slug>.md`](transient/README.md)
+(D242). It names one target slot from A01 to A15. Write 300 to 600 words.
+Use about 80% ASD-STE100 style. Follow the [style guide](../documentation-style.md).
+It stays Proposed until David accepts it. David folds it into that slot only
+when he asks. Slot revisions are
 drafts until David accepts the transfer. Do not allocate A16 or start a
 second consolidated series. Keep reserved numbers 0090/0091 (D18), 0097
 (D20), 0098 (D35), and 0084–0105 (D63). Slices 0109–0114 continue to
@@ -50,7 +53,7 @@ Add this project instruction to every AI coding harness profile (`AGENTS.md`, `C
 
 ```text
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
-D199: during transfer, new or changed decisions use the numbered ADR series only, through docs/adr/TEMPLATE.md and ADR 0087.
+D242: a new or changed decision is docs/adr/transient/T-<slug>.md. Name one slot A01-A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow docs/documentation-style.md. Stay Proposed until David accepts it. Fold it into that slot only when David asks.
 A01-A15 slot revisions are drafts until David accepts the transfer. Do not create A16 or a second consolidated series.
 Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue to numbered acceptance. Keep their current gates.
 Use approximately 80% ASD-STE100 style in ADRs, docs and communication with David. Follow docs/documentation-style.md.
@@ -70,6 +73,23 @@ Do **not** "vibe code" ADRs. A useful ADR must show clear thinking: context, opt
 record paths, required section headings, and a leading Proposed status token.
 It rejects unindexed files and early activation. Status annotations are
 allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
+
+`python3 scripts/check-adr-count.py` fails when the current count exceeds
+15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
+map keep their exact paths as links and stay outside that count. The count
+excludes a path only when that path is an approved historical source and
+`docs/adr-archive/move.json` records it as that archive link. A new
+`move.json` entry outside that set is rejected. Files under
+`docs/adr/transient/` do not count (D242). A new decision there is
+`T-<slug>.md`, names one target slot from A01 to A15, and stays Proposed
+until David accepts it. An Accepted transient body stays frozen. A nested
+file that reuses a mapped number counts. A legal run prints the pass line
+only. It does not name an unplaced record.
+
+A recorded consolidation move may replace a numbered path with a symlink
+to `docs/adr-archive/` when `docs/adr-archive/move.json` records the path,
+link, and sha256. The archived bytes must match the frozen Accepted
+snapshot. Any other content change still fails.
 
 The check does not validate clause or ruling coverage in TRANSFER.md, link
 targets, source status claims, body/header revision agreement, prose meaning,

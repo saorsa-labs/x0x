@@ -1,6 +1,7 @@
 # Transfer map for the 15 ADR set
 
 Source commit: `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. The source set contains 100 numbered ADRs.
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. Those two rows are after the source set.
 
 Every row has one primary home. Related ADRs can cite other slots.
 **All clause reviews remain pending.** A mapping is not formal supersession.
@@ -107,6 +108,8 @@ Every row has one primary home. Related ADRs can cite other slots.
 | [ADR 0112: Any-Admin Invite Redemption (0088 S6)](../0112-any-admin-invite-redemption.md) | Proposed | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | [ADR 0113: Home Is an Explicit Owner Group, Adopted in Place (0088 S7)](../0113-home-is-an-explicit-owner-group-adopted-in-place.md) | Proposed | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | [ADR 0114: Authority Re-Welcome for Unconfirmed Join Rows](../0114-authority-re-welcome.md) | Proposed | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
+| [ADR 0115: Identity Discovery Authority Comes Only From Agent-Authenticated Evidence](../0115-identity-discovery-authority.md) | Accepted | [A02](A02-r01-identity-keys-and-device-enrollment.md) | Pending |
+| [ADR 0116: Local History Retention by Class and Topic](../0116-local-history-retention-policy.md) | Accepted | [A07](A07-r01-messages-receipts-history-and-retry.md) | Pending |
 
 ## Rulings
 
