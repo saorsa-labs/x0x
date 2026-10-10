@@ -235,9 +235,10 @@ esac
         return argparse.Namespace(hosts_file="hosts", nodes=["owner", "writer", "late", "revoked", "outsider"],
                                   daemon_binary="/opt/x0x/x0xd", cli_binary="/opt/x0x/x0x",
                                   api_port_base=14600, quic_port_base=7483, local_port_base=24700,
-                                  poll_timeout=20)
+                                  poll_timeout=20, mixed=False)
 
-    def run_model(self, fixture=None, scenario_cls=None, card_reply=None, tunnel_side_effect=None):
+    def run_model(self, fixture=None, scenario_cls=None, card_reply=None, tunnel_side_effect=None, *,
+                  binary_shas=None, deployed_shas=None, mixed=False, captured=None):
         """Run the REAL run_fixture -> run_home -> exercise ordering against a stateful model.
 
         The model encodes the product facts the harness depends on: a Home join is
@@ -249,7 +250,8 @@ esac
         device yields (`elsewhere`, canonical gid) until it is seated.
         """
         h = fixture or self.h
-        args = self.args(); evidence = self.h.Evidence(); resources = {}
+        args = self.args(); args.mixed = mixed
+        evidence = self.h.Evidence(); resources = {}
         tokens = {n: (f"192.0.2.{i}", "unused") for i, n in enumerate(args.nodes, 1)}
         ids = {n: (str(i) * 64) for i, n in enumerate(args.nodes, 1)}
         public_keys = {n: f"{i:02x}" * 1952 for i, n in enumerate(args.nodes, 1)}
@@ -282,7 +284,13 @@ esac
                 self.keys[target.label] = self.keys[source.label]; events.append(("copy", target.label))
                 return self.keys[target.label]
             def token(self, _node): return "synthetic-token"
-            def hashes(self, node): return (str(args.nodes.index(node.label) + 1) * 64, "f" * 64)
+            def hashes(self, node):
+                sha = "f" * 64 if binary_shas is None else binary_shas[node.label]
+                return (str(args.nodes.index(node.label) + 1) * 64, sha)
+            def deployed_binary_sha(self, node):
+                if deployed_shas is None:
+                    return self.hashes(node)[1]
+                return deployed_shas[node.label]
             def restore(self): return []
 
         def online(label): return label not in Custody.instance.offline
@@ -390,6 +398,8 @@ esac
                 h.run_fixture(args, mock.Mock(), evidence, resources)
             except AssertionError as caught:
                 error = caught
+        if captured is not None:
+            captured.update(resources)
         return events, Custody.instance, world, evidence, error
 
     def test_devices_without_owner_sync_pairing_are_caught_provisioning_a_duplicate(self):
@@ -443,6 +453,86 @@ esac
                  last(("stop", "writer"))]
         self.assertEqual(sorted(chain), chain)
         self.assertEqual({"owner", "writer", "late", "outsider"}, set(world["seats"]))
+
+    def _binary_shas(self, older):
+        """Two deployed x0xd hashes. `older` labels keep the first."""
+        nodes = self.args().nodes
+        first, second = "ab" * 32, "cd" * 32
+        return {label: first if label in older else second for label in nodes}
+
+    def test_mixed_fleet_records_each_binary_and_continues(self):
+        """#1208: distinct deployed binaries must not abort Home before the first step."""
+        shas = self._binary_shas({"owner", "late"})
+        captured: dict = {}
+        events, _custody, _world, evidence, error = self.run_model(
+            binary_shas=shas, mixed=True, captured=captured)
+        self.assertIsNone(error)
+        row = next(item for item in evidence.assertions
+                   if item["label"] == "fixture custody receipt is reproducible")
+        self.assertTrue(row["passed"])
+        self.assertEqual(shas, row["binary_sha256"])
+        self.assertEqual(shas, row["deployed_binary_sha256"])
+        self.assertTrue(row["mixed"])
+        self.assertEqual([], row["mismatched_nodes"])
+        self.assertEqual(shas, captured["manifest"]["binary_sha256"])
+        self.assertEqual(shas, captured["manifest"]["deployed_binary_sha256"])
+        self.assertTrue(captured["manifest"]["mixed"])
+        self.assertIn(("req", "owner", "GET", "/home"), events)
+
+    def test_single_binary_run_rejects_distinct_binary_shas(self):
+        shas = self._binary_shas({"owner"})
+        events, _custody, _world, evidence, error = self.run_model(binary_shas=shas, mixed=False)
+        self.assertIsInstance(error, AssertionError)
+        row = next(item for item in evidence.assertions
+                   if item["label"] == "fixture custody receipt is reproducible")
+        self.assertFalse(row["passed"])
+        self.assertNotIn(("req", "owner", "GET", "/home"), events)
+
+    def test_custody_receipt_must_match_the_binary_on_that_node(self):
+        nodes = self.args().nodes
+        same = "ab" * 32
+        deployed = {label: same for label in nodes}
+        deployed["writer"] = "cd" * 32
+        events, _custody, _world, evidence, error = self.run_model(
+            binary_shas={label: same for label in nodes}, deployed_shas=deployed, mixed=True)
+        self.assertIsInstance(error, AssertionError)
+        row = next(item for item in evidence.assertions
+                   if item["label"] == "fixture custody receipt is reproducible")
+        self.assertFalse(row["passed"])
+        self.assertEqual(["writer"], row["mismatched_nodes"])
+        self.assertEqual({label: same for label in nodes}, row["binary_sha256"])
+        self.assertEqual(deployed, row["deployed_binary_sha256"])
+        self.assertNotIn(("req", "owner", "GET", "/home"), events)
+
+    def test_evaluate_custody_receipt_rejects_a_partial_or_non_hex_map(self):
+        owner, config = "ab" * 32, "11" * 32
+        receipts = {"owner": (config, owner)}
+        with self.assertRaises(RuntimeError):
+            self.h.evaluate_custody_receipt(receipts, {}, mixed=True)
+        with self.assertRaises(RuntimeError):
+            self.h.evaluate_custody_receipt({"owner": ("zz" * 32, owner)}, {"owner": owner}, mixed=True)
+        same = self.h.evaluate_custody_receipt(receipts, {"owner": owner}, mixed=False)
+        self.assertTrue(same["passed"])
+        self.assertTrue(same["uniform"])
+
+    def test_deployed_binary_sha_reads_the_node_binary(self):
+        remote = mock.Mock()
+        remote.run.return_value = ("ab" * 32 + "\n").encode()
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "a" * 32)
+        self.assertEqual("ab" * 32, custody.deployed_binary_sha(self.node()))
+        args, kwargs = remote.run.call_args
+        self.assertEqual(["/opt/x0x/x0xd"], args[2])
+        self.assertTrue(kwargs["capture"])
+        remote.run.return_value = b"not-a-sha\n"
+        with self.assertRaisesRegex(RuntimeError, "invalid deployed binary sha256"):
+            custody.deployed_binary_sha(self.node())
+
+    def test_mixed_flag_is_accepted(self):
+        script = Path(__file__).parent / "e2e_home_fixture.py"
+        result = subprocess.run([sys.executable, str(script), "--help"],
+                                capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(0, result.returncode)
+        self.assertIn("--mixed", result.stdout)
 
     def test_card_envelope_rejects_missing_or_malformed_signed_fields_before_issuance(self):
         key, signature = "02" * 1952, "ab" * 3309

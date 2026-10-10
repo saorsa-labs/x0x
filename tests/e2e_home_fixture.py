@@ -3,6 +3,9 @@
 
 Every daemon, key and token belongs to a fresh /var/tmp/x0x-home-e2e-<uuid>
 root. Existing x0x services and identities are never inspected or modified.
+A single-binary run requires every node to record the same x0xd sha256.
+Pass --mixed to record each node's sha256 and check it against the binary
+deployed to that node.
 """
 from __future__ import annotations
 
@@ -330,6 +333,19 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             raise RuntimeError("invalid synthetic custody hash receipt")
         return fields[0], fields[1]
 
+    def deployed_binary_sha(self, node: Node) -> str:
+        """sha256 of the x0xd file this fixture starts on the node."""
+        self.validate(node)
+        raw = self.remote.run(node.host, r'''set -eu
+binary=$1
+[ -f "$binary" ]
+sha256sum "$binary" | awk '{print $1}'
+''', [self.binary], capture=True)
+        value = raw.decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise RuntimeError("invalid deployed binary sha256")
+        return value
+
     def control_blob_witnesses(self) -> list[dict[str, Any]]:
         """Strictly parsed, node-tagged witness receipts from every started node's log."""
         witnesses: list[dict[str, Any]] = []
@@ -586,6 +602,41 @@ def config_bytes(node: Node, plane: str, bootstrap: str | None) -> bytes:
             '[update]\nenabled = false\n').encode()
 
 
+def _sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def evaluate_custody_receipt(receipts: dict[str, tuple[str, str]], deployed: dict[str, str], *,
+                             mixed: bool) -> dict[str, Any]:
+    """Per-node binary receipt must match the binary deployed to that node.
+
+    A run without --mixed also requires every node to record the same sha256.
+    """
+    if not receipts or set(receipts) != set(deployed):
+        raise RuntimeError("custody receipt does not cover the deployed nodes")
+    binary_sha256: dict[str, str] = {}
+    config_sha256: dict[str, str] = {}
+    mismatched: list[str] = []
+    for label, (config_sha, binary_sha) in receipts.items():
+        expected = deployed[label]
+        if not all(_sha256_hex(value) for value in (config_sha, binary_sha, expected)):
+            raise RuntimeError("invalid synthetic custody hash receipt")
+        config_sha256[label] = config_sha
+        binary_sha256[label] = binary_sha
+        if binary_sha != expected:
+            mismatched.append(label)
+    uniform = len(set(binary_sha256.values())) == 1
+    return {
+        "passed": not mismatched and (mixed or uniform),
+        "binary_sha256": binary_sha256,
+        "deployed_binary_sha256": {label: deployed[label] for label in receipts},
+        "config_sha256": config_sha256,
+        "mismatched_nodes": mismatched,
+        "uniform": uniform,
+        "mixed": mixed,
+    }
+
+
 def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                 resources: dict[str, Any]) -> bool:
     run_id = uuid.uuid4().hex
@@ -628,20 +679,25 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
             clients[label] = Api(f"http://127.0.0.1:{tunnel.local_port}", custody.token(node))
         run_setup_step(evidence, custody, node, "readiness probe", open_api)
     receipts: dict[str, tuple[str, str]] = {}
+    deployed: dict[str, str] = {}
     for label, node in nodes.items():
         def grab(label: str = label, node: Node = node) -> None:
             receipts[label] = custody.hashes(node)
+            deployed[label] = custody.deployed_binary_sha(node)
         run_setup_step(evidence, custody, node, "readiness probe", grab)
-    binary_hashes = {receipt[1] for receipt in receipts.values()}
-    evidence.check("fixture custody receipt is reproducible", len(binary_hashes) == 1,
-                   run_id=run_id, network_id=plane,
-                   binary_sha256=next(iter(binary_hashes), None),
-                   config_sha256={label: receipt[0] for label, receipt in receipts.items()})
+    # #1208: record one sha256 per node. The receipt must match the binary
+    # deployed there. A single-binary run still requires every sha256 to match.
+    facts = evaluate_custody_receipt(receipts, deployed, mixed=bool(getattr(args, "mixed", False)))
+    passed = facts.pop("passed")
     resources["manifest"] = {
         "run_id": run_id, "network_id": plane,
-        "binary_sha256": next(iter(binary_hashes), None),
-        "config_sha256": {label: receipt[0] for label, receipt in receipts.items()},
+        "binary_sha256": facts["binary_sha256"],
+        "deployed_binary_sha256": facts["deployed_binary_sha256"],
+        "config_sha256": facts["config_sha256"],
+        "mixed": facts["mixed"],
     }
+    evidence.check("fixture custody receipt is reproducible", passed,
+                   run_id=run_id, network_id=plane, **facts)
     owner_api = clients[owner]
     # #824: a fresh owner device defers provisioning (at most 90 s) while it
     # waits for owner sync; poll through that documented transient state.
@@ -803,6 +859,9 @@ def main() -> int:
     parser.add_argument("--nodes", nargs=5, required=True,
                         metavar=("OWNER", "WRITER", "LATE", "REVOKED", "OUTSIDER"))
     parser.add_argument("--daemon-binary", required=True)
+    parser.add_argument("--mixed", action="store_true",
+                        help="allow distinct x0xd binaries; each node's receipt must still "
+                             "match the binary deployed to that node")
     parser.add_argument("--cli-binary", required=True)
     parser.add_argument("--api-port-base", type=int, default=14600)
     parser.add_argument("--quic-port-base", type=int, default=7483)
