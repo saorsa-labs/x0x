@@ -48,6 +48,8 @@ struct PendingImage {
 pub(crate) struct RetainedPagePool {
     images: BTreeMap<RetainedPageBinding, PendingImage>,
     received_len: usize,
+    /// Incomplete images `prune` has dropped and no caller has observed yet.
+    unreported_prunes: u64,
 }
 
 impl RetainedPagePool {
@@ -358,11 +360,51 @@ impl RetainedPagePool {
             .filter(|(_, pending)| now.duration_since(pending.created) > INFLIGHT_TTL)
             .map(|(binding, _)| binding.clone())
             .collect();
+        let mut dropped = 0u64;
         for binding in expired {
             if let Some(pending) = self.images.remove(&binding) {
                 self.received_len = self.received_len.saturating_sub(pending.received_len);
+                dropped = dropped.saturating_add(1);
             }
         }
+        self.unreported_prunes = self.unreported_prunes.saturating_add(dropped);
+    }
+
+    /// Drop images older than the inflight TTL and return how many incomplete
+    /// images have been discarded since the last call.
+    ///
+    /// `push` already prunes, so a later page can discard an image before
+    /// this runs. The count covers both paths.
+    pub(crate) fn take_pruned_incomplete(&mut self) -> u64 {
+        self.prune();
+        std::mem::take(&mut self.unreported_prunes)
+    }
+
+    /// When the oldest incomplete image reaches the inflight TTL.
+    ///
+    /// `None` when the pool is empty. Callers sleep until this instant and
+    /// then take the pruned count.
+    pub(crate) fn next_prune_deadline(&self) -> Option<Instant> {
+        self.images
+            .values()
+            .map(|pending| pending.created + INFLIGHT_TTL)
+            .min()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_pending_for_test(&mut self) {
+        let expired_at = Instant::now() - INFLIGHT_TTL - Duration::from_secs(1);
+        for pending in self.images.values_mut() {
+            pending.created = expired_at;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_page_count_for_test(&self) -> usize {
+        self.images
+            .values()
+            .map(|pending| pending.pages.len())
+            .sum()
     }
 }
 
@@ -790,6 +832,38 @@ mod tests {
             )
             .is_err());
         assert!(!pool.images.contains_key(&large_b));
+    }
+
+    /// #1117: an incomplete image that ages past the inflight TTL is reported
+    /// once, then the pool no longer holds it. A fresh image is not a drop.
+    #[test]
+    fn expired_incomplete_image_is_counted_when_pruned() {
+        let binding = RetainedPageBinding {
+            store_id: [4; 32],
+            endorser: [1; 32],
+            authorization: [2; 32],
+            image_id: [4; 32],
+        };
+        let mut pool = RetainedPagePool::default();
+        assert!(pool
+            .push(
+                binding,
+                RetainedPageV1::Page {
+                    image_id: [4; 32],
+                    index: 0,
+                    bytes: vec![9, 9],
+                },
+            )
+            .expect("buffer the only page")
+            .is_none());
+        assert_eq!(pool.take_pruned_incomplete(), 0);
+        assert_eq!(pool.pending_page_count_for_test(), 1);
+        pool.expire_pending_for_test();
+        assert!(pool.next_prune_deadline().expect("deadline") <= Instant::now());
+        assert_eq!(pool.take_pruned_incomplete(), 1);
+        assert_eq!(pool.pending_page_count_for_test(), 0);
+        assert_eq!(pool.received_len, 0);
+        assert_eq!(pool.take_pruned_incomplete(), 0);
     }
 
     /// #886 r3 (reviews (a)+(c)): a full pool of idle images no longer
