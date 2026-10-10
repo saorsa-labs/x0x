@@ -42,10 +42,14 @@ CORE_MARKERS = (
     "x0x store create",
     "-X PUT",
     "/stores/",
-    # The scratch example is a local: topic and is not a private store.
-    "local:scratch-pad",
+    # The scratch example must say the value can leave the daemon.
+    "non-blocked contacts",
     "non-sensitive",
+    "not a private store",
 )
+# A local: pub/sub prefix does not make this store write local. Reject the
+# claim that the scratch topic stays on this daemon.
+FALSE_LOCALITY = "keeps this topic on this daemon"
 
 
 def tokens(data: bytes) -> int:
@@ -91,6 +95,10 @@ def check(root: Path) -> list[str]:
             if "](docs/skill/" in core_text:
                 errors.append(
                     f"{CORE}: topic link is relative; use an absolute GitHub URL"
+                )
+            if FALSE_LOCALITY in core_text:
+                errors.append(
+                    f"{CORE}: scratch example claims same-daemon locality"
                 )
             for page in PAGES:
                 url = TOPIC_URL + page
@@ -138,8 +146,9 @@ x0x direct send
 x0x store create
 -X PUT
 /stores/
-local:scratch-pad
+non-blocked contacts
 non-sensitive
+not a private store
 """
 
 
@@ -218,6 +227,14 @@ def self_test() -> int:
             _valid_pages(),
         )
         expect_fail("relative topic link", relative, "topic link is relative")
+
+        local_claim = base / "local-claim"
+        _write_tree(
+            local_claim,
+            VALID_CORE + "\nThe local: prefix keeps this topic on this daemon.\n",
+            _valid_pages(),
+        )
+        expect_fail("false scratch locality", local_claim, "same-daemon locality")
 
     if failures:
         for failure in failures:
