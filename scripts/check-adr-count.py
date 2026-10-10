@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Count current ADRs and fail when the total exceeds 15.
 
-The plan is docs/adr/consolidated/README.md. Numbered ADRs listed in the
-transfer map keep their paths and do not count. A legal run prints the
-pass line only.
+The plan is docs/adr/consolidated/README.md. An exact ``docs/adr/NNNN-*.md``
+path does not count when ``docs/adr-archive/move.json`` records it and that
+path is a symlink to the recorded archive link. A nested file that reuses a
+mapped number counts. A legal run prints the pass line only.
 
 This check reads local files only. It never starts x0xd or contacts the network.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -41,9 +43,45 @@ def mapped_ids(root: Path) -> set[str]:
     return set(MAPPED_LINK.findall(table))
 
 
+def recorded_archive_paths(root: Path) -> set[str]:
+    """Return exact old paths that are recorded archive links.
+
+    A path is excluded only when ``move.json`` records it and the file at
+    that path is a symlink to the recorded link. A nested file that reuses
+    the same number does not match.
+    """
+    manifest_path = root / "docs/adr-archive/move.json"
+    if not manifest_path.is_file():
+        return set()
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = data.get("moves") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("docs/adr-archive/move.json: moves must be a list.")
+    recorded: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        src = entry.get("from")
+        link = entry.get("link")
+        if not isinstance(src, str) or not isinstance(link, str):
+            continue
+        # docs/adr/NNNN-name.md only. A nested path is never an old path.
+        if not src.startswith("docs/adr/") or src.count("/") != 2:
+            continue
+        path = root / src
+        if not path.is_symlink():
+            continue
+        target = path.readlink()
+        target_text = target.as_posix() if isinstance(target, Path) else str(target)
+        if target_text != link:
+            continue
+        recorded.add(src)
+    return recorded
+
+
 def current_records(root: Path) -> tuple[int, list[str]]:
     """Return the current count and the relative paths that raised it."""
-    mapped = mapped_ids(root)
+    archived = recorded_archive_paths(root)
     slot_count = 0
     consolidated = root / "docs/adr/consolidated"
     if consolidated.exists():
@@ -59,8 +97,8 @@ def current_records(root: Path) -> tuple[int, list[str]]:
             relative = path.relative_to(adr_dir)
             if relative.parts and relative.parts[0] == "consolidated":
                 continue
-            number = NUMBERED_FILE.fullmatch(path.name).group(1)
-            if number in mapped:
+            repo_path = f"docs/adr/{relative.as_posix()}"
+            if repo_path in archived:
                 continue
             extras.append(relative.as_posix())
     extras.sort()
@@ -70,7 +108,7 @@ def current_records(root: Path) -> tuple[int, list[str]]:
 def validate(root: Path) -> list[str]:
     try:
         count, extras = current_records(root)
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         return [f"Cannot count ADRs: {exc}. Plan: {PLAN}"]
     if count > LIMIT:
         return [fail_line(count, extras)]

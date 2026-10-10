@@ -19,7 +19,10 @@ class AdrCountTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        shutil.copytree(ROOT / "docs/adr", self.root / "docs/adr")
+        shutil.copytree(ROOT / "docs/adr", self.root / "docs/adr", symlinks=True)
+        archive = self.root / "docs/adr-archive"
+        archive.mkdir()
+        shutil.copy2(ROOT / "docs/adr-archive/move.json", archive / "move.json")
 
     def test_repository_count_stays_within_the_limit_of_15(self):
         self.assertEqual(CHECK.validate(ROOT), [])
@@ -49,6 +52,20 @@ class AdrCountTests(unittest.TestCase):
             [
                 "16 current ADRs exceeds the limit of 15. "
                 "Extra: 0117-extra-record.md. "
+                "Plan: docs/adr/consolidated/README.md"
+            ],
+        )
+
+    def test_nested_file_reusing_a_mapped_number_counts(self):
+        extra = self.root / "docs/adr/drafts/0115-new-decision.md"
+        extra.parent.mkdir()
+        extra.write_text("# ADR 0115\n\n- **Status:** Proposed\n")
+        errors = CHECK.validate(self.root)
+        self.assertEqual(
+            errors,
+            [
+                "16 current ADRs exceeds the limit of 15. "
+                "Extra: drafts/0115-new-decision.md. "
                 "Plan: docs/adr/consolidated/README.md"
             ],
         )
