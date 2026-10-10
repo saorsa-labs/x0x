@@ -73,8 +73,8 @@ allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
 
 `python3 scripts/check-adr-count.py` fails when the current count exceeds
 15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
-map keep their paths as links and stay outside that count. ADR 0115 and
-ADR 0116 stay outside that count and are named as unplaced.
+map keep their paths as links and stay outside that count. A legal run
+prints the pass line only. It does not name an unplaced record.
 
 A recorded consolidation move may replace a numbered path with a symlink
 to `docs/adr-archive/` when `docs/adr-archive/move.json` records the path,

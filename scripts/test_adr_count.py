@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -28,14 +30,15 @@ class AdrCountTests(unittest.TestCase):
             CHECK.pass_line(count),
             "PASS: 15 current ADRs, within the limit of 15. Plan: docs/adr/consolidated/README.md",
         )
-
-    def test_hold_is_only_the_records_absent_from_the_transfer_map(self):
-        self.assertEqual(CHECK.HOLD, frozenset({"0115", "0116"}))
-        self.assertEqual(
-            CHECK.hold_note(ROOT),
-            "UNPLACED: ADR 0115 and ADR 0116 are outside the #1244 map and are not part of the 15. "
-            "Plan: docs/adr/consolidated/README.md",
+        reported = subprocess.check_output(
+            [sys.executable, str(ROOT / "scripts/check-adr-count.py")],
+            text=True,
         )
+        self.assertEqual(
+            reported,
+            "PASS: 15 current ADRs, within the limit of 15. Plan: docs/adr/consolidated/README.md\n",
+        )
+        self.assertNotIn("UNPLACED", reported)
 
     def test_extra_numbered_adr_exceeds_the_limit_of_15(self):
         extra = self.root / "docs/adr/0117-extra-record.md"
@@ -65,9 +68,9 @@ class AdrCountTests(unittest.TestCase):
         mapped = CHECK.mapped_ids(self.root)
         self.assertIn("0001", mapped)
         self.assertIn("0114", mapped)
-        self.assertNotIn("0115", mapped)
-        self.assertNotIn("0116", mapped)
-        self.assertEqual(len(mapped), 100)
+        self.assertIn("0115", mapped)
+        self.assertIn("0116", mapped)
+        self.assertEqual(len(mapped), 102)
 
 
 if __name__ == "__main__":

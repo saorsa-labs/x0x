@@ -54,9 +54,10 @@ not yet support multiple revision files per slot; see [coverage gaps](../TOOLING
 is 15. This file is the plan. David accepted the transfer on 10 Oct 2026.
 A numbered ADR in the [transfer map](TRANSFER.md) keeps its `docs/adr/` path
 as a link. Its bytes live in `docs/adr-archive/` and stay outside the count.
-ADR 0115 and ADR 0116 are outside that map. They stay in force outside the
-count. Another numbered ADR, or an A16 record, makes the count exceed 15
-and the check fails.
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. They are
+in that map. ADR 0115 also touches A03. ADR 0116 also touches A08 and cites
+ADR 0030. Those are secondary links, not second placements. Another numbered
+ADR, or an A16 record, makes the count exceed 15 and the check fails.
 
 ## Transfer before activation
 

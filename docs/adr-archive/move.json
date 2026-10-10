@@ -603,6 +603,18 @@
       "to": "docs/adr-archive/0114-authority-re-welcome.md",
       "link": "../adr-archive/0114-authority-re-welcome.md",
       "sha256": "a41a4c4551cd6ad5a7d389153eb543e294c48712a82e92f61db8a6a62437a012"
+    },
+    {
+      "from": "docs/adr/0115-identity-discovery-authority.md",
+      "to": "docs/adr-archive/0115-identity-discovery-authority.md",
+      "link": "../adr-archive/0115-identity-discovery-authority.md",
+      "sha256": "8824338bc3feb739cbb63fa1c267ee4994df7a4758fe20453ec81b962cd7e4dd"
+    },
+    {
+      "from": "docs/adr/0116-local-history-retention-policy.md",
+      "to": "docs/adr-archive/0116-local-history-retention-policy.md",
+      "link": "../adr-archive/0116-local-history-retention-policy.md",
+      "sha256": "13057dd17ada731d1cc614bcfa7156891079ee97df954a9772a6bf8b8daad68e"
     }
   ]
 }

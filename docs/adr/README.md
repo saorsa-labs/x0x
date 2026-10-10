@@ -9,8 +9,8 @@ historical archive. They keep these paths as links. Their bytes live in
 [docs/adr-archive](../adr-archive/ARCHIVE.md) and are unchanged. The slot
 files stay Proposed. This index and its status overlay still name the
 accepted records. New docs follow the [style guide](../documentation-style.md).
-ADR 0115 and ADR 0116 are outside that map. They stay in this directory,
-in force, and outside the count of 15.
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. Both are
+in the transfer map. Their bytes are archived with the other mapped records.
 `python3 scripts/check-adr-count.py` fails when the current count exceeds 15.
 The plan is the [15 ADR set](consolidated/README.md).
 

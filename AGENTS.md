@@ -86,7 +86,7 @@ or a second consolidated series. Reserved numbered ADRs remain reserved:
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
 Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
 records, overlay, frozen evidence and team gates remain in force.
-ADR 0115 and ADR 0116 are outside the transfer map and outside the count.
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026.
 Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
 Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
 The plan is `docs/adr/consolidated/README.md`.

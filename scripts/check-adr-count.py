@@ -2,9 +2,8 @@
 """Count current ADRs and fail when the total exceeds 15.
 
 The plan is docs/adr/consolidated/README.md. Numbered ADRs listed in the
-transfer map keep their paths and do not count. ADR 0115 and ADR 0116 were
-accepted after that map. The plan assigns them no slot. They stay in force
-and stay outside this count.
+transfer map keep their paths and do not count. A legal run prints the
+pass line only.
 
 This check reads local files only. It never starts x0xd or contacts the network.
 """
@@ -16,8 +15,6 @@ from pathlib import Path
 
 LIMIT = 15
 PLAN = "docs/adr/consolidated/README.md"
-# Accepted after the #1244 map. No slot is assigned. Leave these files unchanged.
-HOLD = frozenset({"0115", "0116"})
 SLOT_FILE = re.compile(r"A\d{2}-r\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 NUMBERED_FILE = re.compile(r"(\d{4})-[a-z0-9][a-z0-9-]*\.md$")
 MAPPED_LINK = re.compile(r"\]\(\.\./(\d{4})-")
@@ -63,7 +60,7 @@ def current_records(root: Path) -> tuple[int, list[str]]:
             if relative.parts and relative.parts[0] == "consolidated":
                 continue
             number = NUMBERED_FILE.fullmatch(path.name).group(1)
-            if number in mapped or number in HOLD:
+            if number in mapped:
                 continue
             extras.append(relative.as_posix())
     extras.sort()
@@ -80,25 +77,6 @@ def validate(root: Path) -> list[str]:
     return []
 
 
-def hold_note(root: Path) -> str | None:
-    present = []
-    for number in sorted(HOLD):
-        if any((root / "docs/adr").glob(f"{number}-*.md")):
-            present.append(f"ADR {number}")
-    if not present:
-        return None
-    if len(present) == 1:
-        names = present[0]
-    elif len(present) == 2:
-        names = f"{present[0]} and {present[1]}"
-    else:
-        names = ", ".join(present)
-    return (
-        f"UNPLACED: {names} are outside the #1244 map and are not part of the {LIMIT}. "
-        f"Plan: {PLAN}"
-    )
-
-
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     errors = validate(root)
@@ -108,9 +86,6 @@ def main() -> int:
         return 1
     count, _extras = current_records(root)
     print(pass_line(count))
-    note = hold_note(root)
-    if note:
-        print(note)
     return 0
 
 
