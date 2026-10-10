@@ -55,6 +55,9 @@ pub(super) struct PubSubTransport {
     pub repair_tracking_overflow: AtomicU64,
     #[cfg(test)]
     pub recorder: std::sync::Mutex<Option<Recorder>>,
+    /// Test stand-in for a live QUIC session. Production always asks the node.
+    #[cfg(test)]
+    session_override: Mutex<Option<AuthenticatedSession>>,
 }
 
 #[cfg(test)]
@@ -74,7 +77,18 @@ impl PubSubTransport {
             repair_tracking_overflow: AtomicU64::new(0),
             #[cfg(test)]
             recorder: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            session_override: Mutex::new(None),
         }
+    }
+
+    /// Install the session token key-cache recovery tests present as provenance.
+    #[cfg(test)]
+    pub(super) fn set_session_override(&self, session: Option<AuthenticatedSession>) {
+        *self
+            .session_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session;
     }
     /// Track the message IDs an inbound IWANT frame requests, keyed by
     /// (peer, topic, message). Returns the scope whose `Drop` retires the
@@ -176,6 +190,16 @@ impl GossipTransport for PubSubTransport {
     }
 
     fn authenticated_session(&self, peer: PeerId) -> Option<AuthenticatedSession> {
+        #[cfg(test)]
+        if let Some(session) = *self
+            .session_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            if session.peer == peer {
+                return Some(session);
+            }
+        }
         self.network.authenticated_session(peer)
     }
 

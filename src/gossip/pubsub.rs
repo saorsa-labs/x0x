@@ -709,6 +709,9 @@ struct TopicDelivery {
     changed: tokio::sync::Notify,
     ready: tokio::sync::watch::Sender<bool>,
     alive: AtomicBool,
+    /// Set when the forwarder task returns, including forced shutdown.
+    #[cfg(test)]
+    forwarder_stopped: AtomicBool,
     stats: Arc<PubSubStats>,
     /// Held across a local publish or an inbound admission and the pump that
     /// follows it, so a later frame cannot stamp an earlier queued payload.
@@ -728,6 +731,8 @@ impl TopicDelivery {
             changed: tokio::sync::Notify::new(),
             ready,
             alive: AtomicBool::new(true),
+            #[cfg(test)]
+            forwarder_stopped: AtomicBool::new(false),
             stats,
             pump: tokio::sync::Mutex::new(()),
             plumtree_rx: Mutex::new(None),
@@ -754,24 +759,22 @@ impl TopicDelivery {
     /// Move payloads already sitting on the PlumTree receiver onto the
     /// fan-out queue. They have no inbound frame to bind, so the id is absent.
     fn pump_unstamped(&self) {
-        let mut rx = lock_std(&self.plumtree_rx);
-        let Some(rx) = rx.as_mut() else {
-            return;
-        };
-        while let Ok((_peer, encoded_payload)) = rx.try_recv() {
+        for encoded_payload in self.drain_admitted() {
             self.enqueue_stamped(encoded_payload, None);
         }
     }
 
-    /// The one payload this admission enqueued, if PlumTree delivered it.
-    fn take_admitted(&self) -> Option<Bytes> {
+    /// Payloads PlumTree has queued and this task has not yet stamped.
+    fn drain_admitted(&self) -> Vec<Bytes> {
         let mut rx = lock_std(&self.plumtree_rx);
-        let rx = rx.as_mut()?;
-        match rx.try_recv() {
-            Ok((_peer, encoded_payload)) => Some(encoded_payload),
-            Err(mpsc::error::TryRecvError::Empty)
-            | Err(mpsc::error::TryRecvError::Disconnected) => None,
+        let Some(rx) = rx.as_mut() else {
+            return Vec::new();
+        };
+        let mut produced = Vec::new();
+        while let Ok((_peer, encoded_payload)) = rx.try_recv() {
+            produced.push(encoded_payload);
         }
+        produced
     }
 
     fn insert(
@@ -850,6 +853,18 @@ impl Drop for OwnerSetup {
     }
 }
 
+/// Marks the forwarder task finished, including the path that returns
+/// because `force_close_topic_delivery` woke it.
+#[cfg(test)]
+struct ForwarderDone(Arc<TopicDelivery>);
+
+#[cfg(test)]
+impl Drop for ForwarderDone {
+    fn drop(&mut self) {
+        self.0.forwarder_stopped.store(true, Ordering::Release);
+    }
+}
+
 fn force_close_topic_delivery(deliveries: &TopicDeliveryMap, topic_id: TopicId) {
     let slot = {
         let mut map = lock_std(deliveries);
@@ -857,6 +872,9 @@ fn force_close_topic_delivery(deliveries: &TopicDeliveryMap, topic_id: TopicId) 
             return;
         };
         slot.alive.store(false, Ordering::Release);
+        // The forwarder parks on `changed` or `stamped_rx`. Dropping the
+        // downstream senders does not wake it: this slot owns `stamped_tx`.
+        slot.changed.notify_one();
         slot
     };
     let senders = std::mem::take(&mut *lock_std(&slot.senders));
@@ -1190,10 +1208,12 @@ impl Drop for Subscription {
 ///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
 ///
 /// Local subscription delivery path:
-///     PlumTree admits a frame → that delivery is stamped with the frame's
-///     validated `MessageHeader.msg_id` → one forwarder copies the
-///     notification to every local subscriber (#869). Absent metadata stays
-///     absent. The id is not looked up again from the payload.
+///     PlumTree admits a frame while the topic pump is held → that delivery
+///     is stamped with the frame's validated `MessageHeader.msg_id` → one
+///     forwarder copies the notification to every local subscriber (#869).
+///     A duplicate that delivers nothing is not paired with a later payload.
+///     Key-cache recovery is drained under the same pumps and omits the id:
+///     the pinned subscriber tuple does not carry the recovered header.
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
@@ -1282,6 +1302,16 @@ pub struct PubSubManager {
     drop_completed: Arc<AtomicU64>,
     #[cfg(test)]
     subscribe_after_registration_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Pauses after the generation check has passed and before the receiver
+    /// is claimed, so a test can unsubscribe and resubscribe in that gap.
+    #[cfg(test)]
+    subscribe_before_claim_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    /// Pauses inside a topic pump, before `dispatch_inbound`, so a test can
+    /// run key-cache recovery while a duplicate still holds that pump.
+    #[cfg(test)]
+    admission_dispatch_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     #[cfg(test)]
     roster_after_swap_pause:
@@ -1866,6 +1896,10 @@ impl PubSubManager {
             #[cfg(test)]
             subscribe_after_registration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
+            subscribe_before_claim_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            admission_dispatch_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
             roster_after_swap_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             register_after_roster_read_pause: std::sync::Mutex::new(None),
@@ -2420,7 +2454,50 @@ impl PubSubManager {
             });
         }
 
-        let claimed = self.claim_topic_delivery(topic_id, tx);
+        // The check above released these locks. Unsubscribe and a newer
+        // subscribe can finish before the claim. Revalidate under the same
+        // locks and keep them until `subscribe_ready` has registered this
+        // generation's receiver (#869).
+        #[cfg(test)]
+        Self::wait_test_pause(&self.subscribe_before_claim_pause).await;
+        let _claim_name = self
+            .group_preference_apply_locks
+            .name_shard(&topic)
+            .lock()
+            .await;
+        let _claim_topic = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
+        let still_current = self
+            .topic_ref_counts
+            .read()
+            .await
+            .get(&topic)
+            .is_some_and(|state| state.generation == generation);
+        if !still_current {
+            drop(_claim_name);
+            drop(_claim_topic);
+            drop(tx);
+            return Subscription {
+                topic,
+                topic_id: None,
+                receiver: rx,
+                topic_ref_counts: self.topic_ref_counts.clone(),
+                generation,
+                topic_id_by_name: Arc::clone(&self.topic_id_by_name),
+                subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                group_topic_by_id: Arc::clone(&self.group_topic_by_id),
+                plumtree: Arc::clone(&self.plumtree),
+                group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+                topic_delivery: None,
+                sender_id: 0,
+                #[cfg(test)]
+                drop_completed: Arc::clone(&self.drop_completed),
+            };
+        }
+        let claimed = Self::claim_topic_delivery(&self.topic_deliveries, &self.stats, topic_id, tx);
         if claimed.own {
             // One receiver per topic. Returning this owner is the barrier
             // after which an immediate publish cannot miss the fan-out.
@@ -2452,6 +2529,8 @@ impl PubSubManager {
             let stats = Arc::clone(&self.stats);
             let sub_topic = topic.clone();
             tokio::spawn(async move {
+                #[cfg(test)]
+                let _forwarder_done = ForwarderDone(Arc::clone(&slot));
                 let env = ForwardEnv {
                     stats: &stats,
                     contacts: contacts.as_ref(),
@@ -2469,6 +2548,9 @@ impl PubSubManager {
                         // Drain them first, then admit the joiner. Otherwise
                         // a later subscribe observes an earlier publish.
                         _ = slot.changed.notified() => {
+                            if !slot.alive.load(Ordering::Acquire) {
+                                return;
+                            }
                             loop {
                                 match stamped_rx.try_recv() {
                                     Ok(stamped) => {
@@ -2521,7 +2603,11 @@ impl PubSubManager {
             });
             claimed.slot.mark_ready();
             setup.started = true;
+            drop(_claim_name);
+            drop(_claim_topic);
         } else {
+            drop(_claim_name);
+            drop(_claim_topic);
             claimed.admission.wait().await;
         }
 
@@ -2858,24 +2944,24 @@ impl PubSubManager {
             } else {
                 None
             };
-        // Metadata is taken from a frame PlumTree actually delivered. A
-        // duplicate returns before SG verifies, and a topic with no local
-        // subscriber never reaches `admitted_transport_id`. The id is bound
-        // to that delivery here, then cloned at fan-out. It is not looked
-        // up later by peer and payload.
-        let delivery = ordinary_frame.and_then(|header| self.live_topic_delivery(header.topic));
-        let dispatch_result = if let Some(slot) = delivery {
-            let _pump = slot.pump.lock().await;
-            slot.pump_unstamped();
-            let dispatch_result = self.dispatch_inbound(peer, session, data.clone()).await;
-            if dispatch_result.is_ok() {
-                if let Some(payload) = slot.take_admitted() {
-                    let transport_msg_id = self.admitted_transport_id(&data);
-                    slot.enqueue_stamped(payload, transport_msg_id);
-                    slot.pump_unstamped();
-                }
-            }
-            dispatch_result
+        // Stamp only the payloads that appeared while this call held the
+        // pumps covering every subscriber send it can cause. The receiver is
+        // drained first, so a duplicate that delivers nothing cannot take a
+        // payload another call produced. Hop-local key-cache recovery can
+        // deliver onto a different topic; it holds every live topic pump and
+        // then drains. saorsa-gossip's subscriber tuple is `(PeerId, Bytes)`
+        // and the replay stays inside that crate, so a recovered delivery
+        // omits the id instead of borrowing the control frame's header.
+        let hop_local = inspected
+            .as_ref()
+            .is_some_and(|header| header.hop_local_control);
+        let dispatch_result = if hop_local {
+            self.dispatch_and_drain_recovered(peer, session, data).await
+        } else if let Some(slot) =
+            ordinary_frame.and_then(|header| self.live_topic_delivery(header.topic))
+        {
+            self.dispatch_and_bind_topic(slot, peer, session, data)
+                .await
         } else {
             self.dispatch_inbound(peer, session, data).await
         };
@@ -2905,6 +2991,92 @@ impl PubSubManager {
                 peer
             )),
             None => self.plumtree.handle_message(peer, data).await,
+        }
+    }
+
+    /// Hold this topic's pump across dispatch. Payloads already queued are
+    /// unstamped. A payload that appears during the call is this frame's
+    /// delivery. Zero payloads (duplicate, replay, refusal) attach no id.
+    async fn dispatch_and_bind_topic(
+        &self,
+        slot: Arc<TopicDelivery>,
+        peer: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) -> Result<(), anyhow::Error> {
+        let _pump = slot.pump.lock().await;
+        slot.pump_unstamped();
+        #[cfg(test)]
+        Self::wait_test_pause(&self.admission_dispatch_pause).await;
+        let result = self.dispatch_inbound(peer, session, data.clone()).await;
+        self.bind_exclusive_delivery(&slot, &data);
+        result
+    }
+
+    /// Hop-local key-cache control can replay a missed frame onto any live
+    /// topic. Hold those pumps so the replay cannot land in another call's
+    /// drain, then move whatever appeared with no transport id.
+    async fn dispatch_and_drain_recovered(
+        &self,
+        peer: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) -> Result<(), anyhow::Error> {
+        let slots = self.live_slots_in_lock_order();
+        let mut pumps = Vec::with_capacity(slots.len());
+        for (_, slot) in &slots {
+            pumps.push(slot.pump.lock().await);
+        }
+        for (_, slot) in &slots {
+            slot.pump_unstamped();
+        }
+        let result = self.dispatch_inbound(peer, session, data).await;
+        for (_, slot) in &slots {
+            slot.pump_unstamped();
+        }
+        drop(pumps);
+        result
+    }
+
+    fn live_slots_in_lock_order(&self) -> Vec<(TopicId, Arc<TopicDelivery>)> {
+        let mut slots: Vec<_> = lock_std(&self.topic_deliveries)
+            .iter()
+            .filter(|(_, slot)| slot.alive.load(Ordering::Acquire))
+            .map(|(topic_id, slot)| (*topic_id, Arc::clone(slot)))
+            .collect();
+        slots.sort_by_key(|(topic_id, _)| *topic_id.as_bytes());
+        slots
+    }
+
+    /// One new payload under the exclusive pump belongs to `frame`. More than
+    /// one is ambiguous, so those ids are omitted.
+    fn bind_exclusive_delivery(&self, slot: &TopicDelivery, frame: &[u8]) {
+        let mut produced = slot.drain_admitted();
+        let Some(payload) = produced.pop() else {
+            return;
+        };
+        if produced.is_empty() {
+            let transport_msg_id = self.admitted_transport_id(frame);
+            slot.enqueue_stamped(payload, transport_msg_id);
+        } else {
+            slot.enqueue_stamped(payload, None);
+            for payload in produced {
+                slot.enqueue_stamped(payload, None);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_test_pause(
+        pause: &std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    ) {
+        let gates = pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((entered, release)) = gates {
+            entered.wait().await;
+            release.wait().await;
         }
     }
 
@@ -2942,11 +3114,12 @@ impl PubSubManager {
     }
 
     fn claim_topic_delivery(
-        &self,
+        deliveries: &TopicDeliveryMap,
+        stats: &Arc<PubSubStats>,
         topic_id: TopicId,
         tx: mpsc::Sender<PubSubNotification>,
     ) -> ClaimedDelivery {
-        let mut map = lock_std(&self.topic_deliveries);
+        let mut map = lock_std(deliveries);
         if let Some(slot) = map.get(&topic_id).cloned() {
             if slot.alive.load(Ordering::Acquire) {
                 let (sender_id, admission) = slot.insert(tx, true);
@@ -2959,7 +3132,7 @@ impl PubSubManager {
             }
             map.remove(&topic_id);
         }
-        let slot = TopicDelivery::new(Arc::clone(&self.stats));
+        let slot = TopicDelivery::new(Arc::clone(stats));
         let (sender_id, admission) = slot.insert(tx, false);
         map.insert(topic_id, Arc::clone(&slot));
         ClaimedDelivery {
@@ -6349,7 +6522,7 @@ mod tests {
         let mut stale = stale_task.await.expect("stale subscribe task");
         assert!(stale.recv().await.is_none(), "stale handle must be closed");
         manager
-            .publish(name, Bytes::from_static(b"new-generation"))
+            .publish(name.clone(), Bytes::from_static(b"new-generation"))
             .await
             .expect("publish to current generation");
         let delivered = tokio::time::timeout(Duration::from_secs(2), current.recv())
@@ -6357,6 +6530,93 @@ mod tests {
             .expect("current receiver timeout")
             .expect("current receiver closed");
         assert_eq!(delivered.payload, Bytes::from_static(b"new-generation"));
+
+        // A has already passed the generation check. Unsubscribe and B
+        // finish before A claims. A must not join B's slot.
+        drop(current);
+        let completed_before = manager.drop_completed.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.drop_completed.load(Ordering::Relaxed) == completed_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current generation drop completed");
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.subscribe_before_claim_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let stale_task = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.subscribe(name).await })
+        };
+        entered.wait().await;
+        manager.unsubscribe(&name).await;
+        *manager.subscribe_before_claim_pause.lock().unwrap() = None;
+        let mut current = manager.subscribe(name.clone()).await;
+        release.wait().await;
+        let mut stale = stale_task.await.expect("subscribe paused before the claim");
+        let closed = tokio::time::timeout(Duration::from_secs(2), stale.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "a subscribe past the generation check must not join the replacement"
+        );
+        manager
+            .publish(name.clone(), Bytes::from_static(b"after-claim-gap"))
+            .await
+            .expect("publish to the replacement generation");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), current.recv())
+            .await
+            .expect("replacement receiver timeout")
+            .expect("replacement receiver closed");
+        assert_eq!(delivered.payload, Bytes::from_static(b"after-claim-gap"));
+
+        // Without a replacement, the paused subscribe must not open an SG
+        // receiver after unsubscribe removed the membership.
+        drop(current);
+        let completed_before = manager.drop_completed.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.drop_completed.load(Ordering::Relaxed) == completed_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement drop completed");
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.subscribe_before_claim_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let stale_task = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.subscribe(name).await })
+        };
+        entered.wait().await;
+        manager.unsubscribe(&name).await;
+        release.wait().await;
+        let mut stale = stale_task.await.expect("subscribe with no replacement");
+        let closed = tokio::time::timeout(Duration::from_secs(2), stale.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "unsubscribe must win over a subscribe that already passed the check"
+        );
+        assert!(!manager
+            .subscribed_topic_ids
+            .read()
+            .unwrap()
+            .contains(&topic));
+        *manager.subscribe_before_claim_pause.lock().unwrap() = None;
+        let mut fresh = manager.subscribe(name.clone()).await;
+        manager
+            .publish(name, Bytes::from_static(b"fresh"))
+            .await
+            .expect("publish to a fresh subscribe");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), fresh.recv())
+            .await
+            .expect("fresh receiver timeout")
+            .expect("fresh receiver closed");
+        assert_eq!(delivered.payload, Bytes::from_static(b"fresh"));
     }
 
     #[tokio::test]
@@ -9627,6 +9887,299 @@ mod issue869 {
             manager.admitted_transport_id_reads.load(Ordering::Relaxed),
             reads_before,
             "a Full relay with no local subscriber must not decode a transport id"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_unsubscribe_stops_the_forwarder() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let sub = manager.subscribe("issue869-quiet".to_string()).await;
+        let slot = Arc::clone(
+            sub.topic_delivery
+                .as_ref()
+                .expect("subscribed topic has a forwarder"),
+        );
+        manager.unsubscribe("issue869-quiet").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !slot.forwarder_stopped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiet unsubscribe left the forwarder parked");
+        drop(sub);
+    }
+
+    /// SG key-cache v3 wire marker and the reserved control topic. The shapes
+    /// mirror saorsa-gossip's private types; `inspect_message_header` fails
+    /// the test if they drift.
+    const V3_MARKER: &[u8] = b"\xffSGKC\x03";
+    const CONTROL_DOMAIN: &str = "saorsa-gossip/key-cache-control/v1";
+    const CONTROL_MAGIC: [u8; 8] = *b"SGKEYC01";
+
+    #[derive(serde::Serialize)]
+    struct MirrorWireMessage {
+        header: MessageHeader,
+        payload: Option<Bytes>,
+        signature: Vec<u8>,
+        key: MirrorKeyMaterial,
+    }
+
+    #[derive(serde::Serialize)]
+    enum MirrorKeyMaterial {
+        #[allow(dead_code)]
+        Full {
+            key_id: PeerId,
+            public_key: Vec<u8>,
+        },
+        Ref {
+            key_id: PeerId,
+        },
+    }
+
+    #[derive(serde::Serialize)]
+    struct MirrorControlPayload {
+        magic: [u8; 8],
+        version: u8,
+        body: MirrorControl,
+    }
+
+    #[derive(serde::Serialize)]
+    enum MirrorControl {
+        #[allow(dead_code)]
+        Hello {
+            key_ref_version: u8,
+        },
+        #[allow(dead_code)]
+        Ack {
+            key_ids: Vec<PeerId>,
+        },
+        #[allow(dead_code)]
+        Request {
+            key_ids: Vec<PeerId>,
+        },
+        Response {
+            entries: Vec<(PeerId, Vec<u8>)>,
+        },
+    }
+
+    fn eager_message(
+        topic: TopicId,
+        inner: Bytes,
+        msg_id: [u8; 32],
+        key: &saorsa_gossip_identity::MlDsaKeyPair,
+    ) -> saorsa_gossip_pubsub::GossipMessage {
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(inner.as_ref()));
+        let header_bytes = postcard::to_stdvec(&header).expect("header");
+        let signature = key.sign(&header_bytes).expect("sign eager");
+        saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(inner),
+            signature,
+            public_key: key.public_key().to_vec(),
+        }
+    }
+
+    fn v3_ref(message: &saorsa_gossip_pubsub::GossipMessage) -> Bytes {
+        let wire = MirrorWireMessage {
+            header: message.header.clone(),
+            payload: message.payload.clone(),
+            signature: message.signature.clone(),
+            key: MirrorKeyMaterial::Ref {
+                key_id: PeerId::from_pubkey(&message.public_key),
+            },
+        };
+        let mut bytes = V3_MARKER.to_vec();
+        bytes.extend(postcard::to_stdvec(&wire).expect("v3 ref"));
+        bytes.into()
+    }
+
+    fn control_response(
+        from_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        key_id: PeerId,
+        public_key: Vec<u8>,
+    ) -> Bytes {
+        let body = postcard::to_stdvec(&MirrorControlPayload {
+            magic: CONTROL_MAGIC,
+            version: 1,
+            body: MirrorControl::Response {
+                entries: vec![(key_id, public_key)],
+            },
+        })
+        .expect("control body");
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic: TopicId::from_entity(CONTROL_DOMAIN.as_bytes()),
+            msg_id: [0x5a; 32],
+            kind: MessageKind::Ping,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(&body));
+        let signature = from_key
+            .sign(&postcard::to_stdvec(&header).expect("control header"))
+            .expect("sign control");
+        let frame = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(Bytes::from(body)),
+            signature,
+            public_key: from_key.public_key().to_vec(),
+        };
+        postcard::to_stdvec(&frame).expect("control frame").into()
+    }
+
+    fn install_session(
+        manager: &PubSubManager,
+        peer: PeerId,
+    ) -> saorsa_gossip_transport::AuthenticatedSession {
+        let session = saorsa_gossip_transport::AuthenticatedSession {
+            peer,
+            generation: 3,
+        };
+        manager.transport.set_session_override(Some(session));
+        session
+    }
+
+    #[tokio::test]
+    async fn quiet_key_cache_recovery_delivers_without_another_pump() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let topic_name = "issue869-recover";
+        let mut sub = manager.subscribe(topic_name.to_string()).await;
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
+        let inner = signed_inner_v2(&author, topic_name, &Bytes::from_static(b"recovered"));
+        let eager_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("eager key");
+        let message = eager_message(
+            TopicId::from_entity(topic_name.as_bytes()),
+            inner,
+            [0x33; 32],
+            &eager_key,
+        );
+        let from_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("peer key");
+        let from = PeerId::from_pubkey(from_key.public_key());
+        let session = install_session(&manager, from);
+        let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+        manager
+            .handle_incoming(from, Some(session), v3_ref(&message))
+            .await;
+        let missed = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.recv_notification(),
+        )
+        .await;
+        assert!(
+            missed.is_err(),
+            "a key-reference miss stays queued until the control response"
+        );
+        manager
+            .handle_incoming(
+                from,
+                Some(session),
+                control_response(
+                    &from_key,
+                    PeerId::from_pubkey(eager_key.public_key()),
+                    eager_key.public_key().to_vec(),
+                ),
+            )
+            .await;
+        let note = recv_note(&mut sub).await;
+        assert_eq!(note.message.payload.as_ref(), b"recovered");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "recovery omits the id: the subscriber tuple does not carry the header"
+        );
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_before,
+            "recovery does not decode the control frame for a transport id"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_duplicate_does_not_stamp_a_recovered_delivery() {
+        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        let mut sub = manager.subscribe("issue869".to_string()).await;
+        let peer = PeerId::new([9; 32]);
+        let (frame_b, id_b) = eager_frame(b"bee", [0x22; 32]);
+        manager.handle_incoming(peer, None, frame_b.clone()).await;
+        let first = recv_note(&mut sub).await;
+        assert_eq!(first.transport_msg_id, Some(id_b));
+        let reads_after_b = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
+        let inner = signed_inner_v2(&author, "issue869", &Bytes::from_static(b"recovered-a"));
+        let eager_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("eager key");
+        let message_a = eager_message(
+            TopicId::from_entity(b"issue869"),
+            inner,
+            [0x33; 32],
+            &eager_key,
+        );
+        let from_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("peer key");
+        let from = PeerId::from_pubkey(from_key.public_key());
+        let session = install_session(&manager, from);
+        manager
+            .handle_incoming(from, Some(session), v3_ref(&message_a))
+            .await;
+        let queued = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.recv_notification(),
+        )
+        .await;
+        assert!(queued.is_err(), "the reference miss is not delivered yet");
+
+        let mut duplicate: saorsa_gossip_pubsub::GossipMessage =
+            postcard::from_bytes(&frame_b).expect("decode B");
+        duplicate.signature[0] ^= 0xff;
+        let duplicate = Bytes::from(postcard::to_stdvec(&duplicate).expect("encode duplicate"));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.admission_dispatch_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        let duplicate_task = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager.handle_incoming(peer, None, duplicate).await;
+            })
+        };
+        entered.wait().await;
+        let recover_task = {
+            let manager = Arc::clone(&manager);
+            let response = control_response(
+                &from_key,
+                PeerId::from_pubkey(eager_key.public_key()),
+                eager_key.public_key().to_vec(),
+            );
+            tokio::spawn(async move {
+                manager.handle_incoming(from, Some(session), response).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        release.wait().await;
+        *manager.admission_dispatch_pause.lock().unwrap() = None;
+        duplicate_task.await.expect("duplicate task");
+        recover_task.await.expect("recovery task");
+
+        let note = recv_note(&mut sub).await;
+        assert_eq!(note.message.payload.as_ref(), b"recovered-a");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "the recovered delivery must not wear the duplicate's id"
+        );
+        assert_ne!(note.transport_msg_id, Some(id_b));
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_after_b,
+            "the invalid duplicate and the recovery are not read for an id"
         );
     }
 }
