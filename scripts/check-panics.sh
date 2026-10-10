@@ -25,9 +25,11 @@ declare -A IN_TEST=()
 # The item ends when its brace body closes, or at ';' / ',' when it has no
 # body. Strings stay open until the closing quote, block comments nest, and
 # '<' counts as a generic only in type position. A comparison does not.
-# A brace that begins a const-generic argument is not the item body. Code
-# after the closing brace on the same line is still production. A comma
-# inside a quoted cfg value is not a predicate separator.
+# A brace that begins a const-generic argument is not the item body, even
+# when whitespace or a comment separates it from the comma. Code after the
+# closing brace on the same line is still production. Line numbers follow
+# grep and split on LF only. Cfg commas inside comments, quotes, or raw
+# strings are not predicate separators.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
@@ -63,7 +65,11 @@ def test_lines(text: str) -> dict[int, str]:
     ``*`` means the whole line is test-only. Otherwise the spec is a
     comma-separated list of half-open byte ranges that are test-only.
     """
-    lines = text.splitlines()
+    # grep -n splits on LF only. str.splitlines() also breaks on U+2028,
+    # U+2029, and form feed, which would mark a later physical line as test.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     regions: dict[int, str] = {}
 
     depth = 0
@@ -78,6 +84,9 @@ def test_lines(text: str) -> dict[int, str]:
     bracket_stack: list[dict[str, object]] = []
     const_expr = 0
     type_mode = False
+    # Previous non-trivia token. Whitespace, newlines, and comments do not
+    # clear it, so a const-generic `{` can sit on the next line.
+    prev_token = ""
 
     active = False
     floor = 0
@@ -114,6 +123,10 @@ def test_lines(text: str) -> dict[int, str]:
         if kind == "ident" or text in "><,([{":
             return True
         return kind == "start"
+
+    def remember(token: str) -> None:
+        nonlocal prev_token
+        prev_token = token
 
     def start_item() -> None:
         nonlocal active, floor, paren_floor, bracket_floor, phase, mode
@@ -167,6 +180,7 @@ def test_lines(text: str) -> dict[int, str]:
             if in_raw:
                 if ch == '"' and line[i + 1 : i + 1 + raw_hashes] == "#" * raw_hashes:
                     in_raw = False
+                    remember('"')
                     i += 1 + raw_hashes
                     continue
                 i += 1
@@ -182,6 +196,7 @@ def test_lines(text: str) -> dict[int, str]:
                     continue
                 if ch == '"':
                     in_string = False
+                    remember('"')
                     i += 1
                     continue
                 i += 1
@@ -224,6 +239,7 @@ def test_lines(text: str) -> dict[int, str]:
 
             if ch == "'":
                 i = _skip_tick(line, i)
+                remember("'")
                 continue
 
             if ch == "#":
@@ -246,6 +262,7 @@ def test_lines(text: str) -> dict[int, str]:
                         mode = "block"
                         ensure_marking(0)
                     i += len("#![cfg(test)]")
+                    remember("]")
                     continue
                 if kind in {"cfg", "test"} and not active:
                     start_item()
@@ -260,6 +277,7 @@ def test_lines(text: str) -> dict[int, str]:
                 if _word_at(line, i) == "else":
                     phase = "header"
                     mode = ""
+                    remember("ident")
                     ensure_marking(i)
                     i += 4
                     continue
@@ -269,14 +287,17 @@ def test_lines(text: str) -> dict[int, str]:
 
             if ch == "-" and nxt == ">":
                 type_mode = True
+                remember(">")
                 i += 2
                 continue
 
             if ch == ":":
                 if nxt == ":":
+                    remember(":")
                     i += 2
                     continue
                 type_mode = True
+                remember(":")
                 i += 1
                 continue
 
@@ -285,26 +306,29 @@ def test_lines(text: str) -> dict[int, str]:
                 # position. An `=` outside angle brackets ends a type.
                 if angle == 0:
                     type_mode = False
+                remember("=")
                 i += 2 if nxt in "=>" else 1
                 continue
 
             if ch == "{":
                 if const_expr > 0:
                     const_expr += 1
+                    remember("{")
                     if active and phase != "after":
                         ensure_marking(i)
                     i += 1
                     continue
-                # `{` starts a const-generic argument only directly after `<` or `,`.
-                # `if 1 < 2 { 1 }` is an expression block, and it is the real body
-                # when it sits at item level.
+                # `{` starts a const-generic argument only after `<` or `,`.
+                # Those tokens stay visible across whitespace, newlines, and
+                # comments. `if 1 < 2 { 1 }` is an expression block.
                 if (
                     angle > 0
                     and mode == "block"
                     and phase == "header"
-                    and _const_generic_brace(line, i)
+                    and prev_token in {"<", ","}
                 ):
                     const_expr = 1
+                    remember("{")
                     if active:
                         ensure_marking(i)
                     i += 1
@@ -312,6 +336,7 @@ def test_lines(text: str) -> dict[int, str]:
                 if active and phase == "header" and at_item_level():
                     phase = "body"
                     ensure_marking(i)
+                remember("{")
                 type_mode = False
                 depth += 1
                 i += 1
@@ -320,6 +345,7 @@ def test_lines(text: str) -> dict[int, str]:
             if ch == "}":
                 if const_expr > 0:
                     const_expr -= 1
+                    remember("}")
                     if active and phase != "after":
                         ensure_marking(i)
                     i += 1
@@ -346,10 +372,12 @@ def test_lines(text: str) -> dict[int, str]:
                     stop_marking(i)
                     end_item()
                     continue
+                remember("}")
                 i += 1
                 continue
 
             if ch == "(":
+                remember("(")
                 paren += 1
                 i += 1
                 continue
@@ -364,11 +392,13 @@ def test_lines(text: str) -> dict[int, str]:
                     stop_marking(i)
                     end_item()
                     continue
+                remember(")")
                 if paren > 0:
                     paren -= 1
                 i += 1
                 continue
             if ch == "[":
+                remember("[")
                 bracket_stack.append({"expr": False, "depth": depth, "paren": paren})
                 bracket += 1
                 i += 1
@@ -384,6 +414,7 @@ def test_lines(text: str) -> dict[int, str]:
                     stop_marking(i)
                     end_item()
                     continue
+                remember("]")
                 if bracket_stack:
                     bracket_stack.pop()
                 if bracket > 0:
@@ -394,20 +425,25 @@ def test_lines(text: str) -> dict[int, str]:
                 if opens_generic(line, i):
                     angle += 1
                 elif nxt == "=":
+                    remember("=")
                     i += 2
                     continue
+                remember("<")
                 i += 1
                 continue
             if ch == ">":
                 if nxt == "=":
+                    remember("=")
                     i += 2
                     continue
                 if angle > 0:
                     angle -= 1
+                remember(">")
                 i += 1
                 continue
 
             if ch == ";":
+                remember(";")
                 if (
                     bracket_stack
                     and const_expr == 0
@@ -433,6 +469,7 @@ def test_lines(text: str) -> dict[int, str]:
                 and angle == 0
                 and at_item_level()
             ):
+                remember(",")
                 i += 1
                 stop_marking(i)
                 end_item()
@@ -469,13 +506,18 @@ def test_lines(text: str) -> dict[int, str]:
                     type_mode = j < n and line[j] == "<"
                 elif word in {"if", "while", "loop", "match", "return", "let"}:
                     type_mode = False
+                remember("ident")
                 if active and phase != "after":
                     ensure_marking(i)
                 i += len(word)
                 continue
 
+            if ch.isspace():
+                i += 1
+                continue
             if active and phase != "after":
                 ensure_marking(i)
+            remember(ch)
             i += 1
 
         stop_marking(n)
@@ -523,11 +565,6 @@ def _prev_sig(line: str, i: int) -> tuple[str, str]:
     return "other", ch
 
 
-def _const_generic_brace(line: str, i: int) -> bool:
-    _kind, text = _prev_sig(line, i)
-    return text in {"<", ","}
-
-
 def _word_at(line: str, i: int) -> str:
     j = i + 1
     while j < len(line) and (line[j].isalnum() or line[j] == "_"):
@@ -553,32 +590,41 @@ def _attr_kind(line: str, i: int) -> str:
 
 
 def _cfg_all_requires_test(rest: str) -> bool:
-    """True when every build of this attribute requires cfg(test)."""
+    """True when every build of this attribute requires cfg(test).
+
+    Comments are trivia. Ordinary strings and raw strings are one literal,
+    so a comma inside them is not a predicate separator. An attribute this
+    cannot lex is scanned rather than treated as test-only.
+    """
     prefix = "#[cfg(all("
     if not rest.startswith(prefix):
         return False
+    n = len(rest)
+    i = len(prefix)
     depth = 1
     atoms: list[str] = []
     current: list[str] = []
-    in_str = False
-    quote = ""
-    escaped = False
-    for ch in rest[len(prefix) :]:
-        if in_str:
-            current.append(ch)
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                escaped = True
-                continue
-            if ch == quote:
-                in_str = False
+    while i < n and depth > 0:
+        nxt = _cfg_skip_trivia(rest, i)
+        if nxt is None:
+            return False
+        i = nxt
+        if i >= n:
+            break
+        raw_end = _cfg_raw_string_end(rest, i)
+        if raw_end is not None:
+            if raw_end < 0:
+                return False
+            current.append(rest[i:raw_end])
+            i = raw_end
             continue
+        ch = rest[i]
         if ch in "\"'":
-            in_str = True
-            quote = ch
-            current.append(ch)
+            end = _cfg_quoted_end(rest, i)
+            if end < 0:
+                return False
+            current.append(rest[i:end])
+            i = end
             continue
         if ch == "(":
             depth += 1
@@ -586,8 +632,6 @@ def _cfg_all_requires_test(rest: str) -> bool:
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                if in_str:
-                    return False
                 atoms.append("".join(current).strip())
                 return "test" in atoms
             current.append(ch)
@@ -596,8 +640,75 @@ def _cfg_all_requires_test(rest: str) -> bool:
             current = []
         else:
             current.append(ch)
-    # Unclosed attribute: scan it rather than treating it as test-only.
+        i += 1
     return False
+
+
+def _cfg_skip_trivia(rest: str, i: int) -> int | None:
+    n = len(rest)
+    while i < n:
+        if rest[i].isspace():
+            i += 1
+            continue
+        if rest.startswith("//", i):
+            return None
+        if rest.startswith("/*", i):
+            comment = 1
+            i += 2
+            while i < n and comment:
+                if rest.startswith("/*", i):
+                    comment += 1
+                    i += 2
+                elif rest.startswith("*/", i):
+                    comment -= 1
+                    i += 2
+                else:
+                    i += 1
+            if comment:
+                return None
+            continue
+        return i
+    return i
+
+
+def _cfg_raw_string_end(rest: str, i: int) -> int | None:
+    """Index after a raw string at i, -1 if unclosed, None if not one."""
+    if i > 0 and (rest[i - 1].isalnum() or rest[i - 1] == "_"):
+        return None
+    j = i
+    prefixes = 0
+    while prefixes < 2 and j < len(rest) and rest[j] in "bc":
+        j += 1
+        prefixes += 1
+    if j >= len(rest) or rest[j] != "r":
+        return None
+    j += 1
+    hashes = 0
+    while j < len(rest) and rest[j] == "#":
+        hashes += 1
+        j += 1
+    if j >= len(rest) or rest[j] != '"':
+        return None
+    j += 1
+    closer = '"' + ("#" * hashes)
+    end = rest.find(closer, j)
+    if end < 0:
+        return -1
+    return end + len(closer)
+
+
+def _cfg_quoted_end(rest: str, i: int) -> int:
+    quote = rest[i]
+    j = i + 1
+    n = len(rest)
+    while j < n:
+        if rest[j] == "\\":
+            j += 2
+            continue
+        if rest[j] == quote:
+            return j + 1
+        j += 1
+    return -1
 
 
 def _raw_hashes(line: str, quote: int) -> int:
