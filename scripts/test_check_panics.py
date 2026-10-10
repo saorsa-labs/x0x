@@ -661,6 +661,105 @@ class PanicScanner(unittest.TestCase):
                 result = self.scan("src/const_init_prod.rs", source)
                 self._assert_rejected(result, kind)
 
+    def test_cfg_test_macro_item_hides_call(self):
+        # A complete macro item ends at its token tree, and that tree stays test-only.
+        for kind in ("expect", "unwrap", "panic"):
+            for form in ("{}", "()"):
+                with self.subTest(kind=kind, form=form):
+                    hidden = self._call(kind, "hidden")
+                    invocation = (
+                        f"make!{{{hidden};}}" if form == "{}" else f"make!({hidden})"
+                    )
+                    source = (
+                        "macro_rules! make { () => {} }\n"
+                        "#[cfg(test)]\n"
+                        f"{invocation}\n"
+                        "fn prod() {}\n"
+                    )
+                    result = self.scan("src/macro_item.rs", source)
+                    self.assert_clean(result)
+                    self.assertNotIn("hidden", result.stdout)
+
+    def test_cfg_test_macro_item_does_not_hide_production_call(self):
+        # `make!{}` must not swallow the next function. `make!()` closes the same way.
+        for kind in ("expect", "unwrap", "panic"):
+            for form in ("{}", "()"):
+                with self.subTest(kind=kind, form=form):
+                    visible = self._call(kind, "visible")
+                    invocation = "make!{}" if form == "{}" else "make!()"
+                    source = (
+                        "macro_rules! make { () => {} }\n"
+                        "#[cfg(test)]\n"
+                        f"{invocation}\n"
+                        f"fn prod() {{ {visible}; }}\n"
+                    )
+                    result = self.scan("src/macro_item_prod.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_cfg_test_let_cond_hides_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            for cond in (
+                "if let Some(_) = Some(1)",
+                "while let Some(_) = Some(1)",
+            ):
+                with self.subTest(kind=kind, cond=cond):
+                    hidden = self._call(kind, "hidden")
+                    source = (
+                        "fn prod() {\n"
+                        "    #[cfg(test)]\n"
+                        f"    {cond} {{ {hidden}; }}\n"
+                        "}\n"
+                    )
+                    result = self.scan("src/let_cond.rs", source)
+                    self.assert_clean(result)
+                    self.assertNotIn("hidden", result.stdout)
+
+    def test_cfg_test_let_cond_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            for cond, body in (
+                ("if let Some(_) = Some(1)", "{}"),
+                ("while let Some(_) = Some(1)", "{ break; }"),
+            ):
+                with self.subTest(kind=kind, cond=cond):
+                    visible = self._call(kind, "visible")
+                    source = (
+                        "fn prod() {\n"
+                        "    #[cfg(test)]\n"
+                        f"    {cond} {body}\n"
+                        f"    {visible};\n"
+                        "}\n"
+                    )
+                    result = self.scan("src/let_cond_prod.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_unclassified_header_is_production(self):
+        # An unclosed header is not a test item. The call counts as production.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn unfinished(\n"
+                    f"    {visible};\n"
+                )
+                result = self.scan("src/unclassified.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_clear_test_item_hides_call_and_reports_following(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() {\n"
+                    f"    {hidden};\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/clear_item.rs", source)
+                self._assert_rejected(result, kind)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
