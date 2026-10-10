@@ -520,6 +520,53 @@ class PanicScanner(unittest.TestCase):
                     result = self.scan("src/generic_break_prod.rs", source)
                     self._assert_rejected(result, kind)
 
+    def test_bare_cr_in_block_comment_does_not_hide_production_call(self):
+        # open() must not turn a bare CR into LF. grep still counts one line.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "/* a\rb */\n"
+                    "#[cfg(test)]\n"
+                    f"fn helper() {{ {hidden}; }}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/bare_cr.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_comment_before_generic_hides_test_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> std::array::IntoIter /* note */ <u8, {1}> {\n"
+                    f"    {hidden};\n"
+                    "    [0u8].into_iter()\n"
+                    "}\n"
+                    "fn prod() {}\n"
+                )
+                result = self.scan("src/generic_comment.rs", source)
+                self.assert_clean(result)
+                self.assertNotIn("hidden", result.stdout)
+
+    def test_comment_before_generic_does_not_hide_production_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "fn helper() -> std::array::IntoIter /* note */ <u8, {1}> {\n"
+                    f"    {hidden};\n"
+                    "    [0u8].into_iter()\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/generic_comment_prod.rs", source)
+                self._assert_rejected(result, kind)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
