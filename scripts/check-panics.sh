@@ -28,8 +28,9 @@ declare -A IN_TEST=()
 # A brace that begins a const-generic argument is not the item body, even
 # when whitespace or a comment separates it from the comma. Code after the
 # closing brace on the same line is still production. Line numbers follow
-# grep and split on LF only. Cfg commas inside comments, quotes, or raw
-# strings are not predicate separators.
+# grep: the source is read with newlines preserved and split on LF only.
+# A comment before '<' does not hide the type that opens a generic. Cfg
+# commas inside comments, quotes, or raw strings are not predicate separators.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
@@ -113,16 +114,17 @@ def test_lines(text: str) -> dict[int, str]:
         # '<=' is a comparison. Turbofish '::<' is always a generic.
         # In a value expression, every other '<' is an operator. In type
         # position, '<' after a path or delimiter starts type arguments.
+        # prev_token ignores whitespace, newlines, and comments, so
+        # `IntoIter /* note */ <u8, {1}>` still opens the generic.
         if i + 1 < len(at) and at[i + 1] == "=":
             return False
-        kind, text = _prev_sig(at, i)
-        if text == "::":
+        if prev_token == "::":
             return True
         if in_value_expr():
             return False
-        if kind == "ident" or text in "><,([{":
+        if prev_token == "ident" or prev_token in {"<", ">", ",", "(", "[", "{"}:
             return True
-        return kind == "start"
+        return False
 
     def remember(token: str) -> None:
         nonlocal prev_token
@@ -293,7 +295,7 @@ def test_lines(text: str) -> dict[int, str]:
 
             if ch == ":":
                 if nxt == ":":
-                    remember(":")
+                    remember("::")
                     i += 2
                     continue
                 type_mode = True
@@ -544,27 +546,6 @@ def _span_spec(spans: list[list[int]], nbytes: int) -> str:
         return "*"
     return ",".join(f"{start}-{end}" for start, end in merged)
 
-def _prev_sig(line: str, i: int) -> tuple[str, str]:
-    j = i - 1
-    while j >= 0 and line[j].isspace():
-        j -= 1
-    if j < 0:
-        return "start", ""
-    ch = line[j]
-    if ch == ":" and j > 0 and line[j - 1] == ":":
-        return "punct", "::"
-    if ch in "<>()[]{},;:=+-*/%&|^!":
-        return "punct", ch
-    if ch.isdigit():
-        return "num", ch
-    if ch.isalnum() or ch == "_":
-        k = j
-        while k >= 0 and (line[k].isalnum() or line[k] == "_"):
-            k -= 1
-        return "ident", line[k + 1 : j + 1]
-    return "other", ch
-
-
 def _word_at(line: str, i: int) -> str:
     j = i + 1
     while j < len(line) and (line[j].isalnum() or line[j] == "_"):
@@ -760,7 +741,9 @@ def _emit(root, out):
                 continue
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, ".").replace(os.sep, "/")
-            with open(path, encoding="utf-8", errors="replace") as handle:
+            # newline="" keeps a bare CR inside a comment or string. The
+            # default translator would turn it into LF and shift later lines.
+            with open(path, encoding="utf-8", errors="replace", newline="") as handle:
                 text = handle.read()
             for number, spec in test_lines(text).items():
                 out.write(f"{rel}\t{number}\t{spec}\n")
