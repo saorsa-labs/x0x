@@ -465,3 +465,175 @@ fn verify_history_db_from_env() {
     });
     println!("X0X_F_VERIFY {summary}");
 }
+
+// ── Round 2 (Codex review of slice F) ───────────────────────────────────
+
+/// Every file in `dir`: name, length and sha256. A refused open must leave
+/// this exactly as it was: main file, `-wal`, `-shm` and `-journal` alike.
+fn all_files(dir: &Path) -> Vec<(String, u64, String)> {
+    let mut files: Vec<(String, u64, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                bytes.len() as u64,
+                hex::encode(Sha256::digest(&bytes)),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A crash copy: a writer commits schema 5 to the WAL of a copy of the
+/// fixture, and the database is copied with its live `-wal` and `-shm`
+/// before that writer closes (so before any checkpoint). The copy's main
+/// file still says schema 4; only its WAL says 5.
+fn crash_copy_with_a_live_wal(dir: &Path) -> PathBuf {
+    let work = tempfile::tempdir().unwrap();
+    let live = copy_fixture(work.path());
+    let writer = rusqlite::Connection::open(&live).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    writer
+        .execute("UPDATE schema_version SET version = 5", [])
+        .unwrap();
+    for name in ["history.db", "history.db-wal", "history.db-shm"] {
+        let source = work.path().join(name);
+        assert!(source.exists(), "the live writer has {name}");
+        std::fs::copy(&source, dir.join(name)).unwrap();
+    }
+    drop(writer);
+    let wal = std::fs::metadata(dir.join("history.db-wal")).unwrap().len();
+    assert!(wal > 0, "the crash copy's WAL holds the schema-5 commit");
+    dir.join("history.db")
+}
+
+/// Codex F r1 P2-1: a refused open must not checkpoint a WAL it did not
+/// write. Before the fix the closing checkpoint folded the crash copy's
+/// schema-5 frame into the main file and deleted the WAL.
+#[test]
+fn a_refused_newer_schema_leaves_a_crash_wal_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crash_copy_with_a_live_wal(dir.path());
+    let before = all_files(dir.path());
+    assert_eq!(before.len(), 3, "{before:?}");
+
+    let error = Store::open(&path)
+        .expect_err("schema 5 must not open")
+        .to_string();
+    assert!(error.contains("newer than this binary"), "{error}");
+    assert_eq!(
+        all_files(dir.path()),
+        before,
+        "main, -wal and -shm untouched"
+    );
+
+    let config = HistoryConfig {
+        enabled: true,
+        db_path: Some(path.clone()),
+        ..HistoryConfig::default()
+    };
+    let error = match HistoryService::open(&config, dir.path()) {
+        Ok(_) => panic!("the service must not open schema 5"),
+        Err(e) => e.to_string(),
+    };
+    assert!(error.contains("newer than this binary"), "{error}");
+    assert_eq!(all_files(dir.path()), before, "and through the service too");
+}
+
+/// Codex F r1 P2-2: a version read that fails (here: busy) must stop the
+/// open before setup can write. A schema-5 rollback-journal database is
+/// locked by another connection, which releases it while the opener is
+/// still in its busy wait. Before the fix the failed read counted as "no
+/// schema", the next pragma got the freed lock and converted the file to
+/// WAL (header bytes 18–19 from [1, 1] to [2, 2]), and only `migrate` then
+/// refused it.
+#[test]
+fn a_busy_newer_schema_is_not_changed_while_the_lock_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = copy_fixture(dir.path());
+    as_schema_5(&path, true);
+    let before = all_files(dir.path());
+    let header = |path: &Path| std::fs::read(path).unwrap()[18..20].to_vec();
+    assert_eq!(header(&path), vec![1, 1], "a rollback-journal file");
+
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let opener = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = std::time::Instant::now();
+            let result =
+                Store::open_with_busy_timeout(&path, std::time::Duration::from_millis(100));
+            (result.map(|_| ()), started.elapsed())
+        })
+    };
+    started_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    holder.execute_batch("ROLLBACK;").unwrap();
+    drop(holder);
+    let (result, elapsed) = opener.join().unwrap();
+
+    let error = result.expect_err("the open must not proceed").to_string();
+    assert_eq!(
+        header(&path),
+        vec![1, 1],
+        "not converted to WAL ({error}, {elapsed:?})"
+    );
+    assert_eq!(
+        all_files(dir.path()),
+        before,
+        "untouched ({error}, {elapsed:?})"
+    );
+    assert!(error.contains(&path.display().to_string()), "{error}");
+}
+
+/// A crash copy of a schema-5 rollback-journal database with a HOT journal:
+/// a writer spills uncommitted pages to the main file (its cache holds one
+/// page), and the main file and its `-journal` are copied before the writer
+/// rolls back. Opening it read/write would roll the journal back, a write.
+fn crash_copy_with_a_hot_journal(dir: &Path) -> PathBuf {
+    let work = tempfile::tempdir().unwrap();
+    let live = copy_fixture(work.path());
+    as_schema_5(&live, true);
+    let writer = rusqlite::Connection::open(&live).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA cache_size = 1; PRAGMA cache_spill = ON; BEGIN; \
+             UPDATE history SET payload = randomblob(3000);",
+        )
+        .unwrap();
+    for name in ["history.db", "history.db-journal"] {
+        let source = work.path().join(name);
+        assert!(source.exists(), "the live writer has {name}");
+        std::fs::copy(&source, dir.join(name)).unwrap();
+    }
+    writer.execute_batch("ROLLBACK;").unwrap();
+    drop(writer);
+    dir.join("history.db")
+}
+
+/// Round 2: the refusal path includes recovery. A hot rollback journal
+/// beside a newer database is not rolled back: the open is refused and the
+/// main file and its journal stay byte-identical.
+#[test]
+fn a_hot_rollback_journal_is_not_recovered_before_the_version_is_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crash_copy_with_a_hot_journal(dir.path());
+    let before = all_files(dir.path());
+    assert_eq!(before.len(), 2, "{before:?}");
+
+    let error = Store::open(&path).expect_err("must not open").to_string();
+    assert_eq!(
+        all_files(dir.path()),
+        before,
+        "main and -journal untouched ({error})"
+    );
+    assert!(error.contains(&path.display().to_string()), "{error}");
+}
