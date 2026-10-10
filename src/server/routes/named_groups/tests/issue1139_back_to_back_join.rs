@@ -415,8 +415,8 @@ async fn deliver_j2_result(s: &BackToBack) {
 /// The page the authority's TreeKEM catch-up responder serves for J2's
 /// request (`handle_treekem_catchup_request`: every logged membership
 /// event past J2's revision OR epoch). The joiner half of the loop needs
-/// the inline Welcome; the wire-size check stages that Welcome by
-/// reference.
+/// the inline Welcome. The size check reads a separate event the
+/// production admission route logged.
 fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
@@ -426,29 +426,98 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
     }
 }
 
-/// The MemberAdded the seal path logs for catch-up: the real commit and
-/// the real Welcome bytes, staged by `stage_treekem_welcome` and carried
-/// as a reference. An inline Welcome is a larger shape than the log.
-async fn production_catchup_event(s: &BackToBack) -> Result<NamedGroupMetadataEvent> {
-    let mut event = s.add_j1.event.clone();
-    let NamedGroupMetadataEvent::MemberAdded {
-        treekem_welcome_b64,
-        welcome_ref,
-        agent_id,
-        ..
-    } = &mut event
-    else {
-        anyhow::bail!("sealed add is not a MemberAdded");
-    };
-    let inline = treekem_welcome_b64
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("sealed add has no Welcome bytes to stage"))?;
-    let bytes = BASE64.decode(inline)?;
-    let reference =
-        super::super::stage_treekem_welcome(&s._authority, &s.stable_group_id, agent_id, bytes)
-            .await;
-    *welcome_ref = Some(reference);
-    Ok(event)
+/// One seat admitted by `add_named_group_member`, then the `MemberAdded`
+/// that route wrote into the TreeKEM event log. That entry is the catch-up
+/// responder's source: Welcome by reference, roster-certificate sidecar
+/// attached. A helper that clones a fixture event and edits it does not
+/// read this log.
+async fn logged_production_member_added(
+    authority: &Arc<AppState>,
+    group_key: &str,
+) -> Result<NamedGroupMetadataEvent> {
+    let dir = tempfile::tempdir()?;
+    let member = joiner_state(
+        dir.path(),
+        "admit",
+        x0x::identity::AgentKeypair::generate()?,
+    )
+    .await?;
+    let owner = authority
+        .agent
+        .identity()
+        .user_keypair()
+        .expect("owned Home");
+    let cert =
+        x0x::identity::AgentCertificate::issue(owner, member.agent.identity().agent_keypair())?;
+    let member_hex = hex::encode(member.agent.agent_id().as_bytes());
+    authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .insert(
+            member.agent.agent_id(),
+            x0x::DiscoveredAgent {
+                self_name: None,
+                agent_id: member.agent.agent_id(),
+                machine_id: member.agent.machine_id(),
+                user_id: cert.user_id().ok(),
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: cert.not_after(),
+                agent_certificate: Some(cert),
+                agent_public_key: member
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes()
+                    .to_vec(),
+                cert_digest: None,
+            },
+        );
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(
+        member.agent.agent_id(),
+        &agent_treekem_seed(&member.agent, &hex::decode(group_key)?),
+    )?;
+    let response = add_named_group_member(
+        State(Arc::clone(authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_key.to_string()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: member_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: Some(BASE64.encode(prepared.key_package_bytes())),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "production admission failed: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let logs = authority.treekem_event_log.read().await;
+    logs.values()
+        .flat_map(|events| events.iter())
+        .find(|event| {
+            matches!(
+                event,
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == &member_hex
+            )
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("production admission logged no MemberAdded"))
 }
 
 /// WHY (#1139): pins the mechanism. J2 holds only its OWN join result
@@ -545,21 +614,26 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     // (`handle_treekem_catchup_request` → `send_direct_with_config`).
     // The injected page below still carries an inline Welcome so the
     // joiner can adopt without a blob pull. The size check measures the
-    // event the catch-up log stores: the same commit, Welcome by reference.
+    // MemberAdded the production admission route logged, sidecar included.
     let page = catchup_page(&s);
-    let logged = production_catchup_event(&s).await?;
+    let logged = logged_production_member_added(&s._authority, &s.group_key).await?;
     match &logged {
         NamedGroupMetadataEvent::MemberAdded {
             treekem_welcome_b64,
             welcome_ref,
+            roster_certificates_b64,
             ..
         } => {
             assert!(
                 treekem_welcome_b64.is_none() && welcome_ref.is_some(),
-                "catch-up size must measure a Welcome reference, not an inline Welcome"
+                "the logged admission carries a Welcome reference, not an inline Welcome"
+            );
+            assert!(
+                !roster_certificates_b64.is_empty(),
+                "the logged admission carries the roster-certificate sidecar"
             );
         }
-        _ => panic!("catch-up event is a MemberAdded"),
+        _ => panic!("logged admission is a MemberAdded"),
     }
     let one_event = serde_json::to_vec(&TreeKemCatchupResponse {
         message_type: page.message_type.clone(),
@@ -579,30 +653,257 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     Ok(())
 }
 
-/// WHY (#1163): the authority's FetchRequest arm, not a hand-built
-/// `JoinResultMessage::Result`, is what serves J2 the intervening carry.
+fn reference_with_flipped_digest(
+    reference: &super::super::control_blob::ControlBlobRef,
+) -> Result<super::super::control_blob::ControlBlobRef> {
+    let mut value = serde_json::to_value(reference)?;
+    let digest = value
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("staged reference has no digest"))?
+        .to_string();
+    let mut chars = digest.into_bytes();
+    chars[0] = if chars[0] == b'a' { b'b' } else { b'a' };
+    value["digest"] = serde_json::Value::String(String::from_utf8(chars)?);
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Hand the authority's staged chunks to the joiner's production chunk
+/// handler. The pinned stand-in admits the reference and does not move
+/// the bytes, so this is the in-process leg of that offer. `label` is the
+/// reference the joiner's fetch is waiting on; the bytes always come from
+/// `staged`.
+async fn pump_staged_chunks(
+    authority: &Arc<AppState>,
+    joiner: &Arc<AppState>,
+    staged: &super::super::control_blob::ControlBlobRef,
+    label: &super::super::control_blob::ControlBlobRef,
+    for_long: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + for_long;
+    let mut sent = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        let mut sequence = 0u32;
+        loop {
+            let Some(chunk) =
+                super::super::join_result_chunk_if_servable(authority, staged, sequence).await
+            else {
+                break;
+            };
+            super::super::control_blob::handle_control_blob_message(
+                joiner,
+                &authority.agent.agent_id(),
+                true,
+                super::super::control_blob::ControlBlobMessage::Chunk {
+                    reference: label.clone(),
+                    sequence,
+                    data_b64: BASE64.encode(&chunk),
+                },
+            )
+            .await;
+            sent += 1;
+            sequence += 1;
+            if sequence > 64 {
+                break;
+            }
+        }
+        if sequence == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sent
+}
+
+/// The joiner's chunk pull sends `Fetch` with the control-blob config.
+/// With no network that send takes the strict raw stand-in once the
+/// authority's machine is bound, and then waits for the chunk the test
+/// hands to the production chunk handler.
+async fn arm_in_process_fetch(joiner: &Arc<AppState>, authority: &Arc<AppState>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    joiner.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[authority.agent.machine_id()], true),
+    );
+    joiner
+        .agent
+        .record_authenticated_binding_for_testing(
+            authority.agent.agent_id(),
+            authority.agent.machine_id(),
+            now,
+        )
+        .await;
+    joiner
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: authority.agent.agent_id(),
+            machine_id: authority.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+/// The staged join-result copy the FetchRequest arm offered, after its
+/// reference egress. Absent when blob staging did not run.
+async fn offered_join_result_reference(
+    authority: &Arc<AppState>,
+    recipient_hex: &str,
+) -> Option<super::super::control_blob::ControlBlobRef> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let staged = authority
+            .control_blobs
+            .staged_join_result_refs_for_test(recipient_hex);
+        let offered = authority
+            .named_group_test_recorders
+            .join_artifact_egress
+            .lock()
+            .expect("egress witness")
+            .iter()
+            .any(|(to, _, kind)| to == recipient_hex && *kind == "join_result_reference");
+        if offered {
+            if let Some(reference) = staged.into_iter().next() {
+                return Some(reference);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// WHY (#1163): J2 converges only after the oversized result is offered,
+/// fetched, and digest-checked. The serve recorder is cleared first, so a
+/// test that injects those bytes cannot pass. A reference whose digest does
+/// not match the staged chunks must leave J2 pending; the exact reference
+/// then installs the carry.
 #[tokio::test]
 async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    let served = super::adr0107_stuck_join_rearm::serve_result(
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let Some(reference) = offered_join_result_reference(&s._authority, &j2_hex).await else {
+        anyhow::bail!("FetchRequest did not stage and offer a join-result blob");
+    };
+    s._authority
+        .named_group_test_recorders
+        .join_result_serves
+        .lock()
+        .expect("serve witness")
+        .clear();
+    super::super::control_blob::handle_control_blob_message(
         &s._authority,
-        &s.j2,
-        &s.stable_group_id,
-        &s.j2_attempt,
-        Some(s.add_j1.commit.revision - 1),
+        &s.j2.agent.agent_id(),
+        true,
+        super::super::control_blob::ControlBlobMessage::Fetch {
+            reference: reference.clone(),
+            sequence: 0,
+        },
     )
     .await;
-    let Some(JoinResultMessage::Result {
-        intervening_events, ..
-    }) = served
-    else {
-        anyhow::bail!("FetchRequest served no Result");
-    };
+    let fetch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < fetch_deadline {
+        let fetched = s
+            ._authority
+            .named_group_test_recorders
+            .join_artifact_egress
+            .lock()
+            .expect("egress witness")
+            .iter()
+            .any(|(to, _, kind)| to == &j2_hex && *kind == "join_result_chunk");
+        if fetched {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::ensure!(
+        s._authority
+            .named_group_test_recorders
+            .join_artifact_egress
+            .lock()
+            .expect("egress witness")
+            .iter()
+            .any(|(to, _, kind)| to == &j2_hex && *kind == "join_result_chunk"),
+        "the production chunk fetch served nothing"
+    );
+
+    arm_in_process_fetch(&s.j2, &s._authority).await;
+    let mismatched = reference_with_flipped_digest(&reference)?;
+    super::super::control_blob::handle_control_blob_message(
+        &s.j2,
+        &s.authority_id,
+        true,
+        super::super::control_blob::ControlBlobMessage::Reference {
+            reference: mismatched.clone(),
+        },
+    )
+    .await;
+    let damaged = pump_staged_chunks(
+        &s._authority,
+        &s.j2,
+        &reference,
+        &mismatched,
+        Duration::from_secs(2),
+    )
+    .await;
+    anyhow::ensure!(damaged > 0, "the staged blob produced no chunk");
     assert_eq!(
-        intervening_events.len(),
-        1,
-        "the handler serves the r+1 link"
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "a digest mismatch must not install the carry"
+    );
+    assert!(!s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+
+    super::super::control_blob::handle_control_blob_message(
+        &s.j2,
+        &s.authority_id,
+        true,
+        super::super::control_blob::ControlBlobMessage::Reference {
+            reference: reference.clone(),
+        },
+    )
+    .await;
+    let verified = pump_staged_chunks(
+        &s._authority,
+        &s.j2,
+        &reference,
+        &reference,
+        Duration::from_secs(8),
+    )
+    .await;
+    anyhow::ensure!(verified > 0, "the verified pull was given no chunk");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && join_state(&s.j2, &s.group_key).await != "active"
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "active",
+        "the digest-checked blob is what installs the intervening carry"
+    );
+    assert!(
+        s.j2.treekem_groups.read().await.contains_key(&s.group_key),
+        "verified consumption installed TreeKEM keys"
     );
     Ok(())
 }
