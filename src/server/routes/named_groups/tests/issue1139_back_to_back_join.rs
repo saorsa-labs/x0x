@@ -1441,6 +1441,25 @@ async fn d39_a_not_member_restart_then_fresh_invite_recovers_keys() -> Result<()
         "the reopened row stays not_member when the removal is not delivered (live was {after_removal})"
     );
     let r = wa_fresh_invite_round_trip_on(&s, &reopened).await?;
+    // `status` and `body` are the route's response, captured before the
+    // simulated authority exchange that recovers the seat.
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "the reopened daemon's fresh-invite route: {r}"
+    );
+    let rest: serde_json::Value = serde_json::from_str(&r.body)
+        .map_err(|e| anyhow::anyhow!("fresh-invite body is not the route JSON ({e}): {r}"))?;
+    assert_eq!(rest["ok"], true, "fresh-invite route: {r}");
+    assert_eq!(
+        rest["group_id"].as_str(),
+        Some(s.group_key.as_str()),
+        "fresh-invite route: {r}"
+    );
+    assert_eq!(
+        rest["join_state"], "pending_authority_commit",
+        "fresh-invite route, before recovery: {r}"
+    );
     wa_assert_recovered(
         &format!("restarted not_member, live_after_removal={after_removal}"),
         &r,
