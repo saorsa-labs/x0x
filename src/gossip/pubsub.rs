@@ -28,7 +28,7 @@ use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::MessageHeader;
 use saorsa_gossip_types::{MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -1208,15 +1208,14 @@ impl Drop for Subscription {
 ///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
 ///
 /// Local subscription delivery path:
-///     PlumTree admits a frame while the producer gate and the topic pump
-///     are held → that delivery is stamped with the frame's validated
-///     `MessageHeader.msg_id` → one forwarder copies the notification to
-///     every local subscriber (#869). Dropping the producer future still
-///     drains what PlumTree already queued. A duplicate that delivers
-///     nothing is not paired with a later payload. Key-cache recovery holds
-///     the same gate, so a subscribe cannot install a receiver during the
-///     replay, then drains and omits the id: the pinned subscriber tuple
-///     does not carry the recovered header.
+///     PlumTree admits a frame while that topic's turn and pump are held →
+///     that delivery is stamped with the frame's validated
+///     `MessageHeader.msg_id` → one forwarder copies the notification.
+///     Dropping the producer future still drains what PlumTree already
+///     queued. The turn is per topic, so one stalled remote send does not
+///     block other topics or their subscriptions (ADR 0009). Key-cache
+///     recovery does not take those turns: it drains afterwards and omits
+///     the id, because the pinned subscriber tuple has no recovered header.
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
@@ -1278,13 +1277,14 @@ pub struct PubSubManager {
     /// id onto the delivery PlumTree enqueued, then the forwarder copies that
     /// notification to every local subscriber.
     topic_deliveries: Arc<TopicDeliveryMap>,
-    /// Held by every PlumTree producer and by receiver install or removal.
-    ///
-    /// Lock order is this gate, then the name shard, then the topic shard,
-    /// then the topic pump. A snapshot of live receivers is stable until the
-    /// gate is released, so a subscribe during key-cache recovery cannot
-    /// leave a payload sitting on an unstamped `plumtree_rx`.
-    producer_gate: tokio::sync::Mutex<()>,
+    /// One mutex per topic for that topic's producer and its receiver
+    /// install. The map lock is not held across PlumTree or a remote send.
+    /// A stalled fanout on topic A does not block topic B (ADR 0009).
+    topic_turns: Mutex<HashMap<TopicId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Hop-local key-cache recovery is inside PlumTree. Ordinary admission
+    /// omits the transport id while this is non-zero, so a recovered payload
+    /// cannot wear another frame's id. This is not a lock.
+    cross_topic_producers: Arc<AtomicUsize>,
     /// Times a delivered frame was read for its transport id. The read
     /// happens only after PlumTree has delivered that frame.
     #[cfg(test)]
@@ -1323,15 +1323,16 @@ pub struct PubSubManager {
     #[cfg(test)]
     admission_dispatch_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after key-cache recovery has drained, before the producer gate
-    /// is released. A subscribe or unsubscribe started here stays pending.
+    /// Pauses after key-cache recovery has drained, while ordinary admission
+    /// still omits the transport id. Subscribe and unsubscribe proceed.
     #[cfg(test)]
     recovery_dispatch_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     /// Pauses after PlumTree has accepted a delivery and before this task
     /// stamps it. Cancelling the task at this point must still drain.
-    /// The no-subscriber path pauses here before dispatch, while the gate
-    /// is already held, so a subscribe cannot install during that send.
+    /// The no-subscriber path pauses here before dispatch, while this
+    /// topic's turn is already held, so a subscribe of this topic cannot
+    /// install during that send.
     #[cfg(test)]
     after_producer_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
@@ -1499,30 +1500,45 @@ struct ArmedDrain {
     /// `None` leaves the id absent (local publish and key-cache recovery).
     frame: Option<Bytes>,
     reads: Option<Arc<AtomicU64>>,
+    /// While a cross-topic recovery is in PlumTree, the id is omitted.
+    cross_topic: Arc<AtomicUsize>,
 }
 
 impl ArmedDrain {
-    fn omit(slot: Arc<TopicDelivery>) -> Self {
+    fn omit(slot: Arc<TopicDelivery>, cross_topic: Arc<AtomicUsize>) -> Self {
         Self {
             armed: true,
             slot,
             frame: None,
             reads: None,
+            cross_topic,
         }
     }
 
-    fn stamp(slot: Arc<TopicDelivery>, frame: Bytes, reads: Option<Arc<AtomicU64>>) -> Self {
+    fn stamp(
+        slot: Arc<TopicDelivery>,
+        frame: Bytes,
+        reads: Option<Arc<AtomicU64>>,
+        cross_topic: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             armed: true,
             slot,
             frame: Some(frame),
             reads,
+            cross_topic,
         }
     }
 
     fn disarm_and_bind(&mut self) {
         self.armed = false;
-        bind_exclusive_delivery(&self.slot, self.frame.as_deref(), self.reads.as_deref());
+        let frame = if self.cross_topic.load(Ordering::Acquire) == 0 {
+            self.frame.as_deref()
+        } else {
+            None
+        };
+        let reads = frame.and(self.reads.as_deref());
+        bind_exclusive_delivery(&self.slot, frame, reads);
     }
 }
 
@@ -1531,6 +1547,58 @@ impl Drop for ArmedDrain {
         if self.armed {
             self.disarm_and_bind();
         }
+    }
+}
+
+/// Drains whatever a cancelled cross-topic recovery already enqueued.
+/// Recovery does not hold a topic turn across the remote send.
+struct CrossTopicGuard {
+    counter: Arc<AtomicUsize>,
+    deliveries: Arc<TopicDeliveryMap>,
+    armed: bool,
+}
+
+impl CrossTopicGuard {
+    fn arm(counter: Arc<AtomicUsize>, deliveries: Arc<TopicDeliveryMap>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter,
+            deliveries,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for CrossTopicGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let counter = Arc::clone(&self.counter);
+        let deliveries = Arc::clone(&self.deliveries);
+        tokio::spawn(async move {
+            drain_unstamped_slots(&deliveries).await;
+            counter.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+}
+
+async fn drain_unstamped_slots(deliveries: &TopicDeliveryMap) {
+    let mut slots: Vec<(TopicId, Arc<TopicDelivery>)> = lock_std(deliveries)
+        .iter()
+        .filter(|(_, slot)| slot.alive.load(Ordering::Acquire))
+        .map(|(topic_id, slot)| (*topic_id, Arc::clone(slot)))
+        .collect();
+    slots.sort_by_key(|(topic_id, _)| *topic_id.as_bytes());
+    for (_, slot) in slots {
+        let _pump = slot.pump.lock().await;
+        slot.pump_unstamped();
     }
 }
 
@@ -1973,7 +2041,8 @@ impl PubSubManager {
             inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             topic_deliveries: Arc::new(Mutex::new(HashMap::new())),
-            producer_gate: tokio::sync::Mutex::new(()),
+            topic_turns: Mutex::new(HashMap::new()),
+            cross_topic_producers: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             admitted_transport_id_reads: Arc::new(AtomicU64::new(0)),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
@@ -2471,9 +2540,10 @@ impl PubSubManager {
         let (tx, rx) = mpsc::channel(10_000);
 
         let active_generation = {
-            // Gate before the name shard. This path can unsubscribe, and
-            // `unsubscribe` takes the same gate first.
-            let _producer = self.producer_gate.lock().await;
+            // This topic's turn, before the name shard. Other topics are
+            // not blocked, including while a remote send is in progress.
+            let turn = self.topic_turn(topic_id);
+            let _turn = turn.lock().await;
             let _name_guard = self
                 .group_preference_apply_locks
                 .name_shard(&topic)
@@ -2561,9 +2631,10 @@ impl PubSubManager {
         // generation's receiver (#869).
         #[cfg(test)]
         Self::wait_test_pause(&self.subscribe_before_claim_pause).await;
-        // After the claim pause, so that pause can unsubscribe without
-        // waiting on a gate this subscribe already holds.
-        let _producer = self.producer_gate.lock().await;
+        // After the claim pause. The turn is this topic only, so a stalled
+        // fanout on another topic does not delay this subscribe.
+        let turn = self.topic_turn(topic_id);
+        let _turn = turn.lock().await;
         let _claim_name = self
             .group_preference_apply_locks
             .name_shard(&topic)
@@ -2581,7 +2652,7 @@ impl PubSubManager {
             .get(&topic)
             .is_some_and(|state| state.generation == generation);
         if !still_current {
-            drop(_producer);
+            drop(_turn);
             drop(_claim_name);
             drop(_claim_topic);
             drop(tx);
@@ -2708,11 +2779,11 @@ impl PubSubManager {
             });
             claimed.slot.mark_ready();
             setup.started = true;
-            drop(_producer);
+            drop(_turn);
             drop(_claim_name);
             drop(_claim_topic);
         } else {
-            drop(_producer);
+            drop(_turn);
             drop(_claim_name);
             drop(_claim_topic);
             claimed.admission.wait().await;
@@ -3051,35 +3122,31 @@ impl PubSubManager {
             } else {
                 None
             };
-        // The producer gate covers this whole dispatch, including the
-        // no-subscriber path. Receiver install and removal take the same
-        // gate first, so a topic subscribed during the wait cannot obtain a
-        // `plumtree_rx` that this call neither locks nor drains. Stamp only
-        // the payloads that appeared while this call held the topic pump.
-        // Hop-local key-cache recovery can deliver onto another topic; under
-        // the gate its snapshot of live pumps stays complete, and it omits
-        // the id. saorsa-gossip's subscriber tuple is `(PeerId, Bytes)` and
-        // the replay stays inside that crate, so a recovered delivery cannot
-        // carry the recovered header. Cancelling this future after PlumTree
-        // has enqueued a payload still drains it: the drain guard runs
-        // before the gate and the pump are released.
+        // Each ordinary frame holds only its own topic turn across PlumTree,
+        // including that topic's remote send. Other topics and their
+        // subscriptions do not take that turn (ADR 0009). Hop-local recovery
+        // can deliver onto a topic that does not exist yet, so it does not
+        // take every turn: it drains after PlumTree returns and omits the id.
+        // Cancelling the future still drains what was already enqueued.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
-        let _producer = self.producer_gate.lock().await;
         let dispatch_result = if hop_local {
             self.dispatch_and_drain_recovered(peer, session, data).await
-        } else if let Some(slot) =
-            ordinary_frame.and_then(|header| self.live_topic_delivery(header.topic))
-        {
-            self.dispatch_and_bind_topic(slot, peer, session, data)
-                .await
+        } else if let Some(topic) = ordinary_frame.map(|header| header.topic) {
+            let turn = self.topic_turn(topic);
+            let _turn = turn.lock().await;
+            if let Some(slot) = self.live_topic_delivery(topic) {
+                self.dispatch_and_bind_topic(slot, peer, session, data)
+                    .await
+            } else {
+                // This topic's subscribe waits on the same turn, so it cannot
+                // install a receiver while this dispatch is in PlumTree.
+                #[cfg(test)]
+                Self::wait_test_pause(&self.after_producer_pause).await;
+                self.dispatch_inbound(peer, session, data).await
+            }
         } else {
-            // Still holding the producer gate, before PlumTree runs. A
-            // subscribe started here cannot install a receiver until this
-            // dispatch has returned.
-            #[cfg(test)]
-            Self::wait_test_pause(&self.after_producer_pause).await;
             self.dispatch_inbound(peer, session, data).await
         };
         if let Err(e) = dispatch_result {
@@ -3131,7 +3198,12 @@ impl PubSubManager {
         let reads = Some(Arc::clone(&self.admitted_transport_id_reads));
         #[cfg(not(test))]
         let reads: Option<Arc<AtomicU64>> = None;
-        let mut drain = ArmedDrain::stamp(Arc::clone(&slot), data.clone(), reads);
+        let mut drain = ArmedDrain::stamp(
+            Arc::clone(&slot),
+            data.clone(),
+            reads,
+            Arc::clone(&self.cross_topic_producers),
+        );
         let result = self.dispatch_inbound(peer, session, data).await;
         #[cfg(test)]
         Self::wait_test_pause(&self.after_producer_pause).await;
@@ -3139,59 +3211,27 @@ impl PubSubManager {
         result
     }
 
-    /// Hop-local key-cache control can replay a missed frame onto any live
-    /// topic. The caller holds `producer_gate`, so the receiver set cannot
-    /// change until this returns. Hold those pumps, then move whatever
-    /// appeared with no transport id. A receiver that is nevertheless new
-    /// after the replay is drained before the pumps are released.
+    /// Hop-local key-cache control can replay onto any topic, including one
+    /// subscribed during the call. It does not hold topic turns across that
+    /// call, so a remote send here cannot stall unrelated topics. Afterwards
+    /// every live receiver is drained with no transport id. While the call
+    /// is in progress, ordinary admission also omits the id.
     async fn dispatch_and_drain_recovered(
         &self,
         peer: PeerId,
         session: Option<saorsa_gossip_transport::AuthenticatedSession>,
         data: Bytes,
     ) -> Result<(), anyhow::Error> {
-        let slots = self.live_slots_in_lock_order();
-        let mut pumps = Vec::with_capacity(slots.len());
-        for (_, slot) in &slots {
-            pumps.push(slot.pump.lock().await);
-        }
-        for (_, slot) in &slots {
-            slot.pump_unstamped();
-        }
-        let mut armed: Vec<ArmedDrain> = slots
-            .iter()
-            .map(|(_, slot)| ArmedDrain::omit(Arc::clone(slot)))
-            .collect();
+        let guard = CrossTopicGuard::arm(
+            Arc::clone(&self.cross_topic_producers),
+            Arc::clone(&self.topic_deliveries),
+        );
         let result = self.dispatch_inbound(peer, session, data).await;
-        let late = self.live_slots_in_lock_order();
-        let mut late_pumps = Vec::new();
-        for (topic_id, slot) in &late {
-            if slots.iter().any(|(seen, _)| seen == topic_id) {
-                continue;
-            }
-            late_pumps.push(slot.pump.lock().await);
-            let mut drain = ArmedDrain::omit(Arc::clone(slot));
-            drain.disarm_and_bind();
-        }
-        for drain in &mut armed {
-            drain.disarm_and_bind();
-        }
+        drain_unstamped_slots(&self.topic_deliveries).await;
         #[cfg(test)]
         Self::wait_test_pause(&self.recovery_dispatch_pause).await;
-        drop(armed);
-        drop(pumps);
-        drop(late_pumps);
+        guard.disarm();
         result
-    }
-
-    fn live_slots_in_lock_order(&self) -> Vec<(TopicId, Arc<TopicDelivery>)> {
-        let mut slots: Vec<_> = lock_std(&self.topic_deliveries)
-            .iter()
-            .filter(|(_, slot)| slot.alive.load(Ordering::Acquire))
-            .map(|(topic_id, slot)| (*topic_id, Arc::clone(slot)))
-            .collect();
-        slots.sort_by_key(|(topic_id, _)| *topic_id.as_bytes());
-        slots
     }
 
     #[cfg(test)]
@@ -3218,24 +3258,37 @@ impl PubSubManager {
         topic_id: TopicId,
         encoded: Bytes,
     ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
-        let _producer = self.producer_gate.lock().await;
+        let turn = self.topic_turn(topic_id);
+        let _turn = turn.lock().await;
         if let Some(slot) = self.live_topic_delivery(topic_id) {
             let _pump = slot.pump.lock().await;
             // Local publish has no inbound header. The id stays absent.
-            // Cancelling after PlumTree enqueues still drains.
-            let mut drain = ArmedDrain::omit(Arc::clone(&slot));
+            // Cancelling after PlumTree enqueues still drains. The turn is
+            // this topic only, so another topic's publish is not blocked.
+            let mut drain =
+                ArmedDrain::omit(Arc::clone(&slot), Arc::clone(&self.cross_topic_producers));
             let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
             drain.disarm_and_bind();
             result
         } else {
-            // The gate is held, so a receiver cannot appear during this publish.
             let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
+            if let Some(slot) = self.live_topic_delivery(topic_id) {
+                let _pump = slot.pump.lock().await;
+                slot.pump_unstamped();
+            }
             result
         }
+    }
+
+    fn topic_turn(&self, topic_id: TopicId) -> Arc<tokio::sync::Mutex<()>> {
+        lock_std(&self.topic_turns)
+            .entry(topic_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn claim_topic_delivery(
@@ -3311,15 +3364,12 @@ impl PubSubManager {
 
     /// Unsubscribe from a topic, removing all subscriptions.
     pub async fn unsubscribe(&self, topic: &str) {
-        // Before the name shard: a producer holds this gate and then the
-        // topic pump, and subscribe holds it across `subscribe_ready`.
-        let _producer = self.producer_gate.lock().await;
-        let _name_guard = self
-            .group_preference_apply_locks
-            .name_shard(topic)
-            .lock()
-            .await;
         if is_local_topic(topic) {
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(topic)
+                .lock()
+                .await;
             self.topic_ref_counts.write().await.remove(topic);
             self.local_topics.write().await.remove(topic);
             return;
@@ -3331,6 +3381,14 @@ impl PubSubManager {
             .get(topic)
             .copied();
         let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
+        // Turn before the name shard, matching subscribe. Only this topic waits.
+        let turn = self.topic_turn(topic_id);
+        let _turn = turn.lock().await;
+        let _name_guard = self
+            .group_preference_apply_locks
+            .name_shard(topic)
+            .lock()
+            .await;
         let _topic_guard = self
             .group_preference_apply_locks
             .shard(topic_id)
@@ -10370,7 +10428,7 @@ mod issue869 {
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut *task).await;
         assert!(
             finished.is_err(),
-            "{what} finished while the producer gate was held"
+            "{what} finished while this topic's turn was held"
         );
     }
 
@@ -10395,7 +10453,7 @@ mod issue869 {
         assert!(missed.is_err(), "the reference miss is not delivered yet");
 
         let (entered, release) = arm_pause(&manager.recovery_dispatch_pause);
-        let recover_task = {
+        let mut recover_task = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
                 manager.handle_incoming(from, Some(session), response).await;
@@ -10406,28 +10464,41 @@ mod issue869 {
         assert_eq!(recovered.message.payload.as_ref(), b"recovered-late");
         assert!(
             recovered.transport_msg_id.is_none(),
-            "recovery omits the id while the producer gate is still held"
+            "recovery omits the id"
         );
 
-        let mut joiner = {
+        let joiner = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move { manager.subscribe("issue869-during".to_string()).await })
         };
-        stays_pending(&mut joiner, "subscribe during recovery").await;
         let duplicate = invalidate(&frame_b);
-        let mut duplicate_task = {
+        let duplicate_task = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
                 manager.handle_incoming(peer, None, duplicate).await;
             })
         };
-        stays_pending(&mut duplicate_task, "invalid duplicate during recovery").await;
+        // Recovery does not hold a daemon-wide lock, so another topic's
+        // subscribe and this topic's duplicate both finish while the omit
+        // window is still open.
+        let mut joiner = tokio::time::timeout(std::time::Duration::from_secs(2), joiner)
+            .await
+            .expect("subscribe during recovery")
+            .expect("joiner task");
+        tokio::time::timeout(std::time::Duration::from_secs(2), duplicate_task)
+            .await
+            .expect("invalid duplicate during recovery")
+            .expect("duplicate task");
+        let still_recovering =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recover_task).await;
+        assert!(
+            still_recovering.is_err(),
+            "recovery stays paused while the other topic subscribes"
+        );
 
         *manager.recovery_dispatch_pause.lock().unwrap() = None;
         release.wait().await;
         recover_task.await.expect("recovery task");
-        duplicate_task.await.expect("duplicate task");
-        let mut joiner = joiner.await.expect("joiner task");
 
         let extra = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -10470,7 +10541,7 @@ mod issue869 {
         let (from, session, response) =
             queue_miss(&manager, topic, b"recovered-replace", [0x33; 32]).await;
         let (entered, release) = arm_pause(&manager.recovery_dispatch_pause);
-        let recover_task = {
+        let mut recover_task = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
                 manager.handle_incoming(from, Some(session), response).await;
@@ -10481,18 +10552,26 @@ mod issue869 {
         assert_eq!(recovered.message.payload.as_ref(), b"recovered-replace");
         assert!(recovered.transport_msg_id.is_none());
 
-        let mut unsubscribe_task = {
+        let unsubscribe_task = {
             let manager = Arc::clone(&manager);
             let topic = topic.to_string();
             tokio::spawn(async move {
                 manager.unsubscribe(&topic).await;
             })
         };
-        stays_pending(&mut unsubscribe_task, "unsubscribe during recovery").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), unsubscribe_task)
+            .await
+            .expect("unsubscribe during recovery")
+            .expect("unsubscribe task");
+        let still_recovering =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recover_task).await;
+        assert!(
+            still_recovering.is_err(),
+            "recovery stays paused while this topic unsubscribes"
+        );
         *manager.recovery_dispatch_pause.lock().unwrap() = None;
         release.wait().await;
         recover_task.await.expect("recovery task");
-        unsubscribe_task.await.expect("unsubscribe task");
         drop(original);
 
         let mut replacement = manager.subscribe(topic.to_string()).await;
@@ -10526,7 +10605,7 @@ mod issue869 {
 
     #[tokio::test]
     async fn subscribe_during_ordinary_dispatch_does_not_strand_a_payload() {
-        // Leaf refuses an unsubscribed topic before the producer gate, so
+        // Leaf refuses an unsubscribed topic before this topic's turn, so
         // this gap is the Full path that dispatches with no live receiver.
         let manager = Arc::new(
             PubSubManager::new_with_participation(
@@ -10658,5 +10737,87 @@ mod issue869 {
             note.transport_msg_id.is_none(),
             "a local publish has no inbound header to stamp"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_remote_send_on_one_topic_lets_another_finish() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([3; 32])],
+            sends: Vec::new(),
+        });
+        let topic_a = "issue869-stall-a";
+        let topic_b = "issue869-stall-b";
+        let mut sub_a = manager.subscribe(topic_a.to_string()).await;
+        let mut sub_b = manager.subscribe(topic_b.to_string()).await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.transport.remote_send_pause.lock().unwrap() = Some((
+            TopicId::from_entity(topic_a.as_bytes()),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ));
+        let mut publish_a = {
+            let manager = Arc::clone(&manager);
+            let topic = topic_a.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"from-a"))
+                    .await
+                    .expect("publish A");
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("topic A reaches its remote send");
+        let still_sending =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut publish_a).await;
+        assert!(
+            still_sending.is_err(),
+            "topic A stays inside the remote send"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            manager
+                .publish(topic_b.to_string(), Bytes::from_static(b"from-b"))
+                .await
+                .expect("publish B");
+        })
+        .await
+        .expect("topic B finishes while topic A's remote send is held");
+        let note_b = tokio::time::timeout(std::time::Duration::from_secs(2), recv_note(&mut sub_b))
+            .await
+            .expect("topic B delivery");
+        assert_eq!(note_b.message.payload.as_ref(), b"from-b");
+        assert!(note_b.transport_msg_id.is_none());
+
+        let mut sub_c = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.subscribe("issue869-stall-c".to_string()),
+        )
+        .await
+        .expect("subscribe finishes while topic A's remote send is held");
+        let (frame_c, id_c) = eager_frame_on("issue869-stall-c", b"from-c", [0x88; 32]);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.handle_incoming(PeerId::new([5; 32]), None, frame_c),
+        )
+        .await
+        .expect("topic C dispatch while topic A's remote send is held");
+        let note_c = recv_note(&mut sub_c).await;
+        assert_eq!(note_c.message.payload.as_ref(), b"from-c");
+        assert_eq!(note_c.transport_msg_id, Some(id_c));
+
+        release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut publish_a)
+            .await
+            .expect("topic A finishes after its remote send")
+            .expect("publish A task");
+        let note_a = recv_note(&mut sub_a).await;
+        assert_eq!(note_a.message.payload.as_ref(), b"from-a");
+        assert!(note_a.transport_msg_id.is_none());
     }
 }
