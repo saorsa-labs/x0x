@@ -105,6 +105,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A held `history.db` now fails as `HistoryError::Locked` (#1315).** A
+  second opener of a history database that another process (or connection)
+  holds failed on its first statement with SQLite "database is locked",
+  reported as `HistoryError::Database("pragma setup … database is
+  locked")`. It is now `HistoryError::Locked`, the variant documented for
+  this case, naming the path, after one busy-timeout window. The daemon's
+  start-up error now reads "history initialization failed: history database
+  is locked by another process: <path> …" under "failed to create agent".
+  Other setup failures keep their `HistoryError::Database` text.
 - **A newer history database in WAL mode, or settled, is refused without
   being changed (ADR 0116 slice F).** History refused a `history.db`
   written by a newer schema, but the refusal could still change files:
