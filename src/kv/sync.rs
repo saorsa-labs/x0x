@@ -480,6 +480,10 @@ async fn reap_pruned_retained_images(repair: &RetainedPruneRepair<'_>) -> Retain
     }
     let attempt = publish_retained_image_repair(repair);
     tokio::pin!(attempt);
+    // Cancel drops the gate wait and a TreeKEM seal that is still acquiring
+    // its group locks. After `encrypt_message` advances the send ratchet,
+    // `TreeKemGroupStoreProtector::seal_record` keeps those locks until the
+    // snapshot write or its rollback finishes, even if this select drops.
     tokio::select! {
         biased;
         () = repair.cancel.cancelled() => {

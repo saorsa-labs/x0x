@@ -858,7 +858,9 @@ struct GssGroupStoreBinding {
 /// The group mutex covers crypto and the durable snapshot write. A failed
 /// write restores the pre-operation ratchet before releasing the mutex, so a
 /// record is never acknowledged or published from state that only existed in
-/// memory.
+/// memory. After `encrypt_message` advances the send ratchet, that commit
+/// keeps the membership and group locks until the snapshot rename or its
+/// rollback finishes, even when the caller is cancelled.
 ///
 /// The protector holds the daemon state only weakly (#1250, #1269): the
 /// store's sync owns the protector, and the daemon state owns the store
@@ -870,7 +872,7 @@ struct TreeKemGroupStoreProtector {
     group_key: String,
     stable_group_id: String,
     authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
-    invalid: std::sync::atomic::AtomicBool,
+    invalid: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// #895: the live TreeKEM protector for a group-scoped task list — the same
@@ -890,8 +892,51 @@ pub(in crate::server) fn treekem_task_list_protector(
         group_key: group_key.to_string(),
         stable_group_id: info.stable_group_id().to_string(),
         authorization,
-        invalid: std::sync::atomic::AtomicBool::new(false),
+        invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }))
+}
+
+#[cfg(test)]
+struct TreeKemSealPersistPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn treekem_seal_persist_pauses() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<TreeKemSealPersistPause>>,
+> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<TreeKemSealPersistPause>>,
+        >,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Park the next send-ratchet snapshot write for `group_key` after the
+/// ratchet has advanced and before the rename. One-shot.
+#[cfg(test)]
+fn arm_treekem_seal_persist_pause(group_key: &str) -> std::sync::Arc<TreeKemSealPersistPause> {
+    let pause = std::sync::Arc::new(TreeKemSealPersistPause {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    treekem_seal_persist_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(group_key.to_string(), std::sync::Arc::clone(&pause));
+    pause
+}
+
+#[cfg(test)]
+fn take_treekem_seal_persist_pause(
+    group_key: &str,
+) -> Option<std::sync::Arc<TreeKemSealPersistPause>> {
+    treekem_seal_persist_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(group_key)
 }
 
 impl TreeKemGroupStoreProtector {
@@ -905,7 +950,7 @@ impl TreeKemGroupStoreProtector {
             group_key: binding.group_key.clone(),
             stable_group_id: binding.stable_group_id.clone(),
             authorization,
-            invalid: std::sync::atomic::AtomicBool::new(false),
+            invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1049,9 +1094,10 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
     ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
         let state = self.state()?;
         let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
-        let _membership_guard = membership.lock().await;
+        // Lock waits stay on this future, so cancel_sync drops them.
+        let membership_guard = membership.lock_owned().await;
         let live = self.live_group().await?;
-        let mut group = live.lock().await;
+        let mut group = live.lock_owned().await;
         // Re-read authority only after acquiring the ratchet mutex. Membership
         // commits use the same mutex, so this snapshot cannot predate a commit
         // that won while this operation was waiting.
@@ -1064,12 +1110,13 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         }
         let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
         let epoch = group.epoch();
+        let group_id = self.group_id();
         let inner = x0x::kv::treekem::sign_inner_mutation(
             signing,
             kind,
             payload,
             x0x::kv::treekem::TreeKemInnerBinding {
-                group_id: self.group_id(),
+                group_id: group_id.clone(),
                 epoch,
                 store_id,
                 authorization_binding: Self::authorization_binding(&info),
@@ -1083,23 +1130,60 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 return Err(Self::map_crypto_error(error));
             }
         };
-        if let Err(error) =
-            super::named_groups::persist_treekem_snapshot_bound(&state, &self.group_key, &group)
-                .await
-        {
-            self.rollback(&info, &rollback, &mut group).await;
-            return Err(x0x::kv::KvError::Gossip(format!(
-                "persist TreeKEM send ratchet: {error}"
-            )));
-        }
-        Ok(x0x::kv::TreeKemKvStoreRecordV1 {
+        let record = x0x::kv::TreeKemKvStoreRecordV1 {
             version: 1,
-            group_id: self.group_id(),
+            group_id,
             store_id: *store_id.as_bytes(),
             epoch,
             reader_only,
             ciphertext,
-        })
+        };
+        // The send ratchet has moved. A dropped caller must not release
+        // these locks while the snapshot rename is still running: that
+        // rename keeps going in Tokio's blocking pool and can replace a
+        // newer generation written after the locks were freed.
+        let group_key = self.group_key.clone();
+        let invalid = Arc::clone(&self.invalid);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Detach. Dropping this caller must not abort the commit.
+        drop(tokio::spawn(async move {
+            let _membership_guard = membership_guard;
+            #[cfg(test)]
+            if let Some(pause) = take_treekem_seal_persist_pause(&group_key) {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+            let outcome = match super::named_groups::persist_treekem_snapshot_bound(
+                &state, &group_key, &group,
+            )
+            .await
+            {
+                Ok(()) => Ok(record),
+                Err(error) => {
+                    match super::named_groups::restore_local_treekem_group_from_snapshot(
+                        &state, &info, &rollback,
+                    ) {
+                        Ok(restored) => *group = restored,
+                        Err(restore_error) => {
+                            invalid.store(true, std::sync::atomic::Ordering::Release);
+                            tracing::error!(
+                                "failed to rollback TreeKEM store ratchet: {restore_error}"
+                            );
+                        }
+                    }
+                    Err(x0x::kv::KvError::Gossip(format!(
+                        "persist TreeKEM send ratchet: {error}"
+                    )))
+                }
+            };
+            drop(group);
+            let _ = tx.send(outcome);
+        }));
+        rx.await.map_err(|_| {
+            x0x::kv::KvError::Gossip(
+                "TreeKEM send ratchet commit ended before the snapshot write".to_string(),
+            )
+        })?
     }
 
     async fn open_record(
@@ -5252,6 +5336,181 @@ mod tests {
             group_key.to_string(),
             Arc::new(tokio::sync::Mutex::new(live)),
         );
+    }
+
+    fn treekem_store_protector(
+        state: &Arc<AppState>,
+        group_key: &str,
+        info: &x0x::groups::GroupInfo,
+    ) -> TreeKemGroupStoreProtector {
+        let authorization = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(info).expect("treekem auth"),
+        );
+        TreeKemGroupStoreProtector::new(
+            state,
+            &GssGroupStoreBinding {
+                group_key: group_key.to_string(),
+                stable_group_id: info.stable_group_id().to_string(),
+                creator: info.creator,
+                name: "sealed".to_string(),
+                store_id: x0x::kv::KvStoreId::new([7; 32]),
+                topic: format!("group/{group_key}/sealed"),
+            },
+            authorization,
+        )
+    }
+
+    /// Cancel while the seal is still waiting for the group lock. The
+    /// ratchet must not move.
+    #[tokio::test]
+    async fn cancelled_treekem_seal_does_not_advance_while_waiting_for_the_group_lock() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e1".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("seeded group")
+            .clone();
+        let protector = treekem_store_protector(&state, &group_key, &info);
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let live = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .expect("live ratchet");
+        let guard = live.lock().await;
+        let before = guard.to_snapshot_bytes().expect("snapshot before cancel");
+        let seal = tokio::spawn(async move {
+            protector
+                .seal_record(
+                    &signing,
+                    x0x::kv::KvMutationKind::Control,
+                    &x0x::kv::KvStoreId::new([7; 32]),
+                    b"state-request",
+                    true,
+                )
+                .await
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!seal.is_finished(), "seal acquired the lock the test holds");
+        seal.abort();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = live
+            .lock()
+            .await
+            .to_snapshot_bytes()
+            .expect("snapshot after cancel");
+        assert_eq!(
+            before, after,
+            "a seal cancelled during lock acquisition must not advance the ratchet"
+        );
+    }
+
+    /// Drop the caller while the snapshot write is in progress. The group
+    /// locks stay held until that write finishes, so a later seal cannot
+    /// persist a newer generation underneath it.
+    #[tokio::test]
+    async fn cancelled_treekem_seal_holds_the_group_lock_through_snapshot_persist() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e2".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("seeded group")
+            .clone();
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let live = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .expect("live ratchet");
+        let pause = arm_treekem_seal_persist_pause(&group_key);
+        let first = {
+            let protector = treekem_store_protector(&state, &group_key, &info);
+            let signing = signing.clone();
+            tokio::spawn(async move {
+                protector
+                    .seal_record(
+                        &signing,
+                        x0x::kv::KvMutationKind::Delta,
+                        &x0x::kv::KvStoreId::new([7; 32]),
+                        b"first-generation",
+                        false,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("first seal did not reach the snapshot write");
+        first.abort();
+        tokio::task::yield_now().await;
+        assert!(
+            live.try_lock().is_err(),
+            "dropping the caller released the group lock during the snapshot write"
+        );
+        let second = {
+            let protector = treekem_store_protector(&state, &group_key, &info);
+            let signing = signing.clone();
+            tokio::spawn(async move {
+                protector
+                    .seal_record(
+                        &signing,
+                        x0x::kv::KvMutationKind::Delta,
+                        &x0x::kv::KvStoreId::new([7; 32]),
+                        b"second-generation",
+                        false,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a later seal persisted while the cancelled seal still owned the ratchet"
+        );
+        pause.release.notify_one();
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("later seal did not finish after the snapshot write")
+            .expect("later seal task")
+            .expect("later seal");
+        let live_bytes = live
+            .lock()
+            .await
+            .to_snapshot_bytes()
+            .expect("live snapshot");
+        let path = state.treekem_dir.join(format!("{group_key}.snap"));
+        let durable = tokio::fs::read(&path).await.expect("durable snapshot");
+        assert!(
+            durable
+                .windows(live_bytes.len())
+                .any(|window| window == live_bytes.as_slice()),
+            "durable snapshot is not the live ratchet after the later seal"
+        );
+        assert!(record.ciphertext.len() > 16);
     }
 
     #[tokio::test]
