@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! #1288 row 4: a connected WebSocket session is a shutdown owner.
 //!
 //! Axum detaches the upgrade callback. The session loop and its children
@@ -86,6 +87,17 @@ pub(super) struct BackfillHold {
     released: AtomicBool,
     parked: AtomicUsize,
     drain_waiting: AtomicBool,
+}
+
+/// Releases a blocking backfill park when the test returns, including an
+/// early error. Restoring an unbounded drain must fail the test, not leave
+/// the blocking thread parked.
+struct BackfillReleaseGuard(Arc<BackfillHold>);
+
+impl Drop for BackfillReleaseGuard {
+    fn drop(&mut self) {
+        self.0.released.store(true, Ordering::SeqCst);
+    }
 }
 
 fn backfill_holds() -> &'static std::sync::Mutex<Vec<(usize, Arc<BackfillHold>)>> {
@@ -393,6 +405,7 @@ async fn issue1288_ws_backfill_parked_query_reopens_same_dir() -> Result<()> {
     let addr = daemon.handle.local_addr();
     let token = state.api_token.clone();
     let hold = arm_backfill_hold(&state).context("daemon history store")?;
+    let _release = BackfillReleaseGuard(Arc::clone(&hold));
 
     let direct = connect_ws(addr, &token, "/ws/direct?backfill=1").await?;
     let mut plain = connect_ws(addr, &token, "/ws").await?;
@@ -465,6 +478,7 @@ async fn issue1288_ws_backfill_stalled_past_shutdown_budget_keeps_owner() -> Res
     let token = state.api_token.clone();
     let stats = Arc::clone(&state.ws_outbound_stats);
     let hold = arm_backfill_hold(&state).context("daemon history store")?;
+    let release = BackfillReleaseGuard(Arc::clone(&hold));
     let socket = connect_ws(addr, &token, "/ws/direct?backfill=1").await?;
 
     let deadline = tokio::time::Instant::now() + WAIT;
@@ -509,7 +523,7 @@ async fn issue1288_ws_backfill_stalled_past_shutdown_budget_keeps_owner() -> Res
         "the blocking read must still be inside the park"
     );
 
-    hold.released.store(true, Ordering::SeqCst);
+    drop(release);
     let cleanup = tokio::time::Instant::now() + WAIT;
     while super::ws::unfinished_backfill_reads(&stats) > 0 {
         anyhow::ensure!(
@@ -523,16 +537,150 @@ async fn issue1288_ws_backfill_stalled_past_shutdown_budget_keeps_owner() -> Res
     Ok(())
 }
 
+/// Releases a query that is parked inside the connection lock, including
+/// when the test fails before it reaches the explicit release.
+struct QueryLockReleaseGuard(Arc<crate::history::store::QueryLockHold>);
+
+impl Drop for QueryLockReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn writer_wait_record() -> crate::history::HistoryRecord {
+    crate::history::HistoryRecord {
+        msg_id: [9u8; 32],
+        scope: crate::history::Scope::Topic("x0x.test.1288.writer-wait".to_string()),
+        author_agent: None,
+        author_machine: None,
+        author_pubkey: None,
+        sent_at_ms: 1,
+        seen_at_ms: 1,
+        direction: crate::history::Direction::Inbound,
+        content_type: "text/plain".to_string(),
+        payload: b"writer-wait".to_vec(),
+        signed_artifact: None,
+        signature: None,
+        sig_context: None,
+        provenance: crate::history::Provenance::LocalSend,
+        replace_key: None,
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
+    }
+}
+
+/// The backfill holds the connection mutex inside `Store::query`, and an
+/// admitted write is waiting on that mutex. Shutdown must return within the
+/// test bound, report that the owner was not released, and leave the write
+/// to finish after the read releases the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1288_ws_backfill_inside_lock_bounds_writer_shutdown() -> Result<()> {
+    let (daemon, state) = start_daemon().await?;
+    let addr = daemon.handle.local_addr();
+    let token = state.api_token.clone();
+    let stats = Arc::clone(&state.ws_outbound_stats);
+    let history = state.agent.history().context("daemon history")?.clone();
+    let hold = crate::history::store::arm_query_lock_park(history.store());
+    let release = QueryLockReleaseGuard(Arc::clone(&hold));
+    let counters = history.counters();
+    let socket = connect_ws(addr, &token, "/ws/direct?backfill=1").await?;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.parked() < 1 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the history query did not park inside the connection lock (parked {})",
+            hold.parked()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let entered = hold.writer_entered();
+    history.record(writer_wait_record());
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while hold.writer_entered() <= entered {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the history writer did not reach the connection lock (entered {entered})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let written = counters
+        .written_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    drop(state);
+
+    let Daemon {
+        _root,
+        config: _,
+        handle,
+        state_weak: _,
+        agent_weak: _,
+    } = daemon;
+    let shutdown = tokio::time::timeout(WAIT, handle.shutdown_and_wait()).await;
+    let result = match shutdown {
+        Err(_) => {
+            anyhow::bail!(
+                "shutdown did not return within {WAIT:?} while a query held the connection lock"
+            )
+        }
+        Ok(result) => result,
+    };
+    assert!(
+        result.is_err(),
+        "a query holding the connection lock must not be reported as a released shutdown: {result:?}"
+    );
+    assert!(
+        super::ws::unfinished_backfill_reads(&stats) >= 1,
+        "the locked read must stay owned after shutdown returns"
+    );
+    assert!(
+        hold.parked() >= 1 && !hold.is_released(),
+        "the read must still be inside the connection lock"
+    );
+    assert!(
+        hold.writer_entered() > entered,
+        "the writer must have been waiting on the connection lock"
+    );
+    assert_eq!(
+        counters
+            .written_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        written,
+        "the admitted write must still be waiting when shutdown returns"
+    );
+
+    drop(release);
+    let cleanup = tokio::time::Instant::now() + WAIT;
+    while super::ws::unfinished_backfill_reads(&stats) > 0
+        || crate::history::writer::reap_finished_writer_threads() > 0
+        || counters
+            .written_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < written + 1
+    {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < cleanup,
+            "the admitted write did not finish after the read released the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(socket);
+    drop(_root);
+    Ok(())
+}
+
 /// Completed backfill handles are reclaimed on the next registration.
 /// A read that has not finished stays owned. No daemon is started.
 #[tokio::test]
-async fn issue1288_repeated_backfill_reaps_completed_reads() {
+async fn issue1288_repeated_backfill_reaps_completed_reads() -> Result<()> {
     let stats = Arc::new(super::ws::WsOutboundStats::default());
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     assert!(super::ws::track_backfill_task(&stats, async move {
         let _ = done_tx.send(());
     }));
-    done_rx.await.expect("completed read signals");
+    done_rx.await.context("completed read signals")?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         if super::ws::backfill_read_registry_len(&stats) == 1
@@ -562,4 +710,51 @@ async fn issue1288_repeated_backfill_reaps_completed_reads() {
         "the pending read must stay owned"
     );
     let _ = park_tx.send(());
+    Ok(())
+}
+
+/// A failing check must release the blocking park. Otherwise restoring an
+/// unbounded drain makes the stalled-read test wait forever instead of
+/// returning the failure.
+#[test]
+fn issue1288_backfill_hold_releases_when_the_check_fails() {
+    let hold = Arc::new(BackfillHold {
+        released: AtomicBool::new(false),
+        parked: AtomicUsize::new(0),
+        drain_waiting: AtomicBool::new(false),
+    });
+    let parked = Arc::clone(&hold);
+    let thread = std::thread::spawn(move || {
+        parked.parked.fetch_add(1, Ordering::SeqCst);
+        while !parked.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while hold.parked.load(Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the blocking hold did not park"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let failed = (|| -> Result<()> {
+        let _guard = BackfillReleaseGuard(Arc::clone(&hold));
+        anyhow::bail!("shutdown did not return within the bound");
+    })();
+    assert!(
+        failed.is_err(),
+        "the no-bound control must terminate with a failure"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !thread.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failure path left the blocking read parked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = thread.join();
 }

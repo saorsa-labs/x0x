@@ -989,7 +989,10 @@ async fn handle_ws_connection(
                 };
                 match ws_history_query(&state, move || {
                     #[cfg(test)]
-                    super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                    {
+                        super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                        crate::history::store::prepare_query_lock_park();
+                    }
                     store.query(&q)
                 })
                 .await
@@ -1427,7 +1430,10 @@ async fn handle_ws_command(
                         };
                         match ws_history_query(state, move || {
                             #[cfg(test)]
-                            super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                            {
+                                super::issue1288_ws_shutdown::park_backfill_hold(&store);
+                                crate::history::store::prepare_query_lock_park();
+                            }
                             store.query(&q)
                         })
                         .await

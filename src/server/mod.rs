@@ -2844,6 +2844,10 @@ pub async fn serve_with_options(
         //    typed QUIC shutdown path. A successful result proves ant-quic
         //    released its socket; a failure is returned only after the rest of
         //    this supervisor cleanup completes.
+        // #1288: a backfill still inside `Store::query` holds the connection
+        // mutex. This await drains the history writer. The writer's join is
+        // the drain grace, not an open-ended thread join: a write waiting on
+        // that mutex stays on the writer thread, and the await returns.
         let agent_shutdown_result = state.agent.try_shutdown().await;
 
         // Clean up port file on shutdown (kept after task teardown so the

@@ -121,6 +121,8 @@ pub struct Writer {
     handle: WriterHandle,
     thread: Option<std::thread::JoinHandle<()>>,
     shutdown_tx: mpsc::Sender<()>,
+    /// Set when the writer thread returns, including after a panic.
+    finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -137,9 +139,14 @@ impl Writer {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let counters = Arc::new(HistoryCounters::default());
         let thread_counters = Arc::clone(&counters);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_finished = Arc::clone(&finished);
         let thread = std::thread::Builder::new()
             .name("x0x-history-writer".into())
-            .spawn(move || writer_loop(&store, &rx, &shutdown_rx, &thread_counters))
+            .spawn(move || {
+                let _done = WriterFinished(thread_finished);
+                writer_loop(&store, &rx, &shutdown_rx, &thread_counters);
+            })
             .ok();
         if thread.is_none() {
             // Thread spawn failure: every record will count as dropped via
@@ -150,6 +157,7 @@ impl Writer {
             handle: WriterHandle { tx, counters },
             thread,
             shutdown_tx,
+            finished,
         }
     }
 
@@ -161,13 +169,83 @@ impl Writer {
 
     /// Drain-then-stop. Bounded by `SHUTDOWN_DRAIN_GRACE`; queued records
     /// beyond the grace are abandoned and counted — never `abort()`.
+    ///
+    /// The join uses that same grace. A thread blocked in `Store::query`'s
+    /// connection mutex (or inside a write that outlives the grace) is left
+    /// running: the `JoinHandle` stays owned, the in-flight write is not
+    /// cancelled, and this call returns so shutdown is not unbounded.
     pub fn shutdown(mut self) {
         // Signal the loop; it drains what it can within the grace window.
         let _ = self.shutdown_tx.send(());
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_GRACE;
+        while !self.finished.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                retain_unfinished_writer(thread);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = thread.join();
     }
+}
+
+/// Marks the writer thread finished on every return path, including panic.
+struct WriterFinished(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WriterFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn unfinished_writers() -> &'static std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> {
+    static WRITERS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+        std::sync::Mutex::new(Vec::new());
+    &WRITERS
+}
+
+/// Keep a writer that did not exit within the drain grace. Finished handles
+/// already in the registry are joined here. The stuck thread is not detached
+/// and its write is not aborted.
+fn retain_unfinished_writer(thread: std::thread::JoinHandle<()>) {
+    let finished = {
+        let mut guard = unfinished_writers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = std::mem::take(&mut *guard);
+        let (finished, mut pending): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(std::thread::JoinHandle::is_finished);
+        pending.push(thread);
+        *guard = pending;
+        finished
+    };
+    for thread in finished {
+        let _ = thread.join();
+    }
+}
+
+/// Join writer threads that have finished since a bounded shutdown retained
+/// them. Returns how many are still running.
+#[cfg(test)]
+pub fn reap_finished_writer_threads() -> usize {
+    let mut guard = unfinished_writers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pending = std::mem::take(&mut *guard);
+    let (finished, pending): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .partition(std::thread::JoinHandle::is_finished);
+    *guard = pending;
+    let running = guard.len();
+    drop(guard);
+    for thread in finished {
+        let _ = thread.join();
+    }
+    running
 }
 
 fn writer_loop(
@@ -304,4 +382,137 @@ fn flush(store: &Store, batch: &mut Vec<HistoryRecord>, counters: &HistoryCounte
         }
     }
     batch.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{reap_finished_writer_threads, Writer, SHUTDOWN_DRAIN_GRACE};
+    use crate::history::record::{Direction, HistoryRecord, Provenance};
+    use crate::history::store::{
+        arm_query_lock_park, prepare_query_lock_park, HistoryQuery, QueryLockHold, Store,
+    };
+    use crate::history::Scope;
+
+    struct Release(Arc<QueryLockHold>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn waiting_record() -> HistoryRecord {
+        HistoryRecord {
+            msg_id: [9u8; 32],
+            scope: Scope::Topic("x0x.test.1288.writer-wait".to_string()),
+            author_agent: None,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload: b"writer-wait".to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: Provenance::LocalSend,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    /// A query holds the connection mutex and the writer is blocked in
+    /// `insert`. `Writer::shutdown` returns within the drain grace, and the
+    /// admitted write commits after the query releases the lock.
+    #[test]
+    fn issue1288_writer_shutdown_bounded_while_query_holds_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("history.db")).unwrap());
+        let hold = arm_query_lock_park(&store);
+        let release = Release(Arc::clone(&hold));
+        let query_store = Arc::clone(&store);
+        let query = std::thread::spawn(move || {
+            prepare_query_lock_park();
+            let _ = query_store.query(&HistoryQuery {
+                limit: 1,
+                ..HistoryQuery::default()
+            });
+        });
+        let park_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.parked() < 1 {
+            assert!(
+                Instant::now() < park_deadline,
+                "the query did not park inside the connection lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let writer = Writer::spawn(Arc::clone(&store));
+        let counters = writer.handle().counters();
+        let entered = hold.writer_entered();
+        writer.handle().record(waiting_record());
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.writer_entered() <= entered {
+            assert!(
+                Instant::now() < wait_deadline,
+                "the writer did not reach the connection lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let written = counters.written_total.load(Ordering::Relaxed);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let started = Instant::now();
+        let shutdown = std::thread::spawn(move || {
+            writer.shutdown();
+            let _ = done_tx.send(started.elapsed());
+        });
+        let outcome = done_rx.recv_timeout(SHUTDOWN_DRAIN_GRACE + Duration::from_secs(3));
+        if outcome.is_err() {
+            drop(release);
+            let _ = query.join();
+            let _ = shutdown.join();
+            panic!("writer shutdown did not return while the query held the connection");
+        }
+        let elapsed = outcome.unwrap();
+        assert!(
+            elapsed + Duration::from_secs(1) >= SHUTDOWN_DRAIN_GRACE,
+            "shutdown returned before the join bound ({elapsed:?})"
+        );
+        assert!(
+            elapsed < SHUTDOWN_DRAIN_GRACE + Duration::from_secs(2),
+            "shutdown exceeded the drain grace ({elapsed:?})"
+        );
+        assert_eq!(
+            counters.written_total.load(Ordering::Relaxed),
+            written,
+            "the admitted write must still be waiting"
+        );
+        assert!(!hold.is_released());
+
+        drop(release);
+        let cleanup = Instant::now() + Duration::from_secs(2);
+        while !query.is_finished() || reap_finished_writer_threads() > 0 {
+            assert!(
+                Instant::now() < cleanup,
+                "the writer did not finish after the query released the lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            counters.written_total.load(Ordering::Relaxed) >= written + 1,
+            "the admitted write must commit after the lock is released"
+        );
+        let _ = query.join();
+        let _ = shutdown.join();
+    }
 }
