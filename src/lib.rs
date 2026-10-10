@@ -21924,10 +21924,6 @@ impl KvStoreHandle {
         self.sync.state_sync_snapshot()
     }
 
-    pub(crate) async fn retained_content_digest_hex(&self) -> String {
-        hex::encode(self.sync.read().await.served_digest())
-    }
-
     pub(crate) async fn legacy_import_conflicts(&self, source: &kv::KvStore) -> Vec<String> {
         self.sync.read().await.legacy_import_conflicts(source)
     }
@@ -22018,45 +22014,6 @@ impl KvStoreHandle {
     #[cfg(test)]
     pub(crate) fn clear_retained_publish_failure_for_test(&self) {
         self.sync.clear_retained_publish_failure_for_test();
-    }
-
-    /// Merge one validated local legacy Signed-store image into this group
-    /// store, persist the result, and retain current-writer endorsement.
-    pub(crate) async fn import_legacy_signed_history(
-        &self,
-        source: &kv::KvStore,
-        source_owner: identity::AgentId,
-    ) -> error::Result<()> {
-        self.sync
-            .authorize_local_write(&self.agent_id)
-            .await
-            .map_err(|error| match error {
-                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
-                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
-            })?;
-        self.sync.ensure_durable().await.map_err(|error| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store durability degraded before legacy import: {error}"
-            )))
-        })?;
-        {
-            let mut destination = self.sync.write().await;
-            destination
-                .merge_legacy_signed_history(source, source_owner, self.agent_id, self.peer_id)
-                .map_err(|error| match error {
-                    kv::KvError::Unauthorized(message) => {
-                        error::IdentityError::Unauthorized(message)
-                    }
-                    other => {
-                        error::IdentityError::Storage(std::io::Error::other(other.to_string()))
-                    }
-                })?;
-        }
-        self.sync.persist().await.map_err(|error| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "legacy import applied in memory but destination persistence failed: {error}"
-            )))
-        })
     }
 
     /// Check a cached encrypted handle against its current authoritative group.
