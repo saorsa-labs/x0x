@@ -1111,7 +1111,9 @@ pub(in crate::server) struct HistoryPurgeParams {
 /// Issue #1317: the purge takes the retention admission
 /// ([`x0x::history::HistoryHandle::purge`]). While a reaper pass or a trim
 /// holds the store it answers 409 `history_retention_busy` at once and
-/// deletes nothing; it is not queued.
+/// deletes nothing; it is not queued. The purge is not atomic: a 500
+/// after its row delete committed keeps those rows deleted and counts
+/// them in `removed`.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -1164,9 +1166,17 @@ pub(in crate::server) async fn history_purge(
             "another history retention operation is running; try again later",
             "history_retention_busy",
         ),
-        Err(x0x::history::RetainError::Failed { error, .. }) => {
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("purge: {error}"))
-        }
+        // Round 2 (Codex P2): the purge is not atomic. Rows its committed
+        // delete removed stay deleted when a later step fails; `removed`
+        // counts them (0 when the delete itself failed).
+        Err(x0x::history::RetainError::Failed { error, committed }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("purge: {error}"),
+                "removed": committed.deleted,
+            })),
+        ),
         Err(x0x::history::RetainError::InvalidOptions(message)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("purge: {message}"),

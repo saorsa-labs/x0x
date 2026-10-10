@@ -419,9 +419,16 @@ impl HistoryHandle {
     /// returns [`RetainError::Busy`] at once, rather than deleting under
     /// a trim. The SQLite work runs on the blocking pool.
     ///
+    /// A purge is not atomic. Its row delete commits first; then the
+    /// canonical-id cleanup and an incremental vacuum run. If a later step
+    /// fails, the rows stay deleted.
+    ///
     /// # Errors
     /// [`RetainError::Busy`], or [`RetainError::Failed`] on an SQLite
-    /// failure (the delete is one statement, so nothing is committed then).
+    /// failure. `committed.deleted` counts the rows that the committed
+    /// delete removed: 0 when the delete itself failed, else every row of
+    /// the scope, also when a later step failed. If the blocking task does
+    /// not finish (it panicked), the count is not known; the error says so.
     pub async fn purge(&self, scope: &Scope) -> Result<u64, RetainError> {
         let started = std::time::Instant::now();
         let store = Arc::clone(&self.store);
@@ -429,13 +436,11 @@ impl HistoryHandle {
         match tokio::task::spawn_blocking(move || store.purge_admitted(&scope)).await {
             Ok(outcome) => outcome,
             Err(join) => Err(RetainError::Failed {
-                error: HistoryError::Database(format!("history purge task did not finish: {join}")),
-                committed: RetainReport::new(
-                    RetainState::MoreWork,
-                    RetainDeleted::default(),
-                    started.elapsed(),
-                    None,
-                ),
+                error: HistoryError::Database(format!(
+                    "history purge task did not finish: {join}; rows it deleted, if any, \
+                     are not counted"
+                )),
+                committed: RetainReport::purged(0, started.elapsed()),
             }),
         }
     }

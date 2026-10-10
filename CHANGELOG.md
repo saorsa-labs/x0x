@@ -113,7 +113,10 @@ All notable changes to this project will be documented in this file.
   admission and returns `RetainError::Busy` while a reaper pass or a trim
   runs. `DELETE /history` uses it and answers 409 `history_retention_busy`
   then, with nothing deleted or queued; the fork-quarantine refusal is
-  unchanged. `Store`, `Writer` and `WriterHandle` stay public as the
+  unchanged. A purge is not atomic: if its cleanup or vacuum fails after
+  the row delete committed, the rows stay deleted, and the error counts
+  them (`RetainError::Failed`'s `committed.deleted`; the 500 body's new
+  `removed` field). `Store`, `Writer` and `WriterHandle` stay public as the
   low-level offline API. Migration: `handle.store().query(q)` becomes
   `handle.query(q)` (the same for the other reads), and
   `handle.store().purge(s)` becomes `handle.purge(s).await`. Code that

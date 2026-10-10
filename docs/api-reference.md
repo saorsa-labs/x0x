@@ -2098,13 +2098,19 @@ is not propagated. `scope` is required; there is no purge-everything form.
 | 400 | `scope` is missing or malformed |
 | 409 `fork_quarantined` | The scope is a fork-quarantined group (ADR-0066 §3a, below). Nothing is deleted |
 | 409 `history_retention_busy` | A reaper pass or a runtime trim holds the store. Nothing is deleted or queued; try again |
-| 500 | SQLite failed. The delete is one statement, so nothing is committed |
+| 500 | SQLite failed: `{"ok": false, "error": "purge: …", "removed": <rows>}`. Rows deleted before the failure stay deleted, and `removed` counts them (below) |
 | 503 | History is disabled on this daemon |
 
 A purge takes the same retention admission as the reaper and
 `POST /history/retain`, so it never deletes under a trim. The library
 equivalent is `HistoryHandle::purge(&scope).await`, which returns
 `RetainError::Busy` in the same case.
+
+A purge is not atomic. Its row delete commits first; then a canonical-id
+cleanup and an incremental vacuum run. If one of those later steps fails, the
+scope's rows stay deleted (they are not rolled back), and the 500's `removed`
+counts them. `removed` is 0 only when the row delete itself failed. In the
+library, `RetainError::Failed`'s `committed.deleted` carries the same count.
 
 ### Runtime trim — `POST /history/retain` (ADR 0116 §4)
 

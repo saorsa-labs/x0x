@@ -1943,15 +1943,32 @@ impl Store {
     }
 
     /// Delete every row in `scope`. Returns rows removed. Local-only.
+    ///
+    /// Not atomic. The row delete commits first; then the canonical-id
+    /// cleanup and `PRAGMA incremental_vacuum` run. If a later step fails,
+    /// the rows stay deleted and this error does not say how many.
+    /// [`super::HistoryHandle::purge`] reports that count.
     pub fn purge(&self, scope: &Scope) -> HistoryResult<u64> {
-        let guard = lock_conn(&self.conn)?;
-        let n = guard.execute(
-            "DELETE FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
-            rusqlite::params![scope.kind(), scope.id()],
-        )?;
-        cleanup_canonical_ids(&guard)?;
-        guard.execute_batch("PRAGMA incremental_vacuum;")?;
-        Ok(n as u64)
+        self.purge_counting(scope)
+            .map_err(|(error, _deleted)| error)
+    }
+
+    /// The body of [`Self::purge`]. On an error it also returns the rows
+    /// that the committed delete removed: 0 when the delete itself failed
+    /// (one statement, so nothing committed), else every row of the scope.
+    fn purge_counting(&self, scope: &Scope) -> Result<u64, (HistoryError, u64)> {
+        let guard = lock_conn(&self.conn).map_err(|error| (error, 0))?;
+        let deleted = guard
+            .execute(
+                "DELETE FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+                rusqlite::params![scope.kind(), scope.id()],
+            )
+            .map_err(|error| (HistoryError::from(error), 0))? as u64;
+        cleanup_canonical_ids(&guard).map_err(|error| (error, deleted))?;
+        guard
+            .execute_batch("PRAGMA incremental_vacuum;")
+            .map_err(|error| (HistoryError::from(error), deleted))?;
+        Ok(deleted)
     }
 
     /// Issue #1317: [`Self::purge`] under the retention admission that
@@ -1961,28 +1978,28 @@ impl Store {
     ///
     /// # Errors
     /// [`RetainError::Busy`], or [`RetainError::Failed`] on an SQLite
-    /// failure (the delete is one statement, so nothing is committed then).
+    /// failure. The purge is not atomic: when a step after the committed
+    /// row delete fails, those rows stay deleted and `committed.deleted`
+    /// counts them (round 2, Codex P2). It is 0 only when nothing was
+    /// deleted.
     pub(crate) fn purge_admitted(&self, scope: &Scope) -> Result<u64, RetainError> {
         let started = std::time::Instant::now();
-        let failed = |error| RetainError::Failed {
+        let failed = |error, deleted| RetainError::Failed {
             error,
-            committed: RetainReport::new(
-                RetainState::MoreWork,
-                RetainDeleted::default(),
-                started.elapsed(),
-                None,
-            ),
+            committed: RetainReport::purged(deleted, started.elapsed()),
         };
         let _admission = match self.retention.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Err(RetainError::Busy),
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(failed(HistoryError::Database(
-                    "retention mutex poisoned".into(),
-                )))
+                return Err(failed(
+                    HistoryError::Database("retention mutex poisoned".into()),
+                    0,
+                ))
             }
         };
-        self.purge(scope).map_err(failed)
+        self.purge_counting(scope)
+            .map_err(|(error, deleted)| failed(error, deleted))
     }
 
     /// Write a batch inside one transaction (writer thread path).
