@@ -369,8 +369,8 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// carrier networks that carry mainstream HTTP/3 (UDP/443) cleanly but
 /// throttle or drop arbitrary high UDP ports like 5483. Dialing a low
 /// *destination* port is unprivileged (ephemeral high source port), so
-/// clients never need elevation. Both ports are dialed in parallel
-/// (`BootstrapConnector::connect_multiple`); the `:5483` entries are retained
+/// clients never need elevation. Both ports are dialed in parallel;
+/// the `:5483` entries are retained
 /// for backward compatibility with pre-ADR-0011 clients and unrestricted
 /// networks. Identity is key-based, so the two listeners on a host are simply
 /// distinct seed hints (see [[0001-bootstrap-peers-are-seed-hints-only]]).
