@@ -653,66 +653,232 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     Ok(())
 }
 
-fn reference_with_flipped_digest(
-    reference: &super::super::control_blob::ControlBlobRef,
-) -> Result<super::super::control_blob::ControlBlobRef> {
-    let mut value = serde_json::to_value(reference)?;
-    let digest = value
-        .get("digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("staged reference has no digest"))?
-        .to_string();
-    let mut chars = digest.into_bytes();
+fn flip_digest_byte(digest: &str) -> Result<String> {
+    let mut chars = digest.as_bytes().to_vec();
+    if chars.is_empty() {
+        anyhow::bail!("reference digest is empty");
+    }
     chars[0] = if chars[0] == b'a' { b'b' } else { b'a' };
-    value["digest"] = serde_json::Value::String(String::from_utf8(chars)?);
-    Ok(serde_json::from_value(value)?)
+    Ok(String::from_utf8(chars)?)
 }
 
-/// Hand the authority's staged chunks to the joiner's production chunk
-/// handler. The pinned stand-in admits the reference and does not move
-/// the bytes, so this is the in-process leg of that offer. `label` is the
-/// reference the joiner's fetch is waiting on; the bytes always come from
-/// `staged`.
-async fn pump_staged_chunks(
-    authority: &Arc<AppState>,
-    joiner: &Arc<AppState>,
-    staged: &super::super::control_blob::ControlBlobRef,
-    label: &super::super::control_blob::ControlBlobRef,
-    for_long: Duration,
-) -> usize {
-    let deadline = tokio::time::Instant::now() + for_long;
-    let mut sent = 0usize;
-    while tokio::time::Instant::now() < deadline {
-        let mut sequence = 0u32;
-        loop {
-            let Some(chunk) =
-                super::super::join_result_chunk_if_servable(authority, staged, sequence).await
+/// The emitted reference frame with one digest byte changed. The chunk
+/// payloads that follow stay the bytes the authority encoded.
+fn reference_frame_with_flipped_digest(frame: &[u8]) -> Result<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(frame)?;
+    let digest = value
+        .pointer("/reference/digest")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("emitted reference frame has no digest"))?;
+    let flipped = flip_digest_byte(digest)?;
+    value["reference"]["digest"] = serde_json::Value::String(flipped);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn ref_json(reference: &super::super::control_blob::ControlBlobRef) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(reference)?)
+}
+
+fn ref_str(value: &serde_json::Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("reference is missing {field}"))
+}
+
+fn same_pull(
+    reference: &super::super::control_blob::ControlBlobRef,
+    recipient: &str,
+    source: &str,
+    byte_len: u64,
+    attempt: &str,
+    digest: &str,
+) -> bool {
+    let Ok(value) = ref_json(reference) else {
+        return false;
+    };
+    ref_str(&value, "recipient").ok().as_deref() == Some(recipient)
+        && ref_str(&value, "source").ok().as_deref() == Some(source)
+        && ref_str(&value, "digest").ok().as_deref() == Some(digest)
+        && ref_str(&value, "join_attempt_id").ok().as_deref() == Some(attempt)
+        && value.get("byte_len").and_then(|v| v.as_u64()) == Some(byte_len)
+}
+
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        super::super::control_blob::frame_capture::set_capture(false);
+    }
+}
+
+/// The reference frame the production offer encoded for `recipient`.
+/// Absent when that offer never encoded one. `bound` is a failure limit.
+async fn emitted_reference_frame(
+    recipient: &str,
+    source: &str,
+    bound: Duration,
+) -> Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("the offer encoded no reference frame for {recipient}");
+        }
+        for frame in super::super::control_blob::frame_capture::drain_frames() {
+            let Ok(super::super::control_blob::ControlBlobMessage::Reference { reference }) =
+                serde_json::from_slice(&frame)
             else {
-                break;
+                continue;
             };
-            super::super::control_blob::handle_control_blob_message(
-                joiner,
-                &authority.agent.agent_id(),
-                true,
-                super::super::control_blob::ControlBlobMessage::Chunk {
-                    reference: label.clone(),
-                    sequence,
-                    data_b64: BASE64.encode(&chunk),
-                },
-            )
-            .await;
-            sent += 1;
-            sequence += 1;
-            if sequence > 64 {
-                break;
+            let Ok(value) = ref_json(&reference) else {
+                continue;
+            };
+            if ref_str(&value, "recipient").ok().as_deref() == Some(recipient)
+                && ref_str(&value, "source").ok().as_deref() == Some(source)
+            {
+                return Ok(frame);
             }
         }
-        if sequence == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    sent
+}
+
+/// Move encoded Reference, Fetch, and Chunk frames between the two
+/// in-process handlers. Chunk bytes are the payload the authority's Fetch
+/// arm encoded. A chunk is delivered only after this pull's Fetch for that
+/// sequence has been encoded, which is after the joiner installed its
+/// waiter. `translate` keeps the joiner on `joiner_ref` while the authority
+/// serves `serve`: the Fetch digest is restored so the staged blob is
+/// found, and the emitted chunk's `data_b64` is delivered unchanged under
+/// `joiner_ref`. The deadline is a failure bound. The returned string is
+/// the pull task's finished result, and every chunk sequence was forwarded.
+async fn bridge_emitted_pull(
+    authority: &Arc<AppState>,
+    joiner: &Arc<AppState>,
+    serve: &super::super::control_blob::ControlBlobRef,
+    joiner_ref: &super::super::control_blob::ControlBlobRef,
+    group_key: &str,
+    translate: bool,
+    bound: Duration,
+) -> Result<&'static str> {
+    let serve_v = ref_json(serve)?;
+    let joiner_v = ref_json(joiner_ref)?;
+    let recipient = ref_str(&serve_v, "recipient")?;
+    let source = ref_str(&serve_v, "source")?;
+    let attempt = ref_str(&serve_v, "join_attempt_id")?;
+    let serve_digest = ref_str(&serve_v, "digest")?;
+    let joiner_digest = ref_str(&joiner_v, "digest")?;
+    let byte_len = serve_v
+        .get("byte_len")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("served reference has no byte_len"))?;
+    let expected = byte_len.div_ceil(x0x::files::DEFAULT_CHUNK_SIZE as u64);
+    anyhow::ensure!(
+        expected > 1,
+        "the oversized join result is one chunk ({byte_len} B); dropping a later chunk would not be visible"
+    );
+    let mut requested = std::collections::HashSet::new();
+    let mut delivered = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "pull did not finish within {bound:?}; forwarded sequences {delivered:?} of {expected}; outcome {:?}",
+                super::super::control_blob::frame_capture::outcome(&joiner_digest)
+            );
+        }
+        if translate && join_state(joiner, group_key).await == "active" {
+            anyhow::bail!("the joiner left pending before the digest check finished");
+        }
+        if let Some(outcome) = super::super::control_blob::frame_capture::outcome(&joiner_digest) {
+            anyhow::ensure!(
+                delivered.len() as u64 == expected,
+                "the pull finished after {} emitted chunk frame(s); the blob has {expected}. Dropping a later chunk must fail the pull",
+                delivered.len()
+            );
+            return Ok(outcome);
+        }
+        for frame in super::super::control_blob::frame_capture::drain_frames() {
+            let Ok(message) =
+                serde_json::from_slice::<super::super::control_blob::ControlBlobMessage>(&frame)
+            else {
+                continue;
+            };
+            match message {
+                super::super::control_blob::ControlBlobMessage::Fetch {
+                    reference,
+                    sequence,
+                } if same_pull(
+                    &reference,
+                    &recipient,
+                    &source,
+                    byte_len,
+                    &attempt,
+                    &joiner_digest,
+                ) =>
+                {
+                    if !requested.insert(sequence) {
+                        continue;
+                    }
+                    let outbound = if translate {
+                        super::super::control_blob::ControlBlobMessage::Fetch {
+                            reference: serve.clone(),
+                            sequence,
+                        }
+                    } else {
+                        serde_json::from_slice(&frame)?
+                    };
+                    super::super::control_blob::handle_control_blob_message(
+                        authority,
+                        &joiner.agent.agent_id(),
+                        true,
+                        outbound,
+                    )
+                    .await;
+                }
+                super::super::control_blob::ControlBlobMessage::Chunk {
+                    reference,
+                    sequence,
+                    data_b64,
+                } if same_pull(
+                    &reference,
+                    &recipient,
+                    &source,
+                    byte_len,
+                    &attempt,
+                    &serve_digest,
+                ) =>
+                {
+                    if !requested.contains(&sequence) || !delivered.insert(sequence) {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !data_b64.is_empty(),
+                        "emitted chunk {sequence} carried an empty payload"
+                    );
+                    let outbound = if translate {
+                        super::super::control_blob::ControlBlobMessage::Chunk {
+                            reference: joiner_ref.clone(),
+                            sequence,
+                            data_b64,
+                        }
+                    } else {
+                        serde_json::from_slice(&frame)?
+                    };
+                    super::super::control_blob::handle_control_blob_message(
+                        joiner,
+                        &authority.agent.agent_id(),
+                        true,
+                        outbound,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// The joiner's chunk pull sends `Fetch` with the control-blob config.
@@ -762,46 +928,26 @@ async fn arm_in_process_fetch(joiner: &Arc<AppState>, authority: &Arc<AppState>)
         .await;
 }
 
-/// The staged join-result copy the FetchRequest arm offered, after its
-/// reference egress. Absent when blob staging did not run.
-async fn offered_join_result_reference(
-    authority: &Arc<AppState>,
-    recipient_hex: &str,
-) -> Option<super::super::control_blob::ControlBlobRef> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        let staged = authority
-            .control_blobs
-            .staged_join_result_refs_for_test(recipient_hex);
-        let offered = authority
-            .named_group_test_recorders
-            .join_artifact_egress
-            .lock()
-            .expect("egress witness")
-            .iter()
-            .any(|(to, _, kind)| to == recipient_hex && *kind == "join_result_reference");
-        if offered {
-            if let Some(reference) = staged.into_iter().next() {
-                return Some(reference);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    None
-}
-
 /// WHY (#1163): J2 converges only after the oversized result is offered,
-/// fetched, and digest-checked. The serve recorder is cleared first, so a
-/// test that injects those bytes cannot pass. A reference whose digest does
-/// not match the staged chunks must leave J2 pending; the exact reference
-/// then installs the carry.
+/// fetched, and digest-checked. The frames are the bytes the handlers
+/// encoded. The serve recorder is cleared, so injecting those bytes cannot
+/// pass. A reference whose digest does not match the served chunk payloads
+/// must finish as a digest mismatch and leave J2 pending. The exact
+/// reference then installs the carry. A missing later chunk, or a served
+/// payload that does not match the reference, fails the pull.
 #[tokio::test]
 async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
+    let _capture = CaptureGuard;
+    super::super::control_blob::frame_capture::set_capture(true);
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
-    let Some(reference) = offered_join_result_reference(&s._authority, &j2_hex).await else {
-        anyhow::bail!("FetchRequest did not stage and offer a join-result blob");
+    let authority_hex = hex::encode(s.authority_id.as_bytes());
+    let reference_frame =
+        emitted_reference_frame(&j2_hex, &authority_hex, Duration::from_secs(10)).await?;
+    let serve = match serde_json::from_slice(&reference_frame)? {
+        super::super::control_blob::ControlBlobMessage::Reference { reference } => reference,
+        _ => anyhow::bail!("emitted offer was not a reference frame"),
     };
     s._authority
         .named_group_test_recorders
@@ -809,93 +955,77 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
         .lock()
         .expect("serve witness")
         .clear();
-    super::super::control_blob::handle_control_blob_message(
-        &s._authority,
-        &s.j2.agent.agent_id(),
-        true,
-        super::super::control_blob::ControlBlobMessage::Fetch {
-            reference: reference.clone(),
-            sequence: 0,
-        },
-    )
-    .await;
-    let fetch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < fetch_deadline {
-        let fetched = s
-            ._authority
-            .named_group_test_recorders
-            .join_artifact_egress
-            .lock()
-            .expect("egress witness")
-            .iter()
-            .any(|(to, _, kind)| to == &j2_hex && *kind == "join_result_chunk");
-        if fetched {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    anyhow::ensure!(
-        s._authority
-            .named_group_test_recorders
-            .join_artifact_egress
-            .lock()
-            .expect("egress witness")
-            .iter()
-            .any(|(to, _, kind)| to == &j2_hex && *kind == "join_result_chunk"),
-        "the production chunk fetch served nothing"
-    );
-
     arm_in_process_fetch(&s.j2, &s._authority).await;
-    let mismatched = reference_with_flipped_digest(&reference)?;
+
+    let flipped_frame = reference_frame_with_flipped_digest(&reference_frame)?;
+    let flipped = match serde_json::from_slice(&flipped_frame)? {
+        super::super::control_blob::ControlBlobMessage::Reference { reference } => reference,
+        _ => anyhow::bail!("flipped offer was not a reference frame"),
+    };
     super::super::control_blob::handle_control_blob_message(
         &s.j2,
         &s.authority_id,
         true,
-        super::super::control_blob::ControlBlobMessage::Reference {
-            reference: mismatched.clone(),
-        },
+        serde_json::from_slice(&flipped_frame)?,
     )
     .await;
-    let damaged = pump_staged_chunks(
+    let mismatched = bridge_emitted_pull(
         &s._authority,
         &s.j2,
-        &reference,
-        &mismatched,
-        Duration::from_secs(2),
+        &serve,
+        &flipped,
+        &s.group_key,
+        true,
+        Duration::from_secs(20),
     )
-    .await;
-    anyhow::ensure!(damaged > 0, "the staged blob produced no chunk");
+    .await?;
+    anyhow::ensure!(
+        mismatched == "control blob length or digest mismatch",
+        "the bad-digest pull finished as {mismatched}"
+    );
+    tokio::task::yield_now().await;
     assert_eq!(
         join_state(&s.j2, &s.group_key).await,
         "pending_authority_commit",
-        "a digest mismatch must not install the carry"
+        "a finished digest mismatch must not install the carry"
     );
     assert!(!s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    // The negative pull task has recorded its result. Drop anything it
+    // encoded after that before the exact reference starts its own pull.
+    let _ = super::super::control_blob::frame_capture::drain_frames();
 
     super::super::control_blob::handle_control_blob_message(
         &s.j2,
         &s.authority_id,
         true,
-        super::super::control_blob::ControlBlobMessage::Reference {
-            reference: reference.clone(),
-        },
+        serde_json::from_slice(&reference_frame)?,
     )
     .await;
-    let verified = pump_staged_chunks(
+    let verified = bridge_emitted_pull(
         &s._authority,
         &s.j2,
-        &reference,
-        &reference,
-        Duration::from_secs(8),
+        &serve,
+        &serve,
+        &s.group_key,
+        false,
+        Duration::from_secs(20),
     )
-    .await;
-    anyhow::ensure!(verified > 0, "the verified pull was given no chunk");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline
+    .await?;
+    anyhow::ensure!(
+        verified == "verified",
+        "the exact reference's pull finished as {verified}; a corrupt served payload must not verify"
+    );
+    let active_bound = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < active_bound
         && join_state(&s.j2, &s.group_key).await != "active"
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    anyhow::ensure!(
+        tokio::time::Instant::now() < active_bound
+            || join_state(&s.j2, &s.group_key).await == "active",
+        "verified consumption did not install the carry within the failure bound"
+    );
     assert_eq!(
         join_state(&s.j2, &s.group_key).await,
         "active",
