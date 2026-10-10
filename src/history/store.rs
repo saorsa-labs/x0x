@@ -522,26 +522,62 @@ impl Store {
                 ))
             })?;
         }
+        // ADR 0116 Validation, "Storage and downgrade": an unknown newer
+        // schema fails closed WITHOUT changing any file. The whole refusal
+        // path (recovery and close included) must leave the main file and
+        // its sidecars as they were, so first note which sidecars exist,
+        // before this open touches anything.
+        let wal_present = sidecar(path, "-wal").exists();
+        if sidecar(path, "-journal")
+            .metadata()
+            .is_ok_and(|journal| journal.len() > 0)
+        {
+            check_version_beside_a_rollback_journal(path, busy)?;
+        }
         let conn = Connection::open(path).map_err(|e| {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
         let pragma_error =
             |e| HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()));
-        // Exclusive locking first: it does no I/O, and it makes the first
-        // read below use heap memory for a WAL index, as before (no `-shm`).
+        // Exclusive locking first. It does no I/O, and because it comes
+        // before the first access, SQLite keeps this connection's WAL index
+        // in heap memory and never uses `-shm` ("WAL without shared memory"
+        // in the SQLite docs): reading a WAL another writer left behind
+        // rebuilds that index in memory and writes nothing. (On a reopened
+        // WAL file this differs from the order before slice F, whose first
+        // pragma ran in NORMAL mode and created or used `-shm`; both hold
+        // the lifetime exclusive lock once open.)
         conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
             .map_err(pragma_error)?;
-        // ADR 0116 Validation, "Storage and downgrade": an unknown newer
-        // schema fails closed WITHOUT changing the file. So it is refused
-        // here, before any statement that can write: `auto_vacuum` and
-        // `journal_mode` both rewrite the file header, and `migrate` creates
-        // its table. A database with no schema table yet, or one this read
-        // cannot reach (another process holds it), takes the usual path.
-        if let Some(version) = read_schema_version(&conn) {
-            if version > SCHEMA_VERSION {
-                return Err(newer_schema_error(version));
+        // Then the version, before any statement that can write:
+        // `auto_vacuum` and `journal_mode` rewrite the file header, and
+        // `migrate` creates its table. Only a missing `schema_version` table
+        // or row means "no schema yet". Any other failure (busy, I/O, a value
+        // that does not decode) stops the open here, before setup can write
+        // a file whose version is unknown.
+        let stored = read_schema_version(&conn).map_err(|e| {
+            HistoryError::Database(format!(
+                "pragma setup history db {}: schema check: {e}",
+                path.display()
+            ))
+        })?;
+        if let Some(version) = stored.filter(|version| *version > SCHEMA_VERSION) {
+            if wal_present {
+                // A WAL this open did not create may hold another writer's
+                // uncheckpointed frames (a crash). The last connection's
+                // close would checkpoint them into the main file and delete
+                // the WAL; NO_CKPT_ON_CLOSE skips both, so both files stay
+                // byte-identical. Without a WAL beforehand, the ordinary
+                // close only removes the empty one this read created. The
+                // call fails only on an invalid handle; the refusal stands
+                // either way.
+                let _ = conn.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                );
             }
+            return Err(newer_schema_error(version));
         }
         // auto_vacuum must be decided before the first table exists. On a
         // database that is already INCREMENTAL the pragma is not a no-op: it
@@ -549,7 +585,7 @@ impl Store {
         // close). So it is issued only when the mode differs.
         let auto_vacuum: i64 = conn
             .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
-            .unwrap_or(-1);
+            .map_err(pragma_error)?;
         let set_auto_vacuum = if auto_vacuum == 2 {
             ""
         } else {
@@ -3823,16 +3859,66 @@ fn newer_schema_error(version: i64) -> HistoryError {
     ))
 }
 
-/// The stored schema version, if a plain read can see one. `None` when the
-/// database has no `schema_version` table (or row) yet, or when the read
-/// cannot reach it (for instance another process holds the database):
-/// [`Store::open_with_busy_timeout`] then takes its usual path, which creates
-/// or migrates, or reports the lock.
-fn read_schema_version(conn: &Connection) -> Option<i64> {
+/// The stored schema version. `Ok(None)` only when the database has no
+/// `schema_version` table, or no row in it, yet (a new or empty file). Any
+/// other failure (busy, I/O, corruption, a version that does not decode as
+/// an integer) is an error: the caller must not go on to write a database
+/// whose version it could not read.
+fn read_schema_version(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
     conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
         r.get(0)
     })
-    .ok()
+    .optional()
+}
+
+/// `path` with `suffix` appended to its file name: SQLite's sidecar files
+/// (`-wal`, `-shm`, `-journal`).
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// A non-empty `-journal` beside the database may be a HOT rollback journal:
+/// the first read of a read/write connection would roll it back, which
+/// writes the main file and deletes the journal. x0x keeps history in WAL
+/// mode, so such a journal is another writer's. Read the version through a
+/// READ_ONLY connection instead: SQLite does not let a read-only connection
+/// roll a hot journal back, and reports SQLITE_READONLY_ROLLBACK. Refuse on
+/// a newer version and on any read failure (hot journal, busy, I/O); a
+/// journal that is not hot, beside a version this binary knows, leaves the
+/// open to proceed.
+fn check_version_beside_a_rollback_journal(
+    path: &Path,
+    busy: std::time::Duration,
+) -> HistoryResult<()> {
+    let refuse = |e: rusqlite::Error| {
+        HistoryError::Database(format!(
+            "history db {} has a rollback journal and its schema version cannot be read without \
+             recovering it ({e}); x0x keeps history in WAL mode and will not recover another \
+             writer's journal before it knows the version",
+            path.display()
+        ))
+    };
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(refuse)?;
+    conn.busy_timeout(busy).map_err(refuse)?;
+    match read_schema_version(&conn).map_err(refuse)? {
+        Some(version) if version > SCHEMA_VERSION => Err(newer_schema_error(version)),
+        _ => Ok(()),
+    }
 }
 
 /// Schema v2 adds no columns: it backfills the existing FTS projection for

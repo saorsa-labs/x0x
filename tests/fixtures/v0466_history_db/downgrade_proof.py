@@ -311,6 +311,12 @@ def main():
         facts[label] = {"exit": code, "sha256_before": before, "sha256_after": after,
                         "unchanged": before == after}
         print(f"{label}: file unchanged = {before == after}", flush=True)
+        if label == "S4-new":
+            # The new binary must leave a newer database byte-identical.
+            check(before == after, "S4-new: the schema-5 file is byte-identical after the refusal", log)
+        # S4-old is the documented exception: the released v0.46.6 refuses
+        # schema 5 but changes two header bytes (fixed in slice F). It is
+        # recorded in proof.json, not asserted.
 
     with open(os.path.join(work, "proof.json"), "w") as fh:
         json.dump({"log": log, "facts": facts, "stats": {"S1": s1, "S2": s2, "S3": s3}}, fh,
