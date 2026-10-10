@@ -670,6 +670,13 @@ fn lock_std<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// `bind_gate` is a std mutex because `ArmedDrain`'s drop binds synchronously.
+/// Hold it only across the recovery-counter read and the queue drain.
+/// Do not hold it across an await.
+fn lock_bind_gate(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock_std(gate)
+}
+
 /// One local subscriber of a shared topic delivery.
 struct LiveSender {
     id: u64,
@@ -1277,13 +1284,16 @@ pub struct PubSubManager {
     /// id onto the delivery PlumTree enqueued, then the forwarder copies that
     /// notification to every local subscriber.
     topic_deliveries: Arc<TopicDeliveryMap>,
-    /// One mutex per topic for that topic's producer and its receiver
-    /// install. The map lock is not held across PlumTree or a remote send.
-    /// A stalled fanout on topic A does not block topic B (ADR 0009).
+    /// One mutex per topic for receiver install and the short bind that
+    /// follows a remote send. The turn is not held across that send, so one
+    /// stalled fanout cannot park every receive worker (ADR 0009).
     topic_turns: Mutex<HashMap<TopicId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Recovery counter, per-topic flight counts, and the bind gate.
+    bind_shared: Arc<BindShared>,
     /// Hop-local key-cache recovery is inside PlumTree. Ordinary admission
     /// omits the transport id while this is non-zero, so a recovered payload
-    /// cannot wear another frame's id. This is not a lock.
+    /// cannot wear another frame's id. Recovery raises it under `bind_gate`
+    /// before enqueue.
     cross_topic_producers: Arc<AtomicUsize>,
     /// Times a delivered frame was read for its transport id. The read
     /// happens only after PlumTree has delivered that frame.
@@ -1331,8 +1341,8 @@ pub struct PubSubManager {
     /// Pauses after PlumTree has accepted a delivery and before this task
     /// stamps it. Cancelling the task at this point must still drain.
     /// The no-subscriber path pauses here before dispatch, while this
-    /// topic's turn is already held, so a subscribe of this topic cannot
-    /// install during that send.
+    /// topic's flight count is already raised, so a subscribe of this topic
+    /// waits. The pause does not hold the topic turn.
     #[cfg(test)]
     after_producer_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
@@ -1490,55 +1500,160 @@ const _: () = assert!(
     "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
 );
 
+/// In-flight PlumTree calls for one topic. Subscribe waits until `count`
+/// is zero. Receive workers do not wait on this map.
+struct TopicFlight {
+    count: usize,
+    idle: Arc<tokio::sync::Notify>,
+}
+
+/// Shared bind state. `bind_gate` covers the recovery-counter read and the
+/// queue drain together. It is not held across a remote send.
+struct BindShared {
+    flights: Mutex<HashMap<TopicId, TopicFlight>>,
+    bind_gate: Arc<Mutex<()>>,
+    cross_topic: Arc<AtomicUsize>,
+    #[cfg(test)]
+    bind_drain_pause: Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    reads: Arc<AtomicU64>,
+}
+
+/// Counts one producer until it drops, including cancellation.
+struct FlightGuard {
+    shared: Arc<BindShared>,
+    topic: TopicId,
+    active: bool,
+}
+
+impl FlightGuard {
+    fn enter(shared: &Arc<BindShared>, topic: TopicId) -> Self {
+        let mut flights = lock_std(&shared.flights);
+        let entry = flights.entry(topic).or_insert_with(|| TopicFlight {
+            count: 0,
+            idle: Arc::new(tokio::sync::Notify::new()),
+        });
+        entry.count += 1;
+        Self {
+            shared: Arc::clone(shared),
+            topic,
+            active: true,
+        }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mut flights = lock_std(&self.shared.flights);
+        let Some(entry) = flights.get_mut(&self.topic) else {
+            return;
+        };
+        entry.count = entry.count.saturating_sub(1);
+        if entry.count == 0 {
+            entry.idle.notify_waiters();
+        }
+    }
+}
+
 /// Drains a topic pump if the producer future is cancelled after PlumTree
 /// has already enqueued a validated payload. Disarm after a normal return
 /// so the explicit bind is the only one.
 struct ArmedDrain {
     armed: bool,
     slot: Arc<TopicDelivery>,
+    topic: TopicId,
     /// `Some` stamps one exclusive payload from this admitted frame.
     /// `None` leaves the id absent (local publish and key-cache recovery).
     frame: Option<Bytes>,
-    reads: Option<Arc<AtomicU64>>,
-    /// While a cross-topic recovery is in PlumTree, the id is omitted.
-    cross_topic: Arc<AtomicUsize>,
+    shared: Arc<BindShared>,
 }
 
 impl ArmedDrain {
-    fn omit(slot: Arc<TopicDelivery>, cross_topic: Arc<AtomicUsize>) -> Self {
+    fn omit(slot: Arc<TopicDelivery>, topic: TopicId, shared: Arc<BindShared>) -> Self {
         Self {
             armed: true,
             slot,
+            topic,
             frame: None,
-            reads: None,
-            cross_topic,
+            shared,
         }
     }
 
     fn stamp(
         slot: Arc<TopicDelivery>,
+        topic: TopicId,
         frame: Bytes,
-        reads: Option<Arc<AtomicU64>>,
-        cross_topic: Arc<AtomicUsize>,
+        shared: Arc<BindShared>,
     ) -> Self {
         Self {
             armed: true,
             slot,
+            topic,
             frame: Some(frame),
-            reads,
-            cross_topic,
+            shared,
         }
     }
 
+    /// Read the recovery counter and drain the queue under `bind_gate`.
+    /// Recovery takes that same gate before it can enqueue, so it cannot
+    /// insert a payload between the read and the drain.
     fn disarm_and_bind(&mut self) {
+        if !self.armed {
+            return;
+        }
         self.armed = false;
-        let frame = if self.cross_topic.load(Ordering::Acquire) == 0 {
-            self.frame.as_deref()
-        } else {
-            None
+        self.finish_bind(None);
+    }
+
+    /// `recovery_at_entry` was read under `bind_gate` before a test opened
+    /// the window. The drain still re-reads the counter under the gate.
+    #[cfg(test)]
+    fn finish_bind_after_window(&mut self, recovery_at_entry: usize) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.finish_bind(Some(recovery_at_entry));
+    }
+
+    fn finish_bind(&mut self, recovery_at_entry: Option<usize>) {
+        let _gate = lock_bind_gate(&self.shared.bind_gate);
+        let recovery_at_entry =
+            recovery_at_entry.unwrap_or_else(|| self.shared.cross_topic.load(Ordering::Acquire));
+        let mut produced = self.slot.drain_admitted();
+        let recovery_now = self.shared.cross_topic.load(Ordering::Acquire);
+        let flight = lock_std(&self.shared.flights)
+            .get(&self.topic)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let frame =
+            if self.frame.is_some() && recovery_at_entry == 0 && recovery_now == 0 && flight == 1 {
+                self.frame.as_deref()
+            } else {
+                None
+            };
+        let Some(payload) = produced.pop() else {
+            return;
         };
-        let reads = frame.and(self.reads.as_deref());
-        bind_exclusive_delivery(&self.slot, frame, reads);
+        if produced.is_empty() {
+            let transport_msg_id = if let Some(frame) = frame {
+                #[cfg(test)]
+                self.shared.reads.fetch_add(1, Ordering::Relaxed);
+                transport_id_from_admitted_frame(frame)
+            } else {
+                None
+            };
+            self.slot.enqueue_stamped(payload, transport_msg_id);
+        } else {
+            self.slot.enqueue_stamped(payload, None);
+            for payload in produced {
+                self.slot.enqueue_stamped(payload, None);
+            }
+        }
     }
 }
 
@@ -1555,21 +1670,30 @@ impl Drop for ArmedDrain {
 struct CrossTopicGuard {
     counter: Arc<AtomicUsize>,
     deliveries: Arc<TopicDeliveryMap>,
+    bind_gate: Arc<Mutex<()>>,
     armed: bool,
 }
 
 impl CrossTopicGuard {
-    fn arm(counter: Arc<AtomicUsize>, deliveries: Arc<TopicDeliveryMap>) -> Self {
+    /// Caller holds `bind_gate`. The counter is raised before PlumTree can
+    /// enqueue a recovered payload.
+    fn arm(
+        counter: Arc<AtomicUsize>,
+        deliveries: Arc<TopicDeliveryMap>,
+        bind_gate: Arc<Mutex<()>>,
+    ) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self {
             counter,
             deliveries,
+            bind_gate,
             armed: true,
         }
     }
 
     fn disarm(mut self) {
         self.armed = false;
+        let _gate = lock_bind_gate(&self.bind_gate);
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -1582,14 +1706,16 @@ impl Drop for CrossTopicGuard {
         self.armed = false;
         let counter = Arc::clone(&self.counter);
         let deliveries = Arc::clone(&self.deliveries);
+        let bind_gate = Arc::clone(&self.bind_gate);
         tokio::spawn(async move {
-            drain_unstamped_slots(&deliveries).await;
+            drain_unstamped_slots(&deliveries, &bind_gate).await;
+            let _gate = lock_bind_gate(&bind_gate);
             counter.fetch_sub(1, Ordering::AcqRel);
         });
     }
 }
 
-async fn drain_unstamped_slots(deliveries: &TopicDeliveryMap) {
+async fn drain_unstamped_slots(deliveries: &TopicDeliveryMap, bind_gate: &Mutex<()>) {
     let mut slots: Vec<(TopicId, Arc<TopicDelivery>)> = lock_std(deliveries)
         .iter()
         .filter(|(_, slot)| slot.alive.load(Ordering::Acquire))
@@ -1598,33 +1724,8 @@ async fn drain_unstamped_slots(deliveries: &TopicDeliveryMap) {
     slots.sort_by_key(|(topic_id, _)| *topic_id.as_bytes());
     for (_, slot) in slots {
         let _pump = slot.pump.lock().await;
+        let _gate = lock_bind_gate(bind_gate);
         slot.pump_unstamped();
-    }
-}
-
-/// One new payload under the exclusive pump belongs to `frame`. More than
-/// one is ambiguous, so those ids are omitted. `frame == None` is a local
-/// publish or a key-cache recovery: the id stays absent.
-fn bind_exclusive_delivery(slot: &TopicDelivery, frame: Option<&[u8]>, reads: Option<&AtomicU64>) {
-    let mut produced = slot.drain_admitted();
-    let Some(payload) = produced.pop() else {
-        return;
-    };
-    if produced.is_empty() {
-        let transport_msg_id = if let Some(frame) = frame {
-            if let Some(reads) = reads {
-                reads.fetch_add(1, Ordering::Relaxed);
-            }
-            transport_id_from_admitted_frame(frame)
-        } else {
-            None
-        };
-        slot.enqueue_stamped(payload, transport_msg_id);
-    } else {
-        slot.enqueue_stamped(payload, None);
-        for payload in produced {
-            slot.enqueue_stamped(payload, None);
-        }
     }
 }
 
@@ -2024,6 +2125,19 @@ impl PubSubManager {
             });
         }
 
+        let cross_topic = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let reads = Arc::new(AtomicU64::new(0));
+        let bind_shared = Arc::new(BindShared {
+            flights: Mutex::new(HashMap::new()),
+            bind_gate: Arc::new(Mutex::new(())),
+            cross_topic: Arc::clone(&cross_topic),
+            #[cfg(test)]
+            bind_drain_pause: Mutex::new(None),
+            #[cfg(test)]
+            reads: Arc::clone(&reads),
+        });
+
         Ok(Self {
             network,
             plumtree,
@@ -2042,9 +2156,10 @@ impl PubSubManager {
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             topic_deliveries: Arc::new(Mutex::new(HashMap::new())),
             topic_turns: Mutex::new(HashMap::new()),
-            cross_topic_producers: Arc::new(AtomicUsize::new(0)),
+            bind_shared,
+            cross_topic_producers: cross_topic,
             #[cfg(test)]
-            admitted_transport_id_reads: Arc::new(AtomicU64::new(0)),
+            admitted_transport_id_reads: reads,
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
@@ -2540,8 +2655,10 @@ impl PubSubManager {
         let (tx, rx) = mpsc::channel(10_000);
 
         let active_generation = {
-            // This topic's turn, before the name shard. Other topics are
-            // not blocked, including while a remote send is in progress.
+            // Wait until this topic's producers finish. Do not take the
+            // turn first: a producer must be able to bind and drop its
+            // flight count. Other topics are not blocked.
+            self.wait_until_topic_idle(topic_id).await;
             let turn = self.topic_turn(topic_id);
             let _turn = turn.lock().await;
             let _name_guard = self
@@ -2631,8 +2748,9 @@ impl PubSubManager {
         // generation's receiver (#869).
         #[cfg(test)]
         Self::wait_test_pause(&self.subscribe_before_claim_pause).await;
-        // After the claim pause. The turn is this topic only, so a stalled
-        // fanout on another topic does not delay this subscribe.
+        // After the claim pause. Idle wait is before the turn, so a
+        // producer can finish its bind. The turn is this topic only.
+        self.wait_until_topic_idle(topic_id).await;
         let turn = self.topic_turn(topic_id);
         let _turn = turn.lock().await;
         let _claim_name = self
@@ -2694,7 +2812,10 @@ impl PubSubManager {
             claimed.slot.install_plumtree_rx(plumtree_rx);
             // A publish that overlapped registration is already in the
             // receiver. Move it before any joiner can be admitted.
-            claimed.slot.pump_unstamped();
+            {
+                let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+                claimed.slot.pump_unstamped();
+            }
             drop(_pump);
             let mut stamped_rx = claimed.slot.take_stamped_rx().unwrap_or_else(|| {
                 let (_, rx) = mpsc::unbounded_channel();
@@ -3122,29 +3243,35 @@ impl PubSubManager {
             } else {
                 None
             };
-        // Each ordinary frame holds only its own topic turn across PlumTree,
-        // including that topic's remote send. Other topics and their
-        // subscriptions do not take that turn (ADR 0009). Hop-local recovery
-        // can deliver onto a topic that does not exist yet, so it does not
-        // take every turn: it drains after PlumTree returns and omits the id.
-        // Cancelling the future still drains what was already enqueued.
+        // Ordinary dispatch does not take the topic turn across PlumTree.
+        // A remote send must not park the other receive workers (ADR 0009).
+        // The flight count keeps subscribe and unsubscribe from installing
+        // a receiver until this call has bound. Hop-local recovery can
+        // deliver onto a topic that does not exist yet, so it does not take
+        // a turn: it raises the recovery counter under the bind gate, then
+        // drains after PlumTree returns and omits the id. Cancelling the
+        // future still drains what was already enqueued.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
         let dispatch_result = if hop_local {
             self.dispatch_and_drain_recovered(peer, session, data).await
         } else if let Some(topic) = ordinary_frame.map(|header| header.topic) {
-            let turn = self.topic_turn(topic);
-            let _turn = turn.lock().await;
+            let _flight = FlightGuard::enter(&self.bind_shared, topic);
             if let Some(slot) = self.live_topic_delivery(topic) {
-                self.dispatch_and_bind_topic(slot, peer, session, data)
+                self.dispatch_and_bind_topic(slot, topic, peer, session, data)
                     .await
             } else {
-                // This topic's subscribe waits on the same turn, so it cannot
-                // install a receiver while this dispatch is in PlumTree.
+                // This topic's subscribe waits on the flight count, so it
+                // cannot install a receiver while this dispatch is in PlumTree.
                 #[cfg(test)]
-                Self::wait_test_pause(&self.after_producer_pause).await;
-                self.dispatch_inbound(peer, session, data).await
+                Self::wait_test_pause_once(&self.after_producer_pause).await;
+                let result = self.dispatch_inbound(peer, session, data).await;
+                if let Some(slot) = self.live_topic_delivery(topic) {
+                    let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+                    slot.pump_unstamped();
+                }
+                result
             }
         } else {
             self.dispatch_inbound(peer, session, data).await
@@ -3178,35 +3305,64 @@ impl PubSubManager {
         }
     }
 
-    /// Hold this topic's pump across dispatch. Payloads already queued are
-    /// unstamped. A payload that appears during the call is this frame's
-    /// delivery. Zero payloads (duplicate, replay, refusal) attach no id.
-    /// The drain is armed before the await, so cancelling this future after
-    /// PlumTree has enqueued still stamps that delivery.
+    /// Payloads already queued are unstamped before dispatch. A payload that
+    /// appears during the call is this frame's delivery when this producer
+    /// is alone. The remote send does not hold the topic turn or the bind
+    /// gate. The drain is armed before the await, so cancelling this future
+    /// after PlumTree has enqueued still stamps that delivery.
     async fn dispatch_and_bind_topic(
         &self,
         slot: Arc<TopicDelivery>,
+        topic: TopicId,
         peer: PeerId,
         session: Option<saorsa_gossip_transport::AuthenticatedSession>,
         data: Bytes,
     ) -> Result<(), anyhow::Error> {
-        let _pump = slot.pump.lock().await;
-        slot.pump_unstamped();
+        {
+            let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+            slot.pump_unstamped();
+        }
         #[cfg(test)]
         Self::wait_test_pause(&self.admission_dispatch_pause).await;
-        #[cfg(test)]
-        let reads = Some(Arc::clone(&self.admitted_transport_id_reads));
-        #[cfg(not(test))]
-        let reads: Option<Arc<AtomicU64>> = None;
         let mut drain = ArmedDrain::stamp(
             Arc::clone(&slot),
+            topic,
             data.clone(),
-            reads,
-            Arc::clone(&self.cross_topic_producers),
+            Arc::clone(&self.bind_shared),
         );
         let result = self.dispatch_inbound(peer, session, data).await;
         #[cfg(test)]
         Self::wait_test_pause(&self.after_producer_pause).await;
+        let turn = self.topic_turn(topic);
+        let _turn = turn.lock().await;
+        #[cfg(test)]
+        {
+            let pause = self
+                .bind_shared
+                .bind_drain_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((entered, release)) = pause {
+                // The counter read and the drain stay one critical section
+                // in production. This test window releases the gate so
+                // recovery can raise the counter and enqueue, then the
+                // drain re-reads the counter before it chooses an id.
+                // The pump stays held, so recovery cannot deliver that
+                // payload until this bind returns.
+                let recovery_at_entry = {
+                    let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+                    self.bind_shared.cross_topic.load(Ordering::Acquire)
+                };
+                let _pump = slot.pump.lock().await;
+                entered.wait().await;
+                release.wait().await;
+                drain.finish_bind_after_window(recovery_at_entry);
+            } else {
+                drain.disarm_and_bind();
+            }
+        }
+        #[cfg(not(test))]
         drain.disarm_and_bind();
         result
     }
@@ -3222,12 +3378,16 @@ impl PubSubManager {
         session: Option<saorsa_gossip_transport::AuthenticatedSession>,
         data: Bytes,
     ) -> Result<(), anyhow::Error> {
-        let guard = CrossTopicGuard::arm(
-            Arc::clone(&self.cross_topic_producers),
-            Arc::clone(&self.topic_deliveries),
-        );
+        let guard = {
+            let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+            CrossTopicGuard::arm(
+                Arc::clone(&self.cross_topic_producers),
+                Arc::clone(&self.topic_deliveries),
+                Arc::clone(&self.bind_shared.bind_gate),
+            )
+        };
         let result = self.dispatch_inbound(peer, session, data).await;
-        drain_unstamped_slots(&self.topic_deliveries).await;
+        drain_unstamped_slots(&self.topic_deliveries, &self.bind_shared.bind_gate).await;
         #[cfg(test)]
         Self::wait_test_pause(&self.recovery_dispatch_pause).await;
         guard.disarm();
@@ -3248,9 +3408,45 @@ impl PubSubManager {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_test_pause_once(
+        pause: &std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    ) {
+        let gates = pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((entered, release)) = gates {
+            entered.wait().await;
+            release.wait().await;
+        }
+    }
+
     fn live_topic_delivery(&self, topic_id: TopicId) -> Option<Arc<TopicDelivery>> {
         let slot = lock_std(&self.topic_deliveries).get(&topic_id).cloned()?;
         slot.alive.load(Ordering::Acquire).then_some(slot)
+    }
+
+    async fn wait_until_topic_idle(&self, topic_id: TopicId) {
+        loop {
+            let idle = {
+                let flights = lock_std(&self.bind_shared.flights);
+                flights
+                    .get(&topic_id)
+                    .and_then(|entry| (entry.count > 0).then(|| Arc::clone(&entry.idle)))
+            };
+            let Some(idle) = idle else {
+                return;
+            };
+            let wait = idle.notified();
+            let busy = lock_std(&self.bind_shared.flights)
+                .get(&topic_id)
+                .is_some_and(|entry| entry.count > 0);
+            if !busy {
+                return;
+            }
+            wait.await;
+        }
     }
 
     async fn publish_plumtree_and_pump(
@@ -3258,18 +3454,23 @@ impl PubSubManager {
         topic_id: TopicId,
         encoded: Bytes,
     ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
-        let turn = self.topic_turn(topic_id);
-        let _turn = turn.lock().await;
+        // The flight count blocks subscribe. The remote send does not hold
+        // the topic turn, so receive workers for this topic are not parked.
+        let _flight = FlightGuard::enter(&self.bind_shared, topic_id);
         if let Some(slot) = self.live_topic_delivery(topic_id) {
-            let _pump = slot.pump.lock().await;
+            {
+                let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
+                slot.pump_unstamped();
+            }
             // Local publish has no inbound header. The id stays absent.
-            // Cancelling after PlumTree enqueues still drains. The turn is
-            // this topic only, so another topic's publish is not blocked.
+            // Cancelling after PlumTree enqueues still drains.
             let mut drain =
-                ArmedDrain::omit(Arc::clone(&slot), Arc::clone(&self.cross_topic_producers));
+                ArmedDrain::omit(Arc::clone(&slot), topic_id, Arc::clone(&self.bind_shared));
             let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
+            let turn = self.topic_turn(topic_id);
+            let _turn = turn.lock().await;
             drain.disarm_and_bind();
             result
         } else {
@@ -3277,7 +3478,7 @@ impl PubSubManager {
             #[cfg(test)]
             Self::wait_test_pause(&self.after_producer_pause).await;
             if let Some(slot) = self.live_topic_delivery(topic_id) {
-                let _pump = slot.pump.lock().await;
+                let _gate = lock_bind_gate(&self.bind_shared.bind_gate);
                 slot.pump_unstamped();
             }
             result
@@ -3381,7 +3582,8 @@ impl PubSubManager {
             .get(topic)
             .copied();
         let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
-        // Turn before the name shard, matching subscribe. Only this topic waits.
+        // Idle before the turn, matching subscribe. Only this topic waits.
+        self.wait_until_topic_idle(topic_id).await;
         let turn = self.topic_turn(topic_id);
         let _turn = turn.lock().await;
         let _name_guard = self
@@ -10636,7 +10838,7 @@ mod issue869 {
             tokio::spawn(async move { manager.subscribe(topic).await })
         };
         stays_pending(&mut joiner, "subscribe during ordinary dispatch").await;
-        let mut duplicate_task = {
+        let duplicate_task = {
             let manager = Arc::clone(&manager);
             let duplicate = invalidate(&frame);
             tokio::spawn(async move {
@@ -10645,15 +10847,13 @@ mod issue869 {
                     .await;
             })
         };
-        stays_pending(
-            &mut duplicate_task,
-            "invalid duplicate during ordinary dispatch",
-        )
-        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), duplicate_task)
+            .await
+            .expect("same-topic duplicate proceeds while this dispatch is in flight")
+            .expect("duplicate task");
         *manager.after_producer_pause.lock().unwrap() = None;
         release.wait().await;
         dispatch.await.expect("dispatch task");
-        duplicate_task.await.expect("duplicate task");
         let mut joiner = joiner.await.expect("joiner");
         let stranded = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -10819,5 +11019,158 @@ mod issue869 {
         let note_a = recv_note(&mut sub_a).await;
         assert_eq!(note_a.message.payload.as_ref(), b"from-a");
         assert!(note_a.transport_msg_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_after_zero_read_does_not_take_the_frame_id() {
+        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        let mut sub = manager.subscribe("issue869".to_string()).await;
+        let peer = PeerId::new([9; 32]);
+        let (frame_b, id_b) = eager_frame(b"bee", [0x22; 32]);
+        manager.handle_incoming(peer, None, frame_b.clone()).await;
+        let first = recv_note(&mut sub).await;
+        assert_eq!(first.transport_msg_id, Some(id_b));
+        let reads_after_b = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+        let (from, session, response) =
+            queue_miss(&manager, "issue869", b"recovered-gap", [0x33; 32]).await;
+
+        let (entered, release) = arm_pause(&manager.bind_shared.bind_drain_pause);
+        let duplicate_task = {
+            let manager = Arc::clone(&manager);
+            let duplicate = invalidate(&frame_b);
+            tokio::spawn(async move {
+                manager.handle_incoming(peer, None, duplicate).await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("bind reaches the zero read");
+
+        let mut recover_task = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager.handle_incoming(from, Some(session), response).await;
+            })
+        };
+        let started =
+            tokio::time::timeout(std::time::Duration::from_millis(400), &mut recover_task).await;
+        assert!(
+            started.is_err(),
+            "recovery must wait until the bind has drained"
+        );
+        release.wait().await;
+        duplicate_task.await.expect("duplicate task");
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut recover_task)
+            .await
+            .expect("recovery finishes after the bind")
+            .expect("recovery task");
+
+        let note = recv_note(&mut sub).await;
+        assert_eq!(note.message.payload.as_ref(), b"recovered-gap");
+        assert!(
+            note.transport_msg_id.is_none(),
+            "the recovered payload must not wear the duplicate id"
+        );
+        assert_ne!(note.transport_msg_id, Some(id_b));
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_after_b,
+            "the invalid duplicate and the recovery are not read for an id"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_topic_does_not_fill_the_receive_workers() {
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([3; 32])],
+            sends: Vec::new(),
+        });
+        let topic_a = "issue869-workers-a";
+        let topic_b = "issue869-workers-b";
+        let _sub_a = manager.subscribe(topic_a.to_string()).await;
+        let mut sub_b = manager.subscribe(topic_b.to_string()).await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.transport.remote_send_pause.lock().unwrap() = Some((
+            TopicId::from_entity(topic_a.as_bytes()),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ));
+        let mut publish_a = {
+            let manager = Arc::clone(&manager);
+            let topic = topic_a.to_string();
+            tokio::spawn(async move {
+                manager
+                    .publish(topic, Bytes::from_static(b"held-a"))
+                    .await
+                    .expect("publish A");
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+            .await
+            .expect("topic A reaches its remote send");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let worker_count = 4;
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let rx = Arc::clone(&rx);
+            let manager = Arc::clone(&manager);
+            workers.push(tokio::spawn(async move {
+                loop {
+                    let next = {
+                        let mut rx = rx.lock().await;
+                        rx.recv().await
+                    };
+                    let Some((peer, frame)) = next else {
+                        return;
+                    };
+                    manager.handle_incoming(peer, None, frame).await;
+                }
+            }));
+        }
+        for (index, payload) in [b"w0" as &[u8], b"w1", b"w2", b"w3"]
+            .into_iter()
+            .enumerate()
+        {
+            let (frame, _) = eager_frame_on(topic_a, payload, [0xA0 + index as u8; 32]);
+            tx.send((PeerId::new([4; 32]), frame))
+                .await
+                .expect("queue topic A");
+        }
+        let (frame_b, id_b) = eager_frame_on(topic_b, b"worker-b", [0xB1; 32]);
+        tx.send((PeerId::new([6; 32]), frame_b))
+            .await
+            .expect("queue topic B");
+        drop(tx);
+
+        let note_b = tokio::time::timeout(std::time::Duration::from_secs(5), recv_note(&mut sub_b))
+            .await
+            .expect("topic B proceeds while topic A fills the workers");
+        assert_eq!(note_b.message.payload.as_ref(), b"worker-b");
+        assert_eq!(note_b.transport_msg_id, Some(id_b));
+        let still_sending =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut publish_a).await;
+        assert!(
+            still_sending.is_err(),
+            "topic A stays inside the remote send"
+        );
+
+        release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut publish_a)
+            .await
+            .expect("topic A finishes")
+            .expect("publish A task");
+        for worker in workers {
+            tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .expect("worker finishes")
+                .expect("worker task");
+        }
     }
 }
