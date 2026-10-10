@@ -509,6 +509,19 @@ impl Store {
 
     /// Open with an explicit busy timeout (tests use a short one so the
     /// exclusivity probe fails fast).
+    ///
+    /// A database written by a newer schema (or one whose stored version
+    /// cannot be read) is refused (ADR 0116 Validation, "Storage and
+    /// downgrade"). The refusal changes no file when the database is in WAL
+    /// mode, with or without a WAL another writer left uncheckpointed, or
+    /// is a settled rollback-journal database: the main file, `-wal` and
+    /// `-shm` stay byte-identical. The one limit: a HOT rollback journal is
+    /// recovered first, as SQLite requires before anything can be read, so
+    /// such a file is refused after its journal has been rolled back. x0x
+    /// keeps history in WAL mode from first initialization, so a history
+    /// database has a hot rollback journal only from an interrupted pre-WAL
+    /// initialization, before any version is committed (controller decision
+    /// C-0116-F1).
     pub fn open_with_busy_timeout(path: &Path, busy: std::time::Duration) -> HistoryResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -522,19 +535,81 @@ impl Store {
                 ))
             })?;
         }
+        // ADR 0116 Validation, "Storage and downgrade": an unknown newer
+        // schema fails closed without changing any file (see the doc above
+        // for the hot-journal limit). Note whether a WAL exists BEFORE this
+        // open touches anything: one this open did not create may hold
+        // another writer's uncheckpointed frames.
+        let wal_present = sidecar(path, "-wal").exists();
         let conn = Connection::open(path).map_err(|e| {
             HistoryError::Database(format!("open history db {}: {e}", path.display()))
         })?;
         conn.busy_timeout(busy)?;
-        // auto_vacuum must be decided before the first table exists; on an
-        // already-populated db this pragma is a no-op (the setting is baked
-        // into the file header).
-        conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;\n             PRAGMA locking_mode = EXCLUSIVE;\n             PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = NORMAL;",
-        )
-        .map_err(|e| {
-            HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()))
+        let pragma_error =
+            |e| HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()));
+        // With such a WAL, the close must not checkpoint it until the
+        // version is known to be compatible: the last connection's close
+        // would fold its frames into the main file and delete it.
+        // NO_CKPT_ON_CLOSE skips both, so a refusal on ANY path (a newer
+        // version, or a version read that fails) leaves both files
+        // byte-identical. It is switched off again once compatibility is
+        // confirmed, so an ordinary open keeps the ordinary close.
+        let no_checkpoint_on_close = |on: bool| {
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                on,
+            )
+        };
+        if wal_present {
+            no_checkpoint_on_close(true).map_err(pragma_error)?;
+        }
+        // Exclusive locking first. It does no I/O, and because it comes
+        // before the first access, SQLite keeps this connection's WAL index
+        // in heap memory and never uses `-shm` ("WAL without shared memory"
+        // in the SQLite docs): reading a WAL another writer left behind
+        // rebuilds that index in memory and writes nothing. (On a reopened
+        // WAL file this differs from the order before slice F, whose first
+        // pragma ran in NORMAL mode and created or used `-shm`; both hold
+        // the lifetime exclusive lock once open.)
+        conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
+            .map_err(pragma_error)?;
+        // Then the version, before setup writes, apart from hot-journal
+        // recovery (below):
+        // `auto_vacuum` and `journal_mode` rewrite the file header, and
+        // `migrate` creates its table. Only a missing `schema_version` table
+        // or row means "no schema yet". Any other failure (busy, I/O, a value
+        // that does not decode) stops the open here, before setup can write
+        // a file whose version is unknown. (A hot rollback journal is rolled
+        // back by this first read: SQLite recovery, the documented limit.)
+        let stored = read_schema_version(&conn).map_err(|e| {
+            HistoryError::Database(format!(
+                "pragma setup history db {}: schema check: {e}",
+                path.display()
+            ))
         })?;
+        if let Some(version) = stored.filter(|version| *version > SCHEMA_VERSION) {
+            return Err(newer_schema_error(version));
+        }
+        // Compatible (or new): the ordinary close from here on.
+        if wal_present {
+            no_checkpoint_on_close(false).map_err(pragma_error)?;
+        }
+        // auto_vacuum must be decided before the first table exists. On a
+        // database that is already INCREMENTAL the pragma is not a no-op: it
+        // rewrites page 1 (one WAL frame, folded into the file header at
+        // close). So it is issued only when the mode differs.
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .map_err(pragma_error)?;
+        let set_auto_vacuum = if auto_vacuum == 2 {
+            ""
+        } else {
+            "PRAGMA auto_vacuum = INCREMENTAL;\n"
+        };
+        conn.execute_batch(&format!(
+            "{set_auto_vacuum}PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;"
+        ))
+        .map_err(pragma_error)?;
         // Acquire the exclusive lock NOW so a second process fails at open,
         // not at first write.
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
@@ -3788,10 +3863,44 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
                 "no migration path from schema v{v}"
             )))
         }
-        Some(v) => Err(HistoryError::Database(format!(
-            "history.db schema v{v} is newer than this binary (v{SCHEMA_VERSION})"
-        ))),
+        Some(v) => Err(newer_schema_error(v)),
     }
+}
+
+/// The refusal for a database written by a newer binary.
+fn newer_schema_error(version: i64) -> HistoryError {
+    HistoryError::Database(format!(
+        "history.db schema v{version} is newer than this binary (v{SCHEMA_VERSION})"
+    ))
+}
+
+/// The stored schema version. `Ok(None)` only when the database has no
+/// `schema_version` table, or no row in it, yet (a new or empty file). Any
+/// other failure (busy, I/O, corruption, a version that does not decode as
+/// an integer) is an error: the caller must not go on to write a database
+/// whose version it could not read.
+fn read_schema_version(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .optional()
+}
+
+/// `path` with `suffix` appended to its file name: SQLite's sidecar files
+/// (`-wal`, `-shm`).
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
 }
 
 /// Schema v2 adds no columns: it backfills the existing FTS projection for

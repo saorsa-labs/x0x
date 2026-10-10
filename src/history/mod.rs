@@ -547,6 +547,11 @@ impl HistoryService {
     }
 }
 
+/// ADR 0116 Validation "Storage and downgrade": the released v0.46.6
+/// schema-4 fixture (slice F).
+#[cfg(test)]
+mod fixture_v0466_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
