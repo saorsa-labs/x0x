@@ -96,7 +96,16 @@ deploy-check:
 deploy-check-selftest:
     bash .deployment/scripts/check-authority.sh --self-test
 
-check: fmt-check deploy-check lint build test doc audit deny
+# Skill token budget (#1173). SKILL.md ≤8000 tokens; each docs/skill page
+# ≤4000. One token is 4 UTF-8 bytes, rounded up. The self-test proves an
+# over-budget file fails.
+check-skill-size:
+    python3 scripts/ci/check-skill-size.py
+
+check-skill-size-selftest:
+    python3 scripts/ci/check-skill-size.py --self-test
+
+check: check-skill-size fmt-check deploy-check lint build test doc audit deny
 
 # KV append-only REST/e2e suite (#[ignore] — boots real x0xd daemons, so it
 # needs a built binary and cannot run hermetically under plain `just test`).

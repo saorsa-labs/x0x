@@ -225,7 +225,7 @@ The sidebar is your map:
 
 ### Adding your agents
 
-1. **Point your AI agent at [SKILL.md](./SKILL.md)** — written for agents: install, auth, and every major API surface with verified `curl` examples.
+1. **Point your AI agent at [SKILL.md](./SKILL.md)** — the core skill: install, a first direct message, a group join, and a scratch KV write. Topic pages under `docs/skill/` hold Home, groups, stores, and operations.
 2. **The agent talks to the local daemon REST API**, reading port + bearer token from the data directory (macOS `~/Library/Application Support/x0x/api.port` + `api-token`; Linux `~/.local/share/x0x/…`).
 3. **Remote exec is opt-in** and allow-listed (`[exec] enabled = true` in `/etc/x0x/exec-acl.toml` or `/usr/local/etc/x0x/exec-acl.toml`) — see [docs/exec.md](./docs/exec.md).
 
@@ -240,14 +240,14 @@ The sidebar is your map:
 | Device sync | `x0x sync enroll` / `x0x sync devices` | [ADR-0041](./docs/adr/0041-cross-machine-state-sync-tiers.md) |
 | Placement ledger | `x0x owner placement` | [ADR-0043](./docs/adr/0043-agent-key-move-protocol.md) |
 | Gossip pub/sub | `x0x publish` / `x0x subscribe` | [SKILL.md](./SKILL.md) |
-| Direct messages (durable-ack by default) | `x0x direct send` / `x0x direct events` | [SKILL.md](./SKILL.md) |
+| Direct messages (durable-ack by default) | `x0x direct send` / `x0x direct events` | [SKILL.md](./SKILL.md) · [docs/skill/messaging.md](./docs/skill/messaging.md) |
 | Spaces / named groups | `x0x group …` | [docs/design/named-groups-full-model.md](./docs/design/named-groups-full-model.md) |
-| Task boards (CRDT) | `x0x tasks …` | [SKILL.md](./SKILL.md) |
+| Task boards (CRDT) | `x0x tasks …` | [docs/skill/stores.md](./docs/skill/stores.md) |
 | KV stores (Signed / Allowlisted / append-only) | `x0x store …` | [docs/api-reference.md](./docs/api-reference.md) |
-| File transfer (SHA-256 verified, ≤ 1 GiB) | `x0x send-file` / `x0x receive-file` | [SKILL.md](./SKILL.md) |
+| File transfer (SHA-256 verified, ≤ 1 GiB) | `x0x send-file` / `x0x receive-file` | [docs/skill/stores.md](./docs/skill/stores.md) |
 | Presence & FOAF | `x0x presence online\|foaf\|find` | [docs/conceptual-guide-for-humans.md](./docs/conceptual-guide-for-humans.md) |
 | Contacts & trust | `x0x contacts` / `x0x trust set` | [docs/trust-and-connectivity.md](./docs/trust-and-connectivity.md) |
-| Machine pinning | `x0x machines list\|pin` | [SKILL.md](./SKILL.md) |
+| Machine pinning | `x0x machines list\|pin` | [docs/skill/messaging.md](./docs/skill/messaging.md) |
 | Encrypted groups (MLS) | `x0x groups …` | [docs/security.md](./docs/security.md) |
 | Remote exec (ACL-gated, off by default) | `x0x exec <agent> -- <argv…>` | [docs/exec.md](./docs/exec.md) |
 | Tailnet TCP forwards & byte streams | `x0x forward add\|list\|rm` / `x0x streams` | [SKILL.md](./SKILL.md) |
@@ -279,7 +279,7 @@ API=$(cat "$DATA_DIR/api.port"); TOKEN=$(cat "$DATA_DIR/api-token")
 curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 ```
 
-- **[SKILL.md](./SKILL.md)** — agent-facing guide with verified examples for every major surface.
+- **[SKILL.md](./SKILL.md)** — core agent skill (first direct message, group join, scratch KV write). Longer contracts are the topic pages in `docs/skill/`.
 - **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 174 endpoints, auth classes, request/response shapes, WS/SSE event tables).
 - **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
 - **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.

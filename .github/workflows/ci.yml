@@ -682,6 +682,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Skill token budget
+        run: |
+          python3 scripts/ci/check-skill-size.py
+          python3 scripts/ci/check-skill-size.py --self-test
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
