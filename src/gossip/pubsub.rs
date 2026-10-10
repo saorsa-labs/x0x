@@ -591,14 +591,6 @@ pub struct PubSubMessage {
 /// id as authenticated metadata.
 const SG_KEY_CACHE_V3_MARKER: &[u8] = b"\xffSGKC\x03";
 
-/// How long a verified header id may wait for its subscriber delivery.
-/// A claim that never meets a delivery expires instead of attaching to a
-/// later payload that happens to share the same bytes.
-const TRANSPORT_CLAIM_TTL: Duration = Duration::from_secs(5);
-
-/// Bound on outstanding verified header ids. The oldest claim is dropped.
-const TRANSPORT_CLAIM_CAP: usize = 256;
-
 /// Authenticated gossip `MessageHeader.msg_id` for one subscriber delivery.
 ///
 /// This is not `HistoryRecord.msg_id` and not the ADR 0029 application id.
@@ -646,98 +638,22 @@ impl PubSubNotification {
     }
 }
 
-struct TransportClaim {
-    ticket: u64,
-    peer: PeerId,
-    payload: Bytes,
-    msg_id: TransportMsgId,
-    at: Instant,
-}
-
-/// Verified header ids waiting for the matching `(peer, payload)` delivery.
+/// One PlumTree local delivery plus the id of the frame that produced it.
 ///
-/// saorsa-gossip 0.5.87 delivers `(PeerId, Bytes)` and drops the header
-/// (saorsa-gossip #100). x0x checks the inbound frame first and joins a
-/// single matching claim at delivery time. Zero claims, or more than one,
-/// produce no id: a payload hash is not a substitute, and two header ids
-/// must not be collapsed into one guess.
-#[derive(Default)]
-struct TransportClaims {
-    next_ticket: AtomicU64,
-    inner: Mutex<Vec<TransportClaim>>,
+/// The id is copied from that frame after PlumTree has already admitted it.
+/// It is not recovered later by matching peer and payload bytes.
+struct StampedDelivery {
+    encoded_payload: Bytes,
+    transport_msg_id: Option<TransportMsgId>,
 }
 
-impl TransportClaims {
-    fn offer(&self, peer: PeerId, payload: Bytes, msg_id: TransportMsgId) -> u64 {
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        let mut claims = self.lock();
-        let now = Instant::now();
-        prune_transport_claims(&mut claims, now);
-        if claims.len() >= TRANSPORT_CLAIM_CAP {
-            claims.remove(0);
-        }
-        claims.push(TransportClaim {
-            ticket,
-            peer,
-            payload,
-            msg_id,
-            at: now,
-        });
-        ticket
-    }
-
-    fn release(&self, ticket: u64) {
-        self.lock().retain(|claim| claim.ticket != ticket);
-    }
-
-    /// Return the id when exactly one live claim matches.
-    ///
-    /// Several matches are discarded. The delivery then carries no
-    /// authenticated id.
-    fn take_unique(&self, peer: PeerId, payload: &Bytes) -> Option<TransportMsgId> {
-        let mut claims = self.lock();
-        let now = Instant::now();
-        prune_transport_claims(&mut claims, now);
-        let matched: Vec<usize> = claims
-            .iter()
-            .enumerate()
-            .filter(|(_, claim)| claim.peer == peer && claim.payload == payload)
-            .map(|(index, _)| index)
-            .collect();
-        match matched.len() {
-            0 => None,
-            1 => Some(claims.remove(matched[0]).msg_id),
-            _ => {
-                for index in matched.into_iter().rev() {
-                    claims.remove(index);
-                }
-                None
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<TransportClaim>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-fn prune_transport_claims(claims: &mut Vec<TransportClaim>, now: Instant) {
-    claims.retain(|claim| now.saturating_duration_since(claim.at) < TRANSPORT_CLAIM_TTL);
-}
-
-/// Validated eager payload and its header id, or `None` when the frame is
-/// not a signature-checked legacy EAGER with a payload-covering header.
+/// Header id of a frame PlumTree has just delivered to a local subscriber.
 ///
-/// ADR-014 `RejectV1` frames (header-only signatures) and key-cache v3 frames
-/// return `None`. Callers must not invent an id from the payload bytes.
-fn authenticated_eager_claim(frame: &[u8]) -> Option<(Bytes, TransportMsgId)> {
+/// PlumTree verified the signature before that delivery, including the
+/// duplicate drop that happens before verification. This read does not hash
+/// the payload and does not verify again. v1 and key-cache v3 frames yield
+/// no id.
+fn transport_id_from_admitted_frame(frame: &[u8]) -> Option<TransportMsgId> {
     if frame.starts_with(SG_KEY_CACHE_V3_MARKER) {
         return None;
     }
@@ -745,19 +661,7 @@ fn authenticated_eager_claim(frame: &[u8]) -> Option<(Bytes, TransportMsgId)> {
     if message.header.version != 2 || message.header.kind != MessageKind::Eager {
         return None;
     }
-    let payload = message.payload.clone()?;
-    let expected = message.header.payload_hash?;
-    if blake3::hash(payload.as_ref()).as_bytes() != &expected {
-        return None;
-    }
-    let header_bytes = postcard::to_stdvec(&message.header).ok()?;
-    let verified = saorsa_gossip_identity::MlDsaKeyPair::verify(
-        &message.public_key,
-        &header_bytes,
-        &message.signature,
-    )
-    .unwrap_or(false);
-    verified.then_some((payload, TransportMsgId(message.header.msg_id)))
+    Some(TransportMsgId(message.header.msg_id))
 }
 
 fn lock_std<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -796,9 +700,9 @@ impl SenderAdmission {
 
 /// One PlumTree receiver for a topic, fanned out to every local subscriber.
 ///
-/// The forwarder attaches a validated transport id once, then copies that
-/// notification. A per-subscriber claim lookup let the first reader consume
-/// the only id (#869).
+/// Inbound admission stamps the validated header id onto the delivery PlumTree
+/// just enqueued, then the forwarder copies that notification. The id is not
+/// looked up again by peer and payload (#869).
 struct TopicDelivery {
     senders: Mutex<Vec<LiveSender>>,
     next_sender_id: AtomicU64,
@@ -806,11 +710,18 @@ struct TopicDelivery {
     ready: tokio::sync::watch::Sender<bool>,
     alive: AtomicBool,
     stats: Arc<PubSubStats>,
+    /// Held across a local publish or an inbound admission and the pump that
+    /// follows it, so a later frame cannot stamp an earlier queued payload.
+    pump: tokio::sync::Mutex<()>,
+    plumtree_rx: Mutex<Option<mpsc::UnboundedReceiver<(PeerId, Bytes)>>>,
+    stamped_tx: mpsc::UnboundedSender<StampedDelivery>,
+    stamped_rx: Mutex<Option<mpsc::UnboundedReceiver<StampedDelivery>>>,
 }
 
 impl TopicDelivery {
     fn new(stats: Arc<PubSubStats>) -> Arc<Self> {
         let (ready, _) = tokio::sync::watch::channel(false);
+        let (stamped_tx, stamped_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             senders: Mutex::new(Vec::new()),
             next_sender_id: AtomicU64::new(1),
@@ -818,7 +729,49 @@ impl TopicDelivery {
             ready,
             alive: AtomicBool::new(true),
             stats,
+            pump: tokio::sync::Mutex::new(()),
+            plumtree_rx: Mutex::new(None),
+            stamped_tx,
+            stamped_rx: Mutex::new(Some(stamped_rx)),
         })
+    }
+
+    fn install_plumtree_rx(&self, rx: mpsc::UnboundedReceiver<(PeerId, Bytes)>) {
+        *lock_std(&self.plumtree_rx) = Some(rx);
+    }
+
+    fn take_stamped_rx(&self) -> Option<mpsc::UnboundedReceiver<StampedDelivery>> {
+        lock_std(&self.stamped_rx).take()
+    }
+
+    fn enqueue_stamped(&self, encoded_payload: Bytes, transport_msg_id: Option<TransportMsgId>) {
+        let _ = self.stamped_tx.send(StampedDelivery {
+            encoded_payload,
+            transport_msg_id,
+        });
+    }
+
+    /// Move payloads already sitting on the PlumTree receiver onto the
+    /// fan-out queue. They have no inbound frame to bind, so the id is absent.
+    fn pump_unstamped(&self) {
+        let mut rx = lock_std(&self.plumtree_rx);
+        let Some(rx) = rx.as_mut() else {
+            return;
+        };
+        while let Ok((_peer, encoded_payload)) = rx.try_recv() {
+            self.enqueue_stamped(encoded_payload, None);
+        }
+    }
+
+    /// The one payload this admission enqueued, if PlumTree delivered it.
+    fn take_admitted(&self) -> Option<Bytes> {
+        let mut rx = lock_std(&self.plumtree_rx);
+        let rx = rx.as_mut()?;
+        match rx.try_recv() {
+            Ok((_peer, encoded_payload)) => Some(encoded_payload),
+            Err(mpsc::error::TryRecvError::Empty)
+            | Err(mpsc::error::TryRecvError::Disconnected) => None,
+        }
     }
 
     fn insert(
@@ -973,7 +926,6 @@ fn count_undecoded_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64
 
 struct ForwardEnv<'a> {
     stats: &'a PubSubStats,
-    transport_claims: &'a TransportClaims,
     contacts: Option<&'a Arc<RwLock<ContactStore>>>,
     revocation_set: Option<&'a Arc<RwLock<crate::revocation::RevocationSet>>>,
     sub_topic: &'a str,
@@ -982,13 +934,12 @@ struct ForwardEnv<'a> {
 async fn forward_plumtree_payload(
     slot: &TopicDelivery,
     env: &ForwardEnv<'_>,
-    peer: PeerId,
     encoded_payload: Bytes,
+    transport_msg_id: Option<TransportMsgId>,
 ) {
-    // Take the claim once, before this delivery is copied. A later decode
-    // drop still consumes it so it cannot stick to a later payload.
-    // Recipients are the subscribers already past the pre-subscribe buffer.
-    let transport_msg_id = env.transport_claims.take_unique(peer, &encoded_payload);
+    // The id was bound to this delivery at admission. Recipients are the
+    // subscribers already past the pre-subscribe buffer. A joiner added
+    // during decode does not receive this payload.
     let recipients = established_recipient_ids(slot);
     tracing::debug!(
         topic = %env.sub_topic,
@@ -1239,9 +1190,10 @@ impl Drop for Subscription {
 ///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
 ///
 /// Local subscription delivery path:
-///     PlumTree topic receiver → one forwarder attaches a validated
-///     `MessageHeader.msg_id` → that delivery is copied to every local
-///     subscriber (#869). Absent or ambiguous metadata stays absent.
+///     PlumTree admits a frame → that delivery is stamped with the frame's
+///     validated `MessageHeader.msg_id` → one forwarder copies the
+///     notification to every local subscriber (#869). Absent metadata stays
+///     absent. The id is not looked up again from the payload.
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
@@ -1299,11 +1251,14 @@ pub struct PubSubManager {
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
     local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubNotification>>>>>,
-    /// Verified gossip header ids waiting for the matching subscriber delivery (#869).
-    transport_claims: Arc<TransportClaims>,
-    /// One PlumTree receiver per topic. The forwarder attaches a validated
-    /// transport id, then copies that delivery to every local subscriber.
+    /// One PlumTree receiver per topic. Admission stamps a validated transport
+    /// id onto the delivery PlumTree enqueued, then the forwarder copies that
+    /// notification to every local subscriber.
     topic_deliveries: Arc<TopicDeliveryMap>,
+    /// Times [`Self::admitted_transport_id`] ran. That read happens only after
+    /// PlumTree has delivered a frame to a local subscriber.
+    #[cfg(test)]
+    admitted_transport_id_reads: AtomicU64,
     /// Long-lived membership holds so Direct-connect pre-subscribe of a
     /// peer inbox (#380 C4) stays on the subscribed-topic path. The owned
     /// task drains the receiver so a quiet hold cannot fill the channel
@@ -1894,8 +1849,9 @@ impl PubSubManager {
             stats: Arc::new(PubSubStats::default()),
             inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
-            transport_claims: Arc::new(TransportClaims::default()),
             topic_deliveries: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            admitted_transport_id_reads: AtomicU64::new(0),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
@@ -2480,16 +2436,24 @@ impl PubSubManager {
                 slot: Arc::clone(&claimed.slot),
                 started: false,
             };
-            let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
+            let _pump = claimed.slot.pump.lock().await;
+            let plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
+            claimed.slot.install_plumtree_rx(plumtree_rx);
+            // A publish that overlapped registration is already in the
+            // receiver. Move it before any joiner can be admitted.
+            claimed.slot.pump_unstamped();
+            drop(_pump);
+            let mut stamped_rx = claimed.slot.take_stamped_rx().unwrap_or_else(|| {
+                let (_, rx) = mpsc::unbounded_channel();
+                rx
+            });
             let slot = Arc::clone(&claimed.slot);
             let deliveries = Arc::clone(&self.topic_deliveries);
             let stats = Arc::clone(&self.stats);
-            let transport_claims = Arc::clone(&self.transport_claims);
             let sub_topic = topic.clone();
             tokio::spawn(async move {
                 let env = ForwardEnv {
                     stats: &stats,
-                    transport_claims: &transport_claims,
                     contacts: contacts.as_ref(),
                     revocation_set: revocation_set.as_ref(),
                     sub_topic: &sub_topic,
@@ -2506,13 +2470,13 @@ impl PubSubManager {
                         // a later subscribe observes an earlier publish.
                         _ = slot.changed.notified() => {
                             loop {
-                                match plumtree_rx.try_recv() {
-                                    Ok((peer, encoded_payload)) => {
+                                match stamped_rx.try_recv() {
+                                    Ok(stamped) => {
                                         forward_plumtree_payload(
                                             &slot,
                                             &env,
-                                            peer,
-                                            encoded_payload,
+                                            stamped.encoded_payload,
+                                            stamped.transport_msg_id,
                                         )
                                         .await;
                                     }
@@ -2534,16 +2498,16 @@ impl PubSubManager {
                                 return;
                             }
                         }
-                        received = plumtree_rx.recv() => {
-                            let Some((peer, encoded_payload)) = received else {
+                        received = stamped_rx.recv() => {
+                            let Some(stamped) = received else {
                                 force_close_topic_delivery(&deliveries, topic_id);
                                 return;
                             };
                             forward_plumtree_payload(
                                 &slot,
                                 &env,
-                                peer,
-                                encoded_payload,
+                                stamped.encoded_payload,
+                                stamped.transport_msg_id,
                             )
                             .await;
                             if !slot.alive.load(Ordering::Acquire)
@@ -2768,7 +2732,7 @@ impl PubSubManager {
         self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
-        match self.plumtree.publish_with_fanout(topic_id, encoded).await {
+        match self.publish_plumtree_and_pump(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
@@ -2875,18 +2839,6 @@ impl PubSubManager {
         if self.refuse_leaf_unsubscribed_passthrough(ordinary_frame, &data) {
             return;
         }
-        // Record a verified header id before PlumTree can deliver the payload,
-        // and only when a local subscriber will read it. A Full relay with no
-        // subscriber used to decode, hash, and check a signature to cache an
-        // id nobody consumes (#869). `Err` from dispatch releases the ticket.
-        // `Ok` leaves the claim for the one topic forwarder.
-        let transport_ticket =
-            if ordinary_frame.is_some_and(|header| self.has_local_subscriber(header.topic)) {
-                authenticated_eager_claim(&data)
-                    .map(|(payload, msg_id)| self.transport_claims.offer(peer, payload, msg_id))
-            } else {
-                None
-            };
         // #674 C2/C3: first sight of a topic id on the inbound path
         // installs the relay fan-out composite validator. On a Full relay
         // this is the ONLY way an unconsumed topic (never passed through
@@ -2906,7 +2858,42 @@ impl PubSubManager {
             } else {
                 None
             };
-        let dispatch_result = match session {
+        // Metadata is taken from a frame PlumTree actually delivered. A
+        // duplicate returns before SG verifies, and a topic with no local
+        // subscriber never reaches `admitted_transport_id`. The id is bound
+        // to that delivery here, then cloned at fan-out. It is not looked
+        // up later by peer and payload.
+        let delivery = ordinary_frame.and_then(|header| self.live_topic_delivery(header.topic));
+        let dispatch_result = if let Some(slot) = delivery {
+            let _pump = slot.pump.lock().await;
+            slot.pump_unstamped();
+            let dispatch_result = self.dispatch_inbound(peer, session, data.clone()).await;
+            if dispatch_result.is_ok() {
+                if let Some(payload) = slot.take_admitted() {
+                    let transport_msg_id = self.admitted_transport_id(&data);
+                    slot.enqueue_stamped(payload, transport_msg_id);
+                    slot.pump_unstamped();
+                }
+            }
+            dispatch_result
+        } else {
+            self.dispatch_inbound(peer, session, data).await
+        };
+        if let Err(e) = dispatch_result {
+            tracing::warn!(
+                "Failed to handle PlumTree pubsub message from {}: {e}",
+                crate::logging::LogPeerId::from(peer)
+            );
+        }
+    }
+
+    async fn dispatch_inbound(
+        &self,
+        peer: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) -> Result<(), anyhow::Error> {
+        match session {
             Some(session) if session.peer == peer => {
                 self.plumtree
                     .handle_authenticated_message(session, data)
@@ -2918,23 +2905,40 @@ impl PubSubManager {
                 peer
             )),
             None => self.plumtree.handle_message(peer, data).await,
-        };
-        if let Err(e) = dispatch_result {
-            if let Some(ticket) = transport_ticket {
-                self.transport_claims.release(ticket);
-            }
-            tracing::warn!(
-                "Failed to handle PlumTree pubsub message from {}: {e}",
-                crate::logging::LogPeerId::from(peer)
-            );
         }
     }
 
-    fn has_local_subscriber(&self, topic: TopicId) -> bool {
-        self.subscribed_topic_ids
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&topic)
+    /// Read the header id only after PlumTree delivered this frame.
+    fn admitted_transport_id(&self, frame: &[u8]) -> Option<TransportMsgId> {
+        #[cfg(test)]
+        self.admitted_transport_id_reads
+            .fetch_add(1, Ordering::Relaxed);
+        transport_id_from_admitted_frame(frame)
+    }
+
+    fn live_topic_delivery(&self, topic_id: TopicId) -> Option<Arc<TopicDelivery>> {
+        let slot = lock_std(&self.topic_deliveries).get(&topic_id).cloned()?;
+        slot.alive.load(Ordering::Acquire).then_some(slot)
+    }
+
+    async fn publish_plumtree_and_pump(
+        &self,
+        topic_id: TopicId,
+        encoded: Bytes,
+    ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
+        if let Some(slot) = self.live_topic_delivery(topic_id) {
+            let _pump = slot.pump.lock().await;
+            let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
+            slot.pump_unstamped();
+            result
+        } else {
+            let result = self.plumtree.publish_with_fanout(topic_id, encoded).await;
+            if let Some(slot) = self.live_topic_delivery(topic_id) {
+                let _pump = slot.pump.lock().await;
+                slot.pump_unstamped();
+            }
+            result
+        }
     }
 
     fn claim_topic_delivery(
@@ -8304,9 +8308,10 @@ mod tests {
 
         let envelope = signed_inner_v2(&ctx, topic, &Bytes::from("hello"));
         for attempt in ["publish 1", "publish 2 (identical envelope, intentional)"] {
+            // The same bytes `publish` hands to PlumTree, including the pump
+            // that moves the local delivery onto the fan-out queue.
             manager
-                .plumtree
-                .publish_with_fanout(topic_id, envelope.clone())
+                .publish_plumtree_and_pump(topic_id, envelope.clone())
                 .await
                 .expect(attempt);
         }
@@ -9394,124 +9399,6 @@ mod issue869 {
     use crate::history::HistoryRecord;
     use crate::identity::AgentKeypair;
 
-    fn sample_message(payload: &[u8]) -> PubSubMessage {
-        PubSubMessage {
-            topic: "issue869".into(),
-            payload: Bytes::copy_from_slice(payload),
-            sender: None,
-            sender_public_key: None,
-            verified: true,
-            trust_level: None,
-            raw_envelope: None,
-        }
-    }
-
-    fn signed_pair() -> (Bytes, Bytes, Bytes) {
-        let app = Bytes::from_static(b"same-bytes");
-        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
-        let inner = signed_inner_v2(&author, "issue869", &app);
-        let topic = TopicId::from_entity(b"issue869");
-        let frame_a = outer_v2_frame(topic, inner.clone(), [0x11; 32]);
-        let frame_b = outer_v2_frame(topic, inner.clone(), [0x22; 32]);
-        (app, frame_a, frame_b)
-    }
-
-    #[test]
-    fn one_transport_id_survives_repeated_local_delivery() {
-        let (_app, frame_a, _frame_b) = signed_pair();
-        let (_payload, id) = authenticated_eager_claim(&frame_a).expect("validated header id");
-        let note = PubSubNotification::with_transport_id(sample_message(b"same-bytes"), Some(id));
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.try_send(note.clone()).expect("first local delivery");
-        tx.try_send(note).expect("repeated local delivery");
-        let first = rx.try_recv().expect("first notification");
-        let second = rx.try_recv().expect("second notification");
-        assert_eq!(first.transport_msg_id, Some(id));
-        assert_eq!(
-            second.transport_msg_id, first.transport_msg_id,
-            "one transport message keeps its id across repeated local delivery"
-        );
-        assert_eq!(first.message.payload, second.message.payload);
-    }
-
-    #[test]
-    fn same_payload_distinct_header_ids_stay_distinct() {
-        let (app, frame_a, frame_b) = signed_pair();
-        let (payload_a, id_a) = authenticated_eager_claim(&frame_a).expect("id a");
-        let (payload_b, id_b) = authenticated_eager_claim(&frame_b).expect("id b");
-        assert_eq!(
-            payload_a, payload_b,
-            "the two frames carry the same payload"
-        );
-        assert_ne!(id_a, id_b, "distinct header ids stay distinct");
-        assert_eq!(id_a.as_bytes(), [0x11; 32]);
-        assert_eq!(id_b.as_bytes(), [0x22; 32]);
-        let history = HistoryRecord::compute_msg_id(None, &app);
-        assert_ne!(id_a.as_bytes(), history);
-        assert_ne!(id_b.as_bytes(), history);
-        assert_ne!(id_a.as_bytes(), *blake3::hash(&payload_a).as_bytes());
-        let first = PubSubNotification::with_transport_id(sample_message(&app), Some(id_a));
-        let second = PubSubNotification::with_transport_id(sample_message(&app), Some(id_b));
-        assert_eq!(first.message.payload, second.message.payload);
-        assert_ne!(first.transport_msg_id, second.transport_msg_id);
-    }
-
-    #[test]
-    fn absent_or_unvalidated_header_omits_the_transport_id() {
-        let bare = PubSubNotification::bare(sample_message(b"same-bytes"));
-        assert!(bare.transport_msg_id.is_none());
-        let (_app, frame_a, _frame_b) = signed_pair();
-        let mut bad = frame_a.to_vec();
-        let last = bad.len() - 1;
-        bad[last] ^= 0x5a;
-        assert!(
-            authenticated_eager_claim(&bad).is_none(),
-            "a broken signature is not an authenticated id"
-        );
-        let mut v3 = SG_KEY_CACHE_V3_MARKER.to_vec();
-        v3.extend_from_slice(&frame_a);
-        assert!(
-            authenticated_eager_claim(&v3).is_none(),
-            "an unverified v3 frame does not yield an authenticated id"
-        );
-        let claims = TransportClaims::default();
-        let peer = PeerId::new([7; 32]);
-        assert!(claims.take_unique(peer, &frame_a).is_none());
-    }
-
-    #[test]
-    fn overlapping_claims_omit_rather_than_guess_an_id() {
-        let (_app, frame_a, frame_b) = signed_pair();
-        let (payload, id_a) = authenticated_eager_claim(&frame_a).expect("id a");
-        let (_payload_b, id_b) = authenticated_eager_claim(&frame_b).expect("id b");
-        let claims = TransportClaims::default();
-        let peer = PeerId::new([7; 32]);
-        let other = PeerId::new([8; 32]);
-
-        let first = claims.offer(peer, payload.clone(), id_a);
-        assert_eq!(claims.take_unique(peer, &payload), Some(id_a));
-        claims.offer(peer, payload.clone(), id_b);
-        assert_eq!(claims.take_unique(peer, &payload), Some(id_b));
-
-        claims.offer(peer, payload.clone(), id_a);
-        claims.offer(peer, payload.clone(), id_b);
-        assert_eq!(
-            claims.take_unique(peer, &payload),
-            None,
-            "two header ids for one payload are not collapsed or hashed"
-        );
-        assert!(claims.take_unique(peer, &payload).is_none());
-
-        let ticket = claims.offer(peer, payload.clone(), id_a);
-        claims.release(ticket);
-        assert!(claims.take_unique(peer, &payload).is_none());
-        assert_ne!(first, ticket);
-
-        claims.offer(peer, payload.clone(), id_a);
-        assert!(claims.take_unique(other, &payload).is_none());
-        assert_eq!(claims.take_unique(peer, &payload), Some(id_a));
-    }
-
     async fn test_node() -> Arc<NetworkNode> {
         Arc::new(
             NetworkNode::new(
@@ -9535,8 +9422,19 @@ mod issue869 {
         let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
         let inner = signed_inner_v2(&author, "issue869", &app);
         let frame = outer_v2_frame(TopicId::from_entity(b"issue869"), inner, msg_id);
-        let (_payload, id) = authenticated_eager_claim(&frame).expect("validated header id");
-        (frame, id)
+        (frame, TransportMsgId(msg_id))
+    }
+
+    fn same_payload_frames() -> (Bytes, Bytes, TransportMsgId, TransportMsgId) {
+        let app = Bytes::from_static(b"same-bytes");
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
+        let inner = signed_inner_v2(&author, "issue869", &app);
+        let topic = TopicId::from_entity(b"issue869");
+        let id_a = TransportMsgId([0x11; 32]);
+        let id_b = TransportMsgId([0x22; 32]);
+        let frame_a = outer_v2_frame(topic, inner.clone(), id_a.as_bytes());
+        let frame_b = outer_v2_frame(topic, inner, id_b.as_bytes());
+        (frame_a, frame_b, id_a, id_b)
     }
 
     async fn recv_note(sub: &mut Subscription) -> PubSubNotification {
@@ -9577,6 +9475,97 @@ mod issue869 {
         let only = recv_note(&mut second).await;
         assert_eq!(only.transport_msg_id, Some(id_b));
         assert_eq!(only.message.payload.as_ref(), b"two");
+    }
+
+    #[tokio::test]
+    async fn second_valid_frame_with_the_same_payload_does_not_relabel_the_delivery() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let mut first = manager.subscribe("issue869".to_string()).await;
+        let mut second = manager.subscribe("issue869".to_string()).await;
+        let peer = PeerId::new([9; 32]);
+        let (frame_a, frame_b, id_a, id_b) = same_payload_frames();
+        assert_ne!(id_a, id_b);
+        let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+        manager.handle_incoming(peer, None, frame_a.clone()).await;
+        manager.handle_incoming(peer, None, frame_b).await;
+        manager.handle_incoming(peer, None, frame_a).await;
+
+        let left = recv_note(&mut first).await;
+        let right = recv_note(&mut second).await;
+        assert_eq!(
+            left.transport_msg_id,
+            Some(id_a),
+            "the admitted delivery keeps frame A's id"
+        );
+        assert_eq!(
+            right.transport_msg_id,
+            Some(id_a),
+            "both subscribers receive the id bound before fan-out"
+        );
+        assert_ne!(left.transport_msg_id, Some(id_b));
+        assert_eq!(left.message.payload, right.message.payload);
+        assert_ne!(
+            id_a.as_bytes(),
+            HistoryRecord::compute_msg_id(None, &left.message.payload),
+            "the transport id is not HistoryRecord.msg_id"
+        );
+        assert_ne!(
+            id_a.as_bytes(),
+            *blake3::hash(&left.message.payload).as_bytes()
+        );
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            first.recv_notification(),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "a replay and a duplicate must not deliver another copy"
+        );
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            second.recv_notification(),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "the second subscriber sees the same one delivery"
+        );
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_before + 1,
+            "only the admitted frame is read; the replay and the duplicate are not"
+        );
+    }
+
+    #[tokio::test]
+    async fn unvalidated_frame_is_not_given_a_transport_id() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let mut sub = manager.subscribe("issue869".to_string()).await;
+        let peer = PeerId::new([4; 32]);
+        let (frame, _id) = eager_frame(b"one", [0x44; 32]);
+        let mut bad = frame.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x5a;
+        let mut v3 = SG_KEY_CACHE_V3_MARKER.to_vec();
+        v3.extend_from_slice(&frame);
+        let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
+        manager.handle_incoming(peer, None, Bytes::from(bad)).await;
+        manager.handle_incoming(peer, None, Bytes::from(v3)).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.recv_notification(),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "a broken signature and an unverified v3 frame are not delivered"
+        );
+        assert_eq!(
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_before,
+            "a frame PlumTree does not deliver is not decoded for a transport id"
+        );
     }
 
     #[tokio::test]
@@ -9624,18 +9613,20 @@ mod issue869 {
             "relay",
         )
         .expect("manager");
-        let (frame, _id) = eager_frame(b"unread", [0x33; 32]);
-        assert!(
-            authenticated_eager_claim(&frame).is_some(),
-            "the fixture itself is a validated eager frame"
+        let (frame, id) = eager_frame(b"unread", [0x33; 32]);
+        assert_eq!(
+            transport_id_from_admitted_frame(&frame),
+            Some(id),
+            "the fixture itself carries a header id"
         );
+        let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
         manager
             .handle_incoming(PeerId::new([7; 32]), None, frame)
             .await;
         assert_eq!(
-            manager.transport_claims.len(),
-            0,
-            "a Full relay with no local subscriber must not cache a transport id"
+            manager.admitted_transport_id_reads.load(Ordering::Relaxed),
+            reads_before,
+            "a Full relay with no local subscriber must not decode a transport id"
         );
     }
 }
