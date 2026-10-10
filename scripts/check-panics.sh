@@ -15,28 +15,22 @@ NC='\033[0m' # No Color
 
 FOUND_ISSUES=0
 
-# Lines that belong to a test-only item, keyed as "path:line".
+# Lines that belong to a proved test-only item, keyed as "path:line".
 # Populated once by load_test_regions.
 declare -A IN_TEST=()
 
-# A match is test-only when its byte offset sits in a #[cfg(test)],
-# #[cfg(all(..., test, ...))], #[test], or #[tokio::test] item, or after a
-# crate-level #![cfg(test)]. A nested #![cfg(test)] ends with its module.
-# The item ends when its brace body closes, or at ';' / ',' when it has no
-# body, including a literal or other expression that has no identifier.
-# A complete macro item ends at its token-tree boundary. A `!{...}` macro
-# in a signature is not the function body. A brace is an initializer block
-# only after `=` on a const or static item, so `if let` and `while let`
-# still end at the conditional body. A test header that never reaches a
-# body or a terminator is production: an unclassified span does not hide
-# a call. Strings stay open until the closing quote, block comments nest, and
-# '<' counts as a generic only in type position. A comparison does not.
-# A brace that begins a const-generic argument is not the item body, even
-# when whitespace or a comment separates it from the comma. Code after the
-# closing brace on the same line is still production. Line numbers follow
-# grep: the source is read with newlines preserved and split on LF only.
-# A comment before '<' does not hide the type that opens a generic. Cfg
-# commas inside comments, quotes, or raw strings are not predicate separators.
+# A span is test-only only when two things are proved: a test attribute and
+# that item's closing delimiter. Attributes are the exact forms in this tree:
+# #[cfg(test)], #![cfg(test)], #[cfg(all(test, unix))], #[test], #[tokio::test],
+# and #[tokio::test(...)]. A body item closes at the matching '}'. An item
+# with no body closes at ';' or ','. A crate-level #![cfg(test)] runs to EOF.
+# Anything else stays production. That includes a header whose extent is
+# uncertain because of '!' (never type, macro, signature macro) and any
+# attribute this list does not name. Strings and comments are skipped so a
+# brace inside them cannot extend a region. An unclosed string, comment, or
+# item is not committed. Line numbers follow grep: newlines are preserved and
+# split on LF only. Bytes after the closing delimiter on the same line stay
+# production.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
@@ -46,153 +40,79 @@ from __future__ import annotations
 import os
 import sys
 
-BLOCK_WORDS = {
-    "fn",
-    "struct",
-    "enum",
-    "impl",
-    "mod",
-    "trait",
-    "union",
-    "const",
-    "static",
-    "type",
-    "use",
-    "extern",
-    "macro_rules",
-    "async",
-    "unsafe",
-    "pub",
-}
-
-# A prefix `!` after these words is an operator. `make!{}` is a macro item.
-NON_MACRO_WORDS = {
-    "if",
-    "while",
-    "for",
-    "loop",
-    "match",
-    "return",
-    "let",
-    "else",
-    "break",
-    "continue",
-    "move",
-    "box",
-    "yield",
-    "await",
-    "in",
-    "as",
-    "where",
-    "mut",
-    "ref",
-}
+ITEM_ATTRS = (
+    "#[cfg(test)]",
+    "#[cfg(all(test, unix))]",
+    "#[test]",
+)
+FILE_ATTR = "#![cfg(test)]"
+TOKIO_ATTR = "#[tokio::test"
 
 
 def test_lines(text: str) -> dict[int, str]:
-    """Return 1-based lines to a test-span spec.
+    """Return 1-based lines to a proved test-span spec.
 
     ``*`` means the whole line is test-only. Otherwise the spec is a
-    comma-separated list of half-open byte ranges that are test-only.
+    comma-separated list of half-open byte ranges.
     """
-    # grep -n splits on LF only. str.splitlines() also breaks on U+2028,
-    # U+2029, and form feed, which would mark a later physical line as test.
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    regions: dict[int, str] = {}
+    line_bytes = [len(line.encode("utf-8")) for line in lines]
+    byte_ofs: list[list[int]] = []
+    for line in lines:
+        ofs = [0]
+        for ch in line:
+            ofs.append(ofs[-1] + len(ch.encode("utf-8")))
+        byte_ofs.append(ofs)
 
+    regions: dict[int, list[list[int]]] = {}
     depth = 0
     paren = 0
     bracket = 0
-    angle = 0
-    block_depth = 0
+    block = 0
+    in_string = False
     in_raw = False
     raw_hashes = 0
-    in_string = False
-    file_test = False
-    bracket_stack: list[dict[str, object]] = []
-    const_expr = 0
-    type_mode = False
-    # Previous non-trivia token. Whitespace, newlines, and comments do not
-    # clear it, so a const-generic `{` can sit on the next line.
-    prev_token = ""
-    last_word = ""
+    # (line, byte just after the brace) for each unmatched '{'.
+    opens: list[tuple[int, int]] = []
 
     active = False
+    body = False
     floor = 0
     paren_floor = 0
     bracket_floor = 0
-    phase = "header"  # header | body | after
-    mode = ""  # "" | block | expr
-    # True after `=` on a const or static item. Braces there are initializer
-    # blocks; the item ends at `;`. `if let` and `while let` are not initializers.
-    in_initializer = False
-    decl_kind = ""  # "" | const | static | fn
-    # A cfg(test) item whose body is the macro token tree (`make!{}`).
-    macro_item = False
-    macro_tree = ""  # "" | brace | paren | bracket
-    line_no = 0
-    # Set while an active header has no classified body yet. If it is still
-    # set at EOF, those lines were never classified and count as production.
-    uncertain_from = 0
+    origin: tuple[int, int] | None = None
+    file_test = False
 
-    def end_item() -> None:
-        nonlocal active, phase, mode, type_mode, in_initializer, decl_kind
-        nonlocal macro_item, macro_tree, uncertain_from
+    def add_span(line_no: int, start: int, end: int) -> None:
+        if end <= start:
+            return
+        regions.setdefault(line_no, []).append([start, end])
+
+    def commit(end_line: int, end_byte: int) -> None:
+        nonlocal active, body, origin
+        if origin is None:
+            active = False
+            body = False
+            return
+        start_line, start_byte = origin
+        if end_line <= start_line:
+            add_span(start_line, start_byte, end_byte)
+        else:
+            add_span(start_line, start_byte, line_bytes[start_line - 1])
+            for mid in range(start_line + 1, end_line):
+                add_span(mid, 0, line_bytes[mid - 1])
+            add_span(end_line, 0, end_byte)
         active = False
-        phase = "header"
-        mode = ""
-        type_mode = False
-        in_initializer = False
-        decl_kind = ""
-        macro_item = False
-        macro_tree = ""
-        uncertain_from = 0
+        body = False
+        origin = None
 
-    def in_value_expr() -> bool:
-        if const_expr > 0:
-            return True
-        if any(frame["expr"] for frame in bracket_stack):
-            return True
-        return not type_mode
-
-    def opens_generic(at: str, i: int) -> bool:
-        # '<=' is a comparison. Turbofish '::<' is always a generic.
-        # In a value expression, every other '<' is an operator. In type
-        # position, '<' after a path or delimiter starts type arguments.
-        # prev_token ignores whitespace, newlines, and comments, so
-        # `IntoIter /* note */ <u8, {1}>` still opens the generic.
-        if i + 1 < len(at) and at[i + 1] == "=":
-            return False
-        if prev_token == "::":
-            return True
-        if in_value_expr():
-            return False
-        if prev_token == "ident" or prev_token in {"<", ">", ",", "(", "[", "{"}:
-            return True
-        return False
-
-    def remember(token: str) -> None:
-        nonlocal prev_token, last_word
-        prev_token = token
-        if token != "ident":
-            last_word = ""
-
-    def start_item() -> None:
-        nonlocal active, floor, paren_floor, bracket_floor, phase, mode, in_initializer
-        nonlocal decl_kind, macro_item, macro_tree, uncertain_from
-        active = True
-        floor = depth
-        paren_floor = paren
-        bracket_floor = bracket
-        phase = "header"
-        mode = ""
-        in_initializer = False
-        decl_kind = ""
-        macro_item = False
-        macro_tree = ""
-        uncertain_from = line_no
+    def discard() -> None:
+        nonlocal active, body, origin
+        active = False
+        body = False
+        origin = None
 
     def at_item_level() -> bool:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
@@ -200,36 +120,10 @@ def test_lines(text: str) -> dict[int, str]:
     for idx, line in enumerate(lines):
         line_no = idx + 1
         if file_test:
-            regions[idx + 1] = "*"
+            add_span(line_no, 0, line_bytes[idx])
             continue
 
         n = len(line)
-        byte_of = [0]
-        for character in line:
-            byte_of.append(byte_of[-1] + len(character.encode("utf-8")))
-        spans: list[list[int]] = []
-        # Character index where the current test span opened, if any.
-        mark = [0 if (active and phase != "after") else None]
-
-        def stop_marking(at: int) -> None:
-            start_i = mark[0]
-            if start_i is None:
-                return
-            mark[0] = None
-            if at <= start_i:
-                return
-            start_b = byte_of[start_i]
-            end_b = byte_of[at]
-            if spans and start_b <= spans[-1][1]:
-                if end_b > spans[-1][1]:
-                    spans[-1][1] = end_b
-            else:
-                spans.append([start_b, end_b])
-
-        def ensure_marking(at: int) -> None:
-            if mark[0] is None:
-                mark[0] = at
-
         i = 0
         while i < n:
             ch = line[i]
@@ -238,51 +132,40 @@ def test_lines(text: str) -> dict[int, str]:
             if in_raw:
                 if ch == '"' and line[i + 1 : i + 1 + raw_hashes] == "#" * raw_hashes:
                     in_raw = False
-                    remember('"')
                     i += 1 + raw_hashes
-                    continue
-                i += 1
+                else:
+                    i += 1
                 continue
 
-            # A regular string stays open until its closing quote, including
-            # across a newline that is not escaped with a backslash.
             if in_string:
                 if ch == "\\":
-                    if i + 1 >= n:
-                        break
-                    i += 2
+                    i = n if i + 1 >= n else i + 2
                     continue
                 if ch == '"':
                     in_string = False
-                    remember('"')
                     i += 1
                     continue
                 i += 1
                 continue
 
-            # Rust block comments nest. The first */ does not end an outer comment.
-            if ch == "/" and nxt == "*":
-                block_depth += 1
-                i += 2
-                continue
-            if block_depth:
+            if block:
+                if ch == "/" and nxt == "*":
+                    block += 1
+                    i += 2
+                    continue
                 if ch == "*" and nxt == "/":
-                    block_depth -= 1
+                    block -= 1
                     i += 2
                     continue
                 i += 1
                 continue
 
             if ch == "/" and nxt == "/":
-                if active and phase == "after":
-                    stop_marking(i)
-                    end_item()
-                elif active:
-                    ensure_marking(i)
-                    stop_marking(n)
-                else:
-                    stop_marking(i)
                 break
+            if ch == "/" and nxt == "*":
+                block = 1
+                i += 2
+                continue
 
             if ch == '"':
                 hashes = _raw_hashes(line, i)
@@ -297,430 +180,176 @@ def test_lines(text: str) -> dict[int, str]:
 
             if ch == "'":
                 i = _skip_tick(line, i)
-                remember("'")
                 continue
 
-            if ch == "#":
-                kind = _attr_kind(line, i)
-                if active and phase == "after":
-                    stop_marking(i)
-                    end_item()
-                if kind == "file":
-                    # Crate-level inner attributes cover the rest of the file.
-                    # A nested #![cfg(test)] applies only to its enclosing item.
-                    if depth == 0:
-                        file_test = True
-                        mark[0] = 0
-                        i = n
-                        break
+            if line[:i].strip() == "":
+                kind, length = _attr_kind(line[i:])
+                if kind == "file" and depth == 0:
+                    file_test = True
+                    add_span(line_no, byte_ofs[idx][i], line_bytes[idx])
+                    break
+                if kind == "file" and depth > 0 and not active:
+                    active = True
+                    body = True
+                    floor = depth - 1
+                    paren_floor = paren
+                    bracket_floor = bracket
+                    origin = opens[-1] if opens else (line_no, byte_ofs[idx][i])
+                    i += length
+                    continue
+                if kind == "item":
+                    # A header that never reached ';' / ',' / '{' was not
+                    # proved. Drop it and let this attribute start clean.
+                    if active and not body:
+                        discard()
                     if not active:
-                        start_item()
-                        floor = depth - 1
-                        phase = "body"
-                        mode = "block"
-                        uncertain_from = 0
-                        ensure_marking(0)
-                    i += len("#![cfg(test)]")
-                    remember("]")
-                    continue
-                if kind in {"cfg", "test"} and not active:
-                    start_item()
-                    ensure_marking(i)
+                        active = True
+                        body = False
+                        floor = depth
+                        paren_floor = paren
+                        bracket_floor = bracket
+                        origin = (line_no, byte_ofs[idx][i])
+                        i += length
+                        continue
+
+            # '!' before the body is a macro or a never type. The closing
+            # delimiter is not proved, so the candidate stays production.
+            if (
+                active
+                and not body
+                and ch == "!"
+                and nxt != "="
+                and at_item_level()
+            ):
+                discard()
                 i += 1
-                continue
-
-            if active and phase == "after":
-                if ch.isspace():
-                    i += 1
-                    continue
-                if _word_at(line, i) == "else":
-                    phase = "header"
-                    mode = ""
-                    # The following body is not known yet. Until `{`, or if
-                    # the file ends here, this tail is unclassified.
-                    uncertain_from = line_no
-                    last_word = "else"
-                    remember("ident")
-                    ensure_marking(i)
-                    i += 4
-                    continue
-                stop_marking(i)
-                end_item()
-                continue
-
-            if ch == "-" and nxt == ">":
-                type_mode = True
-                remember(">")
-                i += 2
-                continue
-
-            if ch == ":":
-                if nxt == ":":
-                    remember("::")
-                    i += 2
-                    continue
-                type_mode = True
-                remember(":")
-                i += 1
-                continue
-
-            if ch == "=":
-                # Associated-type bindings (`Item = Vec<u8>`) stay in type
-                # position. An `=` outside angle brackets ends a type.
-                # `=>` and `==` are not const/static initializers.
-                if angle == 0:
-                    type_mode = False
-                    # Only a const or static declaration has an initializer.
-                    # `if let` and `while let` use `=` and then a real body.
-                    if (
-                        nxt not in "=>"
-                        and active
-                        and phase == "header"
-                        and at_item_level()
-                        and decl_kind in {"const", "static"}
-                    ):
-                        in_initializer = True
-                remember("=")
-                i += 2 if nxt in "=>" else 1
                 continue
 
             if ch == "{":
-                if const_expr > 0:
-                    const_expr += 1
-                    remember("{")
-                    if active and phase != "after":
-                        ensure_marking(i)
-                    i += 1
-                    continue
-                # `{` starts a const-generic argument only after `<` or `,`.
-                # Those tokens stay visible across whitespace, newlines, and
-                # comments. `if 1 < 2 { 1 }` is an expression block.
-                if (
-                    angle > 0
-                    and mode == "block"
-                    and phase == "header"
-                    and prev_token in {"<", ","}
-                ):
-                    const_expr = 1
-                    remember("{")
-                    if active:
-                        ensure_marking(i)
-                    i += 1
-                    continue
-                # `-> unit!{}` and `const X: T = {0} + {1}` are still the
-                # header. The function body is the following brace, and the
-                # const item runs through its semicolon. `make!{}` is the
-                # whole item: its token tree closes below. A prefix `!`
-                # (`if !flag {}`) is not a macro.
-                if (
-                    active
-                    and phase == "header"
-                    and at_item_level()
-                    and (
-                        in_initializer
-                        or (
-                            prev_token == "!"
-                            and (macro_item or mode == "block")
-                        )
-                    )
-                ):
-                    if macro_item and prev_token == "!":
-                        macro_tree = "brace"
-                    remember("{")
-                    ensure_marking(i)
-                    depth += 1
-                    i += 1
-                    continue
-                if active and phase == "header" and at_item_level():
-                    phase = "body"
-                    uncertain_from = 0
-                    ensure_marking(i)
-                remember("{")
-                type_mode = False
+                if active and not body and at_item_level():
+                    body = True
                 depth += 1
                 i += 1
+                opens.append((line_no, byte_ofs[idx][i]))
                 continue
-
             if ch == "}":
-                if const_expr > 0:
-                    const_expr -= 1
-                    remember("}")
-                    if active and phase != "after":
-                        ensure_marking(i)
-                    i += 1
-                    continue
-                if (
-                    macro_tree == "brace"
-                    and active
-                    and phase == "header"
-                    and depth == floor + 1
-                    and paren == paren_floor
-                    and bracket == bracket_floor
-                ):
-                    depth -= 1
-                    i += 1
-                    stop_marking(i)
-                    end_item()
-                    continue
-                if depth > 0:
-                    depth -= 1
+                # A header with no body of its own ends when its parent closes.
                 if (
                     active
-                    and phase == "body"
+                    and not body
                     and depth == floor
                     and paren == paren_floor
                     and bracket == bracket_floor
                 ):
-                    phase = "after"
+                    commit(line_no, byte_ofs[idx][i])
+                if depth > 0:
+                    depth -= 1
+                if opens:
+                    opens.pop()
+                if active and body and depth == floor and paren == paren_floor and bracket == bracket_floor:
                     i += 1
+                    commit(line_no, byte_ofs[idx][i])
                     continue
-                if (
-                    active
-                    and phase == "header"
-                    and depth < floor
-                    and paren == paren_floor
-                    and bracket == bracket_floor
-                ):
-                    stop_marking(i)
-                    end_item()
-                    continue
-                remember("}")
                 i += 1
                 continue
-
             if ch == "(":
-                if (
-                    macro_item
-                    and prev_token == "!"
-                    and active
-                    and phase == "header"
-                    and at_item_level()
-                ):
-                    macro_tree = "paren"
-                remember("(")
                 paren += 1
                 i += 1
                 continue
             if ch == ")":
-                if (
-                    macro_tree == "paren"
-                    and active
-                    and phase == "header"
-                    and paren == paren_floor + 1
-                    and depth == floor
-                    and bracket == bracket_floor
-                ):
-                    paren -= 1
-                    i += 1
-                    stop_marking(i)
-                    end_item()
-                    continue
-                if (
-                    active
-                    and phase == "header"
-                    and paren <= paren_floor
-                    and depth == floor
-                    and bracket == bracket_floor
-                ):
-                    stop_marking(i)
-                    end_item()
-                    continue
-                remember(")")
                 if paren > 0:
                     paren -= 1
                 i += 1
                 continue
             if ch == "[":
-                if (
-                    macro_item
-                    and prev_token == "!"
-                    and active
-                    and phase == "header"
-                    and at_item_level()
-                ):
-                    macro_tree = "bracket"
-                remember("[")
-                bracket_stack.append({"expr": False, "depth": depth, "paren": paren})
                 bracket += 1
                 i += 1
                 continue
             if ch == "]":
-                if (
-                    macro_tree == "bracket"
-                    and active
-                    and phase == "header"
-                    and bracket == bracket_floor + 1
-                    and depth == floor
-                    and paren == paren_floor
-                ):
-                    if bracket_stack:
-                        bracket_stack.pop()
-                    bracket -= 1
-                    i += 1
-                    stop_marking(i)
-                    end_item()
-                    continue
-                if (
-                    active
-                    and phase == "header"
-                    and bracket <= bracket_floor
-                    and depth == floor
-                    and paren == paren_floor
-                ):
-                    stop_marking(i)
-                    end_item()
-                    continue
-                remember("]")
-                if bracket_stack:
-                    bracket_stack.pop()
                 if bracket > 0:
                     bracket -= 1
                 i += 1
                 continue
-            if ch == "<":
-                if opens_generic(line, i):
-                    angle += 1
-                elif nxt == "=":
-                    remember("=")
-                    i += 2
-                    continue
-                remember("<")
+            if ch == ";" and active and not body and at_item_level():
                 i += 1
+                commit(line_no, byte_ofs[idx][i])
                 continue
-            if ch == ">":
-                if nxt == "=":
-                    remember("=")
-                    i += 2
-                    continue
-                if angle > 0:
-                    angle -= 1
-                remember(">")
+            # Variant, field, parameter, or match arm. A comma before the
+            # body also ends the header; the bytes after it stay production.
+            if ch == "," and active and not body and at_item_level():
                 i += 1
+                commit(line_no, byte_ofs[idx][i])
                 continue
-
-            if ch == ";":
-                remember(";")
-                if (
-                    bracket_stack
-                    and const_expr == 0
-                    and depth == bracket_stack[-1]["depth"]
-                    and paren == bracket_stack[-1]["paren"]
-                ):
-                    bracket_stack[-1]["expr"] = True
-                elif angle == 0 and const_expr == 0:
-                    type_mode = False
-                if active and phase == "header" and at_item_level() and const_expr == 0:
-                    i += 1
-                    stop_marking(i)
-                    end_item()
-                    continue
-                i += 1
-                continue
-
-            if (
-                ch == ","
-                and active
-                and phase == "header"
-                and mode != "block"
-                and angle == 0
-                and at_item_level()
-            ):
-                remember(",")
-                i += 1
-                stop_marking(i)
-                end_item()
-                continue
-
-            if ch.isalpha() or ch == "_":
-                word = _word_at(line, i)
-                if (
-                    active
-                    and phase == "header"
-                    and mode == ""
-                    and at_item_level()
-                    and angle == 0
-                ):
-                    mode = "block" if word in BLOCK_WORDS else "expr"
-                if (
-                    active
-                    and phase == "header"
-                    and at_item_level()
-                    and angle == 0
-                    and const_expr == 0
-                ):
-                    # `const fn` is a function. Its `{` is the body, not an
-                    # initializer. A bare `const` or `static` is a declaration.
-                    if word == "fn":
-                        decl_kind = "fn"
-                    elif word in {"const", "static"} and decl_kind != "fn":
-                        decl_kind = word
-                if word in {
-                    "fn",
-                    "struct",
-                    "enum",
-                    "impl",
-                    "trait",
-                    "type",
-                    "const",
-                    "static",
-                    "union",
-                    "as",
-                }:
-                    type_mode = True
-                elif word == "for":
-                    j = i + len(word)
-                    while j < n and line[j].isspace():
-                        j += 1
-                    # `for<'a>` is a type binder. `for x in` is a loop.
-                    type_mode = j < n and line[j] == "<"
-                elif word in {"if", "while", "loop", "match", "return", "let"}:
-                    type_mode = False
-                last_word = word
-                remember("ident")
-                if active and phase != "after":
-                    ensure_marking(i)
-                i += len(word)
-                continue
-
-            if ch == "!" and nxt != "=":
-                # `make!{}` is the whole item. `if !flag` and `!=` are not.
-                if (
-                    active
-                    and phase == "header"
-                    and mode == "expr"
-                    and at_item_level()
-                    and angle == 0
-                    and const_expr == 0
-                    and prev_token == "ident"
-                    and last_word not in NON_MACRO_WORDS
-                ):
-                    macro_item = True
-                remember("!")
-                if active and phase != "after":
-                    ensure_marking(i)
-                i += 1
-                continue
-
-            if ch.isspace():
-                i += 1
-                continue
-            if active and phase != "after":
-                ensure_marking(i)
-            remember(ch)
             i += 1
 
-        stop_marking(n)
-        spec = _span_spec(spans, byte_of[n])
+    if active and (in_string or in_raw or block or not body):
+        discard()
+    elif active:
+        # Body never closed. Do not commit an open region.
+        discard()
+
+    specs: dict[int, str] = {}
+    for number, spans in regions.items():
+        spec = _span_spec(spans, line_bytes[number - 1])
         if spec:
-            regions[idx + 1] = spec
+            specs[number] = spec
+    return specs
 
-    # A header that never reached a body or `;` / `,` was not classified.
-    # Drop its marks so a call there fails the scan.
-    if active and phase == "header" and uncertain_from and not file_test:
-        for number in range(uncertain_from, len(lines) + 1):
-            regions.pop(number, None)
 
-    return regions
+def _attr_kind(rest: str) -> tuple[str, int]:
+    if rest.startswith(FILE_ATTR):
+        return ("file", len(FILE_ATTR))
+    for attr in ITEM_ATTRS:
+        if rest.startswith(attr):
+            return ("item", len(attr))
+    length = _tokio_attr_len(rest)
+    if length:
+        return ("item", length)
+    return ("", 0)
+
+
+def _tokio_attr_len(rest: str) -> int:
+    """Length of a finished ``#[tokio::test]`` or ``#[tokio::test(...)]``.
+
+    The argument list is part of the attribute. An unclosed list is not an
+    identified attribute, so the following item stays production.
+    """
+    if not rest.startswith(TOKIO_ATTR):
+        return 0
+    if rest.startswith(TOKIO_ATTR + "]"):
+        return len(TOKIO_ATTR) + 1
+    if not rest.startswith(TOKIO_ATTR + "("):
+        return 0
+    depth = 0
+    in_string = False
+    i = len(TOKIO_ATTR)
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if in_string:
+            if ch == "\\":
+                i += 2 if i + 1 < n else 1
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return 0
+            depth -= 1
+            if depth == 0:
+                if i + 1 < n and rest[i + 1] == "]":
+                    return i + 2
+                return 0
+        i += 1
+    return 0
 
 
 def _span_spec(spans: list[list[int]], nbytes: int) -> str:
@@ -738,151 +367,6 @@ def _span_spec(spans: list[list[int]], nbytes: int) -> str:
     if len(merged) == 1 and merged[0][0] == 0 and merged[0][1] >= nbytes > 0:
         return "*"
     return ",".join(f"{start}-{end}" for start, end in merged)
-
-def _word_at(line: str, i: int) -> str:
-    j = i + 1
-    while j < len(line) and (line[j].isalnum() or line[j] == "_"):
-        j += 1
-    return line[i:j]
-
-
-def _attr_kind(line: str, i: int) -> str:
-    if line[:i].strip() != "":
-        return ""
-    rest = line[i:]
-    if rest.startswith("#![cfg(test)]"):
-        return "file"
-    if rest.startswith("#[cfg(test)]"):
-        return "cfg"
-    if rest.startswith("#[test]") or rest.startswith("#[test("):
-        return "test"
-    if rest.startswith("#[tokio::test]") or rest.startswith("#[tokio::test("):
-        return "test"
-    if _cfg_all_requires_test(rest):
-        return "cfg"
-    return ""
-
-
-def _cfg_all_requires_test(rest: str) -> bool:
-    """True when every build of this attribute requires cfg(test).
-
-    Comments are trivia. Ordinary strings and raw strings are one literal,
-    so a comma inside them is not a predicate separator. An attribute this
-    cannot lex is scanned rather than treated as test-only.
-    """
-    prefix = "#[cfg(all("
-    if not rest.startswith(prefix):
-        return False
-    n = len(rest)
-    i = len(prefix)
-    depth = 1
-    atoms: list[str] = []
-    current: list[str] = []
-    while i < n and depth > 0:
-        nxt = _cfg_skip_trivia(rest, i)
-        if nxt is None:
-            return False
-        i = nxt
-        if i >= n:
-            break
-        raw_end = _cfg_raw_string_end(rest, i)
-        if raw_end is not None:
-            if raw_end < 0:
-                return False
-            current.append(rest[i:raw_end])
-            i = raw_end
-            continue
-        ch = rest[i]
-        if ch in "\"'":
-            end = _cfg_quoted_end(rest, i)
-            if end < 0:
-                return False
-            current.append(rest[i:end])
-            i = end
-            continue
-        if ch == "(":
-            depth += 1
-            current.append(ch)
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                atoms.append("".join(current).strip())
-                return "test" in atoms
-            current.append(ch)
-        elif ch == "," and depth == 1:
-            atoms.append("".join(current).strip())
-            current = []
-        else:
-            current.append(ch)
-        i += 1
-    return False
-
-
-def _cfg_skip_trivia(rest: str, i: int) -> int | None:
-    n = len(rest)
-    while i < n:
-        if rest[i].isspace():
-            i += 1
-            continue
-        if rest.startswith("//", i):
-            return None
-        if rest.startswith("/*", i):
-            comment = 1
-            i += 2
-            while i < n and comment:
-                if rest.startswith("/*", i):
-                    comment += 1
-                    i += 2
-                elif rest.startswith("*/", i):
-                    comment -= 1
-                    i += 2
-                else:
-                    i += 1
-            if comment:
-                return None
-            continue
-        return i
-    return i
-
-
-def _cfg_raw_string_end(rest: str, i: int) -> int | None:
-    """Index after a raw string at i, -1 if unclosed, None if not one."""
-    if i > 0 and (rest[i - 1].isalnum() or rest[i - 1] == "_"):
-        return None
-    j = i
-    prefixes = 0
-    while prefixes < 2 and j < len(rest) and rest[j] in "bc":
-        j += 1
-        prefixes += 1
-    if j >= len(rest) or rest[j] != "r":
-        return None
-    j += 1
-    hashes = 0
-    while j < len(rest) and rest[j] == "#":
-        hashes += 1
-        j += 1
-    if j >= len(rest) or rest[j] != '"':
-        return None
-    j += 1
-    closer = '"' + ("#" * hashes)
-    end = rest.find(closer, j)
-    if end < 0:
-        return -1
-    return end + len(closer)
-
-
-def _cfg_quoted_end(rest: str, i: int) -> int:
-    quote = rest[i]
-    j = i + 1
-    n = len(rest)
-    while j < n:
-        if rest[j] == "\\":
-            j += 2
-            continue
-        if rest[j] == quote:
-            return j + 1
-        j += 1
-    return -1
 
 
 def _raw_hashes(line: str, quote: int) -> int:
@@ -934,8 +418,6 @@ def _emit(root, out):
                 continue
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, ".").replace(os.sep, "/")
-            # newline="" keeps a bare CR inside a comment or string. The
-            # default translator would turn it into LF and shift later lines.
             with open(path, encoding="utf-8", errors="replace", newline="") as handle:
                 text = handle.read()
             for number, spec in test_lines(text).items():
@@ -1017,7 +499,7 @@ scan_pattern() {
         local line_num="${rest%%:*}"
         local content="${rest#*:}"
 
-        # Skip only when the matched bytes themselves sit in a test item.
+        # Skip only when the matched bytes themselves sit in a proved test item.
         if is_in_test_code "$file" "$line_num" "$content" "$pattern"; then
             continue
         fi
