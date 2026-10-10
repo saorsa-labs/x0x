@@ -428,6 +428,98 @@ class PanicScanner(unittest.TestCase):
                 result = self.scan("src/cfg_all_quoted.rs", source)
                 self._assert_rejected(result, kind)
 
+    def test_cfg_comment_and_raw_string_are_not_test_predicates(self):
+        # A comment or raw string can contain the letters `test` without
+        # being a predicate. Treating either as code exempts production.
+        attrs = (
+            "#[cfg(all(/* ,test, */ unix))]",
+            '#[cfg(all(custom = r#"a",test,"b"#))]',
+        )
+        for kind in ("expect", "unwrap", "panic"):
+            for attr in attrs:
+                with self.subTest(kind=kind, attr=attr):
+                    visible = self._call(kind, "visible")
+                    source = f"{attr}\nfn prod() {{ {visible}; }}\n"
+                    result = self.scan("src/cfg_trivia.rs", source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(visible, result.stdout)
+
+    def test_cfg_real_test_predicate_with_comment_or_raw_string_is_kept(self):
+        attrs = (
+            "#[cfg(all(test, /* note */ unix))]",
+            '#[cfg(all(test, custom = r#"a,b"#))]',
+        )
+        for kind in ("expect", "unwrap", "panic"):
+            for attr in attrs:
+                with self.subTest(kind=kind, attr=attr):
+                    hidden = self._call(kind, "hidden")
+                    visible = self._call(kind, "visible")
+                    source = (
+                        f"{attr}\n"
+                        "mod tests {\n"
+                        f"    fn t() {{ {hidden}; }}\n"
+                        "}\n"
+                        f"fn prod() {{ {visible}; }}\n"
+                    )
+                    result = self.scan("src/cfg_real_test.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_unicode_line_separator_does_not_hide_following_production_call(self):
+        # grep counts LF only. U+2028 and form feed must not insert a line.
+        for kind in ("expect", "unwrap", "panic"):
+            for separator in ("\u2028", "\f"):
+                with self.subTest(kind=kind, separator=repr(separator)):
+                    hidden = self._call(kind, "hidden")
+                    visible = self._call(kind, "visible")
+                    source = (
+                        f'const S: &str = "a{separator}b";\n'
+                        "#[cfg(test)]\n"
+                        f"fn helper() {{ {hidden}; }}\n"
+                        f"fn prod() {{ {visible}; }}\n"
+                    )
+                    result = self.scan("src/line_sep.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_const_generic_brace_after_newline_or_comment_hides_test_call(self):
+        signatures = (
+            "fn helper() -> std::array::IntoIter<u8,\n{1}> {\n",
+            "fn helper() -> std::array::IntoIter<u8, /* size */ {1}> {\n",
+        )
+        for kind in ("expect", "unwrap", "panic"):
+            for signature in signatures:
+                with self.subTest(kind=kind, signature=signature):
+                    hidden = self._call(kind, "hidden")
+                    source = (
+                        "#[cfg(test)]\n"
+                        f"{signature}"
+                        f"    {hidden};\n"
+                        "}\n"
+                        "fn prod() {}\n"
+                    )
+                    result = self.scan("src/generic_break.rs", source)
+                    self.assert_clean(result)
+                    self.assertNotIn("hidden", result.stdout)
+
+    def test_const_generic_brace_after_newline_or_comment_does_not_hide_production(self):
+        signatures = (
+            "fn helper() -> std::array::IntoIter<u8,\n{1}> {\n",
+            "fn helper() -> std::array::IntoIter<u8, /* size */ {1}> {\n",
+        )
+        for kind in ("expect", "unwrap", "panic"):
+            for signature in signatures:
+                with self.subTest(kind=kind, signature=signature):
+                    hidden = self._call(kind, "hidden")
+                    visible = self._call(kind, "visible")
+                    source = (
+                        "#[cfg(test)]\n"
+                        f"{signature}"
+                        f"    {hidden};\n"
+                        "}\n"
+                        f"fn prod() {{ {visible}; }}\n"
+                    )
+                    result = self.scan("src/generic_break_prod.rs", source)
+                    self._assert_rejected(result, kind)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
