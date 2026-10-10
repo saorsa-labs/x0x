@@ -829,4 +829,133 @@ mod tests {
             drop(blocker);
         });
     }
+
+    /// `Agent::try_shutdown` must not report success while a history write
+    /// is still held. A second call, after the service has been taken, must
+    /// fail the same way. No sockets and no daemon.
+    #[tokio::test]
+    async fn issue1288_try_shutdown_errors_while_history_write_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = crate::Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_history(crate::history::HistoryConfig {
+                enabled: true,
+                db_path: Some(dir.path().join("history.db")),
+                ..crate::history::HistoryConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let history = agent.history().expect("history handle").clone();
+        let hold = arm_query_lock_park(history.store());
+        let release = Release(Arc::clone(&hold));
+        let query_store = Arc::clone(history.store());
+        let query = std::thread::spawn(move || {
+            prepare_query_lock_park();
+            let _ = query_store.query(&HistoryQuery {
+                limit: 1,
+                ..HistoryQuery::default()
+            });
+        });
+        let park_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.parked() < 1 {
+            assert!(
+                Instant::now() < park_deadline,
+                "the read did not park inside the connection lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let counters = history.counters();
+        let entered = hold.writer_entered();
+        history.record(waiting_record());
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while hold.writer_entered() <= entered {
+            assert!(
+                Instant::now() < wait_deadline,
+                "the writer did not reach the connection lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let written = counters.written_total.load(Ordering::Relaxed);
+
+        let started = Instant::now();
+        let first = tokio::time::timeout(
+            SHUTDOWN_DRAIN_GRACE + Duration::from_secs(3),
+            agent.try_shutdown(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let first = first.expect("try_shutdown did not return while the write was held");
+        let message = first
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(
+            first.is_err(),
+            "an unfinished history writer must not be a successful shutdown: {first:?}"
+        );
+        assert!(
+            message.contains("history writer"),
+            "the incomplete writer must be the shutdown error, got {message}"
+        );
+        assert!(
+            elapsed + Duration::from_secs(1) >= SHUTDOWN_DRAIN_GRACE,
+            "shutdown returned before the writer grace ({elapsed:?})"
+        );
+        assert!(
+            elapsed < SHUTDOWN_DRAIN_GRACE + Duration::from_secs(2),
+            "shutdown exceeded the writer grace ({elapsed:?})"
+        );
+        assert!(
+            history.writer_shutdown_incomplete(),
+            "the unfinished writer must stay visible after shutdown returns"
+        );
+        assert_eq!(
+            counters.written_total.load(Ordering::Relaxed),
+            written,
+            "the admitted write must still be waiting"
+        );
+        assert!(
+            hold.parked() >= 1 && !hold.is_released(),
+            "the read must still be held"
+        );
+
+        let again_at = Instant::now();
+        let again = agent.try_shutdown().await;
+        let again_message = again
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(
+            again.is_err(),
+            "a repeated shutdown must not report success while the write is held: {again:?}"
+        );
+        assert!(
+            again_message.contains("history writer"),
+            "the repeated shutdown must still name the writer, got {again_message}"
+        );
+        assert!(
+            again_at.elapsed() < Duration::from_secs(2),
+            "a repeated shutdown waited another grace ({:?})",
+            again_at.elapsed()
+        );
+
+        drop(release);
+        let cleanup = Instant::now() + Duration::from_secs(2);
+        while !query.is_finished()
+            || reap_finished_writer_threads() > 0
+            || counters.written_total.load(Ordering::Relaxed) <= written
+        {
+            assert!(
+                Instant::now() < cleanup,
+                "the admitted write did not finish after the read released the lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = query.join();
+    }
 }

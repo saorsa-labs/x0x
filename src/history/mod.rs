@@ -548,32 +548,37 @@ impl HistoryService {
     /// runs to completion holding the connection — blocking code cannot be
     /// cancelled — which is bounded by one retention pass and covered by the
     /// restart-side retry in `tests/f2_public_group_bootstrap_wiring.rs`.
-    pub async fn shutdown(mut self) {
+    ///
+    /// `false` means the writer was still in SQLite when the grace ended.
+    /// The thread stays in custody. Callers must not report success.
+    pub async fn shutdown(mut self) -> bool {
         self.reaper.abort();
         // Awaits the cancelled task's reaping: returns promptly with a
         // cancelled JoinError once the runtime drops the aborted future.
         let _ = self.reaper.await;
-        if let Some(writer) = self.writer.take() {
-            // The grace covers submission and queueing, not only the time
-            // after a blocking worker starts. Tokio queues `spawn_blocking`
-            // once `max_blocking_threads` is reached, so awaiting the job
-            // with no outer deadline waits for that queue with no bound.
-            // On expiry the handle is dropped, not awaited: a later pool
-            // cleanup must not wait out a second grace. The closure still
-            // owns the writer until it runs; `shutdown_until` then retains
-            // the thread immediately because this same deadline has passed.
-            let budget = writer::SHUTDOWN_DRAIN_GRACE;
-            let deadline = std::time::Instant::now() + budget;
-            let join = tokio::task::spawn_blocking(move || writer.shutdown_until(deadline));
-            // `SHUTDOWN_SUBMIT_SLACK` only covers the last sleep inside a
-            // worker that already started. A job still queued at `deadline`
-            // is not awaited: dropping `join` detaches it, and that later
-            // run retains immediately because `deadline` has passed.
-            if tokio::time::timeout(budget + writer::SHUTDOWN_SUBMIT_SLACK, join)
-                .await
-                .is_err()
-            {
+        let Some(writer) = self.writer.take() else {
+            return true;
+        };
+        // The grace covers submission and queueing, not only the time
+        // after a blocking worker starts. Tokio queues `spawn_blocking`
+        // once `max_blocking_threads` is reached, so awaiting the job
+        // with no outer deadline waits for that queue with no bound.
+        // On expiry the handle is dropped, not awaited: a later pool
+        // cleanup must not wait out a second grace. The closure still
+        // owns the writer until it runs; `shutdown_until` then retains
+        // the thread immediately because this same deadline has passed.
+        let budget = writer::SHUTDOWN_DRAIN_GRACE;
+        let deadline = std::time::Instant::now() + budget;
+        let join = tokio::task::spawn_blocking(move || writer.shutdown_until(deadline));
+        // `SHUTDOWN_SUBMIT_SLACK` only covers the last sleep inside a
+        // worker that already started. A job still queued at `deadline`
+        // is not awaited: dropping `join` detaches it, and that later
+        // run retains immediately because `deadline` has passed.
+        match tokio::time::timeout(budget + writer::SHUTDOWN_SUBMIT_SLACK, join).await {
+            Ok(Ok(completed)) => completed,
+            Ok(Err(_)) | Err(_) => {
                 self.handle.mark_writer_shutdown_incomplete();
+                false
             }
         }
     }

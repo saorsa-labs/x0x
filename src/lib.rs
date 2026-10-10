@@ -7165,16 +7165,21 @@ impl Agent {
         self.stop_discovery_cache_reaper().await;
 
         // 2b. Drain and stop the ADR-0023 history writer (bounded grace,
-        // then abandon-with-count — never abort mid-batch).
-        {
+        // then abandon-with-count — never abort mid-batch). A writer still
+        // in SQLite is an incomplete shutdown. A later call has already
+        // taken the service, so it reads the same flag and still fails.
+        let history_writer_unfinished = {
             let service = {
                 let mut guard = self.history_service.lock().await;
                 guard.take()
             };
             if let Some(service) = service {
-                service.shutdown().await;
+                !service.shutdown().await
+            } else {
+                self.history()
+                    .is_some_and(history::HistoryHandle::writer_shutdown_incomplete)
             }
-        }
+        };
 
         // 3. Stop the DM inbox and the capability advert service (current gaps:
         //    neither was stopped by shutdown() before). Both abort their own
@@ -7299,6 +7304,10 @@ impl Agent {
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
         let mut shutdown_errors = Vec::new();
+        if history_writer_unfinished {
+            shutdown_errors
+                .push("history writer still owns the store after the shutdown grace".to_string());
+        }
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
