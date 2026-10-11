@@ -28,8 +28,14 @@ dial answered mid-handshake cannot produce an `Admitted` verdict.
 The HyParView JOIN seeds of `join_network` are such a consumer (#1321,
 `src/gossip/join_seeds.rs`). A dial that returned `Ok` is transport truth: the
 plane hello that can refuse the peer arrives after it. So the seeds are only the
-dialled peers that `peer_admission` reports `Admitted`, after a bounded wait for
-open plane verdicts.
+dialled peers that `peer_admission` reports `Admitted`. The join's phase counts
+use the same predicate: a refused or disconnected peer does not count toward its
+minimum. The join waits (bounded) for open plane verdicts and compares the
+settled admitted count with that minimum; if peers that filled the minimum are
+refused later, it runs the phases it skipped. A candidate that lost its
+connection without a tombstone stays a possible seed: with no admitted seed, the
+join waits (bounded by the proactive reconnect schedule) for the reconnect and
+reads its verdict again.
 
 **Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
 `tests/cross_plane_join_seeds.rs` (JOIN seeds)

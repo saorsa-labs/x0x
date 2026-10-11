@@ -11,13 +11,18 @@ All notable changes to this project will be documented in this file.
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
   refused it a moment later, and it still became a seed. The JOIN then
   dialled it up to ten times (about 81 s) and the #292 gate refused every
-  dial, so presence beacons, the first identity announcement and the
-  capability advert started that much later. JOIN seeds are now only the
-  dialled peers that `peer_admission` (#292 invariant A) admits, after a
-  bounded wait (at most 12 s) for open plane verdicts. A suppressed peer also
-  no longer counts toward the join's minimum of three connected peers. The
-  defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4 rollout
-  too.
+  dial, so the presence beacons and the first identity announcement started
+  that much later. (In `x0xd` the capability advert service also starts from
+  the DM inbox path, so it did not wait for the JOIN.) JOIN seeds are now
+  only the dialled peers that `peer_admission` (#292 invariant A) admits.
+  The phase counts for the join's minimum of three peers include only peers
+  that are still connected and not suppressed. When peers that filled that
+  minimum with an open plane verdict are refused later, the join still runs
+  the cached-peer and bootstrap phases it skipped. When no seed is admitted
+  but a candidate lost its connection without a tombstone, the join waits
+  (at most about 49 s, the proactive reconnect schedule) for the reconnect
+  and then sends the JOIN. The defect is older than v0.47.0: saorsa-6
+  showed it at the v0.46.4 rollout too.
 
 ## [v0.47.1] - 2026-10-12
 

@@ -12765,79 +12765,22 @@ impl Agent {
         }
 
         // Phase 1: Try cached peers first using the real ant-quic peer IDs.
-        all_connected.prune_suppressed(network);
-        if all_connected.len() < min_connected {
-            if let Some(ref cache) = self.bootstrap_cache {
-                const PHASE1_PEER_CANDIDATES: usize = 12;
-                let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-                if !cached_peers.is_empty() {
-                    tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
-                    let (succeeded, _failed) = self
-                        .connect_cached_peers_parallel_tracked(network, &cached_peers)
-                        .await;
-                    all_connected.extend(succeeded.iter().copied());
-                    tracing::info!(
-                        "Phase 1: {}/{} cached peers connected",
-                        succeeded.len(),
-                        cached_peers.len()
-                    );
-                }
-            }
-        } // end Phase 1 min_connected check
+        // x0x#1321: the phase counts re-read admission, so a peer that is
+        // already refused or disconnected does not fill min_connected.
+        let mut ran_phase1 = false;
+        if all_connected.usable(network).await < min_connected {
+            ran_phase1 = true;
+            self.join_phase1_cached_peers(network, &mut all_connected)
+                .await;
+        }
 
         // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
         // This is the fallback for when coordinator cache and cached peers aren't enough.
-        all_connected.prune_suppressed(network);
-        if all_connected.len() < min_connected && !bootstrap_nodes.is_empty() {
-            let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
-                .iter()
-                .filter(|addr| !all_connected.contains_addr(addr))
-                .copied()
-                .collect();
-
-            // Round 1: Connect to all bootstrap peers in parallel
-            let (succeeded, mut failed) = self
-                .connect_peers_parallel_tracked(network, &remaining)
+        let mut ran_phase2 = false;
+        if !bootstrap_nodes.is_empty() && all_connected.usable(network).await < min_connected {
+            ran_phase2 = true;
+            self.join_phase2_bootstrap(network, &bootstrap_nodes, &mut all_connected)
                 .await;
-            all_connected.extend(succeeded.iter().copied());
-            tracing::info!(
-                "Phase 2 round 1: {}/{} bootstrap peers connected",
-                succeeded.len(),
-                remaining.len()
-            );
-
-            // Retry rounds for failed peers
-            for round in 2..=3 {
-                if failed.is_empty() {
-                    break;
-                }
-                let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
-                tracing::info!(
-                    "Retrying {} failed peers in {}s (round {})",
-                    failed.len(),
-                    delay.as_secs(),
-                    round
-                );
-                tokio::time::sleep(delay).await;
-
-                let (succeeded, still_failed) =
-                    self.connect_peers_parallel_tracked(network, &failed).await;
-                all_connected.extend(succeeded.iter().copied());
-                failed = still_failed;
-                tracing::info!(
-                    "Phase 2 round {}: {} total peers connected",
-                    round,
-                    all_connected.len()
-                );
-            }
-
-            if !failed.is_empty() {
-                tracing::warn!(
-                    "Could not connect to {} bootstrap peers: {:?}",
-                    failed.len(),
-                    failed
-                );
-            }
         }
 
         tracing::info!(
@@ -12845,17 +12788,58 @@ impl Agent {
             all_connected.len()
         );
 
+        // x0x#1321: the counts above include peers whose plane verdict was
+        // still open. Settle those verdicts. If the settled admitted set is
+        // below min_connected, run each phase that an open verdict made the
+        // join skip. Each phase runs at most once per join.
+        let goal = gossip::join_seeds::SettleGoal::Admitted(min_connected);
+        let mut plan = all_connected
+            .settle(network, goal, &self.shutdown_token)
+            .await;
+        if plan.admitted_peers < min_connected && !ran_phase1 {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers after Phase 0; trying cached peers (issue #1321)"
+            );
+            self.join_phase1_cached_peers(network, &mut all_connected)
+                .await;
+            plan = all_connected
+                .settle(network, goal, &self.shutdown_token)
+                .await;
+        }
+        if plan.admitted_peers < min_connected && !ran_phase2 && !bootstrap_nodes.is_empty() {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers; trying bootstrap nodes (issue #1321)"
+            );
+            self.join_phase2_bootstrap(network, &bootstrap_nodes, &mut all_connected)
+                .await;
+            plan = all_connected
+                .settle(network, goal, &self.shutdown_token)
+                .await;
+        }
+
         // Join the HyParView membership overlay via gossip-admitted peers
         // only (x0x#1321): a seed the plane gate refused or #292 suppressed
         // can only make the JOIN retry it.
         if let Some(ref runtime) = self.gossip_runtime {
-            let seeds: Vec<String> = all_connected
-                .settle_join_seeds(network)
-                .await
-                .seeds
-                .iter()
-                .map(|addr| addr.to_string())
-                .collect();
+            if plan.seeds.is_empty() {
+                // No admitted seed. A candidate that lost its connection
+                // without a tombstone, or whose verdict is still open, can
+                // still become admitted (the proactive reconnect redials a
+                // lost peer). Wait for that, bounded, before the JOIN.
+                plan = all_connected
+                    .settle(
+                        network,
+                        gossip::join_seeds::SettleGoal::Recover,
+                        &self.shutdown_token,
+                    )
+                    .await;
+            }
+            all_connected.log_plan(&plan);
+            let seeds: Vec<String> = plan.seeds.iter().map(|addr| addr.to_string()).collect();
             if !seeds.is_empty() {
                 if let Err(e) = runtime.membership().join(seeds).await {
                     tracing::warn!("HyParView membership join failed: {e}");
@@ -13316,6 +13300,93 @@ impl Agent {
     #[must_use]
     pub fn current_dm_capabilities(&self) -> dm::DmCapabilities {
         self.dm_capabilities_tx.borrow().clone()
+    }
+
+    /// `join_network` Phase 1: dial up to 12 cached peers by peer id and
+    /// record the dials that returned `Ok`.
+    async fn join_phase1_cached_peers(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+    ) {
+        let Some(ref cache) = self.bootstrap_cache else {
+            return;
+        };
+        const PHASE1_PEER_CANDIDATES: usize = 12;
+        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        if cached_peers.is_empty() {
+            return;
+        }
+        tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
+        let (succeeded, _failed) = self
+            .connect_cached_peers_parallel_tracked(network, &cached_peers)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 1: {}/{} cached peers connected",
+            succeeded.len(),
+            cached_peers.len()
+        );
+    }
+
+    /// `join_network` Phase 2: dial the configured bootstrap nodes that this
+    /// join has not dialled yet, with two retry rounds for failed dials, and
+    /// record the dials that returned `Ok`.
+    async fn join_phase2_bootstrap(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        bootstrap_nodes: &[std::net::SocketAddr],
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+    ) {
+        let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
+            .iter()
+            .filter(|addr| !candidates.contains_addr(addr))
+            .copied()
+            .collect();
+
+        // Round 1: Connect to all bootstrap peers in parallel
+        let (succeeded, mut failed) = self
+            .connect_peers_parallel_tracked(network, &remaining)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 2 round 1: {}/{} bootstrap peers connected",
+            succeeded.len(),
+            remaining.len()
+        );
+
+        // Retry rounds for failed peers
+        for round in 2..=3 {
+            if failed.is_empty() {
+                break;
+            }
+            let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
+            tracing::info!(
+                "Retrying {} failed peers in {}s (round {})",
+                failed.len(),
+                delay.as_secs(),
+                round
+            );
+            tokio::time::sleep(delay).await;
+
+            let (succeeded, still_failed) =
+                self.connect_peers_parallel_tracked(network, &failed).await;
+            candidates.extend(succeeded.iter().copied());
+            failed = still_failed;
+            tracing::info!(
+                "Phase 2 round {}: {} total peers connected",
+                round,
+                candidates.len()
+            );
+        }
+
+        if !failed.is_empty() {
+            tracing::warn!(
+                "Could not connect to {} bootstrap peers: {:?}",
+                failed.len(),
+                failed
+            );
+        }
     }
 
     /// Connect to cached peers in parallel, returning (succeeded, failed).
