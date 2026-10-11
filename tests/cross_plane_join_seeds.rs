@@ -34,8 +34,12 @@ use x0x::network::{NetworkConfig, NetworkEvent, PeerAdmission};
 use x0x::Agent;
 
 /// Upper bound for one `join_network` call. Phase 1 gives each cached dial
-/// up to 15 s; the rest of the join on loopback takes well under that.
-const JOIN_BOUND: Duration = Duration::from_secs(60);
+/// up to 15 s. Sometimes the cross-plane peer refuses us first: it closes
+/// each of our connections at accept, before its plane hello reaches us.
+/// Then we never write a tombstone for it. The join keeps the old JOIN
+/// retry budget for such a peer (ten dials, at most about 91 s of backoff
+/// with jitter) and sends it no JOIN. The bound covers that case.
+const JOIN_BOUND: Duration = Duration::from_secs(150);
 
 const JOIN_CONNECTING: &str = "JOIN: Connecting to bootstrap node";
 const JOIN_RETRY: &str = "JOIN: Connection failed, will retry";

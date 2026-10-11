@@ -13,16 +13,20 @@ All notable changes to this project will be documented in this file.
   dialled it up to ten times (about 81 s) and the #292 gate refused every
   dial, so the presence beacons and the first identity announcement started
   that much later. (In `x0xd` the capability advert service also starts from
-  the DM inbox path, so it did not wait for the JOIN.) JOIN seeds are now
-  only the dialled peers that `peer_admission` (#292 invariant A) admits.
+  the DM inbox path, so it did not wait for the JOIN.) The JOIN frame now
+  goes only to a dialled peer that `peer_admission` (#292 invariant A)
+  admits. A suppressed peer is dropped as a seed at once. A peer that is not
+  suppressed but not admitted yet (connection lost, or plane verdict still
+  open) keeps the retry budget that the old JOIN gave a seed: up to ten
+  awaited dials with the JOIN's own backoff (100 ms doubling to at most
+  30 s), so the join does not give up while one of its dials is in flight.
   The phase counts for the join's minimum of three peers include only peers
   that are still connected and not suppressed. When peers that filled that
   minimum with an open plane verdict are refused later, the join still runs
-  the cached-peer and bootstrap phases it skipped. When no seed is admitted
-  but a candidate lost its connection without a tombstone, the join waits
-  (at most about 49 s, the proactive reconnect schedule) for the reconnect
-  and then sends the JOIN. The defect is older than v0.47.0: saorsa-6
-  showed it at the v0.46.4 rollout too.
+  the cached-peer and bootstrap phases it skipped. After `begin_shutdown`,
+  no fallback phase or JOIN starts, and a running fallback dial batch stops.
+  The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
+  rollout too.
 
 ## [v0.47.1] - 2026-10-12
 

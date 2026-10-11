@@ -27,15 +27,18 @@ dial answered mid-handshake cannot produce an `Admitted` verdict.
 
 The HyParView JOIN seeds of `join_network` are such a consumer (#1321,
 `src/gossip/join_seeds.rs`). A dial that returned `Ok` is transport truth: the
-plane hello that can refuse the peer arrives after it. So the seeds are only the
-dialled peers that `peer_admission` reports `Admitted`. The join's phase counts
-use the same predicate: a refused or disconnected peer does not count toward its
-minimum. The join waits (bounded) for open plane verdicts and compares the
-settled admitted count with that minimum; if peers that filled the minimum are
-refused later, it runs the phases it skipped. A candidate that lost its
-connection without a tombstone stays a possible seed: with no admitted seed, the
-join waits (bounded by the proactive reconnect schedule) for the reconnect and
-reads its verdict again.
+plane hello that can refuse the peer arrives after it. So the JOIN frame goes
+only to a dialled peer that `peer_admission` reports `Admitted`, and a
+`Suppressed` peer is dropped as a seed at once. The join's phase counts use the
+same predicate: a refused or disconnected peer does not count toward its
+minimum. The join waits (at most the plane legacy grace plus one hello retry)
+for open plane verdicts and compares the settled admitted count with that
+minimum; if peers that filled the minimum are refused later, it runs the phases
+it skipped. The fix changes only which peers can be seeds, not how long a seed
+is retried: a candidate that is not suppressed but not admitted yet (lost
+connection, open verdict) gets the old JOIN's per-seed budget (saorsa-gossip
+`HyParViewMembership::join`: ten awaited dials, backoff 100 ms doubling to at
+most 30 s), and the verdicts are read again between attempts.
 
 **Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
 `tests/cross_plane_join_seeds.rs` (JOIN seeds)
