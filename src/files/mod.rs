@@ -133,6 +133,14 @@ pub struct TransferState {
     /// Total number of chunks.
     #[serde(default)]
     pub total_chunks: u64,
+    /// The receiver has already sent Accept for this transfer.
+    ///
+    /// A missing control ack does not prove the sender ignored that accept.
+    /// The flag stays set when the receive returns to pending, so a later
+    /// chunk from the offering agent is still stored. It is process-local
+    /// and is not part of the HTTP transfer object.
+    #[serde(default, skip)]
+    pub accept_dispatched: bool,
 }
 
 /// Reason a received file chunk cannot be accepted for a transfer.
@@ -333,6 +341,7 @@ mod tests {
             output_path: None,
             chunk_size: 32768,
             total_chunks: 1,
+            accept_dispatched: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let decoded: TransferState = serde_json::from_str(&json).unwrap();

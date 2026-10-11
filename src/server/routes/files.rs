@@ -81,6 +81,10 @@ pub(crate) struct FileChunkAckSlot {
     last_acked: AtomicU64,
     /// Notified every time `last_acked` changes.
     notify: tokio::sync::Notify,
+    /// Peer allowed to complete this waiter. `None` keeps the chunk-ack
+    /// slot open to the transfer's existing sender check. A control-ack
+    /// slot stores the agent the control frame was sent to.
+    expected_sender: Option<AgentId>,
 }
 
 impl FileChunkAckSlot {
@@ -88,7 +92,20 @@ impl FileChunkAckSlot {
         Self {
             last_acked: AtomicU64::new(u64::MAX),
             notify: tokio::sync::Notify::new(),
+            expected_sender: None,
         }
+    }
+
+    fn expecting(sender: AgentId) -> Self {
+        Self {
+            expected_sender: Some(sender),
+            ..Self::new()
+        }
+    }
+
+    fn accepts_sender(&self, sender: &AgentId) -> bool {
+        self.expected_sender
+            .is_none_or(|expected| expected == *sender)
     }
 
     pub(in crate::server) fn record_ack(&self, sequence: u64) {
@@ -245,7 +262,7 @@ async fn send_file_message(
         return deliver_file_message(state, agent_id, msg).await;
     };
     let key = control_ack_key(op, transfer_id);
-    let slot = Arc::new(FileChunkAckSlot::new());
+    let slot = Arc::new(FileChunkAckSlot::expecting(*agent_id));
     state
         .file_chunk_acks
         .write()
@@ -380,6 +397,7 @@ pub(in crate::server) async fn file_send_handler(
         output_path: None,
         chunk_size,
         total_chunks,
+        accept_dispatched: false,
     };
 
     state
@@ -459,10 +477,19 @@ pub(in crate::server) async fn file_accept_handler(
         let mut transfers = state.file_transfers.write().await;
         match transfers.get_mut(&id) {
             Some(t)
-                if t.status == x0x::files::TransferStatus::Pending
-                    && t.direction == x0x::files::TransferDirection::Receiving =>
+                if t.direction == x0x::files::TransferDirection::Receiving
+                    && t.status == x0x::files::TransferStatus::Complete =>
+            {
+                return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
+            }
+            Some(t)
+                if t.direction == x0x::files::TransferDirection::Receiving
+                    && (t.status == x0x::files::TransferStatus::Pending
+                        || (t.status == x0x::files::TransferStatus::InProgress
+                            && t.accept_dispatched)) =>
             {
                 t.status = x0x::files::TransferStatus::InProgress;
+                t.accept_dispatched = true;
                 remote_agent_hex = t.remote_agent_id.clone();
             }
             Some(_) => {
@@ -500,14 +527,22 @@ pub(in crate::server) async fn file_accept_handler(
     };
 
     if delivery_failed {
-        // Revert to Pending so the accept can be retried
+        // A missing control ack is not proof the sender ignored the accept.
+        // Keep bytes already stored. Return an empty in-progress receive to
+        // pending so the caller can retry. accept_dispatched stays set, so a
+        // chunk that arrives after this return is still applied.
         let mut transfers = state.file_transfers.write().await;
         if let Some(t) = transfers.get_mut(&id) {
-            t.status = x0x::files::TransferStatus::Pending;
+            if t.direction == x0x::files::TransferDirection::Receiving
+                && t.status == x0x::files::TransferStatus::InProgress
+                && t.bytes_transferred == 0
+            {
+                t.status = x0x::files::TransferStatus::Pending;
+            }
         }
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "accepted but failed to notify sender — reverted to pending",
+            "accepted but failed to confirm the sender — retry is safe",
         )
     } else {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
@@ -638,7 +673,16 @@ pub(in crate::server) async fn handle_file_message(
         x0x::files::FileMessage::ControlAck { transfer_id, op } => {
             let key = control_ack_key(&op, &transfer_id);
             if let Some(slot) = state.file_chunk_acks.read().await.get(&key) {
-                slot.record_ack(0);
+                if slot.accepts_sender(sender) {
+                    slot.record_ack(0);
+                } else {
+                    tracing::warn!(
+                        transfer_id,
+                        op,
+                        sender = %hex::encode(sender.as_bytes()),
+                        "ignored file control ack from an unexpected agent"
+                    );
+                }
             }
         }
     }
@@ -703,6 +747,7 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         output_path: None,
         chunk_size: offer.chunk_size,
         total_chunks: offer.total_chunks,
+        accept_dispatched: false,
     };
 
     state
@@ -747,19 +792,15 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::info!("File accept received: {transfer_id} from {sender_hex}");
 
-    let source_path;
-    let sha256;
-    let remote_agent_hex;
+    let mut started = None;
     {
         let mut transfers = state.file_transfers.write().await;
         let Some(t) = transfers.get_mut(transfer_id) else {
             tracing::warn!("Accept for unknown transfer: {transfer_id}");
             return;
         };
-        if t.direction != x0x::files::TransferDirection::Sending
-            || t.status != x0x::files::TransferStatus::Pending
-        {
-            tracing::warn!("Accept for non-pending sending transfer: {transfer_id}");
+        if t.direction != x0x::files::TransferDirection::Sending {
+            tracing::warn!("Accept for non-sending transfer: {transfer_id}");
             return;
         }
         // Authenticate: sender must match the remote_agent_id we sent the offer to
@@ -770,11 +811,28 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
             );
             return;
         }
-        t.status = x0x::files::TransferStatus::InProgress;
-        source_path = t.source_path.clone();
-        sha256 = t.sha256.clone();
-        remote_agent_hex = t.remote_agent_id.clone();
+        match t.status {
+            x0x::files::TransferStatus::Pending => {
+                t.status = x0x::files::TransferStatus::InProgress;
+                started = Some((
+                    t.source_path.clone(),
+                    t.sha256.clone(),
+                    t.remote_agent_id.clone(),
+                ));
+            }
+            // The accept already committed. A repeat is the receiver retrying
+            // after a lost control ack. Reply again. Do not start a second stream.
+            x0x::files::TransferStatus::InProgress | x0x::files::TransferStatus::Complete => {}
+            _ => {
+                tracing::warn!("Accept for non-pending sending transfer: {transfer_id}");
+                return;
+            }
+        }
     }
+    let Some((source_path, sha256, remote_agent_hex)) = started else {
+        send_file_control_ack(state, sender, transfer_id, CONTROL_OP_ACCEPT).await;
+        return;
+    };
 
     let Some(path) = source_path else {
         tracing::error!("No source path for transfer {transfer_id}");
@@ -1051,6 +1109,21 @@ async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
 
 async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::files::FileChunk) {
     let sender_hex = hex::encode(sender.as_bytes());
+
+    // A lost control ack can return the receive to Pending after the sender
+    // has already started. Keep chunks that arrive for that accept.
+    {
+        let mut transfers = state.file_transfers.write().await;
+        if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
+            if t.accept_dispatched
+                && t.status == x0x::files::TransferStatus::Pending
+                && t.direction == x0x::files::TransferDirection::Receiving
+                && t.remote_agent_id == sender_hex
+            {
+                t.status = x0x::files::TransferStatus::InProgress;
+            }
+        }
+    }
 
     // Validate: transfer must exist, be a receiving transfer, be InProgress,
     // and the sender must match the original offer's remote_agent_id.
@@ -1523,6 +1596,17 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn control_ack_slot_accepts_only_the_addressed_peer() {
+        let peer = x0x::identity::AgentId([1; 32]);
+        let other = x0x::identity::AgentId([2; 32]);
+        let slot = FileChunkAckSlot::expecting(peer);
+        assert!(slot.accepts_sender(&peer));
+        assert!(!slot.accepts_sender(&other));
+        let chunk_slot = FileChunkAckSlot::new();
+        assert!(chunk_slot.accepts_sender(&other));
     }
 
     #[test]

@@ -157,6 +157,10 @@ fn send_ok(status: u16, body: &str) -> bool {
     status == 200 && serde_json::from_str::<Value>(body).is_ok_and(|value| value["ok"] == true)
 }
 
+fn http_500(status: u16, body: &str) -> bool {
+    status == 500 && serde_json::from_str::<Value>(body).is_ok_and(|value| value["ok"] == false)
+}
+
 async fn post_accept(api: SocketAddr, token: &str, transfer_id: &str) -> (u16, String) {
     let client = authed_client(token);
     match client
@@ -171,6 +175,34 @@ async fn post_accept(api: SocketAddr, token: &str, transfer_id: &str) -> (u16, S
         }
         Err(error) => (0, error.to_string()),
     }
+}
+
+async fn sending_offer_status(api: SocketAddr, token: &str, filename: &str) -> String {
+    let client = authed_client(token);
+    let Ok(response) = client
+        .get(format!("http://{api}/files/transfers"))
+        .send()
+        .await
+    else {
+        return String::new();
+    };
+    let text = response.text().await.unwrap_or_default();
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value["transfers"].as_array().and_then(|transfers| {
+                transfers.iter().find_map(|transfer| {
+                    if transfer["direction"].as_str() == Some("Sending")
+                        && transfer["filename"].as_str() == Some(filename)
+                    {
+                        transfer["status"].as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+        .unwrap_or(text)
 }
 
 async fn sending_status(api: SocketAddr, token: &str, transfer_id: &str) -> String {
@@ -190,6 +222,22 @@ async fn sending_status(api: SocketAddr, token: &str, transfer_id: &str) -> Stri
 }
 
 async fn clear_peer_authority(agent: &crate::Agent, peer: AgentId, machine: MachineId) {
+    // An in-flight evidence lookup can restore the peer after one clear.
+    // Let that lookup land, then clear again immediately before the frame.
+    for _ in 0..2 {
+        agent.identity_discovery_cache().write().await.clear();
+        agent
+            .authenticated_machine_bindings_for_testing()
+            .write()
+            .await
+            .clear_for_test();
+        agent
+            .announced_machine_bindings_for_testing()
+            .write()
+            .await
+            .clear_for_test();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     agent.identity_discovery_cache().write().await.clear();
     agent
         .authenticated_machine_bindings_for_testing()
@@ -397,8 +445,9 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
     let accept_post = post_accept(receiver_api, &receiver_token, &warm_transfer_id);
     let accept_frame_wait = verified_flag_of(&mut sender_direct, "file-accept", receiver_agent);
     let ((accept_status, accept_body), accept_frame) = tokio::join!(accept_post, accept_frame_wait);
-    let accept_ok = send_ok(accept_status, &accept_body);
+    let accept_failed = http_500(accept_status, &accept_body);
     let sender_status = sending_status(sender_api, &sender_token, &warm_transfer_id).await;
+    let receiver_status = sending_status(receiver_api, &receiver_token, &warm_transfer_id).await;
 
     // Offer travels sender → receiver. Put the receiver card back so the
     // sender can address the peer, then empty the receiver's authority.
@@ -426,9 +475,11 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
     );
     let offer_frame_wait = verified_flag_of(&mut receiver_direct, "file-offer", sender_agent);
     let ((status, body), offer_frame) = tokio::join!(cold_post, offer_frame_wait);
-    let cold_ok = send_ok(status, &body);
+    let cold_failed = http_500(status, &body);
     let (offer_seen, transfers_body) =
         pending_offer_now(receiver_api, &receiver_token, "issue1102-cold.bin").await;
+    let local_offer_status =
+        sending_offer_status(sender_api, &sender_token, "issue1102-cold.bin").await;
     let still_connected = sender_network.is_connected(&receiver_peer).await;
     let drops = super::routes::unverified_file_frame_drops();
 
@@ -437,12 +488,14 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
         "warm_seen": warm_seen,
         "accept_status": accept_status,
         "accept_body": accept_body,
-        "accept_ok": accept_ok,
+        "accept_failed": accept_failed,
         "accept_frame_verified": accept_frame,
         "sender_status": sender_status,
+        "receiver_status": receiver_status,
         "status": status,
         "body": body,
-        "send_ok": cold_ok,
+        "cold_failed": cold_failed,
+        "local_offer_status": local_offer_status,
         "offer_frame_verified": offer_frame,
         "offer_seen": offer_seen,
         "transfers": transfers_body,
@@ -459,12 +512,16 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
         "the accept must arrive on the live connection and stay unverified ({report})"
     );
     assert!(
-        !accept_ok,
-        "the receiver must not report success for an accept the sender did not commit ({report})"
+        accept_failed,
+        "a dropped accept must return HTTP 500 ({report})"
     );
     assert_eq!(
         sender_status, "Pending",
         "a dropped accept must leave the sending transfer pending ({report})"
+    );
+    assert_eq!(
+        receiver_status, "Pending",
+        "a dropped accept must return the receive to pending ({report})"
     );
     assert_eq!(
         offer_frame,
@@ -476,8 +533,12 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
         "an unverified offer must not become a pending transfer ({report})"
     );
     assert!(
-        !cold_ok,
-        "the sender must not report success for an offer the peer did not accept ({report})"
+        cold_failed,
+        "a dropped offer must return HTTP 500 ({report})"
+    );
+    assert_eq!(
+        local_offer_status, "Failed",
+        "a dropped offer must be Failed on the sender ({report})"
     );
     assert!(
         still_connected,
