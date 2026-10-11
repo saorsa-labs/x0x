@@ -389,7 +389,8 @@ fn grant_store_persists_through_the_durable_writer() {
         .nth(1)
         .and_then(|rest| rest.split("\n    }\n").next())
         .expect("persist() present");
-    assert!(persist.contains("write_private_bytes_durable("));
+    // #1101: the typed form of the same fsyncing writer.
+    assert!(persist.contains("write_private_bytes_durable_typed("));
     assert!(!persist.contains("save_private_bytes_to("));
 }
 
@@ -443,6 +444,221 @@ async fn zero_clock_yields_no_access() {
         .await
         .is_empty(),
         "clock failure fails closed"
+    );
+}
+
+/// WHY (#1101): when the durable store write fails AFTER the atomic
+/// rename, the grant is already in `share-grants.bin`. The store must
+/// keep it in memory (memory == disk), refuse further writes until a
+/// reload, and still withhold the durable ACK — never roll memory back
+/// below an advanced disk, which made a restart enforce a grant whose
+/// ACK was reported refused.
+#[tokio::test]
+async fn accept_post_rename_failure_keeps_grant_poisons_and_reload_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    let grant = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let outcome = store.accept(grant.clone(), NOW).await;
+    // The durable ACK is withheld either way. The public enum gets no new
+    // variant (additive API for a patch release): the refusal is `Store`,
+    // and `poisoned_reason` tells it apart from a pre-rename failure.
+    assert!(
+        matches!(&outcome, Err(ShareGrantError::Store(msg)) if msg.contains("not durable")),
+        "post-rename failure must not ACK: {outcome:?}"
+    );
+    assert!(store.poisoned_reason().is_some(), "the store is poisoned");
+
+    // Memory keeps the grant: it matches the advanced disk.
+    assert_eq!(store.grants(GrantRole::Issued), vec![grant.clone()]);
+
+    // A reload from disk agrees with memory — the grant really is stored.
+    let reloaded = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    assert_eq!(reloaded.grants(GrantRole::Issued), vec![grant.clone()]);
+
+    // The store is poisoned: with the transient fault cleared, a further
+    // accept is still refused (mirrors OwnerSyncStore).
+    drop(_seam);
+    let second = ShareGrant::sign(
+        &owner,
+        [0x43; 32],
+        Grantee::Agent(agent(8)),
+        vec![agent(2)],
+        vec![ShareCap::Dm],
+        NOW - 60,
+        NOW + 3_600,
+    )
+    .unwrap();
+    assert!(
+        store.accept(second.clone(), NOW).await.is_err(),
+        "poisoned store refuses writes until a fresh load"
+    );
+
+    // A fresh load clears the poison: the reloaded store accepts again.
+    let fresh = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    assert!(fresh.poisoned_reason().is_none());
+    fresh
+        .accept(second, NOW)
+        .await
+        .expect("reload clears poison");
+}
+
+/// WHY (#1101 counterweight): a failure BEFORE the rename leaves the OLD
+/// bytes on disk — the rollback must stay, because a grant that is not
+/// durable must never be reported as stored.
+#[tokio::test]
+#[cfg(unix)]
+async fn accept_pre_rename_failure_rolls_back_grant_and_disk() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    let kept = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    store.accept(kept.clone(), NOW).await.expect("seed grant");
+
+    // Parent dir without the write bit: the temp file cannot even be
+    // created — a BeforeRename failure.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let refused = store
+        .accept(
+            ShareGrant::sign(
+                &owner,
+                [0x44; 32],
+                Grantee::Agent(agent(8)),
+                vec![agent(2)],
+                vec![ShareCap::Dm],
+                NOW - 60,
+                NOW + 3_600,
+            )
+            .unwrap(),
+            NOW,
+        )
+        .await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        matches!(refused, Err(ShareGrantError::Store(_))),
+        "a grant that is not durable is refused, never ACKed: {refused:?}"
+    );
+    assert!(
+        store.poisoned_reason().is_none(),
+        "a pre-rename failure rolls back and does not poison"
+    );
+    // Memory rolled back: only the seeded grant remains …
+    assert_eq!(store.grants(GrantRole::Issued), vec![kept.clone()]);
+    // … and a reload from disk agrees (the file was never replaced).
+    let reloaded = ShareGrantStore::load(path, agent(1), Some(owner.user_id())).await;
+    assert_eq!(reloaded.grants(GrantRole::Issued), vec![kept]);
+}
+
+/// A byte buffer that a thread-local fmt subscriber writes into.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    /// Everything logged since the last call.
+    fn take(&self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
+    }
+}
+
+/// A thread-local INFO-level subscriber writing into a [`LogCapture`].
+/// `#[tokio::test]` runs the body on one thread, so the handler's events
+/// land in the buffer and no other test sees them.
+fn capture_info_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (capture, tracing::subscriber::set_default(subscriber))
+}
+
+/// WHY (#1322 review P3): after a post-rename failure the received grant
+/// IS held (in memory and in the file), so the DM handler must not log it
+/// as "not stored". The sender retries while the ACK is withheld; the
+/// poisoned store refuses the retry, but the grant is still held. Only a
+/// grant that is really absent is logged as "not stored". The ACK is
+/// withheld in every case.
+#[tokio::test]
+async fn post_rename_dm_failure_is_logged_as_held_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    let grant = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    let (logs, _subscriber) = capture_info_logs();
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let (t, rx) = typed(grant.to_dm_payload().unwrap());
+    assert!(handle_share_grant_dm(Some(&store), t).await.is_err());
+    assert!(matches!(rx.await, Ok(Err(_))), "the ACK is withheld");
+    assert_eq!(
+        store.grants(GrantRole::Issued),
+        vec![grant.clone()],
+        "the grant is held"
+    );
+    let first = logs.take();
+    assert!(
+        !first.contains("not stored"),
+        "the grant is held, so the log must not say otherwise: {first}"
+    );
+
+    // The sender retries the same grant: refused, and still held.
+    let (t, rx) = typed(grant.to_dm_payload().unwrap());
+    let err = handle_share_grant_dm(Some(&store), t).await.unwrap_err();
+    assert!(err.contains("this grant is held"), "{err}");
+    assert!(matches!(rx.await, Ok(Err(_))), "the ACK is still withheld");
+    let retry = logs.take();
+    assert!(
+        !retry.contains("not stored"),
+        "the retried grant is still held: {retry}"
+    );
+
+    // A different grant: the poisoned store refuses it, and it is absent.
+    let other = ShareGrant::sign(
+        &owner,
+        [0x45; 32],
+        Grantee::Agent(agent(8)),
+        vec![agent(1)],
+        vec![ShareCap::Dm],
+        NOW - 60,
+        NOW + 3_600,
+    )
+    .unwrap();
+    let (t, rx) = typed(other.to_dm_payload().unwrap());
+    let err = handle_share_grant_dm(Some(&store), t).await.unwrap_err();
+    assert!(
+        err.contains("this grant is refused and not stored"),
+        "a later refusal must not read as if this grant was applied: {err}"
+    );
+    assert!(matches!(rx.await, Ok(Err(_))), "no ACK for the other grant");
+    assert_eq!(
+        store.grants(GrantRole::Issued),
+        vec![grant],
+        "the other grant is absent"
+    );
+    let absent = logs.take();
+    assert!(
+        absent.contains("not stored"),
+        "an absent grant is logged as not stored: {absent}"
     );
 }
 

@@ -827,3 +827,40 @@ async fn overlay_writes_are_private_and_atomic() {
     ));
     assert!(admin.list_connect().await["reload"]["overlay_error"].is_null());
 }
+
+/// WHY (#1101): an overlay write that fails AFTER the atomic rename has
+/// already replaced the file. Committing nothing made the daemon deny
+/// (and its listing omit) an entry that was on disk and would apply
+/// after the next restart — a privilege the API reported as failed.
+/// Memory must be committed to match the disk and the error still
+/// reported.
+#[tokio::test]
+async fn overlay_post_rename_failure_commits_memory_and_reports_error() {
+    let fx = Fixture::new();
+    let admin = fx.start().await;
+
+    let _seam = x0x::storage::arm_fail_parent_dir_fsync_for_testing(&fx.overlay_path("connect"));
+    let err = admin
+        .add_connect(connect_pair(0x21, 0x22, "127.0.0.1:8080"), false)
+        .await
+        .expect_err("post-rename failure is still an error");
+    assert!(matches!(err, AclAdminError::Internal(_)), "{err:?}");
+
+    // Memory committed: the effective policy this daemon enforces already
+    // includes the entry.
+    assert!(connect_allowed(
+        &admin.effective_connect().await,
+        0x21,
+        0x22,
+        "127.0.0.1:8080"
+    ));
+
+    // Disk agrees: a fresh load of the same data dir sees the same entry.
+    let reloaded = fx.start().await;
+    assert!(connect_allowed(
+        &reloaded.effective_connect().await,
+        0x21,
+        0x22,
+        "127.0.0.1:8080"
+    ));
+}
