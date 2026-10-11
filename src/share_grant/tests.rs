@@ -555,6 +555,113 @@ async fn accept_pre_rename_failure_rolls_back_grant_and_disk() {
     assert_eq!(reloaded.grants(GrantRole::Issued), vec![kept]);
 }
 
+/// A byte buffer that a thread-local fmt subscriber writes into.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    /// Everything logged since the last call.
+    fn take(&self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
+    }
+}
+
+/// A thread-local INFO-level subscriber writing into a [`LogCapture`].
+/// `#[tokio::test]` runs the body on one thread, so the handler's events
+/// land in the buffer and no other test sees them.
+fn capture_info_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (capture, tracing::subscriber::set_default(subscriber))
+}
+
+/// WHY (#1322 review P3): after a post-rename failure the received grant
+/// IS held (in memory and in the file), so the DM handler must not log it
+/// as "not stored". The sender retries while the ACK is withheld; the
+/// poisoned store refuses the retry, but the grant is still held. Only a
+/// grant that is really absent is logged as "not stored". The ACK is
+/// withheld in every case.
+#[tokio::test]
+async fn post_rename_dm_failure_is_logged_as_held_not_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    let grant = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    let (logs, _subscriber) = capture_info_logs();
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let (t, rx) = typed(grant.to_dm_payload().unwrap());
+    assert!(handle_share_grant_dm(Some(&store), t).await.is_err());
+    assert!(matches!(rx.await, Ok(Err(_))), "the ACK is withheld");
+    assert_eq!(
+        store.grants(GrantRole::Issued),
+        vec![grant.clone()],
+        "the grant is held"
+    );
+    let first = logs.take();
+    assert!(
+        !first.contains("not stored"),
+        "the grant is held, so the log must not say otherwise: {first}"
+    );
+
+    // The sender retries the same grant: refused, and still held.
+    let (t, rx) = typed(grant.to_dm_payload().unwrap());
+    let err = handle_share_grant_dm(Some(&store), t).await.unwrap_err();
+    assert!(err.contains("this grant is held"), "{err}");
+    assert!(matches!(rx.await, Ok(Err(_))), "the ACK is still withheld");
+    let retry = logs.take();
+    assert!(
+        !retry.contains("not stored"),
+        "the retried grant is still held: {retry}"
+    );
+
+    // A different grant: the poisoned store refuses it, and it is absent.
+    let other = ShareGrant::sign(
+        &owner,
+        [0x45; 32],
+        Grantee::Agent(agent(8)),
+        vec![agent(1)],
+        vec![ShareCap::Dm],
+        NOW - 60,
+        NOW + 3_600,
+    )
+    .unwrap();
+    let (t, rx) = typed(other.to_dm_payload().unwrap());
+    let err = handle_share_grant_dm(Some(&store), t).await.unwrap_err();
+    assert!(
+        err.contains("this grant is refused and not stored"),
+        "a later refusal must not read as if this grant was applied: {err}"
+    );
+    assert!(matches!(rx.await, Ok(Err(_))), "no ACK for the other grant");
+    assert_eq!(
+        store.grants(GrantRole::Issued),
+        vec![grant],
+        "the other grant is absent"
+    );
+    let absent = logs.take();
+    assert!(
+        absent.contains("not stored"),
+        "an absent grant is logged as not stored: {absent}"
+    );
+}
+
 mod enforcement;
 
 mod redelivery;
