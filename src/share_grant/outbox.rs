@@ -120,7 +120,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{Grantee, ShareGrant, ShareGrantError};
+use super::{Grantee, ShareGrant, ShareGrantError, WriteRefusal};
 use crate::identity::{AgentId, UserId};
 use crate::revocation::RevocationSet;
 
@@ -465,7 +465,10 @@ impl GrantRedeliveryOutbox {
     /// reached, or a store failure. A refused entry leaves the outbox
     /// unchanged — except a store failure AFTER the rename (issue #1101):
     /// the entry is already on disk, so it stays queued and the error says
-    /// the write is not confirmed durable.
+    /// the write is not confirmed durable. `Ok` (also `Ok(false)` for an
+    /// entry already queued) always means the entry is durably on disk: a
+    /// duplicate of an unconfirmed entry first rewrites and syncs the
+    /// outbox (#1322 review P2).
     pub async fn enqueue(
         &self,
         grant: &ShareGrant,
@@ -473,17 +476,32 @@ impl GrantRedeliveryOutbox {
         now_unix: u64,
         revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, OutboxError> {
+        self.enqueue_reporting(grant, recipient, now_unix, revocations)
+            .await
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::enqueue`], and on refusal also whether the entry is still
+    /// queued in memory (#1322 review P3), so the caller never describes a
+    /// queued entry as absent.
+    pub(crate) async fn enqueue_reporting(
+        &self,
+        grant: &ShareGrant,
+        recipient: AgentId,
+        now_unix: u64,
+        revocations: &RwLock<RevocationSet>,
+    ) -> Result<bool, WriteRefusal<OutboxError>> {
         self.queueable(grant)?;
         let deadline = grant
             .expiry
             .min(now_unix.saturating_add(OUTBOX_ENTRY_TTL_SECS));
         if now_unix == 0 || now_unix >= deadline {
-            return Err(OutboxError::NotQueueable("grant has expired".into()));
+            return Err(OutboxError::NotQueueable("grant has expired".into()).into());
         }
         if let Some(e) = &self.load_error {
-            return Err(OutboxError::Store(format!(
-                "outbox not writable (unreadable file): {e}"
-            )));
+            return Err(
+                OutboxError::Store(format!("outbox not writable (unreadable file): {e}")).into(),
+            );
         }
         let key = key_of(&grant.grant_id, &recipient);
         let _gate = self.send_gate.read().await;
@@ -492,36 +510,58 @@ impl GrantRedeliveryOutbox {
             .await
             .is_share_grant_revoked(&grant.grant_id, &grant.owner)
         {
-            return Err(OutboxError::Revoked);
+            return Err(OutboxError::Revoked.into());
         }
         let _write = self.write_lock.lock().await;
-        {
+        let duplicate = {
             let mut entries = self.lock();
             if entries.contains_key(&key) {
-                return Ok(false);
+                true
+            } else {
+                entries.retain(|_, e| now_unix < e.deadline);
+                let per_grantee = entries
+                    .values()
+                    .filter(|e| e.grant.grantee == grant.grantee)
+                    .count();
+                if per_grantee >= MAX_OUTBOX_ENTRIES_PER_GRANTEE {
+                    return Err(OutboxError::GranteeFull.into());
+                }
+                if entries.len() >= MAX_OUTBOX_ENTRIES {
+                    return Err(OutboxError::Full.into());
+                }
+                entries.insert(
+                    key,
+                    PendingGrantDelivery {
+                        recipient,
+                        grant: grant.clone(),
+                        queued_at: now_unix,
+                        deadline,
+                        next_attempt_at: now_unix.saturating_add(retry_delay_secs(0)),
+                        attempts: 0,
+                    },
+                );
+                false
             }
-            entries.retain(|_, e| now_unix < e.deadline);
-            let per_grantee = entries
-                .values()
-                .filter(|e| e.grant.grantee == grant.grantee)
-                .count();
-            if per_grantee >= MAX_OUTBOX_ENTRIES_PER_GRANTEE {
-                return Err(OutboxError::GranteeFull);
+        };
+        if duplicate {
+            // #1322 review P2: the entry may be one that a post-rename
+            // failure kept, with no directory sync since. `dirty` is clear
+            // only after a fully successful write, so a clean outbox holds
+            // every entry durably. A dirty outbox is rewritten and synced
+            // here, under `write_lock`, before the duplicate is reported
+            // as queued. On failure the entry stays queued: it is in
+            // memory and in the last renamed file.
+            if self.dirty.load(Ordering::Acquire) {
+                if let Err(e) = self.persist().await {
+                    return Err(WriteRefusal {
+                        error: OutboxError::Store(format!(
+                            "already queued, but not confirmed durable: {e}"
+                        )),
+                        held: true,
+                    });
+                }
             }
-            if entries.len() >= MAX_OUTBOX_ENTRIES {
-                return Err(OutboxError::Full);
-            }
-            entries.insert(
-                key,
-                PendingGrantDelivery {
-                    recipient,
-                    grant: grant.clone(),
-                    queued_at: now_unix,
-                    deadline,
-                    next_attempt_at: now_unix.saturating_add(retry_delay_secs(0)),
-                    attempts: 0,
-                },
-            );
+            return Ok(false);
         }
         match self.persist().await {
             Ok(()) => {}
@@ -529,20 +569,24 @@ impl GrantRedeliveryOutbox {
                 // Issue #1101: the rename already happened — the entry IS
                 // in the outbox file. Keep it (memory matches the
                 // advanced disk; `persist` left the outbox dirty so the
-                // next worker pass rewrites and re-syncs it) and still
-                // report failure: durability is unconfirmed, so
-                // `Ok(true)` ("on disk") would overstate what happened.
+                // next worker pass, or a retry of this enqueue, rewrites
+                // and re-syncs it) and still report failure: durability
+                // is unconfirmed, so `Ok(true)` ("on disk") would
+                // overstate what happened.
                 self.wake.notify_one();
-                return Err(OutboxError::Store(format!(
-                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
-                     the change is in effect"
-                )));
+                return Err(WriteRefusal {
+                    error: OutboxError::Store(format!(
+                        "applied, but durability is not confirmed (directory fsync failed): \
+                         {e}; the change is in effect"
+                    )),
+                    held: true,
+                });
             }
             Err(e) => {
                 // Roll back: an entry that is not durable must not be
                 // reported as queued.
                 self.lock().remove(&key);
-                return Err(OutboxError::Store(format!("{e}")));
+                return Err(OutboxError::Store(format!("{e}")).into());
             }
         }
         self.wake.notify_one();

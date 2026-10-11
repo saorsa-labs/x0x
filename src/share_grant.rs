@@ -189,13 +189,54 @@ pub enum ShareGrantError {
     Store(String),
 }
 
-/// The refusal of a poisoned grant store (issue #1101). It reuses
+/// The refusals of a poisoned grant store (issue #1101). They reuse
 /// [`ShareGrantError::Store`], so the public enum gets no new variant in a
 /// patch release, and the HTTP mapping stays 503.
-fn poisoned_store_error(reason: &str) -> ShareGrantError {
+///
+/// This write crossed the rename but its directory sync failed: the grant
+/// is applied and held, but not confirmed durable.
+fn poisoned_by_this_write(reason: &str) -> ShareGrantError {
     ShareGrantError::Store(format!(
         "poisoned (state replaced but not durable): {reason}"
     ))
+}
+
+/// An earlier write poisoned the store. `held` says whether this exact
+/// grant is in memory (for example, a sender retry of the grant whose
+/// write poisoned the store). A refusal never says a held grant is absent,
+/// and never says an absent grant was applied (#1322 review P3).
+fn poisoned_by_earlier_write(reason: &str, held: bool) -> ShareGrantError {
+    ShareGrantError::Store(if held {
+        format!(
+            "poisoned: this grant is held, but the store refuses writes because an \
+             earlier write is not confirmed durable ({reason})"
+        )
+    } else {
+        format!(
+            "poisoned: this grant is refused and not stored, because an earlier write \
+             is not confirmed durable ({reason})"
+        )
+    })
+}
+
+/// A refused store or outbox write, with whether its state is still held
+/// (issue #1101, #1322 review P3). `held` is true when the change is in
+/// memory and in the file but not confirmed durable. Callers use it so
+/// that they never describe held state as absent. Crate-private: the
+/// public `accept` and `enqueue` keep their error types.
+#[derive(Debug)]
+pub(crate) struct WriteRefusal<E> {
+    /// The public error.
+    pub(crate) error: E,
+    /// The refused change is held in memory (and in the file).
+    pub(crate) held: bool,
+}
+
+impl<E> From<E> for WriteRefusal<E> {
+    /// A refusal that left nothing behind.
+    fn from(error: E) -> Self {
+        Self { error, held: false }
+    }
 }
 
 impl ShareGrant {
@@ -474,6 +515,13 @@ struct StoreState {
 }
 
 impl StoreState {
+    fn role(&self, role: GrantRole) -> &BTreeMap<[u8; 32], ShareGrant> {
+        match role {
+            GrantRole::Issued => &self.issued,
+            GrantRole::Received => &self.received,
+        }
+    }
+
     fn role_mut(&mut self, role: GrantRole) -> &mut BTreeMap<[u8; 32], ShareGrant> {
         match role {
             GrantRole::Issued => &mut self.issued,
@@ -760,21 +808,43 @@ impl ShareGrantStore {
         grant: ShareGrant,
         now_unix: u64,
     ) -> Result<DmTypedPayloadCompletion, ShareGrantError> {
+        self.accept_reporting(grant, now_unix)
+            .await
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::accept`], and on refusal also whether this grant is held in
+    /// memory (#1322 review P3), so the caller never describes a held
+    /// grant as absent.
+    pub(crate) async fn accept_reporting(
+        &self,
+        grant: ShareGrant,
+        now_unix: u64,
+    ) -> Result<DmTypedPayloadCompletion, WriteRefusal<ShareGrantError>> {
         grant.verify()?;
         if now_unix >= grant.expiry {
-            return Err(ShareGrantError::Expired);
+            return Err(ShareGrantError::Expired.into());
         }
         let role = self.classify(&grant).ok_or(ShareGrantError::NotForUs)?;
         if let Some(e) = &self.load_error {
             return Err(ShareGrantError::Store(format!(
                 "store not writable (unreadable file): {e}"
-            )));
+            ))
+            .into());
         }
         let _write = self.write_lock.lock().await;
         // Checked under `write_lock`: `poison` runs while a writer holds
         // it, so a writer that waited for the lock cannot slip past.
-        if let Some(reason) = self.poison_refusal() {
-            return Err(reason);
+        if let Some(reason) = self.poisoned_reason() {
+            let held = self
+                .read_state()
+                .role(role)
+                .get(&grant.grant_id)
+                .is_some_and(|stored| *stored == grant);
+            return Err(WriteRefusal {
+                error: poisoned_by_earlier_write(&reason, held),
+                held,
+            });
         }
         {
             let mut state = self.write_state();
@@ -783,14 +853,14 @@ impl ShareGrantStore {
                 return if *held == grant {
                     Ok(DmTypedPayloadCompletion::Duplicate)
                 } else {
-                    Err(ShareGrantError::Conflict)
+                    Err(ShareGrantError::Conflict.into())
                 };
             }
             if map.len() >= MAX_STORED_GRANTS {
                 map.retain(|_, g| now_unix < g.expiry);
             }
             if map.len() >= MAX_STORED_GRANTS {
-                return Err(ShareGrantError::Store("grant store is full".into()));
+                return Err(ShareGrantError::Store("grant store is full".into()).into());
             }
             map.insert(grant.grant_id, grant.clone());
         }
@@ -807,15 +877,15 @@ impl ShareGrantStore {
                     "applied, but durability is not confirmed (directory fsync failed): {e}; \
                      the change is in effect; restart x0xd to clear"
                 );
-                let refusal = poisoned_store_error(&reason);
+                let error = poisoned_by_this_write(&reason);
                 self.poison(reason);
-                return Err(refusal);
+                return Err(WriteRefusal { error, held: true });
             }
             Err(e) => {
                 // Roll back: a grant that is not durable must not be
                 // reported as stored (the durable ACK would be a lie).
                 self.write_state().role_mut(role).remove(&grant.grant_id);
-                return Err(ShareGrantError::Store(format!("write {e}")));
+                return Err(ShareGrantError::Store(format!("write {e}")).into());
             }
         }
         Ok(DmTypedPayloadCompletion::Inserted)
@@ -839,16 +909,6 @@ impl ShareGrantStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    /// The typed refusal for a poisoned store. Checked FIRST by every
-    /// state-mutating entry point: after a post-rename durability failure
-    /// no mutation may proceed against state whose durability is
-    /// unconfirmed — even after the fault clears — until an explicit
-    /// reload.
-    fn poison_refusal(&self) -> Option<ShareGrantError> {
-        self.poisoned_reason()
-            .map(|reason| poisoned_store_error(&reason))
     }
 
     /// Write the store atomically (mode 0600). Callers hold `write_lock`.
@@ -1169,6 +1229,11 @@ pub async fn handle_share_grant_dm_checked(
         completion,
         ..
     } = typed;
+    // #1322 review P3: a refused grant can still be held (a post-rename
+    // failure, or a sender retry of that grant). Track it, so the log
+    // never says "not stored" for a held grant. The ACK is withheld
+    // either way.
+    let mut held = false;
     let result = match store {
         None => Err("share grants are not enabled on this daemon".to_string()),
         Some(store) => match ShareGrant::from_dm_payload(&payload) {
@@ -1184,9 +1249,12 @@ pub async fn handle_share_grant_dm_checked(
                     Err("share grant is revoked; not stored".to_string())
                 } else {
                     store
-                        .accept(grant, unix_now_secs())
+                        .accept_reporting(grant, unix_now_secs())
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(|refusal| {
+                            held = refusal.held;
+                            refusal.error.to_string()
+                        })
                 }
             }
             Err(e) => Err(e.to_string()),
@@ -1197,6 +1265,12 @@ pub async fn handle_share_grant_dm_checked(
             sender = %hex::encode(sender.as_bytes()),
             ?outcome,
             "share grant received and stored"
+        ),
+        Err(reason) if held => tracing::warn!(
+            sender = %hex::encode(sender.as_bytes()),
+            reason = %reason,
+            "share grant held in memory and in the file, but the grant store is not confirmed \
+             durable; ACK withheld"
         ),
         Err(reason) => tracing::info!(
             sender = %hex::encode(sender.as_bytes()),
@@ -1225,8 +1299,9 @@ pub struct GrantDelivery {
     /// `true` when delivery failed and the grant was durably queued in the
     /// owner-side redelivery outbox (#926), which keeps retrying it.
     pub queued: bool,
-    /// Why delivery failed, if it did (and why it was not queued, if it
-    /// was not).
+    /// Why delivery failed, if it did (and why it was not durably queued,
+    /// if it was not: either it is not queued, or it is queued but its
+    /// outbox write is not confirmed durable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1352,12 +1427,20 @@ async fn queue_failed_delivery(
         return false;
     };
     match outbox
-        .enqueue(grant, recipient, now_unix, revocations)
+        .enqueue_reporting(grant, recipient, now_unix, revocations)
         .await
     {
         Ok(_) => true,
-        Err(e) => {
-            let reason = format!("not queued for redelivery: {e}");
+        Err(refusal) => {
+            // #1322 review P3: a held entry stays queued (the worker
+            // retries it), but it is not confirmed durable, so it is not
+            // reported as `queued`. The error must not call it absent.
+            let e = refusal.error;
+            let reason = if refusal.held {
+                format!("queued for redelivery, but not confirmed durable: {e}")
+            } else {
+                format!("not queued for redelivery: {e}")
+            };
             *error = Some(match error.take() {
                 Some(prev) => format!("{prev}; {reason}"),
                 None => reason,
