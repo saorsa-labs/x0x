@@ -105,6 +105,47 @@ class AdrCountTests(unittest.TestCase):
             errors,
         )
 
+    def test_transfer_row_cannot_approve_an_invented_archive(self):
+        name = "0117-review-invented.md"
+        payload = b"# Invented\n"
+        archive = self.root / "docs/adr-archive" / name
+        archive.write_bytes(payload)
+        source = self.root / "docs/adr" / name
+        source.symlink_to(f"../adr-archive/{name}")
+        manifest_path = self.root / "docs/adr-archive/move.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["moves"].append(
+            {
+                "from": f"docs/adr/{name}",
+                "to": f"docs/adr-archive/{name}",
+                "link": f"../adr-archive/{name}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        transfer = self.root / "docs/adr/consolidated/TRANSFER.md"
+        row = (
+            "| [ADR 0117: Invented](../0117-review-invented.md) | Proposed | "
+            "[A01](A01-r01-purpose-and-product-limits.md) | Pending |\n"
+        )
+        text = transfer.read_text(encoding="utf-8")
+        self.assertIn("\n## Rulings", text)
+        transfer.write_text(text.replace("\n## Rulings", "\n" + row + "\n## Rulings", 1), encoding="utf-8")
+        approved = CHECK.approved_historical_sources()
+        self.assertIn("docs/adr/0115-identity-discovery-authority.md", approved)
+        self.assertIn("docs/adr/0116-local-history-retention-policy.md", approved)
+        self.assertNotIn(f"docs/adr/{name}", approved)
+        errors = CHECK.validate(self.root)
+        self.assertIn(
+            f"docs/adr/{name}: newly invented archive record is not in "
+            "the approved historical source set.",
+            errors,
+        )
+        self.assertIn(
+            f"docs/adr/{name}: transfer row is not in the approved historical source set.",
+            errors,
+        )
+
     def test_source_mapping_must_name_a_slot(self):
         transfer = self.root / "docs/adr/consolidated/TRANSFER.md"
         text = transfer.read_text(encoding="utf-8")

@@ -2207,6 +2207,54 @@ Keep the owner key separate.
             and "Folding does not change these bytes." in out,
         ))
 
+    _FOLD = """\
+# Folded identity keys note
+
+- **Status:** Folded
+- **Target slot:** A02
+- **Record:** T-identity-keys.md
+
+David folded this Accepted record into A02. The Accepted file stays unchanged.
+"""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        accepted_bytes = path.read_bytes()
+        fold = work / "docs/adr/transient/T-identity-keys.folded.md"
+        fold.write_text(_FOLD)
+        _commit_all(work, "fold transient record with an overlay")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: a Folded overlay keeps the exact Accepted bytes",
+            rc == 0
+            and "ADR governance passed" in out
+            and path.read_bytes() == accepted_bytes,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        path = work / "docs/adr/transient/T-identity-keys.md"
+        path.parent.mkdir(parents=True)
+        accepted = _TRANSIENT.replace("- **Status:** Proposed", "- **Status:** Accepted")
+        path.write_text(accepted)
+        _commit_all(work, "accept transient record")
+        path.write_text(accepted.replace("- **Status:** Accepted", "- **Status:** Folded"))
+        _commit_all(work, "mark the Accepted file Folded")
+        rc, out = _run_validator(work)
+        results.append(check(
+            "transient: changing the Accepted file to Folded fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "Folding does not change these bytes." in out,
+        ))
+
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         _init_repo(work)

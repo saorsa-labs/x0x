@@ -37,7 +37,7 @@ it or create A16.
 
 Target 500–1,000 words per ADR. Review records above 1,500 words. Keep the key guarantees, alternatives and consequences in the decision record.
 
-Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change needs an accepted decision; during transfer it uses the numbered series (D199).
+Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change needs an accepted decision. Record that decision as `docs/adr/transient/T-<slug>.md` (D242). Name one target slot from A01 to A15. Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63). Slices 0109–0114 continue to acceptance as numbered ADRs.
 
 ## Language
 

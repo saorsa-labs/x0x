@@ -82,7 +82,9 @@ excludes a path only when that path is an approved historical source and
 `move.json` entry outside that set is rejected. Files under
 `docs/adr/transient/` do not count (D242). A new decision there is
 `T-<slug>.md`, names one target slot from A01 to A15, and stays Proposed
-until David accepts it. An Accepted transient body stays frozen. A nested
+until David accepts it. An Accepted transient body stays frozen. Folding
+adds `T-<slug>.folded.md` beside that file. The Accepted bytes stay the
+same. A nested
 file that reuses a mapped number counts. A legal run prints the pass line
 only. It does not name an unplaced record.
 

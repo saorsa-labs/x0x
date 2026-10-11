@@ -38,7 +38,8 @@ Enforces:
 - A new decision lives at ``docs/adr/transient/T-<slug>.md`` (D242). It names
   one target slot from A01 to A15 and stays Proposed until David accepts it.
   After acceptance, the body bytes stay frozen across later commits and
-  folding. Deleting or editing those bytes fails.
+  folding. Deleting or editing those bytes fails. Folding is recorded in
+  ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
 """
 from __future__ import annotations
 
@@ -636,10 +637,15 @@ def _frozen_adr_snapshot(
 
 
 TRANSIENT_NAME = re.compile(r"^T-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
+FOLD_NAME = re.compile(r"^(T-[a-z0-9]+(?:-[a-z0-9]+)*)\.folded\.md$")
 TARGET_SLOT_RE = re.compile(
     r"(?im)^\s*[-*]\s*\*{0,2}Target slot:?\*{0,2}:?\s*(A(?:0[1-9]|1[0-5]))\b"
 )
+RECORD_RE = re.compile(
+    r"(?im)^\s*[-*]\s*\*{0,2}Record:?\*{0,2}:?\s*(T-[a-z0-9]+(?:-[a-z0-9]+)*\.md)\s*$"
+)
 TRANSIENT_STATUSES = {"Proposed", "Accepted"}
+TRANSIENT_SUPPORT = {"docs/adr/transient/README.md"}
 
 
 def _transient_shape_errors(path: str, text: str) -> list[str]:
@@ -657,6 +663,51 @@ def _transient_shape_errors(path: str, text: str) -> list[str]:
     return errors
 
 
+def _fold_overlay_errors(path: str, text: str) -> list[str]:
+    """Check a Folded overlay. The Accepted decision file stays unchanged."""
+    errors: list[str] = []
+    name = Path(path)
+    match = FOLD_NAME.match(name.name)
+    if name.parent.as_posix() != "docs/adr/transient" or match is None:
+        errors.append(f"{path}: filename must be docs/adr/transient/T-<slug>.folded.md.")
+        return errors
+    record_name = f"{match.group(1)}.md"
+    status = status_of(text)
+    if status is None or status_token(status) != "Folded":
+        errors.append(f"{path}: fold overlay status must be Folded.")
+    slots = TARGET_SLOT_RE.findall(text)
+    if len(slots) != 1:
+        errors.append(f"{path}: name one target slot from A01 to A15.")
+    if RECORD_RE.findall(text) != [record_name]:
+        errors.append(f"{path}: name the Accepted record {record_name}.")
+    decision_path = f"docs/adr/transient/{record_name}"
+    decision = Path(decision_path)
+    if not decision.is_file():
+        errors.append(f"{path}: Folded overlay needs the Accepted record {decision_path}.")
+        return errors
+    try:
+        decision_text = decision.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"{path}: cannot read Accepted record ({exc}).")
+        return errors
+    decision_status = status_of(decision_text)
+    if decision_status is None or status_token(decision_status) != "Accepted":
+        errors.append(
+            f"{path}: folding requires an Accepted record. Do not change its bytes."
+        )
+    decision_slots = TARGET_SLOT_RE.findall(decision_text)
+    if len(slots) == 1 and decision_slots != [slots[0]]:
+        errors.append(f"{path}: fold overlay target slot must match the Accepted record.")
+    return errors
+
+
+def _skip_transient_support(name: str) -> bool:
+    """Support pages and fold overlays are not Accepted decision bodies."""
+    if name in TRANSIENT_SUPPORT:
+        return True
+    return name.startswith("docs/adr/transient/") and name.endswith(".folded.md")
+
+
 def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
     """Protect transient records. Accepted body bytes survive folding."""
     errors: list[str] = []
@@ -665,14 +716,17 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
     if transient.exists():
         for path in sorted(transient.rglob("*.md")):
             repo_path = path.as_posix()
-            if repo_path == "docs/adr/transient/README.md":
+            if repo_path in TRANSIENT_SUPPORT:
                 continue
-            head_paths.append(repo_path)
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 errors.append(f"{repo_path}: cannot read transient record ({exc}).")
                 continue
+            if FOLD_NAME.match(path.name):
+                errors.extend(_fold_overlay_errors(repo_path, text))
+                continue
+            head_paths.append(repo_path)
             errors.extend(_transient_shape_errors(repo_path, text))
 
     if not base:
@@ -681,7 +735,7 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
     candidates = set(head_paths)
     for name in changed:
         if name.startswith("docs/adr/transient/") and name.endswith(".md"):
-            if name == "docs/adr/transient/README.md":
+            if _skip_transient_support(name):
                 continue
             candidates.add(name)
     try:
@@ -700,7 +754,7 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
         errors.append(f"Failed to scan history for transient records: {exc}")
         added = []
     for name in added:
-        if name == "docs/adr/transient/README.md":
+        if _skip_transient_support(name):
             continue
         if name.startswith("docs/adr/transient/") and name.endswith(".md"):
             candidates.add(name)
