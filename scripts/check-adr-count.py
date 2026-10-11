@@ -4,11 +4,17 @@
 The plan is docs/adr/consolidated/README.md. An exact ``docs/adr/NNNN-*.md``
 path does not count only when it is an approved historical source, ``move.json``
 records that path, and the path is a symlink to the recorded archive link.
-The approved set is the numbered ``docs/adr/`` listing at the merge-base,
-including ADR 0115 and ADR 0116. It does not come from the working-tree
-``TRANSFER.md``. A transfer row or ``move.json`` entry outside that set is
-rejected. Files under ``docs/adr/transient/`` do not count (D242). A nested
-file that reuses a mapped number counts. A legal run prints the pass line only.
+The approved set is the numbered ``docs/adr/`` listing at a trusted
+pre-change commit, including ADR 0115 and ADR 0116. Pull requests use the
+merge-base. Push runs use ``GITHUB_BEFORE``. A local checkout of an updated
+main uses its parent. The candidate HEAD never approves its own archive
+entries. The check fails closed when that commit cannot be resolved. The
+set does not come from the working-tree ``TRANSFER.md``. A path is excluded
+only when that history approves it, ``move.json`` records it, and the table
+has exactly one valid slot row for it. A transfer row or ``move.json`` entry
+outside that set is rejected. Files under ``docs/adr/transient/`` do not
+count (D242). A nested file that reuses a mapped number counts. A legal run
+prints the pass line only.
 
 This check reads local files and local git history. It never starts x0xd or
 contacts the network.
@@ -69,6 +75,7 @@ def source_slot_map(root: Path) -> tuple[dict[str, str], list[str]]:
     """Map each approved historical source path to its slot file."""
     errors: list[str] = []
     mapping: dict[str, str] = {}
+    duplicates: set[str] = set()
     consolidated = root / "docs/adr/consolidated"
     for line in _transfer_table(root).splitlines():
         sources = SOURCE_FILE.findall(line)
@@ -84,8 +91,10 @@ def source_slot_map(root: Path) -> tuple[dict[str, str], list[str]]:
         if len(slots) != 1:
             errors.append(f"{src}: source-to-slot mapping must name one slot A01-A15.")
             continue
-        if src in mapping:
+        if src in mapping or src in duplicates:
             errors.append(f"{src}: historical source is mapped more than once.")
+            mapping.pop(src, None)
+            duplicates.add(src)
             continue
         slot = slots[0]
         if not (consolidated / slot).is_file():
@@ -110,39 +119,90 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _git(args: list[str]) -> str:
+def _git_repo(root: Path | None) -> Path:
+    if root is not None and (root / ".git").exists():
+        return root
+    return _repo_root()
+
+
+def _git(args: list[str], repo: Path) -> str:
     return subprocess.check_output(
-        ["git", "-C", str(_repo_root()), *args],
+        ["git", "-C", str(repo), *args],
         text=True,
         stderr=subprocess.DEVNULL,
     ).strip()
 
 
-def _history_base() -> str:
-    """Return the merge-base whose ``docs/adr/`` listing is the approved set."""
-    head = _git(["rev-parse", "HEAD"])
-    candidates: list[str] = []
-    base_sha = os.environ.get("GITHUB_BASE_SHA")
+def _resolve_commit(repo: Path, rev: str) -> str | None:
+    try:
+        resolved = _git(["rev-parse", "--verify", f"{rev}^{{commit}}"], repo)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    if not resolved or resolved == "0" * 40 or set(resolved) <= {"0"}:
+        return None
+    return resolved
+
+
+def _unresolved(source: str) -> ValueError:
+    return ValueError(f"Cannot resolve the approved historical source set from {source}.")
+
+
+def _history_base(repo: Path) -> str:
+    """Return a pre-change commit. Never the candidate HEAD.
+
+    Pull requests use the merge-base with ``GITHUB_BASE_SHA``. Push runs use
+    ``GITHUB_BEFORE``. When those refs are absent and the branch refs point
+    at HEAD, the parent commit is the trusted set. HEAD is not a fallback.
+    """
+    head = _resolve_commit(repo, "HEAD")
+    if head is None:
+        raise _unresolved("HEAD")
+
+    before = os.environ.get("GITHUB_BEFORE", "").strip()
+    if before:
+        resolved = None if before.startswith("0000000") else _resolve_commit(repo, before)
+        if resolved is None or resolved == head:
+            raise _unresolved("GITHUB_BEFORE")
+        return resolved
+
+    base_sha = os.environ.get("GITHUB_BASE_SHA", "").strip()
     if base_sha:
-        candidates.append(base_sha)
-    candidates.extend(["origin/main", "main", "origin/master", "master"])
-    for cand in candidates:
+        resolved = None if base_sha.startswith("0000000") else _resolve_commit(repo, base_sha)
+        if resolved is None or resolved == head:
+            raise _unresolved("GITHUB_BASE_SHA")
         try:
-            resolved = _git(["rev-parse", "--verify", f"{cand}^{{commit}}"])
-            base = _git(["merge-base", resolved, head])
+            base = _git(["merge-base", resolved, head], repo)
+        except (subprocess.CalledProcessError, OSError):
+            raise _unresolved("GITHUB_BASE_SHA") from None
+        if not base or base == head:
+            raise _unresolved("GITHUB_BASE_SHA")
+        return base
+
+    for cand in ("origin/main", "main", "origin/master", "master"):
+        resolved = _resolve_commit(repo, cand)
+        if resolved is None or resolved == head:
+            continue
+        try:
+            base = _git(["merge-base", resolved, head], repo)
         except (subprocess.CalledProcessError, OSError):
             continue
         if base and base != head:
             return base
-    return head
+
+    parent = _resolve_commit(repo, "HEAD^1")
+    if parent is None or parent == head:
+        raise _unresolved("HEAD^1")
+    return parent
 
 
-def approved_historical_sources() -> set[str]:
-    """Numbered ADR paths at the merge-base, including 0115 and 0116.
+def approved_historical_sources(root: Path | None = None) -> set[str]:
+    """Numbered ADR paths before this change, including 0115 and 0116.
 
-    The working-tree transfer table cannot add a path to this set.
+    The working-tree transfer table cannot add a path to this set. The
+    candidate HEAD cannot add a path either.
     """
-    listing = _git(["ls-tree", "--name-only", _history_base(), "docs/adr/"])
+    repo = _git_repo(root)
+    listing = _git(["ls-tree", "--name-only", _history_base(repo), "docs/adr/"], repo)
     found = {line for line in listing.splitlines() if NUMBERED_REPO_PATH.match(line)}
     missing = EXPLICIT_HISTORICAL_ADDITIONS - found
     if missing:
@@ -214,8 +274,10 @@ def current_records(
 ) -> tuple[int, list[str]]:
     """Return the current count and the relative paths that raised it."""
     if approved is None:
-        approved = approved_historical_sources()
-    archived = recorded_archive_paths(root) & approved
+        approved = approved_historical_sources(root)
+    mapping, _map_errors = source_slot_map(root)
+    # History alone is not enough. Exclusion also needs one valid slot row.
+    archived = recorded_archive_paths(root) & approved & set(mapping)
     slot_count = 0
     consolidated = root / "docs/adr/consolidated"
     if consolidated.exists():
@@ -241,11 +303,17 @@ def current_records(
 
 def validate(root: Path) -> list[str]:
     try:
-        approved = approved_historical_sources()
+        approved = approved_historical_sources(root)
         errors = transfer_history_errors(root, approved)
         errors.extend(invented_archive_errors(root, approved))
         count, extras = current_records(root, approved)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ) as exc:
         return [f"Cannot count ADRs: {exc}. Plan: {PLAN}"]
     if count > LIMIT:
         errors.append(fail_line(count, extras))

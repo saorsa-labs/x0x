@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -144,6 +145,136 @@ class AdrCountTests(unittest.TestCase):
         self.assertIn(
             f"docs/adr/{name}: transfer row is not in the approved historical source set.",
             errors,
+        )
+
+    def _git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(self.root), *args], text=True
+        ).strip()
+
+    def _add_invented_archive(self, name: str) -> None:
+        payload = b"# Invented\n"
+        archive = self.root / "docs/adr-archive" / name
+        archive.write_bytes(payload)
+        source = self.root / "docs/adr" / name
+        source.symlink_to(f"../adr-archive/{name}")
+        manifest_path = self.root / "docs/adr-archive/move.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["moves"].append(
+            {
+                "from": f"docs/adr/{name}",
+                "to": f"docs/adr-archive/{name}",
+                "link": f"../adr-archive/{name}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        transfer = self.root / "docs/adr/consolidated/TRANSFER.md"
+        row = (
+            f"| [ADR 0117: Invented](../{name}) | Proposed | "
+            "[A01](A01-r01-purpose-and-product-limits.md) | Pending |\n"
+        )
+        text = transfer.read_text(encoding="utf-8")
+        transfer.write_text(
+            text.replace("\n## Rulings", "\n" + row + "\n## Rulings", 1),
+            encoding="utf-8",
+        )
+
+    def test_push_event_cannot_approve_an_invented_archive(self):
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
+        for key, value in (
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ):
+            subprocess.run(["git", "config", key, value], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "approved history"], cwd=self.root, check=True
+        )
+        before = self._git("rev-parse", "HEAD")
+        name = "0117-review-invented.md"
+        self._add_invented_archive(name)
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "invent archive on main"],
+            cwd=self.root,
+            check=True,
+        )
+        head = self._git("rev-parse", "HEAD")
+        self._git("update-ref", "refs/remotes/origin/main", head)
+        self.assertEqual(self._git("rev-parse", "main"), head)
+        self.assertEqual(self._git("rev-parse", "origin/main"), head)
+        head_listing = self._git("ls-tree", "--name-only", head, "docs/adr/")
+        before_listing = self._git("ls-tree", "--name-only", before, "docs/adr/")
+        self.assertIn(f"docs/adr/{name}", head_listing)
+        self.assertNotIn(f"docs/adr/{name}", before_listing)
+        saved = {
+            key: os.environ.get(key) for key in ("GITHUB_BEFORE", "GITHUB_BASE_SHA")
+        }
+
+        def restore() -> None:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        os.environ.pop("GITHUB_BASE_SHA", None)
+        os.environ["GITHUB_BEFORE"] = before
+        self.assertEqual(CHECK._history_base(self.root), before)
+        self.assertNotEqual(CHECK._history_base(self.root), head)
+        errors = CHECK.validate(self.root)
+        self.assertIn(
+            f"docs/adr/{name}: newly invented archive record is not in "
+            "the approved historical source set.",
+            errors,
+        )
+        self.assertIn(
+            f"docs/adr/{name}: transfer row is not in the approved historical source set.",
+            errors,
+        )
+        self.assertIn(
+            "16 current ADRs exceeds the limit of 15. "
+            f"Extra: {name}. "
+            "Plan: docs/adr/consolidated/README.md",
+            errors,
+        )
+        os.environ.pop("GITHUB_BEFORE", None)
+        self.assertEqual(CHECK._history_base(self.root), before)
+        self.assertNotEqual(CHECK._history_base(self.root), head)
+        local_errors = CHECK.validate(self.root)
+        self.assertIn(
+            f"docs/adr/{name}: newly invented archive record is not in "
+            "the approved historical source set.",
+            local_errors,
+        )
+        os.environ["GITHUB_BEFORE"] = "0" * 40
+        closed = CHECK.validate(self.root)
+        self.assertTrue(
+            any(
+                "Cannot resolve the approved historical source set from GITHUB_BEFORE."
+                in error
+                for error in closed
+            )
+        )
+
+    def test_deleted_transfer_row_counts_the_archived_source(self):
+        transfer = self.root / "docs/adr/consolidated/TRANSFER.md"
+        text = transfer.read_text(encoding="utf-8")
+        needle = "../0115-identity-discovery-authority.md"
+        self.assertEqual(text.count(needle), 1)
+        kept = [line for line in text.splitlines() if needle not in line]
+        transfer.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        errors = CHECK.validate(self.root)
+        self.assertEqual(
+            errors,
+            [
+                "16 current ADRs exceeds the limit of 15. "
+                "Extra: 0115-identity-discovery-authority.md. "
+                "Plan: docs/adr/consolidated/README.md"
+            ],
         )
 
     def test_source_mapping_must_name_a_slot(self):
