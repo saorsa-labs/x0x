@@ -53,6 +53,8 @@ pub(super) use discovery::{
     discovered_agents, find_agent, machine_for_agent_handler, DiscoveredAgentEntry,
 };
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
+#[cfg(test)]
+pub(super) use files::unverified_file_frame_drops;
 pub(super) use files::{
     decode_file_message, file_accept_handler, file_reject_handler, file_send_handler,
     file_transfer_status_handler, file_transfers_handler, handle_file_message, FileChunkAckSlot,

@@ -228,6 +228,18 @@ pub enum FileMessage {
         /// Highest contiguous chunk sequence number successfully persisted.
         sequence: u64,
     },
+    /// The peer committed an offer, accept, or reject.
+    ///
+    /// A raw QUIC receive-ACK only means the bytes were drained. The sender
+    /// of an offer, accept, or reject waits for this frame before it reports
+    /// success. The peer sends it only after it accepts the control frame.
+    #[serde(rename = "file-control-ack")]
+    ControlAck {
+        /// Transfer this acknowledgement belongs to.
+        transfer_id: String,
+        /// `offer`, `accept`, or `reject`.
+        op: String,
+    },
 }
 
 #[cfg(test)]
@@ -365,6 +377,21 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: FileMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, FileMessage::Reject { .. }));
+    }
+
+    #[test]
+    fn file_message_control_ack_roundtrip() {
+        let msg = FileMessage::ControlAck {
+            transfer_id: "t1".to_string(),
+            op: "offer".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file-control-ack\""));
+        let decoded: FileMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            FileMessage::ControlAck { op, .. } if op == "offer"
+        ));
     }
 
     #[test]

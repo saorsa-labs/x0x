@@ -30,6 +30,11 @@ fn ephemeral_family_payloads() -> Vec<(&'static str, Vec<u8>)> {
         sequence: 0,
     })
     .expect("serialize chunk ack");
+    let control_ack = serde_json::to_vec(&x0x::files::FileMessage::ControlAck {
+        transfer_id: "t1".into(),
+        op: "offer".into(),
+    })
+    .expect("serialize control ack");
 
     let keypair = x0x::identity::AgentKeypair::generate().expect("generate group author");
     let group_message = x0x::groups::GroupPublicMessage::sign(
@@ -71,6 +76,7 @@ fn ephemeral_family_payloads() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("file-chunk", chunk),
         ("file-chunk-ack", chunk_ack),
+        ("file-control-ack", control_ack),
         (
             "welcome-blob-chunk",
             br#"{"type":"chunk","group_id":"g","welcome_id":"w","index":0,"data_b64":"AAAA"}"#

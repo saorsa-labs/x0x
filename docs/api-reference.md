@@ -1967,6 +1967,10 @@ exactly this (saorsa-labs/x0x-symphony#10).
 | POST | `/files/accept/:id` | `x0x accept-file <transfer_id>` | Accept a pending transfer |
 | POST | `/files/reject/:id` | `x0x reject-file <transfer_id> [--reason ...]` | Reject a pending transfer |
 
+`POST /files/send` and `POST /files/accept/:id` report success only after the peer commits the control frame. The peer sends a `file-control-ack` after it stores the offer, accept, or reject. A raw QUIC receive-ACK is not that commitment. If the peer does not commit the frame, send returns 500 and marks the local transfer failed. Accept returns 500 and puts the transfer back to pending. Reject stays rejected locally and returns 200 with a warning when the peer does not confirm it.
+
+A peer from before this frame does not send `file-control-ack`. A sender on this build then reports that the control frame was not accepted. The older peer may still have stored the offer.
+
 ### Send-file request body
 
 ```json

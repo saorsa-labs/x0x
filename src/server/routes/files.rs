@@ -163,7 +163,41 @@ pub(in crate::server) async fn wait_for_chunk_window(
     }
 }
 
-async fn send_file_message(
+const CONTROL_OP_OFFER: &str = "offer";
+const CONTROL_OP_ACCEPT: &str = "accept";
+const CONTROL_OP_REJECT: &str = "reject";
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+
+static UNVERIFIED_FILE_FRAME_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(in crate::server) fn unverified_file_frame_drops() -> u64 {
+    UNVERIFIED_FILE_FRAME_DROPS.load(Ordering::Relaxed)
+}
+
+fn control_op(msg: &x0x::files::FileMessage) -> Option<&'static str> {
+    match msg {
+        x0x::files::FileMessage::Offer(_) => Some(CONTROL_OP_OFFER),
+        x0x::files::FileMessage::Accept { .. } => Some(CONTROL_OP_ACCEPT),
+        x0x::files::FileMessage::Reject { .. } => Some(CONTROL_OP_REJECT),
+        _ => None,
+    }
+}
+
+fn control_transfer_id(msg: &x0x::files::FileMessage) -> Option<&str> {
+    match msg {
+        x0x::files::FileMessage::Offer(offer) => Some(&offer.transfer_id),
+        x0x::files::FileMessage::Accept { transfer_id } => Some(transfer_id),
+        x0x::files::FileMessage::Reject { transfer_id, .. } => Some(transfer_id),
+        _ => None,
+    }
+}
+
+fn control_ack_key(op: &str, transfer_id: &str) -> String {
+    format!("ctrl:{op}:{transfer_id}")
+}
+
+async fn deliver_file_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     msg: &x0x::files::FileMessage,
@@ -174,6 +208,68 @@ async fn send_file_message(
         .send_direct_with_config(agent_id, payload, file_transfer_control_send_config())
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn wait_for_control_ack(slot: &FileChunkAckSlot) -> std::result::Result<(), String> {
+    let deadline = tokio::time::Instant::now() + CONTROL_ACK_TIMEOUT;
+    loop {
+        if slot.last_acked.load(Ordering::SeqCst) != u64::MAX {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("peer did not accept the file control frame".to_string());
+        }
+        // `record_ack` calls `notify_waiters`, which stores no permit. Recheck
+        // on a short interval so an ack that lands between the load and the
+        // wait is still observed before the deadline.
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = notified.as_mut() => {}
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+async fn send_file_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &x0x::files::FileMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let Some(op) = control_op(msg) else {
+        return deliver_file_message(state, agent_id, msg).await;
+    };
+    let Some(transfer_id) = control_transfer_id(msg) else {
+        return deliver_file_message(state, agent_id, msg).await;
+    };
+    let key = control_ack_key(op, transfer_id);
+    let slot = Arc::new(FileChunkAckSlot::new());
+    state
+        .file_chunk_acks
+        .write()
+        .await
+        .insert(key.clone(), Arc::clone(&slot));
+    let sent = deliver_file_message(state, agent_id, msg).await;
+    if let Err(error) = sent {
+        state.file_chunk_acks.write().await.remove(&key);
+        return Err(error);
+    }
+    let waited = wait_for_control_ack(&slot).await;
+    state.file_chunk_acks.write().await.remove(&key);
+    waited?;
+    sent
+}
+
+async fn send_file_control_ack(state: &Arc<AppState>, peer: &AgentId, transfer_id: &str, op: &str) {
+    let ack = x0x::files::FileMessage::ControlAck {
+        transfer_id: transfer_id.to_string(),
+        op: op.to_string(),
+    };
+    if let Err(error) = deliver_file_message(state, peer, &ack).await {
+        tracing::warn!(transfer_id, op, "failed to send file control ack: {error}");
+    }
 }
 
 async fn send_file_chunk_message(
@@ -490,6 +586,14 @@ pub(in crate::server) fn decode_file_message(
     message: &x0x::direct::DirectMessage,
 ) -> Option<(&AgentId, x0x::files::FileMessage)> {
     if !message.verified {
+        if serde_json::from_slice::<x0x::files::FileMessage>(&message.payload).is_ok() {
+            let drops = UNVERIFIED_FILE_FRAME_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                sender = %hex::encode(message.sender.as_bytes()),
+                drops,
+                "dropped unverified file frame; a transport ACK is not acceptance"
+            );
+        }
         return None;
     }
     let payload = serde_json::from_slice(&message.payload).ok()?;
@@ -529,6 +633,12 @@ pub(in crate::server) async fn handle_file_message(
             // (already torn down, never started here) are silently dropped.
             if let Some(slot) = state.file_chunk_acks.read().await.get(&transfer_id) {
                 slot.record_ack(sequence);
+            }
+        }
+        x0x::files::FileMessage::ControlAck { transfer_id, op } => {
+            let key = control_ack_key(&op, &transfer_id);
+            if let Some(slot) = state.file_chunk_acks.read().await.get(&key) {
+                slot.record_ack(0);
             }
         }
     }
@@ -600,6 +710,8 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         .write()
         .await
         .insert(offer.transfer_id.clone(), transfer);
+
+    send_file_control_ack(state, sender, &offer.transfer_id, CONTROL_OP_OFFER).await;
 
     // Emit SSE event so apps can be notified
     let _ = state.broadcast_tx.send(SseEvent {
@@ -679,6 +791,8 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
         tracing::error!("Invalid agent_id in transfer {transfer_id}");
         return;
     };
+
+    send_file_control_ack(state, sender, transfer_id, CONTROL_OP_ACCEPT).await;
 
     // Spawn async task to stream chunks.
     //
@@ -890,21 +1004,30 @@ async fn handle_file_reject(
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::info!("File reject received: {transfer_id} from {sender_hex} — {reason}");
-    let mut transfers = state.file_transfers.write().await;
-    if let Some(t) = transfers.get_mut(transfer_id) {
-        if t.direction == x0x::files::TransferDirection::Sending {
-            // Authenticate: sender must match the remote_agent_id
-            if t.remote_agent_id != sender_hex {
+    let applied = {
+        let mut transfers = state.file_transfers.write().await;
+        match transfers.get_mut(transfer_id) {
+            Some(t)
+                if t.direction == x0x::files::TransferDirection::Sending
+                    && t.remote_agent_id == sender_hex =>
+            {
+                t.status = x0x::files::TransferStatus::Rejected;
+                t.error = Some(reason.to_string());
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+                true
+            }
+            Some(t) if t.direction == x0x::files::TransferDirection::Sending => {
                 tracing::warn!(
                     "Reject from wrong agent for {transfer_id}: expected {} got {sender_hex}",
                     t.remote_agent_id
                 );
-                return;
+                false
             }
-            t.status = x0x::files::TransferStatus::Rejected;
-            t.error = Some(reason.to_string());
-            t.completed_at_unix_ms = Some(file_transfer_now().1);
+            _ => false,
         }
+    };
+    if applied {
+        send_file_control_ack(state, sender, transfer_id, CONTROL_OP_REJECT).await;
     }
 }
 
@@ -1335,6 +1458,7 @@ mod tests {
             serde_json::json!({"type": "file-accept", "transfer_id": "id"}),
             serde_json::json!({"type": "file-reject", "transfer_id": "id", "reason": "no"}),
             serde_json::json!({"type": "file-chunk-ack", "transfer_id": "id", "sequence": 0}),
+            serde_json::json!({"type": "file-control-ack", "transfer_id": "id", "op": "offer"}),
         ];
         for frame in frames {
             let payload = serde_json::to_vec(&frame).expect("serialize frame");

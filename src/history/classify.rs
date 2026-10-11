@@ -34,6 +34,7 @@ pub const VOICE_SIGNALING_DM_PREFIX: &[u8] = b"x0x-voice-sig-v1\n";
 const EPHEMERAL_TYPE_TAGS: &[&str] = &[
     "file-chunk",
     "file-chunk-ack",
+    "file-control-ack",
     "fetch_request",
     "offer",
     "chunk",
