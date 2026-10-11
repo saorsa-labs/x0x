@@ -63,14 +63,16 @@ Index entries below that carry an **[overlay: …]** tag are covered here.
 
 ### ADR 0095 open question 4
 
-David ruled on 10 Oct 2026. He closed open question 4. ADR 0095 is Accepted
+David ruled D246 on 11 Oct 2026. He closed open question 4. ADR 0095 is Accepted
 and archived, so its question list stays unchanged. The answer is in
 [A01 Open questions](consolidated/A01-r01-purpose-and-product-limits.md#open-questions).
 
-Goal E counts in place of an R under rule 5 when the change keeps behaviour
-the same and the gain is measured with a before-and-after number. The E-D15
-checklist still applies. A wire, protocol, API, or dependency change still
-needs its own ADR first.
+Goal E counts in place of an R under rule 5 when the change keeps the wire
+format, API, stored format and dependencies unchanged, and the rule-21
+delivery matrix shows no loss. The decision states a target gain when
+Proposed. It is Folded only after a measured before-and-after result that
+meets E-D15 rule 15. Any wire, protocol, API or dependency change needs a
+transient ADR (D242) that names an R.
 
 ### Do not start new work: parked, retired, rejected, withdrawn or held
 
