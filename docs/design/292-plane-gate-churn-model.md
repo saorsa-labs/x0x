@@ -25,7 +25,14 @@ consult. A peer with a live `reconnect_suppressions` tombstone returns `Suppress
 what the ant-quic transport layer reports; a transient accept-to-close window or an in-flight
 dial answered mid-handshake cannot produce an `Admitted` verdict.
 
-**Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases)
+The HyParView JOIN seeds of `join_network` are such a consumer (#1321,
+`src/gossip/join_seeds.rs`). A dial that returned `Ok` is transport truth: the
+plane hello that can refuse the peer arrives after it. So the seeds are only the
+dialled peers that `peer_admission` reports `Admitted`, after a bounded wait for
+open plane verdicts.
+
+**Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
+`tests/cross_plane_join_seeds.rs` (JOIN seeds)
 
 ### B — Per-frame gate drops suppressed-peer frames
 

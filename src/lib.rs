@@ -12727,7 +12727,10 @@ impl Agent {
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
         let min_connected = 3;
-        let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
+        // x0x#1321: dial results with the answered peer ids. A dial that
+        // returned Ok is transport truth only; the plane gate (#206) and the
+        // #292 tombstones decide gossip admission after it.
+        let mut all_connected = gossip::join_seeds::JoinCandidates::default();
 
         // ant-quic now owns first-party mDNS discovery and auto-connect.
         // x0x keeps bootstrap/cache orchestration here, while the transport
@@ -12752,7 +12755,7 @@ impl Agent {
                 let (succeeded, _failed) = self
                     .connect_peers_parallel_tracked(network, &coordinator_addrs)
                     .await;
-                all_connected.extend(&succeeded);
+                all_connected.extend(succeeded.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
                     succeeded.len(),
@@ -12762,6 +12765,7 @@ impl Agent {
         }
 
         // Phase 1: Try cached peers first using the real ant-quic peer IDs.
+        all_connected.prune_suppressed(network);
         if all_connected.len() < min_connected {
             if let Some(ref cache) = self.bootstrap_cache {
                 const PHASE1_PEER_CANDIDATES: usize = 12;
@@ -12771,7 +12775,7 @@ impl Agent {
                     let (succeeded, _failed) = self
                         .connect_cached_peers_parallel_tracked(network, &cached_peers)
                         .await;
-                    all_connected.extend(&succeeded);
+                    all_connected.extend(succeeded.iter().copied());
                     tracing::info!(
                         "Phase 1: {}/{} cached peers connected",
                         succeeded.len(),
@@ -12783,10 +12787,11 @@ impl Agent {
 
         // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
         // This is the fallback for when coordinator cache and cached peers aren't enough.
+        all_connected.prune_suppressed(network);
         if all_connected.len() < min_connected && !bootstrap_nodes.is_empty() {
             let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
                 .iter()
-                .filter(|addr| !all_connected.contains(addr))
+                .filter(|addr| !all_connected.contains_addr(addr))
                 .copied()
                 .collect();
 
@@ -12794,7 +12799,7 @@ impl Agent {
             let (succeeded, mut failed) = self
                 .connect_peers_parallel_tracked(network, &remaining)
                 .await;
-            all_connected.extend(&succeeded);
+            all_connected.extend(succeeded.iter().copied());
             tracing::info!(
                 "Phase 2 round 1: {}/{} bootstrap peers connected",
                 succeeded.len(),
@@ -12817,7 +12822,7 @@ impl Agent {
 
                 let (succeeded, still_failed) =
                     self.connect_peers_parallel_tracked(network, &failed).await;
-                all_connected.extend(&succeeded);
+                all_connected.extend(succeeded.iter().copied());
                 failed = still_failed;
                 tracing::info!(
                     "Phase 2 round {}: {} total peers connected",
@@ -12840,9 +12845,17 @@ impl Agent {
             all_connected.len()
         );
 
-        // Join the HyParView membership overlay via connected peers.
+        // Join the HyParView membership overlay via gossip-admitted peers
+        // only (x0x#1321): a seed the plane gate refused or #292 suppressed
+        // can only make the JOIN retry it.
         if let Some(ref runtime) = self.gossip_runtime {
-            let seeds: Vec<String> = all_connected.iter().map(|addr| addr.to_string()).collect();
+            let seeds: Vec<String> = all_connected
+                .settle_join_seeds(network)
+                .await
+                .seeds
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect();
             if !seeds.is_empty() {
                 if let Err(e) = runtime.membership().join(seeds).await {
                     tracing::warn!("HyParView membership join failed: {e}");
@@ -13305,12 +13318,17 @@ impl Agent {
         self.dm_capabilities_tx.borrow().clone()
     }
 
-    /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
+    /// Connect to cached peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, peer id)`; `connect_cached_peer` returns
+    /// `Ok` only for the requested, authenticated peer.
     async fn connect_cached_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         peers: &[ant_quic::CachedPeer],
-    ) -> (Vec<std::net::SocketAddr>, Vec<ant_quic::PeerId>) {
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<ant_quic::PeerId>,
+    ) {
         use tokio::time::{timeout, Duration};
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -13324,7 +13342,7 @@ impl Agent {
                     match timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)).await {
                         Ok(Ok(addr)) => {
                             tracing::info!("Connected to cached peer {:?} at {}", peer_id, addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to cached peer {:?}: {}", peer_id, e);
@@ -13347,7 +13365,7 @@ impl Agent {
         let mut failed = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
+                Ok(Ok(dialled)) => succeeded.push(dialled),
                 Ok(Err(peer_id)) => failed.push(peer_id),
                 Err(e) => tracing::error!("Connection task panicked: {}", e),
             }
@@ -13355,12 +13373,16 @@ impl Agent {
         (succeeded, failed)
     }
 
-    /// Connect to multiple peers in parallel, returning (succeeded, failed) address lists.
+    /// Connect to multiple peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, answered peer id)`.
     async fn connect_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         addrs: &[std::net::SocketAddr],
-    ) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<std::net::SocketAddr>,
+    ) {
         use tokio::time::{timeout, Duration};
 
         // Per-connection timeout prevents hanging when connecting to
@@ -13375,9 +13397,9 @@ impl Agent {
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
                     match timeout(CONNECT_TIMEOUT, net.connect_addr(addr)).await {
-                        Ok(Ok(_)) => {
+                        Ok(Ok(peer_id)) => {
                             tracing::info!("Connected to peer: {}", addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to {}: {}", addr, e);
@@ -13400,7 +13422,7 @@ impl Agent {
         let mut failed = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
+                Ok(Ok(dialled)) => succeeded.push(dialled),
                 Ok(Err(addr)) => failed.push(addr),
                 Err(e) => tracing::error!("Connection task panicked: {}", e),
             }

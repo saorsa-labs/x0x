@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cached peer on another gossip plane no longer becomes a HyParView JOIN
+  seed (#1321).** `join_network` built the JOIN seeds from transport dial
+  results. A cached cross-plane peer passed the dial, the plane gate (#206)
+  refused it a moment later, and it still became a seed. The JOIN then
+  dialled it up to ten times (about 81 s) and the #292 gate refused every
+  dial, so presence beacons, the first identity announcement and the
+  capability advert started that much later. JOIN seeds are now only the
+  dialled peers that `peer_admission` (#292 invariant A) admits, after a
+  bounded wait (at most 12 s) for open plane verdicts. A suppressed peer also
+  no longer counts toward the join's minimum of three connected peers. The
+  defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4 rollout
+  too.
+
 ## [v0.47.1] - 2026-10-12
 
 A patch release. It contains durability fixes for named groups and share grants. It adds no breaking API change and no stored-format change.
