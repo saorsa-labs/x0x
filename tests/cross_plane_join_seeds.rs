@@ -163,11 +163,20 @@ static RECONNECT_GATE: Gate = Gate::new("proactive reconnect attempt");
 static PLANE_REFUSAL_GATE: Gate =
     Gate::new("gossip-plane mismatch: refusing cross-plane peer (issue #206)");
 
+/// `NetworkNode::connect_addr_with_origin` logs this (target
+/// `x0x::connect`, debug) when an address dial starts, with the address in
+/// `addr`. Every `join_network` address dial goes through it.
+const DIAL_STARTED: &str = "starting direct dial";
+
+/// Addresses of captured [`DIAL_STARTED`] events, in order.
+static DIAL_STARTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 #[derive(Default)]
 struct JoinVisitor {
     message: String,
     seed: Option<String>,
     new_peer: Option<String>,
+    addr: Option<String>,
 }
 
 impl Visit for JoinVisitor {
@@ -176,6 +185,7 @@ impl Visit for JoinVisitor {
             "message" => self.message = value.to_string(),
             "seed" => self.seed = Some(value.to_string()),
             "new_peer" => self.new_peer = Some(value.to_string()),
+            "addr" => self.addr = Some(value.to_string()),
             _ => {}
         }
     }
@@ -185,6 +195,7 @@ impl Visit for JoinVisitor {
             "message" => self.message = format!("{value:?}"),
             "seed" => self.seed = Some(format!("{value:?}")),
             "new_peer" => self.new_peer = Some(format!("{value:?}")),
+            "addr" => self.addr = Some(format!("{value:?}")),
             _ => {}
         }
     }
@@ -202,9 +213,17 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(JoinEvent {
                     message: visitor.message.clone(),
-                    seed: visitor.seed,
-                    new_peer: visitor.new_peer,
+                    seed: visitor.seed.clone(),
+                    new_peer: visitor.new_peer.clone(),
                 });
+        }
+        if visitor.message == DIAL_STARTED {
+            if let Some(addr) = visitor.addr.clone() {
+                DIAL_STARTS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(addr);
+            }
         }
         JOIN_COMPLETE_GATE.pass(&visitor.message);
         RECONNECT_GATE.pass(&visitor.message);
@@ -212,14 +231,27 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
     }
 }
 
-/// Install the process-global capture of saorsa-gossip membership events
-/// and x0x info events (the gate events). Only these targets are enabled,
-/// so other crates' callsites stay disabled.
+/// How many address dials to `addr` have started.
+fn dials_started_to(addr: SocketAddr) -> usize {
+    let addr = addr.to_string();
+    DIAL_STARTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|started| **started == addr)
+        .count()
+}
+
+/// Install the process-global capture of saorsa-gossip membership events,
+/// x0x info events (the gate events) and x0x connect debug events (dial
+/// starts). Only these targets are enabled, so other crates' callsites stay
+/// disabled.
 fn install_join_capture() {
     CAPTURE.get_or_init(|| {
         let targets = tracing_subscriber::filter::Targets::new()
             .with_target("saorsa_gossip_membership", tracing::Level::DEBUG)
-            .with_target("x0x", tracing::Level::INFO);
+            .with_target("x0x", tracing::Level::INFO)
+            .with_target("x0x::connect", tracing::Level::DEBUG);
         let subscriber = tracing_subscriber::registry().with(JoinCapture.with_filter(targets));
         tracing::subscriber::set_global_default(subscriber)
             .expect("install the JOIN capture subscriber");
@@ -550,37 +582,53 @@ fn spawn_join(agent: &Arc<Agent>) -> tokio::task::JoinHandle<x0x::error::Result<
 }
 
 /// How long the reconnect gate stays closed after the seed read is
-/// released, if the join has not returned before. While the gate is
-/// closed, no proactive redial can restore the peer.
+/// released, if the join has not returned before.
 const RECONNECT_HOLD: Duration = Duration::from_secs(3);
 
 /// Upper bound for a join that waits for transport recovery: the reconnect
-/// hold, one proactive redial, and the JOIN.
+/// hold, one redial, and the JOIN.
 const RECOVERY_JOIN_BOUND: Duration = Duration::from_secs(60);
 
-/// Codex round-1 finding 1. The sole same-plane candidate answers the
-/// Phase 1 dial. Then it loses its transport connection before the join
-/// reads the JOIN seed verdicts, and the proactive reconnect restores it
-/// after that read. The JOIN must still reach the peer. (The code before
-/// round 1 kept the address, and the JOIN redialled it.)
+/// Upper bound for the join when the proactive reconnect stays in flight.
+/// The round-2 code (8a60712) gave up after a fixed 49.2 s. The old JOIN
+/// retried one seed for about 81 s of backoff plus dial time.
+const SLOW_RECONNECT_JOIN_BOUND: Duration = Duration::from_secs(150);
+
+/// Upper bound for a join after shutdown began.
+const SHUTDOWN_JOIN_BOUND: Duration = Duration::from_secs(5);
+
+/// How long a test waits for all plane refusals to reach the closed
+/// refusal gate. Well inside the 10 s plane legacy grace, after which an
+/// open verdict reads as admitted.
+const REFUSAL_HOLD_BOUND: Duration = Duration::from_secs(5);
+
+/// The transient-loss scenario, held at the seed read.
+struct TransientLoss {
+    _peer_agent: Agent,
+    peer_addr: SocketAddr,
+    prod: Arc<Agent>,
+    join: tokio::task::JoinHandle<x0x::error::Result<()>>,
+}
+
+/// The sole same-plane candidate answers the Phase 1 dial. Then it loses
+/// its transport connection before the join reads its JOIN seed verdicts.
 ///
 /// Gates fix the event order:
 /// 1. `JOIN_COMPLETE_GATE` holds `join_network` after its dials and before
 ///    its first seed read. The test drops the connection with a
 ///    transport-reason disconnect (no tombstone) and waits until the agent
-///    reports the peer as not connected. Then it opens the gate.
-/// 2. `RECONNECT_GATE` holds every proactive redial until the join has
-///    returned or [`RECONNECT_HOLD`] has passed. So the peer is not
-///    connected when the join reads its verdict.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn issue1321_transient_loss_before_seed_read_still_joins_after_reconnect() {
-    install_join_capture();
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let (_peer_agent, peer, peer_addr) = remote_agent(dir.path(), "peer", Some(PROD_PLANE)).await;
-    let prod = Arc::new(build_agent(dir.path(), "prod", Some(PROD_PLANE)).await);
+///    reports the peer as not connected.
+/// 2. `RECONNECT_GATE` holds every proactive redial. The test waits until
+///    the proactive reconnect for the lost peer reaches the gate. Only then
+///    does it open `JOIN_COMPLETE_GATE`. So the peer is not connected when
+///    the join reads its verdict.
+///
+/// `RECONNECT_GATE` stays closed when this returns.
+async fn transient_loss_at_seed_read(dir: &std::path::Path) -> TransientLoss {
+    let (peer_agent, peer, peer_addr) = remote_agent(dir, "peer", Some(PROD_PLANE)).await;
+    let prod = Arc::new(build_agent(dir, "prod", Some(PROD_PLANE)).await);
     cache_peer(&prod, peer, peer_addr).await;
     let prod_network = Arc::clone(prod.network().expect("prod network"));
-    let prod_id = prod.machine_id().0;
 
     JOIN_COMPLETE_GATE.arm();
     RECONNECT_GATE.arm();
@@ -606,73 +654,141 @@ async fn issue1321_transient_loss_before_seed_read_still_joins_after_reconnect()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        RECONNECT_GATE.wait_held(1, Duration::from_secs(10)).await,
+        "scenario: the proactive reconnect for the lost peer must reach \
+         RECONNECT_GATE before the seed read"
+    );
     assert_eq!(
         prod_network.peer_admission(&peer).await,
         PeerAdmission::NotConnected,
-        "scenario: a transport loss must leave no tombstone"
+        "scenario: a transport loss must leave no tombstone, and the held \
+         reconnect must not have restored the peer"
     );
     JOIN_COMPLETE_GATE.open();
-
-    let hold_deadline = tokio::time::Instant::now() + RECONNECT_HOLD;
-    while !join.is_finished() && tokio::time::Instant::now() < hold_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    TransientLoss {
+        _peer_agent: peer_agent,
+        peer_addr,
+        prod,
+        join,
     }
-    assert!(
-        !prod_network.is_connected(&peer).await,
-        "scenario: nothing may reconnect the peer while the reconnect gate is closed"
-    );
-    RECONNECT_GATE.open();
+}
 
-    let joined = tokio::time::timeout(RECOVERY_JOIN_BOUND, join).await;
-    assert!(
-        matches!(joined, Ok(Ok(Ok(())))),
-        "join_network must finish within {RECOVERY_JOIN_BOUND:?}: {joined:?}"
-    );
+/// The JOIN reached `peer_addr` once, with no retries, and the peer received
+/// the JOIN frame from `joiner`.
+async fn assert_join_reached(peer_addr: SocketAddr, joiner: [u8; 32], context: &str) {
     let events = join_events_for(peer_addr);
     assert_eq!(count(&events, JOIN_RETRY), 0, "no JOIN retries: {events:?}");
     assert_eq!(
         count(&events, JOIN_JOINED),
         1,
-        "after its transport recovers, the same-plane peer must get the JOIN; \
-         it must not be dropped as a seed after one not-connected read: {events:?}"
+        "{context}: the JOIN must reach the same-plane peer {peer_addr}: {events:?}"
     );
     assert!(
-        wait_join_received_from(prod_id, Duration::from_secs(10)).await,
-        "the peer must receive the JOIN frame (overlay membership, not only a return)"
+        wait_join_received_from(joiner, Duration::from_secs(10)).await,
+        "{context}: the peer must receive the JOIN frame (overlay membership, \
+         not only a return)"
     );
 }
 
-/// Codex round-1 finding 2. Three cached cross-plane peers answer the
-/// Phase 1 dials. Their plane verdicts are still open when the join counts
-/// its peers, so they fill `min_connected` and the join skips the Phase 2
-/// bootstrap fallback. The plane gate refuses all three a moment later. The
-/// join must then still fall back to the reachable same-plane bootstrap
-/// node.
-///
-/// Gates fix the event order:
-/// 1. `PLANE_REFUSAL_GATE` holds every plane-mismatch refusal, on both
-///    sides, before its tombstone and disconnect.
-/// 2. `JOIN_COMPLETE_GATE` holds `join_network` after its phase decisions.
-///    The test checks that all three peers are connected with an open plane
-///    verdict. Then it opens both gates, so the refusals land after the
-///    phase decisions.
+/// Codex round-1 finding 1. After the transient loss, the proactive
+/// reconnect is released within [`RECONNECT_HOLD`]. The JOIN must still
+/// reach the peer. (The code before round 1 kept the address, and the JOIN
+/// redialled it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback() {
+async fn issue1321_transient_loss_before_seed_read_still_joins_after_reconnect() {
     install_join_capture();
     let dir = tempfile::tempdir().expect("tmpdir");
-    let (_boot_agent, _boot, boot_addr) = remote_agent(dir.path(), "boot", Some(PROD_PLANE)).await;
+    let scenario = transient_loss_at_seed_read(dir.path()).await;
+    let prod_id = scenario.prod.machine_id().0;
+
+    let hold_deadline = tokio::time::Instant::now() + RECONNECT_HOLD;
+    while !scenario.join.is_finished() && tokio::time::Instant::now() < hold_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    RECONNECT_GATE.open();
+
+    let joined = tokio::time::timeout(RECOVERY_JOIN_BOUND, scenario.join).await;
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must finish within {RECOVERY_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_join_reached(
+        scenario.peer_addr,
+        prod_id,
+        "the lost candidate must not be dropped as a seed after one not-connected read",
+    )
+    .await;
+}
+
+/// Codex re-review of 8a60712, finding 1. After the transient loss, the
+/// proactive reconnect stays in flight (held at `RECONNECT_GATE`) until the
+/// join returns. The round-2 code waited a fixed 49.2 s for it and then
+/// skipped the JOIN. The old JOIN retried the seed itself (ten attempts,
+/// about 81 s of backoff plus dial time), so a fixed limit shorter than a
+/// reconnect in flight must not end the recovery. The JOIN must reach the
+/// peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_reconnect_slower_than_a_fixed_recovery_limit_still_joins() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut scenario = transient_loss_at_seed_read(dir.path()).await;
+    let prod_id = scenario.prod.machine_id().0;
+
+    let joined = tokio::time::timeout(SLOW_RECONNECT_JOIN_BOUND, &mut scenario.join).await;
+    RECONNECT_GATE.open();
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must finish within {SLOW_RECONNECT_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_join_reached(
+        scenario.peer_addr,
+        prod_id,
+        "a proactive reconnect still in flight must not end the seed recovery",
+    )
+    .await;
+}
+
+/// The late-refusal scenario, held at the phase decisions.
+struct LateRefusals {
+    _testnet_agents: Vec<Agent>,
+    testnet: Vec<(ant_quic::PeerId, SocketAddr)>,
+    prod: Arc<Agent>,
+    prod_network: Arc<x0x::network::NetworkNode>,
+    join: tokio::task::JoinHandle<x0x::error::Result<()>>,
+}
+
+/// Three cached cross-plane peers answer the Phase 1 dials. Their plane
+/// verdicts are still open when the join counts its peers, so they fill
+/// `min_connected` and the join skips Phase 2 (`bootstrap`).
+///
+/// Gates fix the event order:
+/// 1. `PLANE_REFUSAL_GATE` holds every plane-mismatch refusal, before its
+///    tombstone and disconnect. The test waits until all four are held:
+///    prod's (one receive loop, so one at a time) and one on each testnet
+///    peer.
+/// 2. `JOIN_COMPLETE_GATE` holds `join_network` after its phase decisions.
+///    The test checks that all three peers are connected with an open plane
+///    verdict.
+///
+/// Both gates stay closed when this returns.
+async fn late_refusals_at_phase_decisions(
+    dir: &std::path::Path,
+    bootstrap_nodes: Vec<SocketAddr>,
+) -> LateRefusals {
+    let mut testnet_agents = Vec::new();
     let mut testnet = Vec::new();
     for name in ["testnet-a", "testnet-b", "testnet-c"] {
-        testnet.push(remote_agent(dir.path(), name, Some(TESTNET_PLANE)).await);
+        let (agent, peer, addr) = remote_agent(dir, name, Some(TESTNET_PLANE)).await;
+        testnet_agents.push(agent);
+        testnet.push((peer, addr));
     }
-    let prod = Arc::new(
-        build_agent_with_bootstrap(dir.path(), "prod", Some(PROD_PLANE), vec![boot_addr]).await,
-    );
-    for (_, peer, addr) in &testnet {
+    let prod =
+        Arc::new(build_agent_with_bootstrap(dir, "prod", Some(PROD_PLANE), bootstrap_nodes).await);
+    for (peer, addr) in &testnet {
         cache_peer(&prod, *peer, *addr).await;
     }
     let prod_network = Arc::clone(prod.network().expect("prod network"));
-    let prod_id = prod.machine_id().0;
 
     PLANE_REFUSAL_GATE.arm();
     JOIN_COMPLETE_GATE.arm();
@@ -682,7 +798,13 @@ async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback()
         JOIN_COMPLETE_GATE.wait_held(1, JOIN_BOUND).await,
         "scenario: join_network must reach the end of its dial phases"
     );
-    for (_, peer, addr) in &testnet {
+    assert!(
+        PLANE_REFUSAL_GATE.wait_held(4, REFUSAL_HOLD_BOUND).await,
+        "scenario: the plane refusals on prod and on the three testnet peers \
+         must be held at PLANE_REFUSAL_GATE (held: {})",
+        PLANE_REFUSAL_GATE.held()
+    );
+    for (peer, addr) in &testnet {
         assert_eq!(
             prod_network.peer_admission(peer).await,
             PeerAdmission::PlanePending,
@@ -690,6 +812,25 @@ async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback()
              verdict still open, at the phase decisions"
         );
     }
+    LateRefusals {
+        _testnet_agents: testnet_agents,
+        testnet,
+        prod,
+        prod_network,
+        join,
+    }
+}
+
+/// Codex round-1 finding 2. The refusals land after the phase decisions.
+/// The join must then still fall back to the reachable same-plane bootstrap
+/// node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (_boot_agent, _boot, boot_addr) = remote_agent(dir.path(), "boot", Some(PROD_PLANE)).await;
+    let scenario = late_refusals_at_phase_decisions(dir.path(), vec![boot_addr]).await;
+    let prod_id = scenario.prod.machine_id().0;
     assert!(
         join_events_for(boot_addr).is_empty(),
         "scenario: no JOIN before the gates open"
@@ -697,19 +838,19 @@ async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback()
     PLANE_REFUSAL_GATE.open();
     JOIN_COMPLETE_GATE.open();
 
-    let joined = tokio::time::timeout(JOIN_BOUND, join).await;
+    let joined = tokio::time::timeout(JOIN_BOUND, scenario.join).await;
     assert!(
         matches!(joined, Ok(Ok(Ok(())))),
         "join_network must finish within {JOIN_BOUND:?}: {joined:?}"
     );
-    for (_, peer, addr) in &testnet {
+    for (peer, addr) in &scenario.testnet {
         let events = join_events_for(*addr);
         assert!(
             events.is_empty(),
             "cross-plane peer {addr} must not be a JOIN seed: {events:?}"
         );
         assert_ne!(
-            prod_network.peer_admission(peer).await,
+            scenario.prod_network.peer_admission(peer).await,
             PeerAdmission::Admitted,
             "scenario: the plane gate must refuse cross-plane peer {addr}"
         );
@@ -725,4 +866,102 @@ async fn issue1321_late_refused_peers_at_min_connected_keep_bootstrap_fallback()
         wait_join_received_from(prod_id, Duration::from_secs(10)).await,
         "the bootstrap node must receive the JOIN frame"
     );
+}
+
+/// No JOIN from `joiner` reached any captured seed or peer.
+fn assert_no_join(joiner: [u8; 32], seeds: &[SocketAddr]) {
+    for seed in seeds {
+        let events = join_events_for(*seed);
+        assert!(
+            events.is_empty(),
+            "after shutdown began, no JOIN may go to {seed}: {events:?}"
+        );
+    }
+    assert_eq!(
+        joins_received_from(joiner),
+        0,
+        "after shutdown began, no peer may receive a JOIN from the joiner"
+    );
+}
+
+/// Codex re-review of 8a60712, finding 2. Shutdown begins (`begin_shutdown`,
+/// which keeps the transport up while the embedder drains its tasks) while
+/// `join_network` is held before its seed settlement. The settlement then
+/// returns early with no admitted peer. The join must not start the
+/// fallback bootstrap phase, and it must not send a JOIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_shutdown_before_seed_settlement_starts_no_fallback_or_join() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (_boot_agent, boot, boot_addr) = remote_agent(dir.path(), "boot", Some(PROD_PLANE)).await;
+    let scenario = late_refusals_at_phase_decisions(dir.path(), vec![boot_addr]).await;
+    let prod_id = scenario.prod.machine_id().0;
+
+    scenario.prod.begin_shutdown();
+    // The refusals stay held, so the plane verdicts stay open: only the
+    // shutdown can end the settlement early.
+    JOIN_COMPLETE_GATE.open();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, scenario.join).await;
+    PLANE_REFUSAL_GATE.open();
+
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must return within {SHUTDOWN_JOIN_BOUND:?} after shutdown began: {joined:?}"
+    );
+    assert_eq!(
+        dials_started_to(boot_addr),
+        0,
+        "shutdown began before the seed settlement: the join must not start the \
+         fallback bootstrap dial"
+    );
+    assert!(
+        !scenario.prod_network.is_connected(&boot).await,
+        "the join must not connect to the bootstrap node after shutdown began"
+    );
+    let mut seeds: Vec<SocketAddr> = scenario.testnet.iter().map(|(_, addr)| *addr).collect();
+    seeds.push(boot_addr);
+    assert_no_join(prod_id, &seeds);
+}
+
+/// Codex re-review of 8a60712, finding 2. The fallback bootstrap phase has
+/// started its dial to an address that never answers (a silent UDP socket).
+/// Shutdown begins while that dial is in flight. The fallback dial batch
+/// and its retry sleeps (10 s and 15 s) must stop on the shutdown token,
+/// and the join must not send a JOIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_shutdown_stops_an_in_flight_fallback_bootstrap_dial() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let scenario = late_refusals_at_phase_decisions(dir.path(), vec![silent_addr]).await;
+    let prod_id = scenario.prod.machine_id().0;
+    assert_eq!(
+        dials_started_to(silent_addr),
+        0,
+        "scenario: the phase decisions must skip the bootstrap phase"
+    );
+    PLANE_REFUSAL_GATE.open();
+    JOIN_COMPLETE_GATE.open();
+
+    let dial_deadline = tokio::time::Instant::now() + JOIN_BOUND;
+    while dials_started_to(silent_addr) == 0 {
+        assert!(
+            tokio::time::Instant::now() < dial_deadline,
+            "scenario: after the late refusals, the join must start the fallback \
+             bootstrap dial"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    scenario.prod.begin_shutdown();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, scenario.join).await;
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "after shutdown began, the fallback dial batch and its retry sleeps must \
+         stop: join_network must return within {SHUTDOWN_JOIN_BOUND:?}: {joined:?}"
+    );
+    let mut seeds: Vec<SocketAddr> = scenario.testnet.iter().map(|(_, addr)| *addr).collect();
+    seeds.push(silent_addr);
+    assert_no_join(prod_id, &seeds);
+    drop(silent);
 }
