@@ -12838,30 +12838,23 @@ impl Agent {
             );
         } else if let Some(ref runtime) = self.gossip_runtime {
             all_connected.log_plan(&plan);
-            let mut tried = plan.seeds.clone();
-            let mut joined = false;
-            if !plan.seeds.is_empty() {
-                let seeds: Vec<String> = plan.seeds.iter().map(|addr| addr.to_string()).collect();
-                match runtime.membership().join(seeds).await {
-                    Ok(()) => joined = true,
-                    Err(e) => tracing::warn!("HyParView membership join failed: {e}"),
+            // x0x#1321: x0x runs the old JOIN loop itself, attempt by
+            // attempt, so the admission check sits between the dial and the
+            // JOIN frame and each address keeps one old retry budget for the
+            // whole join.
+            let overlay = gossip::join_seeds::OverlayJoin::new(node, runtime.membership());
+            match all_connected.join_overlay(&overlay, shutdown).await {
+                gossip::join_seeds::JoinOutcome::Joined(_)
+                | gossip::join_seeds::JoinOutcome::Cancelled => {}
+                gossip::join_seeds::JoinOutcome::NoSeed { attempts } => {
+                    if attempts > 0 {
+                        tracing::warn!(
+                            "HyParView membership join failed: JOIN: Failed to connect to any seed nodes"
+                        );
+                    }
                 }
-            }
-            // x0x#1321: the old JOIN also tried every other dialled peer,
-            // with the same retry budget per seed. Keep that budget for the
-            // candidates that are not suppressed, but send the JOIN only
-            // through an admitted one. Each candidate is tried at most once.
-            while !joined && !shutdown.is_cancelled() {
-                let Some(seed) = all_connected.recover_seed(node, &tried, shutdown).await else {
-                    break;
-                };
-                tried.push(seed);
-                if shutdown.is_cancelled() {
-                    break;
-                }
-                match runtime.membership().join(vec![seed.to_string()]).await {
-                    Ok(()) => joined = true,
-                    Err(e) => tracing::warn!("HyParView membership join failed: {e}"),
+                gossip::join_seeds::JoinOutcome::Failed(e) => {
+                    tracing::warn!("HyParView membership join failed: {e}");
                 }
             }
         }

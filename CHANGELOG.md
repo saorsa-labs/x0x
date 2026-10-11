@@ -10,21 +10,36 @@ All notable changes to this project will be documented in this file.
   seed (#1321).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
   refused it a moment later, and it still became a seed. The JOIN then
-  dialled it up to ten times (about 81 s) and the #292 gate refused every
-  dial, so the presence beacons and the first identity announcement started
-  that much later. (In `x0xd` the capability advert service also starts from
-  the DM inbox path, so it did not wait for the JOIN.) The JOIN frame now
-  goes only to a dialled peer that `peer_admission` (#292 invariant A)
-  admits. A suppressed peer is dropped as a seed at once. A peer that is not
-  suppressed but not admitted yet (connection lost, or plane verdict still
-  open) keeps the retry budget that the old JOIN gave a seed: up to ten
-  awaited dials with the JOIN's own backoff (100 ms doubling to at most
-  30 s), so the join does not give up while one of its dials is in flight.
-  The phase counts for the join's minimum of three peers include only peers
-  that are still connected and not suppressed. When peers that filled that
-  minimum with an open plane verdict are refused later, the join still runs
-  the cached-peer and bootstrap phases it skipped. After `begin_shutdown`,
-  no fallback phase or JOIN starts, and a running fallback dial batch stops.
+  dialled it up to ten times (81.1 s of backoff plus up to about 10.1 s of
+  jitter) and the #292 gate refused every dial, so the presence beacons and
+  the first identity announcement started that much later. (In `x0xd` the
+  capability advert service also starts from the DM inbox path, so it did
+  not wait for the JOIN.)
+  - The JOIN frame now goes only to a dialled peer that `peer_admission`
+    (#292 invariant A) admits. A suppressed peer is dropped as a seed at
+    once.
+  - The retry budget does not change: each seed address has one budget of
+    ten attempts for the whole join, each attempt one awaited
+    `dial_bootstrap` with the old backoff (100 ms doubling to at most 30 s,
+    plus jitter). A peer that is not suppressed but not admitted yet
+    (connection lost, or plane verdict still open) uses that budget; the
+    JOIN frame goes out once it is admitted. x0x now runs the JOIN loop of
+    saorsa-gossip-membership 0.5.87 itself, with the same steps, so that
+    the admission check sits between the dial and the JOIN frame.
+  - The phase counts for the join's minimum of three peers include only
+    peers that are still connected and not suppressed. When peers that
+    filled that minimum with an open plane verdict are refused later, the
+    join runs the cached-peer and bootstrap phases it skipped, before the
+    JOIN. This can add time even when one seed is admitted: for example,
+    with one admitted peer and two pending peers that are refused later,
+    the join first runs the skipped bootstrap phase (up to 70 s when the
+    bootstrap addresses do not answer), where the old code joined at once.
+    Each wait for open plane verdicts adds up to 12 s. The whole time
+    before the JOIN is at most 136 s (100 s of dial phases plus up to three
+    12 s verdict waits), plus scheduling time.
+  - After `begin_shutdown`, no fallback phase or JOIN starts; a running
+    fallback dial batch, its retry sleeps and the JOIN attempts stop.
+
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
 
