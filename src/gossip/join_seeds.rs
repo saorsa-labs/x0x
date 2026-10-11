@@ -879,6 +879,35 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
+    /// Codex re-review of 15e6192, finding 1: an exhausted budget is not
+    /// renewed. A never answers. B answers and is admitted, but its JOIN
+    /// fails, so join_network asks for another seed (the loop below is the
+    /// caller's loop). A must still get one budget in total: ten dials.
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_budget_is_not_renewed_after_a_failed_join() {
+        let transport = FakeTransport::default();
+        transport.plan_dials(addr(1), vec![FakeDial::Fail(Duration::ZERO)]);
+        transport.plan_dials(
+            addr(2),
+            vec![FakeDial::Answer(
+                Duration::ZERO,
+                peer(2),
+                PeerAdmission::Admitted,
+            )],
+        );
+        let mut candidates = candidates(&[(addr(1), peer(1)), (addr(2), peer(2))]);
+        let shutdown = CancellationToken::new();
+
+        let mut tried = Vec::new();
+        while let Some(seed) = candidates.recover_seed(&transport, &tried, &shutdown).await {
+            // The JOIN through `seed` fails.
+            tried.push(seed);
+        }
+
+        assert_eq!(tried, vec![addr(2)]);
+        assert_eq!(transport.dials_to(addr(1)).len(), JOIN_SEED_ATTEMPTS);
+    }
+
     /// The candidates the JOIN already tried are not tried again.
     #[tokio::test(start_paused = true)]
     async fn recovery_skips_the_seeds_the_join_already_tried() {

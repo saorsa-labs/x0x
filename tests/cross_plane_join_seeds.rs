@@ -33,13 +33,18 @@ use tracing_subscriber::Layer;
 use x0x::network::{NetworkConfig, NetworkEvent, PeerAdmission};
 use x0x::Agent;
 
-/// Upper bound for one `join_network` call. Phase 1 gives each cached dial
-/// up to 15 s. Sometimes the cross-plane peer refuses us first: it closes
-/// each of our connections at accept, before its plane hello reaches us.
-/// Then we never write a tombstone for it. The join keeps the old JOIN
-/// retry budget for such a peer (ten dials, at most about 91 s of backoff
-/// with jitter) and sends it no JOIN. The bound covers that case.
-const JOIN_BOUND: Duration = Duration::from_secs(150);
+/// Upper bound for one `join_network` call in a normal topology. Phase 1
+/// gives each cached dial up to 15 s; the rest of the join on loopback
+/// takes well under that.
+const JOIN_BOUND: Duration = Duration::from_secs(60);
+
+/// Upper bound for a join whose only candidates are cross-plane peers.
+/// Sometimes the cross-plane peer refuses us first: it closes each of our
+/// connections at accept, before its plane hello reaches us. Then we never
+/// write a tombstone for it. Such a peer keeps one old JOIN retry budget
+/// (ten dials, 81.1 s of backoff plus up to about 10.1 s of jitter) and
+/// gets no JOIN. This bound covers that case and is used only there.
+const REFUSAL_JOIN_BOUND: Duration = Duration::from_secs(150);
 
 const JOIN_CONNECTING: &str = "JOIN: Connecting to bootstrap node";
 const JOIN_RETRY: &str = "JOIN: Connection failed, will retry";
@@ -51,15 +56,30 @@ const JOIN_RECEIVED: &str = "HyParView: Received JOIN request";
 const PROD_PLANE: &str = "x0x.test.prod";
 const TESTNET_PLANE: &str = "x0x.test.testnet";
 
-/// One captured saorsa-gossip JOIN event.
+/// One captured JOIN event. `seq` orders all captured events.
 #[derive(Debug, Clone)]
 struct JoinEvent {
+    seq: u64,
     message: String,
     seed: Option<String>,
     new_peer: Option<String>,
 }
 
 static JOIN_EVENTS: Mutex<Vec<JoinEvent>> = Mutex::new(Vec::new());
+
+/// Order of all captured events (JOIN events, dial starts, refusals).
+static EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One captured plane refusal: who refused (`our_plane`) whom
+/// (`peer_id_prefix`, first 4 bytes, hex).
+#[derive(Debug, Clone)]
+struct Refusal {
+    seq: u64,
+    our_plane: String,
+    peer_id_prefix: String,
+}
+
+static REFUSALS: Mutex<Vec<Refusal>> = Mutex::new(Vec::new());
 static CAPTURE: OnceLock<()> = OnceLock::new();
 
 /// Longest time a gate holds one thread. A safety net only: a test that
@@ -172,8 +192,11 @@ static PLANE_REFUSAL_GATE: Gate =
 /// `addr`. Every `join_network` address dial goes through it.
 const DIAL_STARTED: &str = "starting direct dial";
 
-/// Addresses of captured [`DIAL_STARTED`] events, in order.
-static DIAL_STARTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Captured [`DIAL_STARTED`] events: `(seq, address)`, in order.
+static DIAL_STARTS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
+/// `plane_handle_hello` logs this (warn) before it refuses a peer.
+const PLANE_REFUSED: &str = "gossip-plane mismatch: refusing cross-plane peer (issue #206)";
 
 #[derive(Default)]
 struct JoinVisitor {
@@ -181,6 +204,8 @@ struct JoinVisitor {
     seed: Option<String>,
     new_peer: Option<String>,
     addr: Option<String>,
+    our_plane: Option<String>,
+    peer_id_prefix: Option<String>,
 }
 
 impl Visit for JoinVisitor {
@@ -190,6 +215,8 @@ impl Visit for JoinVisitor {
             "seed" => self.seed = Some(value.to_string()),
             "new_peer" => self.new_peer = Some(value.to_string()),
             "addr" => self.addr = Some(value.to_string()),
+            "our_plane" => self.our_plane = Some(value.to_string()),
+            "peer_id_prefix" => self.peer_id_prefix = Some(value.to_string()),
             _ => {}
         }
     }
@@ -200,6 +227,8 @@ impl Visit for JoinVisitor {
             "seed" => self.seed = Some(format!("{value:?}")),
             "new_peer" => self.new_peer = Some(format!("{value:?}")),
             "addr" => self.addr = Some(format!("{value:?}")),
+            "our_plane" => self.our_plane = Some(format!("{value:?}")),
+            "peer_id_prefix" => self.peer_id_prefix = Some(format!("{value:?}")),
             _ => {}
         }
     }
@@ -211,11 +240,13 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut visitor = JoinVisitor::default();
         event.record(&mut visitor);
+        let seq = EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if visitor.message.starts_with("JOIN:") || visitor.message.starts_with(JOIN_RECEIVED) {
             JOIN_EVENTS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(JoinEvent {
+                    seq,
                     message: visitor.message.clone(),
                     seed: visitor.seed.clone(),
                     new_peer: visitor.new_peer.clone(),
@@ -226,7 +257,21 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
                 DIAL_STARTS
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(addr);
+                    .push((seq, addr));
+            }
+        }
+        if visitor.message == PLANE_REFUSED {
+            if let (Some(our_plane), Some(peer_id_prefix)) =
+                (visitor.our_plane.clone(), visitor.peer_id_prefix.clone())
+            {
+                REFUSALS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(Refusal {
+                        seq,
+                        our_plane,
+                        peer_id_prefix,
+                    });
             }
         }
         JOIN_COMPLETE_GATE.pass(&visitor.message);
@@ -237,13 +282,45 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
 
 /// How many address dials to `addr` have started.
 fn dials_started_to(addr: SocketAddr) -> usize {
+    dials_started_to_after(addr, 0)
+}
+
+/// How many address dials to `addr` started after event `after`.
+fn dials_started_to_after(addr: SocketAddr, after: u64) -> usize {
+    dial_seqs_to(addr)
+        .iter()
+        .filter(|seq| **seq > after)
+        .count()
+}
+
+/// The `seq` of each address dial to `addr`.
+fn dial_seqs_to(addr: SocketAddr) -> Vec<u64> {
     let addr = addr.to_string();
     DIAL_STARTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .filter(|started| **started == addr)
-        .count()
+        .filter(|(_, started)| *started == addr)
+        .map(|(seq, _)| *seq)
+        .collect()
+}
+
+/// The next event sequence number: every event captured from now on has a
+/// larger `seq`.
+fn seq_mark() -> u64 {
+    EVENT_SEQ.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The `seq` of the first refusal of `peer` by an agent on `our_plane`.
+fn first_refusal_of(peer: ant_quic::PeerId, our_plane: &str) -> Option<u64> {
+    let prefix: String = peer.0[..4].iter().map(|b| format!("{b:02x}")).collect();
+    REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|refusal| refusal.our_plane == our_plane && refusal.peer_id_prefix == prefix)
+        .map(|refusal| refusal.seq)
+        .min()
 }
 
 /// Install the process-global capture of saorsa-gossip membership events,
@@ -387,25 +464,71 @@ fn drain_connected(
     }
 }
 
-/// Run `agent.join_network()` until it returns, until a JOIN event for
-/// `watch` is captured, or until [`JOIN_BOUND`]. Returns `Some(result)` when
-/// the join returned. The early stop keeps a red run short: the unfixed JOIN
-/// spends about 81 s retrying one refused seed.
-async fn join_watching(agent: &Agent, watch: SocketAddr) -> Option<x0x::error::Result<()>> {
+/// Run `agent.join_network()` until it returns, until a JOIN through
+/// `watch` succeeds, or until `bound`. Returns `Some(result)` when the join
+/// returned.
+async fn join_watching(
+    agent: &Agent,
+    watch: SocketAddr,
+    bound: Duration,
+) -> Option<x0x::error::Result<()>> {
     let join = agent.join_network();
     tokio::pin!(join);
-    let deadline = tokio::time::Instant::now() + JOIN_BOUND;
+    let deadline = tokio::time::Instant::now() + bound;
     loop {
         tokio::select! {
             result = &mut join => return Some(result),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if !join_events_for(watch).is_empty()
+                if count(&join_events_for(watch), JOIN_JOINED) > 0
                     || tokio::time::Instant::now() >= deadline
                 {
                     return None;
                 }
             }
         }
+    }
+}
+
+/// The JOIN oracle for a cross-plane peer `peer` at `addr` that `joiner`
+/// (on `PROD_PLANE`) dialled.
+///
+/// - No JOIN through it succeeds, and it receives no JOIN frame.
+/// - If the joiner refused it (tombstone) before the first JOIN attempt of
+///   the join (the saorsa-6 shape of #1321), no JOIN attempt goes to it.
+/// - Otherwise the remote refused us first and we never got its hello, so
+///   there is no tombstone. Then it gets at most one old JOIN budget: ten
+///   attempts.
+fn assert_cross_plane_peer_not_joined(peer: ant_quic::PeerId, addr: SocketAddr, joiner: [u8; 32]) {
+    let events = join_events_for(addr);
+    assert_eq!(
+        count(&events, JOIN_JOINED),
+        0,
+        "no JOIN may succeed through cross-plane peer {addr}: {events:?}"
+    );
+    assert_eq!(
+        joins_received_from(joiner),
+        0,
+        "cross-plane peer {addr} must receive no JOIN frame"
+    );
+    let first_attempt = JOIN_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|event| event.message == JOIN_CONNECTING)
+        .map(|event| event.seq)
+        .min()
+        .unwrap_or(u64::MAX);
+    match first_refusal_of(peer, PROD_PLANE) {
+        Some(refused) if refused < first_attempt => assert!(
+            events.is_empty(),
+            "cross-plane peer {addr} was refused before the JOIN started: it must \
+             get no JOIN attempt and no JOIN retry: {events:?}"
+        ),
+        _ => assert!(
+            count(&events, JOIN_CONNECTING) <= 10,
+            "cross-plane peer {addr} that refused us first may get at most one \
+             old JOIN budget (ten attempts): {events:?}"
+        ),
     }
 }
 
@@ -428,26 +551,17 @@ async fn issue1321_cached_cross_plane_peer_is_not_a_join_seed() {
 
     let prod_network = prod.network().expect("prod network");
     let mut prod_events = prod_network.subscribe();
-    let joined = join_watching(&prod, testnet_addr).await;
+    let joined = join_watching(&prod, testnet_addr, REFUSAL_JOIN_BOUND).await;
 
     assert!(
         drain_connected(&mut prod_events).contains(&testnet_peer.0),
         "scenario: the join must dial the cached cross-plane peer successfully \
          (that dial result is what reached the JOIN seeds on saorsa-6)"
     );
-    let events = join_events_for(testnet_addr);
-    assert_eq!(
-        count(&events, JOIN_RETRY),
-        0,
-        "a refused cross-plane peer must cause no JOIN retries: {events:?}"
-    );
-    assert!(
-        events.is_empty(),
-        "cached cross-plane peer {testnet_addr} must not be a JOIN seed: {events:?}"
-    );
+    assert_cross_plane_peer_not_joined(testnet_peer, testnet_addr, prod.machine_id().0);
     assert!(
         matches!(joined, Some(Ok(()))),
-        "join_network must finish within {JOIN_BOUND:?}: {joined:?}"
+        "join_network must finish within {REFUSAL_JOIN_BOUND:?}: {joined:?}"
     );
     drop(silent);
 }
@@ -466,20 +580,16 @@ async fn issue1321_cross_plane_peer_refused_after_phase1_is_not_a_join_seed() {
 
     let prod_network = prod.network().expect("prod network");
     let mut prod_events = prod_network.subscribe();
-    let joined = join_watching(&prod, testnet_addr).await;
+    let joined = join_watching(&prod, testnet_addr, REFUSAL_JOIN_BOUND).await;
 
     assert!(
         drain_connected(&mut prod_events).contains(&testnet_peer.0),
         "scenario: the join must dial the cached cross-plane peer successfully"
     );
-    let events = join_events_for(testnet_addr);
-    assert!(
-        events.is_empty(),
-        "cached cross-plane peer {testnet_addr} must not be a JOIN seed: {events:?}"
-    );
+    assert_cross_plane_peer_not_joined(testnet_peer, testnet_addr, prod.machine_id().0);
     assert!(
         matches!(joined, Some(Ok(()))),
-        "join_network must finish within {JOIN_BOUND:?}: {joined:?}"
+        "join_network must finish within {REFUSAL_JOIN_BOUND:?}: {joined:?}"
     );
 }
 
@@ -612,6 +722,8 @@ struct TransientLoss {
     peer_addr: SocketAddr,
     prod: Arc<Agent>,
     join: tokio::task::JoinHandle<x0x::error::Result<()>>,
+    /// Event mark taken just before the seed read was released.
+    released: u64,
 }
 
 /// The sole same-plane candidate answers the Phase 1 dial. Then it loses
@@ -669,12 +781,14 @@ async fn transient_loss_at_seed_read(dir: &std::path::Path) -> TransientLoss {
         "scenario: a transport loss must leave no tombstone, and the held \
          reconnect must not have restored the peer"
     );
+    let released = seq_mark();
     JOIN_COMPLETE_GATE.open();
     TransientLoss {
         _peer_agent: peer_agent,
         peer_addr,
         prod,
         join,
+        released,
     }
 }
 
@@ -807,6 +921,13 @@ async fn late_refusals_at_phase_decisions(
         "scenario: the plane refusals on prod and on the three testnet peers \
          must be held at PLANE_REFUSAL_GATE (held: {})",
         PLANE_REFUSAL_GATE.held()
+    );
+    // Exactly four: prod's single receive loop is held on its first refusal,
+    // and each testnet peer is held on its refusal of prod.
+    assert_eq!(
+        PLANE_REFUSAL_GATE.held(),
+        4,
+        "scenario: exactly four refusals are held"
     );
     for (peer, addr) in &testnet {
         assert_eq!(
@@ -967,5 +1088,172 @@ async fn issue1321_shutdown_stops_an_in_flight_fallback_bootstrap_dial() {
     let mut seeds: Vec<SocketAddr> = scenario.testnet.iter().map(|(_, addr)| *addr).collect();
     seeds.push(silent_addr);
     assert_no_join(prod_id, &seeds);
+    drop(silent);
+}
+
+/// Codex re-review of 15e6192, finding 2. A recovered seed keeps one attempt
+/// budget across the recovery and the JOIN. Here the lost peer answers the
+/// join's first redial and is admitted at once (its plane was verified
+/// before the loss), so the JOIN through it takes one attempt: one address
+/// dial. (15e6192 dialled it twice: once in its recovery and once more in
+/// the membership JOIN, which has its own ten-attempt budget.) The proactive
+/// reconnect stays held until the join returns, so no other path dials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_recovered_seed_keeps_one_attempt_budget_across_the_join() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut scenario = transient_loss_at_seed_read(dir.path()).await;
+    let prod_id = scenario.prod.machine_id().0;
+
+    let joined = tokio::time::timeout(SLOW_RECONNECT_JOIN_BOUND, &mut scenario.join).await;
+    RECONNECT_GATE.open();
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must finish within {SLOW_RECONNECT_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_join_reached(
+        scenario.peer_addr,
+        prod_id,
+        "the recovered seed must get the JOIN",
+    )
+    .await;
+    assert_eq!(
+        dials_started_to_after(scenario.peer_addr, scenario.released),
+        1,
+        "one successful JOIN attempt on a recovered seed is one address dial: \
+         the recovery and the JOIN share one attempt budget"
+    );
+}
+
+/// Upper bound for the join in the admitted-seed fallback control: the
+/// fallback bootstrap phase (at most 3 x 15 s dials and 10 s + 15 s sleeps)
+/// plus the settles and the JOIN.
+const FALLBACK_JOIN_BOUND: Duration = Duration::from_secs(120);
+
+/// Codex re-review of 15e6192, question 3: an admitted seed does not mean
+/// an immediate JOIN. Phase 1 answers one same-plane peer and two
+/// cross-plane peers whose plane verdicts are still open. The three fill
+/// `min_connected`, so the phase decisions skip the bootstrap phase. The two
+/// cross-plane peers are refused later. The settled admitted count (1) is
+/// below the minimum, so the join first runs the skipped bootstrap phase.
+/// Every bootstrap address here is silent, so that phase uses its full
+/// schedule: three dials (each up to 15 s) and the 10 s and 15 s retry
+/// sleeps. Only then does the JOIN go to the admitted peer. The old code
+/// joined that peer at once. This control states the delay explicitly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_admitted_seed_with_late_refusals_waits_for_the_bootstrap_fallback() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let (_same_agent, same, same_addr) = remote_agent(dir.path(), "same", Some(PROD_PLANE)).await;
+    let mut testnet_agents = Vec::new();
+    let mut testnet = Vec::new();
+    for name in ["testnet-a", "testnet-b"] {
+        let (agent, peer, addr) = remote_agent(dir.path(), name, Some(TESTNET_PLANE)).await;
+        testnet_agents.push(agent);
+        testnet.push((peer, addr));
+    }
+    let prod = Arc::new(
+        build_agent_with_bootstrap(dir.path(), "prod", Some(PROD_PLANE), vec![silent_addr]).await,
+    );
+    cache_peer(&prod, same, same_addr).await;
+    for (peer, addr) in &testnet {
+        cache_peer(&prod, *peer, *addr).await;
+    }
+    let prod_network = Arc::clone(prod.network().expect("prod network"));
+    let prod_id = prod.machine_id().0;
+
+    PLANE_REFUSAL_GATE.arm();
+    JOIN_COMPLETE_GATE.arm();
+    let join = spawn_join(&prod);
+
+    assert!(
+        JOIN_COMPLETE_GATE.wait_held(1, JOIN_BOUND).await,
+        "scenario: join_network must reach the end of its dial phases"
+    );
+    assert!(
+        PLANE_REFUSAL_GATE.wait_held(3, REFUSAL_HOLD_BOUND).await,
+        "scenario: the plane refusals on prod and on the two testnet peers \
+         must be held at PLANE_REFUSAL_GATE (held: {})",
+        PLANE_REFUSAL_GATE.held()
+    );
+    assert_eq!(
+        PLANE_REFUSAL_GATE.held(),
+        3,
+        "scenario: exactly three refusals are held"
+    );
+    for (peer, addr) in &testnet {
+        assert_eq!(
+            prod_network.peer_admission(peer).await,
+            PeerAdmission::PlanePending,
+            "scenario: cross-plane peer {addr} must be connected, with its plane \
+             verdict still open, at the phase decisions"
+        );
+    }
+    assert!(
+        matches!(
+            prod_network.peer_admission(&same).await,
+            PeerAdmission::Admitted | PeerAdmission::PlanePending
+        ),
+        "scenario: the same-plane peer must be connected at the phase decisions"
+    );
+    assert_eq!(
+        dials_started_to(silent_addr),
+        0,
+        "scenario: the phase decisions must skip the bootstrap phase"
+    );
+    let released = tokio::time::Instant::now();
+    PLANE_REFUSAL_GATE.open();
+    JOIN_COMPLETE_GATE.open();
+
+    let joined = tokio::time::timeout(FALLBACK_JOIN_BOUND, join).await;
+    let elapsed = released.elapsed();
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must finish within {FALLBACK_JOIN_BOUND:?}: {joined:?}"
+    );
+    let events = join_events_for(same_addr);
+    assert_eq!(
+        count(&events, JOIN_JOINED),
+        1,
+        "the JOIN must go to the admitted same-plane peer: {events:?}"
+    );
+    assert!(
+        wait_join_received_from(prod_id, Duration::from_secs(10)).await,
+        "the same-plane peer must receive the JOIN frame"
+    );
+    let joined_seq = events
+        .iter()
+        .filter(|event| event.message == JOIN_JOINED)
+        .map(|event| event.seq)
+        .min()
+        .unwrap_or(0);
+    let silent_dials = dial_seqs_to(silent_addr);
+    assert_eq!(
+        silent_dials.len(),
+        3,
+        "the fallback bootstrap phase dials the silent address in all three rounds"
+    );
+    assert!(
+        silent_dials.iter().all(|seq| *seq < joined_seq),
+        "the JOIN to the admitted peer waits until the fallback phase has finished"
+    );
+    // The two retry sleeps (10 s + 15 s) are the floor. Three 15 s dial
+    // timeouts and the 12 s settles bound it from above.
+    assert!(
+        elapsed >= Duration::from_secs(25),
+        "fallback delay {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(25 + 3 * 15 + 3 * 12),
+        "fallback delay {elapsed:?}"
+    );
+    for (_, addr) in &testnet {
+        assert!(
+            join_events_for(*addr).is_empty(),
+            "cross-plane peer {addr} must not be a JOIN seed"
+        );
+    }
     drop(silent);
 }
