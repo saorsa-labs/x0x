@@ -317,6 +317,7 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
 /// `OwnerSyncStore` introduced for its `write_atomically`, review R5
 /// finding 2).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DurableWriteError {
     /// Failed before the rename: the OLD bytes are still on disk and no
     /// new bytes are visible; callers may safely roll in-memory state
