@@ -2628,6 +2628,7 @@ fn group_card_signature_accepted(card: &x0x::groups::GroupCard) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(in crate::server) fn unsigned_group_cards_refused() -> u64 {
     UNSIGNED_GROUP_CARDS_REFUSED.load(Ordering::Relaxed)
 }
