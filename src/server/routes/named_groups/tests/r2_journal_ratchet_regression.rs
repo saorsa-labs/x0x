@@ -4,31 +4,37 @@
 //! generation) with no randomness, so a repeated generation repeats the
 //! exact (key, nonce) pair.
 //!
-//! These tests FAIL on origin/main (and on the #1187 tree, except A2 which
-//! #1187 already closes): the restart replays the journal's older snapshot
-//! over the newer `<gid>.snap`, the restored group repeats a send
-//! generation, and the two wire ciphertexts carry the same epoch, sender
-//! leaf, generation and nonce. They PASS on the fix: every retained-journal
-//! path keeps the journal's snapshot in step with the live ratchet (or
-//! discards/rolls back a rejected transaction), so a restart never reuses a
-//! (key, nonce) pair. The last two assert that an unreadable journal fails
-//! the send CLOSED (no ciphertext leaves).
+//! Fixed in v0.47.1 (#1326, GHSA-63j6-cch7-w9h4). Before that fix, these
+//! tests fail: the restart replays the journal's older snapshot over the
+//! newer `<gid>.snap`, the restored group repeats a send generation, and
+//! the two wire ciphertexts carry the same epoch, sender leaf, generation
+//! and nonce. With the fix they pass: every retained-journal path keeps the
+//! journal's snapshot in step with the live ratchet (or discards and rolls
+//! back a rejected transaction), so a restart never reuses a (key, nonce)
+//! pair. The fail-closed cases assert that a journal this binary cannot
+//! read, or cannot refresh durably, refuses the send (no ciphertext leaves).
 //!
 //! The entry paths (src/server/routes/named_groups.rs):
 //! - A1: the rebind named save returns ReplacedNotDurable, so the journal
 //!   stays on disk (apply runs only on Durable).
-//! - A2: the rebind apply snapshot write fails after its rename (#1187
-//!   consumes the journal here, so this path is already closed; the test
-//!   confirms it stays closed).
+//! - A2: the rebind apply snapshot write fails after its rename. The #1187
+//!   part of #1326 (complete the transaction after the rename) consumes the
+//!   journal here, so A2 does not depend on the journal refresh: it stays
+//!   green if only the refresh is removed, and fails if that post-rename
+//!   completion is reverted.
 //! - B: a crash after the rebind commit point, then a replay apply failure
 //!   before the snapshot write keeps the pair; a later boot replays it.
 //! - C: a seal caller that leaves the group advanced on a failed named
 //!   write (direct add); the kept journal rolls the e+1 ratchet back.
 //!
 //! Inert: tempdirs only, no network config, no sockets. Each fault comes
-//! from an existing cfg(test) seam. Every test holds `fault_test_lock` so
-//! the process-global replay-fault cell used by path B cannot fire inside
-//! another test's concurrent restart (OMP review note).
+//! from a cfg(test) seam scoped to this test's own data: the replay fault
+//! used by path B is keyed by the test's TreeKEM directory (#1331 review),
+//! the fsync and write-pause seams by path, and the named-save fault lives
+//! on the test's own `AppState`. So a fault armed here cannot fire inside
+//! another test's recovery in a threaded run. Each test also holds
+//! `fault_test_lock`, because other suites arm process-global quarantine
+//! faults under that lock.
 
 use super::*;
 
@@ -217,9 +223,10 @@ async fn r2_rebind_replaced_not_durable_no_aead_nonce_reuse() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// A2: the rebind apply snapshot write fails after its rename. #1187 completes
-// the transaction and consumes the journal, so this path has no kept journal.
-// The test confirms no reuse (green on the #1187 tree and on the fix).
+// A2: the rebind apply snapshot write fails after its rename. The post-rename
+// completion (the #1187 part of #1326) consumes the journal, so this path has
+// no kept journal. The test confirms no reuse. It does not depend on the
+// journal refresh; it fails if the post-rename completion is reverted.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -292,7 +299,7 @@ async fn r2_replay_apply_failure_no_aead_nonce_reuse() -> Result<()> {
     // Boot 1: the replay fails between the named write and the snapshot
     // write (one I/O error), so both journals are retained.
     let boot1 = {
-        let _fault = set_replay_fault(&[ReplayFault::AfterNamedApply]);
+        let _fault = set_replay_fault(&state.treekem_dir, &[ReplayFault::AfterNamedApply]);
         restart(&state).await?
     };
     assert!(journal.exists(), "[B] boot 1 retained the journal pair");
@@ -382,7 +389,13 @@ async fn r2_direct_add_named_write_failure_no_aead_nonce_reuse() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Set up a kept journal via the A1 path, with no fault left armed.
-async fn fixture_with_kept_journal(byte: u8) -> Result<(Arc<AppState>, String, PathBuf)> {
+///
+/// Returns the fixture too: it owns the test's `TempDir` and agent state.
+/// The caller keeps it alive for the whole test (bind it as `_fixture`, not
+/// `_`) and it drops at the end of the test, which removes the temp files.
+async fn fixture_with_kept_journal(
+    byte: u8,
+) -> Result<(Arc<AppState>, String, PathBuf, MemberJoinedTreeKemFixture)> {
     let fixture = baseline_fixture(byte).await?;
     let state = Arc::clone(&fixture.state);
     let gid = fixture.group_id.clone();
@@ -394,14 +407,13 @@ async fn fixture_with_kept_journal(byte: u8) -> Result<(Arc<AppState>, String, P
     let _ = rename_via_api(&state, &gid, "R2 Kept Journal").await;
     assert!(journal.exists(), "the rebind journal is kept on disk");
     // The one-shot save fault is spent by the rename; nothing is left armed.
-    std::mem::forget(fixture);
-    Ok((state, gid, journal))
+    Ok((state, gid, journal, fixture))
 }
 
 #[tokio::test]
 async fn r2_kept_journal_undecodable_fails_the_send_closed() -> Result<()> {
     let _fault_test_lock = fault_test_lock().await;
-    let (state, gid, journal) = fixture_with_kept_journal(0xb6).await?;
+    let (state, gid, journal, _fixture) = fixture_with_kept_journal(0xb6).await?;
 
     // Replace the retained journal with bytes this binary cannot decode.
     std::fs::write(&journal, b"not a postcard journal")?;
@@ -418,7 +430,7 @@ async fn r2_kept_journal_undecodable_fails_the_send_closed() -> Result<()> {
 #[tokio::test]
 async fn r2_kept_journal_unbound_snapshot_fails_the_send_closed() -> Result<()> {
     let _fault_test_lock = fault_test_lock().await;
-    let (state, gid, journal) = fixture_with_kept_journal(0xb7).await?;
+    let (state, gid, journal, _fixture) = fixture_with_kept_journal(0xb7).await?;
 
     // Rewrite the journal so its snapshot envelope has no binding magic (a
     // legacy unbound snapshot the refresh cannot re-bind).
@@ -437,14 +449,15 @@ async fn r2_kept_journal_unbound_snapshot_fails_the_send_closed() -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// P2-1 (OMP round-1 review): the journal refresh must be DURABLE before the
+// Durable refresh: the journal refresh must be DURABLE before the
 // send proceeds. If the refresh write crosses its rename but its directory
 // fsync fails, a crash can revert the journal to the journal-time snapshot;
 // a restart would then replay that older snapshot over the newer `.snap`
 // (equal revision and hash -> Apply) and a send that already left would
 // repeat a generation. The send must fail closed on that fault, so no
-// ciphertext leaves. On the pre-fix tree the refresh maps crossed-rename to
-// Ok, so the send returns 200 and this FAILS; on the fix it is refused.
+// ciphertext leaves. Without the durable-refresh requirement (before #1326,
+// or with a crossed-rename treated as success) the send returns 200 and this
+// fails; with it, the send is refused.
 //
 // Both crash outcomes are then safe, because the send emitted nothing:
 // - the rename survived: a restart replays the refreshed (current) snapshot;
@@ -457,7 +470,7 @@ async fn r2_kept_journal_unbound_snapshot_fails_the_send_closed() -> Result<()> 
 #[tokio::test]
 async fn r2_refresh_not_durable_fails_the_send_closed() -> Result<()> {
     let _fault_test_lock = fault_test_lock().await;
-    let (state, gid, journal) = fixture_with_kept_journal(0xb8).await?;
+    let (state, gid, journal, _fixture) = fixture_with_kept_journal(0xb8).await?;
 
     // The journal's bytes as they stand before the send (the journal-time
     // snapshot), so the "rename was lost" outcome can be reconstructed.

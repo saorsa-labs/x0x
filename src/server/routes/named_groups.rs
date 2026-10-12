@@ -29314,38 +29314,71 @@ pub(in crate::server) enum ReplayFault {
 }
 
 impl ReplayFault {
+    #[cfg(test)]
     const fn bit(self) -> u8 {
         1 << (self as u8)
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-static REPLAY_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// #1331 review: the replay fault is PATH-SCOPED, keyed by the TreeKEM
+/// directory the replay runs on (each test has its own tempdir), like the
+/// #1101 storage seam and the #1187 discard seam. A process-global mask let
+/// one test's armed fault fire inside another test's concurrent recovery in
+/// a threaded `cargo test` run. Test builds only.
+#[cfg(test)]
+static REPLAY_FAULTS_FOR_TESTING: std::sync::Mutex<Vec<(PathBuf, u8)>> =
+    std::sync::Mutex::new(Vec::new());
 
-fn replay_fault_active(fault: ReplayFault) -> bool {
-    cfg!(test) && (REPLAY_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) & fault.bit()) != 0
+/// Whether `fault` is armed for the replay that runs on `treekem_dir`.
+#[cfg(test)]
+fn replay_fault_active(treekem_dir: &FsPath, fault: ReplayFault) -> bool {
+    REPLAY_FAULTS_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(dir, mask)| dir == treekem_dir && (mask & fault.bit()) != 0)
+}
+
+/// Production builds: no replay fault is ever armed.
+#[cfg(not(test))]
+fn replay_fault_active(_treekem_dir: &FsPath, _fault: ReplayFault) -> bool {
+    false
+}
+
+/// Disarms only the directory this guard armed, on drop, so a failed
+/// assertion cannot leak the fault into another test.
+#[cfg(test)]
+pub(in crate::server) struct ReplayFaultGuard {
+    treekem_dir: PathBuf,
 }
 
 #[cfg(test)]
-pub(in crate::server) struct ReplayFaultGuard(Option<ReplayFault>);
-#[cfg(test)]
 impl Drop for ReplayFaultGuard {
     fn drop(&mut self) {
-        if std::thread::panicking() || self.0.is_some() {
-            REPLAY_FAULT_INJECT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut armed = REPLAY_FAULTS_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|(dir, _)| *dir == self.treekem_dir) {
+            armed.swap_remove(idx);
         }
     }
 }
 
+/// Arm `faults` for replays that run on `treekem_dir` until the returned
+/// guard drops. Replays on every other directory are unaffected.
 #[cfg(test)]
-pub(in crate::server) fn set_replay_fault(faults: &[ReplayFault]) -> ReplayFaultGuard {
+pub(in crate::server) fn set_replay_fault(
+    treekem_dir: &FsPath,
+    faults: &[ReplayFault],
+) -> ReplayFaultGuard {
     let mask = faults.iter().fold(0u8, |acc, f| acc | f.bit());
-    REPLAY_FAULT_INJECT.store(mask, std::sync::atomic::Ordering::SeqCst);
-    ReplayFaultGuard(if faults.is_empty() {
-        None
-    } else {
-        Some(faults[0])
-    })
+    REPLAY_FAULTS_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((treekem_dir.to_path_buf(), mask));
+    ReplayFaultGuard {
+        treekem_dir: treekem_dir.to_path_buf(),
+    }
 }
 
 /// #457 r11 — the fault cells are PROCESS-GLOBAL in test builds: every
@@ -30308,7 +30341,7 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                 .await?;
                 // #457 r13 item 13.7 — test fault point between the two
                 // live writes (a torn sidecar-applied/named-not state).
-                if replay_fault_active(ReplayFault::AfterSidecarApply) {
+                if replay_fault_active(treekem_dir, ReplayFault::AfterSidecarApply) {
                     anyhow::bail!("injected failure between the sidecar and named writes");
                 }
             }
@@ -30321,7 +30354,7 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             .await?;
             // #457 r14 item 14.6 — second tear point: after the named
             // write, before the snapshot.
-            if replay_fault_active(ReplayFault::AfterNamedApply) {
+            if replay_fault_active(treekem_dir, ReplayFault::AfterNamedApply) {
                 anyhow::bail!("injected failure between the named and snapshot writes");
             }
             match persist_treekem_snapshot_bytes_typed(
@@ -60999,7 +61032,7 @@ mod hs451_downgrade_safety {
 
         // Boot 1: the apply fails right after the sidecar write.
         {
-            let _r_guard = set_replay_fault(&[ReplayFault::AfterSidecarApply]);
+            let _r_guard = set_replay_fault(&treekem, &[ReplayFault::AfterSidecarApply]);
             recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
                 .await
                 .expect("#457 r13: an apply failure never aborts startup");
@@ -61085,7 +61118,7 @@ mod hs451_downgrade_safety {
             )
             .await
             .expect("reseed journal");
-            let _r_guard = set_replay_fault(&[ReplayFault::AfterNamedApply]);
+            let _r_guard = set_replay_fault(&treekem, &[ReplayFault::AfterNamedApply]);
             recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
                 .await
                 .expect("second tear never aborts");
