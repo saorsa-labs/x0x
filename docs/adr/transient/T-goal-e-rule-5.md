@@ -12,7 +12,7 @@ ADR 0072 rule 5 says that every new decision names the requirement (R) that it s
 
 ADR 0095 makes efficiency (goal E) part of the core. Its open question 4 asks if goal E can count in place of an R. ADR 0095 is Accepted, so its text does not change. This record gives the answer.
 
-Without an answer, an efficiency decision must claim a loose R. For example, "fewer presence bytes serve R3". That claim is only paperwork. It does not filter scope.
+Without an answer, an efficiency decision must claim a loose R, such as "fewer presence bytes serve R3". That claim does not filter scope.
 
 Two risks need guards:
 
@@ -25,11 +25,11 @@ Goal E counts in place of an R under rule 5 when the change keeps the wire forma
 
 ## How to apply it
 
-1. **Scope test.** Check four surfaces: the wire format, the API, the stored format and the dependencies. If one of them changes, goal E alone is not enough. Name an R. You can name goal E as related.
+1. **Scope test.** Check four surfaces: the wire format, the API, the stored format and the dependencies. If one of them changes, goal E alone is not enough. Name an R.
 2. **Delivery.** Attach the rule-21 delivered and published matrix. Own-origin, inbox, targeted and revocation classes stay at 100%. No pair falls below the baseline.
 3. **Target.** The Proposed record states the target gain. It should also say how the gain will be measured.
-4. **Measurement.** The result meets E-D15 rule 15, with the scope that rule 15 gives. For example, gating rates need at least 5 deploys per arm. p90 needs at least 30 samples, and p95 needs at least 60. Gates use histograms, not means. Public-mesh rows never gate. Evidence is collected at the shipped default log level. Measure first on a sealed, all-upgraded mesh (rule 14). Exact local tests and benchmarks that rule 15 does not restrict stay valid.
-5. **Lifecycle.** David accepts the record. It is Folded only after the measured result is attached. The other E-D15 rules apply to every PR, as before.
+4. **Measurement.** The result meets E-D15 rule 15, with the scope that rule 15 gives. For example, gating rates need at least 5 deploys per arm. p90 needs at least 30 samples, and p95 needs at least 60. Gates use histograms, not means. Public-mesh rows never gate. Evidence is collected at the shipped default log level. Measure first on a sealed, all-upgraded mesh (rule 14).
+5. **Lifecycle.** David accepts the record. It is Folded only after the measured result is attached. The other E-D15 rules still apply to every PR.
 
 ## Rejected options
 
@@ -41,5 +41,4 @@ Goal E counts in place of an R under rule 5 when the change keeps the wire forma
 
 - Efficiency decisions get a direct route, with a delivery guard and a measurement guard.
 - A decision that changes a contract still names an R, so rule 5 still filters scope.
-- The 15-slot limit stays. This record lives in `docs/adr/transient/` and does not count toward the 15.
-- ADR 0095 stays byte-unchanged. A01 Open questions points to this record.
+- The 15-slot limit stays. ADR 0095 stays byte-unchanged.
