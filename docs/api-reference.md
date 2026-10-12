@@ -1969,7 +1969,7 @@ exactly this (saorsa-labs/x0x-symphony#10).
 
 `POST /files/send` and `POST /files/accept/:id` report success only after the peer commits the control frame. The peer sends a `file-control-ack` after it stores the offer, accept, or reject. A raw QUIC receive-ACK is not that commitment. The ack names the peer the frame was sent to. An ack from any other agent is ignored. If the peer does not commit an offer, send returns 500 and marks the local transfer failed. Accept returns 500 when the sender does not confirm the frame. An empty receive returns to pending so the caller can retry. Bytes already stored stay. A later accept does not start a second send when the sender is already in progress or complete. Reject stays rejected locally and returns 200 with a warning when the peer does not confirm it.
 
-A peer from before this frame does not send `file-control-ack`. A sender on this build then reports that the control frame was not accepted. The older peer may still have stored the offer.
+A peer from before this frame does not send `file-control-ack`. A sender on this build then reports that the control frame was not accepted. The older peer may still have stored the offer. v0.47.0 advertises the same capability bits and the same DM protocol version as this build, and this crate version is still 0.47.0. This build cannot tell that peer from a peer that sends the frame, so the wait stays mandatory.
 
 ### Send-file request body
 

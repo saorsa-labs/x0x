@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
@@ -70,9 +70,18 @@ const FILE_CHUNK_WINDOW: u64 = 8;
 /// QUIC return path is the slow leg.
 const FILE_CHUNK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Which frame may complete this waiter. A chunk ack and a control ack
+/// share `file_chunk_acks`, so the handler must match the kind before it
+/// records a sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckSlotKind {
+    Chunk,
+    Control,
+}
+
 /// Per-transfer chunk-ack slot. The sender registers this when it begins
 /// streaming chunks; the file-message listener bumps `last_acked` and wakes
-/// any waiter every time a `FileMessage::ChunkAck` lands for this transfer;
+/// any waiter every time a matching ack lands for this transfer;
 /// the sender's chunk loop blocks on `wait_for_chunk_window` when its in-flight
 /// budget would exceed `FILE_CHUNK_WINDOW`.
 pub(crate) struct FileChunkAckSlot {
@@ -85,6 +94,10 @@ pub(crate) struct FileChunkAckSlot {
     /// slot open to the transfer's existing sender check. A control-ack
     /// slot stores the agent the control frame was sent to.
     expected_sender: Option<AgentId>,
+    kind: AckSlotKind,
+    /// Control callers joined on this slot. The map entry is removed only
+    /// when the last caller releases the same `Arc`.
+    waiters: AtomicUsize,
 }
 
 impl FileChunkAckSlot {
@@ -93,12 +106,16 @@ impl FileChunkAckSlot {
             last_acked: AtomicU64::new(u64::MAX),
             notify: tokio::sync::Notify::new(),
             expected_sender: None,
+            kind: AckSlotKind::Chunk,
+            waiters: AtomicUsize::new(0),
         }
     }
 
     fn expecting(sender: AgentId) -> Self {
         Self {
             expected_sender: Some(sender),
+            kind: AckSlotKind::Control,
+            waiters: AtomicUsize::new(1),
             ..Self::new()
         }
     }
@@ -106,6 +123,11 @@ impl FileChunkAckSlot {
     fn accepts_sender(&self, sender: &AgentId) -> bool {
         self.expected_sender
             .is_none_or(|expected| expected == *sender)
+    }
+
+    /// A frame completes this waiter only when its kind and sender match.
+    fn accepts_ack(&self, kind: AckSlotKind, sender: &AgentId) -> bool {
+        self.kind == kind && self.accepts_sender(sender)
     }
 
     pub(in crate::server) fn record_ack(&self, sequence: u64) {
@@ -214,11 +236,69 @@ fn control_ack_key(op: &str, transfer_id: &str) -> String {
     format!("ctrl:{op}:{transfer_id}")
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct FileRouteTestHook {
+    stub_egress: bool,
+    /// When set, delivery waits until this notify fires. Shutdown drops that wait.
+    egress_gate: Option<Arc<tokio::sync::Notify>>,
+    egress_entered: Arc<std::sync::atomic::AtomicBool>,
+    pause_chunk_for: Option<String>,
+    chunk_entered: Arc<std::sync::atomic::AtomicBool>,
+    chunk_release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+static FILE_ROUTE_TEST_HOOK: std::sync::Mutex<Option<FileRouteTestHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static FILE_ROUTE_HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn file_route_test_hook() -> Option<FileRouteTestHook> {
+    FILE_ROUTE_TEST_HOOK
+        .lock()
+        .expect("file route test hook")
+        .clone()
+}
+
+#[cfg(test)]
+struct FileRouteHookGuard;
+
+#[cfg(test)]
+impl Drop for FileRouteHookGuard {
+    fn drop(&mut self) {
+        *FILE_ROUTE_TEST_HOOK.lock().expect("file route test hook") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_file_route_hook(hook: FileRouteTestHook) -> FileRouteHookGuard {
+    *FILE_ROUTE_TEST_HOOK.lock().expect("file route test hook") = Some(hook);
+    FileRouteHookGuard
+}
+
 async fn deliver_file_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     msg: &x0x::files::FileMessage,
 ) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    #[cfg(test)]
+    if let Some(hook) = file_route_test_hook() {
+        hook.egress_entered.store(true, Ordering::SeqCst);
+        if let Some(gate) = hook.egress_gate {
+            gate.notified().await;
+        }
+        if hook.stub_egress {
+            return Ok(x0x::dm::DmReceipt {
+                request_id: [0; 16],
+                accepted_at: std::time::Instant::now(),
+                retries_used: 0,
+                path: x0x::dm::DmPath::Loopback,
+            });
+        }
+    }
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     state
         .agent
@@ -250,6 +330,43 @@ async fn wait_for_control_ack(slot: &FileChunkAckSlot) -> std::result::Result<()
     }
 }
 
+async fn register_control_waiter(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    key: &str,
+) -> Arc<FileChunkAckSlot> {
+    let mut slots = state.file_chunk_acks.write().await;
+    if let Some(existing) = slots.get(key).cloned() {
+        if existing.kind == AckSlotKind::Control && existing.accepts_sender(agent_id) {
+            existing.waiters.fetch_add(1, Ordering::SeqCst);
+            return existing;
+        }
+    }
+    let slot = Arc::new(FileChunkAckSlot::expecting(*agent_id));
+    slots.insert(key.to_string(), Arc::clone(&slot));
+    slot
+}
+
+async fn release_control_waiter(state: &Arc<AppState>, key: &str, slot: &Arc<FileChunkAckSlot>) {
+    let mut slots = state.file_chunk_acks.write().await;
+    let previous = slot.waiters.load(Ordering::SeqCst);
+    if previous == 0 {
+        return;
+    }
+    slot.waiters.fetch_sub(1, Ordering::SeqCst);
+    if previous == 1
+        && slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        slots.remove(key);
+    }
+}
+
+fn shutdown_error() -> String {
+    "shutting down".to_string()
+}
+
 async fn send_file_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
@@ -262,19 +379,32 @@ async fn send_file_message(
         return deliver_file_message(state, agent_id, msg).await;
     };
     let key = control_ack_key(op, transfer_id);
-    let slot = Arc::new(FileChunkAckSlot::expecting(*agent_id));
-    state
-        .file_chunk_acks
-        .write()
-        .await
-        .insert(key.clone(), Arc::clone(&slot));
-    let sent = deliver_file_message(state, agent_id, msg).await;
+    let slot = register_control_waiter(state, agent_id, &key).await;
+    if state.shutdown_started.is_cancelled() {
+        release_control_waiter(state, &key, &slot).await;
+        return Err(shutdown_error());
+    }
+    let sent = tokio::select! {
+        biased;
+        _ = state.shutdown_started.cancelled() => {
+            release_control_waiter(state, &key, &slot).await;
+            return Err(shutdown_error());
+        }
+        sent = deliver_file_message(state, agent_id, msg) => sent,
+    };
     if let Err(error) = sent {
-        state.file_chunk_acks.write().await.remove(&key);
+        release_control_waiter(state, &key, &slot).await;
         return Err(error);
     }
-    let waited = wait_for_control_ack(&slot).await;
-    state.file_chunk_acks.write().await.remove(&key);
+    let waited = tokio::select! {
+        biased;
+        _ = state.shutdown_started.cancelled() => {
+            release_control_waiter(state, &key, &slot).await;
+            return Err(shutdown_error());
+        }
+        waited = wait_for_control_ack(&slot) => waited,
+    };
+    release_control_waiter(state, &key, &slot).await;
     waited?;
     sent
 }
@@ -398,6 +528,7 @@ pub(in crate::server) async fn file_send_handler(
         chunk_size,
         total_chunks,
         accept_dispatched: false,
+        chunk_admit_held: false,
     };
 
     state
@@ -529,16 +660,12 @@ pub(in crate::server) async fn file_accept_handler(
     if delivery_failed {
         // A missing control ack is not proof the sender ignored the accept.
         // Keep bytes already stored. Return an empty in-progress receive to
-        // pending so the caller can retry. accept_dispatched stays set, so a
-        // chunk that arrives after this return is still applied.
+        // pending so the caller can retry, unless a chunk is already inside
+        // admission. accept_dispatched stays set, so a later chunk is still
+        // applied.
         let mut transfers = state.file_transfers.write().await;
         if let Some(t) = transfers.get_mut(&id) {
-            if t.direction == x0x::files::TransferDirection::Receiving
-                && t.status == x0x::files::TransferStatus::InProgress
-                && t.bytes_transferred == 0
-            {
-                t.status = x0x::files::TransferStatus::Pending;
-            }
+            revert_unconfirmed_empty_receive(t);
         }
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -664,16 +791,25 @@ pub(in crate::server) async fn handle_file_message(
             transfer_id,
             sequence,
         } => {
-            // Wake the sender's chunk loop. Acks for unknown transfers
-            // (already torn down, never started here) are silently dropped.
+            // Wake the sender's chunk loop. A control waiter lives in the
+            // same map under `ctrl:<op>:<id>`. A chunk ack must not complete
+            // it, even when the sender is the addressed peer.
             if let Some(slot) = state.file_chunk_acks.read().await.get(&transfer_id) {
-                slot.record_ack(sequence);
+                if slot.accepts_ack(AckSlotKind::Chunk, sender) {
+                    slot.record_ack(sequence);
+                } else {
+                    tracing::warn!(
+                        transfer_id,
+                        sender = %hex::encode(sender.as_bytes()),
+                        "ignored file chunk ack for a control waiter"
+                    );
+                }
             }
         }
         x0x::files::FileMessage::ControlAck { transfer_id, op } => {
             let key = control_ack_key(&op, &transfer_id);
             if let Some(slot) = state.file_chunk_acks.read().await.get(&key) {
-                if slot.accepts_sender(sender) {
+                if slot.accepts_ack(AckSlotKind::Control, sender) {
                     slot.record_ack(0);
                 } else {
                     tracing::warn!(
@@ -748,6 +884,7 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         chunk_size: offer.chunk_size,
         total_chunks: offer.total_chunks,
         accept_dispatched: false,
+        chunk_admit_held: false,
     };
 
     state
@@ -1107,55 +1244,91 @@ async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
     state.pending_file_chunks.write().await.remove(transfer_id);
 }
 
-async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::files::FileChunk) {
-    let sender_hex = hex::encode(sender.as_bytes());
-
-    // A lost control ack can return the receive to Pending after the sender
-    // has already started. Keep chunks that arrive for that accept.
+/// Timeout recovery and chunk admission share this predicate. A chunk that
+/// has been admitted holds `chunk_admit_held`, so this transition does not
+/// move the receive back to pending underneath that chunk.
+fn revert_unconfirmed_empty_receive(transfer: &mut x0x::files::TransferState) {
+    if transfer.direction == x0x::files::TransferDirection::Receiving
+        && transfer.status == x0x::files::TransferStatus::InProgress
+        && transfer.bytes_transferred == 0
+        && !transfer.chunk_admit_held
     {
-        let mut transfers = state.file_transfers.write().await;
-        if let Some(t) = transfers.get_mut(&chunk.transfer_id) {
-            if t.accept_dispatched
-                && t.status == x0x::files::TransferStatus::Pending
-                && t.direction == x0x::files::TransferDirection::Receiving
-                && t.remote_agent_id == sender_hex
-            {
-                t.status = x0x::files::TransferStatus::InProgress;
-            }
+        transfer.status = x0x::files::TransferStatus::Pending;
+    }
+}
+
+/// Promote a lost-ack receive and decide whether this chunk is admissible
+/// under one write lock. The admit flag stays set until the byte count moves.
+async fn begin_chunk_admission(
+    state: &Arc<AppState>,
+    sender_hex: &str,
+    transfer_id: &str,
+) -> Option<u64> {
+    let mut transfers = state.file_transfers.write().await;
+    let Some(transfer) = transfers.get_mut(transfer_id) else {
+        tracing::warn!("Ignoring chunk for unknown transfer {transfer_id}");
+        return None;
+    };
+    if transfer.accept_dispatched
+        && transfer.status == x0x::files::TransferStatus::Pending
+        && transfer.direction == x0x::files::TransferDirection::Receiving
+        && transfer.remote_agent_id == sender_hex
+    {
+        transfer.status = x0x::files::TransferStatus::InProgress;
+    }
+    match x0x::files::receive_chunk_expected_sequence(transfer, sender_hex) {
+        Ok(sequence) => {
+            transfer.chunk_admit_held = true;
+            Some(sequence)
+        }
+        Err(x0x::files::FileChunkValidationError::WrongSender) => {
+            tracing::warn!(
+                "Chunk from wrong agent for {transfer_id}: expected {} got {sender_hex}",
+                transfer.remote_agent_id
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Ignoring chunk for transfer {transfer_id} (dir={:?} status={:?})",
+                transfer.direction,
+                transfer.status
+            );
+            None
         }
     }
+}
 
-    // Validate: transfer must exist, be a receiving transfer, be InProgress,
-    // and the sender must match the original offer's remote_agent_id.
-    let expected_sequence = {
-        let transfers = state.file_transfers.read().await;
-        match transfers.get(&chunk.transfer_id) {
-            Some(t) => match x0x::files::receive_chunk_expected_sequence(t, &sender_hex) {
-                Ok(sequence) => sequence,
-                Err(x0x::files::FileChunkValidationError::WrongSender) => {
-                    tracing::warn!(
-                        "Chunk from wrong agent for {}: expected {} got {sender_hex}",
-                        chunk.transfer_id,
-                        t.remote_agent_id
-                    );
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Ignoring chunk for transfer {} (dir={:?} status={:?})",
-                        chunk.transfer_id,
-                        t.direction,
-                        t.status
-                    );
-                    return;
-                }
-            },
-            None => {
-                tracing::warn!("Ignoring chunk for unknown transfer {}", chunk.transfer_id);
-                return;
-            }
-        }
+async fn end_chunk_admission(state: &Arc<AppState>, transfer_id: &str) {
+    let mut transfers = state.file_transfers.write().await;
+    if let Some(transfer) = transfers.get_mut(transfer_id) {
+        transfer.chunk_admit_held = false;
+    }
+}
+
+#[cfg(test)]
+async fn pause_after_chunk_admission(transfer_id: &str) {
+    let Some(hook) = file_route_test_hook() else {
+        return;
     };
+    if hook.pause_chunk_for.as_deref() != Some(transfer_id) {
+        return;
+    }
+    hook.chunk_entered.store(true, Ordering::SeqCst);
+    while !hook.chunk_release.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::files::FileChunk) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let Some(expected_sequence) =
+        begin_chunk_admission(state, &sender_hex, &chunk.transfer_id).await
+    else {
+        return;
+    };
+    #[cfg(test)]
+    pause_after_chunk_admission(&chunk.transfer_id).await;
 
     let data = match BASE64.decode(&chunk.data) {
         Ok(d) => d,
@@ -1166,6 +1339,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                 t.status = x0x::files::TransferStatus::Failed;
                 t.error = Some(format!("Chunk decode error: {e}"));
                 t.completed_at_unix_ms = Some(file_transfer_now().1);
+                t.chunk_admit_held = false;
             }
             drop(transfers);
             cleanup_failed_transfer(state, &chunk.transfer_id).await;
@@ -1180,6 +1354,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             expected_sequence,
             "ignoring duplicate/stale file chunk"
         );
+        end_chunk_admission(state, &chunk.transfer_id).await;
         return;
     }
 
@@ -1201,6 +1376,8 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             );
         }
         // Ack even for buffered chunks: it lets the sender's window advance.
+        // The chunk is stored, so admission no longer blocks timeout recovery.
+        end_chunk_admission(state, &chunk.transfer_id).await;
         send_chunk_ack(state, sender, &chunk.transfer_id, chunk.sequence).await;
         return;
     }
@@ -1213,6 +1390,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             t.status = x0x::files::TransferStatus::Failed;
             t.error = Some(e);
             t.completed_at_unix_ms = Some(file_transfer_now().1);
+            t.chunk_admit_held = false;
         }
         drop(transfers);
         cleanup_failed_transfer(state, &chunk.transfer_id).await;
@@ -1305,6 +1483,7 @@ async fn apply_ready_file_chunks(
                 .get_mut(transfer_id)
                 .ok_or_else(|| "transfer disappeared while updating progress".to_string())?;
             t.bytes_transferred = new_total;
+            t.chunk_admit_held = false;
             if t.bytes_transferred == t.total_size {
                 Some(t.sha256.clone())
             } else {
@@ -1688,5 +1867,361 @@ mod tests {
             chunk.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
         );
+    }
+
+    fn empty_hook_notify() -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
+
+    fn hook_flag() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for file-route test hook");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn route_state() -> (Arc<AppState>, tempfile::TempDir) {
+        super::super::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("file route test state")
+    }
+
+    #[tokio::test]
+    async fn forged_chunk_ack_does_not_complete_control_waiter() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([7; 32]);
+        let other = x0x::identity::AgentId([8; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_OFFER, &transfer_id);
+        let control = register_control_waiter(&state, &peer, &key).await;
+        let chunk_slot = Arc::new(FileChunkAckSlot::new());
+        state
+            .file_chunk_acks
+            .write()
+            .await
+            .insert(transfer_id.clone(), Arc::clone(&chunk_slot));
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ChunkAck {
+                transfer_id: key.clone(),
+                sequence: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            control.last_acked.load(Ordering::SeqCst),
+            u64::MAX,
+            "a chunk ack must not complete a control waiter"
+        );
+
+        handle_file_message(
+            &state,
+            &other,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id: transfer_id.clone(),
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), u64::MAX);
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ChunkAck {
+                transfer_id: transfer_id.clone(),
+                sequence: 4,
+            },
+        )
+        .await;
+        assert_eq!(chunk_slot.last_acked.load(Ordering::SeqCst), 4);
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), u64::MAX);
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id,
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_control_waits_share_one_slot() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([3; 32]);
+        let key = control_ack_key(CONTROL_OP_ACCEPT, "same-accept");
+        let first = register_control_waiter(&state, &peer, &key).await;
+        let second = register_control_waiter(&state, &peer, &key).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second accept must join the live slot"
+        );
+        assert_eq!(first.waiters.load(Ordering::SeqCst), 2);
+
+        let first_wait = {
+            let slot = Arc::clone(&first);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        let second_wait = {
+            let slot = Arc::clone(&second);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        first.record_ack(0);
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first_wait)
+            .await
+            .expect("first wait")
+            .expect("first task");
+        let second_result = tokio::time::timeout(Duration::from_secs(2), second_wait)
+            .await
+            .expect("second wait")
+            .expect("second task");
+        first_result.expect("joined slot receives the ack");
+        second_result.expect("joined slot receives the ack");
+
+        release_control_waiter(&state, &key, &first).await;
+        assert!(state.file_chunk_acks.read().await.contains_key(&key));
+        release_control_waiter(&state, &key, &second).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn control_waiter_timeout_release_keeps_the_live_slot() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([5; 32]);
+        let key = control_ack_key(CONTROL_OP_ACCEPT, "live-accept");
+        let timed_out = register_control_waiter(&state, &peer, &key).await;
+        let live = register_control_waiter(&state, &peer, &key).await;
+        assert!(Arc::ptr_eq(&timed_out, &live));
+
+        let waiting = {
+            let slot = Arc::clone(&live);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The accept timeout path releases only the caller that finished.
+        release_control_waiter(&state, &key, &timed_out).await;
+        let current = state
+            .file_chunk_acks
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("live waiter must keep the map entry");
+        assert!(Arc::ptr_eq(&current, &live));
+
+        live.record_ack(0);
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("live wait")
+            .expect("live task")
+            .expect("ack still completes the remaining waiter");
+        release_control_waiter(&state, &key, &live).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn chunk_admission_holds_while_accept_wait_expires() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        tokio::fs::create_dir_all(&state.transfers_dir)
+            .await
+            .expect("transfers dir");
+        let sender = x0x::identity::AgentId([6; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let payload = b"test";
+        let sha256 = hex::encode(Sha256::digest(payload));
+        state.file_transfers.write().await.insert(
+            transfer_id.clone(),
+            x0x::files::TransferState {
+                transfer_id: transfer_id.clone(),
+                direction: x0x::files::TransferDirection::Receiving,
+                remote_agent_id: hex::encode(sender.as_bytes()),
+                filename: "note.txt".to_string(),
+                total_size: payload.len() as u64,
+                bytes_transferred: 0,
+                status: x0x::files::TransferStatus::Pending,
+                sha256,
+                error: None,
+                started_at: 0,
+                started_at_unix_ms: 0,
+                completed_at_unix_ms: None,
+                source_path: None,
+                output_path: None,
+                chunk_size: x0x::files::DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                accept_dispatched: true,
+                chunk_admit_held: false,
+            },
+        );
+        let chunk_entered = hook_flag();
+        let chunk_release = hook_flag();
+        let entered = Arc::clone(&chunk_entered);
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: Some(transfer_id.clone()),
+            chunk_entered,
+            chunk_release: Arc::clone(&chunk_release),
+        });
+        let state_for_chunk = Arc::clone(&state);
+        let chunk_id = transfer_id.clone();
+        let chunk_task = tokio::spawn(async move {
+            handle_file_chunk(
+                &state_for_chunk,
+                &sender,
+                x0x::files::FileChunk {
+                    transfer_id: chunk_id,
+                    sequence: 0,
+                    data: BASE64.encode(payload),
+                },
+            )
+            .await;
+        });
+        wait_for_flag(&entered).await;
+        {
+            let mut transfers = state.file_transfers.write().await;
+            let transfer = transfers
+                .get_mut(&transfer_id)
+                .expect("transfer remains during the pause");
+            assert!(transfer.chunk_admit_held);
+            assert_eq!(transfer.status, x0x::files::TransferStatus::InProgress);
+            assert_eq!(transfer.bytes_transferred, 0);
+            revert_unconfirmed_empty_receive(transfer);
+            assert_eq!(
+                transfer.status,
+                x0x::files::TransferStatus::InProgress,
+                "accept timeout must not return an admitted chunk to pending"
+            );
+        }
+        chunk_release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), chunk_task)
+            .await
+            .expect("chunk task")
+            .expect("chunk task join");
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("transfer after chunk");
+        assert_eq!(transfer.bytes_transferred, payload.len() as u64);
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Complete);
+        assert!(!transfer.chunk_admit_held);
+    }
+
+    #[tokio::test]
+    async fn control_ack_wait_ends_on_shutdown_when_ack_is_withheld() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([4; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_ACCEPT, &transfer_id);
+        let held = register_control_waiter(&state, &peer, &key).await;
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send_id = transfer_id.clone();
+        let send = tokio::spawn(async move {
+            send_file_message(
+                &state_for_send,
+                &peer,
+                &x0x::files::FileMessage::Accept {
+                    transfer_id: send_id,
+                },
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while held.waiters.load(Ordering::SeqCst) < 2 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("second accept did not join the control waiter");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state.shutdown_started.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("shutdown must not wait out the withheld ack")
+            .expect("send task")
+            .expect_err("withheld ack during shutdown is not success");
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(
+            state.file_chunk_acks.read().await.contains_key(&key),
+            "shutdown must release only the cancelled caller"
+        );
+        assert_eq!(held.waiters.load(Ordering::SeqCst), 1);
+        release_control_waiter(&state, &key, &held).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn control_delivery_selects_shutdown() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([9; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_OFFER, &transfer_id);
+        let entered = hook_flag();
+        let gate = empty_hook_notify();
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: false,
+            egress_gate: Some(Arc::clone(&gate)),
+            egress_entered: Arc::clone(&entered),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send_id = transfer_id.clone();
+        let send = tokio::spawn(async move {
+            send_file_message(
+                &state_for_send,
+                &peer,
+                &x0x::files::FileMessage::Offer(x0x::files::FileOffer {
+                    transfer_id: send_id,
+                    filename: "a.bin".to_string(),
+                    size: 1,
+                    sha256: "abc".to_string(),
+                    chunk_size: 32,
+                    total_chunks: 1,
+                }),
+            )
+            .await
+        });
+        wait_for_flag(&entered).await;
+        state.shutdown_started.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("shutdown during delivery")
+            .expect("send task")
+            .expect_err("delivery must stop on shutdown");
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(
+            !state.file_chunk_acks.read().await.contains_key(&key),
+            "the only caller must drop its slot on shutdown"
+        );
+        gate.notify_waiters();
     }
 }

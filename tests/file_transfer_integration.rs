@@ -49,6 +49,7 @@ fn make_sending_transfer(size: u64, chunk_size: usize) -> TransferState {
         chunk_size,
         total_chunks,
         accept_dispatched: false,
+        chunk_admit_held: false,
     }
 }
 
@@ -72,6 +73,7 @@ fn make_receiving_transfer(size: u64, chunk_size: usize) -> TransferState {
         chunk_size,
         total_chunks,
         accept_dispatched: false,
+        chunk_admit_held: false,
     }
 }
 

@@ -141,6 +141,12 @@ pub struct TransferState {
     /// and is not part of the HTTP transfer object.
     #[serde(default, skip)]
     pub accept_dispatched: bool,
+    /// A chunk has passed admission and has not yet updated
+    /// `bytes_transferred`. Timeout recovery must not return this receive
+    /// to pending while the flag is set. Process-local. Not part of the
+    /// HTTP transfer object.
+    #[serde(default, skip)]
+    pub chunk_admit_held: bool,
 }
 
 /// Reason a received file chunk cannot be accepted for a transfer.
@@ -342,6 +348,7 @@ mod tests {
             chunk_size: 32768,
             total_chunks: 1,
             accept_dispatched: false,
+            chunk_admit_held: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let decoded: TransferState = serde_json::from_str(&json).unwrap();
