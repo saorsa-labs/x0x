@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,7 @@ STALE_BEFORE = "0a15ce643a7da30956b5a18fd870a9f50acfb047"
 
 class AdrCountTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         shutil.copytree(ROOT / "docs/adr", self.root / "docs/adr", symlinks=True)
@@ -37,6 +38,31 @@ class AdrCountTests(unittest.TestCase):
         for key in GITHUB_ENV_KEYS:
             os.environ.pop(key, None)
         self.addCleanup(self._restore_github_env)
+        self.addCleanup(self._remove_worktree)
+
+    def _remove_worktree(self) -> None:
+        root = getattr(self, "root", None)
+        if root is None or not root.exists():
+            return
+        if (root / ".git").exists():
+            # A fsmonitor daemon writes into .git after the test returns.
+            subprocess.run(
+                ["git", "-C", str(root), "fsmonitor--daemon", "stop"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        last_error: OSError | None = None
+        for _ in range(8):
+            try:
+                shutil.rmtree(root)
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.05)
+                continue
+            return
+        if last_error is not None:
+            raise last_error
 
     def _restore_github_env(self) -> None:
         for key, value in self._saved_github_env.items():
@@ -180,6 +206,10 @@ class AdrCountTests(unittest.TestCase):
             ("user.name", "Test"),
             ("user.email", "test@example.com"),
             ("commit.gpgsign", "false"),
+            ("gc.auto", "0"),
+            ("gc.autoDetach", "false"),
+            ("core.fsmonitor", "false"),
+            ("maintenance.auto", "false"),
         ):
             subprocess.run(["git", "config", key, value], cwd=self.root, check=True)
 
