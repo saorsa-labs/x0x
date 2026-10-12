@@ -3923,15 +3923,11 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let Some(snapshot) = ({
         let groups = state.named_groups.read().await;
-        let info = match groups.get(group_key) {
-            Some(info) => info,
-            None => match groups
-                .values()
-                .find(|info| info.stable_group_id() == group_key)
-            {
-                Some(info) => info,
-                None => return,
-            },
+        // #732: the map key and the stable id are different spellings. The
+        // shared resolver hits the key first, then scans by stable id, so a
+        // quarantine check below cannot miss an alias-keyed record.
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
+            return;
         };
         let committed_by = match info.commit_log.last() {
             Some(link) => link.commit.committed_by.as_str(),
