@@ -8,7 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
+David accepted the archive transfer on 10 October 2026. These slots remain
+Proposed; replacement acceptance and clause-level transfer checks are still open.
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must bound the work and resources used by each daemon. A user's device must not become general network infrastructure without a clear role and policy.
@@ -72,7 +73,7 @@ Making every participant a relay can improve aggregate reach, but it spends user
 
 ## Current implementation
 
-Leaf behavior, priority shedding, receive-loop rules and connectivity bounds exist in several forms. The hard resource envelope and broad efficiency evidence remain work in progress.
+Desktop daemons default to `ParticipationMode::Leaf`. A seed listen address, a bind on UDP/443, a managed binary path or an explicit relay setting selects `Full`. Leaf byte shedding exists but is opt-in: `byte_policy` defaults to `observe_only`. Priority shedding and connectivity bounds exist. The complete resource envelope and broad efficiency evidence remain incomplete.
 
 Historical traffic or CPU measurements are not current release measurements.
 
@@ -95,6 +96,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0004 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0004-quic-stream-and-channel-limits.md) · [ADR 0009 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0009-recv-pump-overload-policy.md) · [ADR 0013 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0013-priority-aware-pubsub-shed.md) · [ADR 0033 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0033-recv-pump-never-blocks.md) · [ADR 0034 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0034-leaf-participation-default.md) · [ADR 0035 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0035-relay-decentralization.md) · [ADR 0051 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0051-application-level-peer-relay.md) · [ADR 0071 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0071-relay-backbone-shipped-truth-and-deferred-work.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

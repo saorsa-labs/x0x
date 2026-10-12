@@ -8,7 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
+David accepted the archive transfer on 10 October 2026. These slots remain
+Proposed; replacement acceptance and clause-level transfer checks are still open.
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x uses separate identities for a human owner, an agent and a machine. This separation lets the owner grant authority to an agent without giving that agent the owner's key.
@@ -35,7 +36,7 @@ Authentication must prove the relevant agent and machine binding. A transport si
 
 A key-owning harness keeps its own agent key. An API rider uses a scoped delegation through a daemon, as defined in [A04](A04-r01-agent-attachment-and-inbound-events.md). Both forms retain clear attribution.
 
-Pinned agents remain bound to their approved machine. Existing placement records and denials remain effective. This draft does not activate roaming or the disabled key-move ceremony.
+Pinned agents remain bound to their approved machine. Existing placement records and denials remain effective. This draft does not activate roaming or the key-move ceremony, which is off by default.
 
 Enrollment and certificate issuance must require owner authority. Discovery provides possible addresses; it does not grant ownership or permission.
 
@@ -65,7 +66,7 @@ Automatic key movement would make placement easier, but would require a complete
 
 ## Current implementation
 
-The three identity types, certificates, enrollment and placement checks exist. Some custody and placement records describe historical or disabled mechanisms. The archive map must retain those distinctions.
+The three identity types, certificates, enrollment and placement checks exist. The experimental key-move ceremony can be enabled with `[key_move] ceremony_enabled = true`; its endpoints return HTTP 501 by default. The archive map must retain the distinction between this optional ceremony and the always-on enrollment and placement checks.
 
 [A03](A03-r01-trust-permissions-sharing-and-revocation.md) owns revocation effects. [A05](A05-r01-connectivity-discovery-and-names.md) owns name resolution and reachability. [A15](A15-r01-compatibility-validation-and-decision-rules.md) owns format compatibility.
 
@@ -90,6 +91,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 David placed [ADR 0115](../0115-identity-discovery-authority.md) in A02 on 10 Oct 2026. It amends ADR 0043. It also touches [A03](A03-r01-trust-permissions-sharing-and-revocation.md). That touch is not a second placement.
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

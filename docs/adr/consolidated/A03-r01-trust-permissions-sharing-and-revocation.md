@@ -8,7 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
+David accepted the archive transfer on 10 October 2026. These slots remain
+Proposed; replacement acceptance and clause-level transfer checks are still open.
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x grants access through verified authority and limited permissions. Possession of a network connection, a message, or an agent name does not grant authority.
@@ -64,7 +65,7 @@ A network-wide reputation score cannot replace an owner's explicit grant or a gr
 
 ## Current implementation
 
-Many trust, grant and ACL surfaces exist. Unified authority, complete revocation coverage and corruption recovery remain active work. This draft must not describe those gaps as repaired.
+Many trust, grant and ACL surfaces exist. Unified authority and complete revocation coverage remain incomplete. Startup still loads an unreadable revocation store as an empty set. The heartbeat removes agent and machine revocation records after 90 days, without checking credential expiry. Binding tombstones are permanent; grant revocations follow the grant expiry. The corruption and lifetime requirements above are not fully implemented.
 
 ## Validation
 
@@ -85,6 +86,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0008 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0008-trust-evaluation-system.md) · [ADR 0018 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0018-key-lifecycle-expiry-renewal-revocation.md) · [ADR 0019 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0019-connect-acl-default-closed.md) · [ADR 0046 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0046-exec-service-fail-closed-acl.md) · [ADR 0070 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0070-owner-trust-and-share-grants.md) · [ADR 0079 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0079-grant-carried-owner-and-machine-names.md) · [ADR 0080 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0080-grant-revocation-direct-push.md) · [ADR 0089 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0089-relationship-peer-evidence-survives-restart.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

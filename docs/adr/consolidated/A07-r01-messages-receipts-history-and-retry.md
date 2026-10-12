@@ -8,7 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
+David accepted the archive transfer on 10 October 2026. These slots remain
+Proposed; replacement acceptance and clause-level transfer checks are still open.
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must report what happened to a message. A successful send must not imply that an external agent accepted or completed the work.
@@ -29,7 +30,7 @@ The delivery model has these distinct states:
 4. Started: the runtime has begun the work.
 5. Completed, refused, failed or expired: the application reports a terminal result.
 
-The existing DM-v2 acknowledgment retains its current meaning: verified envelope, completed local dispatch and awaited history commit. It must not be renamed to imply consumer acceptance.
+A successful DM-v2 acknowledgment confirms a verified envelope and a durable local record. Ordinary DMs require local dispatch and an awaited history commit, or an existing matching committed row. A registered durable protocol handler instead confirms its own store. The acknowledgment must not be renamed to imply consumer acceptance.
 
 ## Durable delivery
 
@@ -73,7 +74,7 @@ A global central broker would provide a convenient queue service but add a depen
 
 ## Validation
 
-History, durable DM receipts, logical IDs and bounded backfill exist. The common Outbox design and full consumer inbox remain incomplete.
+History, durable DM receipts, logical IDs and bounded backfill exist. ADR 0116 recording and retention policy is implemented. By default, `dm_recording` is `inherit`. With `ephemeral`, a new ordinary DM-v2 request without a committed row is withheld before dispatch and gets no acknowledgment; a matching committed duplicate can still be acknowledged. Grant redelivery and public-group bootstrap have separate outboxes. The shared durable delivery mechanism and full consumer inbox are not implemented.
 
 Test crash boundaries on both peers and the adapter. Test duplicate delivery, a lost acknowledgment, capacity refusal, expiry and revocation during replay.
 
@@ -92,6 +93,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 David placed [ADR 0116](../0116-local-history-retention-policy.md) in A07 on 10 Oct 2026. It amends ADR 0023. It also touches [A08](A08-r01-groups-home-membership-and-repair.md) and cites [ADR 0030](../0030-dm-durable-application-ack-v2.md). Those links are not a second placement.
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

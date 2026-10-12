@@ -8,7 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
+David accepted the archive transfer on 10 October 2026. These slots remain
+Proposed; replacement acceptance and clause-level transfer checks are still open.
 Use the [index and transition rules](README.md) to interpret their status.
 
 A group defines who can act and which shared state is valid. Home is a private group for one owner. Group operation must not depend on an unnecessary fixed device.
@@ -69,7 +70,7 @@ Allowing every admin to act immediately improves local progress but can create c
 
 ## Current implementation
 
-The group foundation exists. The full liveness contract, scoped certificate work, any-holder repair, any-admin redemption and explicit Home transition span accepted and proposed old records. They are not one completed feature.
+The group foundation and Home-scoped certificate checks exist. Home still auto-provisions and uses the owner-sync Home register to select the canonical group. The explicit Home transition is not implemented. The full liveness contract, any-holder repair and any-admin redemption remain incomplete.
 
 D63 keeps separate numbered slice acceptance in this order:
 **S2 & S8 → S4 & S3 → S5 → S6 → S7**. D65 clarifies that S8 here means
@@ -108,6 +109,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0016 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0016-role-based-group-authority-flat-admin.md) · [ADR 0031 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0031-sole-member-self-leave-deletes-group.md) · [ADR 0038 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0038-home-owner-certified-personal-space.md) · [ADR 0059 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0059-invite-authentication-and-seating-provenance.md) · [ADR 0060 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0060-one-home-per-owner.md) · [ADR 0062 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0062-home-persistence-pair-recovery.md) · [ADR 0064 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0064-owner-anchored-fork-authority.md) · [ADR 0065 Superseded](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0065-duplicate-home-inventory-retirement-deferred.md) · [ADR 0066 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md) · [ADR 0067 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0067-lifecycle-epoch-token-is-derived-marker-identity.md) · [ADR 0068 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0068-quarantine-pinned-history-retention-and-buffered-task-deltas.md) · [ADR 0069 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0069-home-wait-for-sync-before-auto-provisioning.md) · [ADR 0088 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0088-group-liveness-contract.md) · [ADR 0106 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0106-join-result-carries-intervening-membership-events.md) · [ADR 0107 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0107-stuck-join-rearm-and-serving-guard.md) · [ADR 0108 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0108-home-scoped-owner-certificate.md) · [ADR 0109 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0109-ownerless-attestation-self-recovery.md) · [ADR 0111 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0111-evidence-size-k-and-fetch-by-hash.md) · [ADR 0112 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0112-any-admin-invite-redemption.md) · [ADR 0113 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0113-home-is-an-explicit-owner-group-adopted-in-place.md) · [ADR 0114 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0114-authority-re-welcome.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

@@ -3,6 +3,7 @@
   "phase": "transfer_review",
   "maximum_current_adrs": 15,
   "source_commit": "eacf68591dffcb6f949e2a12bc6f05cfb6e8d481",
+  "implementation_commit": "8cb6488331e6c1226913104ddb99ca4ec18bec37",
   "slots": [
     {
       "id": "A01",
