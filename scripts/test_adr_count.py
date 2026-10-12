@@ -15,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("adr_count", ROOT / "scripts/check-adr-count.py")
 CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
+GITHUB_ENV_KEYS = (
+    "GITHUB_EVENT_NAME",
+    "GITHUB_BEFORE",
+    "GITHUB_BASE_SHA",
+    "GITHUB_BASE_REF",
+)
+STALE_BEFORE = "0a15ce643a7da30956b5a18fd870a9f50acfb047"
 
 
 class AdrCountTests(unittest.TestCase):
@@ -26,6 +33,17 @@ class AdrCountTests(unittest.TestCase):
         archive = self.root / "docs/adr-archive"
         archive.mkdir()
         shutil.copy2(ROOT / "docs/adr-archive/move.json", archive / "move.json")
+        self._saved_github_env = {key: os.environ.get(key) for key in GITHUB_ENV_KEYS}
+        for key in GITHUB_ENV_KEYS:
+            os.environ.pop(key, None)
+        self.addCleanup(self._restore_github_env)
+
+    def _restore_github_env(self) -> None:
+        for key, value in self._saved_github_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_repository_count_stays_within_the_limit_of_15(self):
         self.assertEqual(CHECK.validate(ROOT), [])
@@ -36,9 +54,13 @@ class AdrCountTests(unittest.TestCase):
             CHECK.pass_line(count),
             "PASS: 15 current ADRs, within the limit of 15. Plan: docs/adr/consolidated/README.md",
         )
+        env = os.environ.copy()
+        for key in GITHUB_ENV_KEYS:
+            env.pop(key, None)
         reported = subprocess.check_output(
             [sys.executable, str(ROOT / "scripts/check-adr-count.py")],
             text=True,
+            env=env,
         )
         self.assertEqual(
             reported,
@@ -152,6 +174,20 @@ class AdrCountTests(unittest.TestCase):
             ["git", "-C", str(self.root), *args], text=True
         ).strip()
 
+    def _init_repo(self) -> None:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
+        for key, value in (
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ):
+            subprocess.run(["git", "config", key, value], cwd=self.root, check=True)
+
+    def _commit_all(self, message: str) -> str:
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.root, check=True)
+        return self._git("rev-parse", "HEAD")
+
     def _add_invented_archive(self, name: str) -> None:
         payload = b"# Invented\n"
         archive = self.root / "docs/adr-archive" / name
@@ -181,27 +217,11 @@ class AdrCountTests(unittest.TestCase):
         )
 
     def test_push_event_cannot_approve_an_invented_archive(self):
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
-        for key, value in (
-            ("user.name", "Test"),
-            ("user.email", "test@example.com"),
-            ("commit.gpgsign", "false"),
-        ):
-            subprocess.run(["git", "config", key, value], cwd=self.root, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "approved history"], cwd=self.root, check=True
-        )
-        before = self._git("rev-parse", "HEAD")
+        self._init_repo()
+        before = self._commit_all("approved history")
         name = "0117-review-invented.md"
         self._add_invented_archive(name)
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "invent archive on main"],
-            cwd=self.root,
-            check=True,
-        )
-        head = self._git("rev-parse", "HEAD")
+        head = self._commit_all("invent archive on main")
         self._git("update-ref", "refs/remotes/origin/main", head)
         self.assertEqual(self._git("rev-parse", "main"), head)
         self.assertEqual(self._git("rev-parse", "origin/main"), head)
@@ -209,19 +229,11 @@ class AdrCountTests(unittest.TestCase):
         before_listing = self._git("ls-tree", "--name-only", before, "docs/adr/")
         self.assertIn(f"docs/adr/{name}", head_listing)
         self.assertNotIn(f"docs/adr/{name}", before_listing)
-        saved = {
-            key: os.environ.get(key) for key in ("GITHUB_BEFORE", "GITHUB_BASE_SHA")
-        }
-
-        def restore() -> None:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-        self.addCleanup(restore)
-        os.environ.pop("GITHUB_BASE_SHA", None)
+        for key in GITHUB_ENV_KEYS:
+            self.assertNotIn(key, os.environ)
+        os.environ["GITHUB_EVENT_NAME"] = ""
+        os.environ["GITHUB_BASE_SHA"] = ""
+        os.environ["GITHUB_BASE_REF"] = ""
         os.environ["GITHUB_BEFORE"] = before
         self.assertEqual(CHECK._history_base(self.root), before)
         self.assertNotEqual(CHECK._history_base(self.root), head)
@@ -259,6 +271,84 @@ class AdrCountTests(unittest.TestCase):
                 for error in closed
             )
         )
+
+    def test_stale_github_before_outside_the_repo_still_reports_the_pr_count(self):
+        self._init_repo()
+        base = self._commit_all("approved history")
+        name = "0117-review-invented.md"
+        self._add_invented_archive(name)
+        self._commit_all("invent archive on the previous head")
+        (self.root / "note.txt").write_text("force-push replacement\n")
+        head = self._commit_all("replacement head")
+        self._git("update-ref", "refs/remotes/origin/main", head)
+        self.assertIsNone(CHECK._resolve_commit(self.root, STALE_BEFORE))
+        os.environ["GITHUB_EVENT_NAME"] = "pull_request"
+        os.environ["GITHUB_BEFORE"] = STALE_BEFORE
+        os.environ["GITHUB_BASE_SHA"] = base
+        os.environ["GITHUB_BASE_REF"] = "main"
+        self.assertEqual(CHECK._history_base(self.root), base)
+        errors = CHECK.validate(self.root)
+        self.assertFalse(
+            any("GITHUB_BEFORE" in error for error in errors),
+            errors,
+        )
+        self.assertIn(
+            f"docs/adr/{name}: newly invented archive record is not in "
+            "the approved historical source set.",
+            errors,
+        )
+        self.assertIn(
+            f"docs/adr/{name}: transfer row is not in the approved historical source set.",
+            errors,
+        )
+        self.assertIn(
+            "16 current ADRs exceeds the limit of 15. "
+            f"Extra: {name}. "
+            "Plan: docs/adr/consolidated/README.md",
+            errors,
+        )
+
+    def test_pull_request_fails_closed_when_the_base_sha_is_absent(self):
+        self._init_repo()
+        base = self._commit_all("approved history")
+        name = "0117-review-invented.md"
+        self._add_invented_archive(name)
+        self._commit_all("invent archive")
+        os.environ["GITHUB_EVENT_NAME"] = "pull_request"
+        os.environ["GITHUB_BEFORE"] = base
+        os.environ["GITHUB_BASE_SHA"] = STALE_BEFORE
+        os.environ["GITHUB_BASE_REF"] = "main"
+        errors = CHECK.validate(self.root)
+        self.assertTrue(
+            any(
+                "Cannot resolve the approved historical source set from GITHUB_BASE_SHA."
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("newly invented archive record" in error for error in errors))
+
+    def test_push_fails_closed_when_github_before_is_absent(self):
+        self._init_repo()
+        base = self._commit_all("approved history")
+        (self.root / "note.txt").write_text("later\n")
+        self._commit_all("later")
+        os.environ["GITHUB_EVENT_NAME"] = "push"
+        os.environ["GITHUB_BEFORE"] = STALE_BEFORE
+        os.environ["GITHUB_BASE_SHA"] = base
+        os.environ["GITHUB_BASE_REF"] = "main"
+        self.assertIsNone(CHECK._resolve_commit(self.root, STALE_BEFORE))
+        errors = CHECK.validate(self.root)
+        self.assertTrue(
+            any(
+                "Cannot resolve the approved historical source set from GITHUB_BEFORE."
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("exceeds the limit" in error for error in errors))
 
     def test_deleted_transfer_row_counts_the_archived_source(self):
         transfer = self.root / "docs/adr/consolidated/TRANSFER.md"

@@ -5,16 +5,18 @@ The plan is docs/adr/consolidated/README.md. An exact ``docs/adr/NNNN-*.md``
 path does not count only when it is an approved historical source, ``move.json``
 records that path, and the path is a symlink to the recorded archive link.
 The approved set is the numbered ``docs/adr/`` listing at a trusted
-pre-change commit, including ADR 0115 and ADR 0116. Pull requests use the
-merge-base. Push runs use ``GITHUB_BEFORE``. A local checkout of an updated
-main uses its parent. The candidate HEAD never approves its own archive
-entries. The check fails closed when that commit cannot be resolved. The
-set does not come from the working-tree ``TRANSFER.md``. A path is excluded
-only when that history approves it, ``move.json`` records it, and the table
-has exactly one valid slot row for it. A transfer row or ``move.json`` entry
-outside that set is rejected. Files under ``docs/adr/transient/`` do not
-count (D242). A nested file that reuses a mapped number counts. A legal run
-prints the pass line only.
+pre-change commit, including ADR 0115 and ADR 0116. A pull request uses the
+merge-base with ``GITHUB_BASE_SHA``. ``GITHUB_BEFORE`` on that event is the
+previous head. A force-push can remove that commit from the checkout. It is
+not the approved set. A push uses ``GITHUB_BEFORE``. A local checkout of an
+updated main uses its parent. The candidate HEAD never approves its own
+archive entries. The check fails closed when the commit for that event
+cannot be resolved. The set does not come from the working-tree
+``TRANSFER.md``. A path is excluded only when that history approves it,
+``move.json`` records it, and the table has exactly one valid slot row for
+it. A transfer row or ``move.json`` entry outside that set is rejected.
+Files under ``docs/adr/transient/`` do not count (D242). A nested file that
+reuses a mapped number counts. A legal run prints the pass line only.
 
 This check reads local files and local git history. It never starts x0xd or
 contacts the network.
@@ -147,37 +149,41 @@ def _unresolved(source: str) -> ValueError:
     return ValueError(f"Cannot resolve the approved historical source set from {source}.")
 
 
-def _history_base(repo: Path) -> str:
-    """Return a pre-change commit. Never the candidate HEAD.
+def _selector_commit(repo: Path, rev: str) -> str | None:
+    if not rev or rev.startswith("0000000"):
+        return None
+    return _resolve_commit(repo, rev)
 
-    Pull requests use the merge-base with ``GITHUB_BASE_SHA``. Push runs use
-    ``GITHUB_BEFORE``. When those refs are absent and the branch refs point
-    at HEAD, the parent commit is the trusted set. HEAD is not a fallback.
-    """
-    head = _resolve_commit(repo, "HEAD")
-    if head is None:
-        raise _unresolved("HEAD")
 
+def _require_merge_base(repo: Path, head: str, resolved: str, source: str) -> str:
+    if resolved == head:
+        raise _unresolved(source)
+    try:
+        base = _git(["merge-base", resolved, head], repo)
+    except (subprocess.CalledProcessError, OSError):
+        raise _unresolved(source) from None
+    if not base or base == head:
+        raise _unresolved(source)
+    return base
+
+
+def _from_github_before(repo: Path, head: str) -> str:
     before = os.environ.get("GITHUB_BEFORE", "").strip()
-    if before:
-        resolved = None if before.startswith("0000000") else _resolve_commit(repo, before)
-        if resolved is None or resolved == head:
-            raise _unresolved("GITHUB_BEFORE")
-        return resolved
+    resolved = _selector_commit(repo, before)
+    if resolved is None or resolved == head:
+        raise _unresolved("GITHUB_BEFORE")
+    return resolved
 
+
+def _from_github_base_sha(repo: Path, head: str) -> str:
     base_sha = os.environ.get("GITHUB_BASE_SHA", "").strip()
-    if base_sha:
-        resolved = None if base_sha.startswith("0000000") else _resolve_commit(repo, base_sha)
-        if resolved is None or resolved == head:
-            raise _unresolved("GITHUB_BASE_SHA")
-        try:
-            base = _git(["merge-base", resolved, head], repo)
-        except (subprocess.CalledProcessError, OSError):
-            raise _unresolved("GITHUB_BASE_SHA") from None
-        if not base or base == head:
-            raise _unresolved("GITHUB_BASE_SHA")
-        return base
+    resolved = _selector_commit(repo, base_sha)
+    if resolved is None:
+        raise _unresolved("GITHUB_BASE_SHA")
+    return _require_merge_base(repo, head, resolved, "GITHUB_BASE_SHA")
 
+
+def _from_local_history(repo: Path, head: str) -> str:
     for cand in ("origin/main", "main", "origin/master", "master"):
         resolved = _resolve_commit(repo, cand)
         if resolved is None or resolved == head:
@@ -193,6 +199,33 @@ def _history_base(repo: Path) -> str:
     if parent is None or parent == head:
         raise _unresolved("HEAD^1")
     return parent
+
+
+def _history_base(repo: Path) -> str:
+    """Return a pre-change commit. Never the candidate HEAD.
+
+    A pull request uses the merge-base with ``GITHUB_BASE_SHA`` and does
+    not read ``GITHUB_BEFORE``. A push uses ``GITHUB_BEFORE``. When the
+    event name is absent, an explicit ``GITHUB_BEFORE`` or
+    ``GITHUB_BASE_SHA`` is used in that order, then the branch merge-base,
+    then the parent commit. An explicit selector that does not resolve
+    fails closed. HEAD is not a fallback.
+    """
+    head = _resolve_commit(repo, "HEAD")
+    if head is None:
+        raise _unresolved("HEAD")
+
+    event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+    if event == "pull_request":
+        return _from_github_base_sha(repo, head)
+    if event == "push":
+        return _from_github_before(repo, head)
+
+    if os.environ.get("GITHUB_BEFORE", "").strip():
+        return _from_github_before(repo, head)
+    if os.environ.get("GITHUB_BASE_SHA", "").strip():
+        return _from_github_base_sha(repo, head)
+    return _from_local_history(repo, head)
 
 
 def approved_historical_sources(root: Path | None = None) -> set[str]:
