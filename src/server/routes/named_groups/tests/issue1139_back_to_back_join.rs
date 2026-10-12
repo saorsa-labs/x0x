@@ -2294,13 +2294,22 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
 
 /// ADR 0107 Validation, Shape B (separate limitation control, never combined
 /// with the carry test): a join that timed out with NO carry leaves no row —
-/// the finalizer removed the stub — so S8 (a) has nothing to re-arm. On one
-/// device, a fresh base-seated invite keeps the known #1150 limitation: the
+/// the finalizer removed the stub — so S8 (a) has nothing to re-arm. A fresh
+/// base-seated invite keeps the known #1150 limitation: the
 /// ordinary (non-re-armed) path reports the snapshot `active`, with no keys
-/// and no key recovery claimed. On another, the operator exit — owner
-/// remove-member + re-invite — restores eligible membership WITH keys.
+/// and no key recovery claimed. On the SAME device, without a restart, the
+/// operator exit — owner remove-member + re-invite — restores membership
+/// WITH keys (#1191). Cover a timeout that loses to the snapshot seat and
+/// a poll superseded by removal before its deadline.
 #[tokio::test]
 async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys() -> Result<()> {
+    for timeout_before_removal in [true, false] {
+        shape_b_remove_reinvite_without_restart(timeout_before_removal).await?;
+    }
+    Ok(())
+}
+
+async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     assert_eq!(
@@ -2318,11 +2327,75 @@ async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys()
         "Shape B keeps the known limitation, with no re-arm and no key recovery: {r}"
     );
 
-    let dir = tempfile::tempdir()?;
-    let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
+    let member = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &member);
+    let attempt =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .expect("base-seated invite attempt")
+            .attempt_id
+            .clone();
+    if timeout_before_removal {
+        let lock = super::super::group_membership_lock_for_known_group(&s.j2, &s.group_key)
+            .await
+            .expect("known group");
+        assert_eq!(
+            super::super::finalize_join_attempt(
+                &s.j2,
+                &s.group_key,
+                &s.stable_group_id,
+                &member,
+                &attempt,
+                super::super::JoinAttemptOutcome::TimedOut,
+                super::super::JoinFinalizeGuard::Owned(lock.lock().await),
+            )
+            .await,
+            super::super::JoinFinalizeDisposition::NotApplicable
+        );
+        assert!(
+            !s.j2
+                .pending_join_attempts
+                .lock()
+                .expect("attempt registry")
+                .contains_key(&key),
+            "#1191: NotApplicable must retire the matching attempt before removal"
+        );
+        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+        assert!(
+            !s.j2
+                .last_join_outcomes
+                .lock()
+                .expect("outcomes")
+                .contains_key(&s.group_key),
+            "the snapshot seat must not acquire a timeout outcome"
+        );
+    }
     let after_removal = wa_owner_removes_j2(&s, true).await?;
+    assert_eq!(after_removal.after, "no_row");
+    super::super::poll_join_result_until_membership_confirmed(
+        Arc::clone(&s.j2),
+        s.group_key.clone(),
+        s.stable_group_id.clone(),
+        s.authority_id,
+        member,
+        true,
+        None,
+        attempt,
+    )
+    .await;
+    assert!(super::super::expected_join_result_inviter(&s.j2, &key).is_none());
+    assert_eq!(
+        super::group_counters_for_test(&s.j2, &s.group_key)
+            .await
+            .join_attempts_timed_out,
+        0,
+        "bookkeeping-only exits must not count a timeout"
+    );
     let r = wa_fresh_invite_round_trip(&s).await?;
+    assert_eq!(r.status, StatusCode::OK,
+        "#1191: remove + re-invite must be accepted without restart (timeout_before_removal={timeout_before_removal}): {r}");
     wa_assert_recovered(
         &format!(
             "shape B, j2_after_removal={} j2_apply_accepted={:?}",
@@ -2330,6 +2403,198 @@ async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys()
         ),
         &r,
     );
+    Ok(())
+}
+
+/// #1191: a late finalizer or poll must not remove a newer attempt or its
+/// inviter pin, even when the local roster already seats the device.
+#[tokio::test]
+async fn issue1191_stale_finalizer_and_poll_preserve_new_attempt() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt && r.final_state == "active" && !r.treekem,
+        "{r}"
+    );
+    let member = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &member);
+    let current =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .expect("new attempt")
+            .attempt_id
+            .clone();
+    assert_ne!(current, s.j2_attempt);
+    let task = tokio::spawn(std::future::pending::<()>());
+    let handle = task.abort_handle();
+    s.j2.pending_join_attempts
+        .lock()
+        .expect("attempt registry")
+        .get_mut(&key)
+        .expect("new attempt")
+        .tasks
+        .push(task);
+    let pin = super::super::expected_join_result_inviter(&s.j2, &key);
+    assert!(pin.is_some());
+    let lock = super::super::group_membership_lock_for_known_group(&s.j2, &s.group_key)
+        .await
+        .expect("known group");
+    for outcome in [
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinAttemptOutcome::Refused,
+    ] {
+        assert_eq!(
+            super::super::finalize_join_attempt(
+                &s.j2,
+                &s.group_key,
+                &s.stable_group_id,
+                &member,
+                &s.j2_attempt,
+                outcome,
+                super::super::JoinFinalizeGuard::Owned(lock.lock().await),
+            )
+            .await,
+            super::super::JoinFinalizeDisposition::NotApplicable
+        );
+    }
+    super::super::poll_join_result_until_membership_confirmed(
+        Arc::clone(&s.j2),
+        s.group_key.clone(),
+        s.stable_group_id.clone(),
+        s.authority_id,
+        member,
+        true,
+        None,
+        s.j2_attempt.clone(),
+    )
+    .await;
+    assert_eq!(
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .expect("new attempt survives")
+            .attempt_id,
+        current
+    );
+    assert_eq!(super::super::expected_join_result_inviter(&s.j2, &key), pin);
+    tokio::task::yield_now().await;
+    assert!(!handle.is_finished(), "the newer attempt's task survives");
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(!s
+        .j2
+        .last_join_outcomes
+        .lock()
+        .expect("outcomes")
+        .contains_key(&s.group_key));
+    Ok(())
+}
+
+/// #1191: an existing terminal outcome prevents another outcome write,
+/// but both the finalizer and the poll must still retire matching work.
+#[tokio::test]
+async fn issue1191_existing_outcome_retires_matching_attempt() -> Result<()> {
+    for via_poll in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let s = build_back_to_back(dir.path()).await?;
+        let group_before = serde_json::to_value(
+            s.j2.named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .expect("join stub"),
+        )?;
+        let member = hex::encode(s.j2.agent.agent_id().as_bytes());
+        let key = join_result_key(&s.stable_group_id, &member);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = task.abort_handle();
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get_mut(&key)
+            .expect("live attempt")
+            .tasks
+            .push(task);
+        s.j2.last_join_outcomes.lock().expect("outcomes").insert(
+            s.group_key.clone(),
+            super::super::LastJoinOutcome {
+                outcome: "refused",
+                reason: Some("invite_secret_consumed"),
+                finished_at_ms: 7,
+            },
+        );
+        if via_poll {
+            super::super::poll_join_result_until_membership_confirmed(
+                Arc::clone(&s.j2),
+                s.group_key.clone(),
+                s.stable_group_id.clone(),
+                s.authority_id,
+                member,
+                true,
+                None,
+                s.j2_attempt.clone(),
+            )
+            .await;
+        } else {
+            let lock = super::super::group_membership_lock_for_known_group(&s.j2, &s.group_key)
+                .await
+                .expect("known group");
+            assert_eq!(
+                super::super::finalize_join_attempt(
+                    &s.j2,
+                    &s.group_key,
+                    &s.stable_group_id,
+                    &member,
+                    &s.j2_attempt,
+                    super::super::JoinAttemptOutcome::TimedOut,
+                    super::super::JoinFinalizeGuard::Owned(lock.lock().await),
+                )
+                .await,
+                super::super::JoinFinalizeDisposition::NotApplicable
+            );
+        }
+        assert!(!s
+            .j2
+            .pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .contains_key(&key));
+        assert!(super::super::expected_join_result_inviter(&s.j2, &key).is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt task was aborted");
+        assert_eq!(
+            serde_json::to_value(
+                s.j2.named_groups
+                    .read()
+                    .await
+                    .get(&s.group_key)
+                    .expect("join stub preserved"),
+            )?,
+            group_before,
+            "bookkeeping cleanup must not change the group"
+        );
+        assert!(s
+            .j2
+            .pending_join_stubs
+            .lock()
+            .expect("stubs")
+            .contains(&s.group_key));
+        let outcomes = s.j2.last_join_outcomes.lock().expect("outcomes");
+        let outcome = outcomes.get(&s.group_key).expect("existing outcome");
+        assert_eq!(
+            (outcome.outcome, outcome.reason, outcome.finished_at_ms),
+            ("refused", Some("invite_secret_consumed"), 7)
+        );
+    }
     Ok(())
 }
 

@@ -36369,12 +36369,14 @@ async fn finalize_seated_join_attempt_locked(
 /// #477 (r7 item 4) — what a finalizer call actually did. Callers count
 /// (refusal reasons, timeouts) ONLY on `Finalized`: a finalizer that lost
 /// to a durable seat, a newer attempt, or an earlier terminal outcome
-/// owned nothing and must not be observable in the counters.
+/// must not be observable in the counters. It still retires any matching
+/// attempt bookkeeping (#1191).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum JoinFinalizeDisposition {
     /// This call owned the attempt and performed the finalization.
     Finalized,
-    /// Nothing owned, nothing mutated (seat won / duplicate / superseded).
+    /// The requested outcome did not apply (seat won / duplicate / superseded).
+    /// Matching attempt bookkeeping may still have been retired.
     NotApplicable,
 }
 
@@ -36402,11 +36404,12 @@ pub(in crate::server) enum JoinFinalizeGuard<'a> {
 /// membership → persistence FIRST, then re-checks (a) that no durable
 /// seat exists for the member, (b) that no terminal outcome was already
 /// recorded and (c) that the registry entry is THIS attempt's, and only
-/// then mutates: the stub + marker removal AND the terminal-outcome write
-/// happen inside the SAME persistence-guarded step (join-status reads
+/// then changes group state: the stub + marker removal AND the terminal
+/// outcome write happen inside the SAME persistence-guarded step (join-status reads
 /// under the same locks, so it can never observe the group gone without
-/// its outcome). The finalizer's OWN task handle (the timeout owner is a
-/// registered poll) is deregistered, never aborted — aborting itself
+/// its outcome). Matching attempt bookkeeping is still retired when a seat
+/// or an existing outcome wins (#1191). The finalizer's OWN task handle
+/// (the timeout owner is a registered poll) is deregistered, never aborted — aborting itself
 /// would cancel the cleanup at the next await. An ABSENT entry never
 /// authorizes a Refused (a seat that won the guard race removed it); only
 /// the TimedOut legacy deadline owner may finalize on absence, and only
@@ -36464,6 +36467,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     } else {
         Some(state.named_groups_persistence_lock.lock().await)
     };
+    let mut outcome_applies = true;
     // #477 (r6 item 2, re-checked AFTER both locks per r7): a DURABLE
     // SEAT always wins — if the local roster already seats the member
     // actively, a delayed Refused or a TimedOut whose deadline expired
@@ -36480,10 +36484,10 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             tracing::debug!(
                 group_id = %LogHexId::group(local_group_key),
                 member = %LogHexId::agent(member_agent_id),
-                "#477: a durable seat exists — {:?} finalize owns nothing (the seat wins)",
+                "#477: a durable seat exists — {:?} outcome does not apply (the seat wins)",
                 outcome
             );
-            return JoinFinalizeDisposition::NotApplicable;
+            outcome_applies = false;
         }
     }
     // Idempotency + ownership, ALL under the guards: a concurrent
@@ -36495,8 +36499,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if outcomes.contains_key(local_group_key) && outcome != JoinAttemptOutcome::Seated {
             // A terminal outcome already exists: this finalize is a
-            // duplicate (loser of the race) — own nothing, do nothing.
-            return JoinFinalizeDisposition::NotApplicable;
+            // duplicate. Preserve that outcome, but retire any matching
+            // attempt bookkeeping below (#1191).
+            outcome_applies = false;
         }
     }
     // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
@@ -36521,6 +36526,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 entry.listener_token,
             )
         } else {
+            if !outcome_applies {
+                return JoinFinalizeDisposition::NotApplicable;
+            }
             match attempts.get(&expected_key) {
                 // A NEWER attempt owns the entry: this finalize owns NOTHING.
                 Some(_) => return JoinFinalizeDisposition::NotApplicable,
@@ -36566,6 +36574,12 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             continue;
         }
         handle.abort();
+    }
+    // #1191: a snapshot seat or an existing terminal outcome does not
+    // keep a dead attempt alive. Retire only its bookkeeping; preserve the
+    // group, its listener, and the winning outcome, and count nothing.
+    if !outcome_applies {
+        return JoinFinalizeDisposition::NotApplicable;
     }
     if outcome != JoinAttemptOutcome::Seated {
         let outcome_str = match outcome {
@@ -39621,8 +39635,8 @@ async fn poll_join_result_until_membership_confirmed(
             Some(arc) => Some(arc.lock().await),
             None => None,
         };
-        // A registered attempt's stub is always locally known while the
-        // attempt is live: an unknown group means it was finalized.
+        // An unknown group ends this registered attempt. The exit below
+        // retires its bookkeeping even if removal left it in the registry.
         if membership_arc.is_none() && !attempt_id.is_empty() {
             superseded = true;
             break;
@@ -39814,12 +39828,6 @@ async fn poll_join_result_until_membership_confirmed(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    if superseded || already_finalized {
-        // A newer attempt owns the key (superseded: its pin is NOT ours to
-        // clear), or a refusal/timeout finalize already ran (it cleared
-        // the pin): the poll exits silently — no finalizer.
-        return;
-    }
     // #477 (r5 item 2): finalize takes the membership guard from its
     // caller — the poll acquires the (lookup-gated) lock here so the
     // finalization critical section is intact. The finalizer itself
@@ -39832,6 +39840,22 @@ async fn poll_join_result_until_membership_confirmed(
         Some(arc) => JoinFinalizeGuard::Owned(arc.lock().await),
         None => JoinFinalizeGuard::Unlocked,
     };
+    if superseded || already_finalized {
+        // #1191: a removed group or an existing outcome can leave this
+        // attempt registered. Use bookkeeping-only finalization. Its
+        // attempt-id comparison preserves a newer attempt and its pin.
+        finalize_join_attempt(
+            state.as_ref(),
+            &group_id,
+            &event_group_id,
+            &member_agent_id,
+            &attempt_id,
+            JoinAttemptOutcome::Seated,
+            finalize_guard,
+        )
+        .await;
+        return;
+    }
     if timed_out {
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; finalizing the attempt as timed_out");
         // #477 C8: the poll task IS the deadline owner — the live expiry
@@ -39866,7 +39890,11 @@ async fn poll_join_result_until_membership_confirmed(
         // #477 C5: a confirmed seat finalizes the attempt bookkeeping
         // WITHOUT touching the now-durable group and WITHOUT recording a
         // terminal outcome (seated is not a terminal refusal state).
-        clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+        if attempt_id.is_empty()
+            && join_attempt_is_current_locked(state.as_ref(), &expected_key, &attempt_id)
+        {
+            clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+        }
         finalize_join_attempt(
             state.as_ref(),
             &group_id,
@@ -44786,7 +44814,8 @@ pub(in crate::server) mod tests {
 
         /// #477 (r6 item 2): a DURABLE SEAT always wins — after the local
         /// roster seats the member, a valid signed refusal delivered
-        /// through the REAL arm records NOTHING and owns NOTHING.
+        /// through the REAL arm records no refusal outcome and leaves the
+        /// group intact. #1191 retires the matching attempt.
         #[tokio::test]
         async fn wp_b_t2_seated_member_never_refused() {
             let (authority_state, _a) = fresh_state().await;
@@ -44858,8 +44887,8 @@ pub(in crate::server) mod tests {
                 },
             )
             .await;
-            // The seat won: no terminal outcome, the attempt untouched,
-            // the group intact.
+            // The seat won: no terminal outcome, the group intact, and the
+            // matching attempt is retired (#1191).
             assert!(
                 joiner_state
                     .last_join_outcomes
@@ -44870,12 +44899,12 @@ pub(in crate::server) mod tests {
                 "a seated member never records a refusal outcome (the seat wins)"
             );
             assert!(
-                joiner_state
+                !joiner_state
                     .pending_join_attempts
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .contains_key(&join_result_key(&group, &joiner)),
-                "the seat-wins finalize owns NOTHING (the attempt is untouched)"
+                "the seat-wins finalize retires the matching attempt (#1191)"
             );
             assert!(
                 joiner_state.named_groups.read().await.contains_key(&group),
