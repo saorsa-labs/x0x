@@ -15763,6 +15763,20 @@ pub(in crate::server) async fn get_named_group(
     )
 }
 
+fn durable_owner_or_forbid(
+    actor: &crate::server::rider_auth::ActorContext,
+    action: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if actor.is_durable_owner() {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            format!("{action} requires the durable API token (not a session token)"),
+        ))
+    }
+}
+
 /// POST /groups/:id/quarantine/clear — ADR-0064 slice 3, #472 decision 1
 /// (r2 maintainer decision).
 ///
@@ -15797,14 +15811,18 @@ pub(in crate::server) async fn get_named_group(
 /// ADR-0066 §2 promises unreachable from the stable id every other surface
 /// shows the operator. Refusal bodies may still name the map key — that is
 /// the spelling the roster is filed under — but both now clear.
-/// Requires the local API token (same auth layer as
-/// every `/groups` route). Increments `fork_quarantine_manual_clears`
+/// #1228: only the durable API token may clear. A session token is refused
+/// before the marker is touched. Increments `fork_quarantine_manual_clears`
 /// and returns the updated `fork_quarantine: null` view.
 pub(in crate::server) async fn clear_group_quarantine(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<ClearQuarantineRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = durable_owner_or_forbid(&actor, "clearing fork quarantine") {
+        return response;
+    }
     let conflict = |reason: &str| {
         (
             StatusCode::CONFLICT,
@@ -20320,6 +20338,9 @@ pub(in crate::server) async fn join_group_via_invite(
 }
 
 /// PUT /groups/:id/display-name — set your display name in a group.
+///
+/// #1228: the local seat must be admin or higher. A member seat is refused.
+/// A session token of an admin seat may still set the name.
 pub(in crate::server) async fn set_group_display_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -20336,6 +20357,12 @@ pub(in crate::server) async fn set_group_display_name(
             Ok(info) => info,
             Err(resp) => return resp,
         };
+        if !info
+            .caller_role(&agent_hex)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        {
+            return forbidden("setting a display name requires admin");
+        }
         let mut next = info.clone();
         next.set_display_name(&agent_hex, req.name.clone());
         next
@@ -25822,19 +25849,22 @@ pub(in crate::server) async fn unban_group_member(
     )
 }
 
-/// GET /groups/:id/requests — list join requests (admin+).
+/// GET /groups/:id/requests — list join requests (durable owner, admin seat).
 ///
 /// #1166 S3: admission (unknown-group 404, the local-seat admin gate —
 /// and NO withdrawn check, today's shape) lives in the `GroupAccess`
 /// extractor; the list below is served from this handler's OWN lock
 /// read, so the admission core runs AGAIN on that same snapshot
-/// (r2/P2-1). The route never read an actor and still does not — the
-/// seat gate evaluates the local daemon.
+/// (r2/P2-1). #1228: a session token is refused before that seat gate.
 pub(in crate::server) async fn list_join_requests(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
+    if let Err(response) = durable_owner_or_forbid(&actor, "listing join requests") {
+        return response;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let info = match group_access::admit_join_request_listing(&groups, &id, &caller_hex) {
@@ -27138,10 +27168,18 @@ pub(in crate::server) async fn reject_join_request(
 }
 
 /// DELETE /groups/:id/requests/:request_id — cancel own pending request.
+///
+/// #1228: the actor must be an owner (session or durable). A rider is
+/// refused before the request is touched. The requester check below
+/// still limits the cancel to the request this daemon filed.
 pub(in crate::server) async fn cancel_join_request(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+        return forbidden("cancelling a join request is limited to the owner who filed it");
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -40780,6 +40818,7 @@ pub(in crate::server) mod tests {
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
+    mod issue1228_actor_checks;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
@@ -51567,6 +51606,7 @@ pub(in crate::server) mod tests {
         let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
         let (status, body) = mls_encrypt(
             State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Path(group_id.to_string()),
             Json(MlsEncryptRequest {
                 payload: BASE64.encode(b"secret"),
@@ -51585,6 +51625,7 @@ pub(in crate::server) mod tests {
         install_legacy_mls_endpoint_group(&state, group_id).await?;
         let (encrypt_status, encrypted) = mls_encrypt(
             State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Path(group_id.to_string()),
             Json(MlsEncryptRequest {
                 payload: BASE64.encode(b"secret"),
@@ -51596,6 +51637,7 @@ pub(in crate::server) mod tests {
         let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
         let (status, body) = mls_decrypt(
             State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Path(group_id.to_string()),
             Json(MlsDecryptRequest {
                 ciphertext: encrypted.0["ciphertext"]

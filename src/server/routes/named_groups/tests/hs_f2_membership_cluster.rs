@@ -8964,10 +8964,14 @@ async fn n19b_treekem_seal_repairs_snapshot_and_manual_clear_is_durable() -> Res
     let req: ClearQuarantineRequest = serde_json::from_value(
         serde_json::json!({ "force": true, "reason": "n19b treekem repair" }),
     )?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(state)), Path(stable_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(stable_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "the manual clear succeeds: {body}");
     assert!(
@@ -9040,9 +9044,14 @@ async fn n19b_manual_clear_candidate_is_invisible_mid_write() -> Result<()> {
             serde_json::json!({ "force": true, "reason": "n19b mid-write" }),
         )
         .expect("request");
-        clear_group_quarantine(State(clear_state), Path(clear_id), Json(req))
-            .await
-            .into_response()
+        clear_group_quarantine(
+            State(clear_state),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(clear_id),
+            Json(req),
+        )
+        .await
+        .into_response()
     });
     reached.notified().await;
     *state

@@ -2434,10 +2434,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
 
     // Path (a) is unreachable for this population, and says so.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
@@ -2458,10 +2462,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
         "force": true,
         "reason": "benign split confirmed by both operators",
     }))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "the override clears: {body}");
     assert_eq!(body["cleared_by"].as_str(), Some("force"));
