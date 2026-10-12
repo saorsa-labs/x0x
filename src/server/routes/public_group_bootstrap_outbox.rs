@@ -43,11 +43,12 @@ use crate::server::state::AppState;
 use x0x::identity::AgentId;
 
 use super::named_groups::{
-    confirm_named_groups_durability, ensure_named_group_listeners, group_membership_lock,
-    named_group_direct_delivery_config, now_millis_u64, persist_named_group_info,
-    persist_named_groups_mutation, signed_public_bootstrap_snapshot,
-    validate_public_group_bootstrap, write_named_groups_json_atomic, AtomicWriteOutcome,
-    PublicGroupBootstrap, MAX_BOOTSTRAP_INSTALLED_GROUPS,
+    apply_signed_public_revision_catchup, confirm_named_groups_durability,
+    ensure_named_group_listeners, group_membership_lock, named_group_direct_delivery_config,
+    now_millis_u64, persist_named_group_info, persist_named_groups_mutation,
+    signed_public_bootstrap_snapshot, validate_public_group_bootstrap,
+    write_named_groups_json_atomic, AtomicWriteOutcome, PublicGroupBootstrap,
+    MAX_BOOTSTRAP_INSTALLED_GROUPS,
 };
 
 /// Strict typed-DM framing for a signed-public group bootstrap. The legacy
@@ -313,6 +314,25 @@ async fn public_group_bootstrap_wire_version(
         // the obligation pending until a current v2 advert, or an explicit
         // verified v1 advert/card binding, is available.
         PublicGroupBootstrapWireVersion::StrictV2
+    }
+}
+
+/// One best-effort send of a SignedPublic head to a member who is one
+/// revision behind. This does not write an outbox obligation.
+pub(in crate::server) async fn push_signed_public_catchup_snapshot(
+    state: &AppState,
+    recipient: AgentId,
+    snapshot: x0x::groups::GroupInfo,
+) {
+    let obligation = match prepare_public_group_bootstrap_obligation(recipient, snapshot) {
+        Ok(obligation) => obligation,
+        Err(error) => {
+            tracing::warn!("signed-public catch-up snapshot was not encoded: {error}");
+            return;
+        }
+    };
+    if let Err(error) = deliver_public_group_bootstrap(state, &obligation).await {
+        tracing::debug!("signed-public catch-up snapshot was not delivered: {error}");
     }
 }
 
@@ -1264,6 +1284,38 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         // obligation survives until it catches up through the ordinary
         // metadata-commit path.
         if !frontier_matches {
+            // A new install still refuses a foreign frontier. An installed
+            // member who is exactly one signed commit behind may take this
+            // head when the sender is the admin who signed it.
+            let caught_up = persist_named_groups_mutation(state, |groups| {
+                let Some((key, info)) =
+                    crate::server::resolve_group_entry_locked(groups, &group_id)
+                        .map(|(key, info)| (key.to_string(), info.clone()))
+                else {
+                    return false;
+                };
+                let Some(next) = apply_signed_public_revision_catchup(
+                    &info,
+                    &group,
+                    &sender_hex,
+                    &local_agent_hex,
+                ) else {
+                    return false;
+                };
+                super::named_groups::store_named_group_info_locked(groups, &key, next)
+            })
+            .await;
+            if matches!(caught_up, Ok(AtomicWriteOutcome::Durable)) {
+                tracing::info!(
+                    group_id = %LogHexId::group(&group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    "applied signed-public revision catch-up"
+                );
+                return Ok(DmTypedPayloadCompletion::Inserted);
+            }
+            if matches!(caught_up, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
+                return Err("public-group bootstrap catch-up was not directory-durable".to_string());
+            }
             return Err("public-group bootstrap frontier is not the installed one".to_string());
         }
         // `Duplicate` certifies that a durable record already exists, so it may

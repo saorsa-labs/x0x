@@ -3765,6 +3765,200 @@ pub(in crate::server) fn validate_public_group_bootstrap(
 /// bounds attacker-driven state growth and listener-task spawn.
 pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
+/// How often one ahead member offers the same SignedPublic commit to one peer.
+const SIGNED_PUBLIC_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
+
+fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision: u64) -> bool {
+    use std::sync::Mutex;
+    static LAST: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
+    let key = format!("{group_id}:{author_hex}:{from_revision}");
+    let mut guard = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    guard.retain(|(_, at)| now.saturating_duration_since(*at) < SIGNED_PUBLIC_CATCHUP_THROTTLE);
+    if guard.iter().any(|(existing, _)| existing == &key) {
+        return false;
+    }
+    if guard.len() >= 64 {
+        guard.remove(0);
+    }
+    guard.push((key, now));
+    true
+}
+
+fn restore_local_member_key_material(
+    next: &mut x0x::groups::GroupInfo,
+    local: &x0x::groups::GroupInfo,
+) {
+    for (id, member) in next.members_v2.iter_mut() {
+        let Some(previous) = local.members_v2.get(id) else {
+            continue;
+        };
+        if member.kem_public_key_b64.is_none() {
+            member
+                .kem_public_key_b64
+                .clone_from(&previous.kem_public_key_b64);
+        }
+        if member.treekem_key_package_b64.is_none() {
+            member
+                .treekem_key_package_b64
+                .clone_from(&previous.treekem_key_package_b64);
+        }
+        if member.treekem_key_package_hash.is_none() {
+            member
+                .treekem_key_package_hash
+                .clone_from(&previous.treekem_key_package_hash);
+        }
+        if member.certificate_missing_since_ms.is_none() {
+            member.certificate_missing_since_ms = previous.certificate_missing_since_ms;
+        }
+    }
+}
+
+/// Apply one newer SignedPublic bootstrap onto an installed group.
+///
+/// The snapshot must be the sanitized head from
+/// [`signed_public_bootstrap_snapshot`]. The sender must be the admin who
+/// signed that head, and the head must be the next link after `local`.
+/// Local invite, lineage, quarantine and mandate state stay on `local`.
+/// A snapshot that does not chain returns `None` and leaves `local` unused.
+pub(in crate::server) fn apply_signed_public_revision_catchup(
+    local: &x0x::groups::GroupInfo,
+    snapshot: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+    local_agent_hex: &str,
+) -> Option<x0x::groups::GroupInfo> {
+    if local.withdrawn
+        || local.fork_quarantine.is_some()
+        || snapshot.withdrawn
+        || snapshot.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || local.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || snapshot.shared_secret.is_some()
+        || snapshot.security_binding.is_some()
+        || snapshot.invite_lineage.is_some()
+        || snapshot.fork_quarantine.is_some()
+        || !snapshot.mandate_capability.is_empty()
+        || snapshot.stable_group_id() != local.stable_group_id()
+        || snapshot.state_revision != local.state_revision.saturating_add(1)
+        || snapshot.prev_state_hash.as_deref() != Some(local.state_hash.as_str())
+        || !snapshot.has_active_member(local_agent_hex)
+        || !snapshot.has_active_member(sender_hex)
+    {
+        return None;
+    }
+    let retained = snapshot.commit_log.last()?;
+    if snapshot.commit_log.len() != 1 || !retained.roster_root_consistent() {
+        return None;
+    }
+    let commit = &retained.commit;
+    if commit.verify_structure().is_err()
+        || commit.committed_by != sender_hex
+        || !local
+            .caller_role(sender_hex)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        || commit.group_id != snapshot.stable_group_id()
+        || commit.revision != snapshot.state_revision
+        || commit.state_hash != snapshot.state_hash
+        || commit.prev_state_hash != snapshot.prev_state_hash
+        || commit.withdrawn != snapshot.withdrawn
+        || commit.security_binding != snapshot.security_binding
+        || commit.roster_root != x0x::groups::compute_roster_root(&snapshot.members_v2)
+        || commit.policy_hash != x0x::groups::compute_policy_hash(&snapshot.policy)
+        || commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&snapshot.public_meta())
+    {
+        return None;
+    }
+    if x0x::groups::enforce_last_admin_invariant(&snapshot.members_v2, snapshot.withdrawn).is_err()
+    {
+        return None;
+    }
+    let mut next = local.clone();
+    next.name.clone_from(&snapshot.name);
+    next.description.clone_from(&snapshot.description);
+    next.tags.clone_from(&snapshot.tags);
+    next.avatar_url.clone_from(&snapshot.avatar_url);
+    next.banner_url.clone_from(&snapshot.banner_url);
+    next.home.clone_from(&snapshot.home);
+    next.policy = snapshot.policy.clone();
+    next.members_v2.clone_from(&snapshot.members_v2);
+    next.state_revision = snapshot.state_revision;
+    next.prev_state_hash.clone_from(&snapshot.prev_state_hash);
+    next.withdrawn = snapshot.withdrawn;
+    next.security_binding.clone_from(&snapshot.security_binding);
+    next.updated_at = snapshot.updated_at;
+    restore_local_member_key_material(&mut next, local);
+    next.recompute_state_hash();
+    if next.state_hash != snapshot.state_hash {
+        return None;
+    }
+    if next
+        .commit_log
+        .last()
+        .is_none_or(|link| link.commit.revision != commit.revision)
+    {
+        next.commit_log
+            .push(x0x::groups::state_commit::RetainedCommit::capture(
+                commit.clone(),
+                &next.members_v2,
+                next.public_meta(),
+            ));
+        if next.commit_log.len() > x0x::groups::COMMIT_LOG_CAP {
+            let overflow = next.commit_log.len() - x0x::groups::COMMIT_LOG_CAP;
+            next.commit_log.drain(0..overflow);
+        }
+    }
+    Some(next)
+}
+
+/// The ahead committer offers its current SignedPublic head to a member whose
+/// KV binding is exactly one revision behind. The record itself stays rejected.
+pub(in crate::server) async fn offer_signed_public_kv_catchup(
+    state: &Arc<AppState>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) {
+    let author_hex = hex::encode(author.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(snapshot) = ({
+        let groups = state.named_groups.read().await;
+        let info = match groups.get(group_key) {
+            Some(info) => info,
+            None => match groups
+                .values()
+                .find(|info| info.stable_group_id() == group_key)
+            {
+                Some(info) => info,
+                None => return,
+            },
+        };
+        let committed_by = match info.commit_log.last() {
+            Some(link) => link.commit.committed_by.as_str(),
+            None => return,
+        };
+        if info.withdrawn
+            || info.fork_quarantine.is_some()
+            || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+            || info.state_revision != signed_revision.saturating_add(1)
+            || !info.has_active_member(&author_hex)
+            || committed_by != local_hex
+        {
+            return;
+        }
+        signed_public_bootstrap_snapshot(info.clone())
+    }) else {
+        return;
+    };
+    if !signed_public_catchup_allowed(snapshot.stable_group_id(), &author_hex, signed_revision) {
+        return;
+    }
+    super::public_group_bootstrap_outbox::push_signed_public_catchup_snapshot(
+        state, author, snapshot,
+    )
+    .await;
+}
+
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     let reg = state.group_metadata_tasks.write().await.remove(group_id);
     if let Some(reg) = reg {
@@ -5412,7 +5606,7 @@ async fn refresh_group_card_cache_from_info(
     }
 }
 
-fn store_named_group_info_locked(
+pub(in crate::server) fn store_named_group_info_locked(
     groups: &mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
     info: x0x::groups::GroupInfo,
@@ -40410,6 +40604,7 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue1105_public_revision_catchup;
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;

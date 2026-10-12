@@ -176,11 +176,41 @@ impl PublicState {
     }
 }
 
+/// One signed-public control record whose group and store match, and whose
+/// signed revision does not. The record stays rejected. The hook may ask the
+/// group layer for the missing commit.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicRevisionSkew {
+    pub signed_revision: u64,
+    pub local_revision: u64,
+    pub author: AgentId,
+}
+
+/// Called when a public control record is one binding revision away from this
+/// context. It must not block and must not admit the record.
+pub type PublicRevisionSkewHook = Arc<dyn Fn(PublicRevisionSkew) + Send + Sync>;
+
+struct SkewNotice {
+    signed_revision: u64,
+    author: AgentId,
+    at: std::time::Instant,
+}
+
 /// Current-policy authorization for a plaintext group-signed store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PublicGroupKvContext {
     state: Arc<std::sync::RwLock<PublicState>>,
     changes: tokio::sync::watch::Sender<PublicAuthorizationVersion>,
+    skew_hook: Arc<std::sync::Mutex<Option<PublicRevisionSkewHook>>>,
+    skew_notices: Arc<std::sync::Mutex<Vec<SkewNotice>>>,
+}
+
+impl std::fmt::Debug for PublicGroupKvContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicGroupKvContext")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PublicGroupKvContext {
@@ -198,8 +228,19 @@ impl PublicGroupKvContext {
             Self {
                 state: Arc::new(std::sync::RwLock::new(state)),
                 changes,
+                skew_hook: Arc::new(std::sync::Mutex::new(None)),
+                skew_notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         })
+    }
+
+    /// Install the daemon hook that offers a missing SignedPublic commit.
+    /// A later call replaces the previous hook.
+    pub fn set_revision_skew_hook(&self, hook: PublicRevisionSkewHook) {
+        *self
+            .skew_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     pub fn update_from_group(&self, info: &GroupInfo) {
@@ -266,6 +307,48 @@ impl KvSecureContext for PublicGroupKvContext {
         &self,
     ) -> Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>> {
         Some(self.changes.subscribe())
+    }
+
+    fn note_public_revision_skew(&self, signed_revision: u64, author: &AgentId) {
+        let local_revision = self.current_epoch();
+        if signed_revision == local_revision {
+            return;
+        }
+        let now = std::time::Instant::now();
+        {
+            let mut notices = self
+                .skew_notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            notices
+                .retain(|notice| now.duration_since(notice.at) < std::time::Duration::from_secs(2));
+            if notices
+                .iter()
+                .any(|notice| notice.signed_revision == signed_revision && notice.author == *author)
+            {
+                return;
+            }
+            if notices.len() >= 32 {
+                notices.remove(0);
+            }
+            notices.push(SkewNotice {
+                signed_revision,
+                author: *author,
+                at: now,
+            });
+        }
+        let hook = self
+            .skew_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(PublicRevisionSkew {
+                signed_revision,
+                local_revision,
+                author: *author,
+            });
+        }
     }
 
     fn seal(&self, _: &KvStoreId, _: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {

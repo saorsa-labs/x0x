@@ -1533,6 +1533,37 @@ fn refresh_public_store_binding(
     false
 }
 
+fn install_public_kv_revision_catchup(
+    state: &Arc<AppState>,
+    ctx: &x0x::groups::PublicGroupKvContext,
+    group_key: String,
+) {
+    let state = Arc::downgrade(state);
+    ctx.set_revision_skew_hook(Arc::new(move |skew| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let group_key = group_key.clone();
+        let signed_revision = skew.signed_revision;
+        let author = skew.author;
+        let task_state = Arc::clone(&state);
+        if !state.spawn_detached(async move {
+            super::named_groups::offer_signed_public_kv_catchup(
+                &task_state,
+                &group_key,
+                signed_revision,
+                author,
+            )
+            .await;
+        }) {
+            tracing::debug!(
+                target: "x0x::kv",
+                "shutdown has begun; signed-public revision catch-up was not offered"
+            );
+        }
+    }));
+}
+
 fn public_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::PublicGroupKvContext>,
@@ -2079,6 +2110,7 @@ async fn open_bound_public_store(
                 .ok_or_else(|| bad_request("group is not SignedPublic"))?,
         )
     };
+    install_public_kv_revision_catchup(state, &context, expected.group_key.clone());
     // Drop the map read guard before any mismatch cleanup takes the write
     // guard. In edition 2021 an `if let` scrutinee temporary otherwise lives
     // through the whole arm and self-deadlocks on `write().await` below.

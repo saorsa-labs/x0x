@@ -241,6 +241,10 @@ pub trait KvSecureContext: Send + Sync {
         None
     }
 
+    /// A public control record matched this group and store, and its signed
+    /// revision did not. The default ignores it. The record is still rejected.
+    fn note_public_revision_skew(&self, _signed_revision: u64, _author: &AgentId) {}
+
     /// Nonblocking signal for changes to an encrypted group's local
     /// authorization snapshot. A pending cold-sync requester can wake when
     /// its reader membership arrives instead of waiting for a backoff tail.
@@ -710,6 +714,24 @@ pub fn open_signed_mutation(
         ));
     }
     Ok(mutation)
+}
+
+/// Group and store match, the author signature verifies, and the signed
+/// revision is not the local one. Other mismatches, including a bad
+/// signature, return `None`. This does not admit the record.
+pub fn public_control_revision_skew(
+    ctx: &dyn KvSecureContext,
+    expected_store_id: &KvStoreId,
+    mutation: &SignedKvMutation,
+) -> Option<(u64, AgentId)> {
+    if mutation.group_id != ctx.group_id() || mutation.store_id != *expected_store_id.as_bytes() {
+        return None;
+    }
+    if mutation.epoch == ctx.current_epoch() {
+        return None;
+    }
+    verify_mutation_author(mutation).ok()?;
+    Some((mutation.epoch, mutation.author_id))
 }
 
 /// Verify signature and current group/store/epoch bindings without granting
