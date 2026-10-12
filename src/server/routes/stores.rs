@@ -1533,28 +1533,81 @@ fn refresh_public_store_binding(
     false
 }
 
+struct SignedPublicCatchupQueueGuard {
+    queue: Arc<std::sync::Mutex<Vec<(String, u64, x0x::identity::AgentId)>>>,
+    group_key: String,
+    signed_revision: u64,
+    author: x0x::identity::AgentId,
+}
+
+impl Drop for SignedPublicCatchupQueueGuard {
+    fn drop(&mut self) {
+        let mut pending = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::named_groups::release_signed_public_catchup_queue(
+            &mut pending,
+            &self.group_key,
+            self.signed_revision,
+            self.author,
+        );
+    }
+}
+
 fn install_public_kv_revision_catchup(
     state: &Arc<AppState>,
     ctx: &x0x::groups::PublicGroupKvContext,
     group_key: String,
 ) {
     let state = Arc::downgrade(state);
+    let ctx = ctx.clone();
+    let hook_ctx = ctx.clone();
+    let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
     ctx.set_revision_skew_hook(Arc::new(move |skew| {
+        // The context already drops ineligible skew. Check again here so a
+        // hook invocation cannot spawn before those gates.
+        if skew.signed_revision.saturating_add(1) != skew.local_revision
+            || !hook_ctx.is_active_member(&skew.author)
+        {
+            return;
+        }
         let Some(state) = state.upgrade() else {
             return;
         };
         let group_key = group_key.clone();
         let signed_revision = skew.signed_revision;
         let author = skew.author;
+        {
+            let mut pending = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !super::named_groups::reserve_signed_public_catchup_queue(
+                &mut pending,
+                &group_key,
+                signed_revision,
+                author,
+            ) {
+                return;
+            }
+        }
         let task_state = Arc::clone(&state);
+        let task_group = group_key.clone();
+        let guard = SignedPublicCatchupQueueGuard {
+            queue: Arc::clone(&queue),
+            group_key,
+            signed_revision,
+            author,
+        };
         if !state.spawn_detached(async move {
             super::named_groups::offer_signed_public_kv_catchup(
                 &task_state,
-                &group_key,
+                &task_group,
                 signed_revision,
                 author,
             )
             .await;
+            drop(guard);
         }) {
             tracing::debug!(
                 target: "x0x::kv",

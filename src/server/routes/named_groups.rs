@@ -3768,6 +3768,14 @@ pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 /// How often one ahead member offers the same SignedPublic commit to one peer.
 const SIGNED_PUBLIC_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 
+/// Live send-throttle entries. A full cache refuses a new peer. It does not
+/// evict a peer whose five seconds are still running.
+const SIGNED_PUBLIC_CATCHUP_SEND_LIMIT: usize = 64;
+
+/// In-flight catch-up tasks for one daemon hook. A full queue refuses more
+/// work. It does not start another task for a key that is already pending.
+pub(in crate::server) const SIGNED_PUBLIC_CATCHUP_QUEUE_CAP: usize = 32;
+
 fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision: u64) -> bool {
     use std::sync::Mutex;
     static LAST: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
@@ -3775,16 +3783,57 @@ fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision
     let mut guard = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = std::time::Instant::now();
+    signed_public_catchup_decide(&mut guard, &key, std::time::Instant::now())
+}
+
+fn signed_public_catchup_decide(
+    guard: &mut Vec<(String, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
     guard.retain(|(_, at)| now.saturating_duration_since(*at) < SIGNED_PUBLIC_CATCHUP_THROTTLE);
-    if guard.iter().any(|(existing, _)| existing == &key) {
+    if guard.iter().any(|(existing, _)| existing == key) {
         return false;
     }
-    if guard.len() >= 64 {
-        guard.remove(0);
+    if guard.len() >= SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
+        return false;
     }
-    guard.push((key, now));
+    guard.push((key.to_string(), now));
     true
+}
+
+pub(in crate::server) fn reserve_signed_public_catchup_queue(
+    pending: &mut Vec<(String, u64, AgentId)>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) -> bool {
+    if pending.iter().any(|(group, revision, pending_author)| {
+        group == group_key && *revision == signed_revision && *pending_author == author
+    }) {
+        return false;
+    }
+    if pending.len() >= SIGNED_PUBLIC_CATCHUP_QUEUE_CAP {
+        return false;
+    }
+    pending.push((group_key.to_string(), signed_revision, author));
+    true
+}
+
+pub(in crate::server) fn release_signed_public_catchup_queue(
+    pending: &mut Vec<(String, u64, AgentId)>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) {
+    if let Some(index) = pending
+        .iter()
+        .position(|(group, revision, pending_author)| {
+            group == group_key && *revision == signed_revision && *pending_author == author
+        })
+    {
+        pending.remove(index);
+    }
 }
 
 fn restore_local_member_key_material(
@@ -3792,27 +3841,27 @@ fn restore_local_member_key_material(
     local: &x0x::groups::GroupInfo,
 ) {
     for (id, member) in next.members_v2.iter_mut() {
+        // These fields are local. They are not in the roster root or the
+        // state hash, so a signed next commit can carry a different
+        // non-empty value and still verify. Drop the remote value first.
+        // Retained members then take the local value back, including None.
+        member.kem_public_key_b64 = None;
+        member.treekem_key_package_b64 = None;
+        member.treekem_key_package_hash = None;
+        member.certificate_missing_since_ms = None;
         let Some(previous) = local.members_v2.get(id) else {
             continue;
         };
-        if member.kem_public_key_b64.is_none() {
-            member
-                .kem_public_key_b64
-                .clone_from(&previous.kem_public_key_b64);
-        }
-        if member.treekem_key_package_b64.is_none() {
-            member
-                .treekem_key_package_b64
-                .clone_from(&previous.treekem_key_package_b64);
-        }
-        if member.treekem_key_package_hash.is_none() {
-            member
-                .treekem_key_package_hash
-                .clone_from(&previous.treekem_key_package_hash);
-        }
-        if member.certificate_missing_since_ms.is_none() {
-            member.certificate_missing_since_ms = previous.certificate_missing_since_ms;
-        }
+        member
+            .kem_public_key_b64
+            .clone_from(&previous.kem_public_key_b64);
+        member
+            .treekem_key_package_b64
+            .clone_from(&previous.treekem_key_package_b64);
+        member
+            .treekem_key_package_hash
+            .clone_from(&previous.treekem_key_package_hash);
+        member.certificate_missing_since_ms = previous.certificate_missing_since_ms;
     }
 }
 

@@ -196,6 +196,11 @@ struct SkewNotice {
     at: std::time::Instant,
 }
 
+/// Live skew notices. A full cache refuses a new author. It does not evict
+/// a notice that is still inside the two-second window.
+const SKEW_NOTICE_LIMIT: usize = 32;
+const SKEW_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Current-policy authorization for a plaintext group-signed store.
 #[derive(Clone)]
 pub struct PublicGroupKvContext {
@@ -310,26 +315,40 @@ impl KvSecureContext for PublicGroupKvContext {
     }
 
     fn note_public_revision_skew(&self, signed_revision: u64, author: &AgentId) {
-        let local_revision = self.current_epoch();
-        if signed_revision == local_revision {
-            return;
-        }
+        let local_revision = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if signed_revision == state.state_revision {
+                return;
+            }
+            // Catch-up is only the next revision, and only for an active
+            // member of a valid SignedPublic context. Any other verified
+            // skew stays rejected and does not enter the notice cache.
+            if !state.valid
+                || signed_revision.saturating_add(1) != state.state_revision
+                || !state.writers.contains_key(author)
+            {
+                return;
+            }
+            state.state_revision
+        };
         let now = std::time::Instant::now();
         {
             let mut notices = self
                 .skew_notices
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            notices
-                .retain(|notice| now.duration_since(notice.at) < std::time::Duration::from_secs(2));
+            notices.retain(|notice| now.duration_since(notice.at) < SKEW_NOTICE_TTL);
             if notices
                 .iter()
                 .any(|notice| notice.signed_revision == signed_revision && notice.author == *author)
             {
                 return;
             }
-            if notices.len() >= 32 {
-                notices.remove(0);
+            if notices.len() >= SKEW_NOTICE_LIMIT {
+                return;
             }
             notices.push(SkewNotice {
                 signed_revision,
@@ -1394,6 +1413,61 @@ mod tests {
         assert!(
             ctx.seal(&store_id, b"after-clear").is_ok(),
             "and sealing must work again once the marker is gone"
+        );
+    }
+
+    #[test]
+    fn skew_notice_cache_keeps_live_entries_when_full() {
+        let owner = AgentId([9; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "skew-notice".to_string(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        let mut authors = Vec::new();
+        for index in 1..=super::SKEW_NOTICE_LIMIT + 1 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = u8::try_from(index).expect("author index");
+            let author = AgentId(bytes);
+            info.add_member(
+                hex::encode(author.as_bytes()),
+                GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+            authors.push(author);
+        }
+        info.state_revision = 5;
+        let ctx = PublicGroupKvContext::from_group(&info).expect("public context");
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_hook = std::sync::Arc::clone(&hits);
+        ctx.set_revision_skew_hook(std::sync::Arc::new(move |_| {
+            hits_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let stranger = AgentId([255; 32]);
+        ctx.note_public_revision_skew(1, &authors[0]);
+        ctx.note_public_revision_skew(4, &stranger);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a far revision or a non-member must not spawn catch-up work"
+        );
+        for author in authors.iter().take(super::SKEW_NOTICE_LIMIT) {
+            ctx.note_public_revision_skew(4, author);
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            super::SKEW_NOTICE_LIMIT
+        );
+        ctx.note_public_revision_skew(4, authors.last().expect("overflow author"));
+        ctx.note_public_revision_skew(4, &authors[0]);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            super::SKEW_NOTICE_LIMIT,
+            "a full notice cache refuses a new author and keeps the first live notice"
         );
     }
 }

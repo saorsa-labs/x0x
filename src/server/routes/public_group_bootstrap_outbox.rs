@@ -157,7 +157,7 @@ fn public_group_bootstrap_request_id(
 
 /// Message-type tag carried inside the JSON body, shared with the legacy
 /// unprefixed wire form so one decoder serves both.
-const PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE: &str = "public_group_bootstrap";
+pub(in crate::server) const PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE: &str = "public_group_bootstrap";
 
 fn encode_public_group_bootstrap_typed_payload(
     group: x0x::groups::GroupInfo,
@@ -1264,6 +1264,14 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     let group_id = group.stable_group_id().to_string();
     let frontier = (group.state_revision, group.state_hash.clone());
 
+    // Both bootstrap listeners enter here. A local metadata update holds this
+    // same lock from the moment it clones the installed frontier until
+    // `persist_named_group_info` returns. Take it before the read, and hold
+    // it through apply and persistence, so that clone cannot replace a
+    // removal this admission has already acknowledged.
+    let membership_lock = group_membership_lock(state, &group_id).await;
+    let membership_guard = membership_lock.lock().await;
+
     let installed_frontier_matches = {
         let groups = state.named_groups.read().await;
         // #732: the both-spellings rule comes from the one shared resolver —
@@ -1322,6 +1330,11 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
                     sender = %LogHexId::agent(&sender_hex),
                     "applied signed-public revision catch-up"
                 );
+                // The membership guard is still held, so a stale clone cannot
+                // persist until this acknowledgement is about to return.
+                #[cfg(test)]
+                catchup_apply_test_seam::park(&group_id).await;
+                drop(membership_guard);
                 return Ok(DmTypedPayloadCompletion::Inserted);
             }
             if matches!(caught_up, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
@@ -1355,6 +1368,7 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         true
     })
     .await;
+    drop(membership_guard);
     // Only `Durable` — rename plus parent-directory fsync — earns `Inserted`.
     // `ReplacedNotDurable` is visible but not yet proven to survive a crash, so
     // it withholds the ACK and the sender retries.
@@ -1402,6 +1416,81 @@ pub(in crate::server) async fn handle_public_group_bootstrap_typed_payload(
     };
     if let Some(completion) = completion {
         let _ = completion.send(result);
+    }
+}
+
+/// Parks a durable catch-up acknowledgement so a test can persist a stale
+/// clone before `Inserted` returns. One-shot, keyed by group id.
+#[cfg(test)]
+pub(in crate::server) mod catchup_apply_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct Pause {
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    pub(in crate::server) struct Armed {
+        key: String,
+        pause: Arc<Pause>,
+    }
+
+    impl Armed {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.pause.released.store(true, Ordering::SeqCst);
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<Pause>>>> = Mutex::new(None);
+
+    pub(in crate::server) fn arm(group_id: &str) -> Armed {
+        let pause = Arc::new(Pause {
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(group_id.to_string(), Arc::clone(&pause));
+        Armed {
+            key: group_id.to_string(),
+            pause,
+        }
+    }
+
+    pub(in crate::server) async fn park(group_id: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(group_id));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }
 

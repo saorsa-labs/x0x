@@ -266,3 +266,284 @@ async fn catchup_withholds_a_quarantined_snapshot() {
         "a quarantined group must not send the catch-up snapshot"
     );
 }
+
+#[test]
+fn catchup_keeps_conflicting_local_key_material() {
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let member = crate::identity::AgentKeypair::generate().expect("member");
+    let newcomer = crate::identity::AgentKeypair::generate().expect("newcomer");
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let newcomer_hex = hex::encode(newcomer.agent_id().as_bytes());
+    let authority_hex = hex::encode(authority.agent_id().as_bytes());
+    let mut group = crate::groups::GroupInfo::with_policy(
+        "Catch-up".to_string(),
+        String::new(),
+        authority.agent_id(),
+        "ab".repeat(32),
+        crate::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+    );
+    group.add_member(
+        member_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(authority_hex.clone()),
+        None,
+    );
+    group
+        .seal_commit(&authority, now_millis_u64())
+        .expect("first seal");
+    let mut behind = group.clone();
+    let local_member = behind
+        .members_v2
+        .get_mut(&member_hex)
+        .expect("local member");
+    local_member.kem_public_key_b64 = Some("local-kem".to_string());
+    local_member.treekem_key_package_b64 = Some("local-package".to_string());
+    local_member.treekem_key_package_hash = Some("local-hash".to_string());
+    local_member.certificate_missing_since_ms = Some(11);
+    let local_admin = behind
+        .members_v2
+        .get_mut(&authority_hex)
+        .expect("local admin");
+    local_admin.kem_public_key_b64 = Some("local-admin-kem".to_string());
+    local_admin.certificate_missing_since_ms = Some(22);
+    group.add_member(
+        newcomer_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(authority_hex.clone()),
+        None,
+    );
+    group.description = "renamed".to_string();
+    group
+        .seal_commit(&authority, now_millis_u64().saturating_add(1))
+        .expect("second seal");
+    let mut snapshot = signed_public_bootstrap_snapshot(group).expect("snapshot");
+    for (id, kem, package, hash, timer) in [
+        (
+            member_hex.as_str(),
+            "remote-kem",
+            "remote-package",
+            "remote-hash",
+            99,
+        ),
+        (
+            authority_hex.as_str(),
+            "remote-admin-kem",
+            "remote-admin-package",
+            "remote-admin-hash",
+            77,
+        ),
+        (
+            newcomer_hex.as_str(),
+            "remote-newcomer-kem",
+            "remote-newcomer-package",
+            "remote-newcomer-hash",
+            55,
+        ),
+    ] {
+        let remote = snapshot.members_v2.get_mut(id).expect("snapshot member");
+        remote.kem_public_key_b64 = Some(kem.to_string());
+        remote.treekem_key_package_b64 = Some(package.to_string());
+        remote.treekem_key_package_hash = Some(hash.to_string());
+        remote.certificate_missing_since_ms = Some(timer);
+    }
+    let updated =
+        apply_signed_public_revision_catchup(&behind, &snapshot, &authority_hex, &member_hex)
+            .expect("a signed next head still applies when its local-only fields differ");
+    let kept = updated
+        .members_v2
+        .get(&member_hex)
+        .expect("retained member");
+    assert_eq!(kept.kem_public_key_b64.as_deref(), Some("local-kem"));
+    assert_eq!(
+        kept.treekem_key_package_b64.as_deref(),
+        Some("local-package")
+    );
+    assert_eq!(kept.treekem_key_package_hash.as_deref(), Some("local-hash"));
+    assert_eq!(kept.certificate_missing_since_ms, Some(11));
+    let kept_admin = updated
+        .members_v2
+        .get(&authority_hex)
+        .expect("retained admin");
+    assert_eq!(
+        kept_admin.kem_public_key_b64.as_deref(),
+        Some("local-admin-kem")
+    );
+    assert_eq!(kept_admin.certificate_missing_since_ms, Some(22));
+    assert!(kept_admin.treekem_key_package_b64.is_none());
+    assert!(kept_admin.treekem_key_package_hash.is_none());
+    let added = updated.members_v2.get(&newcomer_hex).expect("new member");
+    assert!(added.kem_public_key_b64.is_none());
+    assert!(added.treekem_key_package_b64.is_none());
+    assert!(added.treekem_key_package_hash.is_none());
+    assert!(added.certificate_missing_since_ms.is_none());
+    assert_eq!(updated.description, "renamed");
+}
+
+#[test]
+fn catchup_send_cache_keeps_live_entries_when_full() {
+    let mut guard = Vec::new();
+    let now = std::time::Instant::now();
+    for index in 0..super::super::SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
+        assert!(
+            super::super::signed_public_catchup_decide(&mut guard, &format!("group:{index}"), now),
+            "a cache under the cap admits the peer"
+        );
+    }
+    assert!(
+        !super::super::signed_public_catchup_decide(&mut guard, "group:overflow", now),
+        "a full cache must refuse a new peer instead of evicting a live one"
+    );
+    assert!(
+        !super::super::signed_public_catchup_decide(&mut guard, "group:0", now),
+        "the first peer is still inside the five-second throttle"
+    );
+    assert_eq!(guard.len(), super::super::SIGNED_PUBLIC_CATCHUP_SEND_LIMIT);
+}
+
+#[test]
+fn catchup_queue_coalesces_and_caps_pending_work() {
+    let mut pending = Vec::new();
+    let author = crate::identity::AgentId([1; 32]);
+    for revision in 0..super::super::SIGNED_PUBLIC_CATCHUP_QUEUE_CAP as u64 {
+        assert!(super::super::reserve_signed_public_catchup_queue(
+            &mut pending,
+            "group",
+            revision,
+            author,
+        ));
+    }
+    assert!(
+        !super::super::reserve_signed_public_catchup_queue(&mut pending, "group", 0, author),
+        "work already pending is coalesced"
+    );
+    assert!(
+        !super::super::reserve_signed_public_catchup_queue(
+            &mut pending,
+            "group",
+            1_000,
+            crate::identity::AgentId([2; 32]),
+        ),
+        "a full queue refuses a new peer"
+    );
+    assert_eq!(pending.len(), super::super::SIGNED_PUBLIC_CATCHUP_QUEUE_CAP);
+    super::super::release_signed_public_catchup_queue(&mut pending, "group", 0, author);
+    assert!(super::super::reserve_signed_public_catchup_queue(
+        &mut pending,
+        "group",
+        1_000,
+        crate::identity::AgentId([2; 32]),
+    ));
+}
+
+#[tokio::test]
+async fn catchup_apply_does_not_ack_a_removal_a_stale_clone_replaces() {
+    let (state, _dir) = super::secure_endpoint_test_state().await.expect("state");
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let victim = crate::identity::AgentKeypair::generate().expect("victim");
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let authority_hex = hex::encode(authority.agent_id().as_bytes());
+    let victim_hex = hex::encode(victim.agent_id().as_bytes());
+    let mut group = crate::groups::GroupInfo::with_policy(
+        "Catch-up".to_string(),
+        String::new(),
+        authority.agent_id(),
+        "ef".repeat(32),
+        crate::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+    );
+    group.add_member(
+        local_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(authority_hex.clone()),
+        None,
+    );
+    group.add_member(
+        victim_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(authority_hex.clone()),
+        None,
+    );
+    group
+        .seal_commit(&authority, now_millis_u64())
+        .expect("installed seal");
+    let behind = group.clone();
+    let mut removal = group.clone();
+    removal.remove_member(&victim_hex, Some(authority_hex.clone()));
+    removal
+        .seal_commit(&authority, now_millis_u64().saturating_add(1))
+        .expect("removal seal");
+    let snapshot = signed_public_bootstrap_snapshot(removal).expect("removal snapshot");
+    let mut metadata = behind.clone();
+    metadata.description = "local rename".to_string();
+    metadata
+        .seal_commit(&authority, now_millis_u64().saturating_add(2))
+        .expect("metadata seal");
+    let group_id = behind.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), behind);
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&authority.agent_id(), crate::contacts::TrustLevel::Trusted);
+
+    let pause = crate::server::routes::public_group_bootstrap_outbox::catchup_apply_test_seam::arm(
+        &group_id,
+    );
+    let lock = super::super::group_membership_lock(&state, &group_id).await;
+    let guard = lock.lock().await;
+    let task_state = std::sync::Arc::clone(&state);
+    let task_snapshot = snapshot.clone();
+    let sender = authority.agent_id();
+    let admit = tokio::spawn(async move {
+        crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
+            &task_state,
+            sender,
+            None,
+            super::super::PublicGroupBootstrap {
+                message_type: crate::server::routes::public_group_bootstrap_outbox::PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE
+                    .to_string(),
+                group: Box::new(task_snapshot),
+            },
+        )
+        .await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pause.reached() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    super::super::persist_named_group_info(&state, &group_id, metadata.clone())
+        .await
+        .expect("stale metadata clone persists");
+    drop(guard);
+    drop(pause);
+    let result = admit.await.expect("catch-up admission");
+    let installed = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("installed group")
+        .clone();
+    let victim_active = installed
+        .members_v2
+        .get(&victim_hex)
+        .is_some_and(|member| member.is_active());
+    let acknowledged = matches!(
+        result,
+        Ok(crate::dm_inbox::DmTypedPayloadCompletion::Inserted)
+    );
+    assert!(
+        !(acknowledged && victim_active),
+        "an acknowledged catch-up removal must not be replaced by the stale clone, acknowledged={acknowledged} victim_active={victim_active}"
+    );
+    if !acknowledged {
+        assert_eq!(installed.state_hash, metadata.state_hash);
+        assert!(
+            victim_active,
+            "the metadata update that held the membership lock keeps the member"
+        );
+    }
+}
