@@ -377,6 +377,18 @@ impl TreeKemMlsGroup {
         self.remove_leaf_for_member(member, leaf)
     }
 
+    /// Whether `key_package` still occupies a live ratchet leaf.
+    ///
+    /// A roster-removed member can keep this leaf until a remaining member
+    /// commits their removal. A package that does not decode names no leaf.
+    #[must_use]
+    pub fn has_key_package_leaf(&self, key_package: &[u8]) -> bool {
+        let Ok(kp) = decode::<KeyPackage>(key_package, "key package") else {
+            return false;
+        };
+        self.inner.find_leaf_by_key_package(&kp).is_some()
+    }
+
     fn remove_leaf_for_member(&mut self, member: AgentId, leaf: u32) -> Result<Vec<u8>> {
         let commit = self
             .inner
