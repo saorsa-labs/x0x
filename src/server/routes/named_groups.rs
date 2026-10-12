@@ -57,7 +57,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
@@ -2609,6 +2609,29 @@ async fn remote_group_card_roster_admins(state: &AppState, group_id: &str) -> BT
     group_card_roster_admins(&groups, group_id, &local_agent_hex).unwrap_or_default()
 }
 
+/// #1224: unsigned and unverifiable GroupCards refused before a discovery
+/// cache or an API response. v0.45.0 through v0.47.1 publish only signed
+/// cards (`card.sign` / `to_signed_group_card`).
+static UNSIGNED_GROUP_CARDS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+fn group_card_signature_accepted(card: &x0x::groups::GroupCard) -> bool {
+    match card.verify_signature() {
+        Ok(()) => true,
+        Err(error) => {
+            UNSIGNED_GROUP_CARDS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                group_id = %card.group_id,
+                "refused unsigned or unverifiable GroupCard: {error}"
+            );
+            false
+        }
+    }
+}
+
+pub(in crate::server) fn unsigned_group_cards_refused() -> u64 {
+    UNSIGNED_GROUP_CARDS_REFUSED.load(Ordering::Relaxed)
+}
+
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
 /// Listener lives for the daemon's lifetime.
 pub(in crate::server) async fn spawn_global_discovery_listener(
@@ -2639,18 +2662,11 @@ pub(in crate::server) async fn spawn_global_discovery_listener(
                     );
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
                     if let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event {
-                        // Phase D.3: verify authority signature on signed
-                        // cards. Unsigned cards (pre-D.3 legacy peers) are
-                        // accepted for backward compatibility; signed cards
-                        // with a bad signature are dropped silently.
-                        if !card.signature.is_empty() {
-                            if let Err(e) = card.verify_signature() {
-                                tracing::warn!(
-                                    group_id = %card.group_id,
-                                    "D.3: dropped card with invalid signature: {e}"
-                                );
-                                continue;
-                            }
+                        // #1224: refuse an unsigned or unverifiable card before
+                        // it reaches the discovery cache. v0.45.0 and later
+                        // publish only signed cards.
+                        if !group_card_signature_accepted(&card) {
+                            continue;
                         }
 
                         // Phase D.3: withdrawal supersession. A withdrawal
@@ -2941,21 +2957,9 @@ async fn handle_directory_message(
     };
     match msg {
         x0x::groups::DirectoryMessage::Card { card } => {
-            // Require a signature on shard-delivered cards. Unsigned cards on
-            // a directory shard are treated as malformed (directory plane is
-            // authority-signed by construction) and dropped.
-            if card.signature.is_empty() {
-                tracing::debug!(
-                    group_id = %card.group_id,
-                    "C.2: dropped unsigned card on shard topic"
-                );
-                return;
-            }
-            if let Err(e) = card.verify_signature() {
-                tracing::warn!(
-                    group_id = %card.group_id,
-                    "C.2: dropped card with invalid signature: {e}"
-                );
+            // #1224: the directory plane is authority-signed. An unsigned or
+            // unverifiable card is dropped before the shard cache.
+            if !group_card_signature_accepted(&card) {
                 return;
             }
             // Defensive privacy guard: a Hidden or ListedToContacts card must
@@ -3184,15 +3188,9 @@ pub(in crate::server) async fn spawn_listed_to_contacts_listener(
                             continue;
                         }
                     };
-                    // Require a signature; unsigned LTC cards are dropped.
-                    if card.signature.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = card.verify_signature() {
-                        tracing::warn!(
-                            group_id = %card.group_id,
-                            "C.2/LTC: dropped card with invalid signature: {e}"
-                        );
+                    // #1224: an unsigned or unverifiable contact card is dropped
+                    // before the contact cache.
+                    if !group_card_signature_accepted(&card) {
                         continue;
                     }
                     // Defensive privacy guard: even via LTC delivery, a
@@ -14104,7 +14102,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if card.group_id != info.stable_group_id() {
                 return ApplyMetadataResult::REJECTED;
             }
-            if !card.signature.is_empty() && card.verify_signature().is_err() {
+            // #1224: an unsigned or unverifiable card does not enter the cache.
+            if !group_card_signature_accepted(&card) {
                 return ApplyMetadataResult::REJECTED;
             }
             let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -27525,6 +27524,10 @@ pub(in crate::server) async fn discover_groups(
         if card.policy_summary.discoverability == x0x::groups::GroupDiscoverability::Hidden {
             return;
         }
+        // #1224: a cached unsigned or unverifiable card is not a listing entry.
+        if !group_card_signature_accepted(card) {
+            return;
+        }
         let entry = cards.entry(card.group_id.clone());
         match entry {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -27733,8 +27736,11 @@ pub(in crate::server) async fn get_group_card(
         let mut cache = state.group_card_cache.write().await;
         prune_and_bound_group_card_cache(&mut cache, now_millis_u64());
         if let Some(card) = cache.get(&id) {
-            return Json(serde_json::to_value(card).unwrap_or(serde_json::Value::Null))
-                .into_response();
+            // #1224: do not serve an unsigned or unverifiable cached card.
+            if group_card_signature_accepted(card) {
+                return Json(serde_json::to_value(card).unwrap_or(serde_json::Value::Null))
+                    .into_response();
+            }
         }
     }
     let groups = state.named_groups.read().await;
@@ -41137,6 +41143,7 @@ pub(in crate::server) mod tests {
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
+    mod issue1224_unsigned_group_card;
     mod issue1228_actor_checks;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
