@@ -12769,9 +12769,13 @@ impl Agent {
 
         // Phase 1: Try cached peers first using the real ant-quic peer IDs.
         // x0x#1321: the phase counts re-read admission, so a peer that is
-        // already refused or disconnected does not fill min_connected.
+        // already refused or disconnected does not fill min_connected. The
+        // count is `None` after shutdown began: then no phase starts.
         let mut ran_phase1 = false;
-        if all_connected.usable(node).await < min_connected {
+        if matches!(
+            all_connected.usable(node, &self.shutdown_token).await,
+            Some(usable) if usable < min_connected
+        ) {
             ran_phase1 = true;
             self.join_phase1_cached_peers(network, &mut all_connected, None)
                 .await;
@@ -12780,7 +12784,12 @@ impl Agent {
         // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
         // This is the fallback for when coordinator cache and cached peers aren't enough.
         let mut ran_phase2 = false;
-        if !bootstrap_nodes.is_empty() && all_connected.usable(node).await < min_connected {
+        if !bootstrap_nodes.is_empty()
+            && matches!(
+                all_connected.usable(node, &self.shutdown_token).await,
+                Some(usable) if usable < min_connected
+            )
+        {
             ran_phase2 = true;
             self.join_phase2_bootstrap(network, &bootstrap_nodes, &mut all_connected, None)
                 .await;

@@ -41,7 +41,9 @@ saorsa-gossip 0.5.88), with one budget per seed address for the whole join and
 its own backoff (it grows only after a failed dial). x0x chooses the candidate
 and, after a dial that answered, lets the JOIN frame go out only once the peer
 is `Admitted`; a peer that is not suppressed but not admitted yet (lost
-connection, open verdict) uses its attempts until then.
+connection, open verdict) uses its attempts until then. After a lost
+connection, the next attempt on that address waits saorsa-gossip's loss
+cooldown (100 ms doubling to 30 s, with jitter; D252).
 
 **Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
 `tests/cross_plane_join_seeds.rs` (JOIN seeds)

@@ -23,10 +23,16 @@ All notable changes to this project will be documented in this file.
     one `JoinLedger` for the whole join; **needs saorsa-gossip 0.5.88**) and
     checks admission between the dial and the JOIN frame. Each seed address
     has one budget of ten attempts for the whole join. Only a failed dial
-    grows the backoff (100 ms doubling to at most 30 s, plus jitter); a
-    failed send, or a peer that is not admitted after the dial (connection
-    lost, or plane verdict still open after up to 12 s), allows the next
-    attempt at once.
+    grows the dial backoff (100 ms doubling to at most 30 s, plus jitter); a
+    failed send, or a plane verdict still open after up to 12 s, allows the
+    next attempt at once.
+  - A peer that answers the dial and then loses its connection before
+    admission (for example, the remote refused us first) waits
+    saorsa-gossip's loss cooldown before the next attempt on that address:
+    100 ms, doubled after each loss up to 30 s, plus jitter (D252). It does
+    not reset when the peer answers again. Another admitted address can go
+    meanwhile. Such a peer costs at most ten dials and 81.1 s plus up to
+    10.128 s of cooldown, and gets no JOIN.
   - The phase counts for the join's minimum of three peers include only
     peers that are still connected and not suppressed. When peers that
     filled that minimum with an open plane verdict are refused later, the
@@ -40,8 +46,9 @@ All notable changes to this project will be documented in this file.
     waits); admission reads and scheduling come on top. The JOIN then costs
     at most 91.228 s plus ten dial times per seed address that is not
     suppressed. These are budgets, not a deadline for the whole call.
-  - After `begin_shutdown`, no fallback phase or JOIN starts; a running
-    fallback dial batch, its retry sleeps and the JOIN attempts stop.
+  - After `begin_shutdown`, no phase, fallback phase or JOIN starts; a
+    running fallback dial batch, its retry sleeps, the JOIN attempts and the
+    admission reads stop.
 
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.

@@ -42,23 +42,30 @@
 //!   - One `JoinLedger` covers the whole `join_network` call, so each
 //!     candidate address has one budget of saorsa-gossip's attempts, kept
 //!     when another candidate interrupts it and never renewed.
-//!   - After a failed dial, the next attempt on that address waits the
-//!     `retry_after` that saorsa-gossip returns. Only a failed dial grows
-//!     the backoff, as in its `join`.
+//!   - The next attempt on an address waits for `JoinLedger::ready_at`:
+//!     the later of saorsa-gossip's dial backoff (it grows only after a
+//!     failed dial, as in its `join`) and its loss cooldown.
 //!   - After a dial that answered, the JOIN frame goes out only when the
 //!     peer is `Admitted`. The gate waits for an open plane verdict (at
-//!     most [`JOIN_SEED_VERDICT_WAIT`]). A peer that lost its connection, or
-//!     whose verdict stays open, ends the attempt without a frame; the
-//!     next attempt may start at once, as after a failed send.
+//!     most [`JOIN_SEED_VERDICT_WAIT`]).
+//!   - A peer that answered and then lost its connection before admission
+//!     (for example, the remote refused us first) is reported with
+//!     `JoinLedger::record_loss`: saorsa-gossip's loss cooldown (100 ms,
+//!     doubled after each loss up to 30 s, plus jitter; D252) paces the
+//!     next attempt on that address. Another admitted address can go
+//!     meanwhile.
+//!   - A failed send, or a verdict that stays open for the whole gate
+//!     wait, ends the attempt; the next attempt may start at once.
 //!   - A suppressed candidate is dropped at once, with no attempt.
 //!   - An admitted candidate goes first. Otherwise the candidates are tried
 //!     in dial order, one after another, as the old JOIN tried its seeds.
 //!
 //! `join_network` awaits all of this, as it awaited the old JOIN. There is
 //! no new time limit for a candidate and no retry after its budget. The
-//! verdict waits, the JOIN dials, the backoffs and the JOIN send stop on
-//! the shutdown token. `join_network` checks the token before the fallback
-//! phases and before the JOIN.
+//! admission reads, the verdict waits, the JOIN dials, the backoffs and the
+//! JOIN send stop on the shutdown token; when the token and a result are
+//! both ready, cancellation goes first. `join_network` checks the token
+//! before each phase and before the JOIN.
 //!
 //! None of these steps weakens the plane gate or the #292 dial gates; they
 //! only read their verdicts.
@@ -175,8 +182,10 @@ pub(crate) enum JoinOutcome {
 
 /// How one JOIN attempt ended.
 enum Attempt {
-    /// The ledger and the waits were updated; choose the next attempt.
+    /// The attempt was used; choose the next attempt.
     Next,
+    /// saorsa-gossip refused an early dial (no attempt used).
+    NotReady,
     Joined(SocketAddr),
     Failed(String),
     Cancelled,
@@ -186,12 +195,39 @@ enum Attempt {
 enum Gate {
     /// Admitted: send the JOIN frame.
     Send,
-    /// Not admitted yet (lost connection, or the verdict stayed open): end
-    /// this attempt without a frame.
-    NotYet,
+    /// The peer lost its connection before admission: end this attempt
+    /// without a frame and start saorsa-gossip's loss cooldown (D252).
+    Lost,
+    /// The plane verdict stayed open for the whole gate wait: end this
+    /// attempt without a frame; the next attempt may start at once.
+    Unresolved,
     /// Suppressed: drop the candidate.
     Refused,
     Cancelled,
+}
+
+/// One admission read that ends early when shutdown begins. Cancellation
+/// goes first when both are ready.
+async fn read_admission<A: SeedAdmission + ?Sized>(
+    admission: &A,
+    peer: &ant_quic::PeerId,
+    shutdown: &CancellationToken,
+) -> Option<PeerAdmission> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        verdict = admission.admission(peer) => Some(verdict),
+    }
+}
+
+/// Sleep for `wait`, or until shutdown begins. Returns `false` on shutdown.
+/// Cancellation goes first when both are ready.
+async fn nap(wait: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(wait) => true,
+    }
 }
 
 /// One candidate: a dial that returned `Ok`.
@@ -200,9 +236,6 @@ struct Candidate {
     addr: SocketAddr,
     /// The peer that answered at `addr` last.
     peer: ant_quic::PeerId,
-    /// The next JOIN attempt starts no earlier than this (saorsa-gossip's
-    /// backoff after a failed dial).
-    next_attempt: Option<Instant>,
 }
 
 /// Dial results of one `join_network` run, with the answered peer ids and
@@ -214,8 +247,8 @@ pub(crate) struct JoinCandidates {
     connected: Vec<Candidate>,
     /// Addresses whose answered peer was later found suppressed.
     refused: Vec<SocketAddr>,
-    /// saorsa-gossip's JOIN attempts and backoff per address, for the whole
-    /// join.
+    /// saorsa-gossip's JOIN attempts, dial backoff and loss cooldown per
+    /// address, for the whole join.
     ledger: JoinLedger,
 }
 
@@ -230,11 +263,7 @@ impl JoinCandidates {
         for (addr, peer) in dialled {
             match self.connected.iter_mut().find(|known| known.addr == addr) {
                 Some(record) => record.peer = peer,
-                None => self.connected.push(Candidate {
-                    addr,
-                    peer,
-                    next_attempt: None,
-                }),
+                None => self.connected.push(Candidate { addr, peer }),
             }
         }
     }
@@ -259,16 +288,17 @@ impl JoinCandidates {
     /// Read the verdict of every record (only those with JOIN budget left
     /// when `budgeted`). Suppressed records move to the refused set.
     /// Returns the kept records' addresses with their verdicts, in dial
-    /// order.
+    /// order, or `None` when shutdown began.
     async fn read_verdicts<A: SeedAdmission + ?Sized>(
         &mut self,
         admission: &A,
         budgeted: bool,
-    ) -> Vec<(SocketAddr, ant_quic::PeerId, PeerAdmission)> {
+        shutdown: &CancellationToken,
+    ) -> Option<Vec<(SocketAddr, ant_quic::PeerId, PeerAdmission)>> {
         let mut read = Vec::with_capacity(self.connected.len());
         for candidate in &self.connected {
             if !budgeted || !self.ledger.is_exhausted(candidate.addr) {
-                let verdict = admission.admission(&candidate.peer).await;
+                let verdict = read_admission(admission, &candidate.peer, shutdown).await?;
                 read.push((candidate.addr, candidate.peer, verdict));
             }
         }
@@ -278,16 +308,20 @@ impl JoinCandidates {
             }
         }
         read.retain(|(_, _, verdict)| *verdict != PeerAdmission::Suppressed);
-        read
+        Some(read)
     }
 
     /// The count for the join's phase decisions: distinct peers that are
     /// still connected and not suppressed (`Admitted` or `PlanePending`).
     /// It reads the verdicts now and does not wait. Suppressed candidates
-    /// move to the refused set.
-    pub(crate) async fn usable<A: SeedAdmission + ?Sized>(&mut self, admission: &A) -> usize {
+    /// move to the refused set. `None` when shutdown began.
+    pub(crate) async fn usable<A: SeedAdmission + ?Sized>(
+        &mut self,
+        admission: &A,
+        shutdown: &CancellationToken,
+    ) -> Option<usize> {
         let mut usable: Vec<ant_quic::PeerId> = Vec::new();
-        for (_, peer, verdict) in self.read_verdicts(admission, false).await {
+        for (_, peer, verdict) in self.read_verdicts(admission, false, shutdown).await? {
             let connected = matches!(
                 verdict,
                 PeerAdmission::Admitted | PeerAdmission::PlanePending
@@ -296,11 +330,12 @@ impl JoinCandidates {
                 usable.push(peer);
             }
         }
-        usable.len()
+        Some(usable.len())
     }
 
     /// Read the verdicts until [`settled`] for `target`, then keep only the
-    /// admitted candidates. Returns early when `shutdown` is cancelled.
+    /// admitted candidates. When shutdown begins, it returns at once with no
+    /// seed.
     pub(crate) async fn settle<A: SeedAdmission + ?Sized>(
         &self,
         admission: &A,
@@ -316,22 +351,24 @@ impl JoinCandidates {
         loop {
             let mut verdicts = Vec::with_capacity(records.len());
             for (_, peer) in &records {
-                verdicts.push(admission.admission(peer).await);
+                match read_admission(admission, peer, shutdown).await {
+                    Some(verdict) => verdicts.push(verdict),
+                    None => return JoinSeedPlan::default(),
+                }
             }
             let plan = plan_join_seeds(&records, &verdicts);
-            if settled(&plan, target, started.elapsed()) || shutdown.is_cancelled() {
+            if settled(&plan, target, started.elapsed()) {
                 return plan;
             }
-            tokio::select! {
-                () = tokio::time::sleep(JOIN_SEED_VERDICT_POLL) => {}
-                () = shutdown.cancelled() => {}
+            if !nap(JOIN_SEED_VERDICT_POLL, shutdown).await {
+                return JoinSeedPlan::default();
             }
         }
     }
 
-    /// The JOIN through `membership`, with saorsa-gossip's attempt budget
-    /// per address and x0x's admission gate before each JOIN frame (see the
-    /// module doc).
+    /// The JOIN through `membership`, with saorsa-gossip's attempt budget,
+    /// dial backoff and loss cooldown per address, and x0x's admission gate
+    /// before each JOIN frame (see the module doc).
     pub(crate) async fn join_overlay<T, A>(
         &mut self,
         membership: &HyParViewMembership<T>,
@@ -352,7 +389,9 @@ impl JoinCandidates {
             if shutdown.is_cancelled() {
                 return JoinOutcome::Cancelled;
             }
-            let live = self.read_verdicts(admission, true).await;
+            let Some(live) = self.read_verdicts(admission, true, shutdown).await else {
+                return JoinOutcome::Cancelled;
+            };
             let pick = live
                 .iter()
                 .find(|(_, _, verdict)| *verdict == PeerAdmission::Admitted)
@@ -362,18 +401,15 @@ impl JoinCandidates {
                 // As in the old JOIN, the last failed attempt's backoff
                 // ends before the JOIN gives up.
                 if let Some(wait) = remaining(gate) {
-                    tokio::select! {
-                        () = tokio::time::sleep(wait) => {}
-                        () = shutdown.cancelled() => return JoinOutcome::Cancelled,
+                    if !nap(wait, shutdown).await {
+                        return JoinOutcome::Cancelled;
                     }
                 }
                 return JoinOutcome::NoSeed { attempts };
             };
-            let own = self
-                .connected
-                .iter()
-                .find(|known| known.addr == addr)
-                .and_then(|known| known.next_attempt);
+            // saorsa-gossip's readiness for this address: the later of its
+            // dial backoff and its loss cooldown.
+            let own = self.ledger.ready_at(addr);
             let ready_at = if admitted {
                 own
             } else {
@@ -382,18 +418,17 @@ impl JoinCandidates {
             if let Some(wait) = ready_at.and_then(remaining) {
                 // Not yet: wait (a little at a time, so that a candidate
                 // that becomes admitted can go first).
-                tokio::select! {
-                    () = tokio::time::sleep(wait.min(JOIN_SEED_VERDICT_POLL)) => {}
-                    () = shutdown.cancelled() => return JoinOutcome::Cancelled,
+                if !nap(wait.min(JOIN_SEED_VERDICT_POLL), shutdown).await {
+                    return JoinOutcome::Cancelled;
                 }
                 continue;
             }
-            attempts += 1;
             match self
                 .attempt(membership, admission, addr, &mut gate, shutdown)
                 .await
             {
-                Attempt::Next => {}
+                Attempt::Next => attempts += 1,
+                Attempt::NotReady => {}
                 Attempt::Joined(seed) => return JoinOutcome::Joined(seed),
                 Attempt::Failed(error) => return JoinOutcome::Failed(error),
                 Attempt::Cancelled => return JoinOutcome::Cancelled,
@@ -415,31 +450,38 @@ impl JoinCandidates {
         T: GossipTransport + 'static,
         A: SeedAdmission + ?Sized,
     {
+        if shutdown.is_cancelled() {
+            return Attempt::Cancelled;
+        }
         let dialled = tokio::select! {
-            dialled = membership.join_dial(&mut self.ledger, addr) => dialled,
+            biased;
             () = shutdown.cancelled() => return Attempt::Cancelled,
+            dialled = membership.join_dial(&mut self.ledger, addr) => dialled,
         };
         let peer = match dialled {
             JoinDial::Answered(peer) => ant_peer(peer),
-            JoinDial::Failed {
-                retry_after,
-                exhausted,
-            } => {
-                let at = Instant::now() + retry_after;
-                self.set_next_attempt(addr, Some(at));
+            JoinDial::Failed { exhausted, .. } => {
                 if exhausted {
-                    *gate = (*gate).max(at);
+                    if let Some(at) = self.ledger.ready_at(addr) {
+                        *gate = (*gate).max(at);
+                    }
                 }
                 return Attempt::Next;
             }
+            JoinDial::NotReady { .. } => return Attempt::NotReady,
             JoinDial::Exhausted => return Attempt::Next,
         };
         self.extend([(addr, peer)]);
-        self.set_next_attempt(addr, None);
 
         match self.gate(admission, addr, peer, shutdown).await {
             Gate::Send => {}
-            Gate::NotYet => return Attempt::Next,
+            Gate::Lost => {
+                // D252: saorsa-gossip's loss cooldown paces the next
+                // attempt on this address.
+                let _ready_at = self.ledger.record_loss(addr);
+                return Attempt::Next;
+            }
+            Gate::Unresolved => return Attempt::Next,
             Gate::Refused => {
                 self.drop_candidate(addr);
                 return Attempt::Next;
@@ -447,9 +489,13 @@ impl JoinCandidates {
             Gate::Cancelled => return Attempt::Cancelled,
         }
 
+        if shutdown.is_cancelled() {
+            return Attempt::Cancelled;
+        }
         let sent = tokio::select! {
-            sent = membership.join_send(addr, saorsa_gossip_types::PeerId::new(peer.0)) => sent,
+            biased;
             () = shutdown.cancelled() => return Attempt::Cancelled,
+            sent = membership.join_send(addr, saorsa_gossip_types::PeerId::new(peer.0)) => sent,
         };
         match sent {
             Ok(JoinSend::Joined) => Attempt::Joined(addr),
@@ -470,7 +516,10 @@ impl JoinCandidates {
     ) -> Gate {
         let deadline = Instant::now() + JOIN_SEED_VERDICT_WAIT;
         loop {
-            match admission.admission(&peer).await {
+            let Some(verdict) = read_admission(admission, &peer, shutdown).await else {
+                return Gate::Cancelled;
+            };
+            match verdict {
                 PeerAdmission::Admitted => return Gate::Send,
                 PeerAdmission::Suppressed => {
                     tracing::info!(
@@ -486,7 +535,7 @@ impl JoinCandidates {
                         seed = %addr,
                         "JOIN seed lost its connection before admission (issue #1321)"
                     );
-                    return Gate::NotYet;
+                    return Gate::Lost;
                 }
                 PeerAdmission::PlanePending => {
                     let Some(wait) = remaining(deadline) else {
@@ -495,20 +544,13 @@ impl JoinCandidates {
                             seed = %addr,
                             "JOIN seed plane verdict still open (issue #1321)"
                         );
-                        return Gate::NotYet;
+                        return Gate::Unresolved;
                     };
-                    tokio::select! {
-                        () = tokio::time::sleep(wait.min(JOIN_SEED_VERDICT_POLL)) => {}
-                        () = shutdown.cancelled() => return Gate::Cancelled,
+                    if !nap(wait.min(JOIN_SEED_VERDICT_POLL), shutdown).await {
+                        return Gate::Cancelled;
                     }
                 }
             }
-        }
-    }
-
-    fn set_next_attempt(&mut self, addr: SocketAddr, at: Option<Instant>) {
-        if let Some(known) = self.connected.iter_mut().find(|known| known.addr == addr) {
-            known.next_attempt = at;
         }
     }
 

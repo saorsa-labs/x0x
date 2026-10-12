@@ -372,7 +372,8 @@ async fn settle_ends_at_once_on_shutdown() {
     shutdown.cancel();
     let started = Instant::now();
     let plan = candidates.settle(fake.as_ref(), 3, &shutdown).await;
-    assert_eq!(plan.plane_unresolved, 1);
+    // A cancelled settlement reports no seed, and reads nothing.
+    assert_eq!(plan, JoinSeedPlan::default());
     assert_eq!(started.elapsed(), Duration::ZERO);
 }
 
