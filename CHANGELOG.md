@@ -23,7 +23,7 @@ A patch release. It contains durability fixes for named groups and share grants.
 
 ### Documentation
 
-- ADR governance: 102 numbered ADRs archived, 15 current slots A01–A15, transient decisions in `docs/adr/transient/` (#1313, #1325). First transient record: `T-goal-e-rule-5` (#1324), accepted.
+- ADR governance: 102 numbered ADRs archived, 15 current slots A01–A15, transient decisions in `docs/adr/transient/` (#1313, #1325). First transient record: `T-goal-e-rule-5`, added as Proposed (#1324) and accepted by David (#1328).
 
 ## [v0.47.0] - 2026-10-10
 
