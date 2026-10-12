@@ -34,9 +34,12 @@ jobs:
     name: Validate ADRs and immutable Accepted status
     runs-on: ubuntu-latest
     env:
-      # Push event: previous branch tip (all-zeros on branch creation/force-push).
+      # Actions event name. pull_request uses the merge-base. push uses GITHUB_BEFORE.
+      GITHUB_EVENT_NAME: ${{ github.event_name }}
+      # Previous tip. All zeros when the branch is created. A force-push keeps
+      # the old tip, which can be absent from the pull-request checkout.
       GITHUB_BEFORE: ${{ github.event.before }}
-      # Pull-request event: exact base commit SHA.
+      # Pull request: exact base commit. The count check uses this on pull_request.
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
       - uses: actions/checkout@v4
