@@ -13087,8 +13087,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            // Captured before `treekem_payload` is moved into the commit install.
+            let roster_only_removal = treekem_payload.is_none();
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(
+            let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
                 &resolved_group_key,
                 &current,
@@ -13226,8 +13228,37 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // join-artifact egress BEFORE the removal commits, then drop what
             // stays staged AFTER it.
             quiesce_member_join_egress(state, &resolved_group_key, &agent_id).await;
-            let persisted =
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await;
+            // #1113: a TreeKEM self-leave does not carry a removal commit.
+            // Seal that commit BEFORE this roster state is published. A
+            // later write would change `state_hash` after peers (and a
+            // restart) have already observed the removal, so restart would
+            // not rehydrate the hash it served.
+            // Causal replay already holds the roster persistence lock, so
+            // it cannot take that lock again here. Its leaf stays for the
+            // startup pass, which runs after the lock drops.
+            let mut rekey_persisted = false;
+            if roster_only_removal && !removed_self && !roster_lock_already_held {
+                if let SelfLeaveRekeyStep::Committed =
+                    commit_treekem_self_leave_rekey_from(state, &resolved_group_key, next.clone())
+                        .await
+                {
+                    if let Some(stored) = state
+                        .named_groups
+                        .read()
+                        .await
+                        .get(&resolved_group_key)
+                        .cloned()
+                    {
+                        next = stored;
+                    }
+                    rekey_persisted = true;
+                }
+            }
+            let persisted = if rekey_persisted {
+                Ok(AtomicWriteOutcome::Durable)
+            } else {
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await
+            };
             purge_join_artifacts_if_ineligible(state, &resolved_group_key, &agent_id).await;
             if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return ApplyMetadataResult::REJECTED;
@@ -22443,6 +22474,17 @@ async fn commit_next_treekem_self_leave_rekey(
     let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
         return SelfLeaveRekeyStep::Done;
     };
+    commit_treekem_self_leave_rekey_from(state, group_key, info).await
+}
+
+/// Commit one removal starting from `info`, which already shows the leaver
+/// as Removed. `info` may not be the map entry yet: the self-leave apply
+/// passes its candidate so the rekey is the first durable hash.
+async fn commit_treekem_self_leave_rekey_from(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: x0x::groups::GroupInfo,
+) -> SelfLeaveRekeyStep {
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
         return SelfLeaveRekeyStep::Done;
     }
