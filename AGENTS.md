@@ -72,16 +72,23 @@ The documentation and communication style is in `docs/documentation-style.md`.
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
 behaviour, public APIs or operational invariants, check `docs/adr/` and its
-status overlay. During transfer, new or changed decisions use the numbered
-ADR series only, through `docs/adr/TEMPLATE.md` and the ADR 0087 process
-(D199). Accepted ADRs are immutable. Supersede them instead. Only David marks
-an ADR Accepted.
+status overlay. A new or changed decision is `docs/adr/transient/T-<slug>.md`
+(D242). It names one target slot from A01 to A15. Write 300 to 600 words.
+Use about 80% ASD-STE100 style. Follow `docs/documentation-style.md`. It
+stays Proposed until David accepts it. David folds it into that slot only
+when he asks. Accepted ADRs
+are immutable. Supersede them instead. Only David marks an ADR Accepted.
 
 The 15-slot direction, A01 through A15, is confirmed by David (D198).
-Slot revisions are drafts until David accepts the transfer (D199). Read
+David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.
+Mapped numbered records are the historical archive. Their `docs/adr/` paths
+stay as links, and the bytes live in `docs/adr-archive/`. Read
 `docs/adr/consolidated/README.md` for the transfer rules. Do not create A16
 or a second consolidated series. Reserved numbered ADRs remain reserved:
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
 Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
 records, overlay, frozen evidence and team gates remain in force.
+David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026.
 Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
+Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
+The plan is `docs/adr/consolidated/README.md`.

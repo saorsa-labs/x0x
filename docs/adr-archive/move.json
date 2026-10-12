@@ -1,0 +1,620 @@
+{
+  "schema_version": 1,
+  "plan": "docs/adr/consolidated/README.md",
+  "transfer_accepted": "2026-10-10",
+  "note": "David accepted the transfer on 10 Oct 2026.",
+  "moves": [
+    {
+      "from": "docs/adr/0001-bootstrap-peers-are-seed-hints-only.md",
+      "to": "docs/adr-archive/0001-bootstrap-peers-are-seed-hints-only.md",
+      "link": "../adr-archive/0001-bootstrap-peers-are-seed-hints-only.md",
+      "sha256": "502f87f722735f7e1bf36493907c8da8c7896b26b676bce77cd7d6394229a93e"
+    },
+    {
+      "from": "docs/adr/0002-application-level-keepalive-for-direct-connections.md",
+      "to": "docs/adr-archive/0002-application-level-keepalive-for-direct-connections.md",
+      "link": "../adr-archive/0002-application-level-keepalive-for-direct-connections.md",
+      "sha256": "3a4ec78821e25bbe4b7581716eb380585708176f70afda796d95c71f90f0d340"
+    },
+    {
+      "from": "docs/adr/0003-auto-connect-to-discovered-agents.md",
+      "to": "docs/adr-archive/0003-auto-connect-to-discovered-agents.md",
+      "link": "../adr-archive/0003-auto-connect-to-discovered-agents.md",
+      "sha256": "af342dec6f783e95c7d2629e4c22a50cb62078cdb570db4ea69d2a20cf1a555e"
+    },
+    {
+      "from": "docs/adr/0004-quic-stream-and-channel-limits.md",
+      "to": "docs/adr-archive/0004-quic-stream-and-channel-limits.md",
+      "link": "../adr-archive/0004-quic-stream-and-channel-limits.md",
+      "sha256": "1661408aa6cf2c01a1d4301bb813c61baebd99447036e5d4e18f5c5cd88a81dc"
+    },
+    {
+      "from": "docs/adr/0005-mdns-local-network-discovery.md",
+      "to": "docs/adr-archive/0005-mdns-local-network-discovery.md",
+      "link": "../adr-archive/0005-mdns-local-network-discovery.md",
+      "sha256": "5e2f3c8d35fbdbde339b5127ae33597932aa038b42a05b88c23897739fcb84f8"
+    },
+    {
+      "from": "docs/adr/0006-no-global-dht-for-user-and-group-data.md",
+      "to": "docs/adr-archive/0006-no-global-dht-for-user-and-group-data.md",
+      "link": "../adr-archive/0006-no-global-dht-for-user-and-group-data.md",
+      "sha256": "6ff7d8c6087ca594976b46b5c973c7d538299cfeb8b53fcdbca583cb3553163d"
+    },
+    {
+      "from": "docs/adr/0007-three-layer-identity-model.md",
+      "to": "docs/adr-archive/0007-three-layer-identity-model.md",
+      "link": "../adr-archive/0007-three-layer-identity-model.md",
+      "sha256": "9e5a61dc8ffc3ce59f56cf72f40a4c3635a8ff210bdecf77de904dfeab4095de"
+    },
+    {
+      "from": "docs/adr/0008-trust-evaluation-system.md",
+      "to": "docs/adr-archive/0008-trust-evaluation-system.md",
+      "link": "../adr-archive/0008-trust-evaluation-system.md",
+      "sha256": "d14ae8100d5d69fa9627c8a9acfdeb577c5f916125aad99e1408956c8f58c23c"
+    },
+    {
+      "from": "docs/adr/0009-recv-pump-overload-policy.md",
+      "to": "docs/adr-archive/0009-recv-pump-overload-policy.md",
+      "link": "../adr-archive/0009-recv-pump-overload-policy.md",
+      "sha256": "1bfff439e2790419e040bb8269998053adf2c10090f19ee3138571e6ea6d3293"
+    },
+    {
+      "from": "docs/adr/0010-gss-before-mls-treekem-for-v1-secure-groups.md",
+      "to": "docs/adr-archive/0010-gss-before-mls-treekem-for-v1-secure-groups.md",
+      "link": "../adr-archive/0010-gss-before-mls-treekem-for-v1-secure-groups.md",
+      "sha256": "473c97cd68488c85e25ab34572db5cae1db2091f3559bed49b8bf76cfaf6ed44"
+    },
+    {
+      "from": "docs/adr/0011-bootstrap-dual-listen-udp-443.md",
+      "to": "docs/adr-archive/0011-bootstrap-dual-listen-udp-443.md",
+      "link": "../adr-archive/0011-bootstrap-dual-listen-udp-443.md",
+      "sha256": "944a858bd2db159bd7a2ab43a1d38c78bdf1c76c1f8dbdc52c2e5be0d7441a38"
+    },
+    {
+      "from": "docs/adr/0012-treekem-default-secure-groups.md",
+      "to": "docs/adr-archive/0012-treekem-default-secure-groups.md",
+      "link": "../adr-archive/0012-treekem-default-secure-groups.md",
+      "sha256": "1b213f79cd70a22314642db574da2b7e3ec785a1b5c4278c488f3fcc1c8c7c99"
+    },
+    {
+      "from": "docs/adr/0013-priority-aware-pubsub-shed.md",
+      "to": "docs/adr-archive/0013-priority-aware-pubsub-shed.md",
+      "link": "../adr-archive/0013-priority-aware-pubsub-shed.md",
+      "sha256": "dab3f92bf41acd414300359886c08d20661c63ecd7a5696a973fd9500a723b8b"
+    },
+    {
+      "from": "docs/adr/0014-treekem-self-leave-owner-driven-rekey.md",
+      "to": "docs/adr-archive/0014-treekem-self-leave-owner-driven-rekey.md",
+      "link": "../adr-archive/0014-treekem-self-leave-owner-driven-rekey.md",
+      "sha256": "18335ca9e2ae9b3544823a1c04f63e2ec2479fa180a492c22d5256a11d19d825"
+    },
+    {
+      "from": "docs/adr/0015-no-app-layer-at-rest-encryption.md",
+      "to": "docs/adr-archive/0015-no-app-layer-at-rest-encryption.md",
+      "link": "../adr-archive/0015-no-app-layer-at-rest-encryption.md",
+      "sha256": "5bb8441320adbaf635c26b3fbb1f9207bce47e5102ac6ff198e878f00557732d"
+    },
+    {
+      "from": "docs/adr/0016-role-based-group-authority-flat-admin.md",
+      "to": "docs/adr-archive/0016-role-based-group-authority-flat-admin.md",
+      "link": "../adr-archive/0016-role-based-group-authority-flat-admin.md",
+      "sha256": "974a16d3c036aa25109abb776d59ef5be009e3f922dacd7d970eee50bf926e79"
+    },
+    {
+      "from": "docs/adr/0017-x0x-as-agent-transport-layer.md",
+      "to": "docs/adr-archive/0017-x0x-as-agent-transport-layer.md",
+      "link": "../adr-archive/0017-x0x-as-agent-transport-layer.md",
+      "sha256": "dfdb3074ef4c1da75bb4049ff40ddebf243ccc4f07e09f119e2009e854cf6669"
+    },
+    {
+      "from": "docs/adr/0018-key-lifecycle-expiry-renewal-revocation.md",
+      "to": "docs/adr-archive/0018-key-lifecycle-expiry-renewal-revocation.md",
+      "link": "../adr-archive/0018-key-lifecycle-expiry-renewal-revocation.md",
+      "sha256": "c8f4be29352c7ea02cf4eed7cbe21d6ba041e87b04f00d43780a6f86d128ee70"
+    },
+    {
+      "from": "docs/adr/0019-connect-acl-default-closed.md",
+      "to": "docs/adr-archive/0019-connect-acl-default-closed.md",
+      "link": "../adr-archive/0019-connect-acl-default-closed.md",
+      "sha256": "4a3925450ffe0b916c3da5853d8a708a77b64ecd936cb77eca2dabb5b6651eca"
+    },
+    {
+      "from": "docs/adr/0020-tailnet-phase-1-byte-streams-and-forwarding.md",
+      "to": "docs/adr-archive/0020-tailnet-phase-1-byte-streams-and-forwarding.md",
+      "link": "../adr-archive/0020-tailnet-phase-1-byte-streams-and-forwarding.md",
+      "sha256": "3bb609191ff0960d85df19b85d2e9feebe74e6cb7fb31c8391f46b8e7bef7e5c"
+    },
+    {
+      "from": "docs/adr/0021-dm-origin-machine-attestation.md",
+      "to": "docs/adr-archive/0021-dm-origin-machine-attestation.md",
+      "link": "../adr-archive/0021-dm-origin-machine-attestation.md",
+      "sha256": "e0b962c36d72624b9cace0c0969cf0634d93d7b700e07e3b4ae307c3465bf7a3"
+    },
+    {
+      "from": "docs/adr/0022-tailnet-stream-api.md",
+      "to": "docs/adr-archive/0022-tailnet-stream-api.md",
+      "link": "../adr-archive/0022-tailnet-stream-api.md",
+      "sha256": "4b4c95a2c13236189c73550c4121663aaa14a0a92bbcea231a7fa3a25f660563"
+    },
+    {
+      "from": "docs/adr/0023-durable-local-history.md",
+      "to": "docs/adr-archive/0023-durable-local-history.md",
+      "link": "../adr-archive/0023-durable-local-history.md",
+      "sha256": "af8beeba3cd13f9ea5d56691107901fbdcc643ac41d895818eef1c0f51897bf9"
+    },
+    {
+      "from": "docs/adr/0024-gss-rotation-on-admin-remove-fail-closed.md",
+      "to": "docs/adr-archive/0024-gss-rotation-on-admin-remove-fail-closed.md",
+      "link": "../adr-archive/0024-gss-rotation-on-admin-remove-fail-closed.md",
+      "sha256": "2915791e4c7aaa98cdf32b731a0654b903dc86df98a875177a91aa102523cc4a"
+    },
+    {
+      "from": "docs/adr/0025-required-gates-prove-observation-completeness.md",
+      "to": "docs/adr-archive/0025-required-gates-prove-observation-completeness.md",
+      "link": "../adr-archive/0025-required-gates-prove-observation-completeness.md",
+      "sha256": "4076c2be41d8f4c05323dfa34a2c03291f742bb9c90f105d6c303131d0d1bcb3"
+    },
+    {
+      "from": "docs/adr/0026-managed-x0xd-deployment.md",
+      "to": "docs/adr-archive/0026-managed-x0xd-deployment.md",
+      "link": "../adr-archive/0026-managed-x0xd-deployment.md",
+      "sha256": "4355d977e3eb0e5984943b66d0cad56f3f0ba3079f289cd1bb9afdabed03d80f"
+    },
+    {
+      "from": "docs/adr/0027-active-recipient-group-key-sealing.md",
+      "to": "docs/adr-archive/0027-active-recipient-group-key-sealing.md",
+      "link": "../adr-archive/0027-active-recipient-group-key-sealing.md",
+      "sha256": "2d36ca5ac83fb22ade0595f6764a3b2b035d4d5d549a6841085ea633d289d53d"
+    },
+    {
+      "from": "docs/adr/0028-authenticated-causal-predecessor-delivery.md",
+      "to": "docs/adr-archive/0028-authenticated-causal-predecessor-delivery.md",
+      "link": "../adr-archive/0028-authenticated-causal-predecessor-delivery.md",
+      "sha256": "1b7484137d69c837e73d48bd723fd2d93c00c69fd7456a8385d5e259b0f08fd1"
+    },
+    {
+      "from": "docs/adr/0029-public-message-threading.md",
+      "to": "docs/adr-archive/0029-public-message-threading.md",
+      "link": "../adr-archive/0029-public-message-threading.md",
+      "sha256": "ab051e02c9b6f08b250300efbde2c996d7d3296d5bfbb09e6fac0b6a2aa77f5d"
+    },
+    {
+      "from": "docs/adr/0030-dm-durable-application-ack-v2.md",
+      "to": "docs/adr-archive/0030-dm-durable-application-ack-v2.md",
+      "link": "../adr-archive/0030-dm-durable-application-ack-v2.md",
+      "sha256": "eb8238e5724290a98ea740ef31e453ce4171bdacdd1434152c226b25d7c4998a"
+    },
+    {
+      "from": "docs/adr/0031-sole-member-self-leave-deletes-group.md",
+      "to": "docs/adr-archive/0031-sole-member-self-leave-deletes-group.md",
+      "link": "../adr-archive/0031-sole-member-self-leave-deletes-group.md",
+      "sha256": "388dec77de365428eb9b1938e1d5d6d6acd82cdadb8041b3bf249c8f2eb06899"
+    },
+    {
+      "from": "docs/adr/0032-x0xd-443-own-identity.md",
+      "to": "docs/adr-archive/0032-x0xd-443-own-identity.md",
+      "link": "../adr-archive/0032-x0xd-443-own-identity.md",
+      "sha256": "c4dc2cdb8382b964bd785f4daa41a20b92a202cc9e46ef6ddfc59c70e0326b74"
+    },
+    {
+      "from": "docs/adr/0033-recv-pump-never-blocks.md",
+      "to": "docs/adr-archive/0033-recv-pump-never-blocks.md",
+      "link": "../adr-archive/0033-recv-pump-never-blocks.md",
+      "sha256": "8d9e8c7f1b534692a255be5d6b1bf9daaddc777af91adb51ba328d326a2a6e7d"
+    },
+    {
+      "from": "docs/adr/0034-leaf-participation-default.md",
+      "to": "docs/adr-archive/0034-leaf-participation-default.md",
+      "link": "../adr-archive/0034-leaf-participation-default.md",
+      "sha256": "8e832c27b2559957bb770695c83dedec526e751c25374cce0bfbc0bddd8c1daa"
+    },
+    {
+      "from": "docs/adr/0035-relay-decentralization.md",
+      "to": "docs/adr-archive/0035-relay-decentralization.md",
+      "link": "../adr-archive/0035-relay-decentralization.md",
+      "sha256": "9807d7b45ff936efcd7b4b9f531d96695f4adb643d2ff3900d3817d5a5147686"
+    },
+    {
+      "from": "docs/adr/0036-owner-singleton-and-naming-registry.md",
+      "to": "docs/adr-archive/0036-owner-singleton-and-naming-registry.md",
+      "link": "../adr-archive/0036-owner-singleton-and-naming-registry.md",
+      "sha256": "b44e56af4b7f32c6d1e8185977f0da641b46881274349250f44d34c8df87d5e8"
+    },
+    {
+      "from": "docs/adr/0037-agent-placement-and-key-custody.md",
+      "to": "docs/adr-archive/0037-agent-placement-and-key-custody.md",
+      "link": "../adr-archive/0037-agent-placement-and-key-custody.md",
+      "sha256": "4165c2d5f3e99dced8de4d686cf2d81821468af362aa62c0b0e310352e86fbf4"
+    },
+    {
+      "from": "docs/adr/0038-home-owner-certified-personal-space.md",
+      "to": "docs/adr-archive/0038-home-owner-certified-personal-space.md",
+      "link": "../adr-archive/0038-home-owner-certified-personal-space.md",
+      "sha256": "4d30062e1dc525130b9a84eb7287967e211b87e1ac38c771c4fbb7dbb4925198"
+    },
+    {
+      "from": "docs/adr/0039-agent-harness-boundary.md",
+      "to": "docs/adr-archive/0039-agent-harness-boundary.md",
+      "link": "../adr-archive/0039-agent-harness-boundary.md",
+      "sha256": "88675786314a57642d705a8f0d4db6bf611da23daad0ec07eaec0857e0e1b9eb"
+    },
+    {
+      "from": "docs/adr/0040-agent-delegation-in-spaces.md",
+      "to": "docs/adr-archive/0040-agent-delegation-in-spaces.md",
+      "link": "../adr-archive/0040-agent-delegation-in-spaces.md",
+      "sha256": "c9ae4baaa5f8d8d11d5ebd6fa6718fcfba51296bd46c70d4107a0a745bee85a8"
+    },
+    {
+      "from": "docs/adr/0041-cross-machine-state-sync-tiers.md",
+      "to": "docs/adr-archive/0041-cross-machine-state-sync-tiers.md",
+      "link": "../adr-archive/0041-cross-machine-state-sync-tiers.md",
+      "sha256": "435409cf845a1bef6e93bdb09132cb2b72dfd5d81f45ccc84f3c2f923c3b725a"
+    },
+    {
+      "from": "docs/adr/0042-voice-media-over-tailnet-streams.md",
+      "to": "docs/adr-archive/0042-voice-media-over-tailnet-streams.md",
+      "link": "../adr-archive/0042-voice-media-over-tailnet-streams.md",
+      "sha256": "28d0e9fcd3dccd4d853aff70fad0f344922e9b3d3f042f9193bef0960965a41d"
+    },
+    {
+      "from": "docs/adr/0043-agent-key-move-protocol.md",
+      "to": "docs/adr-archive/0043-agent-key-move-protocol.md",
+      "link": "../adr-archive/0043-agent-key-move-protocol.md",
+      "sha256": "a86a429772b52f8b92541e18f42e46e2469168b7fa83e23ae470397ac9946840"
+    },
+    {
+      "from": "docs/adr/0044-daemon-local-rest-ws-sse-control-plane.md",
+      "to": "docs/adr-archive/0044-daemon-local-rest-ws-sse-control-plane.md",
+      "link": "../adr-archive/0044-daemon-local-rest-ws-sse-control-plane.md",
+      "sha256": "bb7d0c08470f1fe0d0ab170b41bf7d6104c65ca50d09e24fe65c765ececbe14d"
+    },
+    {
+      "from": "docs/adr/0045-decentralized-self-update.md",
+      "to": "docs/adr-archive/0045-decentralized-self-update.md",
+      "link": "../adr-archive/0045-decentralized-self-update.md",
+      "sha256": "6e926fa3b499ec5a7efdbc33d9bbba941952590678a7c28a5dfbf128bedd7a58"
+    },
+    {
+      "from": "docs/adr/0046-exec-service-fail-closed-acl.md",
+      "to": "docs/adr-archive/0046-exec-service-fail-closed-acl.md",
+      "link": "../adr-archive/0046-exec-service-fail-closed-acl.md",
+      "sha256": "687ac178fd92c212eaef1ee16c82c2ec282f99ad2c7205a4f75cd044cabeee02"
+    },
+    {
+      "from": "docs/adr/0047-crdt-kv-store-delta-gossip.md",
+      "to": "docs/adr-archive/0047-crdt-kv-store-delta-gossip.md",
+      "link": "../adr-archive/0047-crdt-kv-store-delta-gossip.md",
+      "sha256": "2dbc5cf1735e79dbc8d98d1289e927338213f611858aa8e5440e83fa083f1e39"
+    },
+    {
+      "from": "docs/adr/0048-crdt-task-list-coordination.md",
+      "to": "docs/adr-archive/0048-crdt-task-list-coordination.md",
+      "link": "../adr-archive/0048-crdt-task-list-coordination.md",
+      "sha256": "624537b2817a851d90abc402b13cc5c9ec3031fe37fbb4e0bdfba2e1eb0054fd"
+    },
+    {
+      "from": "docs/adr/0049-presence-foaf-discovery.md",
+      "to": "docs/adr-archive/0049-presence-foaf-discovery.md",
+      "link": "../adr-archive/0049-presence-foaf-discovery.md",
+      "sha256": "70d466401e9c02110a68011aa5fb2bea5547221112cfe74d0e1f5a79ef5c8ce1"
+    },
+    {
+      "from": "docs/adr/0050-dm-over-gossip-base-transport.md",
+      "to": "docs/adr-archive/0050-dm-over-gossip-base-transport.md",
+      "link": "../adr-archive/0050-dm-over-gossip-base-transport.md",
+      "sha256": "f7c1a58f795b049bddd2ca28247a1d5b3aa05968ce36dada973f30508529ec63"
+    },
+    {
+      "from": "docs/adr/0051-application-level-peer-relay.md",
+      "to": "docs/adr-archive/0051-application-level-peer-relay.md",
+      "link": "../adr-archive/0051-application-level-peer-relay.md",
+      "sha256": "651e1b96f18d28fcc21f6ed206319ae70835f067be67bfa082053b4baf300566"
+    },
+    {
+      "from": "docs/adr/0052-embedded-gui-in-daemon-binary.md",
+      "to": "docs/adr-archive/0052-embedded-gui-in-daemon-binary.md",
+      "link": "../adr-archive/0052-embedded-gui-in-daemon-binary.md",
+      "sha256": "ccabb44ad9a812e9beffa12dd358e13f4f49c72b40d2cd2ba6dcbf747247797c"
+    },
+    {
+      "from": "docs/adr/0053-api-unserved-watchdog.md",
+      "to": "docs/adr-archive/0053-api-unserved-watchdog.md",
+      "link": "../adr-archive/0053-api-unserved-watchdog.md",
+      "sha256": "339d07a00e43d1342c23d705409216ce8502230aa1b74de157a5d2f3caa95ead"
+    },
+    {
+      "from": "docs/adr/0054-external-agent-signing-dst.md",
+      "to": "docs/adr-archive/0054-external-agent-signing-dst.md",
+      "link": "../adr-archive/0054-external-agent-signing-dst.md",
+      "sha256": "159207c661beb9a3d4d44beb188be7f96ea9c8d1f97e148af1ec5f3848fcefee"
+    },
+    {
+      "from": "docs/adr/0055-dm-file-transfer-protocol.md",
+      "to": "docs/adr-archive/0055-dm-file-transfer-protocol.md",
+      "link": "../adr-archive/0055-dm-file-transfer-protocol.md",
+      "sha256": "982fc4ad4911824d52e4b2274b922a28d13027b7bbda0e2d41b9d2a4c89a3104"
+    },
+    {
+      "from": "docs/adr/0056-voice-link-transport-and-signaling.md",
+      "to": "docs/adr-archive/0056-voice-link-transport-and-signaling.md",
+      "link": "../adr-archive/0056-voice-link-transport-and-signaling.md",
+      "sha256": "835f9aa05956e30d9454cc8d5764c0a8b982c332f296e4c6b998511ae4fafb1f"
+    },
+    {
+      "from": "docs/adr/0057-embedded-serve-library-local-apps.md",
+      "to": "docs/adr-archive/0057-embedded-serve-library-local-apps.md",
+      "link": "../adr-archive/0057-embedded-serve-library-local-apps.md",
+      "sha256": "881a12d7017a2a31a43a6b45a630d3ffdaa5fdf2dc19d3b625da21309641615f"
+    },
+    {
+      "from": "docs/adr/0058-compile-time-embedded-constitution.md",
+      "to": "docs/adr-archive/0058-compile-time-embedded-constitution.md",
+      "link": "../adr-archive/0058-compile-time-embedded-constitution.md",
+      "sha256": "1e0f45d53ee080d8172ecfdb9374bda38dcb322c784356bd55849f05619b9934"
+    },
+    {
+      "from": "docs/adr/0059-invite-authentication-and-seating-provenance.md",
+      "to": "docs/adr-archive/0059-invite-authentication-and-seating-provenance.md",
+      "link": "../adr-archive/0059-invite-authentication-and-seating-provenance.md",
+      "sha256": "7d31faa44467419b0a950fe8dde69837826c392ea893168f6df9cfa640cddbf8"
+    },
+    {
+      "from": "docs/adr/0060-one-home-per-owner.md",
+      "to": "docs/adr-archive/0060-one-home-per-owner.md",
+      "link": "../adr-archive/0060-one-home-per-owner.md",
+      "sha256": "f4e4c541b4ff2f8628fce029b5dbcc722e0651022e2a2ed433463180c700a0ab"
+    },
+    {
+      "from": "docs/adr/0061-supervised-upgrade-restart-ownership.md",
+      "to": "docs/adr-archive/0061-supervised-upgrade-restart-ownership.md",
+      "link": "../adr-archive/0061-supervised-upgrade-restart-ownership.md",
+      "sha256": "eb224d0d5614c770fdf4bfb78c1ecb2c971fc4f80f416c325571d477bb0b85ed"
+    },
+    {
+      "from": "docs/adr/0062-home-persistence-pair-recovery.md",
+      "to": "docs/adr-archive/0062-home-persistence-pair-recovery.md",
+      "link": "../adr-archive/0062-home-persistence-pair-recovery.md",
+      "sha256": "c3fcf17987aa570ccab06761418ae1bbf34ba8f20396d8b273ea0aabaa5ca378"
+    },
+    {
+      "from": "docs/adr/0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md",
+      "to": "docs/adr-archive/0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md",
+      "link": "../adr-archive/0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md",
+      "sha256": "1442fe5816219562d6704f8359d195cd266c520579e886dbefcc436b36026df9"
+    },
+    {
+      "from": "docs/adr/0064-owner-anchored-fork-authority.md",
+      "to": "docs/adr-archive/0064-owner-anchored-fork-authority.md",
+      "link": "../adr-archive/0064-owner-anchored-fork-authority.md",
+      "sha256": "ca23470c5924a283e1968531210438629bba6276be803779360e6b0065fd1034"
+    },
+    {
+      "from": "docs/adr/0065-duplicate-home-inventory-retirement-deferred.md",
+      "to": "docs/adr-archive/0065-duplicate-home-inventory-retirement-deferred.md",
+      "link": "../adr-archive/0065-duplicate-home-inventory-retirement-deferred.md",
+      "sha256": "c67906ce96e9f4c20c957f8133e1f229b6dd9e29cc5c13a14cd4d91f0a3666e2"
+    },
+    {
+      "from": "docs/adr/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md",
+      "to": "docs/adr-archive/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md",
+      "link": "../adr-archive/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md",
+      "sha256": "58978f8f509a6a0452db435eb24da2c4b8bd809b4ceec37289ac95184f74c812"
+    },
+    {
+      "from": "docs/adr/0067-lifecycle-epoch-token-is-derived-marker-identity.md",
+      "to": "docs/adr-archive/0067-lifecycle-epoch-token-is-derived-marker-identity.md",
+      "link": "../adr-archive/0067-lifecycle-epoch-token-is-derived-marker-identity.md",
+      "sha256": "7561c99475d7372dfe3ad046015d4f955aba6b3702c8cd105d1eeef5d7b0b445"
+    },
+    {
+      "from": "docs/adr/0068-quarantine-pinned-history-retention-and-buffered-task-deltas.md",
+      "to": "docs/adr-archive/0068-quarantine-pinned-history-retention-and-buffered-task-deltas.md",
+      "link": "../adr-archive/0068-quarantine-pinned-history-retention-and-buffered-task-deltas.md",
+      "sha256": "319e9c149fd33f107b4022c467b2d4d76b8fce68d9c7dfbc4f69e8cf951a0cbf"
+    },
+    {
+      "from": "docs/adr/0069-home-wait-for-sync-before-auto-provisioning.md",
+      "to": "docs/adr-archive/0069-home-wait-for-sync-before-auto-provisioning.md",
+      "link": "../adr-archive/0069-home-wait-for-sync-before-auto-provisioning.md",
+      "sha256": "0e6f41a2f46a134f2a73d7f842905a44c448e60343c232cd4da10ddd0a6fcb1e"
+    },
+    {
+      "from": "docs/adr/0070-owner-trust-and-share-grants.md",
+      "to": "docs/adr-archive/0070-owner-trust-and-share-grants.md",
+      "link": "../adr-archive/0070-owner-trust-and-share-grants.md",
+      "sha256": "b11934579893d3d8cbbdec4c73c76e553756593362482dddb05e5bb4840a90fe"
+    },
+    {
+      "from": "docs/adr/0071-relay-backbone-shipped-truth-and-deferred-work.md",
+      "to": "docs/adr-archive/0071-relay-backbone-shipped-truth-and-deferred-work.md",
+      "link": "../adr-archive/0071-relay-backbone-shipped-truth-and-deferred-work.md",
+      "sha256": "a9cf95617700fdf96921acfe548d680187ffd7301f185b9c39b28e1ebe86b19c"
+    },
+    {
+      "from": "docs/adr/0072-scope-freeze-deferred-and-legacy-maintenance.md",
+      "to": "docs/adr-archive/0072-scope-freeze-deferred-and-legacy-maintenance.md",
+      "link": "../adr-archive/0072-scope-freeze-deferred-and-legacy-maintenance.md",
+      "sha256": "1d45f731247b8751a26e0c19892c4b33287e3757d493a8b22853f41b1e67df7b"
+    },
+    {
+      "from": "docs/adr/0073-audio-and-video-calling.md",
+      "to": "docs/adr-archive/0073-audio-and-video-calling.md",
+      "link": "../adr-archive/0073-audio-and-video-calling.md",
+      "sha256": "b74c6be45a4c5ca3bc480684851623498d448b13bde1387584772f94b20f8392"
+    },
+    {
+      "from": "docs/adr/0074-tailnet-phase-2-names-persistent-forwards-socks5.md",
+      "to": "docs/adr-archive/0074-tailnet-phase-2-names-persistent-forwards-socks5.md",
+      "link": "../adr-archive/0074-tailnet-phase-2-names-persistent-forwards-socks5.md",
+      "sha256": "c8c107337095bafa07c6392078c90577984650859e2e37a668723df6a4e052c6"
+    },
+    {
+      "from": "docs/adr/0075-collaborative-notes-and-agent-scratchpads.md",
+      "to": "docs/adr-archive/0075-collaborative-notes-and-agent-scratchpads.md",
+      "link": "../adr-archive/0075-collaborative-notes-and-agent-scratchpads.md",
+      "sha256": "900469b84e006a993185988776727d439a5927107dfe702b99270e45fd39d02a"
+    },
+    {
+      "from": "docs/adr/0077-share-grant-owner-side-redelivery-outbox.md",
+      "to": "docs/adr-archive/0077-share-grant-owner-side-redelivery-outbox.md",
+      "link": "../adr-archive/0077-share-grant-owner-side-redelivery-outbox.md",
+      "sha256": "75feebd97b181d3210abf416bfcfb2407dd4e66f514edfe5ab9dd4dca63ad86a"
+    },
+    {
+      "from": "docs/adr/0079-grant-carried-owner-and-machine-names.md",
+      "to": "docs/adr-archive/0079-grant-carried-owner-and-machine-names.md",
+      "link": "../adr-archive/0079-grant-carried-owner-and-machine-names.md",
+      "sha256": "316295033d74e941525e5ab67b65b447c328754178b62532c0f07b3181222110"
+    },
+    {
+      "from": "docs/adr/0080-grant-revocation-direct-push.md",
+      "to": "docs/adr-archive/0080-grant-revocation-direct-push.md",
+      "link": "../adr-archive/0080-grant-revocation-direct-push.md",
+      "sha256": "55e1d3ec71e23c9454a92d2b63c4451800f0065da818b0d820f130a65c9eaac2"
+    },
+    {
+      "from": "docs/adr/0081-notes-use-loro-crdt.md",
+      "to": "docs/adr-archive/0081-notes-use-loro-crdt.md",
+      "link": "../adr-archive/0081-notes-use-loro-crdt.md",
+      "sha256": "3109267df2ccfce39c99ee2737bada0f45c533e6801e3dc1f1ee92e3020cf3c7"
+    },
+    {
+      "from": "docs/adr/0082-notes-epoch-bound-writer-rule.md",
+      "to": "docs/adr-archive/0082-notes-epoch-bound-writer-rule.md",
+      "link": "../adr-archive/0082-notes-epoch-bound-writer-rule.md",
+      "sha256": "010c3ab531a9c89d011ed2e93122f6e9bd1967b1c98b68cb556f685c17c2208e"
+    },
+    {
+      "from": "docs/adr/0083-agent-initiated-gui-show.md",
+      "to": "docs/adr-archive/0083-agent-initiated-gui-show.md",
+      "link": "../adr-archive/0083-agent-initiated-gui-show.md",
+      "sha256": "6c01940b9de97cd8c734b28b63f563568ebab73394513502c5330a7353357c26"
+    },
+    {
+      "from": "docs/adr/0084-enrolled-owner-sync-admission.md",
+      "to": "docs/adr-archive/0084-enrolled-owner-sync-admission.md",
+      "link": "../adr-archive/0084-enrolled-owner-sync-admission.md",
+      "sha256": "76e4bd99cf6218b7ee808bffff53fc3f829b6aab81101f5f916fba14cb998946"
+    },
+    {
+      "from": "docs/adr/0085-persisted-binary-formats-are-versioned.md",
+      "to": "docs/adr-archive/0085-persisted-binary-formats-are-versioned.md",
+      "link": "../adr-archive/0085-persisted-binary-formats-are-versioned.md",
+      "sha256": "e34804c203abc4e079d261536e16474318d1361c175be13c642d1c97095d6abd"
+    },
+    {
+      "from": "docs/adr/0086-gossip-send-targets-bounded-by-transport-connectivity.md",
+      "to": "docs/adr-archive/0086-gossip-send-targets-bounded-by-transport-connectivity.md",
+      "link": "../adr-archive/0086-gossip-send-targets-bounded-by-transport-connectivity.md",
+      "sha256": "807ce58920671427c85ef5aa4479cace4e24eb94b2142186f5971719d8e04a80"
+    },
+    {
+      "from": "docs/adr/0087-repository-and-release-governance.md",
+      "to": "docs/adr-archive/0087-repository-and-release-governance.md",
+      "link": "../adr-archive/0087-repository-and-release-governance.md",
+      "sha256": "55efc90af24be1a20d28f497988861040975827fa2345ab7356475cafc02eba5"
+    },
+    {
+      "from": "docs/adr/0088-group-liveness-contract.md",
+      "to": "docs/adr-archive/0088-group-liveness-contract.md",
+      "link": "../adr-archive/0088-group-liveness-contract.md",
+      "sha256": "96cc1e5c9ef26864dba630bb3d35f1fa11a1a9122187e9bced3fce109e29c0da"
+    },
+    {
+      "from": "docs/adr/0089-relationship-peer-evidence-survives-restart.md",
+      "to": "docs/adr-archive/0089-relationship-peer-evidence-survives-restart.md",
+      "link": "../adr-archive/0089-relationship-peer-evidence-survives-restart.md",
+      "sha256": "808c3afdb87b09386c28273cc73394ce81d334d82c8bab64e5cf0e9128e8e9f9"
+    },
+    {
+      "from": "docs/adr/0093-capability-advert-registry.md",
+      "to": "docs/adr-archive/0093-capability-advert-registry.md",
+      "link": "../adr-archive/0093-capability-advert-registry.md",
+      "sha256": "d4e4d53a774995eceee278fbf62753eb5e3164699e9cb281685d797f881e824d"
+    },
+    {
+      "from": "docs/adr/0094-m2-safe-apply.md",
+      "to": "docs/adr-archive/0094-m2-safe-apply.md",
+      "link": "../adr-archive/0094-m2-safe-apply.md",
+      "sha256": "90405768c0ded123fa8e5a1d51db9b7aa8295ae178b82b67cb952fabf51e5f1d"
+    },
+    {
+      "from": "docs/adr/0095-scope-x0x-is-glue.md",
+      "to": "docs/adr-archive/0095-scope-x0x-is-glue.md",
+      "link": "../adr-archive/0095-scope-x0x-is-glue.md",
+      "sha256": "fdb6b6bf9eadad48ba8fd1de92a61d0434d246ac35f72191b9dc3ee154ab5c0b"
+    },
+    {
+      "from": "docs/adr/0096-r12-x0x-is-maintained-by-its-own-agents.md",
+      "to": "docs/adr-archive/0096-r12-x0x-is-maintained-by-its-own-agents.md",
+      "link": "../adr-archive/0096-r12-x0x-is-maintained-by-its-own-agents.md",
+      "sha256": "90cd61b18c34a0e8354930560b691c8e68caa73dd53e6a856aa4cf88269599e4"
+    },
+    {
+      "from": "docs/adr/0106-join-result-carries-intervening-membership-events.md",
+      "to": "docs/adr-archive/0106-join-result-carries-intervening-membership-events.md",
+      "link": "../adr-archive/0106-join-result-carries-intervening-membership-events.md",
+      "sha256": "70f72b3deeac5bd733675fbb0ad05f8f6081db0903399055fe98499015a4ae23"
+    },
+    {
+      "from": "docs/adr/0107-stuck-join-rearm-and-serving-guard.md",
+      "to": "docs/adr-archive/0107-stuck-join-rearm-and-serving-guard.md",
+      "link": "../adr-archive/0107-stuck-join-rearm-and-serving-guard.md",
+      "sha256": "bcf153cbf4e7f37946f2d82c77058583da8f754d360486b352ed8795ea0b9110"
+    },
+    {
+      "from": "docs/adr/0108-home-scoped-owner-certificate.md",
+      "to": "docs/adr-archive/0108-home-scoped-owner-certificate.md",
+      "link": "../adr-archive/0108-home-scoped-owner-certificate.md",
+      "sha256": "4491aa981a017e9b454c6dee69ab01f2ff86ef98f5d5a3ad597dfd4dab80f2a4"
+    },
+    {
+      "from": "docs/adr/0109-ownerless-attestation-self-recovery.md",
+      "to": "docs/adr-archive/0109-ownerless-attestation-self-recovery.md",
+      "link": "../adr-archive/0109-ownerless-attestation-self-recovery.md",
+      "sha256": "043cdd780c440567dff143da8c3cc11c99868455d5a5713946f8479ead9d1fa7"
+    },
+    {
+      "from": "docs/adr/0110-revocation-eviction-designated-first.md",
+      "to": "docs/adr-archive/0110-revocation-eviction-designated-first.md",
+      "link": "../adr-archive/0110-revocation-eviction-designated-first.md",
+      "sha256": "6c5efbc95b8490f07953e4affa4a8c4bfc41ba26579ba28929732d08abfbd9a2"
+    },
+    {
+      "from": "docs/adr/0111-evidence-size-k-and-fetch-by-hash.md",
+      "to": "docs/adr-archive/0111-evidence-size-k-and-fetch-by-hash.md",
+      "link": "../adr-archive/0111-evidence-size-k-and-fetch-by-hash.md",
+      "sha256": "90519eae0ff57a7a460dcc2bcebe8ec894968547dc4e91331dd0773cd10a1c7d"
+    },
+    {
+      "from": "docs/adr/0112-any-admin-invite-redemption.md",
+      "to": "docs/adr-archive/0112-any-admin-invite-redemption.md",
+      "link": "../adr-archive/0112-any-admin-invite-redemption.md",
+      "sha256": "0b37b23148535399a96d9f8bb6361c8ac775b962cf12c64dc8af46b13d7ada7a"
+    },
+    {
+      "from": "docs/adr/0113-home-is-an-explicit-owner-group-adopted-in-place.md",
+      "to": "docs/adr-archive/0113-home-is-an-explicit-owner-group-adopted-in-place.md",
+      "link": "../adr-archive/0113-home-is-an-explicit-owner-group-adopted-in-place.md",
+      "sha256": "03c13316eae0b2b0e417e7b3fde09727be43474fe2e5f27c88249c6640de1281"
+    },
+    {
+      "from": "docs/adr/0114-authority-re-welcome.md",
+      "to": "docs/adr-archive/0114-authority-re-welcome.md",
+      "link": "../adr-archive/0114-authority-re-welcome.md",
+      "sha256": "a41a4c4551cd6ad5a7d389153eb543e294c48712a82e92f61db8a6a62437a012"
+    },
+    {
+      "from": "docs/adr/0115-identity-discovery-authority.md",
+      "to": "docs/adr-archive/0115-identity-discovery-authority.md",
+      "link": "../adr-archive/0115-identity-discovery-authority.md",
+      "sha256": "8824338bc3feb739cbb63fa1c267ee4994df7a4758fe20453ec81b962cd7e4dd"
+    },
+    {
+      "from": "docs/adr/0116-local-history-retention-policy.md",
+      "to": "docs/adr-archive/0116-local-history-retention-policy.md",
+      "link": "../adr-archive/0116-local-history-retention-policy.md",
+      "sha256": "13057dd17ada731d1cc614bcfa7156891079ee97df954a9772a6bf8b8daad68e"
+    }
+  ]
+}

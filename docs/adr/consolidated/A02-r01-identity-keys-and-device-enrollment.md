@@ -88,6 +88,8 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0007 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0007-three-layer-identity-model.md) · [ADR 0015 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0015-no-app-layer-at-rest-encryption.md) · [ADR 0036 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0036-owner-singleton-and-naming-registry.md) · [ADR 0037 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0037-agent-placement-and-key-custody.md) · [ADR 0043 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0043-agent-key-move-protocol.md) · [ADR 0054 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0054-external-agent-signing-dst.md) · [ADR 0084 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0084-enrolled-owner-sync-admission.md)
 
+David placed [ADR 0115](../0115-identity-discovery-authority.md) in A02 on 10 Oct 2026. It amends ADR 0043. It also touches [A03](A03-r01-trust-permissions-sharing-and-revocation.md). That touch is not a second placement.
+
 Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
 
 [All 15 ADRs](README.md)

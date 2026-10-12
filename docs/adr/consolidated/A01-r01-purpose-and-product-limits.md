@@ -69,6 +69,14 @@ Before this replacement is accepted, the capability map must identify an owning 
 
 Confirm that reliable inbound events are part of every supported agent attachment. Confirm that voice/video and rich text retain their current priority.
 
+## Open questions
+
+ADR 0095 is Accepted and archived. This draft does not edit its text.
+
+David ruled D246 on 11 Oct 2026. He closed ADR 0095 open question 4 (Goal E under rule 5).
+
+Goal E counts in place of an R under rule 5 when the change keeps the wire format, API, stored format and dependencies unchanged, and the rule-21 delivery matrix shows no loss. The decision states a target gain when Proposed. It is Folded only after a measured before-and-after result that meets E-D15 rule 15. Any wire, protocol, API or dependency change needs a transient ADR (D242) that names an R.
+
 ## Existing decision records
 
 Read the [design direction and rulings digest](../../design/x0x-direction.md)
