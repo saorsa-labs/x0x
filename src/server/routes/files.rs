@@ -378,6 +378,12 @@ async fn send_file_message(
     let Some(transfer_id) = control_transfer_id(msg) else {
         return deliver_file_message(state, agent_id, msg).await;
     };
+    // Wait only when a current verified advert sets bit 3. A v0.47.0 peer
+    // does not advertise it. No verified advert uses that same path: the
+    // transport receipt is success and the sender does not wait.
+    if !peer_advertises_file_control_ack(state, agent_id) {
+        return deliver_file_message(state, agent_id, msg).await;
+    }
     let key = control_ack_key(op, transfer_id);
     let slot = register_control_waiter(state, agent_id, &key).await;
     if state.shutdown_started.is_cancelled() {
@@ -409,7 +415,29 @@ async fn send_file_message(
     sent
 }
 
+fn file_control_ack_support(state: &AppState, peer: &AgentId) -> Option<bool> {
+    state
+        .agent
+        .capability_store()
+        .verified_registry_supports(peer, x0x::dm::CapabilityRegistry::FILE_CONTROL_ACK_V1)
+}
+
+fn peer_advertises_file_control_ack(state: &AppState, peer: &AgentId) -> bool {
+    file_control_ack_support(state, peer) == Some(true)
+}
+
+/// `Some(false)` is a verified advert that lacks bit 3. That peer is v0.47.0.
+fn peer_lacks_file_control_ack(state: &AppState, peer: &AgentId) -> bool {
+    file_control_ack_support(state, peer) == Some(false)
+}
+
 async fn send_file_control_ack(state: &Arc<AppState>, peer: &AgentId, transfer_id: &str, op: &str) {
+    // Do not send the frame to a peer whose verified advert lacks bit 3.
+    // No verified advert still sends. That peer may already be waiting
+    // because it holds this node's advert. A v0.47.0 peer ignores the tag.
+    if peer_lacks_file_control_ack(state, peer) {
+        return;
+    }
     let ack = x0x::files::FileMessage::ControlAck {
         transfer_id: transfer_id.to_string(),
         op: op.to_string(),
@@ -1893,6 +1921,27 @@ mod tests {
             .expect("file route test state")
     }
 
+    /// v0.47.0 `CapabilityRegistry::current` before bit 3 existed.
+    fn v047_registry_bits() -> u64 {
+        x0x::dm::CapabilityRegistry::SHARE_GRANT_V1
+            | x0x::dm::CapabilityRegistry::PREDECESSOR_OFFER_V1
+            | x0x::dm::CapabilityRegistry::PEER_EVIDENCE_V1
+    }
+
+    fn advertise_registry(state: &AppState, peer: x0x::identity::AgentId, bits: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified capability advert"
+        );
+    }
+
     #[tokio::test]
     async fn forged_chunk_ack_does_not_complete_control_waiter() {
         let (state, _dir) = route_state().await;
@@ -2133,6 +2182,7 @@ mod tests {
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let key = control_ack_key(CONTROL_OP_ACCEPT, &transfer_id);
         let held = register_control_waiter(&state, &peer, &key).await;
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
         let _hook = install_file_route_hook(FileRouteTestHook {
             stub_egress: true,
             egress_gate: None,
@@ -2183,6 +2233,7 @@ mod tests {
         let peer = x0x::identity::AgentId([9; 32]);
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let key = control_ack_key(CONTROL_OP_OFFER, &transfer_id);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
         let entered = hook_flag();
         let gate = empty_hook_notify();
         let _hook = install_file_route_hook(FileRouteTestHook {
@@ -2223,5 +2274,168 @@ mod tests {
             "the only caller must drop its slot on shutdown"
         );
         gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn v047_peer_without_file_control_bit_keeps_a_stored_offer() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([11; 32]);
+        advertise_registry(&state, peer, v047_registry_bits());
+        assert_eq!(
+            state.agent.capability_store().verified_registry_supports(
+                &peer,
+                x0x::dm::CapabilityRegistry::FILE_CONTROL_ACK_V1,
+            ),
+            Some(false),
+            "a v0.47.0 advert must not advertise bit 3"
+        );
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            file_send_handler(
+                State(Arc::clone(&state)),
+                Json(serde_json::json!({
+                    "agent_id": hex::encode(peer.as_bytes()),
+                    "filename": "old-peer.bin",
+                    "size": 4,
+                    "sha256": "abc",
+                })),
+            ),
+        )
+        .await
+        .expect("a peer that does not advertise the bit must not wait for file-control-ack")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .values()
+            .find(|transfer| transfer.filename == "old-peer.bin")
+            .cloned()
+            .expect("local send");
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Pending);
+        assert!(transfer.error.is_none());
+        assert!(
+            state
+                .file_chunk_acks
+                .read()
+                .await
+                .keys()
+                .all(|key| !key.starts_with("ctrl:")),
+            "the old path must not register a control waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_that_advertises_file_control_bit_waits_for_the_ack() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([12; 32]);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send = tokio::spawn(async move {
+            file_send_handler(
+                State(state_for_send),
+                Json(serde_json::json!({
+                    "agent_id": hex::encode(peer.as_bytes()),
+                    "filename": "new-peer.bin",
+                    "size": 4,
+                    "sha256": "abc",
+                })),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let transfer_id = loop {
+            let slots = state.file_chunk_acks.read().await;
+            if let Some(key) = slots.keys().find(|key| key.starts_with("ctrl:offer:")) {
+                break key.trim_start_matches("ctrl:offer:").to_string();
+            }
+            drop(slots);
+            if tokio::time::Instant::now() >= deadline {
+                panic!("a peer that advertises bit 3 must wait for file-control-ack");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id: transfer_id.clone(),
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("ack must release the waiter")
+            .expect("send task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("local send");
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Pending);
+        assert!(transfer.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_ack_is_sent_unless_a_verified_advert_lacks_the_bit() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let unknown = x0x::identity::AgentId([13; 32]);
+        let old = x0x::identity::AgentId([14; 32]);
+        let current = x0x::identity::AgentId([15; 32]);
+        advertise_registry(&state, old, v047_registry_bits());
+        advertise_registry(&state, current, x0x::dm::CapabilityRegistry::current().bits);
+        let entered = hook_flag();
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: Arc::clone(&entered),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+
+        send_file_control_ack(&state, &unknown, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "no verified advert still sends the frame"
+        );
+
+        entered.store(false, Ordering::SeqCst);
+        send_file_control_ack(&state, &old, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "a v0.47.0 advert must not receive file-control-ack"
+        );
+
+        send_file_control_ack(&state, &current, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "a peer that advertises bit 3 must receive file-control-ack"
+        );
     }
 }

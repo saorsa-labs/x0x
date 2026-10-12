@@ -1,65 +1,70 @@
 # T-file-control-ack: Application acknowledgement for file control frames
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-12
+- **Accepted:** 2026-10-12 13:08 Europe/London by David Irvine, slot A10, option (b)
 - **Target slot:** A10
-- **Decision owners:** David Irvine must accept this record before merge
+- **Decision owners:** David Irvine
 - **Reviewers:** pending
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** issue #1102; ADR 0055; ADR 0093; PR #1323
 
-This record is Proposed. It is not a numbered ADR. David must accept it before merge.
+David accepted this record at 13:08 London on 12 Oct 2026. He chose option (b) for slot A10. ADR 0093 bytes stay unchanged.
 
 ## Context
 
-ADR 0055 carries file transfer as JSON frames on the direct-message path. A raw QUIC receive-ACK means the transport drained the bytes. It does not mean the peer stored the offer. Issue #1102 shows a dropped frame while the sender observes HTTP 200. Slot A10 requires shared file data to name its holder and its failure result.
+ADR 0055 carries file transfer as JSON frames on the direct-message path. A raw QUIC receive-ACK means the transport drained the bytes. It does not mean the peer stored the offer. A v0.47.0 peer stores the offer and does not send `file-control-ack`.
 
 ## Decision Drivers
 
-- A dropped offer must not be reported as success.
-- The peer that stores the offer, accept, or reject must confirm it.
+- A dropped offer must not be success when the peer speaks the new frame.
+- A stored offer on a v0.47.0 peer must count as success.
+- The signal is a capability bit. A version string does not name this handler.
 - A chunk acknowledgement must not confirm a control frame.
 - History must not store this confirmation as chat.
-- This record must not allocate a new ADR 0093 capability bit.
 
 ## Considered Options
 
-1. Keep the raw QUIC receive-ACK as success. This preserves false success.
-2. Allocate a new ADR 0093 bit. That needs a separate accepted registry change.
-3. Infer support from the crate version or DM protocol version 2. ADR 0093 rejects that inference. v0.47.0 and this tree advertise the same bits and the same DM protocol version. The crate version is still 0.47.0.
-4. Add `file-control-ack` and wait for it from the addressed peer. This is the proposed option.
+1. Option (a). Infer support from the crate version or DM protocol version 2. ADR 0093 rejects that inference.
+2. Option (b). Add capability bit 3, `file_control_ack_v1`. Wait only when a verified advert sets that bit. David accepted this option.
+3. Always wait. A healthy v0.47.0 peer then returns HTTP 500 and the send becomes Failed.
 
 ## Decision
 
-We will add `FileMessage::ControlAck` with wire tag `file-control-ack`. The frame names the transfer id and the operation: `offer`, `accept`, or `reject`. The peer sends it only after it accepts that control frame. The sender waits for a matching frame from that same peer. A chunk acknowledgement whose id is `ctrl:<op>:<id>` must not complete the wait. An acknowledgement from any other agent must not complete the wait.
+We will add `FileMessage::ControlAck` with wire tag `file-control-ack`. The frame names the transfer id and the operation: `offer`, `accept`, or `reject`.
 
-A missing acknowledgement fails the call. An offer becomes Failed and returns HTTP 500. An empty accept may return to pending so the caller can retry. Stored bytes stay. A chunk that has passed admission and has not yet updated the byte count stays in progress. The accept timeout and that admission are one state transition. History classifies the frame as ephemeral.
+Bit 3 is `file_control_ack_v1` (`1 << 3`). Bits 0, 1, and 2 stay assigned. This record allocates bit 3. It does not edit ADR 0093.
 
-This record does not skip the wait for v0.47.0. No existing signal identifies a peer that sends the new frame. A later accepted decision must name that signal.
+A node waits for `file-control-ack` only when the peer's current verified advert sets bit 3. A missing acknowledgement fails the call. An offer becomes Failed and returns HTTP 500. An empty accept may return to pending.
+
+A verified advert without bit 3 is v0.47.0. Do not wait. Do not send the frame. A stored offer is success. Do not return HTTP 500. Do not mark the send Failed.
+
+No verified advert uses that success path. Do not wait. Still send the frame. The peer may already be waiting on this node's advert. A v0.47.0 peer ignores the unknown tag.
+
+A chunk acknowledgement whose id is `ctrl:<op>:<id>` must not complete the wait. An acknowledgement from any other agent must not complete the wait. History classifies the frame as ephemeral.
 
 ## Consequences
 
 ### Positive
 
-- Success means the addressed peer committed the control frame.
+- A peer that advertises bit 3 reports success only after it commits the control frame.
+- A v0.47.0 peer that stores the offer keeps a working transfer.
 - A forged chunk acknowledgement cannot finish the wait.
-- Shutdown releases only the caller's waiter.
 
 ### Negative / Trade-offs
 
-- A healthy v0.47.0 peer stores the offer and does not send `file-control-ack`. This build still reports failure, so a later accept cannot start.
-- Concurrent accepts share one waiter. The last caller removes the map entry.
+- No verified advert uses the old path. A new peer whose advert has not arrived can still report success for a dropped offer.
+- Concurrent accepts share one waiter. The last caller removes it.
 
 ### Neutral / Operational
 
-- Older peers ignore an unknown JSON tag.
-- David must accept this Proposed record before merge.
+- David folds this Accepted record into slot A10 only when he asks.
 
 ## Validation
 
-Tests must reject a chunk acknowledgement for `ctrl:<op>:<id>`, pause chunk zero across an expired accept wait, join a second accept on one slot, keep that slot when one waiter times out, and end a withheld acknowledgement on shutdown. History tests must keep the tag ephemeral.
+A v0.47.0 advert without bit 3 must treat a stored offer as success. A peer that advertises bit 3 must wait for `file-control-ack`. Tests must reject a chunk acknowledgement for `ctrl:<op>:<id>` and must keep the history tag ephemeral.
 
 ## Notes for AI-assisted work
 
-Do not mark this record Accepted. David accepts it before merge. Do not create a numbered ADR from this file. Do not allocate an ADR 0093 capability bit from this file.
+Do not fold this Accepted record in this pull request. Do not edit ADR 0093 to add bit 3.

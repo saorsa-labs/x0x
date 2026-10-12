@@ -157,6 +157,19 @@ fn send_ok(status: u16, body: &str) -> bool {
     status == 200 && serde_json::from_str::<Value>(body).is_ok_and(|value| value["ok"] == true)
 }
 
+fn advertise_file_control(agent: &crate::Agent, peer: AgentId, machine: MachineId) {
+    // Keep the gossip inbox off so the live raw path stays the transport.
+    // The registry bit is what the file waiter reads.
+    let mut capabilities = crate::dm::DmCapabilities::pending();
+    capabilities.application_registry = crate::dm::CapabilityRegistry::current();
+    assert!(
+        agent
+            .capability_store()
+            .insert(peer, machine, capabilities, dm_capability::now_unix_ms(),),
+        "the peer must advertise file_control_ack_v1"
+    );
+}
+
 fn http_500(status: u16, body: &str) -> bool {
     status == 500 && serde_json::from_str::<Value>(body).is_ok_and(|value| value["ok"] == false)
 }
@@ -414,6 +427,9 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    advertise_file_control(&sender_state.agent, receiver_agent, receiver_machine);
+    advertise_file_control(&receiver_state.agent, sender_agent, sender_machine);
+
     let (warm_status, warm_body) = post_offer(
         sender_api,
         &sender_token,
@@ -437,6 +453,7 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
     // Accept travels receiver → sender. Empty the sender's authority and keep
     // the QUIC connection. The receiver can still address the sender.
     clear_peer_authority(&sender_state.agent, receiver_agent, receiver_machine).await;
+    advertise_file_control(&receiver_state.agent, sender_agent, sender_machine);
     assert!(
         sender_network.is_connected(&receiver_peer).await,
         "clearing sender authority must keep the raw connection"
@@ -460,6 +477,7 @@ async fn issue1102_raw_offer_from_unverified_sender_is_not_a_silent_success() {
         ))
         .await;
     clear_peer_authority(&receiver_state.agent, sender_agent, sender_machine).await;
+    advertise_file_control(&sender_state.agent, receiver_agent, receiver_machine);
     assert!(
         sender_network.is_connected(&receiver_peer).await,
         "clearing receiver authority must keep the raw connection"
