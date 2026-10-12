@@ -70,6 +70,9 @@ struct FakeState {
     reads: usize,
     /// After this many reads, each admission read takes this long.
     slow_reads_after: Option<(usize, Duration)>,
+    /// Peers that independent transport recovery admits again just after
+    /// one read has seen them not connected.
+    recover_after_loss: Vec<ant_quic::PeerId>,
 }
 
 /// A scripted saorsa-gossip transport that is also the admission source.
@@ -97,6 +100,12 @@ impl Fake {
     /// After `reads` fast admission reads, each read takes `took`.
     fn slow_reads_after(&self, reads: usize, took: Duration) {
         self.state.lock().unwrap().slow_reads_after = Some((reads, took));
+    }
+
+    /// The first read that sees `peer` not connected returns that, and then
+    /// independent transport recovery admits `peer` again (once).
+    fn recover_after_loss(&self, peer: ant_quic::PeerId) {
+        self.state.lock().unwrap().recover_after_loss.push(peer);
     }
 
     fn dials_to(&self, target: SocketAddr) -> Vec<Instant> {
@@ -147,12 +156,19 @@ impl SeedAdmission for Fake {
         if let Some(took) = slow {
             tokio::time::sleep(took).await;
         }
-        let state = self.state.lock().unwrap();
-        state
+        let mut state = self.state.lock().unwrap();
+        let verdict = state
             .verdicts
             .get(peer)
             .copied()
-            .unwrap_or(PeerAdmission::NotConnected)
+            .unwrap_or(PeerAdmission::NotConnected);
+        if verdict == PeerAdmission::NotConnected {
+            if let Some(at) = state.recover_after_loss.iter().position(|p| p == peer) {
+                state.recover_after_loss.remove(at);
+                state.verdicts.insert(*peer, PeerAdmission::Admitted);
+            }
+        }
+        verdict
     }
 }
 
@@ -1140,4 +1156,68 @@ async fn settle_stops_on_shutdown_during_a_slow_admission_read() {
     canceller.await.unwrap();
 
     assert_eq!(started.elapsed(), Duration::from_secs(1));
+}
+
+/// Codex re-review of bde6b2c, finding 1: a cooling admitted address does
+/// not block a ready admitted one. A answers and then loses its connection,
+/// so it waits its loss cooldown. Independent transport recovery admits A
+/// again during that cooldown. B is admitted and ready: B must go first,
+/// and A keeps its cooldown and its budget.
+#[tokio::test(start_paused = true)]
+async fn a_ready_admitted_address_goes_before_a_cooling_one() {
+    let fake = fake();
+    fake.set(peer(1), PeerAdmission::Admitted);
+    fake.set(peer(2), PeerAdmission::Admitted);
+    fake.plan_dials(
+        addr(1),
+        vec![
+            FakeDial::Answer(Duration::ZERO, peer(1), Some(PeerAdmission::NotConnected)),
+            FakeDial::Answer(Duration::ZERO, peer(1), None),
+        ],
+    );
+    fake.recover_after_loss(peer(1));
+    fake.plan_dials(
+        addr(2),
+        vec![FakeDial::Answer(Duration::ZERO, peer(2), None)],
+    );
+    let membership = membership(&fake);
+    let mut candidates = candidates(&[(addr(1), peer(1)), (addr(2), peer(2))]);
+    let started = Instant::now();
+
+    let outcome = join(
+        &mut candidates,
+        &fake,
+        &membership,
+        &CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(outcome, JoinOutcome::Joined(addr(2)));
+    assert_eq!(
+        fake.dials_to(addr(1)).len(),
+        1,
+        "A waits for its loss cooldown"
+    );
+    assert_eq!(fake.dials_to(addr(2)), vec![started], "B goes at once");
+    assert_eq!(fake.sends_to(peer(1)), 0);
+    assert_eq!(candidates.ledger.attempts(addr(1)), 1, "A keeps its budget");
+    assert!(
+        candidates
+            .ledger
+            .ready_at(addr(1))
+            .is_some_and(|at| at > Instant::now()),
+        "A keeps its cooldown"
+    );
+}
+
+/// Codex re-review of bde6b2c, finding 2: the phase count is `None` after
+/// shutdown began, even when there is no candidate to read.
+#[tokio::test(start_paused = true)]
+async fn the_phase_count_is_none_after_shutdown_with_no_candidates() {
+    let fake = fake();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let mut candidates = JoinCandidates::default();
+
+    assert_eq!(candidates.usable(fake.as_ref(), &shutdown).await, None);
 }

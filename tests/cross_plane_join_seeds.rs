@@ -188,6 +188,12 @@ static RECONNECT_GATE: Gate = Gate::new("proactive reconnect attempt");
 /// disconnects a cross-plane peer.
 static PLANE_REFUSAL_GATE: Gate =
     Gate::new("gossip-plane mismatch: refusing cross-plane peer (issue #206)");
+/// `join_network` Phase 0 logs this after its cache read, before it starts
+/// its dials.
+static PHASE0_START_GATE: Gate = Gate::new("Phase 0: Trying");
+/// `join_network` Phase 1 logs this after its phase count and its cache
+/// read, before it starts its dials.
+static PHASE1_START_GATE: Gate = Gate::new("Phase 1: Trying");
 
 /// `NetworkNode::connect_addr_with_origin` logs this (target
 /// `x0x::connect`, debug) when an address dial starts, with the address in
@@ -279,6 +285,8 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
         JOIN_COMPLETE_GATE.pass(&visitor.message);
         RECONNECT_GATE.pass(&visitor.message);
         PLANE_REFUSAL_GATE.pass(&visitor.message);
+        PHASE0_START_GATE.pass(&visitor.message);
+        PHASE1_START_GATE.pass(&visitor.message);
     }
 }
 
@@ -1258,4 +1266,135 @@ async fn issue1321_admitted_seed_with_late_refusals_waits_for_the_bootstrap_fall
         );
     }
     drop(silent);
+}
+
+/// Codex re-review of bde6b2c, finding 2. The normal bootstrap phase (not
+/// the fallback) has started its dial to an address that never answers (a
+/// silent UDP socket). Shutdown begins while that dial is in flight. The
+/// dial batch and its retry sleeps (10 s and 15 s) must stop on the shutdown
+/// token. At bde6b2c the normal phases had no token, so the join ran the
+/// whole schedule (three dials of up to 15 s and both sleeps).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_shutdown_stops_an_in_flight_normal_bootstrap_dial() {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let prod = Arc::new(
+        build_agent_with_bootstrap(dir.path(), "prod", Some(PROD_PLANE), vec![silent_addr]).await,
+    );
+    let join = spawn_join(&prod);
+
+    let dial_deadline = tokio::time::Instant::now() + JOIN_BOUND;
+    while dials_started_to(silent_addr) == 0 {
+        assert!(
+            tokio::time::Instant::now() < dial_deadline,
+            "scenario: the normal bootstrap phase must start its dial"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    prod.begin_shutdown();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, join).await;
+
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "after shutdown began, the normal bootstrap dial batch and its retry \
+         sleeps must stop: join_network must return within \
+         {SHUTDOWN_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_eq!(
+        dials_started_to(silent_addr),
+        1,
+        "no retry round may start after shutdown began"
+    );
+    drop(silent);
+}
+
+/// The count/start race of Codex's re-review of bde6b2c, finding 2. The
+/// only cached peer is at an address that never answers (a silent UDP
+/// socket); Phase 0 and Phase 1 both select it. `gate` holds the join after
+/// one phase's cache read, just before that phase starts its dials. Then
+/// shutdown begins and the gate opens.
+async fn shutdown_at_phase_start(gate: &'static Gate) -> PhaseStartShutdown {
+    install_join_capture();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let prod = Arc::new(build_agent(dir.path(), "prod", Some(PROD_PLANE)).await);
+    cache_peer(&prod, ant_quic::PeerId([0x51; 32]), silent_addr).await;
+
+    gate.arm();
+    let join = spawn_join(&prod);
+    assert!(
+        gate.wait_held(1, JOIN_BOUND).await,
+        "scenario: the phase must reach the start of its dials"
+    );
+    prod.begin_shutdown();
+    gate.open();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, join)
+        .await
+        .ok()
+        .map(|joined| joined.expect("join task"));
+    PhaseStartShutdown {
+        joined,
+        silent_addr,
+        _silent: silent,
+        _prod: prod,
+        _dir: dir,
+    }
+}
+
+/// The result of [`shutdown_at_phase_start`].
+struct PhaseStartShutdown {
+    /// The join's result; `None` when it did not return within
+    /// [`SHUTDOWN_JOIN_BOUND`].
+    joined: Option<x0x::error::Result<()>>,
+    silent_addr: SocketAddr,
+    _silent: std::net::UdpSocket,
+    _prod: Arc<Agent>,
+    _dir: tempfile::TempDir,
+}
+
+/// Codex re-review of bde6b2c, finding 2: Phase 0 checks the token after
+/// its cache read. Shutdown begins just before Phase 0 starts its dials.
+/// It must start no dial, and the join must return at once. At bde6b2c
+/// Phase 0 had no token, so it dialled the silent address and waited up to
+/// its 15 s dial timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_shutdown_at_the_start_of_phase0_starts_no_dial() {
+    let run = shutdown_at_phase_start(&PHASE0_START_GATE).await;
+    assert!(
+        matches!(run.joined, Some(Ok(()))),
+        "after shutdown began, Phase 0 must start no dial: join_network must \
+         return within {SHUTDOWN_JOIN_BOUND:?}: {:?}",
+        run.joined
+    );
+    assert_eq!(
+        dials_started_to(run.silent_addr),
+        0,
+        "Phase 0 started a dial"
+    );
+}
+
+/// Codex re-review of bde6b2c, finding 2 (a count/start race). Phase 0
+/// dials the silent address and fails. Shutdown begins after the Phase 1
+/// count and its cache read, just before Phase 1 starts its dials. Phase 1
+/// must start no dial, and the join must return at once. (A Phase 1 dial
+/// goes by peer id and logs no address dial, so the oracle is the time.)
+/// At bde6b2c Phase 1 had no token, so it dialled the cached peer and
+/// waited up to its 15 s dial timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_shutdown_between_the_phase1_count_and_its_dials_starts_no_dial() {
+    let run = shutdown_at_phase_start(&PHASE1_START_GATE).await;
+    assert!(
+        matches!(run.joined, Some(Ok(()))),
+        "after shutdown began, Phase 1 must start no dial: join_network must \
+         return within {SHUTDOWN_JOIN_BOUND:?}: {:?}",
+        run.joined
+    );
+    assert_eq!(
+        dials_started_to(run.silent_addr),
+        1,
+        "scenario: only Phase 0 dialled the silent address"
+    );
 }
