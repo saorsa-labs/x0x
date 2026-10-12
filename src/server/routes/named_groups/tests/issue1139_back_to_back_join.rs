@@ -1839,10 +1839,51 @@ async fn wa_stuck_keyless(s: &BackToBack) -> Result<WaJoin> {
     wa_fresh_invite_round_trip(s).await
 }
 
+/// #1162 (Greptile issue 3): the authority's published `MemberRemoved` for
+/// `member_hex`. Errors visibly when nothing was published — the
+/// delivered-removal leg must never degrade silently to the undelivered
+/// path.
+fn wa_published_member_removed(
+    authority: &Arc<AppState>,
+    member_hex: &str,
+) -> Result<NamedGroupMetadataEvent> {
+    authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
+        .find(|e| {
+            matches!(
+                e,
+                NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == member_hex
+            )
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the authority published no MemberRemoved for {member_hex}; the \
+                 removal-delivery leg would be silently skipped (#1162)"
+            )
+        })
+}
+
+/// What the owner-removal flow left behind (#1162): never a silent skip.
+struct WaRemoval {
+    /// J2's local state after the removal flow.
+    after: &'static str,
+    /// `Some(accepted)` — the verdict of J2's REAL apply — when the removal
+    /// was delivered; `None` when it was not (the offline leg).
+    applied: Option<bool>,
+}
+
 /// The owner removes J2 (`x0x group remove-member <group> <agent>` =
 /// `DELETE /groups/:id/members/:agent_id`); optionally the resulting
-/// MemberRemoved reaches J2. Returns J2's local state afterwards.
-async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<&'static str> {
+/// MemberRemoved reaches J2. Delivered, the event MUST be found and is put
+/// through J2's real apply, whose verdict is returned — the delivered leg
+/// completes or errors visibly, never silently degrades to the undelivered
+/// path (#1162, Greptile issue 3).
+async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<WaRemoval> {
     let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
     s._authority
         .named_group_test_recorders
@@ -1862,21 +1903,19 @@ async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<&'static s
         String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
             .to_string();
     anyhow::ensure!(status.is_success(), "owner remove-member: {status} {body}");
+    let mut applied = None;
     if deliver {
-        let removed = s
-            ._authority
-            .named_group_test_recorders
-            .publish_bytes
-            .lock()
-            .expect("publish hook")
-            .iter()
-            .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
-            .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == j2_hex));
-        if let Some(event) = removed {
-            apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
-        }
+        let event = wa_published_member_removed(&s._authority, &j2_hex)?;
+        applied = Some(
+            apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None)
+                .await
+                .accepted,
+        );
     }
-    Ok(wa_state(&s.j2, &s.group_key).await)
+    Ok(WaRemoval {
+        after: wa_state(&s.j2, &s.group_key).await,
+        applied,
+    })
 }
 
 /// A new daemon on the joiner's data directory, with the same agent key.
@@ -1955,20 +1994,43 @@ async fn d39_not_member_remove_reinvite(deliver_removal: bool) -> Result<(String
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     wa_stuck_not_member(&s).await?;
-    let after_removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    let removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    // #1162: pin each leg's outcome. Delivered, the stuck remnant's real
+    // apply REJECTS the removal: its chain is one commit behind (its own
+    // seat, which it never applied), so the removal commit's
+    // prev_state_hash cannot match, and TreeKEM gap adoption is
+    // deliberately excluded (`try_adopt_member_added_across_gap`). The row
+    // stays `not_member` and the fresh invite below is the documented
+    // remedy (#1148). If delivery ever starts applying cleanly, flip the
+    // pin to `Some(true)` and `after == "no_row"` (the self-removal apply
+    // drops the row).
+    let expected_applied = if deliver_removal { Some(false) } else { None };
+    anyhow::ensure!(
+        removal.applied == expected_applied,
+        "removal_delivered={deliver_removal}: unexpected apply verdict {:?}",
+        removal.applied
+    );
+    anyhow::ensure!(
+        removal.after == "not_member",
+        "removal_delivered={deliver_removal}: expected the remnant kept, found {}",
+        removal.after
+    );
     let r = wa_fresh_invite_round_trip(&s).await?;
     Ok((
         format!(
-            "from=not_member removal_delivered={deliver_removal} j2_after_removal={after_removal}"
+            "from=not_member removal_delivered={deliver_removal} \
+             j2_after_removal={} j2_apply_accepted={:?}",
+            removal.after, removal.applied
         ),
         r,
     ))
 }
 
 /// D39(A): stuck `not_member` → the owner removes the device (the removal
-/// reaches it) → fresh invite → `active` WITH keys. Red on eb4c6b7: the
-/// leftover row answered the invite `ok:true, join_state:"not_member"` and
-/// started no attempt.
+/// reaches it; #1162 pins that the remnant's real apply REJECTS it on the
+/// chain gap — see `d39_not_member_remove_reinvite`) → fresh invite →
+/// `active` WITH keys. Red on eb4c6b7: the leftover row answered the invite
+/// `ok:true, join_state:"not_member"` and started no attempt.
 #[tokio::test]
 async fn d39_a_not_member_owner_removes_delivered_then_fresh_invite_recovers_keys() -> Result<()> {
     let (ctx, r) = d39_not_member_remove_reinvite(true).await?;
@@ -1983,6 +2045,21 @@ async fn d39_a_not_member_owner_removes_undelivered_then_fresh_invite_recovers_k
 {
     let (ctx, r) = d39_not_member_remove_reinvite(false).await?;
     wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+/// #1162 (Greptile issue 3): the delivered-removal leg fails loudly when
+/// the authority published nothing — the silent skip that let the delivered
+/// case pass through the undelivered path is gone.
+#[tokio::test]
+async fn d39_a_delivered_removal_errors_loudly_when_nothing_was_published() -> Result<()> {
+    let (authority, _dir) = secure_endpoint_test_state().await?;
+    let err = wa_published_member_removed(&authority, &"22".repeat(32))
+        .expect_err("an empty publish hook must be a visible error");
+    assert!(
+        err.to_string().contains("MemberRemoved"),
+        "the error must name the missing removal: {err}"
+    );
     Ok(())
 }
 
@@ -2012,9 +2089,14 @@ async fn d39_a_not_member_restart_then_fresh_invite_recovers_keys() -> Result<()
     );
     let after_removal = wa_owner_removes_j2(&s, false).await?;
     assert_eq!(
+        after_removal.applied, None,
+        "the offline leg delivers nothing to the live joiner"
+    );
+    assert_eq!(
         wa_state(&reopened, &s.group_key).await,
         "not_member",
-        "the reopened row stays not_member when the removal is not delivered (live was {after_removal})"
+        "the reopened row stays not_member when the removal is not delivered (live was {})",
+        after_removal.after
     );
     let r = wa_fresh_invite_round_trip_on(&s, &reopened).await?;
     // `status` and `body` are the route's response, captured before the
@@ -2037,7 +2119,10 @@ async fn d39_a_not_member_restart_then_fresh_invite_recovers_keys() -> Result<()
         "fresh-invite route, before recovery: {r}"
     );
     wa_assert_recovered(
-        &format!("restarted not_member, live_after_removal={after_removal}"),
+        &format!(
+            "restarted not_member, live_after_removal={}",
+            after_removal.after
+        ),
         &r,
     );
     Ok(())
@@ -2238,7 +2323,13 @@ async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys()
     assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
     let after_removal = wa_owner_removes_j2(&s, true).await?;
     let r = wa_fresh_invite_round_trip(&s).await?;
-    wa_assert_recovered(&format!("shape B, j2_after_removal={after_removal}"), &r);
+    wa_assert_recovered(
+        &format!(
+            "shape B, j2_after_removal={} j2_apply_accepted={:?}",
+            after_removal.after, after_removal.applied
+        ),
+        &r,
+    );
     Ok(())
 }
 
