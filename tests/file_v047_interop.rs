@@ -1,9 +1,14 @@
 //! Both-direction file transfer against the pinned v0.47.0 daemon.
 //!
-//! The peer is tag `57ca3866a816f73cd7df55024c15d3ad8f0f29db`. It does not
-//! advertise `file_control_ack_v1` and it does not send `file-control-ack`.
-//! A stored offer must still count as success. Accept must finish with the
-//! same bytes. Reject must complete on both sides.
+//! The peer is commit `57ca3866a816f73cd7df55024c15d3ad8f0f29db`, the
+//! published `v0.47.0` `x0xd`. It does not advertise `file_control_ack_v1`
+//! and it does not send `file-control-ack`. A stored offer must still count
+//! as success. Accept must finish with the same bytes. Reject must complete
+//! on both sides.
+//!
+//! The daemon is installed by `scripts/ci/prepare-v047-pinned.sh` before the
+//! loopback-only test namespace starts. A shallow checkout has no git object
+//! for that commit, and the namespace has no route that could fetch one.
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -49,31 +54,34 @@ fn pinned_v047_bin() -> PathBuf {
         );
         return path;
     }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cached = manifest.join("target/v047-pinned/x0xd");
-    if cached.is_file() {
-        return cached;
-    }
-    let src = manifest.join("target/v047-src");
-    if !src.join("Cargo.toml").is_file() {
-        let status = Command::new("git")
-            .args(["worktree", "add", "--detach"])
-            .arg(&src)
-            .arg(V047_TAG)
-            .current_dir(&manifest)
-            .status()
-            .expect("git worktree");
-        assert!(status.success(), "git worktree add {V047_TAG} failed");
-    }
-    let status = Command::new("cargo")
-        .args(["build", "--offline", "--locked", "--bin", "x0xd"])
-        .current_dir(&src)
-        .env("CARGO_BUILD_JOBS", "1")
-        .status()
-        .expect("cargo build pinned x0xd");
-    assert!(status.success(), "pinned v0.47.0 x0xd failed to build");
-    fs::create_dir_all(cached.parent().expect("cache parent")).expect("cache dir");
-    fs::copy(src.join("target/debug/x0xd"), &cached).expect("copy pinned x0xd");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/v047-pinned");
+    let cached = dir.join("x0xd");
+    let provenance_path = dir.join("build-provenance.json");
+    let provenance_text = fs::read_to_string(&provenance_path).unwrap_or_else(|error| {
+        panic!(
+            "pinned v0.47.0 daemon is not prepared ({}, {error}). \
+             Run scripts/ci/prepare-v047-pinned.sh before the isolated test run.",
+            provenance_path.display()
+        )
+    });
+    let provenance: Value = serde_json::from_str(&provenance_text).expect("pinned provenance");
+    assert_eq!(
+        provenance["source_head"].as_str(),
+        Some(V047_TAG),
+        "pinned daemon was not built from {V047_TAG}"
+    );
+    let expected = provenance["binaries"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["file"] == "x0xd"))
+        .and_then(|row| row["sha256"].as_str())
+        .expect("provenance x0xd sha256");
+    let bytes = fs::read(&cached)
+        .unwrap_or_else(|error| panic!("read pinned x0xd {}: {error}", cached.display()));
+    assert_eq!(
+        sha_hex(&bytes),
+        expected,
+        "pinned x0xd does not match its provenance"
+    );
     cached
 }
 
