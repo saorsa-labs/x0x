@@ -17,7 +17,7 @@ Without an answer, an efficiency decision must claim a loose R. For example, "fe
 Two risks need guards:
 
 1. The efficiency changes that need a decision are usually trade-offs. Examples are the cadence change from 300 s to 600 s in v0.39.10, the storm-control validators, and pruning or deferring traffic.
-2. Efficiency measurements in this project have been wrong before. A benchmark artifact showed a false 3x regression. A cumulative counter showed a false 50x regression.
+2. Efficiency measurements in this project have been wrong before. A benchmark that did not prove its path ran, and a cumulative-counter baseline, each showed a false regression. E-D15 rule 15 now forbids both methods.
 
 ## Decision
 
@@ -27,15 +27,15 @@ Goal E counts in place of an R under rule 5 when the change keeps the wire forma
 
 1. **Scope test.** Check four surfaces: the wire format, the API, the stored format and the dependencies. If one of them changes, goal E alone is not enough. Name an R. You can name goal E as related.
 2. **Delivery.** Attach the rule-21 delivered and published matrix. Own-origin, inbox, targeted and revocation classes stay at 100%. No pair falls below the baseline.
-3. **Target.** The Proposed record states the target gain and the measurement plan.
-4. **Measurement.** The result meets E-D15 rule 15. Measure on a sealed eph mesh, with at least 5 deploys per arm. Use histograms, not means. p90 needs at least 30 samples, and p95 needs at least 60. Public-mesh rows never gate. Collect evidence at the shipped default log level.
+3. **Target.** The Proposed record states the target gain. It should also say how the gain will be measured.
+4. **Measurement.** The result meets E-D15 rule 15, with the scope that rule 15 gives. For example, gating rates need at least 5 deploys per arm. p90 needs at least 30 samples, and p95 needs at least 60. Gates use histograms, not means. Public-mesh rows never gate. Evidence is collected at the shipped default log level. Measure first on a sealed, all-upgraded mesh (rule 14). Exact local tests and benchmarks that rule 15 does not restrict stay valid.
 5. **Lifecycle.** David accepts the record. It is Folded only after the measured result is attached. The other E-D15 rules apply to every PR, as before.
 
 ## Rejected options
 
 - **Goal E becomes R13.** If efficiency became a requirement in its own right, nearly every change could claim it. Rule 5 would stop filtering anything.
 - **Goal E stays a review only.** Efficiency decisions would then keep making loose R claims.
-- **"Behaviour stays the same."** This was the first wording. It excluded the trade-offs that need a decision. A change that keeps behaviour the same is a normal PR and needs no decision record.
+- **"Behaviour stays the same."** This was the first wording. It excluded the trade-offs that need a decision. This record does not change when a decision record is needed. ADR 0087 rule 8 still applies to every change.
 
 ## Consequences
 
