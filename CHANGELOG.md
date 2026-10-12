@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cached peer on another gossip plane no longer becomes a HyParView JOIN
+  seed (#1321).** `join_network` built the JOIN seeds from transport dial
+  results. A cached cross-plane peer passed the dial, the plane gate (#206)
+  refused it a moment later, and it still became a seed. The JOIN then
+  dialled it up to ten times (81.1 s of backoff plus up to 10.128 s of
+  jitter, plus the dial times) and the #292 gate refused every dial, so the
+  presence beacons and the first identity announcement started that much
+  later. (In `x0xd` the capability advert service also starts from the DM
+  inbox path, so it did not wait for the JOIN.)
+  - The JOIN frame now goes only to a dialled peer that `peer_admission`
+    (#292 invariant A) admits. A suppressed peer is dropped as a seed at
+    once.
+  - saorsa-gossip still drives the JOIN and owns its retry policy, frame
+    and side effects. x0x uses its new step API (`join_dial`, `join_send`,
+    one `JoinLedger` for the whole join; **needs saorsa-gossip 0.5.88**) and
+    checks admission between the dial and the JOIN frame. Each seed address
+    has one budget of ten attempts for the whole join. Only a failed dial
+    grows the dial backoff (100 ms doubling to at most 30 s, plus jitter); a
+    failed send, or a plane verdict still open after up to 12 s, allows the
+    next attempt at once.
+  - A peer that answers the dial and then loses its connection before
+    admission (for example, the remote refused us first) waits
+    saorsa-gossip's loss cooldown before the next attempt on that address:
+    100 ms, doubled after each loss up to 30 s, plus jitter (D252). It does
+    not reset when the peer answers again. Meanwhile a ready admitted
+    address goes first. Such a peer costs at most ten dials and nine
+    cooldowns (51.1 s plus up to 6.379 s of jitter; no cooldown follows the
+    tenth dial), and gets no JOIN.
+  - The phase counts for the join's minimum of three peers include only
+    peers that are still connected and not suppressed. When peers that
+    filled that minimum with an open plane verdict are refused later, the
+    join runs the cached-peer and bootstrap phases it skipped, before the
+    JOIN. This can add time even when one seed is admitted: for example,
+    with one admitted peer and two pending peers that are refused later,
+    the join first runs the skipped bootstrap phase (up to 70 s when the
+    bootstrap addresses do not answer), where the old code joined at once.
+    Each wait for open plane verdicts adds up to 12 s. The budgets before
+    the JOIN total 136 s (100 s of dial phases plus up to three 12 s verdict
+    waits); admission reads and scheduling come on top. The JOIN then costs
+    at most 91.228 s plus ten dial times and up to 12 s of admission wait
+    per attempt, per seed address that is not suppressed. These are
+    budgets, not a deadline for the whole call.
+  - After `begin_shutdown`, no phase, fallback phase or JOIN starts, and no
+    phase or spawned dial task starts a dial; a running dial batch of any
+    phase, its retry sleeps, the JOIN attempts and the admission reads stop.
+
+  - **Needs saorsa-gossip 0.5.88.** x0x now pins the whole saorsa-gossip
+    family at `=0.5.88`, the release that adds the step API (D257). The #501
+    meter producer premise moves to `saorsa-gossip-pubsub` 0.5.88, whose
+    sources are unchanged from 0.5.87 (see `docs/legacy-compat.md`).
+
+  The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
+  rollout too.
+
 ## [v0.47.1] - 2026-10-12
 
 A patch release. It contains durability fixes for named groups and share grants. It adds no breaking API change and no stored-format change.

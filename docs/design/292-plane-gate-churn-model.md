@@ -25,7 +25,29 @@ consult. A peer with a live `reconnect_suppressions` tombstone returns `Suppress
 what the ant-quic transport layer reports; a transient accept-to-close window or an in-flight
 dial answered mid-handshake cannot produce an `Admitted` verdict.
 
-**Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases)
+The HyParView JOIN seeds of `join_network` are such a consumer (#1321,
+`src/gossip/join_seeds.rs`). A dial that returned `Ok` is transport truth: the
+plane hello that can refuse the peer arrives after it. So the JOIN frame goes
+only to a dialled peer that `peer_admission` reports `Admitted`, and a
+`Suppressed` peer is dropped as a seed at once. The join's phase counts use the
+same predicate: a refused or disconnected peer does not count toward its
+minimum. The join waits (at most the plane legacy grace plus one hello retry)
+for open plane verdicts and compares the settled admitted count with that
+minimum; if peers that filled the minimum are refused later, it runs the phases
+it skipped. The fix changes only which peers can be seeds, not how long a seed
+is retried: saorsa-gossip drives each JOIN attempt through its step API
+(`HyParViewMembership::join_dial`, `join_send`, one `JoinLedger` per join;
+saorsa-gossip 0.5.88), with one budget per seed address for the whole join and
+its own backoff (it grows only after a failed dial). x0x chooses the candidate
+and, after a dial that answered, lets the JOIN frame go out only once the peer
+is `Admitted`; a peer that is not suppressed but not admitted yet (lost
+connection, open verdict) uses its attempts until then. After a lost
+connection, the next attempt on that address waits saorsa-gossip's loss
+cooldown (100 ms doubling to 30 s, with jitter; D252); meanwhile a ready
+admitted address goes first.
+
+**Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
+`tests/cross_plane_join_seeds.rs` (JOIN seeds)
 
 ### B — Per-frame gate drops suppressed-peer frames
 

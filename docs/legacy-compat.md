@@ -168,6 +168,26 @@ of the downloaded
 fixes available to x0x; it is not evidence that either delivery regression is
 fixed on the fleet. Runtime and fleet acceptance remain separate gates.
 
+## 2026-10-12 — meter producer premise moved to saorsa-gossip-pubsub 0.5.88
+
+x0x now requires the coherent **0.5.88** gossip family for #1321 (D257):
+saorsa-gossip 0.5.88 adds the step-by-step JOIN API in
+`saorsa-gossip-membership` (saorsa-gossip#111, ADR-015). The #501 meter
+producer premise (`src/legacy_bus_interop_tests.rs`,
+`scripts/ci/derive-legacy-bus-attempts.py` and its test) therefore moves from
+0.5.87 to **0.5.88**, checksum
+`accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097`. The
+0.5.87 package (checksum
+`d3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502`) is now an
+invalid fixture, as 0.5.86 is.
+
+The checksum is the one in `Cargo.lock` after the resolve, and it equals the
+SHA-256 of the downloaded `saorsa-gossip-pubsub-0.5.88.crate`. The 0.5.88
+pubsub `src/` tree is byte-identical to 0.5.87 (only the version fields in its
+`Cargo.toml` and its VCS commit differ), so the outbound meters,
+`wire_bytes_for_peer` and the key-cache `CONTROL_DOMAIN` are unchanged. The
+0.5.85–0.5.87 moves were made in code and commits only (0.5.87: #857).
+
 ## 2026-09-18 — meter producer premise moved to saorsa-gossip-pubsub 0.5.83
 
 saorsa-gossip 0.5.83 carries the #504 slice-2 Leaf egress work

@@ -12727,7 +12727,10 @@ impl Agent {
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
         let min_connected = 3;
-        let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
+        // x0x#1321: dial results with the answered peer ids. A dial that
+        // returned Ok is transport truth only; the plane gate (#206) and the
+        // #292 tombstones decide gossip admission after it.
+        let mut all_connected = gossip::join_seeds::JoinCandidates::default();
 
         // ant-quic now owns first-party mDNS discovery and auto-connect.
         // x0x keeps bootstrap/cache orchestration here, while the transport
@@ -12736,6 +12739,8 @@ impl Agent {
         // Phase 0: Try quality-scored coordinator peers from bootstrap cache.
         // The bootstrap cache learns about coordinator-capable peers passively
         // through normal connections — no coordinator gossip topic needed.
+        // x0x#1321: after shutdown began (also during the cache read), the
+        // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
@@ -12743,16 +12748,20 @@ impl Agent {
                 .flat_map(|peer| peer.preferred_addresses())
                 .collect();
 
-            if !coordinator_addrs.is_empty() {
+            if !coordinator_addrs.is_empty() && !self.shutdown_token.is_cancelled() {
                 tracing::info!(
                     "Phase 0: Trying {} addresses from {} cached coordinators",
                     coordinator_addrs.len(),
                     coordinators.len()
                 );
                 let (succeeded, _failed) = self
-                    .connect_peers_parallel_tracked(network, &coordinator_addrs)
+                    .connect_peers_parallel_tracked(
+                        network,
+                        &coordinator_addrs,
+                        &self.shutdown_token,
+                    )
                     .await;
-                all_connected.extend(&succeeded);
+                all_connected.extend(succeeded.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
                     succeeded.len(),
@@ -12761,78 +12770,42 @@ impl Agent {
             }
         }
 
+        // x0x#1321: the seed choice reads #292 admission from the node.
+        let node: &network::NetworkNode = network;
+
         // Phase 1: Try cached peers first using the real ant-quic peer IDs.
-        if all_connected.len() < min_connected {
-            if let Some(ref cache) = self.bootstrap_cache {
-                const PHASE1_PEER_CANDIDATES: usize = 12;
-                let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-                if !cached_peers.is_empty() {
-                    tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
-                    let (succeeded, _failed) = self
-                        .connect_cached_peers_parallel_tracked(network, &cached_peers)
-                        .await;
-                    all_connected.extend(&succeeded);
-                    tracing::info!(
-                        "Phase 1: {}/{} cached peers connected",
-                        succeeded.len(),
-                        cached_peers.len()
-                    );
-                }
-            }
-        } // end Phase 1 min_connected check
+        // x0x#1321: the phase counts re-read admission, so a peer that is
+        // already refused or disconnected does not fill min_connected. The
+        // count is `None` after shutdown began: then no phase starts. A
+        // phase that starts gets the shutdown token too, so a shutdown
+        // between the count and the dials (or during them) stops it.
+        let mut ran_phase1 = false;
+        if matches!(
+            all_connected.usable(node, &self.shutdown_token).await,
+            Some(usable) if usable < min_connected
+        ) {
+            ran_phase1 = true;
+            self.join_phase1_cached_peers(network, &mut all_connected, &self.shutdown_token)
+                .await;
+        }
 
         // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
         // This is the fallback for when coordinator cache and cached peers aren't enough.
-        if all_connected.len() < min_connected && !bootstrap_nodes.is_empty() {
-            let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
-                .iter()
-                .filter(|addr| !all_connected.contains(addr))
-                .copied()
-                .collect();
-
-            // Round 1: Connect to all bootstrap peers in parallel
-            let (succeeded, mut failed) = self
-                .connect_peers_parallel_tracked(network, &remaining)
-                .await;
-            all_connected.extend(&succeeded);
-            tracing::info!(
-                "Phase 2 round 1: {}/{} bootstrap peers connected",
-                succeeded.len(),
-                remaining.len()
-            );
-
-            // Retry rounds for failed peers
-            for round in 2..=3 {
-                if failed.is_empty() {
-                    break;
-                }
-                let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
-                tracing::info!(
-                    "Retrying {} failed peers in {}s (round {})",
-                    failed.len(),
-                    delay.as_secs(),
-                    round
-                );
-                tokio::time::sleep(delay).await;
-
-                let (succeeded, still_failed) =
-                    self.connect_peers_parallel_tracked(network, &failed).await;
-                all_connected.extend(&succeeded);
-                failed = still_failed;
-                tracing::info!(
-                    "Phase 2 round {}: {} total peers connected",
-                    round,
-                    all_connected.len()
-                );
-            }
-
-            if !failed.is_empty() {
-                tracing::warn!(
-                    "Could not connect to {} bootstrap peers: {:?}",
-                    failed.len(),
-                    failed
-                );
-            }
+        let mut ran_phase2 = false;
+        if !bootstrap_nodes.is_empty()
+            && matches!(
+                all_connected.usable(node, &self.shutdown_token).await,
+                Some(usable) if usable < min_connected
+            )
+        {
+            ran_phase2 = true;
+            self.join_phase2_bootstrap(
+                network,
+                &bootstrap_nodes,
+                &mut all_connected,
+                &self.shutdown_token,
+            )
+            .await;
         }
 
         tracing::info!(
@@ -12840,11 +12813,66 @@ impl Agent {
             all_connected.len()
         );
 
-        // Join the HyParView membership overlay via connected peers.
-        if let Some(ref runtime) = self.gossip_runtime {
-            let seeds: Vec<String> = all_connected.iter().map(|addr| addr.to_string()).collect();
-            if !seeds.is_empty() {
-                if let Err(e) = runtime.membership().join(seeds).await {
+        // x0x#1321: the counts above include peers whose plane verdict was
+        // still open. Settle those verdicts. If the settled admitted set is
+        // below min_connected, run each phase that an open verdict made the
+        // join skip. Each phase runs at most once per join. After shutdown
+        // began, no fallback phase starts, and a running one stops.
+        let shutdown = &self.shutdown_token;
+        let mut plan = all_connected.settle(node, min_connected, shutdown).await;
+        if plan.admitted_peers < min_connected && !ran_phase1 && !shutdown.is_cancelled() {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers after Phase 0; trying cached peers (issue #1321)"
+            );
+            self.join_phase1_cached_peers(network, &mut all_connected, shutdown)
+                .await;
+            plan = all_connected.settle(node, min_connected, shutdown).await;
+        }
+        if plan.admitted_peers < min_connected
+            && !ran_phase2
+            && !bootstrap_nodes.is_empty()
+            && !shutdown.is_cancelled()
+        {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers; trying bootstrap nodes (issue #1321)"
+            );
+            self.join_phase2_bootstrap(network, &bootstrap_nodes, &mut all_connected, shutdown)
+                .await;
+            plan = all_connected.settle(node, min_connected, shutdown).await;
+        }
+
+        // Join the HyParView membership overlay via gossip-admitted peers
+        // only (x0x#1321): a seed the plane gate refused or #292 suppressed
+        // can only make the JOIN retry it.
+        if shutdown.is_cancelled() {
+            tracing::info!(
+                target: "x0x::connect",
+                "shutdown began: skipping the HyParView JOIN (issue #1321)"
+            );
+        } else if let Some(ref runtime) = self.gossip_runtime {
+            all_connected.log_plan(&plan);
+            // x0x#1321 (D248): saorsa-gossip drives each JOIN attempt
+            // (`join_dial` / `join_send`, one `JoinLedger` for the whole
+            // join); x0x picks the candidate and checks admission between
+            // the dial and the JOIN frame.
+            match all_connected
+                .join_overlay(runtime.membership().as_ref(), node, shutdown)
+                .await
+            {
+                gossip::join_seeds::JoinOutcome::Joined(_)
+                | gossip::join_seeds::JoinOutcome::Cancelled => {}
+                gossip::join_seeds::JoinOutcome::NoSeed { attempts } => {
+                    if attempts > 0 {
+                        tracing::warn!(
+                            "HyParView membership join failed: JOIN: Failed to connect to any seed nodes"
+                        );
+                    }
+                }
+                gossip::join_seeds::JoinOutcome::Failed(e) => {
                     tracing::warn!("HyParView membership join failed: {e}");
                 }
             }
@@ -13305,26 +13333,181 @@ impl Agent {
         self.dm_capabilities_tx.borrow().clone()
     }
 
-    /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
+    /// `join_network` Phase 1: dial up to 12 cached peers by peer id and
+    /// record the dials that returned `Ok`. `stop` is the agent's shutdown
+    /// token (x0x#1321): after it is cancelled the phase starts no dial,
+    /// and a cancellation ends the dial batch at once.
+    async fn join_phase1_cached_peers(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        let Some(ref cache) = self.bootstrap_cache else {
+            return;
+        };
+        const PHASE1_PEER_CANDIDATES: usize = 12;
+        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        if cached_peers.is_empty() || stop.is_cancelled() {
+            return;
+        }
+        tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
+        let (succeeded, _failed) = self
+            .connect_cached_peers_parallel_tracked(network, &cached_peers, stop)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 1: {}/{} cached peers connected",
+            succeeded.len(),
+            cached_peers.len()
+        );
+    }
+
+    /// `join_network` Phase 2: dial the configured bootstrap nodes that this
+    /// join has not dialled yet, with two retry rounds for failed dials, and
+    /// record the dials that returned `Ok`. `stop` is the agent's shutdown
+    /// token (x0x#1321): after it is cancelled the phase starts no dial, and
+    /// a cancellation ends the dial batches and the retry sleeps at once.
+    async fn join_phase2_bootstrap(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        bootstrap_nodes: &[std::net::SocketAddr],
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        let stopped = || stop.is_cancelled();
+        if stopped() {
+            return;
+        }
+        let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
+            .iter()
+            .filter(|addr| !candidates.contains_addr(addr))
+            .copied()
+            .collect();
+
+        // Round 1: Connect to all bootstrap peers in parallel
+        let (succeeded, mut failed) = self
+            .connect_peers_parallel_tracked(network, &remaining, stop)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 2 round 1: {}/{} bootstrap peers connected",
+            succeeded.len(),
+            remaining.len()
+        );
+
+        // Retry rounds for failed peers
+        for round in 2..=3 {
+            if failed.is_empty() || stopped() {
+                break;
+            }
+            let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
+            tracing::info!(
+                "Retrying {} failed peers in {}s (round {})",
+                failed.len(),
+                delay.as_secs(),
+                round
+            );
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+
+            let (succeeded, still_failed) = self
+                .connect_peers_parallel_tracked(network, &failed, stop)
+                .await;
+            candidates.extend(succeeded.iter().copied());
+            failed = still_failed;
+            tracing::info!(
+                "Phase 2 round {}: {} total peers connected",
+                round,
+                candidates.len()
+            );
+        }
+
+        if !failed.is_empty() && !stopped() {
+            tracing::warn!(
+                "Could not connect to {} bootstrap peers: {:?}",
+                failed.len(),
+                failed
+            );
+        }
+    }
+
+    /// Await the dial tasks of one `join_network` batch, in order. A
+    /// cancellation of `stop` aborts every task that has not finished and
+    /// ends the batch at once; it goes first when a result is also ready.
+    async fn collect_join_dials<S, F>(
+        handles: Vec<tokio::task::JoinHandle<Result<S, F>>>,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (Vec<S>, Vec<F>) {
+        let aborts: Vec<tokio::task::AbortHandle> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            let joined = tokio::select! {
+                biased;
+                () = stop.cancelled() => {
+                    for abort in aborts.iter().skip(index) {
+                        abort.abort();
+                    }
+                    break;
+                }
+                joined = handle => joined,
+            };
+            match joined {
+                Ok(Ok(dialled)) => succeeded.push(dialled),
+                Ok(Err(failure)) => failed.push(failure),
+                Err(e) => tracing::error!("Connection task panicked: {}", e),
+            }
+        }
+        (succeeded, failed)
+    }
+
+    /// Connect to cached peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, peer id)`; `connect_cached_peer` returns
+    /// `Ok` only for the requested, authenticated peer. After `stop` is
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_cached_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         peers: &[ant_quic::CachedPeer],
-    ) -> (Vec<std::net::SocketAddr>, Vec<ant_quic::PeerId>) {
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<ant_quic::PeerId>,
+    ) {
         use tokio::time::{timeout, Duration};
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+        if stop.is_cancelled() {
+            return (Vec::new(), Vec::new());
+        }
 
         let handles: Vec<_> = peers
             .iter()
             .map(|peer| {
                 let net = network.clone();
                 let peer_id = peer.peer_id;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to cached peer: {:?}", peer_id);
-                    match timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)).await {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(peer_id),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)) => dialled,
+                    };
+                    match dialled {
                         Ok(Ok(addr)) => {
                             tracing::info!("Connected to cached peer {:?} at {}", peer_id, addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to cached peer {:?}: {}", peer_id, e);
@@ -13343,41 +13526,51 @@ impl Agent {
             })
             .collect();
 
-        let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
-                Ok(Err(peer_id)) => failed.push(peer_id),
-                Err(e) => tracing::error!("Connection task panicked: {}", e),
-            }
-        }
-        (succeeded, failed)
+        Self::collect_join_dials(handles, stop).await
     }
 
-    /// Connect to multiple peers in parallel, returning (succeeded, failed) address lists.
+    /// Connect to multiple peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, answered peer id)`. After `stop` is
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         addrs: &[std::net::SocketAddr],
-    ) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<std::net::SocketAddr>,
+    ) {
         use tokio::time::{timeout, Duration};
 
         // Per-connection timeout prevents hanging when connecting to
         // ourselves or to unreachable addresses.
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+        if stop.is_cancelled() {
+            return (Vec::new(), Vec::new());
+        }
+
         let handles: Vec<_> = addrs
             .iter()
             .map(|addr| {
                 let net = network.clone();
                 let addr = *addr;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
-                    match timeout(CONNECT_TIMEOUT, net.connect_addr(addr)).await {
-                        Ok(Ok(_)) => {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(addr),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_addr(addr)) => dialled,
+                    };
+                    match dialled {
+                        Ok(Ok(peer_id)) => {
                             tracing::info!("Connected to peer: {}", addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to {}: {}", addr, e);
@@ -13396,16 +13589,7 @@ impl Agent {
             })
             .collect();
 
-        let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
-                Ok(Err(addr)) => failed.push(addr),
-                Err(e) => tracing::error!("Connection task panicked: {}", e),
-            }
-        }
-        (succeeded, failed)
+        Self::collect_join_dials(handles, stop).await
     }
 
     /// Subscribe to messages on a given topic.

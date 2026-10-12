@@ -1413,7 +1413,7 @@ pub const MAX_PLANE_ID_LEN: usize = 64;
 /// after this elapses. New-code cross-plane peers present a mismatched hello
 /// within milliseconds of connecting, long before grace expiry, so the grace
 /// only ever gates truly legacy peers.
-const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a successful plane verification stays trusted across connection
 /// generations (issue #206). Connection churn (mutual-dial supersedes,
@@ -1432,7 +1432,7 @@ const PLANE_REVERIFY_TTL: Duration = Duration::from_secs(600);
 /// cross-plane peer as legacy. Retrying every 2s gives ~4 further chances
 /// inside the grace window, so legacy admission is reserved for peers that
 /// genuinely never speak the hello protocol.
-const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Per-peer gossip-plane state, tracked only when plane isolation is
 /// configured (`NetworkConfig::network_id` is `Some`).
