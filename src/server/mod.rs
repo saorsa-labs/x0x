@@ -2125,6 +2125,16 @@ pub async fn serve_with_options(
         state.agent.subscribe_direct(),
     )));
 
+    // ADR 0014 / ADR 0016: a self-leave that landed while this daemon was
+    // offline still has the leaver's ratchet leaf. The lowest active admin
+    // commits that removal on this online pass.
+    {
+        let rekey_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            routes::named_groups::rekey_outstanding_treekem_self_leaves(&rekey_state).await;
+        }));
+    }
+
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
     // handles the same signed message when the sender additionally direct-
