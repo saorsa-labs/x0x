@@ -248,3 +248,14 @@ ask before the next release rather than re-saving it into a private space.
   as your own notes until this is fixed. Do not switch a space to public in
   order to share pages — it does not share them, and it makes them readable by
   anyone.
+
+## 7) A secure group refuses to send after a storage error or a downgrade [working]
+
+Since v0.47.1, a TreeKEM secure group refuses a send (HTTP 500) when it cannot keep its recovery journal (`<gid>.journal`) in step with its snapshot. This is deliberate: it stops a restart from loading an older group state than the one the daemon used (GHSA-63j6-cch7-w9h4). The group's data stays intact.
+
+Two cases can keep a group in this state:
+
+- **The binary was downgraded.** A journal that a newer x0xd wrote has a format that an older x0xd cannot read. The older binary ignores that journal at startup, but it refuses every send to that group. Upgrade back to the binary that wrote the journal. A later journaled change to the group, or removing the group, also clears it.
+- **A power loss reverted a change that had not reached disk.** If a group change was in place but not yet durable, and the next change's journal replaced the earlier journal, the restart cannot repair that group. The group then stays unavailable. Share the group again from a member that still has it.
+
+Do not delete `<gid>.journal` or `<gid>.snap` files by hand. Check the daemon log for the storage error (a failed fsync, a full disk, or an I/O error) and fix the disk first.
