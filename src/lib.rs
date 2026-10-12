@@ -12838,12 +12838,14 @@ impl Agent {
             );
         } else if let Some(ref runtime) = self.gossip_runtime {
             all_connected.log_plan(&plan);
-            // x0x#1321: x0x runs the old JOIN loop itself, attempt by
-            // attempt, so the admission check sits between the dial and the
-            // JOIN frame and each address keeps one old retry budget for the
-            // whole join.
-            let overlay = gossip::join_seeds::OverlayJoin::new(node, runtime.membership());
-            match all_connected.join_overlay(&overlay, shutdown).await {
+            // x0x#1321 (D248): saorsa-gossip drives each JOIN attempt
+            // (`join_dial` / `join_send`, one `JoinLedger` for the whole
+            // join); x0x picks the candidate and checks admission between
+            // the dial and the JOIN frame.
+            match all_connected
+                .join_overlay(runtime.membership().as_ref(), node, shutdown)
+                .await
+            {
                 gossip::join_seeds::JoinOutcome::Joined(_)
                 | gossip::join_seeds::JoinOutcome::Cancelled => {}
                 gossip::join_seeds::JoinOutcome::NoSeed { attempts } => {

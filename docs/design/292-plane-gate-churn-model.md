@@ -35,11 +35,12 @@ minimum. The join waits (at most the plane legacy grace plus one hello retry)
 for open plane verdicts and compares the settled admitted count with that
 minimum; if peers that filled the minimum are refused later, it runs the phases
 it skipped. The fix changes only which peers can be seeds, not how long a seed
-is retried: x0x runs the loop of saorsa-gossip `HyParViewMembership::join`
-itself, with one budget per seed address for the whole join (ten attempts, each
-one awaited `dial_bootstrap`, backoff 100 ms doubling to at most 30 s, plus the
-same jitter). After a dial that answered, the JOIN frame goes out only once the
-peer is `Admitted`; a peer that is not suppressed but not admitted yet (lost
+is retried: saorsa-gossip drives each JOIN attempt through its step API
+(`HyParViewMembership::join_dial`, `join_send`, one `JoinLedger` per join;
+saorsa-gossip 0.5.88), with one budget per seed address for the whole join and
+its own backoff (it grows only after a failed dial). x0x chooses the candidate
+and, after a dial that answered, lets the JOIN frame go out only once the peer
+is `Admitted`; a peer that is not suppressed but not admitted yet (lost
 connection, open verdict) uses its attempts until then.
 
 **Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
