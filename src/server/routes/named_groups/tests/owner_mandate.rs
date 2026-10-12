@@ -3791,3 +3791,71 @@ async fn replaced_not_durable_queued_replay_withholds_the_notification_759() -> 
     assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn issue1103_mandate_does_not_publish_a_failed_clear() -> Result<()> {
+    for fault in [SaveFault::Error, SaveFault::NotReplaced] {
+        let (state, _dir, owner_kp, group_id, joiner_hex, pre_seal, cert) =
+            receiver_stage().await?;
+        let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let terminal =
+            terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+        let mandate = mint_mandate_like_authority(
+            &pre_seal,
+            None,
+            0,
+            &joiner_hex,
+            &actor_hex,
+            "issue1103-invite",
+            &cert,
+            &owner_kp,
+            1_500,
+        );
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("receiver");
+            let header = info.terminal_commit_header();
+            info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                revision: terminal.revision - 1,
+                state_hash: "issue1103-conflict".to_string(),
+                committed_by: actor_hex.clone(),
+                observed_at_ms: now_millis_u64(),
+                snapshot: x0x::groups::ForkSnapshot {
+                    terminal_commit: header.clone(),
+                    conflicting_commit: header,
+                    classification: None,
+                },
+                no_anchor: false,
+            });
+        }
+        assert_eq!(
+            persist_named_groups_mutation(&state, |_| true).await?,
+            AtomicWriteOutcome::Durable
+        );
+        let event = member_added_event(
+            &group_id,
+            terminal.revision,
+            &actor_hex,
+            &joiner_hex,
+            &cert,
+            terminal,
+            Some(mandate),
+        );
+        let task_state = Arc::clone(&state);
+        let result = super::fork_quarantine::fail_clear_before_publication(
+            &state,
+            &group_id,
+            0,
+            fault,
+            async move { apply_event(&task_state, event).await },
+        )
+        .await?;
+        assert!(!result.accepted);
+        let groups = state.named_groups.read().await;
+        assert!(!groups[&group_id].has_active_member(&joiner_hex));
+        drop(groups);
+        let row = diag_row(&state, &group_id).await;
+        assert_eq!(row.counters.fork_quarantine_owner_anchored_clears, 0);
+    }
+    Ok(())
+}

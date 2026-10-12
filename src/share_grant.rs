@@ -179,8 +179,64 @@ pub enum ShareGrantError {
     #[error("a different share grant with this id is already held")]
     Conflict,
     /// The store is full, unreadable, or could not be written.
+    ///
+    /// It is also the error of a poisoned store (issue #1101): a durable
+    /// write crossed the atomic rename but could not be synced. Then the
+    /// new state IS on disk and memory matches it, but the store refuses
+    /// further writes until a fresh load.
+    /// [`ShareGrantStore::poisoned_reason`] tells this case apart.
     #[error("share grant store: {0}")]
     Store(String),
+}
+
+/// The refusals of a poisoned grant store (issue #1101). They reuse
+/// [`ShareGrantError::Store`], so the public enum gets no new variant in a
+/// patch release, and the HTTP mapping stays 503.
+///
+/// This write crossed the rename but its directory sync failed: the grant
+/// is applied and held, but not confirmed durable.
+fn poisoned_by_this_write(reason: &str) -> ShareGrantError {
+    ShareGrantError::Store(format!(
+        "poisoned (state replaced but not durable): {reason}"
+    ))
+}
+
+/// An earlier write poisoned the store. `held` says whether this exact
+/// grant is in memory (for example, a sender retry of the grant whose
+/// write poisoned the store). A refusal never says a held grant is absent,
+/// and never says an absent grant was applied (#1322 review P3).
+fn poisoned_by_earlier_write(reason: &str, held: bool) -> ShareGrantError {
+    ShareGrantError::Store(if held {
+        format!(
+            "poisoned: this grant is held, but the store refuses writes because an \
+             earlier write is not confirmed durable ({reason})"
+        )
+    } else {
+        format!(
+            "poisoned: this grant is refused and not stored, because an earlier write \
+             is not confirmed durable ({reason})"
+        )
+    })
+}
+
+/// A refused store or outbox write, with whether its state is still held
+/// (issue #1101, #1322 review P3). `held` is true when the change is in
+/// memory and in the file but not confirmed durable. Callers use it so
+/// that they never describe held state as absent. Crate-private: the
+/// public `accept` and `enqueue` keep their error types.
+#[derive(Debug)]
+pub(crate) struct WriteRefusal<E> {
+    /// The public error.
+    pub(crate) error: E,
+    /// The refused change is held in memory (and in the file).
+    pub(crate) held: bool,
+}
+
+impl<E> From<E> for WriteRefusal<E> {
+    /// A refusal that left nothing behind.
+    fn from(error: E) -> Self {
+        Self { error, held: false }
+    }
 }
 
 impl ShareGrant {
@@ -459,6 +515,13 @@ struct StoreState {
 }
 
 impl StoreState {
+    fn role(&self, role: GrantRole) -> &BTreeMap<[u8; 32], ShareGrant> {
+        match role {
+            GrantRole::Issued => &self.issued,
+            GrantRole::Received => &self.received,
+        }
+    }
+
     fn role_mut(&mut self, role: GrantRole) -> &mut BTreeMap<[u8; 32], ShareGrant> {
         match role {
             GrantRole::Issued => &mut self.issued,
@@ -482,6 +545,12 @@ pub struct ShareGrantStore {
     /// Set when the file on disk could not be read: the store then holds
     /// nothing and refuses writes so the file is never silently replaced.
     load_error: Option<String>,
+    /// Set when a durable write crossed the rename but could not be
+    /// synced (issue #1101): memory still matches the advanced disk, but
+    /// the durability contract is broken — the store refuses writes
+    /// until a fresh `load` re-establishes ground truth. Mirrors
+    /// `OwnerSyncStore`'s poison (review R5 finding 2).
+    poisoned: std::sync::Mutex<Option<String>>,
 }
 
 impl ShareGrantStore {
@@ -495,6 +564,7 @@ impl ShareGrantStore {
             state: std::sync::RwLock::new(StoreState::default()),
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
+            poisoned: std::sync::Mutex::new(None),
         }
     }
 
@@ -577,6 +647,13 @@ impl ShareGrantStore {
         }
     }
 
+    /// Test seam (x0x #1150 r7c): hold the store's state as a writer does,
+    /// until the returned guard drops. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn hold_state_for_testing(&self) -> impl Sized + '_ {
+        self.write_state()
+    }
+
     fn read_state(&self) -> std::sync::RwLockReadGuard<'_, StoreState> {
         self.state
             .read()
@@ -607,7 +684,34 @@ impl ShareGrantStore {
         revoked: &RevocationSet,
         now: u64,
     ) -> bool {
-        let state = self.read_state();
+        self.evidence_related_in(&self.read_state(), agent, cert, revoked, now)
+    }
+
+    /// [`Self::evidence_related`] without ever blocking (x0x #1150 r7c,
+    /// synchronous seams): `None` while a writer holds the store.
+    pub(crate) fn try_evidence_related(
+        &self,
+        agent: AgentId,
+        cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> Option<bool> {
+        let state = match self.state.try_read() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(self.evidence_related_in(&state, agent, cert, revoked, now))
+    }
+
+    fn evidence_related_in(
+        &self,
+        state: &StoreState,
+        agent: AgentId,
+        cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> bool {
         state.issued.values().any(|g| {
             g.is_active_at(now)
                 && g.agents.contains(&self.local_agent)
@@ -685,27 +789,63 @@ impl ShareGrantStore {
     /// Verify, classify and durably store a grant.
     ///
     /// Returns `Inserted` or `Duplicate` only once the grant is on disk (or
-    /// the store is in-memory). Every refusal leaves the store unchanged.
+    /// the store is in-memory). Every refusal leaves the store unchanged,
+    /// EXCEPT a post-rename durability failure (issue #1101): the grant is
+    /// then already on disk, so it STAYS in memory and the store is
+    /// poisoned ([`Self::poisoned_reason`]) — rolling memory back would
+    /// leave a restart enforcing a grant whose ACK was withheld.
     ///
     /// # Errors
     /// Any [`ShareGrantError`]: invalid/forged ([`ShareGrant::verify`]),
-    /// `Expired` at `now_unix`, `NotForUs`, `Conflict`, or `Store`.
+    /// `Expired` at `now_unix`, `NotForUs`, `Conflict`, or `Store`. A
+    /// `Store` error has one of two meanings. Usually the write failed
+    /// before the rename, and the grant is rolled back. If
+    /// [`Self::poisoned_reason`] is `Some`, the write crossed the rename
+    /// but was not confirmed durable: the grant is kept, and the store
+    /// refuses writes until a fresh [`Self::load`].
     pub async fn accept(
         &self,
         grant: ShareGrant,
         now_unix: u64,
     ) -> Result<DmTypedPayloadCompletion, ShareGrantError> {
+        self.accept_reporting(grant, now_unix)
+            .await
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::accept`], and on refusal also whether this grant is held in
+    /// memory (#1322 review P3), so the caller never describes a held
+    /// grant as absent.
+    pub(crate) async fn accept_reporting(
+        &self,
+        grant: ShareGrant,
+        now_unix: u64,
+    ) -> Result<DmTypedPayloadCompletion, WriteRefusal<ShareGrantError>> {
         grant.verify()?;
         if now_unix >= grant.expiry {
-            return Err(ShareGrantError::Expired);
+            return Err(ShareGrantError::Expired.into());
         }
         let role = self.classify(&grant).ok_or(ShareGrantError::NotForUs)?;
         if let Some(e) = &self.load_error {
             return Err(ShareGrantError::Store(format!(
                 "store not writable (unreadable file): {e}"
-            )));
+            ))
+            .into());
         }
         let _write = self.write_lock.lock().await;
+        // Checked under `write_lock`: `poison` runs while a writer holds
+        // it, so a writer that waited for the lock cannot slip past.
+        if let Some(reason) = self.poisoned_reason() {
+            let held = self
+                .read_state()
+                .role(role)
+                .get(&grant.grant_id)
+                .is_some_and(|stored| *stored == grant);
+            return Err(WriteRefusal {
+                error: poisoned_by_earlier_write(&reason, held),
+                held,
+            });
+        }
         {
             let mut state = self.write_state();
             let map = state.role_mut(role);
@@ -713,28 +853,70 @@ impl ShareGrantStore {
                 return if *held == grant {
                     Ok(DmTypedPayloadCompletion::Duplicate)
                 } else {
-                    Err(ShareGrantError::Conflict)
+                    Err(ShareGrantError::Conflict.into())
                 };
             }
             if map.len() >= MAX_STORED_GRANTS {
                 map.retain(|_, g| now_unix < g.expiry);
             }
             if map.len() >= MAX_STORED_GRANTS {
-                return Err(ShareGrantError::Store("grant store is full".into()));
+                return Err(ShareGrantError::Store("grant store is full".into()).into());
             }
             map.insert(grant.grant_id, grant.clone());
         }
-        if let Err(e) = self.persist().await {
-            // Roll back: a grant that is not durable must not be reported
-            // as stored (the durable ACK would be a lie).
-            self.write_state().role_mut(role).remove(&grant.grant_id);
-            return Err(ShareGrantError::Store(e));
+        match self.persist().await {
+            Ok(()) => {}
+            Err(e) if e.crossed_rename() => {
+                // Issue #1101: the rename already happened — the grant IS
+                // in `share-grants.bin`. Keep it (memory matches the
+                // advanced disk) and poison the store instead of rolling
+                // memory back below an advanced disk; a restart must never
+                // enforce a grant that was reported refused. Mirrors
+                // `OwnerSyncStore` (review R5 finding 2).
+                let reason = format!(
+                    "applied, but durability is not confirmed (directory fsync failed): {e}; \
+                     the change is in effect; restart x0xd to clear"
+                );
+                let error = poisoned_by_this_write(&reason);
+                self.poison(reason);
+                return Err(WriteRefusal { error, held: true });
+            }
+            Err(e) => {
+                // Roll back: a grant that is not durable must not be
+                // reported as stored (the durable ACK would be a lie).
+                self.write_state().role_mut(role).remove(&grant.grant_id);
+                return Err(ShareGrantError::Store(format!("write {e}")).into());
+            }
         }
         Ok(DmTypedPayloadCompletion::Inserted)
     }
 
+    /// Poison the store: a durable write crossed the rename but could not
+    /// be synced, so the durability contract is broken — the store refuses
+    /// writes until a fresh `load` re-establishes ground truth (issue
+    /// #1101; mirrors `OwnerSyncStore`, review R5 finding 2).
+    fn poison(&self, reason: String) {
+        *self
+            .poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    /// Why the store is poisoned, if it is.
+    #[must_use]
+    pub fn poisoned_reason(&self) -> Option<String> {
+        self.poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Write the store atomically (mode 0600). Callers hold `write_lock`.
-    async fn persist(&self) -> Result<(), String> {
+    /// The error says which half of the durable write failed (issue
+    /// #1101): `BeforeRename` leaves the old file in place (callers roll
+    /// back), `AfterRename` means the new file is already there (callers
+    /// keep the mutation and fail-stop).
+    async fn persist(&self) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -745,16 +927,20 @@ impl ShareGrantStore {
                 received: state.received.values().cloned().collect(),
             }
         };
-        let body = bincode::serialize(&file).map_err(|e| format!("encode: {e}"))?;
+        let body = bincode::serialize(&file).map_err(|e| {
+            crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+                "encode: {e}"
+            )))
+        })?;
         let mut bytes = Vec::with_capacity(STORE_MAGIC.len() + body.len());
         bytes.extend_from_slice(STORE_MAGIC);
         bytes.extend_from_slice(&body);
         // Durable (temp + fsync + rename + dir fsync): the completion that
         // follows releases a v2 ACK meaning "stored", which must survive
         // power loss.
-        crate::storage::write_private_bytes_durable(path, bytes)
+        crate::storage::write_private_bytes_durable_typed(path, bytes)
             .await
-            .map_err(|e| format!("write {}: {e}", path.display()))
+            .map_err(|e| e.with_path(path))
     }
 }
 
@@ -1043,6 +1229,11 @@ pub async fn handle_share_grant_dm_checked(
         completion,
         ..
     } = typed;
+    // #1322 review P3: a refused grant can still be held (a post-rename
+    // failure, or a sender retry of that grant). Track it, so the log
+    // never says "not stored" for a held grant. The ACK is withheld
+    // either way.
+    let mut held = false;
     let result = match store {
         None => Err("share grants are not enabled on this daemon".to_string()),
         Some(store) => match ShareGrant::from_dm_payload(&payload) {
@@ -1058,9 +1249,12 @@ pub async fn handle_share_grant_dm_checked(
                     Err("share grant is revoked; not stored".to_string())
                 } else {
                     store
-                        .accept(grant, unix_now_secs())
+                        .accept_reporting(grant, unix_now_secs())
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(|refusal| {
+                            held = refusal.held;
+                            refusal.error.to_string()
+                        })
                 }
             }
             Err(e) => Err(e.to_string()),
@@ -1071,6 +1265,12 @@ pub async fn handle_share_grant_dm_checked(
             sender = %hex::encode(sender.as_bytes()),
             ?outcome,
             "share grant received and stored"
+        ),
+        Err(reason) if held => tracing::warn!(
+            sender = %hex::encode(sender.as_bytes()),
+            reason = %reason,
+            "share grant held in memory and in the file, but the grant store is not confirmed \
+             durable; ACK withheld"
         ),
         Err(reason) => tracing::info!(
             sender = %hex::encode(sender.as_bytes()),
@@ -1099,8 +1299,9 @@ pub struct GrantDelivery {
     /// `true` when delivery failed and the grant was durably queued in the
     /// owner-side redelivery outbox (#926), which keeps retrying it.
     pub queued: bool,
-    /// Why delivery failed, if it did (and why it was not queued, if it
-    /// was not).
+    /// Why delivery failed, if it did (and why it was not durably queued,
+    /// if it was not: either it is not queued, or it is queued but its
+    /// outbox write is not confirmed durable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1226,12 +1427,20 @@ async fn queue_failed_delivery(
         return false;
     };
     match outbox
-        .enqueue(grant, recipient, now_unix, revocations)
+        .enqueue_reporting(grant, recipient, now_unix, revocations)
         .await
     {
         Ok(_) => true,
-        Err(e) => {
-            let reason = format!("not queued for redelivery: {e}");
+        Err(refusal) => {
+            // #1322 review P3: a held entry stays queued (the worker
+            // retries it), but it is not confirmed durable, so it is not
+            // reported as `queued`. The error must not call it absent.
+            let e = refusal.error;
+            let reason = if refusal.held {
+                format!("queued for redelivery, but not confirmed durable: {e}")
+            } else {
+                format!("not queued for redelivery: {e}")
+            };
             *error = Some(match error.take() {
                 Some(prev) => format!("{prev}; {reason}"),
                 None => reason,
@@ -1603,16 +1812,18 @@ pub async fn record_local_share_grant_revocation(
         Some(outbox) => Some(outbox.revocation_barrier().await),
         None => None,
     };
+    // ADR 0115 §5: the same future bound as every carrier,
+    // so a fast clock cannot store a record the next load would drop.
     revocation_set
         .write()
         .await
-        .verify_and_insert(record, None)
+        .verify_and_insert_at(record, None, crate::Agent::unix_timestamp_secs())
         .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
     let mut failures = Vec::new();
     if let Err(e) =
         crate::persist_share_grant_revocations_durable(revocation_set, identity_dir).await
     {
-        failures.push(e);
+        failures.push(e.to_string());
     }
     if let (Some(outbox), Some(grant_id)) = (outbox, grant_id) {
         if let Err(e) = outbox.remove_grant(&grant_id).await {

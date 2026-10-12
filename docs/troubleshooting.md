@@ -248,3 +248,18 @@ ask before the next release rather than re-saving it into a private space.
   as your own notes until this is fixed. Do not switch a space to public in
   order to share pages — it does not share them, and it makes them readable by
   anyone.
+
+## 7) A secure group refuses to send after a storage error or a downgrade [working]
+
+Since v0.47.1, a TreeKEM secure group refuses a send (HTTP 500) when it cannot keep its recovery journal (`<gid>.journal`) in step with its snapshot. This is deliberate: it stops a restart from loading an older group state than the one the daemon used (GHSA-63j6-cch7-w9h4). The group's data stays intact.
+
+Two cases can keep a group in this state:
+
+- **The binary was downgraded.** A newer x0xd can write a journal that an older x0xd cannot use. The journal can be the only record of the last change to that group. At startup, the older binary does one of two things:
+  - If it can decode the journal but does not support its version, it leaves the journal in place. An older binary of v0.47.1 or later then refuses every send to that group.
+  - If it cannot decode the journal, it moves the journal aside to `<gid>.journal.quarantined-<ms>-<seq>` and continues. See `docs/upgrade-system.md` ("Quarantined journals").
+
+  Upgrade back to the binary that wrote the journal BEFORE you make any change to that group. On the older binary, do not rename the group, do not change its members, roles or policy, and do not remove it. Each of these writes a new journal over the old one, or deletes it. The older state then replaces the only recovery record, and an upgrade can no longer recover the change. Do not delete or rename a quarantined journal, except by the procedure in `docs/upgrade-system.md`, and only after the upgrade.
+- **A power loss reverted a change that had not reached disk.** If a group change was in place but not yet durable, and the next change's journal replaced the earlier journal, the restart cannot repair that group. The group then stays unavailable. Share the group again from a member that still has it.
+
+Do not delete `<gid>.journal` or `<gid>.snap` files by hand. Check the daemon log for the storage error (a failed fsync, a full disk, or an I/O error) and fix the disk first.

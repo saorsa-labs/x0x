@@ -224,6 +224,20 @@ impl AutoApplyUpgrader {
             "Restart contract resolved before replacement"
         );
 
+        // #1196 round 2 test seam (cfg(test) only): when an in-process
+        // test has installed an apply attempt, the destructive half —
+        // downloads, hash/signature verification, extraction, binary
+        // replacement and the restart itself — is the INJECTION, not the
+        // filesystem or the network. Everything above (version/platform
+        // resolution and the ADR-0061 §1 restart-contract resolution the
+        // #1196 behaviour lives in) still runs for real, so a refused
+        // contract never reaches this hook. Compiled out entirely in
+        // non-test builds; an uninstalled hook changes nothing.
+        #[cfg(test)]
+        if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
+            return Ok(result);
+        }
+
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
@@ -427,6 +441,60 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
     }
 }
 
+/// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test observe — and stand in for — ONE
+/// apply attempt of [`AutoApplyUpgrader::apply_upgrade_from_manifest`].
+/// The hook fires only after the ADR-0061 §1 restart contract has resolved
+/// for real (a refused contract never reaches it), and replaces the
+/// destructive half of the apply: downloads, verification, extraction,
+/// replacement, restart. Compiled out entirely in non-test builds; an
+/// uninstalled hook changes nothing.
+#[cfg(test)]
+pub(crate) mod apply_attempt_seam {
+    use super::UpgradeResult;
+    use crate::upgrade::manifest::ReleaseManifest;
+    use crate::upgrade::restart::RestartPlan;
+    use std::sync::Mutex;
+
+    /// An installed apply attempt: sees the resolved restart plan and the
+    /// manifest being applied, and answers as the destructive half would.
+    pub(crate) type Attempt =
+        Box<dyn Fn(&RestartPlan, &ReleaseManifest) -> UpgradeResult + Send + Sync>;
+
+    static INSTALLED: Mutex<Option<Attempt>> = Mutex::new(None);
+
+    /// Uninstalls the attempt on drop, so a test cannot leak its injection
+    /// into sibling tests in the same process.
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = INSTALLED.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Install `attempt` for the guard's lifetime.
+    pub(crate) fn install(attempt: Attempt) -> Guard {
+        let mut slot = INSTALLED.lock().expect("apply attempt seam poisoned");
+        *slot = Some(attempt);
+        Guard { _private: () }
+    }
+
+    /// Run the installed attempt, or `None` when nothing is installed
+    /// (fall through to the real destructive half).
+    pub(crate) fn intercept(
+        plan: &RestartPlan,
+        manifest: &ReleaseManifest,
+    ) -> Option<UpgradeResult> {
+        let slot = INSTALLED.lock().expect("apply attempt seam poisoned");
+        slot.as_ref().map(|attempt| attempt(plan, manifest))
+    }
+}
+
 /// Download a URL to a local file, enforcing a maximum size limit.
 ///
 /// Checks `Content-Length` upfront and streams the response to disk with
@@ -501,6 +569,13 @@ async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeEr
 }
 
 /// Extract a binary from an archive (tar.gz or zip, detected by magic bytes).
+///
+/// The only acceptable entry is a regular file whose final path component is
+/// exactly `binary_name` (#1144); an archive holding more than one such entry
+/// is refused outright. After extraction the output must carry the magic of a
+/// native executable for this platform (ELF/Mach-O/MZ), or it is deleted and
+/// the apply is refused — a macOS AppleDouble sidecar like `._x0xd` must never
+/// be staged as the daemon.
 pub fn extract_binary_from_archive(
     archive_path: &Path,
     output_path: &Path,
@@ -512,14 +587,79 @@ pub fn extract_binary_from_archive(
     // Detect archive format by magic bytes
     if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
         // gzip magic bytes -> tar.gz
-        extract_from_tar_gz(archive_path, output_path, binary_name)
+        extract_from_tar_gz(archive_path, output_path, binary_name)?;
     } else if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
         // PK zip magic bytes
-        extract_from_zip(archive_path, output_path, binary_name)
+        extract_from_zip(archive_path, output_path, binary_name)?;
     } else {
-        Err(UpgradeError::ExtractionError(
+        return Err(UpgradeError::ExtractionError(
             "unknown archive format (not tar.gz or zip)".to_string(),
-        ))
+        ));
+    }
+
+    verify_extracted_binary_magic(output_path, binary_name)
+}
+
+/// Magic-number prefixes accepted as a native executable for the platform
+/// this upgrade applies to (the self-update target is always the host).
+///
+/// Any target other than Linux, macOS or Windows always fails this check:
+/// fail closed, since no release asset exists for such a target.
+fn has_native_executable_magic(prefix: &[u8]) -> bool {
+    if cfg!(target_os = "linux") {
+        prefix.starts_with(b"\x7fELF")
+    } else if cfg!(target_os = "macos") {
+        // MH_MAGIC / MH_MAGIC_64, their byte-swapped CIGAM forms, and the
+        // 32-bit (CA FE BA BE) and 64-bit (CA FE BA BF) fat (universal)
+        // magics with their byte-swapped forms — the same set `file(1)`
+        // accepts.
+        matches!(
+            prefix.first_chunk::<4>(),
+            Some([0xFE, 0xED, 0xFA, 0xCE])
+                | Some([0xFE, 0xED, 0xFA, 0xCF])
+                | Some([0xCE, 0xFA, 0xED, 0xFE])
+                | Some([0xCF, 0xFA, 0xED, 0xFE])
+                | Some([0xCA, 0xFE, 0xBA, 0xBE])
+                | Some([0xBE, 0xBA, 0xFE, 0xCA])
+                | Some([0xCA, 0xFE, 0xBA, 0xBF])
+                | Some([0xBF, 0xBA, 0xFE, 0xCA])
+        )
+    } else if cfg!(target_os = "windows") {
+        prefix.starts_with(b"MZ")
+    } else {
+        // Fail closed: no release asset exists for any other target, so an
+        // extracted binary there can never pass this check.
+        false
+    }
+}
+
+/// Refuse an extracted file that does not carry a native executable magic.
+///
+/// A file that fails the check is removed, so it can never be left where a
+/// caller could stage it as the replacement binary.
+fn verify_extracted_binary_magic(
+    output_path: &Path,
+    binary_name: &str,
+) -> Result<(), UpgradeError> {
+    use std::io::Read;
+
+    let mut prefix = [0u8; 4];
+    let read = std::fs::File::open(output_path).and_then(|mut f| f.read_exact(&mut prefix));
+
+    match read {
+        Ok(()) if has_native_executable_magic(&prefix) => Ok(()),
+        Ok(()) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(UpgradeError::ExtractionError(format!(
+                "extracted '{binary_name}' does not have the magic of a native executable for this platform"
+            )))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(UpgradeError::ExtractionError(format!(
+                "failed to read extracted '{binary_name}' for magic check: {e}"
+            )))
+        }
     }
 }
 
@@ -533,6 +673,7 @@ fn extract_from_tar_gz(
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
+    let mut extracted = false;
     for entry_result in archive
         .entries()
         .map_err(|e| UpgradeError::ExtractionError(format!("failed to read tar entries: {e}")))?
@@ -544,37 +685,52 @@ fn extract_from_tar_gz(
             .map_err(|e| UpgradeError::ExtractionError(format!("bad entry path: {e}")))?;
 
         let path_str = path.to_string_lossy();
-        // Match binary by filename (last component) or full path
+        // Only a regular file whose last path component is exactly the
+        // binary name may match (#1144): an AppleDouble sidecar (`._x0xd`),
+        // an `old-x0xd` backup or a symlink must never be extracted.
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        if file_name == binary_name || path_str.ends_with(binary_name) {
-            debug!(archive_path = %path_str, "Found binary in tar.gz archive: {}", path_str);
-            let mut output = std::fs::File::create(output_path).map_err(|e| {
-                UpgradeError::ExtractionError(format!("failed to create output: {e}"))
-            })?;
-            std::io::copy(&mut entry, &mut output).map_err(|e| {
-                UpgradeError::ExtractionError(format!("failed to extract binary: {e}"))
-            })?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| {
-                        UpgradeError::ExtractionError(format!("failed to set permissions: {e}"))
-                    })?;
-            }
-
-            return Ok(());
+        if file_name != binary_name {
+            continue;
         }
+        if extracted {
+            // Never pick between candidates — a duplicate could be the
+            // wrong artifact, so the whole archive is refused.
+            let _ = std::fs::remove_file(output_path);
+            return Err(UpgradeError::ExtractionError(format!(
+                "multiple entries named '{binary_name}' in tar.gz archive; refusing to pick one"
+            )));
+        }
+
+        debug!(archive_path = %path_str, "Found binary in tar.gz archive: {}", path_str);
+        let mut output = std::fs::File::create(output_path)
+            .map_err(|e| UpgradeError::ExtractionError(format!("failed to create output: {e}")))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| UpgradeError::ExtractionError(format!("failed to extract binary: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| UpgradeError::ExtractionError(format!("failed to set permissions: {e}")),
+            )?;
+        }
+
+        extracted = true;
     }
 
-    Err(UpgradeError::ExtractionError(format!(
-        "binary '{binary_name}' not found in tar.gz archive"
-    )))
+    if !extracted {
+        return Err(UpgradeError::ExtractionError(format!(
+            "binary '{binary_name}' not found in tar.gz archive"
+        )));
+    }
+    Ok(())
 }
 
 fn extract_from_zip(
@@ -587,41 +743,59 @@ fn extract_from_zip(
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| UpgradeError::ExtractionError(format!("failed to open zip: {e}")))?;
 
+    let mut extracted = false;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| UpgradeError::ExtractionError(format!("bad zip entry: {e}")))?;
 
-        let entry_name = entry.name().to_string();
-        let file_name = Path::new(&entry_name)
+        // Only a regular file whose last path component is exactly the
+        // binary name may match (#1144) — same rule as the tar.gz branch.
+        if !entry.is_file() {
+            continue;
+        }
+        let file_name = Path::new(entry.name())
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        if file_name == binary_name || entry_name.ends_with(binary_name) {
-            let mut output = std::fs::File::create(output_path).map_err(|e| {
-                UpgradeError::ExtractionError(format!("failed to create output: {e}"))
-            })?;
-            std::io::copy(&mut entry, &mut output).map_err(|e| {
-                UpgradeError::ExtractionError(format!("failed to extract binary: {e}"))
-            })?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| {
-                        UpgradeError::ExtractionError(format!("failed to set permissions: {e}"))
-                    })?;
-            }
-
-            return Ok(());
+        if file_name != binary_name {
+            continue;
         }
+        // Same-basename matches under different directories are still caught
+        // by the guard below, but zip's name-keyed IndexMap collapses entries
+        // whose *full* names are identical, so an exact same-name duplicate
+        // can never be observed on this path (the archive is signed CI
+        // output, which never contains one).
+        if extracted {
+            let _ = std::fs::remove_file(output_path);
+            return Err(UpgradeError::ExtractionError(format!(
+                "multiple entries named '{binary_name}' in zip archive; refusing to pick one"
+            )));
+        }
+
+        let mut output = std::fs::File::create(output_path)
+            .map_err(|e| UpgradeError::ExtractionError(format!("failed to create output: {e}")))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|e| UpgradeError::ExtractionError(format!("failed to extract binary: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| UpgradeError::ExtractionError(format!("failed to set permissions: {e}")),
+            )?;
+        }
+
+        extracted = true;
     }
 
-    Err(UpgradeError::ExtractionError(format!(
-        "binary '{binary_name}' not found in zip archive"
-    )))
+    if !extracted {
+        return Err(UpgradeError::ExtractionError(format!(
+            "binary '{binary_name}' not found in zip archive"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -630,68 +804,236 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    fn create_test_tar_gz(dir: &Path, binary_name: &str, content: &[u8]) -> PathBuf {
+    /// Magic prefix of a native executable on the host platform, so archive
+    /// contents built by these tests pass the post-extraction magic check.
+    /// Mirrors `has_native_executable_magic` exactly: any target that
+    /// function fails closed on has no prefix here either.
+    fn native_executable_prefix() -> &'static [u8] {
+        if cfg!(target_os = "linux") {
+            b"\x7fELF\x02"
+        } else if cfg!(target_os = "macos") {
+            &[0xCF, 0xFA, 0xED, 0xFE] // MH_MAGIC_64, little-endian
+        } else if cfg!(target_os = "windows") {
+            b"MZ\x90\x00" // PE
+        } else {
+            unreachable!(
+                "no native executable magic on this target; x0x release assets exist only for linux, macos and windows"
+            )
+        }
+    }
+
+    /// Fake executable body: host magic prefix plus a recognisable tag.
+    fn fake_binary(tag: &[u8]) -> Vec<u8> {
+        let mut content = native_executable_prefix().to_vec();
+        content.extend_from_slice(tag);
+        content
+    }
+
+    type TarGzBuilder = tar::Builder<flate2::write::GzEncoder<std::fs::File>>;
+
+    fn new_tar_gz(dir: &Path) -> (TarGzBuilder, PathBuf) {
         let archive_path = dir.join("test.tar.gz");
         let file = std::fs::File::create(&archive_path).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        let mut builder = tar::Builder::new(encoder);
+        (tar::Builder::new(encoder), archive_path)
+    }
 
-        let inner_path = format!("x0x-linux-x64-gnu/{binary_name}");
+    /// Append a single tar entry with an explicit entry type: regular files,
+    /// the `x0x-<target>/` directory entry the release packaging writes, and
+    /// the link types the filter must refuse. `content` is empty for links
+    /// and directories.
+    fn append_entry(
+        builder: &mut TarGzBuilder,
+        inner_path: &str,
+        entry_type: tar::EntryType,
+        link_name: Option<&str>,
+        content: &[u8],
+    ) {
         let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
         header.set_size(content.len() as u64);
         header.set_mode(0o755);
+        if let Some(target) = link_name {
+            header.set_link_name(target).unwrap();
+        }
         header.set_cksum();
         builder
-            .append_data(&mut header, &inner_path, content)
+            .append_data(&mut header, inner_path, content)
             .unwrap();
-        builder.finish().unwrap();
+    }
+
+    /// Finish a tar.gz builder into a complete archive on disk: the tar
+    /// end-of-archive blocks, then the gzip footer. `Builder::finish`
+    /// alone leaves the gzip stream unflushed inside the encoder until it
+    /// is dropped — too late when a test reads the archive in the same
+    /// scope — so extraction would hit a truncated deflate stream.
+    fn finish_tar_gz(builder: TarGzBuilder) {
+        builder
+            .into_inner()
+            .expect("finish tar stream")
+            .finish()
+            .expect("finish gzip stream");
+    }
+
+    fn create_tar_gz_with_entries(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        let (mut builder, archive_path) = new_tar_gz(dir);
+
+        for &(inner_path, content) in entries {
+            append_entry(
+                &mut builder,
+                inner_path,
+                tar::EntryType::Regular,
+                None,
+                content,
+            );
+        }
+        finish_tar_gz(builder);
 
         archive_path
     }
 
-    fn create_test_zip(dir: &Path, binary_name: &str, content: &[u8]) -> PathBuf {
+    fn create_test_tar_gz(dir: &Path, binary_name: &str, content: &[u8]) -> PathBuf {
+        create_tar_gz_with_entries(
+            dir,
+            &[(&format!("x0x-linux-x64-gnu/{binary_name}"), content)],
+        )
+    }
+
+    fn create_zip_with_entries(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
         let archive_path = dir.join("test.zip");
         let file = std::fs::File::create(&archive_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
 
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
-        zip.start_file(binary_name, options).unwrap();
-        zip.write_all(content).unwrap();
+        for (entry_name, content) in entries {
+            zip.start_file(*entry_name, options).unwrap();
+            zip.write_all(content).unwrap();
+        }
         zip.finish().unwrap();
 
         archive_path
     }
 
+    fn create_test_zip(dir: &Path, binary_name: &str, content: &[u8]) -> PathBuf {
+        create_zip_with_entries(dir, &[(binary_name, content)])
+    }
+
     #[test]
     fn test_extract_from_tar_gz() {
         let dir = TempDir::new().unwrap();
-        let archive = create_test_tar_gz(dir.path(), "x0xd", b"fake binary content");
-        let output = dir.path().join("extracted");
+        let daemon = fake_binary(b"fake daemon binary");
+        let cli = fake_binary(b"fake cli binary");
+        // Mirrors the macOS packaging in release.yml: a `x0x-macos-arm64/`
+        // directory entry, both binaries plus the provenance/docs files under
+        // that prefix, and the AppleDouble sidecar macOS tarring leaves next
+        // to `x0xd`.
+        let (mut builder, archive) = new_tar_gz(dir.path());
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/",
+            tar::EntryType::Directory,
+            None,
+            b"",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/x0xd",
+            tar::EntryType::Regular,
+            None,
+            &daemon,
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/x0x",
+            tar::EntryType::Regular,
+            None,
+            &cli,
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/._x0xd",
+            tar::EntryType::Regular,
+            None,
+            b"\x00\x05\x16\x07 AppleDouble junk",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/Cargo.lock",
+            tar::EntryType::Regular,
+            None,
+            b"# Cargo.lock\n",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/build-provenance.json",
+            tar::EntryType::Regular,
+            None,
+            b"{\"provenance\":true}\n",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/LICENSE",
+            tar::EntryType::Regular,
+            None,
+            b"license text\n",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-macos-arm64/README.md",
+            tar::EntryType::Regular,
+            None,
+            b"readme text\n",
+        );
+        finish_tar_gz(builder);
 
-        extract_binary_from_archive(&archive, &output, "x0xd").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"fake binary content");
+        let daemon_output = dir.path().join("extracted-x0xd");
+        extract_binary_from_archive(&archive, &daemon_output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&daemon_output).unwrap(), daemon);
+
+        let cli_output = dir.path().join("extracted-x0x");
+        extract_binary_from_archive(&archive, &cli_output, "x0x").unwrap();
+        assert_eq!(std::fs::read(&cli_output).unwrap(), cli);
     }
 
     #[test]
     fn test_extract_from_zip() {
         let dir = TempDir::new().unwrap();
-        let archive = create_test_zip(dir.path(), "x0xd.exe", b"fake windows binary");
-        let output = dir.path().join("extracted");
+        let daemon = fake_binary(b"fake windows daemon");
+        let cli = fake_binary(b"fake windows cli");
+        // Mirrors the Windows packaging in release.yml: root-level
+        // `x0xd.exe` and `x0x.exe` beside the provenance/docs files.
+        let archive = create_zip_with_entries(
+            dir.path(),
+            &[
+                ("x0xd.exe", &daemon),
+                ("x0x.exe", &cli),
+                ("Cargo.lock", b"# Cargo.lock\n"),
+                ("build-provenance.json", b"{\"provenance\":true}\n"),
+                ("LICENSE", b"license text\n"),
+                ("README.md", b"readme text\n"),
+            ],
+        );
 
-        extract_binary_from_archive(&archive, &output, "x0xd.exe").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"fake windows binary");
+        let daemon_output = dir.path().join("extracted-x0xd.exe");
+        extract_binary_from_archive(&archive, &daemon_output, "x0xd.exe").unwrap();
+        assert_eq!(std::fs::read(&daemon_output).unwrap(), daemon);
+
+        let cli_output = dir.path().join("extracted-x0x.exe");
+        extract_binary_from_archive(&archive, &cli_output, "x0x.exe").unwrap();
+        assert_eq!(std::fs::read(&cli_output).unwrap(), cli);
     }
 
     #[test]
     fn test_extract_nested_path() {
         let dir = TempDir::new().unwrap();
         // create_test_tar_gz puts it at x0x-linux-x64-gnu/x0x
-        let archive = create_test_tar_gz(dir.path(), "x0x", b"cli binary");
+        let content = fake_binary(b"cli binary");
+        let archive = create_test_tar_gz(dir.path(), "x0x", &content);
         let output = dir.path().join("extracted");
 
         extract_binary_from_archive(&archive, &output, "x0x").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"cli binary");
+        assert_eq!(std::fs::read(&output).unwrap(), content);
     }
 
     #[test]
@@ -723,6 +1065,187 @@ mod tests {
 
         let result = extract_binary_from_archive(&archive, &output, "x0xd.exe");
         assert!(matches!(result, Err(UpgradeError::ExtractionError(_))));
+    }
+
+    #[test]
+    fn test_extract_appledouble_sidecar_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"real daemon");
+        // Sidecar first, as in the gate-7b archive: `._x0xd` merely ends with
+        // `x0xd`, so it must never match (#1144).
+        let archive = create_tar_gz_with_entries(
+            dir.path(),
+            &[
+                ("._x0xd", b"\x00\x05\x16\x07 AppleDouble junk"),
+                ("x0x-linux-x64-gnu/x0xd", &content),
+            ],
+        );
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+    }
+
+    #[test]
+    fn test_extract_refuses_archive_with_only_appledouble_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let archive =
+            create_tar_gz_with_entries(dir.path(), &[("._x0xd", b"\x00\x05\x16\x07 junk")]);
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive, &output, "x0xd");
+        assert!(matches!(result, Err(UpgradeError::ExtractionError(_))));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn test_extract_refuses_zip_with_only_appledouble_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let archive = create_zip_with_entries(dir.path(), &[("._x0xd.exe", b"junk")]);
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive, &output, "x0xd.exe");
+        assert!(matches!(result, Err(UpgradeError::ExtractionError(_))));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn test_extract_refuses_duplicate_binary_in_tar_gz() {
+        let dir = TempDir::new().unwrap();
+        let archive = create_tar_gz_with_entries(
+            dir.path(),
+            &[
+                ("dir1/x0xd", &fake_binary(b"one")),
+                ("dir2/x0xd", &fake_binary(b"two")),
+            ],
+        );
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive, &output, "x0xd");
+        assert!(matches!(
+            &result,
+            Err(UpgradeError::ExtractionError(msg)) if msg.contains("multiple entries")
+        ));
+        assert!(
+            !output.exists(),
+            "a refused duplicate must not leave a staged file"
+        );
+    }
+
+    #[test]
+    fn test_extract_refuses_duplicate_binary_in_zip() {
+        let dir = TempDir::new().unwrap();
+        let archive = create_zip_with_entries(
+            dir.path(),
+            &[
+                ("dir1/x0xd.exe", &fake_binary(b"one")),
+                ("dir2/x0xd.exe", &fake_binary(b"two")),
+            ],
+        );
+        let output = dir.path().join("extracted");
+        let result = extract_binary_from_archive(&archive, &output, "x0xd.exe");
+        assert!(matches!(
+            &result,
+            Err(UpgradeError::ExtractionError(msg)) if msg.contains("multiple entries")
+        ));
+        assert!(
+            !output.exists(),
+            "a refused duplicate must not leave a staged file"
+        );
+    }
+
+    #[test]
+    fn test_extract_refuses_non_executable_magic() {
+        let dir = TempDir::new().unwrap();
+        let archive = create_test_tar_gz(dir.path(), "x0xd", b"#!/bin/sh\nnot a binary\n");
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive, &output, "x0xd");
+        assert!(matches!(
+            &result,
+            Err(UpgradeError::ExtractionError(msg)) if msg.contains("magic")
+        ));
+        assert!(
+            !output.exists(),
+            "a failed magic check must not leave the file staged"
+        );
+    }
+
+    #[test]
+    fn test_extract_skips_symlink_named_as_binary() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"real daemon");
+        // A symlink whose basename matches, next to the real regular binary:
+        // the entry-type filter must skip it and extract the regular file
+        // (#1144), not merely fail for want of a match.
+        let (mut builder, archive_path) = new_tar_gz(dir.path());
+        append_entry(
+            &mut builder,
+            "x0xd",
+            tar::EntryType::Symlink,
+            Some("elsewhere"),
+            b"",
+        );
+        append_entry(
+            &mut builder,
+            "x0x-linux-x64-gnu/x0xd",
+            tar::EntryType::Regular,
+            None,
+            &content,
+        );
+        finish_tar_gz(builder);
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+    }
+
+    #[test]
+    fn test_extract_refuses_hardlink_named_as_binary() {
+        let dir = TempDir::new().unwrap();
+        // A hard link whose basename matches is the only candidate: the
+        // entry-type filter must skip it, so the apply is refused with
+        // "not found" rather than staging the link's zero bytes (#1144).
+        let (mut builder, archive_path) = new_tar_gz(dir.path());
+        append_entry(
+            &mut builder,
+            "x0x-linux-x64-gnu/x0xd",
+            tar::EntryType::Link,
+            Some("other-entry"),
+            b"",
+        );
+        finish_tar_gz(builder);
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive_path, &output, "x0xd");
+        assert!(matches!(
+            &result,
+            Err(UpgradeError::ExtractionError(msg))
+                if msg == "binary 'x0xd' not found in tar.gz archive"
+        ));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn test_extract_skips_zip_directory_named_as_binary() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"real daemon");
+        // A directory entry whose name matches the binary (`add_directory`
+        // stores it as `x0xd/`), next to the real regular file: the
+        // entry-type filter must skip it and extract the regular file.
+        let archive_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.add_directory("x0xd", options).unwrap();
+        zip.start_file("x0x-linux-x64-gnu/x0xd", options).unwrap();
+        zip.write_all(&content).unwrap();
+        zip.finish().unwrap();
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
     }
 
     #[test]

@@ -25,7 +25,10 @@
 //! how a rekey (GSS rotation, TreeKEM commit) takes effect on the very next
 //! delta. With a protector installed the sync loop publishes only sealed
 //! records and refuses plaintext unless the protector says the group is
-//! signed-public (see [`TaskDeltaProtector::admits_plaintext`]).
+//! signed-public (see [`TaskDeltaProtector::admits_plaintext`]); a plaintext
+//! publish additionally passes
+//! [`TaskDeltaProtector::confirm_plaintext_publication`] (#1100), so a flip
+//! to `MlsEncrypted` cannot commit between the check and the publish.
 
 use crate::groups::{GroupInfo, GssKvSecureContext};
 use crate::identity::AgentId;
@@ -140,6 +143,25 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
         &'a self,
         body: &'a SealedTaskRecordBody,
     ) -> TaskSealFuture<'a, TaskPublication>;
+
+    /// #1100: called after [`seal`](Self::seal) returned `None` (the group
+    /// was signed-public when sealed) and immediately before that plaintext
+    /// payload is published. Answers whether the group is STILL signed-public
+    /// and, if so, returns a permit that keeps the group's policy commits off
+    /// until it is dropped, so a flip to `MlsEncrypted` cannot commit between
+    /// the check and the publish. [`TaskPublication::Stale`] sends the
+    /// payload back through the sealing path instead — plaintext is never
+    /// published after the group left the public plane.
+    ///
+    /// Unlike [`confirm_publication`](Self::confirm_publication) this hook
+    /// carries a default: it post-dates every existing implementor, and the
+    /// default preserves each one's published behaviour exactly (publish the
+    /// already-plaintext payload, holding nothing). A protector that resolves
+    /// a LIVE group policy MUST override it and fail closed, for the same
+    /// reason `confirm_publication` refuses a default.
+    fn confirm_plaintext_publication<'a>(&'a self) -> TaskSealFuture<'a, TaskPublication> {
+        Box::pin(async move { Ok(TaskPublication::Current(TaskPublicationPermit::none())) })
+    }
 }
 
 /// Holds whatever keeps a group's epoch fixed while a sealed task record is

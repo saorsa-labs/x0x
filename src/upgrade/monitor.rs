@@ -12,6 +12,33 @@ use super::manifest::{encode_signed_manifest, ReleaseManifest};
 use super::signature::verify_manifest_signature;
 use super::UpgradeError;
 
+/// Default GitHub API base URL.
+const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Test-only override of [`DEFAULT_GITHUB_API_BASE`] (issue #1086): lets the
+/// server readiness test point every update fetch at a loopback black hole.
+/// This seam does not exist in release builds — no environment variable can
+/// redirect the update source of a shipped `x0xd`.
+#[cfg(test)]
+pub(crate) static TEST_API_BASE_OVERRIDE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Resolve the GitHub API base URL: the test-only override when set, else
+/// the real GitHub API.
+#[cfg(not(test))]
+fn github_api_base() -> String {
+    DEFAULT_GITHUB_API_BASE.to_string()
+}
+
+#[cfg(test)]
+fn github_api_base() -> String {
+    TEST_API_BASE_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE.to_string())
+}
+
 /// Maximum age of a manifest timestamp before it is rejected (30 days).
 ///
 /// Applied at every ingestion point — the GitHub-polling monitor here, plus
@@ -53,6 +80,8 @@ pub struct VerifiedRelease {
 /// Fallback mechanism for x0xd (startup check + 48h poll).
 pub struct UpgradeMonitor {
     repo: String,
+    /// Base URL for GitHub API requests ([`github_api_base`]).
+    api_base: String,
     current_version: Version,
     client: Client,
     include_prereleases: bool,
@@ -77,6 +106,7 @@ impl UpgradeMonitor {
 
         Ok(Self {
             repo: repo.to_string(),
+            api_base: github_api_base(),
             current_version: version,
             client,
             include_prereleases: false,
@@ -155,7 +185,7 @@ impl UpgradeMonitor {
                 .await
                 .map_err(UpgradeError::ManifestFetchFailed)
         } else {
-            let api_url = format!("https://api.github.com/repos/{}/releases/latest", self.repo);
+            let api_url = format!("{}/repos/{}/releases/latest", self.api_base, self.repo);
             debug!("Checking for updates from: {}", api_url);
             self.client
                 .get(&api_url)
@@ -257,10 +287,7 @@ impl UpgradeMonitor {
     /// Fetch the latest release including pre-releases by listing all releases
     /// and returning the first one (which GitHub returns sorted newest-first).
     async fn fetch_latest_release_including_prereleases(&self) -> Result<GitHubRelease, String> {
-        let api_url = format!(
-            "https://api.github.com/repos/{}/releases?per_page=1",
-            self.repo
-        );
+        let api_url = format!("{}/repos/{}/releases?per_page=1", self.api_base, self.repo);
         debug!(
             "Checking for updates (including prereleases) from: {}",
             api_url

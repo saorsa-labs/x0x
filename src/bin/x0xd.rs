@@ -64,8 +64,15 @@ fn resolve_instance_startup(
     Ok((instance_name, connect_acl_path))
 }
 
+fn main() -> anyhow::Result<()> {
+    if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
+        return result;
+    }
+    run_daemon()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_daemon() -> anyhow::Result<()> {
     // dhat heap profiler. Each daemon writes its own file so multi-daemon
     // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
     #[cfg(feature = "profile-heap")]
@@ -677,6 +684,14 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     if let Err(message) = config.groups.validate() {
         anyhow::bail!("invalid [groups] configuration: {message}");
     }
+    // ADR 0116 §1 (ruling Q9): the `[history]` recording and retention rules
+    // are validated here whether or not history is enabled, so a bad rule
+    // refuses startup. Unknown keys elsewhere stay warn-only; an unknown key
+    // inside a new rule object already failed the parse above.
+    config
+        .history
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [history] configuration: {e}"))?;
     Ok((config, findings.warning_lines()))
 }
 
@@ -976,6 +991,37 @@ mod tests {
             path,
             Some(expected_path),
             "config name derives its plane-scoped default"
+        );
+    }
+
+    /// ADR 0116 §1 and ruling Q9: the daemon validates the `[history]`
+    /// rules when it loads its config, whether or not history is enabled.
+    /// A bad rule refuses startup; it is not dropped with a warning like an
+    /// unknown key.
+    #[tokio::test]
+    async fn invalid_history_rule_refuses_startup_even_with_history_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+        std::fs::write(
+            &path,
+            "[history]\nenabled = false\n\n[[history.class_limits]]\nclass = \"durable\"\n",
+        )
+        .expect("write config");
+        let error = super::load_config(&path_str)
+            .await
+            .expect_err("an invalid [history] rule must refuse startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("[history]")
+                && message.contains("sets neither max_bytes nor a positive max_age_days"),
+            "refused for the wrong reason: {message}"
+        );
+
+        std::fs::write(&path, "[history]\nenabled = false\n").expect("rewrite config");
+        assert!(
+            super::load_config(&path_str).await.is_ok(),
+            "a config without the new rules still loads"
         );
     }
 }

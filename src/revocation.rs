@@ -40,22 +40,27 @@ use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
 
 /// Magic marker prefixing the on-disk revocation set file.
-const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
+pub(crate) const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
 
 /// Magic marker prefixing the ADR-0043 ad-hoc binding-record file
 /// (`revocations-v2.bin`).
-const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
 
 /// Magic marker prefixing the ADR-0070 share-grant revocation file
 /// (`revocations-v3.bin`). A distinct magic (and file) keeps the v1/v2
 /// stores loadable by older daemons after a downgrade.
-const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
 
 /// How long past the revoked grant's own expiry a share-grant revocation is
 /// kept before it may be garbage-collected. A grant is dead at `expiry`
 /// (evaluation never honours it after that); the slack covers clock skew
 /// between the owner and the enforcing daemons.
 pub const SHARE_GRANT_REVOCATION_GC_SLACK_SECS: u64 = 3_600;
+
+/// ADR 0115 §5 (D213): the most a record's `revoked_at` may lie
+/// ahead of local time. Beyond it the record is rejected at ingress and
+/// dropped at load: a far-future `revoked_at` would never expire.
+pub(crate) const REVOCATION_MAX_FUTURE_SKEW_SECS: u64 = 300;
 
 /// An ADR-0070 §2 share-grant revocation: the grant id plus the owner that
 /// signed the grant. Carrying the owner makes authority verifiable from the
@@ -353,6 +358,33 @@ impl RevocationRecord {
         ))
     }
 
+    /// ADR 0115 D214: the user whose key issued this record, read as a
+    /// `UserId` (the derivation [`Self::verify_authority`] compares with
+    /// a certificate's user). `None` for an unreadable key.
+    #[must_use]
+    pub(crate) fn issuer_user_id(&self) -> Option<UserId> {
+        let key = MlDsaPublicKey::from_bytes(&self.issuer_public_key).ok()?;
+        Some(UserId(derive_peer_id_from_public_key(&key).0))
+    }
+
+    /// ADR 0115 D214: whether this record's authority comes from a subject
+    /// certificate: an issuer revocation of an agent, or a binding tombstone.
+    #[must_use]
+    pub(crate) fn needs_certificate_authority(&self) -> Option<AgentId> {
+        match &self.subject {
+            RevokedSubject::Agent(agent) if !self.is_self_revocation() => Some(*agent),
+            RevokedSubject::AgentMachineBinding(binding) => Some(binding.agent),
+            _ => None,
+        }
+    }
+
+    /// ADR 0115 §5: whether `revoked_at` is within
+    /// [`REVOCATION_MAX_FUTURE_SKEW_SECS`] of `now_unix`.
+    #[must_use]
+    pub(crate) fn revoked_at_is_credible(&self, now_unix: u64) -> bool {
+        self.revoked_at <= now_unix.saturating_add(REVOCATION_MAX_FUTURE_SKEW_SECS)
+    }
+
     /// Whether this is a self-revocation — the issuer key hashes to the
     /// subject id.
     ///
@@ -609,10 +641,97 @@ impl RevocationSet {
         }))
     }
 
-    /// Raw insert of an already-verified record. Performs NO cryptographic
-    /// checks — it is module-private and reachable ONLY through
-    /// [`verify_and_insert`](Self::verify_and_insert), which is the sole path a
-    /// record can enter the set. Returns `true` if new.
+    /// ADR 0115 §5: [`verify_and_insert`](Self::verify_and_insert) for a
+    /// record from any ingress carrier. A `revoked_at` beyond the
+    /// future-skew bound at `now_unix` is rejected and counted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Revocation`] for a far-future `revoked_at`,
+    /// an invalid signature or a missing authority.
+    pub(crate) fn verify_and_insert_at(
+        &mut self,
+        record: RevocationRecord,
+        subject_cert: Option<&AgentCertificate>,
+        now_unix: u64,
+    ) -> Result<bool, IdentityError> {
+        if !record.revoked_at_is_credible(now_unix) {
+            crate::identity_authority::note_revocation_future_dropped(1);
+            return Err(IdentityError::Revocation(format!(
+                "revoked_at {} is more than {REVOCATION_MAX_FUTURE_SKEW_SECS} s ahead of local time {now_unix}",
+                record.revoked_at
+            )));
+        }
+        self.verify_and_insert(record, subject_cert)
+    }
+
+    /// ADR 0115 §5: drop every record whose `revoked_at` is beyond the
+    /// future-skew bound at `now_unix` (a load-time check). Returns the
+    /// number dropped and counts them.
+    pub(crate) fn drop_future_records(&mut self, now_unix: u64) -> usize {
+        let dropped = self
+            .take_records_where(|record, _| !record.revoked_at_is_credible(now_unix))
+            .len();
+        if dropped > 0 {
+            crate::identity_authority::note_revocation_future_dropped(dropped as u64);
+        }
+        dropped
+    }
+
+    /// ADR 0115 D214: every record with its retained certificate.
+    pub(crate) fn records_with_certs(
+        &self,
+    ) -> impl Iterator<Item = (&RevocationRecord, Option<&AgentCertificate>)> {
+        self.records_by_hash
+            .values()
+            .map(|persisted| (&persisted.record, persisted.subject_cert.as_ref()))
+    }
+
+    /// ADR 0115 D214: replace the bundle-derived tombstones with exactly
+    /// `tombstones` (recomputed from the bundles that remain held).
+    pub(crate) fn reset_bundle_retired(&mut self, tombstones: &[AgentMachineBinding]) {
+        self.bundle_retired_epochs.clear();
+        self.union_bundle_retired(tombstones);
+        self.change_generation = self.change_generation.saturating_add(1);
+    }
+
+    /// Remove every record matching `take` and return it with its retained
+    /// certificate. The record-derived indices are rebuilt from the records
+    /// that remain; bundle-derived tombstones are untouched.
+    pub(crate) fn take_records_where(
+        &mut self,
+        mut take: impl FnMut(&RevocationRecord, Option<&AgentCertificate>) -> bool,
+    ) -> Vec<(RevocationRecord, Option<AgentCertificate>)> {
+        let hashes: Vec<[u8; 32]> = self
+            .records_by_hash
+            .iter()
+            .filter(|(_, persisted)| take(&persisted.record, persisted.subject_cert.as_ref()))
+            .map(|(hash, _)| *hash)
+            .collect();
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let taken: Vec<(RevocationRecord, Option<AgentCertificate>)> = hashes
+            .iter()
+            .filter_map(|hash| self.records_by_hash.remove(hash))
+            .map(|persisted| (persisted.record, persisted.subject_cert))
+            .collect();
+        self.revoked_agents.clear();
+        self.revoked_machines.clear();
+        self.binding_epochs.clear();
+        self.revoked_share_grants.clear();
+        let remaining: Vec<PersistedRevocation> = self
+            .records_by_hash
+            .drain()
+            .map(|(_, persisted)| persisted)
+            .collect();
+        for persisted in remaining {
+            self.insert_verified(persisted);
+        }
+        self.change_generation = self.change_generation.saturating_add(1);
+        taken
+    }
+
     /// Monotonic generation counter — changes on every insert or expiry.
     /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
     /// the publish (except the periodic fallback).
@@ -686,6 +805,13 @@ impl RevocationSet {
         expired.len()
     }
 
+    /// Raw insert of an already-verified record. Performs NO cryptographic
+    /// checks. It is module-private and reachable only through
+    /// [`verify_and_insert`](Self::verify_and_insert) (the sole path a new
+    /// record enters the set) and
+    /// [`take_records_where`](Self::take_records_where), which re-inserts
+    /// records that were already in the set while it rebuilds the indices.
+    /// Returns `true` if new.
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
         let hash = persisted.record.record_hash();
         if self.records_by_hash.contains_key(&hash) {
@@ -756,6 +882,29 @@ impl RevocationSet {
             .filter(|p| matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .map(|p| p.record.clone())
             .collect()
+    }
+
+    /// Validate the persisted layout without verifying record signatures.
+    /// Load/merge callers still use the authority-verifying decoders.
+    pub(crate) fn validate_persisted_bytes(
+        bytes: &[u8],
+        magic: &[u8; 4],
+    ) -> Result<(), IdentityError> {
+        use bincode::Options;
+
+        // Keep the existing decoders' empty-file acceptance.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let body = bytes.strip_prefix(magic).ok_or_else(|| {
+            IdentityError::Serialization("revocation file magic mismatch".to_string())
+        })?;
+        let _: Vec<PersistedRevocation> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(body)
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        Ok(())
     }
 
     /// Encode the V1 set for on-disk persistence: `X0XR` magic + bincode of
@@ -981,6 +1130,135 @@ fn is_v1_subject(subject: &RevokedSubject) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    #[tokio::test]
+    async fn trailing_bytes_block_revocation_overwrite_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = bincode::serialize(&Vec::<PersistedRevocation>::new()).unwrap();
+        for (name, magic, store) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                crate::storage::RevocationStore::V1,
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                crate::storage::RevocationStore::V2,
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                crate::storage::RevocationStore::V3,
+            ),
+        ] {
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&body);
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            let mut garbage = valid.clone();
+            garbage.extend_from_slice(b"trailing garbage");
+            assert!(RevocationSet::validate_persisted_bytes(&garbage, magic).is_err());
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &garbage).await.unwrap();
+            let unreadable = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .expect_err("trailing bytes make the store unreadable");
+            assert!(crate::storage::revocation_persistence_is_blocked(
+                &unreadable
+            ));
+            let outcome = crate::storage::save_private_bytes_to(&path, valid).await;
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                garbage,
+                "persist must preserve a valid body with trailing garbage"
+            );
+            let refused = outcome.expect_err("trailing bytes block overwrite");
+            assert!(crate::storage::revocation_persistence_is_blocked(&refused));
+        }
+    }
+
+    #[tokio::test]
+    async fn structural_validation_keeps_signature_checks_on_load_1116() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &agent).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, magic, subject, subject_cert) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                RevokedSubject::Agent(agent.agent_id()),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                    agent: agent.agent_id(),
+                    machine: crate::identity::MachineId([0x55; 32]),
+                    move_epoch: 1,
+                }),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x66; 32],
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                None,
+            ),
+        ] {
+            let decode = |bytes: &[u8]| match name {
+                "revocations.bin" => RevocationSet::from_bytes(bytes),
+                "revocations-v2.bin" => RevocationSet::from_bytes_v2(bytes),
+                _ => RevocationSet::from_bytes_v3(bytes),
+            };
+            let record = RevocationRecord::sign(
+                subject,
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            let hash = record.record_hash();
+            let mut persisted = vec![PersistedRevocation {
+                record,
+                subject_cert,
+            }];
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            assert!(
+                decode(&valid).unwrap().contains_hash(&hash),
+                "valid subject and authority must load from {name}"
+            );
+            // A native v3 subject is essential: a v1 Agent subject would
+            // be filtered out before v3's signature check, hiding a defect.
+            persisted[0].record.signature[0] ^= 0xff;
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&bytes, magic).is_ok());
+            let loaded = decode(&bytes).unwrap();
+            assert!(
+                loaded.is_empty(),
+                "invalid signature still rejected on load from {name}"
+            );
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            crate::storage::save_private_bytes_to(&path, bytes.clone())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+            let mut malformed = magic.to_vec();
+            malformed.push(1);
+            assert!(RevocationSet::validate_persisted_bytes(&malformed, magic).is_err());
+            assert!(RevocationSet::validate_persisted_bytes(b"X0RX", magic).is_err());
+        }
+    }
+
     mod revocation_cadence {
         use super::super::*;
         use crate::identity::AgentKeypair;
@@ -996,6 +1274,54 @@ mod tests {
                 None,
             )
             .expect("self-revocation signs")
+        }
+
+        /// ADR 0115 §5: ingress rejects a far-future
+        /// `revoked_at`, and the load-time drop removes one while the
+        /// other records of the same subject keep enforcing.
+        #[test]
+        fn far_future_revoked_at_is_rejected_and_dropped_at_load() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let other = AgentKeypair::generate().expect("other keypair");
+            let now = 1_800_000_000u64;
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert_at(
+                    self_revocation(&kp, now + REVOCATION_MAX_FUTURE_SKEW_SECS + 1),
+                    None,
+                    now
+                )
+                .is_err());
+            assert!(set
+                .verify_and_insert_at(
+                    self_revocation(&kp, now + REVOCATION_MAX_FUTURE_SKEW_SECS),
+                    None,
+                    now
+                )
+                .expect("at the bound is credible"));
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+
+            // A persisted far-future record, as an earlier build may hold.
+            let mut loaded = RevocationSet::new();
+            loaded
+                .verify_and_insert(self_revocation(&kp, u64::MAX), None)
+                .expect("legacy insert has no bound");
+            loaded
+                .verify_and_insert(self_revocation(&kp, now), None)
+                .expect("current record");
+            loaded
+                .verify_and_insert(self_revocation(&other, u64::MAX), None)
+                .expect("legacy far-future record");
+            assert_eq!(loaded.drop_future_records(now), 2);
+            assert_eq!(loaded.len(), 1);
+            assert!(
+                loaded.is_agent_revoked(&kp.agent_id()),
+                "the current record still revokes its subject"
+            );
+            assert!(
+                !loaded.is_agent_revoked(&other.agent_id()),
+                "a subject revoked only by a dropped record is no longer revoked"
+            );
         }
 
         /// #380 cadence: the TTL expiry kills the 2 stale July testnet

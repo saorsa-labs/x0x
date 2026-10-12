@@ -935,6 +935,16 @@ impl DirectMessaging {
         connected.get(agent_id).copied()
     }
 
+    /// [`Self::get_machine_id`] without waiting for the registry lock, for
+    /// synchronous admission seams (x0x #1150 r7b). `None`: the lock is
+    /// held right now.
+    pub(crate) fn try_machine_id(&self, agent_id: &AgentId) -> Option<Option<MachineId>> {
+        self.connected_agents
+            .try_read()
+            .ok()
+            .map(|connected| connected.get(agent_id).copied())
+    }
+
     /// Get all currently connected agents.
     pub async fn connected_agents(&self) -> Vec<AgentId> {
         let connected = self.connected_agents.read().await;

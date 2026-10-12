@@ -164,6 +164,13 @@ pub struct ServerHandle {
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// W3-H (#1164) test builds: the daemon's state (weak, so a restart can
+    /// drop it) and its router, so the harness drives the public API through
+    /// `Router::oneshot` without a socket.
+    #[cfg(test)]
+    pub(super) test_state: std::sync::Weak<AppState>,
+    #[cfg(test)]
+    pub(super) test_router: axum::Router,
     // Issue #601/#645: the data-dir and identity-dir instance locks are NOT
     // fields here. They are moved into the supervisor task by
     // `serve_with_options` so they are released only after the supervisor has
@@ -836,6 +843,12 @@ pub(super) struct AppState {
     /// window consulted by the MemberAdded enforcement arm and surfaced
     /// (derived) in `/diagnostics/groups` capability phases.
     pub(super) groups_config: DaemonGroupsConfig,
+    /// Live REST `/subscribe` forwarders, keyed by subscription id.
+    ///
+    /// #1288 row 2: the shutdown drain takes this map after cancelling
+    /// `shutdown_started`. `subscribe` checks that token under this lock
+    /// and does not admit a forwarder the drain will not join. A topic in
+    /// `[history] record_topics` makes the forwarder hold `history.db`.
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
@@ -952,6 +965,83 @@ pub(super) struct AppState {
     /// One cancellable owner-side stream per staged Welcome.
     /// `None` closes admission during shutdown under the same lock as replacement.
     pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// #1269: detached best-effort tasks that capture the Agent or this
+    /// AppState: named-group event direct deliveries (immediate and
+    /// delayed), the terminal-event and delegation-carrier redelivery
+    /// schedules, legacy join work, control-blob fetches and sends, the
+    /// owner-side join-result and Welcome fetch handlers, the delayed card
+    /// and chat publishes of `POST /groups`, and since #1274 the public
+    /// message fan-out race (gossip publish and member unicasts), the
+    /// one-shot predecessor-relay offer used when the durable offer
+    /// obligation could not be persisted, the member-keyed KeyPackage
+    /// catch-up requests, the KV-store delta direct deliveries and the
+    /// outgoing file-chunk streams, and since #1288 the WebSocket session
+    /// loop and its child tasks (the writer, the direct-message, call, and
+    /// keepalive forwarders, and the shared and per-session topic
+    /// forwarders). None of them owns a write that an abort
+    /// could cut: the most a send leaves behind is the outbound DM history
+    /// row that `Agent::send_direct_with_history` enqueues synchronously
+    /// after a successful send, and the history writer owns that
+    /// transaction. `None` closes admission during shutdown; the shutdown
+    /// tail drains them with the other server tasks (grace, then abort), so
+    /// none of them keeps the Agent and its exclusive `history.db`
+    /// connection alive after `shutdown_and_wait`.
+    pub(super) detached_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    /// #1269 r2: admitted applies that persist group state (a pulled
+    /// control blob's apply, the owner-certificate join retry) and, since
+    /// #1275, every apply a server listener runs for an event it received
+    /// (named-group metadata, join results, catch-up responses, group
+    /// bootstraps, predecessor relays, KV-store deltas, certificate
+    /// hydrations), and since #1274 the owner-sync profile catch-up write.
+    /// Shutdown never aborts them: an abort inside an atomic
+    /// write or its journal step would leave the persisted state torn, or
+    /// leave a blocking write running after the daemon released its locks.
+    /// `None` closes admission (an apply that has not started is refused);
+    /// the shutdown tail then awaits the admitted ones, bounded, before the
+    /// Agent stops.
+    pub(super) shielded_tasks: StdMutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    /// #1269 r2: cancelled when the shutdown drain starts. A network wait
+    /// inside a shielded apply (the joiner's Welcome fetch) selects on it,
+    /// so the apply takes its ordinary failure path instead of waiting out
+    /// a peer that can no longer answer while shutdown waits for it.
+    pub(super) shutdown_started: tokio_util::sync::CancellationToken,
+    /// ADR 0107 (review r2): every in-flight join-artifact egress task
+    /// (join-result send, control-blob staging and chunk sends), keyed by
+    /// `(group id, recipient hex)`. Registered under the group's membership
+    /// lock before it runs; a removal or ban aborts and awaits them inside
+    /// its critical section, before it commits.
+    pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
+    /// #1274 r3: the shutdown drain's completion fence for join-artifact
+    /// egress. One `AbortHandle` per accepted egress task, pushed under the
+    /// `join_artifact_egress` lock when the task is registered, and pruned
+    /// only once the task is finished. A task's own cleanup and the
+    /// removal/ban quiesce edit the registry above, so registry emptiness
+    /// does not prove that a task has released what it captured; a
+    /// finished task has. Tokio drops a task's future, and with it every
+    /// owner the future captured, before it marks the task complete
+    /// (tokio 1.53 `runtime/task/harness.rs`: `poll_future` stores the
+    /// output, replacing the future, and `cancel_task` drops it, both
+    /// before `complete()` sets COMPLETE, which `AbortHandle::is_finished`
+    /// reads). Lock order: `join_artifact_egress`, then this.
+    pub(super) join_artifact_egress_owners: StdMutex<Vec<tokio::task::AbortHandle>>,
+    /// ADR 0107 (review r2; r5 G6): fair, coalescing admission for Welcome
+    /// `FetchRequest` handlers, which run off the single Welcome listener
+    /// loop (they can wait on a group membership lock): one in-flight
+    /// handler per Welcome, a per-group share and a global cap.
+    pub(super) welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r5 G7): fair, coalescing admission for join-result
+    /// `FetchRequest` handlers, which run off the shared join-result
+    /// listener: one in-flight handler per `(group, member)`, a per-group
+    /// share and a global cap.
+    pub(super) join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r5 G8): fair, coalescing admission for join-result chunk
+    /// tasks: one in-flight task per chunk, a per-group share and a global
+    /// cap. A fetch is validated (staged copy, existing sequence) first.
+    pub(super) join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r6 P3): fair, coalescing admission for inline join-result
+    /// egress tasks: one in flight per `(group, recipient)` (the ticket
+    /// lives in the task), a per-group share and a global cap.
+    pub(super) join_result_egress_admission: crate::server::routes::named_groups::FairAdmission,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,
@@ -1081,10 +1171,11 @@ pub(super) struct AppState {
     /// #946 r2: requester-side per-digest suppression for group-scoped
     /// certificate fetches (in-flight dedup + 60 s negative cache).
     pub(super) cert_fetch_requested:
-        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: responder-side suppression deadline per (stable group id,
     /// digest) — the answer rate limit and the miss negative cache.
-    pub(super) cert_fetch_answered: StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    pub(super) cert_fetch_answered:
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: the current certificate-unobtainable refusal window per
     /// (stable group id, joining member) — the typed refusal is staged only
     /// after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
@@ -1252,12 +1343,130 @@ pub(super) struct AppState {
     pub(super) named_group_test_recorders: NamedGroupTestRecorders,
 }
 
+impl AppState {
+    /// #1269: spawn `task` and register it in [`AppState::detached_tasks`],
+    /// so the shutdown tail drains it (grace, then abort). Once shutdown has
+    /// closed admission, `task` is dropped unrun and `false` is returned.
+    pub(super) fn spawn_detached<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_detached_with_abort(task).is_some()
+    }
+
+    /// #1288 row 4: [`spawn_detached`](Self::spawn_detached), plus the task's
+    /// abort handle so a WebSocket session can stop one child on
+    /// unsubscribe without dropping the drain's `JoinHandle`. `None` once
+    /// shutdown has closed admission; `task` is not started.
+    pub(super) fn spawn_detached_with_abort<F>(&self, task: F) -> Option<tokio::task::AbortHandle>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tasks = guard.as_mut()?;
+        // Reap finished tasks so the registry holds only live ones.
+        tasks.retain(|task| !task.is_finished());
+        let handle = tokio::spawn(task);
+        let abort = handle.abort_handle();
+        tasks.push(handle);
+        Some(abort)
+    }
+
+    /// #1269: whether shutdown has closed detached-task admission.
+    pub(super) fn detached_admission_closed(&self) -> bool {
+        self.detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// #1269 r2: spawn an apply that persists group state and register it in
+    /// [`AppState::shielded_tasks`]. Shutdown awaits it and never aborts it.
+    /// Once shutdown has closed admission, `task` is dropped unrun (the apply
+    /// never starts) and `false` is returned.
+    pub(super) fn spawn_shielded<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .shielded_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tasks) = guard.as_mut() else {
+            return false;
+        };
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(task));
+        true
+    }
+
+    /// #1269 r2: run `task` as a shielded apply and wait for its output. If
+    /// the caller is aborted or times out while it waits, the apply still
+    /// runs to completion. `None` when shutdown refused it before it
+    /// started.
+    pub(super) async fn run_shielded<F>(&self, task: F) -> Option<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let admitted = self.spawn_shielded(async move {
+            let _ = done_tx.send(task.await);
+        });
+        if !admitted {
+            return None;
+        }
+        done_rx.await.ok()
+    }
+}
+
+/// ADR 0107 (review r2): in-flight join-artifact egress tasks keyed by
+/// `(group id, recipient hex)` (see `AppState::join_artifact_egress`).
+pub(super) type JoinArtifactEgressRegistry =
+    HashMap<(String, String), Vec<tokio::task::JoinHandle<()>>>;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct NamedGroupTestRecorders {
     pub(super) publish_attempts: StdMutex<Vec<(String, String, Option<String>)>>,
     pub(super) publish_bytes: StdMutex<Vec<(String, Vec<u8>)>>,
     pub(super) direct_deliveries: StdMutex<Vec<(String, String, &'static str, &'static str)>>,
+    /// ADR 0107: every join result the `FetchRequest` arm decided to serve,
+    /// as `(recipient, group, exact payload)`, recorded at the serve
+    /// DECISION (before any egress task runs). Tests read the payload here.
+    pub(super) join_result_serves: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (review r2): every join-artifact EGRESS handoff, as
+    /// `(recipient, group, kind)`, recorded immediately before the bytes
+    /// are handed to the transport (`join_result`, `join_result_reference`,
+    /// `join_result_chunk`, `welcome_frame`).
+    pub(super) join_artifact_egress: StdMutex<Vec<(String, String, &'static str)>>,
+    /// ADR 0107 (review r2 P1-2): the delivery path every join-artifact
+    /// egress was handed to, as `(recipient, kind, can_reach_gossip)`. A
+    /// path that can reach the gossip inbox can leave the bytes with a
+    /// detached stranded-publish retry.
+    pub(super) join_artifact_delivery_paths: StdMutex<Vec<(String, &'static str, bool)>>,
+    /// ADR 0107 (r5, G3): the transport discipline every class-R exchange
+    /// was handed to, as `(recipient, kind, transport)`. Only
+    /// `pinned_single_exchange` admits every physical write.
+    pub(super) join_artifact_transports: StdMutex<Vec<(String, &'static str, &'static str)>>,
+    /// x0x #1150 (r7b): every class-R/class-K exchange's outcome, in
+    /// order, as `(recipient, kind, error text)`; an empty text is a write.
+    pub(super) join_artifact_outcomes: StdMutex<Vec<(String, &'static str, String)>>,
+    /// ADR 0107 (r5, G4): ordered lifecycle events — an egress task or
+    /// Welcome stream ending (`egress_ended:<group>:<recipient>`,
+    /// `welcome_stream_ended:<welcome id>`) and a terminal commit
+    /// (`tombstone_persist:<group>`) — so tests can check quiesce-then-commit
+    /// ordering.
+    pub(super) join_artifact_lifecycle: StdMutex<Vec<String>>,
+    /// ADR 0107 / D60 (r5, G11): every class-K share delivery scheduled, as
+    /// `(group, recipient, exact payload)`.
+    pub(super) secure_share_scheduled: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (r6): seconds added to the stream seam's clock, to land a
+    /// certificate expiry between the pre-phase and the seam.
+    pub(super) seam_clock_skew_secs: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]

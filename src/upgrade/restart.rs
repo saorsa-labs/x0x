@@ -99,11 +99,22 @@ pub struct SupervisionSignals {
     pub stdin_is_tty: bool,
 }
 
+/// Whether systemd's `INVOCATION_ID` is set. #1196 r2: an installed readback
+/// scenario stands in for it in tests, so tests never mutate the process
+/// environment.
+fn sampled_invocation_id() -> bool {
+    #[cfg(test)]
+    if let Some(present) = systemd_readback_seam::invocation_id_present() {
+        return present;
+    }
+    std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty())
+}
+
 impl SupervisionSignals {
     /// Sample the real process environment.
     pub fn sample() -> Self {
         Self {
-            invocation_id: std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty()),
+            invocation_id: sampled_invocation_id(),
             x0x_supervised: std::env::var(SUPERVISED_ENV_VAR).as_deref() == Ok("1"),
             parent_comm: parent_comm(),
             stdin_is_tty: stdin_is_tty(),
@@ -665,6 +676,22 @@ pub enum SystemdPolicyReadback {
     /// `SupervisedExit` on any of these is the silent-service-disappearance
     /// failure §3 exists to prevent.
     NotGuaranteed { detail: String },
+    /// Every guarantee EXCEPT the start-rate window was confirmed: the
+    /// unit's current activation has not yet outlived
+    /// `StartLimitIntervalUSec`, so a restart now could still hit the
+    /// start limit. Distinct from `NotGuaranteed` because the refusal is
+    /// time-bound, not a policy defect — the daemon's startup check waits
+    /// out `retry_after` and retries the apply once instead of skipping the
+    /// version (#1196); every other apply path keeps refusing on contact.
+    StartRateWindowPending {
+        /// Why the window has not aged out (the guard's own refusal text).
+        detail: String,
+        /// How long — from the readback's own
+        /// `ActiveEnterTimestampMonotonic`/`StartLimitIntervalUSec` sample —
+        /// until the activation has outlived the interval. Never a
+        /// hard-coded default interval.
+        retry_after: Duration,
+    },
 }
 
 /// Whether the recognized supervision signal names a systemd unit (either
@@ -1219,16 +1246,27 @@ fn readback_systemd_policy_in(
             );
         };
         match monotonic_now_us {
-            Some(now_us) if now_us > active_enter_us && now_us - active_enter_us > interval_us => {
-                // Stable old service: the window has aged out completely.
-            }
-            Some(_) => {
-                return refuse(
-                    "the unit's current activation has not outlived StartLimitIntervalUSec; \
-                     a restart now could hit the start-rate limit and leave the service \
-                     down (man systemd.service)"
-                        .to_string(),
-                );
+            Some(now_us) => {
+                let elapsed_us = now_us.saturating_sub(active_enter_us);
+                if elapsed_us > interval_us {
+                    // Stable old service: the window has aged out completely.
+                } else {
+                    // #1196: this is the LAST check in the readback, so a
+                    // refusal here means every other guarantee above WAS
+                    // confirmed — the only problem is that the window has
+                    // not aged out yet. Report it as time-bound (with the
+                    // readback's own remaining window, never a hard-coded
+                    // interval) so the daemon's startup check can wait it
+                    // out and retry once; other callers keep refusing.
+                    return SystemdPolicyReadback::StartRateWindowPending {
+                        detail: "the unit's current activation has not outlived \
+                                 StartLimitIntervalUSec; a restart now could hit the \
+                                 start-rate limit and leave the service down (man \
+                                 systemd.service)"
+                            .to_string(),
+                        retry_after: Duration::from_micros(interval_us - elapsed_us),
+                    };
+                }
             }
             None => {
                 return refuse(
@@ -1799,6 +1837,16 @@ pub fn readback_systemd_policy(
     if systemd_signal_name(signals).is_none() {
         return SystemdPolicyReadback::NotApplicable;
     }
+    // #1196 round 2 test seam (cfg(test) only): an in-process test that
+    // installed a [`systemd_readback_seam::Scenario`] answers the readback
+    // from the REAL decision logic with an injected `systemctl show`
+    // output, busctl snapshot and monotonic clock, instead of this
+    // driver's `/proc` + subprocess sampling. Compiled out in non-test
+    // builds; an uninstalled scenario changes nothing.
+    #[cfg(test)]
+    if let Some(verdict) = systemd_readback_seam::intercept(executable, argv) {
+        return verdict;
+    }
     let cgroup = match std::fs::read_to_string("/proc/self/cgroup") {
         Ok(c) => c,
         Err(e) => {
@@ -1834,6 +1882,17 @@ pub fn readback_systemd_policy(
     _executable: &Path,
     _argv: &[String],
 ) -> SystemdPolicyReadback {
+    // #1196 round 2 test seam (cfg(test) only): the non-Linux twin of the
+    // driver seam above, behind the same signal gate, so an in-process
+    // test drives the real readback decision table on any platform.
+    // Compiled out in non-test builds, where this stub always answers
+    // `NotApplicable`.
+    #[cfg(test)]
+    if systemd_signal_name(_signals).is_some() {
+        if let Some(verdict) = systemd_readback_seam::intercept(_executable, _argv) {
+            return verdict;
+        }
+    }
     SystemdPolicyReadback::NotApplicable
 }
 
@@ -1853,6 +1912,173 @@ pub async fn readback_systemd_policy_offloaded(
         .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
             detail: format!("systemd readback task failed: {e}"),
         })
+}
+
+/// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test drive the daemon's startup update
+/// check END TO END against the REAL readback decision logic
+/// ([`readback_systemd_policy_in`]) by injecting the world the Linux
+/// driver would have sampled — the `systemctl show` property text, the
+/// structured `ExecStart` snapshot derived from it, the monotonic clock,
+/// the cgroup and the invocation id — instead of shelling out to a real
+/// systemd (none exists on the test hosts). The seam intercepts
+/// [`readback_systemd_policy`] behind the same supervision-signal gate the
+/// Linux driver uses; it is compiled out entirely in non-test builds, and
+/// a test that installs no scenario observes production behaviour.
+#[cfg(test)]
+pub(crate) mod systemd_readback_seam {
+    use super::{
+        parse_invocation_id_hex, readback_systemd_policy_in, BusctlExecStart,
+        SystemdPolicyReadback, SystemdReadbackInput,
+    };
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// What the readback's Nth call should observe.
+    pub(crate) struct ReadbackCall {
+        /// Full `systemctl show` property text for the unit, exactly as
+        /// the bounded collector would return it.
+        pub show_output: String,
+        /// Monotonic clock (µs) at the readback — the value the Linux
+        /// driver samples from `CLOCK_MONOTONIC`.
+        pub monotonic_now_us: u64,
+    }
+
+    /// An installed readback scenario. `calls[n]` (0-based) answers the
+    /// readback's n-th invocation; calls beyond the table reuse the last
+    /// entry, so a scenario of one Verified call stays Verified.
+    pub(crate) struct Scenario {
+        /// This process's cgroup, naming the unit under test (fixture:
+        /// `0::/system.slice/x0xd.service`).
+        pub cgroup: String,
+        /// The `INVOCATION_ID` the process reports, when set. While the
+        /// scenario is installed it stands in for the real environment
+        /// variable (`SupervisionSignals::sample`), so tests never call
+        /// `std::env::set_var`.
+        pub invocation_id: Option<String>,
+        /// Per-call show output + monotonic clock.
+        pub calls: Vec<ReadbackCall>,
+    }
+
+    struct Installed {
+        scenario: Scenario,
+        next_call: usize,
+    }
+
+    static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
+
+    /// Uninstalls the scenario on drop, so a test cannot leak its fixture
+    /// into sibling tests in the same process.
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = INSTALLED.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Install `scenario` as the readback's world for the guard's lifetime.
+    pub(crate) fn install(scenario: Scenario) -> Guard {
+        let mut slot = INSTALLED.lock().expect("systemd readback seam poisoned");
+        *slot = Some(Installed {
+            scenario,
+            next_call: 0,
+        });
+        Guard { _private: () }
+    }
+
+    /// Whether an installed scenario reports an `INVOCATION_ID` (`Some`), or
+    /// `None` when no scenario is installed (use the real environment).
+    pub(crate) fn invocation_id_present() -> Option<bool> {
+        let slot = INSTALLED.lock().ok()?;
+        slot.as_ref().map(|installed| {
+            installed
+                .scenario
+                .invocation_id
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        })
+    }
+
+    /// The readback verdict for the n-th call of an installed scenario, or
+    /// `None` when no scenario is installed (fall through to the driver).
+    pub(crate) fn intercept(executable: &Path, argv: &[String]) -> Option<SystemdPolicyReadback> {
+        let (show_output, monotonic_now_us, cgroup, invocation_id) = {
+            let mut slot = INSTALLED.lock().expect("systemd readback seam poisoned");
+            let installed = slot.as_mut()?;
+            let call = installed
+                .scenario
+                .calls
+                .get(installed.next_call)
+                .or_else(|| installed.scenario.calls.last())?;
+            installed.next_call += 1;
+            (
+                call.show_output.clone(),
+                call.monotonic_now_us,
+                installed.scenario.cgroup.clone(),
+                installed.scenario.invocation_id.clone(),
+            )
+        };
+        let pid = std::process::id();
+        let structured = structured_from_show(&show_output, pid, invocation_id.as_deref());
+        Some(readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: &cgroup,
+                pid,
+                invocation_id: invocation_id.as_deref(),
+                executable,
+                argv,
+                monotonic_now_us: Some(monotonic_now_us),
+            },
+            &mut move |_user_manager, _unit| Ok(Some(show_output.clone())),
+            &mut move |_user_manager, _unit| Ok(structured.clone()),
+            // Fixture ExecStart paths are the running executable verbatim,
+            // so plain path equality is the fixture's same-executable
+            // relation; production canonicalization stays on the Linux
+            // driver path this seam replaces.
+            &|loaded, ours| Path::new(loaded) == ours,
+        ))
+    }
+
+    /// Test-fixture bridge: derive the structured `ExecStart` snapshot the
+    /// way the fixture's `systemctl show` ExecStart line renders it — the
+    /// same derivation the readback unit tests use. Production boundaries
+    /// come from the busctl JSON array, never this split.
+    fn structured_from_show(show: &str, pid: u32, invocation: Option<&str>) -> BusctlExecStart {
+        let line = show
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap_or("");
+        let path = line
+            .split("path=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let argv: Vec<String> = line
+            .split("argv[]=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        BusctlExecStart {
+            path,
+            argv,
+            main_pid: pid,
+            invocation_id: invocation.and_then(parse_invocation_id_hex),
+        }
+    }
 }
 
 /// The instance's restart contract could not be resolved, so no bytes may be
@@ -1940,6 +2166,15 @@ pub enum RestartOwnershipError {
         exit_code: i32,
         /// Why the loaded policy could not be confirmed.
         detail: String,
+        /// Present only when the single unconfirmed guarantee is the
+        /// start-rate window: how long (per the readback's own sample)
+        /// until the activation outlives `StartLimitIntervalUSec`. The
+        /// daemon's startup check waits it out and retries the apply once
+        /// instead of skipping the version (#1196); `None` on every other
+        /// refusal, which keeps today's refuse-and-skip behaviour. Not
+        /// interpolated into the message above — the `detail` already
+        /// carries the specifics.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -2071,16 +2306,29 @@ pub fn resolve_restart_plan(
     if mode == RestartMode::SupervisedExit {
         if let Some(signal) = systemd_signal_name(signals) {
             if !matches!(systemd_readback, SystemdPolicyReadback::Verified(_)) {
-                let detail = match systemd_readback {
-                SystemdPolicyReadback::NotGuaranteed { detail } => detail.clone(),
-                _ => "the systemd readback did not run for a systemd-signalled                       instance"
-                    .to_string(),
-            };
+                let (detail, retry_after) = match systemd_readback {
+                    SystemdPolicyReadback::NotGuaranteed { detail } => (detail.clone(), None),
+                    // #1196: the start-rate window is the single unmet
+                    // guarantee, and it is time-bound — carry the readback's
+                    // remaining window so the startup check can wait and
+                    // retry once. Still an error: nothing may be replaced
+                    // until the window has aged out.
+                    SystemdPolicyReadback::StartRateWindowPending {
+                        detail,
+                        retry_after,
+                    } => (detail.clone(), Some(*retry_after)),
+                    _ => (
+                        "the systemd readback did not run for a systemd-signalled instance"
+                            .to_string(),
+                        None,
+                    ),
+                };
                 return Err(
                     RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
                         signal: signal.to_string(),
                         exit_code: supervised_exit_code(),
                         detail,
+                        retry_after,
                     },
                 );
             }
@@ -5078,8 +5326,11 @@ mod tests {
             matches!(v, SystemdPolicyReadback::Verified(_)),
             "aged-out window"
         );
-        // Fresh activation (2 s ago < 10 s): refuse — the window may still
-        // count prior attempts.
+        // Fresh activation (2 s ago < 10 s): refused as time-bound, not a
+        // policy defect — the #1196 contract. Every other guarantee in the
+        // same show output WAS confirmed, and the remaining window (8 s) is
+        // read from the readback's own ActiveEnterTimestampMonotonic +
+        // StartLimitIntervalUSec sample, never hard-coded.
         let v = run_readback(
             SYSTEM_CGROUP,
             4242,
@@ -5089,8 +5340,30 @@ mod tests {
             Some(3_000_000),
         );
         assert!(
-            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("start-rate")),
-            "fresh activation refuses"
+            matches!(
+                &v,
+                SystemdPolicyReadback::StartRateWindowPending { detail, retry_after }
+                    if detail.contains("start-rate") && *retry_after == Duration::from_secs(8)
+            ),
+            "fresh activation is a retryable start-rate refusal: {v:?}"
+        );
+        // Boundary: elapsed == interval is NOT outlived (the guard requires
+        // strictly greater), so the pending refusal carries a zero wait.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "5", "1000000"))),
+            Some(11_000_000),
+        );
+        assert!(
+            matches!(
+                &v,
+                SystemdPolicyReadback::StartRateWindowPending { retry_after, .. }
+                    if *retry_after == Duration::ZERO
+            ),
+            "elapsed == interval is still inside the window: {v:?}"
         );
         // Ambiguous: no monotonic clock with a live limit.
         let v = run_readback(
@@ -5224,14 +5497,34 @@ mod tests {
         let unit = plan.systemd_verified.expect("plan carries the unit");
         assert_eq!(unit.unit, "x0xd.service");
         assert_eq!(unit.restart, "always");
-        // NotGuaranteed → refusal naming the systemd policy.
+        // NotGuaranteed → refusal naming the systemd policy, with NO retry
+        // wait: a permanent policy defect is not waited out (#1196 keeps
+        // today's behaviour for every refusal except the start-rate window).
         let err = mk(SystemdPolicyReadback::NotGuaranteed {
             detail: "unit `x0xd.service` has Restart=\"no\"".into(),
         })
         .expect_err("not-guaranteed readback refuses");
         assert!(matches!(
-            err,
-            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed { .. }
+            &err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                retry_after: None,
+                ..
+            }
+        ));
+        // StartRateWindowPending (#1196): still a refusal — nothing may be
+        // replaced inside the window — but the error carries the readback's
+        // remaining window so the startup check can wait and retry once.
+        let err = mk(SystemdPolicyReadback::StartRateWindowPending {
+            detail: "the unit's current activation has not outlived StartLimitIntervalUSec".into(),
+            retry_after: Duration::from_secs(7),
+        })
+        .expect_err("pending window still refuses");
+        assert!(matches!(
+            &err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                retry_after: Some(wait),
+                ..
+            } if *wait == Duration::from_secs(7)
         ));
         // NotApplicable while the signal IS systemd → refusal.
         let err = mk(SystemdPolicyReadback::NotApplicable).expect_err("missing readback refuses");

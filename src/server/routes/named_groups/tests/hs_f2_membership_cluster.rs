@@ -487,6 +487,9 @@ async fn issue447_rejected_member_joined_is_retained_and_retried() -> Result<()>
 /// pin but NO roster seat must read `pending_authority_commit`, not a bare
 /// success. A seated member still reads `active`.
 #[tokio::test]
+// #1166 S5: join-state PROBE (asserts the #447/#458 label), not
+// admission.
+#[allow(clippy::disallowed_methods)]
 async fn issue447_typed_pending_join_state() -> Result<()> {
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let group_id = "48".repeat(32);
@@ -1101,6 +1104,8 @@ async fn issue458_third_party_cannot_adopt_across_gap() -> Result<()> {
 /// 2026-08-30/31 campaigns wedged on (#447 evidence timing + #457 rename
 /// binding + #458 rename-gap commit).
 #[tokio::test]
+// #1166 S5: join-state PROBE, as above.
+#[allow(clippy::disallowed_methods)]
 async fn integration_rename_restart_certified_join_single_announce() -> Result<()> {
     let owner_dir = tempfile::tempdir()?;
     let owner_seed = [0x0F; 32];
@@ -9124,5 +9129,63 @@ async fn replaced_not_durable_owner_seal_withholds_the_notification_759() -> Res
     assert!(sync.read().await.get_task(&task_id).is_none());
     let row = diagnostics_row(state.as_ref(), &group_id).await;
     assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue1103_gap_adoption_does_not_publish_a_failed_clear() -> Result<()> {
+    for fault in [SaveFault::Error, SaveFault::NotReplaced] {
+        let stage = Arc::new(r3_stage(0x9C).await?);
+        let terminal_revision = match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit.revision,
+            _ => panic!("staged terminal commit"),
+        };
+        {
+            let mut groups = stage.joiner_state.named_groups.write().await;
+            let info = groups.get_mut(&stage.group_id).expect("stub");
+            let header = info.terminal_commit_header();
+            info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                revision: terminal_revision - 1,
+                state_hash: "issue1103-conflict".to_string(),
+                committed_by: stage.authority_hex.clone(),
+                observed_at_ms: now_millis_u64(),
+                snapshot: x0x::groups::ForkSnapshot {
+                    terminal_commit: header.clone(),
+                    conflicting_commit: header,
+                    classification: None,
+                },
+                no_anchor: false,
+            });
+        }
+        // Confirm the fixture for persistence; otherwise the pending-stub
+        // filter deliberately omits it and cannot provide a reload control.
+        stage
+            .joiner_state
+            .pending_join_stubs
+            .lock()
+            .expect("stub lock")
+            .remove(&stage.group_id);
+        assert_eq!(
+            persist_named_groups_mutation(&stage.joiner_state, |_| true).await?,
+            AtomicWriteOutcome::Durable
+        );
+        let state = Arc::clone(&stage.joiner_state);
+        let group_id = stage.group_id.clone();
+        let joiner_hex = stage.joiner_hex.clone();
+        let task_stage = Arc::clone(&stage);
+        let result = super::fork_quarantine::fail_clear_before_publication(
+            &state,
+            &group_id,
+            0,
+            fault,
+            async move { r3_apply_with_chain(&task_stage, task_stage.chain.clone()).await },
+        )
+        .await?;
+        assert!(!result.accepted);
+        assert!(!state.named_groups.read().await[&group_id].has_active_member(&joiner_hex));
+    }
     Ok(())
 }

@@ -6,7 +6,9 @@
 
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
-use crate::revocation::RevocationSet;
+use crate::revocation::{
+    RevocationSet, REVOCATIONS_FILE_MAGIC, REVOCATIONS_FILE_MAGIC_V2, REVOCATIONS_FILE_MAGIC_V3,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -263,6 +265,7 @@ const REVOCATION_FILE: &str = "revocations.bin";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let _revocation_guard = revocation_write_guard(path).await?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -309,6 +312,129 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Which half of a durable atomic write failed — the two halves have
+/// OPPOSITE rollback semantics (issue #1101; the same split
+/// `OwnerSyncStore` introduced for its `write_atomically`, review R5
+/// finding 2).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DurableWriteError {
+    /// Failed before the rename: the OLD bytes are still on disk and no
+    /// new bytes are visible; callers may safely roll in-memory state
+    /// back.
+    BeforeRename(std::io::Error),
+    /// The rename happened but the post-rename parent-directory open or
+    /// fsync failed: the NEW bytes are already in place on disk; rolling
+    /// memory back would leave it behind an advanced disk. Callers must
+    /// align memory with the new disk instead (and fail-stop where the
+    /// durability contract demands it).
+    AfterRename(std::io::Error),
+}
+
+impl std::fmt::Display for DurableWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeRename(e) => {
+                write!(f, "durable write failed before the rename (disk unchanged): {e}")
+            }
+            Self::AfterRename(e) => write!(
+                f,
+                "durable write failed after the rename (new bytes are in place, durability unconfirmed): {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeRename(e) | Self::AfterRename(e) => Some(e),
+        }
+    }
+}
+
+impl DurableWriteError {
+    /// Whether the failure arrived AFTER the atomic rename — the NEW
+    /// bytes are already visible on disk and memory must not be rolled
+    /// back below them (issue #1101).
+    #[must_use]
+    pub fn crossed_rename(&self) -> bool {
+        matches!(self, Self::AfterRename(_))
+    }
+
+    /// Prefix the carried message with `path` context without changing
+    /// which half failed (the variant is the contract; the message is for
+    /// logs).
+    #[must_use]
+    pub fn with_path(self, path: &Path) -> Self {
+        let contextual =
+            |e: &std::io::Error| std::io::Error::other(format!("{}: {e}", path.display()));
+        match self {
+            Self::BeforeRename(e) => Self::BeforeRename(contextual(&e)),
+            Self::AfterRename(e) => Self::AfterRename(contextual(&e)),
+        }
+    }
+}
+
+/// Test-only fault injection for [`write_private_bytes_durable`]
+/// (issue #1101): while a target path is armed, the parent-directory
+/// fsync — durable point 2, AFTER the atomic rename — fails for writes
+/// to exactly that path, so tests can prove each caller keeps memory
+/// aligned with the already-advanced disk. Mirrors
+/// `OwnerSyncStore::set_fail_after_rename_for_testing`; compiled only
+/// for this crate's own test builds (`cfg(test)` — no env var, no cargo
+/// feature). Path-scoped, not process-global: threaded `cargo test`
+/// runs the whole suite in one process, where a global flag armed by
+/// any test would fail every concurrent durable write in the others.
+#[cfg(test)]
+static FAIL_PARENT_DIR_FSYNC_FOR_TESTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Disarms only the path this guard armed, on drop, so a panicking
+/// assertion cannot leak the injected fault — not even to other tests'
+/// writes in the same process.
+#[cfg(test)]
+pub(crate) struct FailParentDirFsyncGuard {
+    path: std::path::PathBuf,
+}
+
+/// Arm the parent-directory fsync failure seam for writes to `path`
+/// (issue #1101): until the returned guard is dropped, durable writes
+/// to exactly this path fail AFTER the atomic rename; writes to every
+/// other path are unaffected.
+#[cfg(test)]
+pub(crate) fn arm_fail_parent_dir_fsync_for_testing(path: &Path) -> FailParentDirFsyncGuard {
+    FAIL_PARENT_DIR_FSYNC_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+    FailParentDirFsyncGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+/// Whether `path` is armed in [`FAIL_PARENT_DIR_FSYNC_FOR_TESTING`].
+#[cfg(test)]
+fn fails_parent_dir_fsync_for_testing(path: &Path) -> bool {
+    FAIL_PARENT_DIR_FSYNC_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|armed| armed == path)
+}
+
+#[cfg(test)]
+impl Drop for FailParentDirFsyncGuard {
+    fn drop(&mut self) {
+        let mut armed = FAIL_PARENT_DIR_FSYNC_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|p| *p == self.path) {
+            armed.swap_remove(idx);
+        }
+    }
+}
+
 /// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
 /// temp file (0600) → `sync_all` the file → atomic rename into place →
 /// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
@@ -318,8 +444,78 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created, the write, the
-/// file sync, the rename, or the parent-directory sync fails.
+/// file sync, the rename, or the parent-directory sync fails. This error
+/// does not say whether the rename happened. A caller that rolls memory
+/// back on failure must use [`write_private_bytes_durable_typed`]
+/// instead (issue #1101).
 pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    // The guard's own error passes through unchanged, as before #1101.
+    let guard = revocation_write_guard(path).await?;
+    write_private_bytes_durable_guarded(path, bytes, guard)
+        .await
+        .map_err(durable_write_identity_error)
+}
+
+/// [`write_private_bytes_durable`], with a typed error that says which
+/// half of the write failed (issue #1101). The write itself is the same:
+/// temp file (0600), file fsync, atomic rename, parent-directory fsync.
+///
+/// # Errors
+/// [`DurableWriteError::BeforeRename`] when the failure precedes the
+/// rename (the revocation-store guard, directory creation, the write,
+/// the file sync, the chmod or the rename itself): the destination still
+/// holds its OLD bytes, so callers may roll in-memory state back.
+/// [`DurableWriteError::AfterRename`] when the parent-directory open or
+/// fsync fails: the NEW bytes are already in place and callers must NOT
+/// roll memory back below the advanced disk.
+pub async fn write_private_bytes_durable_typed(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), DurableWriteError> {
+    let guard = revocation_write_guard(path)
+        .await
+        .map_err(guard_refusal_before_rename)?;
+    write_private_bytes_durable_guarded(path, bytes, guard).await
+}
+
+/// V3's read/merge already validated the file and holds its write guard.
+/// Consume that guard through fsync rather than reading the file twice.
+pub(crate) async fn write_revocation_bytes_durable(
+    bytes: Vec<u8>,
+    guard: RevocationWriteGuard,
+) -> Result<()> {
+    let path = guard.path.clone();
+    write_private_bytes_durable_guarded(&path, bytes, Some(guard))
+        .await
+        .map_err(durable_write_identity_error)
+}
+
+/// The revocation-store guard runs before any byte is written, so its
+/// refusal is a [`DurableWriteError::BeforeRename`]. The `io::Error` is
+/// moved, not re-wrapped: its [`RevocationPersistenceBlocked`] source
+/// stays in place for [`revocation_persistence_is_blocked`].
+fn guard_refusal_before_rename(error: IdentityError) -> DurableWriteError {
+    match error {
+        IdentityError::Storage(io) => DurableWriteError::BeforeRename(io),
+        other => DurableWriteError::BeforeRename(std::io::Error::other(other)),
+    }
+}
+
+/// The untyped writers' historical error: `IdentityError::Storage` with
+/// the original `io::Error` (and its source) for either half.
+fn durable_write_identity_error(error: DurableWriteError) -> IdentityError {
+    match error {
+        DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+            IdentityError::Storage(io)
+        }
+    }
+}
+
+async fn write_private_bytes_durable_guarded(
+    path: &Path,
+    bytes: Vec<u8>,
+    _revocation_guard: Option<RevocationWriteGuard>,
+) -> std::result::Result<(), DurableWriteError> {
     use tokio::io::AsyncWriteExt;
 
     let parent = path
@@ -328,10 +524,10 @@ pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .await
-        .map_err(IdentityError::from)?;
+        .map_err(DurableWriteError::BeforeRename)?;
 
     let file_name = path.file_name().ok_or_else(|| {
-        IdentityError::from(std::io::Error::new(
+        DurableWriteError::BeforeRename(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid path: missing file name",
         ))
@@ -346,16 +542,16 @@ pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<
 
     let mut file = fs::File::create(&tmp_path)
         .await
-        .map_err(IdentityError::from)?;
+        .map_err(DurableWriteError::BeforeRename)?;
     if let Err(err) = file.write_all(&bytes).await {
         let _ = fs::remove_file(&tmp_path).await;
-        return Err(IdentityError::from(err));
+        return Err(DurableWriteError::BeforeRename(err));
     }
     // Durable point 1: the journal bytes reach stable storage BEFORE the
     // rename makes them visible.
     if let Err(err) = file.sync_all().await {
         let _ = fs::remove_file(&tmp_path).await;
-        return Err(IdentityError::from(err));
+        return Err(DurableWriteError::BeforeRename(err));
     }
     drop(file);
 
@@ -363,23 +559,38 @@ pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<
     {
         let mut perms = fs::metadata(&tmp_path)
             .await
-            .map_err(IdentityError::from)?
+            .map_err(DurableWriteError::BeforeRename)?
             .permissions();
         perms.set_mode(0o600);
         fs::set_permissions(&tmp_path, perms)
             .await
-            .map_err(IdentityError::from)?;
+            .map_err(DurableWriteError::BeforeRename)?;
     }
 
     if let Err(err) = fs::rename(&tmp_path, path).await {
         let _ = fs::remove_file(&tmp_path).await;
-        return Err(IdentityError::from(err));
+        return Err(DurableWriteError::BeforeRename(err));
+    }
+
+    // Everything below runs with the NEW bytes already visible on disk.
+
+    // Test seam (issue #1101): fail the parent-directory fsync here for
+    // the armed path only, so PostRename callers can be exercised
+    // without a real fsync fault and without breaking concurrent
+    // durable writes to other paths in the same test process.
+    #[cfg(test)]
+    if fails_parent_dir_fsync_for_testing(path) {
+        return Err(DurableWriteError::AfterRename(std::io::Error::other(
+            "injected parent-directory fsync failure (test seam)",
+        )));
     }
 
     // Durable point 2: the rename itself survives power loss.
-    let dir = fs::File::open(parent).await.map_err(IdentityError::from)?;
+    let dir = fs::File::open(parent)
+        .await
+        .map_err(DurableWriteError::AfterRename)?;
     if let Err(err) = dir.sync_all().await {
-        return Err(IdentityError::from(err));
+        return Err(DurableWriteError::AfterRename(err));
     }
     Ok(())
 }
@@ -802,13 +1013,206 @@ pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<Agen
 ///
 /// When `identity_dir` is provided (multi-instance daemons), the file is
 /// stored there instead of the global `~/.x0x/` directory.
-fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+pub(crate) fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     match identity_dir {
         Some(dir) => Some(dir.join(REVOCATION_FILE)),
         // Issue #456: honor X0X_HOME (tests relocate this; never the real
         // home under the test harness).
         None => x0x_home_dir().map(|dir| dir.join(REVOCATION_FILE)),
     }
+}
+
+/// Each store keeps its existing decoder and load acceptance rules.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RevocationStore {
+    V1,
+    V2,
+    V3,
+}
+
+impl RevocationStore {
+    fn name(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::V3 => "v3",
+        }
+    }
+
+    fn at_path(path: &Path) -> Option<Self> {
+        match path.file_name()?.to_str()? {
+            "revocations.bin" => Some(Self::V1),
+            "revocations-v2.bin" => Some(Self::V2),
+            "revocations-v3.bin" => Some(Self::V3),
+            _ => None,
+        }
+    }
+
+    fn validate(self, bytes: &[u8]) -> Result<()> {
+        let magic = match self {
+            Self::V1 => REVOCATIONS_FILE_MAGIC,
+            Self::V2 => REVOCATIONS_FILE_MAGIC_V2,
+            Self::V3 => REVOCATIONS_FILE_MAGIC_V3,
+        };
+        RevocationSet::validate_persisted_bytes(bytes, magic)
+    }
+
+    fn decode(self, bytes: &[u8]) -> Result<RevocationSet> {
+        match self {
+            Self::V1 => RevocationSet::from_bytes(bytes),
+            Self::V2 => RevocationSet::from_bytes_v2(bytes),
+            Self::V3 => RevocationSet::from_bytes_v3(bytes),
+        }
+    }
+}
+
+/// Private typed refusal, retained as the source of IdentityError::Storage.
+/// No public error variant or persisted format is added.
+#[derive(Debug, thiserror::Error)]
+#[error("revocations-{store} persistence blocked at {path}: {error}")]
+pub(crate) struct RevocationPersistenceBlocked {
+    store: &'static str,
+    path: std::path::PathBuf,
+    error: String,
+}
+
+pub(crate) fn revocation_persistence_is_blocked(error: &IdentityError) -> bool {
+    matches!(error, IdentityError::Storage(io) if io.get_ref().is_some_and(|source| source.is::<RevocationPersistenceBlocked>()))
+}
+
+#[derive(Default)]
+struct RevocationStoreState {
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    unreadable: Option<String>,
+    last_persist_warning: Option<std::time::Instant>,
+}
+
+type RevocationStoreStates = std::collections::HashMap<std::path::PathBuf, RevocationStoreState>;
+
+fn revocation_store_states() -> &'static tokio::sync::Mutex<RevocationStoreStates> {
+    static STATES: std::sync::OnceLock<tokio::sync::Mutex<RevocationStoreStates>> =
+        std::sync::OnceLock::new();
+    STATES.get_or_init(|| tokio::sync::Mutex::new(RevocationStoreStates::new()))
+}
+
+/// Caller holds write serialization (and, for v3 merge, the OS file lock).
+/// Re-read even a previously blocked store: an operator repair clears the
+/// refusal without restart. Missing files permit first-run creation.
+async fn read_revocation_store_locked(
+    path: &Path,
+    store: RevocationStore,
+    persist_attempt: bool,
+) -> Result<Option<Vec<u8>>> {
+    let result = match fs::read(path).await {
+        Ok(bytes) => store.validate(&bytes).map(|()| Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(IdentityError::Storage(e)),
+    };
+    let mut states = revocation_store_states().lock().await;
+    let state = states.entry(path.to_path_buf()).or_default();
+    match result {
+        Ok(set) => {
+            state.unreadable = None;
+            state.last_persist_warning = None;
+            Ok(set)
+        }
+        Err(e) => {
+            state.unreadable = Some(e.to_string());
+            // Startup warnings must not consume the first persist-attempt
+            // window. Repeated persists warn at most once every 30 seconds.
+            let now = std::time::Instant::now();
+            if !persist_attempt
+                || state.last_persist_warning.is_none_or(|last| {
+                    now.duration_since(last) >= std::time::Duration::from_secs(30)
+                })
+            {
+                tracing::warn!(
+                    store = store.name(),
+                    path = %path.display(),
+                    error = %e,
+                    persistence_blocked = true,
+                    "revocation store unreadable; persistence refused until repaired"
+                );
+                if persist_attempt {
+                    state.last_persist_warning = Some(now);
+                }
+            }
+            Err(IdentityError::Storage(std::io::Error::other(
+                RevocationPersistenceBlocked {
+                    store: store.name(),
+                    path: path.to_path_buf(),
+                    error: state.unreadable.clone().unwrap_or_default(),
+                },
+            )))
+        }
+    }
+}
+
+/// Serialization is per store path. The global map mutex only protects
+/// warning state/lock lookup, never disk I/O or record signature checks.
+pub(crate) struct RevocationWriteGuard {
+    path: std::path::PathBuf,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn lock_revocation_path(path: &Path) -> RevocationWriteGuard {
+    // Path spelling is stable: all in-process revocation writers derive
+    // these filenames from the same identity_dir (or x0x_home_dir fallback).
+    // They do not independently resolve relative paths or symlink aliases,
+    // so load, probe and persist share this key, even before the file exists.
+    let lock = {
+        let mut states = revocation_store_states().lock().await;
+        std::sync::Arc::clone(&states.entry(path.to_path_buf()).or_default().write_lock)
+    };
+    RevocationWriteGuard {
+        path: path.to_path_buf(),
+        _lock: lock.lock_owned().await,
+    }
+}
+
+/// Load-only callers keep their fail-open fallback and verify authority
+/// after releasing storage serialization.
+pub(crate) async fn read_revocation_store(
+    path: &Path,
+    store: RevocationStore,
+    persist_attempt: bool,
+) -> Result<Option<RevocationSet>> {
+    let bytes = {
+        let _guard = lock_revocation_path(path).await;
+        read_revocation_store_locked(path, store, persist_attempt).await?
+    };
+    bytes.map(|bytes| store.decode(&bytes)).transpose()
+}
+
+/// V3 merge keeps this guard through the final durable write, and reads
+/// only once under its OS lock. Signature verification happens without
+/// holding the global bookkeeping mutex.
+pub(crate) async fn read_revocation_store_for_write(
+    path: &Path,
+    store: RevocationStore,
+) -> Result<(Option<RevocationSet>, RevocationWriteGuard)> {
+    let guard = lock_revocation_path(path).await;
+    let bytes = read_revocation_store_locked(path, store, true).await?;
+    let set = bytes.map(|bytes| store.decode(&bytes)).transpose()?;
+    Ok((set, guard))
+}
+
+/// Check an unchanged store for a rate-limited blocked-store warning.
+pub(crate) async fn probe_revocation_store(path: &Path, store: RevocationStore) -> Result<()> {
+    let _guard = lock_revocation_path(path).await;
+    read_revocation_store_locked(path, store, true).await?;
+    Ok(())
+}
+
+/// Both atomic writers use this guard, covering ordinary, pre-encoded and
+/// generic saves. It stays held from structural validation through fsync.
+async fn revocation_write_guard(path: &Path) -> Result<Option<RevocationWriteGuard>> {
+    let Some(store) = RevocationStore::at_path(path) else {
+        return Ok(None);
+    };
+    let guard = lock_revocation_path(path).await;
+    read_revocation_store_locked(path, store, true).await?;
+    Ok(Some(guard))
 }
 
 /// Load the local revocation set from disk.
@@ -822,19 +1226,9 @@ pub async fn load_revocation_set(identity_dir: Option<&Path>) -> RevocationSet {
     let Some(path) = revocation_path(identity_dir) else {
         return RevocationSet::new();
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => match RevocationSet::from_bytes(&bytes) {
-            Ok(set) => set,
-            Err(e) => {
-                tracing::warn!("Failed to load revocation set from {}: {e}", path.display());
-                RevocationSet::new()
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RevocationSet::new(),
-        Err(e) => {
-            tracing::warn!("Could not read revocation file {}: {e}", path.display());
-            RevocationSet::new()
-        }
+    match read_revocation_store(&path, RevocationStore::V1, false).await {
+        Ok(Some(set)) => set,
+        Ok(None) | Err(_) => RevocationSet::new(),
     }
 }
 
@@ -884,6 +1278,219 @@ pub async fn save_private_bytes_to(path: &std::path::Path, bytes: Vec<u8>) -> Re
 mod tests {
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
+
+    /// #1116 / ADR 0085 rule 4: a fail-open load must not authorize
+    /// overwriting an unreadable v1 file on the next ordinary persist.
+    #[tokio::test]
+    async fn unreadable_v1_revocations_survive_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let garbage = b"unreadable v1 revocations\x00\xff";
+        tokio::fs::write(&path, garbage)
+            .await
+            .expect("seed garbage");
+
+        let mut set = load_revocation_set(Some(dir.path())).await;
+        assert!(set.is_empty(), "ADR 0018 load remains fail-open");
+        let issuer = AgentKeypair::generate().expect("issuer key");
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(issuer.agent_id()),
+            issuer.public_key(),
+            issuer.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign self-revocation");
+        assert!(set.verify_and_insert(record, None).expect("insert"));
+
+        // Persistence may refuse the unreadable store; the original bytes
+        // and the newly accepted in-memory revocation must survive either way.
+        let refused = save_revocation_set(&set, Some(dir.path()))
+            .await
+            .expect_err("v1 write refused");
+        assert!(revocation_persistence_is_blocked(&refused));
+        assert!(set.is_agent_revoked(&issuer.agent_id()));
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read original file"),
+            garbage,
+            "persist must leave unreadable revocations.bin byte-identical"
+        );
+        tokio::fs::write(&path, RevocationSet::new().to_bytes().unwrap())
+            .await
+            .expect("operator repair");
+        save_revocation_set(&set, Some(dir.path()))
+            .await
+            .expect("repair unblocks v1");
+        assert!(load_revocation_set(Some(dir.path()))
+            .await
+            .is_agent_revoked(&issuer.agent_id()));
+    }
+
+    /// Missing stores are healthy, independent, and may be created by every
+    /// writer, including the pre-encoded v1 gossip path and generic v2 path.
+    #[tokio::test]
+    async fn missing_revocation_stores_allow_first_run_creation_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = RevocationSet::new();
+        assert!(load_revocation_set(Some(dir.path())).await.is_empty());
+        save_revocation_set(&set, Some(dir.path())).await.unwrap();
+        assert!(RevocationSet::from_bytes(
+            &fs::read(dir.path().join(REVOCATION_FILE)).await.unwrap()
+        )
+        .is_ok());
+        fs::remove_file(dir.path().join(REVOCATION_FILE))
+            .await
+            .unwrap();
+        save_revocation_set_bytes(set.to_bytes().unwrap(), Some(dir.path()))
+            .await
+            .unwrap();
+
+        // A blocked v1 must not prevent first-run v2/v3 creation.
+        fs::write(dir.path().join(REVOCATION_FILE), b"garbage")
+            .await
+            .unwrap();
+        assert!(save_revocation_set(&set, Some(dir.path())).await.is_err());
+        let v2 = dir.path().join("revocations-v2.bin");
+        save_private_bytes_to(&v2, set.to_bytes_v2().unwrap())
+            .await
+            .unwrap();
+        assert!(RevocationSet::from_bytes_v2(&fs::read(v2).await.unwrap()).is_ok());
+        let v3 = dir.path().join("revocations-v3.bin");
+        crate::persist_share_grant_revocations_durable(
+            &tokio::sync::RwLock::new(set),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(RevocationSet::from_bytes_v3(&fs::read(v3).await.unwrap()).is_ok());
+    }
+
+    /// Re-validation is required even when startup read healthy bytes.
+    /// Both raw writers must guard every store, and the pre-encoded v1
+    /// gossip writer must not bypass the ordinary save's refusal.
+    #[tokio::test]
+    async fn all_revocation_writers_refuse_post_load_corruption_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = RevocationSet::new();
+        for (name, store, bytes) in [
+            (
+                "revocations.bin",
+                RevocationStore::V1,
+                set.to_bytes().unwrap(),
+            ),
+            (
+                "revocations-v2.bin",
+                RevocationStore::V2,
+                set.to_bytes_v2().unwrap(),
+            ),
+            (
+                "revocations-v3.bin",
+                RevocationStore::V3,
+                set.to_bytes_v3().unwrap(),
+            ),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, &bytes).await.unwrap();
+            assert!(read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .is_some());
+            fs::write(&path, b"corruption after load").await.unwrap();
+            let err = save_private_bytes_to(&path, bytes.clone())
+                .await
+                .unwrap_err();
+            assert!(revocation_persistence_is_blocked(&err));
+            let err = write_private_bytes_durable(&path, bytes.clone())
+                .await
+                .unwrap_err();
+            assert!(revocation_persistence_is_blocked(&err));
+            // #1101: the typed writer refuses BEFORE the rename (the
+            // guard runs before any byte is written), and the blocked
+            // source survives the typed error and the mapping back.
+            let err = write_private_bytes_durable_typed(&path, bytes.clone())
+                .await
+                .unwrap_err();
+            assert!(!err.crossed_rename(), "guard refusal is BeforeRename");
+            assert!(revocation_persistence_is_blocked(
+                &durable_write_identity_error(err)
+            ));
+            if matches!(store, RevocationStore::V1) {
+                let err = save_revocation_set_bytes(bytes.clone(), Some(dir.path()))
+                    .await
+                    .unwrap_err();
+                assert!(revocation_persistence_is_blocked(&err));
+            }
+            assert_eq!(fs::read(&path).await.unwrap(), b"corruption after load");
+            fs::write(&path, &bytes).await.unwrap();
+            save_private_bytes_to(&path, bytes.clone()).await.unwrap();
+            write_private_bytes_durable(&path, bytes.clone())
+                .await
+                .unwrap();
+            write_private_bytes_durable_typed(&path, bytes)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Read I/O failures are recorded too. Startup does not consume the
+    /// first persist warning; retries warn again in each 30-second window.
+    #[tokio::test]
+    async fn unreadable_store_warning_windows_and_io_errors_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, store, bytes) in [
+            (
+                "revocations.bin",
+                RevocationStore::V1,
+                RevocationSet::new().to_bytes().unwrap(),
+            ),
+            (
+                "revocations-v2.bin",
+                RevocationStore::V2,
+                RevocationSet::new().to_bytes_v2().unwrap(),
+            ),
+            (
+                "revocations-v3.bin",
+                RevocationStore::V3,
+                RevocationSet::new().to_bytes_v3().unwrap(),
+            ),
+        ] {
+            let path = dir.path().join(name);
+            fs::create_dir(&path).await.unwrap();
+            assert!(read_revocation_store(&path, store, false).await.is_err());
+            {
+                let states = revocation_store_states().lock().await;
+                assert!(states[&path].unreadable.is_some());
+                assert!(states[&path].last_persist_warning.is_none());
+            }
+            assert!(save_private_bytes_to(&path, bytes.clone()).await.is_err());
+            let first = revocation_store_states().lock().await[&path]
+                .last_persist_warning
+                .unwrap();
+            assert!(save_private_bytes_to(&path, bytes.clone()).await.is_err());
+            assert_eq!(
+                revocation_store_states().lock().await[&path].last_persist_warning,
+                Some(first)
+            );
+            revocation_store_states()
+                .lock()
+                .await
+                .get_mut(&path)
+                .unwrap()
+                .last_persist_warning = first.checked_sub(std::time::Duration::from_secs(31));
+            assert!(save_private_bytes_to(&path, bytes.clone()).await.is_err());
+            assert!(
+                revocation_store_states().lock().await[&path]
+                    .last_persist_warning
+                    .unwrap()
+                    >= first
+            );
+            fs::remove_dir(&path).await.unwrap();
+            save_private_bytes_to(&path, bytes).await.unwrap();
+            let states = revocation_store_states().lock().await;
+            assert!(states[&path].unreadable.is_none());
+            assert!(states[&path].last_persist_warning.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn test_keypair_serialization_roundtrip() {
@@ -1408,5 +2015,76 @@ mod tests {
             .expect("rewrite");
         let bytes = tokio::fs::read(&path).await.expect("reread");
         assert_eq!(bytes, vec![9]);
+    }
+
+    /// Issue #1101 seam proof: an injected failure at the parent-directory
+    /// fsync (durable point 2, AFTER the rename) is typed `AfterRename`
+    /// and the NEW bytes are already in place — the contract every
+    /// PostRename caller relies on.
+    #[tokio::test]
+    async fn durable_write_injected_post_rename_failure_leaves_new_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.bin");
+        super::write_private_bytes_durable(&path, vec![1, 2, 3])
+            .await
+            .expect("seed write");
+        let _seam = super::arm_fail_parent_dir_fsync_for_testing(&path);
+        let err = super::write_private_bytes_durable_typed(&path, vec![9, 9])
+            .await
+            .expect_err("injected post-rename failure");
+        assert!(
+            matches!(err, super::DurableWriteError::AfterRename(_)),
+            "typed AfterRename, got: {err:?}"
+        );
+        let bytes = tokio::fs::read(&path).await.expect("read back");
+        assert_eq!(bytes, vec![9, 9], "the NEW bytes are already in place");
+        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read_dir");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            assert!(
+                !entry.file_name().to_string_lossy().contains(".tmp"),
+                "no temp debris: {}",
+                entry.file_name().to_string_lossy()
+            );
+        }
+
+        // The untyped public writer keeps its historical error: the same
+        // fault is `IdentityError::Storage` carrying the original
+        // `io::Error`, so existing callers see no change (additive API).
+        let err = super::write_private_bytes_durable(&path, vec![7])
+            .await
+            .expect_err("same injected failure through the untyped writer");
+        match err {
+            IdentityError::Storage(io) => assert_eq!(
+                io.to_string(),
+                "injected parent-directory fsync failure (test seam)"
+            ),
+            other => panic!("untyped writer must keep IdentityError::Storage, got: {other:?}"),
+        }
+        assert_eq!(tokio::fs::read(&path).await.expect("read back"), vec![7]);
+    }
+
+    /// Issue #1101 seam scoping (round 2): threaded `cargo test` runs the
+    /// whole suite in ONE process, so the seam must fail only the armed
+    /// path — with path A armed, a concurrent durable write to path B
+    /// still succeeds (a process-global flag would have failed B too).
+    #[tokio::test]
+    async fn post_rename_seam_only_fails_the_armed_path() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let path_a = dir_a.path().join("a.bin");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let path_b = dir_b.path().join("b.bin");
+
+        let _seam = super::arm_fail_parent_dir_fsync_for_testing(&path_a);
+        let (a, b) = tokio::join!(
+            super::write_private_bytes_durable_typed(&path_a, vec![1]),
+            super::write_private_bytes_durable_typed(&path_b, vec![2]),
+        );
+        assert!(a.is_err(), "the armed path fails after its rename");
+        b.expect("a concurrent durable write to another path succeeds");
+        assert_eq!(
+            tokio::fs::read(&path_b).await.expect("read b"),
+            vec![2],
+            "path B's bytes are in place and its directory was synced"
+        );
     }
 }

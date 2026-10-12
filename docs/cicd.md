@@ -2,7 +2,7 @@
 
 Eight workflows in `.github/workflows/`:
 
-- **ci.yml**: fmt, clippy, nextest, line coverage, doc, API/GUI parity
+- **ci.yml**: fmt, clippy, nextest, line coverage, doc, API/GUI parity, skill token budget
 - **security.yml**: `cargo audit` (daily schedule + PRs)
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
 - **build.yml**: PR validation
@@ -23,6 +23,10 @@ the rulings D04, D05, D15 and D36 are summarised in
 - `main` is protected by a repository ruleset: changes land only through pull requests, force-push and deletion
   are blocked, and the required checks are `Format Check`, `Clippy Lint`, `Test Suite`, `Documentation` and
   `Build linux-x64-gnu`. There is no bypass.
+- The Documentation job runs `python3 scripts/ci/check-skill-size.py` before rustdoc.
+  `SKILL.md` must stay at or under 8,000 tokens. Each file in `docs/skill/` must stay at or under 4,000.
+  One token is 4 UTF-8 bytes, rounded up. The same step runs `--self-test`, which fails the job
+  if an over-budget fixture is accepted.
 - `v*` tags can be created, moved or deleted only by repository admins (tag ruleset). Every agent currently acts
   as the `dirvine` admin account, so this and the `release` environment reviewer are procedural gates, not
   technical separation between agents and David (a separate bot identity was declined, D15).

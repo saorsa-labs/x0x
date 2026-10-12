@@ -1,0 +1,1 @@
+../adr-archive/0112-any-admin-invite-redemption.md

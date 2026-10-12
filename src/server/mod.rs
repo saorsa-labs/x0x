@@ -17,13 +17,22 @@ mod auth;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
+mod group_access;
 mod instance_lock;
 mod legacy_store_migration;
 mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+// W3-H (#1164): deterministic simulation harness (test builds only:
+// `#![cfg(test)]` inside the module).
+mod w3h;
 mod ws;
+
+#[cfg(test)]
+mod issue1288_ws_shutdown;
+#[cfg(test)]
+mod shutdown_regression;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
@@ -40,49 +49,48 @@ use routes::{
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
     add_named_group_member, add_task, agent_info, agent_reachability, agent_sign,
     agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
-    apply_direct_kv_store_delta, apply_named_group_metadata_event,
-    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
-    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
-    causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
+    apply_direct_kv_store_delta, apply_named_group_metadata_event_inner_serialized, apply_upgrade,
+    approve_join_request, ban_group_member, bootstrap_cache_stats, broadcast_current_manifest,
+    cancel_join_request, causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
     connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
-    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
-    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
+    dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
-    history_list, history_message, history_purge, history_scopes, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
-    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
-    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
-    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_causal_approval_queue, load_named_groups_merged,
-    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler,
-    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
-    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
-    now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
-    owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
+    history_diagnostics, history_list, history_message, history_policy, history_purge,
+    history_retain, history_scopes, history_search, history_stats, identity_revocations,
+    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
+    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
+    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
+    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
+    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
+    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
+    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
-    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
-    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
-    send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
+    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
+    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
+    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -90,12 +98,13 @@ use routes::{
     update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
+    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -256,7 +265,7 @@ pub async fn run_update_check_and_report(
     skip_update_check: bool,
 ) -> anyhow::Result<()> {
     if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None, false).await {
+        match run_startup_update_check(config, None, None).await {
             Ok(Some(version)) => println!("x0xd updated to {version}"),
             Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
             Err(e) => return Err(e).context("self-update check failed"),
@@ -449,13 +458,14 @@ pub async fn serve_with_options(
         .context("failed to create data directory")?;
 
     // Issue #601: explicit single-instance guard on the data directory.
-    // Taken BEFORE the startup update check, the API listener, identity
-    // load/generation, or any other subsystem initialises — and independent
-    // of `[history] enabled` (the previous implicit guard was SQLite's
-    // EXCLUSIVE lock on history.db, which covered only that file and
-    // surfaced as a history subsystem error). Held until the spawned
-    // supervisor below has finished draining; process exit releases it even
-    // on crash (#645 — the guard must outlive the ServerHandle's Drop).
+    // Taken BEFORE the API listener bind, identity load/generation, the
+    // post-bind startup update check, or any other subsystem initialises —
+    // and independent of `[history] enabled` (the previous implicit guard
+    // was SQLite's EXCLUSIVE lock on history.db, which covered only that
+    // file and surfaced as a history subsystem error). Held until the
+    // spawned supervisor below has finished draining; process exit releases
+    // it even on crash (#645 — the guard must outlive the ServerHandle's
+    // Drop).
     let instance_lock =
         instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
     // Startup banner
@@ -469,15 +479,12 @@ pub async fn serve_with_options(
     // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
     // by the binary (see `run_update_check_and_report`) before it ever calls
     // `serve_with_options`; it is intentionally not a `ServeOptions` field.
-
-    // Startup GitHub check (fallback mechanism — gossip is primary).
-    // Gated on `self_update_enabled` so embedders never download/install a new
-    // binary in-process; the daemon binary sets it to `config.update.enabled`.
-    if self_update_enabled && config.update.enabled {
-        if let Err(e) = run_startup_update_check(&config, None, true).await {
-            tracing::warn!(error = %e, "Startup update check failed: {e}");
-        }
-    }
+    //
+    // Startup GitHub check (fallback mechanism — gossip is primary) moved to a
+    // post-bind background task below (#1086): awaiting it here, before the
+    // API listener bound, stalled startup for the monitor's ~30 s HTTP
+    // timeout on hosts whose TCP 443 egress is firewalled. Startup must never
+    // wait on the network for update checks.
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
     if let Some(ref name) = instance_name {
@@ -1109,6 +1116,27 @@ pub async fn serve_with_options(
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+        detached_tasks: StdMutex::new(Some(Vec::new())),
+        shielded_tasks: StdMutex::new(Some(Vec::new())),
+        shutdown_started: tokio_util::sync::CancellationToken::new(),
+        join_artifact_egress: StdMutex::new(HashMap::new()),
+        join_artifact_egress_owners: StdMutex::new(Vec::new()),
+        welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
+            crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+        ),
+        join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+        ),
+        join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
+        ),
+        join_result_egress_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_CAP,
+        ),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
@@ -1275,6 +1303,10 @@ pub async fn serve_with_options(
                         .all(|id| g.members_v2.get(*id).is_some_and(|m| m.is_active()))
             }))
         }));
+    agent.peer_evidence().wire_limits.ready_hello.store(
+        std::env::var("X0X_EVIDENCE_READY_HELLO").as_deref() == Ok("1"),
+        std::sync::atomic::Ordering::Release,
+    );
     let evidence_state = Arc::downgrade(&state);
     agent.start_peer_evidence(
         config.data_dir.clone(),
@@ -1657,6 +1689,44 @@ pub async fn serve_with_options(
         }
     }));
 
+    // Startup GitHub check (fallback mechanism — gossip is primary), the
+    // same check the daemon used to await before anything else. #1086: it
+    // now runs as a background task spawned only after the API listener is
+    // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
+    // HTTP timeout in the background instead of delaying API readiness.
+    // Gates unchanged: `self_update_enabled` (embedders /
+    // `--skip-update-check`) AND `[update] enabled`.
+    if self_update_enabled && config.update.enabled {
+        let startup_check_config = config.clone();
+        // #261: the apply's restart planner needs the bound API address
+        // (health commit) and the graceful-shutdown hook (bounded cancel) —
+        // both exist only now, post-bind.
+        let startup_api_addr = state.api_address;
+        let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
+        let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let data_dir = startup_check_config.data_dir.clone();
+            if let Err(e) = run_startup_update_check(
+                &startup_check_config,
+                None,
+                Some(StartupUpdateCheckRuntime {
+                    restart_context: listener_restart_context(
+                        &data_dir,
+                        startup_api_addr,
+                        startup_shutdown,
+                    ),
+                    upgrade_apply_lock: startup_apply_lock,
+                    shutdown_watch: startup_shutdown_watch,
+                }),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "Startup update check failed: {e}");
+            }
+        }));
+    }
+
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
@@ -1851,8 +1921,18 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_join_result_message(&join_result_state, &msg.sender, msg.verified, join_msg)
-                    .await;
+                // #1275: the dispatch runs a result's apply shielded and
+                // awaits it, so results still apply in arrival order.
+                if !dispatch_join_result_message(
+                    &join_result_state,
+                    &msg.sender,
+                    msg.verified,
+                    join_msg,
+                )
+                .await
+                {
+                    break;
+                }
             }
         }));
     }
@@ -1877,7 +1957,7 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
+                dispatch_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
             }
         }));
     }
@@ -1925,13 +2005,26 @@ pub async fn serve_with_options(
                 if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
                 {
                     if response.message_type == "treekem_catchup_response" {
-                        handle_treekem_catchup_response(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            response,
-                        )
-                        .await;
+                        // #1275: the response's events are applied and
+                        // persisted, so the apply runs shielded; awaiting it
+                        // keeps the responses in arrival order.
+                        let apply_state = Arc::clone(&catchup_state);
+                        let sender = msg.sender;
+                        let verified = msg.verified;
+                        let applied = catchup_state
+                            .run_shielded(Box::pin(async move {
+                                handle_treekem_catchup_response(
+                                    &apply_state,
+                                    &sender,
+                                    verified,
+                                    response,
+                                )
+                                .await;
+                            }))
+                            .await;
+                        if applied.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -1970,13 +2063,25 @@ pub async fn serve_with_options(
                 );
                 // The legacy unprefixed wire form carries no durable
                 // receipt, so the admission outcome has nowhere to go.
-                let _ = admit_public_group_bootstrap(
-                    &bootstrap_state,
-                    msg.sender,
-                    Some(msg.machine_id),
-                    bootstrap,
-                )
-                .await;
+                // #1275: the admission installs and persists the group, so
+                // it runs shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let sender = msg.sender;
+                let machine_id = msg.machine_id;
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        let _ = admit_public_group_bootstrap(
+                            &apply_state,
+                            sender,
+                            Some(machine_id),
+                            bootstrap,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -1989,35 +2094,10 @@ pub async fn serve_with_options(
     // shared apply handler re-validates the signed commit, enforces the same
     // authorization checks, and is idempotent, so applying via both the direct
     // and gossip channels is safe.
-    {
-        let meta_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
-            let mut rx = meta_state.agent.subscribe_direct();
-            loop {
-                let Some(msg) = rx.recv().await else { break };
-                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
-                else {
-                    continue; // not a named-group metadata event
-                };
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "direct_classified_metadata_event",
-                    sender = %hex::encode(msg.sender.as_bytes()),
-                    len = msg.payload.len(),
-                    verified = msg.verified,
-                    event = named_group_metadata_event_kind(&event),
-                );
-                apply_named_group_metadata_event(
-                    &meta_state,
-                    event,
-                    msg.sender,
-                    msg.verified,
-                    None, // direct DM path — no V2 envelope bytes available
-                )
-                .await;
-            }
-        }));
-    }
+    bg_tasks.push(tokio::spawn(run_direct_metadata_listener(
+        Arc::clone(&state),
+        state.agent.subscribe_direct(),
+    )));
 
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
@@ -2075,7 +2155,24 @@ pub async fn serve_with_options(
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
-                handle_predecessor_relay_typed_payload(&relay_state, &local_agent_hex, typed).await;
+                // #1275: the handler applies the event and persists the
+                // roster and the relay obligation, so it runs shielded and
+                // is awaited in arrival order.
+                let apply_state = Arc::clone(&relay_state);
+                let local_agent_hex = local_agent_hex.clone();
+                let handled = relay_state
+                    .run_shielded(Box::pin(async move {
+                        handle_predecessor_relay_typed_payload(
+                            &apply_state,
+                            &local_agent_hex,
+                            typed,
+                        )
+                        .await;
+                    }))
+                    .await;
+                if handled.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2107,7 +2204,18 @@ pub async fn serve_with_options(
                     );
                     continue;
                 };
-                apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
+                // #1275: the merge persists the store's snapshot, so it runs
+                // shielded and is awaited in arrival order.
+                let apply_state = Arc::clone(&kv_delta_state);
+                let sender = typed.sender;
+                let applied = kv_delta_state
+                    .run_shielded(Box::pin(async move {
+                        apply_direct_kv_store_delta(&apply_state, sender, delta_msg).await;
+                    }))
+                    .await;
+                if applied.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2180,7 +2288,19 @@ pub async fn serve_with_options(
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
-                handle_public_group_bootstrap_typed_payload(&bootstrap_state, typed).await;
+                // #1275: the admission installs and persists the group
+                // before it completes the ACK, so it runs shielded and is
+                // awaited in arrival order. A refused payload is dropped
+                // with its completion: no ACK, so the sender re-offers.
+                let apply_state = Arc::clone(&bootstrap_state);
+                let admitted = bootstrap_state
+                    .run_shielded(Box::pin(async move {
+                        handle_public_group_bootstrap_typed_payload(&apply_state, typed).await;
+                    }))
+                    .await;
+                if admitted.is_none() {
+                    break;
+                }
             }
         }));
     }
@@ -2248,7 +2368,19 @@ pub async fn serve_with_options(
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                        public_group_bootstrap_outbox_step(&bootstrap_state).await;
+                        // #1288: the step persists the outbox around its send.
+                        // Run that pass shielded so the drain awaits the
+                        // write. `None` means admission has closed.
+                        let step_state = Arc::clone(&bootstrap_state);
+                        if bootstrap_state
+                            .run_shielded(async move {
+                                public_group_bootstrap_outbox_step(&step_state).await;
+                            })
+                            .await
+                            .is_none()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -2482,6 +2614,17 @@ pub async fn serve_with_options(
         .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
+        // ADR 0116 §3: owner-only policy read (durable token, see auth.rs).
+        .route("/history/policy", get(history_policy))
+        // ADR 0116 §4: the bounded runtime trim (durable token, see auth.rs).
+        // Its 1 KiB body limit sits inside the router-wide 1 MiB one and
+        // overrides it for this route (larger bodies are 413).
+        .route(
+            "/history/retain",
+            post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
+                routes::HISTORY_RETAIN_BODY_LIMIT,
+            )),
+        )
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/state-sync", get(state_sync_diagnostics))
@@ -2576,6 +2719,10 @@ pub async fn serve_with_options(
     // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
     let cancel = tokio_util::sync::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
+    #[cfg(test)]
+    let test_state = Arc::downgrade(&state);
+    #[cfg(test)]
+    let test_router = app.clone();
 
     let task = tokio::spawn(async move {
         // #645: the single-instance guards live HERE, in the supervisor
@@ -2688,45 +2835,8 @@ pub async fn serve_with_options(
         //    returns a `JoinError`; that is expected, never unwrap it. Draining
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
-        let mut bg_tasks = bg_tasks;
-        bg_tasks.extend(
-            std::mem::take(&mut *state.group_metadata_tasks.write().await)
-                .into_values()
-                .map(|reg| reg.handle),
-        );
-        bg_tasks
-            .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
-        // Taking `Some` closes admission under the same mutex used by
-        // FetchRequest replacement. A handler waiting here cannot spawn a
-        // stream after this shutdown drain.
-        let welcome_streams = state
-            .pending_welcome_streams
-            .lock()
-            .await
-            .take()
-            .unwrap_or_default();
-        bg_tasks.extend(welcome_streams.into_values());
-        bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
-        // Keep abort handles so stragglers can be aborted after the grace window.
-        // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
-        // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
-        // so that after aborting we `join.await` the remainder. Without this, the
-        // "join_network fully stopped before Agent shutdown" guarantee would
-        // only hold on the non-timeout path; now it holds on BOTH. A cancelled/
-        // aborted task yields Err(JoinError) — expected, never unwrapped.
-        let abort_handles: Vec<tokio::task::AbortHandle> =
-            bg_tasks.iter().map(|h| h.abort_handle()).collect();
-        let mut join = futures::future::join_all(bg_tasks);
-        tokio::select! {
-            _results = &mut join => {}
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                tracing::warn!("background tasks did not stop within grace; aborting stragglers");
-                for handle in &abort_handles {
-                    handle.abort();
-                }
-                let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
-            }
-        }
+        drain_server_tasks(&state, bg_tasks).await;
+        let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
         //    reaper / DM-inbox / advert / presence, drain the Agent's own
@@ -2734,7 +2844,20 @@ pub async fn serve_with_options(
         //    typed QUIC shutdown path. A successful result proves ant-quic
         //    released its socket; a failure is returned only after the rest of
         //    this supervisor cleanup completes.
+        // #1288: a backfill still inside `Store::query` holds the connection
+        // mutex. This await drains the history writer. The writer's join is
+        // the drain grace, not an open-ended thread join: a write waiting on
+        // that mutex stays on the writer thread, and the await returns.
         let agent_shutdown_result = state.agent.try_shutdown().await;
+        // A writer blocked in SQLite past the drain grace is not a finished
+        // shutdown, even when no WebSocket backfill is outstanding. The
+        // thread stays in custody and still holds `history.db`. Read the
+        // flag before dropping `state`: the agent's history handle shares it
+        // with the writer that just timed out.
+        let writer_shutdown_incomplete = state
+            .agent
+            .history()
+            .is_some_and(|history| history.writer_shutdown_incomplete());
 
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).
@@ -2756,6 +2879,30 @@ pub async fn serve_with_options(
         // behaviour rather than anything worse.
         std::mem::drop(state);
         tracing::info!("Shutdown complete");
+        let server_result = if writer_shutdown_incomplete {
+            let writer = anyhow::anyhow!(
+                "history writer still owns the store after the shutdown grace; the write was left running"
+            );
+            Err(match server_result {
+                Ok(()) => writer,
+                Err(server) => server.context(format!("history writer also remained: {writer}")),
+            })
+        } else {
+            server_result
+        };
+        let server_result = if backfill_release_incomplete {
+            let backfill = anyhow::anyhow!(
+                "websocket history backfill still owns the store after the shutdown grace; the read was left running"
+            );
+            Err(match server_result {
+                Ok(()) => backfill,
+                Err(server) => server.context(format!(
+                    "websocket history backfill also remained: {backfill}"
+                )),
+            })
+        } else {
+            server_result
+        };
         combine_server_shutdown_results(server_result, agent_shutdown_result)
     });
 
@@ -2764,7 +2911,199 @@ pub async fn serve_with_options(
         cancel,
         acl_admin,
         task: Some(task),
+        #[cfg(test)]
+        test_state,
+        #[cfg(test)]
+        test_router,
     })
+}
+
+/// #1269 r2: how long the shutdown tail waits for admitted group-state
+/// applies (see [`drain_server_tasks`]) before it leaves them to finish.
+const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
+
+/// The single grace window the shutdown tail gives every abortable server
+/// task (see [`drain_server_tasks`]) before it aborts the stragglers.
+const SERVER_TASK_GRACE: Duration = Duration::from_secs(2);
+
+/// #1274: how long the shutdown tail waits for aborted join-artifact egress
+/// tasks to end (an abort takes effect at the task's next await point).
+const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
+
+/// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
+/// server-owned task (the startup tasks in `bg_tasks`, the AppState handle
+/// maps, the REST `/subscribe` forwarders, the detached registry, the
+/// join-attempt registry and, in place, the join-artifact egress registry),
+/// then await, never abort, the shielded group-state applies.
+async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+    // #1269 r2: end the network waits of applies in progress first (they
+    // fail as on a lost peer), so the shielded wait below stays short.
+    state.shutdown_started.cancel();
+    // #1288 row 2: REST `/subscribe` forwarders. A topic in
+    // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
+    // which holds `history.db`. Dropping the map would detach that task and
+    // leave the database locked after `shutdown_and_wait`. Admission is
+    // `shutdown_started`, cancelled above and checked under this lock by
+    // `subscribe`. These tasks only forward, so the grace window below
+    // aborts any still blocked on receive.
+    bg_tasks.extend(routes::take_rest_subscribe_forwarders(state).await);
+    bg_tasks.extend(
+        std::mem::take(&mut *state.group_metadata_tasks.write().await)
+            .into_values()
+            .map(|reg| reg.handle),
+    );
+    bg_tasks.extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
+    // Taking `Some` closes admission under the same mutex used by
+    // FetchRequest replacement. A handler waiting here cannot spawn a
+    // stream after this shutdown drain.
+    let welcome_streams = state
+        .pending_welcome_streams
+        .lock()
+        .await
+        .take()
+        .unwrap_or_default();
+    bg_tasks.extend(welcome_streams.into_values());
+    bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
+    // #1269: detached best-effort tasks (delayed direct deliveries, the
+    // redelivery schedules, control-blob fetches, the owner-side join-result
+    // and Welcome fetch handlers, delayed publishes; since #1274 also the
+    // public-message fan-out race, the one-shot predecessor-relay fallback
+    // offer, the member-keyed KeyPackage catch-up requests, the KV-store
+    // delta direct deliveries, the outgoing file-chunk streams, and since
+    // #1288 the WebSocket session loop and its writer and forwarders) and the
+    // joiner's join-attempt polls and sends hold the Agent or this AppState.
+    // Left running, one asleep before a delayed delivery keeps the Agent, and
+    // its exclusive `history.db` connection, alive after the supervisor
+    // returns, and a same-dir relaunch is refused. Taking `Some` closes
+    // detached admission; the attempt registry is drained after it, so
+    // `spawn_attempt_task_under_guard` (which checks admission under the
+    // registry lock) either registered its task before this drain or spawns
+    // nothing. None of this work owns a write that an abort could cut (a
+    // successful direct send at most enqueues its outbound DM history row,
+    // synchronously, for the history writer): the deliveries and
+    // publishes are best-effort copies of what the metadata topic and the
+    // join-result fetch carry (the public fan-out re-sends a message already
+    // published and cached; the predecessor fallback runs only after its
+    // durable obligation could not be written, and that write is the request
+    // handler's own, never a detached task's), the redelivery schedules are
+    // deliberately not persisted, and the join-attempt registry is in-memory
+    // and dies with this AppState anyway (recovery after a joiner restart is
+    // ADR 0107's durable carry remnant). Work that does persist runs shielded
+    // (below).
+    bg_tasks.extend(
+        state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default(),
+    );
+    bg_tasks.extend(
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+            .flat_map(|attempt| {
+                std::mem::take(&mut attempt.polls)
+                    .into_iter()
+                    .chain(std::mem::take(&mut attempt.tasks))
+            }),
+    );
+    // #1269 r2: close shielded admission at the same moment: an apply that
+    // has not started is refused from here on (as if it had arrived after
+    // the stop), and one that has started is awaited below, never aborted.
+    let shielded = state
+        .shielded_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    // Keep abort handles so stragglers can be aborted after the grace window.
+    // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the
+    // JoinHandles owned by `join` (select! over `&mut join` vs the 2s sleep)
+    // so that after aborting we `join.await` the remainder. Without this, the
+    // "join_network fully stopped before Agent shutdown" guarantee would
+    // only hold on the non-timeout path; now it holds on BOTH. A cancelled/
+    // aborted task yields Err(JoinError) — expected, never unwrapped.
+    let abort_handles: Vec<tokio::task::AbortHandle> =
+        bg_tasks.iter().map(|h| h.abort_handle()).collect();
+    let grace_end = tokio::time::Instant::now() + SERVER_TASK_GRACE;
+    let mut join = futures::future::join_all(bg_tasks);
+    tokio::select! {
+        _results = &mut join => {}
+        _ = tokio::time::sleep_until(grace_end) => {
+            tracing::warn!("background tasks did not stop within grace; aborting stragglers");
+            for handle in &abort_handles {
+                handle.abort();
+            }
+            let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+        }
+    }
+    // #1288: history backfills outlive the session that started them. The
+    // session join above drops its wait; the blocking query still owns the
+    // store. `Store::query` cannot be cancelled here. The wait is a fresh
+    // `SERVER_TASK_GRACE`, not the session grace that may already have
+    // elapsed. A read still running stays registered (its task holds
+    // `WsOutboundStats`). The supervisor then reports that the owner was
+    // not released. This wait does not drop that handle.
+    if !ws::await_ws_backfill_reads(state, SERVER_TASK_GRACE).await {
+        ws::note_backfill_release_incomplete(&state.ws_outbound_stats);
+    }
+    // #1274: the ADR 0107 join-artifact egress tasks (join-result and
+    // control-blob sends, secure shares) hold this AppState up to their
+    // artifact deadline: a secure share to an unavailable member retries for
+    // up to `PENDING_JOIN_RESULT_TTL` (10 min). They only send, and a removal
+    // or ban already aborts them at any await point, so they are abortable
+    // by design. They stay in their registry, which that quiesce uses, so
+    // they are not taken here: they share the grace window above, and any
+    // still running at its end is aborted in place and awaited (bounded).
+    // Both waits read the owners fence, which lists a task until it is
+    // finished and has so dropped every owner it captured (#1274 r3: an
+    // empty registry does not prove that). `shutdown_started` (cancelled
+    // above) closes their admission under the registry lock.
+    if tokio::time::timeout_at(
+        grace_end,
+        routes::named_groups::join_artifact_egress_idle(state),
+    )
+    .await
+    .is_err()
+    {
+        routes::named_groups::abort_join_artifact_egress(state);
+        if tokio::time::timeout(
+            JOIN_ARTIFACT_EGRESS_ABORT_BOUND,
+            routes::named_groups::join_artifact_egress_idle(state),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                bound_secs = JOIN_ARTIFACT_EGRESS_ABORT_BOUND.as_secs(),
+                "a join-artifact egress task did not end after its abort"
+            );
+        }
+    }
+    // #1269 r2: admitted applies that persist group state (a pulled control
+    // blob's apply, the owner-certificate join retry, since #1275 the
+    // listeners' event applies, and since #1288 the public-group bootstrap
+    // outbox step) run to completion. An
+    // abort inside an atomic write or its journal step would leave the
+    // persisted state torn, or leave a blocking write running after the
+    // instance locks are released. They are awaited before the Agent stops,
+    // bounded; one still running after the bound is left to finish (never
+    // aborted), and the AppState it holds then outlives this supervisor.
+    if !shielded.is_empty() {
+        let applies = futures::future::join_all(shielded);
+        if tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
+                "a group-state apply is still running at shutdown; it is left to finish, not aborted"
+            );
+        }
+    }
 }
 
 /// Whether two directory paths refer to the same directory, tolerating
@@ -4352,7 +4691,9 @@ async fn run_member_certificate_bridge(
     state: Arc<AppState>,
     mut events: broadcast::Receiver<x0x::VerifiedCertificate>,
 ) {
-    reconcile_member_certificates_from_cache(&state).await;
+    if !reconcile_member_certificates_shielded(&state).await {
+        return;
+    }
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
         tokio::select! {
@@ -4364,18 +4705,48 @@ async fn run_member_certificate_bridge(
                 break;
             }
             received = events.recv() => match received {
-                Ok(event) => apply_verified_certificate_event(&state, &event).await,
+                Ok(event) => {
+                    // #1275: shielded, like the reconciles (see below).
+                    let apply_state = Arc::clone(&state);
+                    let applied = state
+                        .run_shielded(Box::pin(async move {
+                            apply_verified_certificate_event(&apply_state, &event).await;
+                        }))
+                        .await;
+                    if applied.is_none() {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,
                         "verified-certificate ring overflowed; re-running full member-certificate reconcile"
                     );
-                    reconcile_member_certificates_from_cache(&state).await;
+                    if !reconcile_member_certificates_shielded(&state).await {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     }
+}
+
+/// #1275: run the full reconcile as a shielded apply. A hydration persists
+/// the roster, and the supervisor aborts this worker as soon as shutdown is
+/// signalled; shielded, that abort only ends the wait, the write completes
+/// and the shutdown drain waits for it. The worker awaits each hydration
+/// before it reads the next event, so they still run one at a time.
+/// `false` (shutdown refused it, or it panicked) ends the worker; the
+/// supervisor then exits on shutdown or restarts it, as after a panic.
+async fn reconcile_member_certificates_shielded(state: &Arc<AppState>) -> bool {
+    let apply_state = Arc::clone(state);
+    state
+        .run_shielded(Box::pin(async move {
+            reconcile_member_certificates_from_cache(&apply_state).await;
+        }))
+        .await
+        .is_some()
 }
 
 /// F1: supervise the bridge worker for the daemon's lifetime, following the
@@ -4872,6 +5243,65 @@ mod member_certificate_bridge_tests {
         assert_eq!(second.certificate, first.certificate);
     }
 
+    /// #1275: the supervisor aborts the bridge worker as soon as shutdown
+    /// is signalled, before the drain's grace even starts. A hydration the
+    /// worker has started persists the roster, so it must not be cut off in
+    /// the middle of that write: the drain waits for it, the write
+    /// completes, and no temp file is left. The write is parked after its
+    /// temp file is synced and before the rename (the #1269 write pause).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue1275_hydration_is_not_aborted_mid_write_at_shutdown() {
+        use crate::server::routes::named_groups::atomic_write_test_seam;
+        use crate::server::routes::named_groups::tests::issue1275_listener_apply_shield::stop_while_write_parked;
+
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let member_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert = x0x::identity::AgentCertificate::issue(&user, &member_kp).unwrap();
+        let agent_hex = hex::encode(member_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        let (group_id, info) =
+            group_with_digest_only_members(&[(member_kp.agent_id(), cert.clone())]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        // Nothing is on disk yet: the file gets the group (and the member)
+        // only through the hydration's write.
+        let path = state.named_groups_path.clone();
+        let pause = atomic_write_test_seam::arm(&path);
+        let rx = state.agent.subscribe_verified_certificates();
+        let supervisor = tokio::spawn(supervise_member_certificate_bridge(Arc::clone(&state), rx));
+        state
+            .agent
+            .insert_discovered_agent_for_testing(cached_cert_entry(
+                member_kp.agent_id(),
+                cert.clone(),
+            ))
+            .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pause.reached() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hydration parks in its roster write"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The supervisor sees shutdown and aborts its worker at once.
+        let _ = state.shutdown_notify.send(true);
+        let outcome = stop_while_write_parked(&state, vec![supervisor], &pause, &path, &agent_hex)
+            .await
+            .unwrap();
+        assert!(
+            outcome.apply_completed(),
+            "the hydration must finish its roster write at shutdown: {outcome:?}"
+        );
+        let member = member_of(&state, &group_id, &agent_hex).await;
+        assert!(member.certificate.as_ref().is_some_and(|c| *c == cert));
+    }
+
     /// WHY (r4 / addendum item 5): the supervisor must RESPAWN a bridge
     /// worker that dies mid-stream, and every (re)start re-runs the FULL
     /// cache reconcile — a digest-only seat created while the worker was
@@ -4987,3 +5417,158 @@ mod member_certificate_bridge_tests {
             .expect("supervisor task completed cleanly");
     }
 }
+
+#[cfg(test)]
+mod startup_update_check_tests {
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+    use std::time::{Duration, Instant};
+
+    /// Points the test-only upgrade-monitor API base override
+    /// (`upgrade::monitor::TEST_API_BASE_OVERRIDE`) at `base` and restores
+    /// the prior value on drop, so the redirect cannot leak into sibling
+    /// tests in the same process. The seam is `cfg(test)`-only: release
+    /// builds have no configurable update source.
+    struct ApiBaseOverrideGuard {
+        previous: Option<String>,
+    }
+
+    impl ApiBaseOverrideGuard {
+        fn set(base: String) -> Self {
+            let mut slot = crate::upgrade::monitor::TEST_API_BASE_OVERRIDE
+                .lock()
+                .expect("TEST_API_BASE_OVERRIDE poisoned");
+            let previous = slot.clone();
+            *slot = Some(base);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ApiBaseOverrideGuard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = crate::upgrade::monitor::TEST_API_BASE_OVERRIDE.lock() {
+                *slot = self.previous.take();
+            }
+        }
+    }
+
+    /// #1086: the startup update check used to be awaited BEFORE the API
+    /// listener bound, so on a host whose update endpoint is a black hole
+    /// (firewalled TCP 443 egress) the API bind, `api.port`, and every
+    /// later startup log line stalled for the monitor's 30 s HTTP timeout.
+    /// The check now runs as a background task spawned after the bind.
+    ///
+    /// Observable contract: with `[update] enabled`, self-update not
+    /// skipped, and an update source that accepts connections and never
+    /// responds, the API answers `/health` within seconds while the check
+    /// is still hung. With the pre-#1086 ordering restored (the check
+    /// awaited before the bind), this test fails: the `serve_with_options`
+    /// await itself stalls on the black hole for the 30 s client timeout,
+    /// blowing the 20 s budget — deliberately below the stall, generous for
+    /// slow CI startup.
+    #[tokio::test]
+    async fn api_readiness_does_not_wait_for_the_startup_update_check() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Black-hole update endpoint: accepts the TCP connection and never
+        // answers — the update request then blocks until the monitor's 30 s
+        // client timeout, exactly the firewalled-egress shape from the
+        // issue. No external network is touched.
+        let blackhole =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole listener");
+        let blackhole_addr = blackhole.local_addr().expect("black-hole address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            // Hold every accepted connection open without ever responding.
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = blackhole.accept() {
+                let _ = stream.read(&mut [0u8; 1024]);
+                accepted_counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+
+        // Aim every update fetch at the black hole BEFORE serving.
+        let _api_base = ApiBaseOverrideGuard::set(format!("http://{blackhole_addr}"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("issue-1086.update-check-readiness".to_string()),
+            mdns_enabled: false,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        // The daemon startup shape the issue describes: `[update] enabled`
+        // (the default) and self-update not skipped for this process.
+        assert!(
+            config.update.enabled,
+            "`[update] enabled` must be the default for this test to mean anything"
+        );
+        let options = ServeOptions {
+            skip_update_check: false,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: true,
+            ..ServeOptions::default()
+        };
+
+        let handle =
+            tokio::time::timeout(Duration::from_secs(20), serve_with_options(config, options))
+                .await
+                .expect("serve must not wait on the startup update check (20 s budget)")
+                .expect("hermetic serve");
+
+        // Readiness is an HTTP fact, not the handle: `/health` (auth-exempt)
+        // must answer while the update check is still hung on the black hole.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+        let health_url = format!("http://{}/health", handle.local_addr());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => break,
+                _ if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("`/health` must answer while the update check is hung: {other:?}"),
+            }
+        }
+
+        // The checks must actually have engaged the update source — otherwise
+        // the gates were off and the readiness assert above was vacuous.
+        // Two distinct fetches go through the override — the startup check
+        // and the startup manifest broadcast (`broadcast_current_manifest`)
+        // — so `>= 1` would also pass on the broadcast alone with the
+        // startup check never running.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while accepted.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 2,
+            "the startup update check and the startup manifest broadcast must \
+             both be fetching from the update source"
+        );
+
+        // Shutdown stays prompt: the supervisor's bounded drain aborts the
+        // hung fetch tasks instead of waiting out their HTTP timeout.
+        tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
+            .await
+            .expect("shutdown must complete despite the hung update check")
+            .expect("clean shutdown");
+    }
+}
+
+// GHSA-rr9m-cvx5-pmv9 (fixed in v0.46.5): regression tests for ADR 0115
+// (Accepted), identity discovery authority. Test builds only.
+#[cfg(test)]
+mod identity_ingest_authority_tests;

@@ -385,7 +385,6 @@ async fn raw_dm_receive_loop_records_inbound_history() {
         let query_scope = scope.clone();
         let rows = tokio::task::spawn_blocking(move || {
             query_handle
-                .store()
                 .query(&HistoryQuery {
                     scope: Some(query_scope),
                     limit: 16,

@@ -483,6 +483,19 @@ pub enum HistoryError {
     /// Filesystem error touching the database path.
     #[error("history io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A `[history]` rule failed validation (ADR 0116 §1), or this build
+    /// cannot enforce it yet. History refuses to open; the daemon refuses
+    /// to start. The message names the rule.
+    #[error("{0}")]
+    InvalidConfig(String),
+
+    /// ADR 0116 §3: the local history policy keeps this record out of
+    /// history (`dm_recording` or a topic rule set to `ephemeral`). Nothing
+    /// was written; a caller that needs a committed row must not treat this
+    /// as success.
+    #[error("history record not written: the local history policy suppresses it (ADR 0116)")]
+    PolicySuppressed,
 }
 
 impl From<rusqlite::Error> for HistoryError {

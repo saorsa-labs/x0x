@@ -286,17 +286,19 @@ pub(in crate::server) async fn owner_agents_revoke(
     }
 
     let reason = body.and_then(|Json(req)| req.reason);
-    if let Err(e) = state.agent.revoke_as_owner(&cert, reason).await {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("owner revocation failed: {e}"),
-        );
-    }
-    // Review fix #3: the token sweep is persist-or-fail. The cert-level
-    // revocation above is already durable, and the middleware checks
-    // agent revocation on every rider request, so a failed sweep write
-    // is fenced twice over — surface it as 500 rather than reporting a
-    // success that did not happen.
+    let durability_error = match state.agent.revoke_as_owner(&cert, reason).await {
+        Ok(_) => None,
+        Err(e @ crate::error::IdentityError::Storage(_)) => Some(e),
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("owner revocation failed: {e}"),
+            );
+        }
+    };
+    // A Storage error follows application/publication. Sweep rider
+    // tokens before reporting the durability failure, so retirement
+    // also fences them durably even while v1 is blocked.
     let swept = state
         .rider_tokens
         .lock()
@@ -312,6 +314,13 @@ pub(in crate::server) async fn owner_agents_revoke(
             );
         }
     };
+
+    if let Some(e) = durability_error {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("owner revocation applied and published; not durable; rider tokens swept: {e}"),
+        );
+    }
 
     (
         StatusCode::OK,
@@ -719,5 +728,84 @@ pub(in crate::server) async fn owner_riders_revoke(
                 "revoked": true,
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod revocation_persistence_tests {
+    use super::*;
+    use crate::server::rider_auth::{ActorContext, RiderTokenStore, RIDER_TOKENS_FILE};
+
+    #[tokio::test]
+    async fn blocked_owner_revocation_still_sweeps_rider_tokens_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            super::super::identity::revocation_persistence_tests::state_at(dir.path()).await;
+        // Issue a real rider certificate through the owner route, so the
+        // retained authority evidence and roster are the production shape.
+        let sub_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let target = hex::encode(sub_agent.agent_id().as_bytes());
+        let (status, _) = owner_agents_issue(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(ActorContext::Owner { durable: true }),
+            Json(IssueAgentRequest {
+                agent_public_key: hex::encode(sub_agent.public_key().as_bytes()),
+                mode: Some("rider".to_string()),
+                label: None,
+                not_after: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let now = crate::server::rider_auth::unix_now_secs();
+        let (_, token) = state
+            .rider_tokens
+            .lock()
+            .await
+            .issue(
+                target.clone(),
+                vec![],
+                None,
+                60,
+                "digest".to_string(),
+                None,
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        let path = dir.path().join("revocations.bin");
+        tokio::fs::write(&path, b"unreadable v1").await.unwrap();
+        let (status, Json(body)) = owner_agents_revoke(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(ActorContext::Owner { durable: true }),
+            Path(target.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body
+            .to_string()
+            .contains("applied and published; not durable"));
+        assert!(state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_agent_revoked(&sub_agent.agent_id()));
+        assert!(state
+            .rider_tokens
+            .lock()
+            .await
+            .list()
+            .iter()
+            .any(|record| { record.token_id == token.token_id && record.revoked_at.is_some() }));
+        let reloaded = RiderTokenStore::load(dir.path().join(RIDER_TOKENS_FILE)).await;
+        assert!(reloaded
+            .list()
+            .iter()
+            .any(|record| { record.token_id == token.token_id && record.revoked_at.is_some() }));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v1");
+        state.agent.shutdown().await;
     }
 }

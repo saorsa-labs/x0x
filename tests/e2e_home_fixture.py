@@ -3,6 +3,9 @@
 
 Every daemon, key and token belongs to a fresh /var/tmp/x0x-home-e2e-<uuid>
 root. Existing x0x services and identities are never inspected or modified.
+A single-binary run requires every node to record the same x0xd sha256.
+Pass --mixed to record each node's sha256 and check it against the binary
+deployed to that node. Every later start must still run that recorded binary.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -82,6 +86,23 @@ while [ ! -s "$root/daemon.pid" ] && [ $i -lt 50 ]; do sleep .1; i=$((i+1)); don
 set -- $(cat "$root/daemon.pid")
 [ "$#" = 2 ] && [ "$1" = "$launcher" ]
 kill -0 "$1"
+'''
+
+def running_exe_script(proc_root: str = "/proc") -> str:
+    """sha256 of the owned daemon executable. The receipt file is not an input."""
+    proc = shlex.quote(proc_root)
+    return rf'''set -eu
+root=$1 marker=$2
+proc={proc}
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ -s "$root/daemon.pid" ]
+set -- $(cat "$root/daemon.pid")
+[ "$#" = 2 ]
+pid=$1 expected_start=$2
+case "$pid:$expected_start" in *[!0-9:]*) exit 41;; esac
+[ -r "$proc/$pid/stat" ]
+[ "$(awk '{{print $22}}' "$proc/$pid/stat")" = "$expected_start" ]
+sha256sum "$proc/$pid/exe" | awk '{{print $1}}'
 '''
 
 def stop_script(proc_root: str = "/proc", *, terminate: bool = True,
@@ -185,12 +206,16 @@ class SyntheticProcessCustody:
 
     def prepare(self, node: Node, config: bytes) -> None:
         self.validate(node)
+        # #1221: a retried setup finds its own marker. A different marker still fails.
         script = r'''set -eu
 root=$1 marker=$2
-[ ! -e "$root" ]
 umask 077
-mkdir -p "$root/identity" "$root/data" "$root/logs"
-printf '%s\n' "$marker" > "$root/fixture.marker"
+if [ -e "$root" ]; then
+  [ "$(cat "$root/fixture.marker")" = "$marker" ]
+else
+  mkdir -p "$root/identity" "$root/data" "$root/logs"
+  printf '%s\n' "$marker" > "$root/fixture.marker"
+fi
 '''
         self.remote.run(node.host, script, [node.root, self.marker])
         self.remote.run(node.host, "set -eu; umask 077; cat >\"$1/config.toml.tmp\"; mv \"$1/config.toml.tmp\" \"$1/config.toml\"",
@@ -325,6 +350,28 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             raise RuntimeError("invalid synthetic custody hash receipt")
         return fields[0], fields[1]
 
+    def deployed_binary_sha(self, node: Node) -> str:
+        """sha256 of the x0xd file this fixture starts on the node."""
+        self.validate(node)
+        raw = self.remote.run(node.host, r'''set -eu
+binary=$1
+[ -f "$binary" ]
+sha256sum "$binary" | awk '{print $1}'
+''', [self.binary], capture=True)
+        value = raw.decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise RuntimeError("invalid deployed binary sha256")
+        return value
+
+    def running_exe_sha(self, node: Node) -> str:
+        """sha256 of the running owned daemon, not the receipt written at start."""
+        self.validate(node)
+        raw = self.remote.run(node.host, running_exe_script(), [node.root, self.marker], capture=True)
+        value = raw.decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise RuntimeError("invalid running executable sha256")
+        return value
+
     def control_blob_witnesses(self) -> list[dict[str, Any]]:
         """Strictly parsed, node-tagged witness receipts from every started node's log."""
         witnesses: list[dict[str, Any]] = []
@@ -349,6 +396,202 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             except Exception as error:
                 errors.append(f"cleanup {label}: {type(error).__name__}")
         return errors
+
+
+SETUP_STEPS = ("start", "readiness probe", "identity", "join")
+# The fetch is larger than the retained tail so a cut line can be dropped
+# before retention. The count and the tail are separate reads; a full tail is
+# treated as truncated because the log can grow between them. Stdin and command
+# stdout stay out: those can carry a token or key.
+LOG_FETCH = 8192
+LOG_RETAIN = 4096
+DAEMON_LOG_SCRIPT = rf'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+if [ ! -s "$root/logs/daemon.log" ]; then printf '%s\n' '<empty>'; exit 0; fi
+wc -c < "$root/logs/daemon.log"
+tail -c {LOG_FETCH} "$root/logs/daemon.log"
+'''
+# Introducer plus the secret value. Replacing the value makes a second pass a no-op.
+_SECRET_VALUE = re.compile(r"(?i)(authorization:\s*bearer\s+|private_key\s*=\s*|token\s*=\s*)(\S+)")
+
+
+class SetupStepError(subprocess.TimeoutExpired):
+    """Named setup timeout. The text always includes the command, stderr and daemon log."""
+
+    def __init__(self, step: str, node: str, command: str, stderr: str, daemon_log: str, *,
+                 retried: bool) -> None:
+        if step not in SETUP_STEPS:
+            raise ValueError("unknown setup step")
+        self.step, self.node, self.retried = step, node, retried
+        self.command = _nonempty_text(command, limit=500)
+        self.stderr_text = _nonempty_text(stderr, limit=2000)
+        self.daemon_log = _nonempty_text(daemon_log, limit=LOG_RETAIN)
+        super().__init__(self.command, 0)
+        self.args = (self.diagnostic(),)
+
+    def diagnostic(self) -> str:
+        return (f"setup step {self.step} on {self.node} timed out; retried={self.retried}; "
+                f"command={self.command}; stderr={self.stderr_text}; daemon_log={self.daemon_log}")
+
+    def __str__(self) -> str:
+        return self.diagnostic()
+
+
+def _redact_secrets(text: str) -> str:
+    """Drop bearer, private_key, and token values before any tail is retained."""
+    return _SECRET_VALUE.sub(r"\1<redacted>", text)
+
+
+def _nonempty_text(value: bytes | str | None, *, limit: int = LOG_RETAIN, truncated: bool = False) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif value is None:
+        text = ""
+    else:
+        text = str(value)
+    text = text.replace("\x00", "")
+    if truncated:
+        # tail(1) can begin inside a secret, after the introducer has been cut off.
+        newline = text.find("\n")
+        text = "" if newline < 0 else text[newline + 1:]
+    text = _redact_secrets(text).strip()
+    if not text:
+        return "<empty>"
+    return text[-limit:]
+
+
+def _captured_log_body(raw: bytes) -> tuple[bytes, bool]:
+    """Split a leading byte-count line.
+
+    Truncated means the counted file was longer than the fetched tail, or the
+    tail filled the fetch. A full tail may have grown past the earlier count,
+    so its first line can start after a secret's introducer.
+    """
+    if not raw or raw.startswith(b"<empty>"):
+        return raw, False
+    newline = raw.find(b"\n")
+    if newline < 0:
+        return raw, False
+    header = raw[:newline].strip()
+    if not header.isdigit():
+        return raw, False
+    body = raw[newline + 1:]
+    return body, int(header) > len(body) or len(body) >= LOG_FETCH
+
+
+def _timeout_command(error: subprocess.TimeoutExpired) -> str:
+    command = error.cmd
+    if isinstance(command, (list, tuple)):
+        rendered = shlex.join(str(part) for part in command)
+    else:
+        rendered = "" if command is None else str(command)
+    return _nonempty_text(rendered, limit=500)
+
+
+def capture_daemon_log(custody: Any, node: Node) -> str:
+    """Read the daemon log before setup gives up. The result is never empty."""
+    remote = getattr(custody, "remote", None)
+    marker = getattr(custody, "marker", None)
+    if remote is None or not marker:
+        return "<capture failed: no remote>"
+    try:
+        raw = remote.run(node.host, DAEMON_LOG_SCRIPT, [node.root, marker], capture=True, timeout=10)
+    except Exception as error:
+        return f"<capture failed: {type(error).__name__}>"
+    if not isinstance(raw, bytes):
+        raw = str(raw).encode()
+    body, truncated = _captured_log_body(raw)
+    return _nonempty_text(body, limit=LOG_RETAIN, truncated=truncated)
+
+
+def setup_timeout_diagnostic(custody: Any, node: Node, error: subprocess.TimeoutExpired) -> dict[str, str]:
+    return {"command": _timeout_command(error),
+            "stderr": _nonempty_text(getattr(error, "stderr", None), limit=2000),
+            "daemon_log": capture_daemon_log(custody, node)}
+
+
+def _retry_row(node: Node, step: str, diagnostic: dict[str, str]) -> dict[str, Any]:
+    return {"label": f"{node.label} setup retried {step}", "passed": True, "step": step,
+            "node": node.label, "retries": 1, "command": diagnostic["command"],
+            "stderr": diagnostic["stderr"], "daemon_log": diagnostic["daemon_log"]}
+
+
+def _bind_setup_step(error: BaseException, step: str, node: str) -> None:
+    setattr(error, "setup_step", step)
+    setattr(error, "setup_node", node)
+    prefix = f"setup step {step} on {node}: "
+    if not error.args or not isinstance(error.args[0], str) or error.args[0].startswith("setup step "):
+        return
+    error.args = (prefix + error.args[0], *error.args[1:])
+
+
+def _resume_setup_after_timeout(evidence: Evidence, custody: Any, node: Node, step: str,
+                                error: subprocess.TimeoutExpired, action: Callable[[], Any]) -> Any:
+    """Capture this attempt, retry the transient step once, then name a second timeout."""
+    evidence.assertions.append(_retry_row(node, step, setup_timeout_diagnostic(custody, node, error)))
+    try:
+        return action()
+    except subprocess.TimeoutExpired as second:
+        final = setup_timeout_diagnostic(custody, node, second)
+        raise SetupStepError(step, node.label, final["command"], final["stderr"],
+                             final["daemon_log"], retried=True) from second
+    except Exception as other:
+        _bind_setup_step(other, step, node.label)
+        raise
+
+
+def run_setup_step(evidence: Evidence, custody: Any, node: Node, step: str,
+                   action: Callable[[], Any]) -> Any:
+    """Run one named setup step. A timeout keeps its log and is tried once more."""
+    if step not in SETUP_STEPS:
+        raise ValueError("unknown setup step")
+    try:
+        return action()
+    except subprocess.TimeoutExpired as first:
+        return _resume_setup_after_timeout(evidence, custody, node, step, first, action)
+    except Exception as error:
+        _bind_setup_step(error, step, node.label)
+        raise
+
+
+def _start_daemon(custody: Any, node: Node) -> None:
+    """Start the daemon. A timed-out attempt is stopped before the one retry."""
+    if node.label in custody.started and node.label not in custody.offline:
+        custody.stop(node.label)
+    custody.start(node)
+
+
+def _copy_installed_owner_key(custody: Any, source: Node, target: Node) -> str:
+    existing = custody.key_fingerprint(target)
+    if existing is not None:
+        return existing
+    return custody.copy_owner_key(source, target)
+
+
+def _setup_failure_row(error: BaseException) -> dict[str, Any]:
+    row: dict[str, Any] = {"label": f"fixture {type(error).__name__}", "passed": False}
+    if isinstance(error, SetupStepError):
+        row["label"] = f"fixture setup step {error.step} TimeoutExpired"
+        row.update(setup_step=error.step, node=error.node, command=error.command,
+                   stderr=error.stderr_text, daemon_log=error.daemon_log, retried=error.retried)
+        return row
+    step = getattr(error, "setup_step", None)
+    if isinstance(step, str) and step in SETUP_STEPS:
+        row["label"] = f"fixture setup step {step} {type(error).__name__}"
+        row["setup_step"] = step
+        node = getattr(error, "setup_node", None)
+        if isinstance(node, str):
+            row["node"] = node
+    return row
+
+
+def _setup_failure_text(error: BaseException) -> str:
+    if isinstance(error, SetupStepError):
+        return error.diagnostic()
+    if isinstance(getattr(error, "setup_step", None), str):
+        return str(error).strip() or f"setup step {error.setup_step}"
+    return ""
 
 
 def trust_peer(evidence: Evidence, client: Api, label: str, peer: str, agent_id: str) -> None:
@@ -385,6 +628,51 @@ def config_bytes(node: Node, plane: str, bootstrap: str | None) -> bytes:
             '[update]\nenabled = false\n').encode()
 
 
+def _sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def evaluate_custody_receipt(receipts: dict[str, tuple[str, str]], deployed: dict[str, str], *,
+                             mixed: bool) -> dict[str, Any]:
+    """Per-node binary receipt must match the binary deployed to that node.
+
+    A run without --mixed also requires every node to record the same sha256.
+    """
+    if not receipts or set(receipts) != set(deployed):
+        raise RuntimeError("custody receipt does not cover the deployed nodes")
+    binary_sha256: dict[str, str] = {}
+    config_sha256: dict[str, str] = {}
+    mismatched: list[str] = []
+    for label, (config_sha, binary_sha) in receipts.items():
+        expected = deployed[label]
+        if not all(_sha256_hex(value) for value in (config_sha, binary_sha, expected)):
+            raise RuntimeError("invalid synthetic custody hash receipt")
+        config_sha256[label] = config_sha
+        binary_sha256[label] = binary_sha
+        if binary_sha != expected:
+            mismatched.append(label)
+    uniform = len(set(binary_sha256.values())) == 1
+    return {
+        "passed": not mismatched and (mixed or uniform),
+        "binary_sha256": binary_sha256,
+        "deployed_binary_sha256": {label: deployed[label] for label in receipts},
+        "config_sha256": config_sha256,
+        "mismatched_nodes": mismatched,
+        "uniform": uniform,
+        "mixed": mixed,
+    }
+
+
+def require_expected_binary(evidence: Evidence, custody: Any, node: Node,
+                            expected: dict[str, str]) -> None:
+    """Fail when the owned process is not the binary recorded for this node."""
+    actual = custody.running_exe_sha(node)
+    wanted = expected[node.label]
+    evidence.check(f"{node.label} runs the expected fixture binary",
+                   _sha256_hex(actual) and actual == wanted,
+                   expected_sha256=wanted, running_sha256=actual)
+
+
 def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                 resources: dict[str, Any]) -> bool:
     run_id = uuid.uuid4().hex
@@ -398,95 +686,173 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
              for i, (label, host) in enumerate(zip(args.nodes, hosts))}
     custody = SyntheticProcessCustody(remote, args.daemon_binary, run_id)
     tunnels: list[TunnelHandle] = []
+    open_tunnels: dict[str, TunnelHandle] = {}
     resources["custody"], resources["tunnels"] = custody, tunnels
     clients: dict[str, Api] = {}
     owner = args.nodes[0]
     bootstrap = f"{nodes[owner].host}:{nodes[owner].quic_port}"
     for label, node in nodes.items():
-        custody.prepare(node, config_bytes(node, plane, None if label == owner else bootstrap))
-    custody.create_owner_key(nodes[owner], args.cli_binary)
+        def prepare(node: Node = node, label: str = label) -> None:
+            custody.prepare(node, config_bytes(node, plane, None if label == owner else bootstrap))
+        run_setup_step(evidence, custody, node, "start", prepare)
+
+    def ensure_owner_key() -> None:
+        if custody.key_fingerprint(nodes[owner]) is None:
+            custody.create_owner_key(nodes[owner], args.cli_binary)
+    run_setup_step(evidence, custody, nodes[owner], "identity", ensure_owner_key)
     for label, node in nodes.items():
-        custody.start(node)
-        tunnel = start_ssh_tunnel(node.host, args.local_port_base + len(tunnels), remote_port=node.api_port)
-        tunnels.append(tunnel)
-        clients[label] = Api(f"http://127.0.0.1:{tunnel.local_port}", custody.token(node))
-    receipts = {label: custody.hashes(node) for label, node in nodes.items()}
-    binary_hashes = {receipt[1] for receipt in receipts.values()}
-    evidence.check("fixture custody receipt is reproducible", len(binary_hashes) == 1,
-                   run_id=run_id, network_id=plane,
-                   binary_sha256=next(iter(binary_hashes), None),
-                   config_sha256={label: receipt[0] for label, receipt in receipts.items()})
+        run_setup_step(evidence, custody, node, "start", lambda node=node: _start_daemon(custody, node))
+
+        # A token timeout must reuse the tunnel already opened for this node.
+        # Reading the token first would race the daemon writing api-token.
+        def open_api(label: str = label, node: Node = node) -> None:
+            tunnel = open_tunnels.get(label)
+            if tunnel is None:
+                tunnel = start_ssh_tunnel(node.host, args.local_port_base + len(tunnels),
+                                          remote_port=node.api_port)
+                tunnels.append(tunnel)
+                open_tunnels[label] = tunnel
+            clients[label] = Api(f"http://127.0.0.1:{tunnel.local_port}", custody.token(node))
+        run_setup_step(evidence, custody, node, "readiness probe", open_api)
+    receipts: dict[str, tuple[str, str]] = {}
+    deployed: dict[str, str] = {}
+    for label, node in nodes.items():
+        def grab(label: str = label, node: Node = node) -> None:
+            receipts[label] = custody.hashes(node)
+            deployed[label] = custody.deployed_binary_sha(node)
+        run_setup_step(evidence, custody, node, "readiness probe", grab)
+    # #1208: record one sha256 per node. The receipt must match the binary
+    # deployed there. A single-binary run still requires every sha256 to match.
+    facts = evaluate_custody_receipt(receipts, deployed, mixed=bool(getattr(args, "mixed", False)))
+    passed = facts.pop("passed")
     resources["manifest"] = {
         "run_id": run_id, "network_id": plane,
-        "binary_sha256": next(iter(binary_hashes), None),
-        "config_sha256": {label: receipt[0] for label, receipt in receipts.items()},
+        "binary_sha256": facts["binary_sha256"],
+        "deployed_binary_sha256": facts["deployed_binary_sha256"],
+        "config_sha256": facts["config_sha256"],
+        "mixed": facts["mixed"],
     }
+    evidence.check("fixture custody receipt is reproducible", passed,
+                   run_id=run_id, network_id=plane, **facts)
+    # Locked for the whole run. Later starts compare the live executable to this map.
+    expected_sha = {label: facts["binary_sha256"][label] for label in nodes}
+    for label, node in nodes.items():
+        require_expected_binary(evidence, custody, node, expected_sha)
     owner_api = clients[owner]
     # #824: a fresh owner device defers provisioning (at most 90 s) while it
     # waits for owner sync; poll through that documented transient state.
-    home_status, home = settled_home(owner_api, owner, args.poll_timeout)
-    evidence.check("synthetic owner provisions verified local Home", home_status == 200
-                   and home.get("state") == "local"
-                   and (home.get("primary_agent") or {}).get("verified") is True,
-                   status=home_status, state=home.get("state"))
-    owner_id = home.get("owner_user_id")
-    evidence.check("synthetic Home owner id", isinstance(owner_id, str) and len(owner_id) == 64)
+    def settle_owner() -> tuple[int, dict[str, Any], Any]:
+        home_status, home = settled_home(owner_api, owner, args.poll_timeout)
+        evidence.check("synthetic owner provisions verified local Home", home_status == 200
+                       and home.get("state") == "local"
+                       and (home.get("primary_agent") or {}).get("verified") is True,
+                       status=home_status, state=home.get("state"))
+        owner_id = home.get("owner_user_id")
+        evidence.check("synthetic Home owner id", isinstance(owner_id, str) and len(owner_id) == 64)
+        return home_status, home, owner_id
+    _home_status, home, owner_id = run_setup_step(evidence, custody, nodes[owner], "identity", settle_owner)
 
     # Home admission needs each device's own user-identity announcement, which
     # requires the owner key on that device; every Home device is therefore a
     # same-owner device that is ALSO issued its own owner certificate.
-    owner_key_sha = custody.key_fingerprint(nodes[owner])
-    evidence.check("synthetic owner key fingerprint recorded", owner_key_sha is not None,
-                   owner_key_sha256=owner_key_sha)
+    def record_owner_key() -> str | None:
+        owner_key_sha = custody.key_fingerprint(nodes[owner])
+        evidence.check("synthetic owner key fingerprint recorded", owner_key_sha is not None,
+                       owner_key_sha256=owner_key_sha)
+        return owner_key_sha
+    owner_key_sha = run_setup_step(evidence, custody, nodes[owner], "identity", record_owner_key)
     # #824: the real product setup for an additional owner device. Owner sync
     # is bilateral, so the owner device enrolls itself and each new machine
     # before that machine restarts with the key. The new device enrolls the
     # owner while its own Home provisioning waits for owner sync.
     home_gid = home.get("group_id")
     owner_agent, owner_machine = owner_api.agent_id(), machine_id(owner_api)
-    enroll_peer(evidence, owner_api, owner, owner, None)
+    run_setup_step(evidence, custody, nodes[owner], "join",
+                   lambda: enroll_peer(evidence, owner_api, owner, owner, None))
 
     def certify_same_owner_device(label: str) -> None:
-        card_status, response = clients[label].request("GET", "/agent/card")
-        card = response.get("card") if isinstance(response, dict) else None
-        public_key = card.get("agent_public_key") if isinstance(card, dict) else None
-        signature = card.get("signature") if isinstance(card, dict) else None
-        evidence.check(f"{label} signed card exposes public key", card_status == 200
-                       and isinstance(response, dict) and response.get("ok") is True
-                       and isinstance(public_key, str) and re.fullmatch(r"[0-9a-f]{3904}", public_key) is not None
-                       and isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{6618}", signature) is not None,
-                       status=card_status)
-        device_agent, device_machine = clients[label].agent_id(), machine_id(clients[label])
-        trust_peer(evidence, clients[label], label, owner, owner_agent)
-        custody.stop(label)
-        issue_status, issued = owner_api.request("POST", "/owner/agents/issue",
-                                                 {"agent_public_key": public_key, "mode": "acp",
-                                                  "label": f"home-e2e-{label}"})
-        certificate = (issued.get("certificate") or {}).get("storage_b64")
-        evidence.check(f"owner certifies {label}", issue_status == 200 and isinstance(certificate, str),
-                       status=issue_status)
-        trust_peer(evidence, owner_api, owner, label, device_agent)
-        enroll_peer(evidence, owner_api, owner, label, device_machine)
-        custody.write_certificate(nodes[label], certificate)
-        fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])
-        evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
-                       owner_key_sha256=fingerprint)
-        custody.start(nodes[label])
-        poll(f"{label} restarts certified", args.poll_timeout,
-             lambda label=label: clients[label].request("GET", "/health"),
-             lambda result: result[0] == 200 and result[1].get("ok") is True)
-        # The owner first: enrolling wakes owner sync at once, and that session
-        # must deliver the canonical Home pointer before the wait ends.
-        enroll_peer(evidence, clients[label], label, owner, owner_machine)
-        enroll_peer(evidence, clients[label], label, label, None)
-        device_status, device_home = settled_home(clients[label], label, args.poll_timeout)
-        evidence.check(f"{label} yields to the canonical Home instead of provisioning a duplicate",
-                       device_status == 200 and device_home.get("state") == "elsewhere"
-                       and device_home.get("canonical_group_id") == home_gid,
-                       status=device_status, state=device_home.get("state"))
-        announce_status, _ = clients[label].request("POST", "/announce",
-                                                    {"include_user_identity": True, "human_consent": True})
-        evidence.check(f"{label} publishes owner certificate", announce_status in (200, 201), status=announce_status)
+        # Card reads stay before stop. A certificate-write timeout retries only
+        # the write, so it does not query the daemon that was already stopped.
+        node = nodes[label]
+        held: dict[str, Any] = {}
+
+        def read_card() -> None:
+            card_status, response = clients[label].request("GET", "/agent/card")
+            card = response.get("card") if isinstance(response, dict) else None
+            public_key = card.get("agent_public_key") if isinstance(card, dict) else None
+            signature = card.get("signature") if isinstance(card, dict) else None
+            evidence.check(f"{label} signed card exposes public key", card_status == 200
+                           and isinstance(response, dict) and response.get("ok") is True
+                           and isinstance(public_key, str) and re.fullmatch(r"[0-9a-f]{3904}", public_key) is not None
+                           and isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{6618}", signature) is not None,
+                           status=card_status)
+            device_agent, device_machine = clients[label].agent_id(), machine_id(clients[label])
+            trust_peer(evidence, clients[label], label, owner, owner_agent)
+            held["public_key"] = public_key
+            held["device_agent"] = device_agent
+            held["device_machine"] = device_machine
+        run_setup_step(evidence, custody, node, "identity", read_card)
+
+        def stop_device() -> None:
+            if label not in custody.offline:
+                custody.stop(label)
+        run_setup_step(evidence, custody, node, "identity", stop_device)
+
+        def issue_certificate() -> None:
+            issue_status, issued = owner_api.request("POST", "/owner/agents/issue",
+                                                     {"agent_public_key": held["public_key"], "mode": "acp",
+                                                      "label": f"home-e2e-{label}"})
+            certificate = (issued.get("certificate") or {}).get("storage_b64")
+            evidence.check(f"owner certifies {label}", issue_status == 200 and isinstance(certificate, str),
+                           status=issue_status)
+            trust_peer(evidence, owner_api, owner, label, held["device_agent"])
+            enroll_peer(evidence, owner_api, owner, label, held["device_machine"])
+            held["certificate"] = certificate
+        run_setup_step(evidence, custody, node, "identity", issue_certificate)
+
+        def install_certificate() -> None:
+            custody.write_certificate(node, held["certificate"])
+        run_setup_step(evidence, custody, node, "identity", install_certificate)
+        try:
+            fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])
+        except subprocess.TimeoutExpired as error:
+            fingerprint = _resume_setup_after_timeout(
+                evidence, custody, nodes[label], "identity", error,
+                lambda: _copy_installed_owner_key(custody, nodes[owner], nodes[label]))
+        except Exception as error:
+            _bind_setup_step(error, "identity", label)
+            raise
+
+        def confirm_key() -> None:
+            evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
+                           owner_key_sha256=fingerprint)
+        run_setup_step(evidence, custody, nodes[label], "identity", confirm_key)
+        def start_certified(label: str = label) -> None:
+            _start_daemon(custody, nodes[label])
+            require_expected_binary(evidence, custody, nodes[label], expected_sha)
+        run_setup_step(evidence, custody, nodes[label], "start", start_certified)
+
+        def probe(label: str = label) -> None:
+            poll(f"{label} restarts certified", args.poll_timeout,
+                 lambda label=label: clients[label].request("GET", "/health"),
+                 lambda result: result[0] == 200 and result[1].get("ok") is True)
+        run_setup_step(evidence, custody, nodes[label], "readiness probe", probe)
+
+        def join(label: str = label) -> None:
+            # The owner first: enrolling wakes owner sync at once, and that session
+            # must deliver the canonical Home pointer before the wait ends.
+            enroll_peer(evidence, clients[label], label, owner, owner_machine)
+            enroll_peer(evidence, clients[label], label, label, None)
+            device_status, device_home = settled_home(clients[label], label, args.poll_timeout)
+            evidence.check(f"{label} yields to the canonical Home instead of provisioning a duplicate",
+                           device_status == 200 and device_home.get("state") == "elsewhere"
+                           and device_home.get("canonical_group_id") == home_gid,
+                           status=device_status, state=device_home.get("state"))
+            announce_status, _ = clients[label].request("POST", "/announce",
+                                                        {"include_user_identity": True, "human_consent": True})
+            evidence.check(f"{label} publishes owner certificate", announce_status in (200, 201),
+                           status=announce_status)
+        run_setup_step(evidence, custody, nodes[label], "join", join)
 
     for label in args.nodes[1:4]:
         certify_same_owner_device(label)
@@ -521,6 +887,7 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         evidence.check("owner and admin devices stopped before writer restart",
                        is_offline(owner) and is_offline(admin))
         custody.stop(late); stopped.add(late); custody.restart(writer)
+        require_expected_binary(evidence, custody, nodes[writer], expected_sha)
         poll("writer health after isolated restart", 60,
              lambda: clients[writer].request("GET", "/health"),
              lambda result: result[0] == 200 and result[1].get("ok") is True)
@@ -535,6 +902,9 @@ def main() -> int:
     parser.add_argument("--nodes", nargs=5, required=True,
                         metavar=("OWNER", "WRITER", "LATE", "REVOKED", "OUTSIDER"))
     parser.add_argument("--daemon-binary", required=True)
+    parser.add_argument("--mixed", action="store_true",
+                        help="allow distinct x0xd binaries; each node's receipt must still "
+                             "match the binary deployed to that node")
     parser.add_argument("--cli-binary", required=True)
     parser.add_argument("--api-port-base", type=int, default=14600)
     parser.add_argument("--quic-port-base", type=int, default=7483)
@@ -547,7 +917,10 @@ def main() -> int:
     try:
         succeeded = run_fixture(args, Remote(), evidence, resources)
     except Exception as error:
-        evidence.assertions.append(with_poll_timeout({"label": f"fixture {type(error).__name__}", "passed": False}, error))
+        text = _setup_failure_text(error)
+        if text:
+            print(text, file=sys.stderr)
+        evidence.assertions.append(with_poll_timeout(_setup_failure_row(error), error))
     finally:
         custody = resources.get("custody")
         witnesses: list[dict[str, Any]] = []

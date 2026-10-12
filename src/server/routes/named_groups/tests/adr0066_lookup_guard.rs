@@ -331,13 +331,16 @@ fn adr0066_lookup_guard_still_sees_the_waived_census() {
     let sites = all_sites();
     assert_eq!(
         sites.len(),
-        11,
-        "#732 census: 12 single-spelling roster lookups remain on quarantine \
+        9,
+        "#732 census: 9 single-spelling roster lookups remain on quarantine \
          paths, each waived at the site (8 at the original 15-line window, 4 \
          more once review of #750 widened it to 25; N19-B routes the manual \
          clear's closure through resolve_group_entry_mut_locked, so that \
-         site no longer spells the lookup itself — 12 -> 11). If you added \
-         or removed one, say so here:\n{sites:#?}"
+         site no longer spells the lookup itself — 12 -> 11; and the #1166 \
+         S2 migration folds the send + secure encrypt/decrypt/reseal \
+         handler lookups into two admission cores in `group_access.rs`, \
+         which carry the handlers' waivers at their sites — 11 -> 9). If \
+         you added or removed one, say so here:\n{sites:#?}"
     );
     assert!(
         sites.iter().all(|site| site.waived),

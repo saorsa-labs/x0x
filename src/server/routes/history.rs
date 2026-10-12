@@ -5,8 +5,8 @@
 //! `spawn_blocking` — the store is synchronous SQLite and must never run on
 //! the async executor threads.
 
-use super::super::api_error;
 use super::super::state::AppState;
+use super::super::{api_error, api_error_with_reason};
 use crate as x0x;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1107,6 +1107,13 @@ pub(in crate::server) struct HistoryPurgeParams {
 /// purge closes so nobody — operator or attacker — can delete the evidence
 /// mid-incident. The check runs BEFORE any deletion, so a refused purge
 /// leaves the store untouched.
+///
+/// Issue #1317: the purge takes the retention admission
+/// ([`x0x::history::HistoryHandle::purge`]). While a reaper pass or a trim
+/// holds the store it answers 409 `history_retention_busy` at once and
+/// deletes nothing; it is not queued. The purge is not atomic: a 500
+/// after its row delete committed keeps those rows deleted and counts
+/// them in `removed`.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -1133,6 +1140,10 @@ pub(in crate::server) async fn history_purge(
         // annotation; it lets `Store::purge` below destroy the forensic
         // record of a quarantined group. The refusal names the resolved MAP
         // KEY, because that is the id the manual clear route accepts.
+        // #1166 S5 ceiling: the purge gate consumes the query's `scope`
+        // (group:<stable id>) and resolves both spellings itself — it
+        // cannot move into the extractor (the S4 ruling).
+        #[allow(clippy::disallowed_methods)]
         let refusal = {
             let groups = state.named_groups.read().await;
             crate::server::resolve_group_entry_locked(&groups, group_id).and_then(|(key, info)| {
@@ -1145,15 +1156,215 @@ pub(in crate::server) async fn history_purge(
             return refusal;
         }
     }
-    let store = Arc::clone(history.store());
-    match tokio::task::spawn_blocking(move || store.purge(&scope)).await {
-        Ok(Ok(removed)) => (
+    match history.purge(&scope).await {
+        Ok(removed) => (
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "removed": removed })),
         ),
-        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("purge: {e}")),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
+        Err(x0x::history::RetainError::Busy) => api_error_with_reason(
+            StatusCode::CONFLICT,
+            "another history retention operation is running; try again later",
+            "history_retention_busy",
+        ),
+        // Round 2 (Codex P2): the purge is not atomic. Rows its committed
+        // delete removed stay deleted when a later step fails; `removed`
+        // counts them (0 when the delete itself failed).
+        Err(x0x::history::RetainError::Failed { error, committed }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("purge: {error}"),
+                "removed": committed.deleted,
+            })),
+        ),
+        Err(x0x::history::RetainError::InvalidOptions(message)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("purge: {message}"),
+        ),
     }
+}
+
+/// Rules as `GET /history/policy` reports them: the global and exact-scope
+/// bounds, the topics recorded, and the ADR 0116 rules in compiled form
+/// (class limits Durable then Replaceable; topic rules in prefix byte
+/// order).
+fn history_policy_rules_json(
+    policy: &x0x::history::HistoryPolicy,
+    retention: &x0x::history::RetentionPolicy,
+    record_topics: &[String],
+) -> serde_json::Value {
+    const DAY_MS: i64 = 86_400_000;
+    let class_limits: Vec<serde_json::Value> = [
+        x0x::history::RetainedClass::Durable,
+        x0x::history::RetainedClass::Replaceable,
+    ]
+    .into_iter()
+    .filter_map(|class| {
+        policy.class_bounds(class).map(|bounds| {
+            serde_json::json!({
+                "class": class,
+                "max_bytes": bounds.max_bytes,
+                "max_age_days": bounds.max_age_ms.map(|ms| ms / DAY_MS),
+            })
+        })
+    })
+    .collect();
+    let topic_rules: Vec<serde_json::Value> = policy
+        .topic_rules()
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "prefix": rule.prefix,
+                "recording": rule.recording,
+                "max_bytes": rule.bounds.max_bytes,
+                "max_age_days": rule.bounds.max_age_ms.map(|ms| ms / DAY_MS),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "max_bytes": retention.max_bytes,
+        "max_age_days": retention.max_age_days,
+        "scope_limits": retention.scope_limits,
+        "record_topics": record_topics,
+        "dm_recording": policy.dm_recording(),
+        "class_limits": class_limits,
+        "topic_rules": topic_rules,
+    })
+}
+
+/// GET /history/policy (ADR 0116 §3): the local history policy in force.
+///
+/// Owner-only. The durable bearer is enforced at the route layer
+/// (`auth::requires_durable_owner`) and again here; sessions and riders get
+/// 403. The read works when history is disabled: it then reports the
+/// configured `[history]` rules, with no store and no counters. With
+/// history enabled it reports what the open store enforces.
+///
+/// Ruling Q11: this is the only body that carries the ADR 0116 counters
+/// and gauges (C's suppression counters; the #1286 and topic-rule skip
+/// gauges). No existing response gained a key. Every counter is a bounded
+/// scalar: no topic, payload or other label.
+///
+/// ADR 0066 §1: classified Observability. It reports the fork-quarantine
+/// pins (the protected-group exception) and does not act under them.
+pub(in crate::server) async fn history_policy(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "the history policy is owner-only: use the durable API token",
+        );
+    }
+    let history = state.agent.history();
+    let config = &state.history_config;
+    let from_config;
+    let (policy, retention) = match history {
+        Some(history) => (history.policy(), history.retention_policy().clone()),
+        None => {
+            from_config = match config.compile_policy() {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("history policy: {e}"),
+                    )
+                }
+            };
+            (
+                &from_config,
+                x0x::history::RetentionPolicy {
+                    max_bytes: config.max_bytes,
+                    max_age_days: config.max_age_days,
+                    scope_limits: config.scope_limits.clone(),
+                },
+            )
+        }
+    };
+    let rules = history_policy_rules_json(policy, &retention, &config.record_topics);
+
+    let defaults = {
+        let daemon = x0x::history::HistoryConfig::daemon_default();
+        let mut defaults = history_policy_rules_json(
+            &x0x::history::HistoryPolicy::default(),
+            &x0x::history::RetentionPolicy {
+                max_bytes: daemon.max_bytes,
+                max_age_days: daemon.max_age_days,
+                scope_limits: daemon.scope_limits.clone(),
+            },
+            &daemon.record_topics,
+        );
+        defaults["enabled"] = daemon.enabled.into();
+        defaults
+    };
+
+    // The protected-group exception: every fork-quarantined group, under
+    // both spellings, with the ADR 0068 ceiling that alone may evict it.
+    // Owner-only route, so every marker is visible.
+    let pinned_scopes: Vec<serde_json::Value> = all_quarantine_markers(&state)
+        .await
+        .into_iter()
+        .filter_map(|(scope, _marker)| {
+            let parsed = Scope::parse(&scope).ok()?;
+            Some(serde_json::json!({
+                "scope": scope,
+                "ceiling_bytes": x0x::history::Store::pinned_ceiling(&retention, &parsed),
+            }))
+        })
+        .collect();
+
+    let (counters, store) = match history {
+        Some(history) => {
+            use std::sync::atomic::Ordering::Relaxed;
+            let c = history.counters();
+            let store = history.store();
+            (
+                serde_json::json!({
+                    "policy_suppressed_dm_total": c.policy_suppressed_dm_total.load(Relaxed),
+                    "policy_suppressed_topic_total": c.policy_suppressed_topic_total.load(Relaxed),
+                    "policy_durable_receipt_withheld_total":
+                        c.policy_durable_receipt_withheld_total.load(Relaxed),
+                    "skipped_scope_limits": store.skipped_scope_limits(),
+                    "skipped_topic_rules": store.skipped_topic_rules(),
+                }),
+                serde_json::json!({ "text_encoding": store.text_encoding() }),
+            )
+        }
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "enabled": history.is_some(),
+            "rules": rules,
+            "defaults": defaults,
+            "class_derivation": {
+                "durable": "replace_key IS NULL",
+                "replaceable": "replace_key IS NOT NULL",
+                "ephemeral": "never stored",
+            },
+            "protected_group_exception": {
+                "group_history_ephemeral": false,
+                "pins_win_over_every_rule": true,
+                "pinned_scopes": pinned_scopes,
+                "ceiling": {
+                    "formula": "min(multiplier * base, max_bytes / absolute_divisor); \
+                                base = the scope's scope_limits entry, else \
+                                max_bytes / base_divisor",
+                    "multiplier": x0x::history::HISTORY_QUARANTINE_PIN_MULTIPLIER,
+                    "base_divisor": x0x::history::HISTORY_QUARANTINE_PIN_BASE_DIVISOR,
+                    "absolute_divisor": x0x::history::HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR,
+                },
+            },
+            "counters": counters,
+            "store": store,
+        })),
+    )
 }
 
 /// GET /diagnostics/history — writer/reaper counters (one-per-subsystem
@@ -2597,6 +2808,1052 @@ mod adr0066_fork_quarantine_tests {
         assert!(
             other.get("fork_quarantined").is_none(),
             "the control group must not inherit the neighbour's label: {other}"
+        );
+        Ok(())
+    }
+}
+
+/// ADR 0116 §4: the body limit of `POST /history/retain`.
+pub(in crate::server) const HISTORY_RETAIN_BODY_LIMIT: usize = 1024;
+
+/// The only body `POST /history/retain` accepts (ADR 0116 §4): no SQL,
+/// path, force flag, replacement policy or scope selector. A field given as
+/// `null` means "use the default", like an omitted one.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct HistoryRetainBody {
+    /// Most rows to delete, pin-ceiling deletions included (1–65 536;
+    /// default 4 096).
+    #[serde(default)]
+    max_rows: Option<u32>,
+    /// Work-admission budget in milliseconds (1–10 000; default 2 000).
+    #[serde(default)]
+    budget_ms: Option<u32>,
+}
+
+/// Decode a `POST /history/retain` body from its raw bytes. An empty (or
+/// all-whitespace) body is `{}` (ruling Q12). Anything else must be a JSON
+/// object with only the two knobs, in range. Decoding the bytes here, not
+/// through axum's `Json` extractor, keeps every refusal a 400 (`Json` would
+/// answer 415 or 422).
+fn parse_retain_body(body: &[u8]) -> Result<x0x::history::RetainOptions, String> {
+    let parsed = if body.iter().all(u8::is_ascii_whitespace) {
+        HistoryRetainBody::default()
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+        if !value.is_object() {
+            return Err("the body must be a JSON object".to_string());
+        }
+        serde_json::from_value(value).map_err(|e| {
+            format!("invalid retain body: {e}; only max_rows and budget_ms are accepted")
+        })?
+    };
+    let options = x0x::history::RetainOptions {
+        max_rows: parsed
+            .max_rows
+            .unwrap_or(x0x::history::RETAIN_DEFAULT_MAX_ROWS),
+        budget_ms: parsed
+            .budget_ms
+            .unwrap_or(x0x::history::RETAIN_DEFAULT_BUDGET_MS),
+    };
+    options.validate().map_err(|e| e.to_string())?;
+    Ok(options)
+}
+
+/// POST /history/retain — one bounded trim of local history under the
+/// daemon's startup policy now (ADR 0116 §4). Owner-only: the durable
+/// bearer, enforced at the route layer (`auth.rs`) and again here.
+///
+/// The body takes only `max_rows` and `budget_ms` (1 KiB limit: larger
+/// bodies are 413). Malformed or out-of-range bodies are 400. Disabled
+/// history is 409 `history_disabled`; a reaper pass or another trim holding
+/// the store is 409 `history_retention_busy` (nothing is queued). A 200
+/// carries the [`x0x::history::RetainReport`]: committed deletions by
+/// phase, pin-ceiling deletions, elapsed time and `state`. An SQLite
+/// failure is a typed 500 with the counts committed before it.
+///
+/// ADR 0066 §1 classification `Covered(&[27])`: the trim runs through the
+/// retention service and the daemon's live pin source (ADR 0068 D1), so a
+/// fork-quarantined group's rows are pinned exactly as for the reaper.
+pub(in crate::server) async fn history_retain(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "history retention is owner-only: use the durable API token",
+        )
+        .into_response();
+    }
+    let options = match parse_retain_body(&body) {
+        Ok(options) => options,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(history) = state.agent.history() else {
+        return api_error_with_reason(
+            StatusCode::CONFLICT,
+            "history is disabled on this daemon",
+            "history_disabled",
+        )
+        .into_response();
+    };
+    match history.retain(options).await {
+        Ok(report) => {
+            let mut body = serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}));
+            body["ok"] = true.into();
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(x0x::history::RetainError::Busy) => api_error_with_reason(
+            StatusCode::CONFLICT,
+            "another history retention operation is running; try again later",
+            "history_retention_busy",
+        )
+        .into_response(),
+        Err(x0x::history::RetainError::InvalidOptions(message)) => {
+            api_error(StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(x0x::history::RetainError::Failed { error, committed }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "history trim failed: {error}. The {} deletions committed before the \
+                     failure are not rolled back.",
+                    committed.deleted
+                ),
+                "reason": "history_retention_failed",
+                "committed": committed,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod adr0116_policy_tests {
+    //! ADR 0116 §3, slice E: `GET /history/policy`. The route is owner-only
+    //! (durable bearer), works when history is disabled, and carries the
+    //! active rules, the defaults, the class derivation, the protected-group
+    //! exception (the current pins) and the bounded counters. Under ruling
+    //! Q11 these appear nowhere else. Driven through the production auth
+    //! middleware.
+
+    use super::discovery_auth_tests::{text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+    use x0x::history::{
+        ClassLimit, DmRecording, HistoryConfig, PinnedScopes, RetainedClass, RetentionPolicy,
+        ScopeLimit, TopicRecording, TopicRule,
+    };
+
+    pub(super) async fn state_with(
+        dir: &std::path::Path,
+        history: Option<HistoryConfig>,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let identity_dir = dir.join("identity");
+        tokio::fs::create_dir_all(&identity_dir).await?;
+        let mut builder = x0x::Agent::builder()
+            .with_identity_dir(&identity_dir)
+            .with_machine_key(identity_dir.join("machine.key"))
+            .with_agent_key_path(identity_dir.join("agent.key"))
+            .with_agent_cert_path(identity_dir.join("agent.cert"))
+            .with_user_key(x0x::identity::UserKeypair::generate()?)
+            .with_contact_store_path(dir.join("contacts.json"));
+        if let Some(config) = history {
+            builder = builder.with_history(config);
+        }
+        let agent = Arc::new(builder.build().await?);
+        super::super::named_groups::tests::secure_endpoint_test_state_at(dir, agent).await
+    }
+
+    pub(super) fn enabled(dir: &std::path::Path, config: HistoryConfig) -> HistoryConfig {
+        HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.join("history.db")),
+            ..config
+        }
+    }
+
+    fn policy_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route("/history/policy", get(history_policy))
+            .route("/diagnostics/history", get(history_diagnostics))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn get_with(
+        app: &axum::Router,
+        uri: &str,
+        bearer: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method("GET").uri(uri);
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
+        let request = request
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let response = app.clone().oneshot(request).await.expect("router answers");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    pub(super) async fn rider(state: &AppState) -> String {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _record) = store
+            .issue(
+                "aa".repeat(32),
+                vec!["any-group".to_string()],
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await
+            .expect("rider token issues");
+        token
+    }
+
+    /// A fork-quarantined group whose roster key differs from its stable id.
+    pub(super) async fn quarantine_under(state: &AppState, map_key: &str, stable_id: &str) {
+        let creator = state.agent.agent_id();
+        let mut info = x0x::groups::GroupInfo::new(
+            map_key.to_string(),
+            "adr-0116 slice E fixture".to_string(),
+            creator,
+            stable_id.to_string(),
+        );
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 9,
+            state_hash: info.state_hash.clone(),
+            committed_by: hex::encode(creator.as_bytes()),
+            observed_at_ms: 2_000,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: Some("signer_only".to_string()),
+            },
+            no_anchor: true,
+        });
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(map_key.to_string(), info);
+    }
+
+    /// Validation "Policy read and counters": the full token matrix. Only
+    /// the durable owner token reads the policy; sessions and riders get
+    /// 403, a missing or unknown token 401, and the durable token is never
+    /// accepted from a query string. Holds with history enabled and with it
+    /// disabled.
+    #[tokio::test]
+    async fn adr0116_policy_token_matrix() -> anyhow::Result<()> {
+        for history_enabled in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let history =
+                history_enabled.then(|| enabled(dir.path(), HistoryConfig::daemon_default()));
+            let state = state_with(dir.path(), history).await?;
+            let app = policy_router(Arc::clone(&state));
+            let session = state.sessions.issue(std::time::Instant::now());
+            let rider = rider(&state).await;
+            let cases = [
+                (
+                    "/history/policy".to_string(),
+                    Some(DURABLE),
+                    StatusCode::OK,
+                    "durable owner",
+                ),
+                (
+                    "/history/policy".to_string(),
+                    Some(session.as_str()),
+                    StatusCode::FORBIDDEN,
+                    "session bearer",
+                ),
+                (
+                    "/history/policy".to_string(),
+                    Some(rider.as_str()),
+                    StatusCode::FORBIDDEN,
+                    "rider",
+                ),
+                (
+                    "/history/policy".to_string(),
+                    None,
+                    StatusCode::UNAUTHORIZED,
+                    "no token",
+                ),
+                (
+                    "/history/policy".to_string(),
+                    Some("not-a-token"),
+                    StatusCode::UNAUTHORIZED,
+                    "unknown token",
+                ),
+                (
+                    format!("/history/policy?token={DURABLE}"),
+                    None,
+                    StatusCode::UNAUTHORIZED,
+                    "durable token in the query",
+                ),
+            ];
+            for (uri, bearer, expected, who) in cases {
+                assert_eq!(
+                    get_with(&app, &uri, bearer).await.0,
+                    expected,
+                    "{who}, history enabled = {history_enabled}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The active rules, the defaults and the class derivation, as in force
+    /// on this store.
+    #[tokio::test]
+    async fn adr0116_policy_reports_the_active_rules_defaults_and_class_derivation(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = enabled(
+            dir.path(),
+            HistoryConfig {
+                max_bytes: 500_000_000,
+                max_age_days: 30,
+                scope_limits: vec![ScopeLimit {
+                    scope: "group:g".into(),
+                    max_bytes: 1_000_000,
+                }],
+                dm_recording: DmRecording::Ephemeral,
+                class_limits: vec![ClassLimit {
+                    class: RetainedClass::Durable,
+                    max_bytes: None,
+                    max_age_days: Some(7),
+                }],
+                topic_rules: vec![
+                    TopicRule {
+                        prefix: "app.sync.".into(),
+                        recording: TopicRecording::Ephemeral,
+                        max_bytes: None,
+                        max_age_days: None,
+                    },
+                    TopicRule {
+                        prefix: "app.chat".into(),
+                        recording: TopicRecording::Inherit,
+                        max_bytes: Some(16_777_216),
+                        max_age_days: Some(3),
+                    },
+                ],
+                ..HistoryConfig::daemon_default()
+            },
+        );
+        let state = state_with(dir.path(), Some(config)).await?;
+        let app = policy_router(Arc::clone(&state));
+        let (status, body) = get_with(&app, "/history/policy", Some(DURABLE)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], true);
+        let rules = &body["rules"];
+        assert_eq!(rules["max_bytes"], 500_000_000);
+        assert_eq!(rules["max_age_days"], 30);
+        assert_eq!(
+            rules["scope_limits"],
+            serde_json::json!([{"scope": "group:g", "max_bytes": 1_000_000}])
+        );
+        assert_eq!(rules["dm_recording"], "ephemeral");
+        assert_eq!(
+            rules["class_limits"],
+            serde_json::json!([{"class": "durable", "max_bytes": null, "max_age_days": 7}])
+        );
+        assert_eq!(
+            rules["topic_rules"],
+            serde_json::json!([
+                {"prefix": "app.chat", "recording": "inherit", "max_bytes": 16_777_216, "max_age_days": 3},
+                {"prefix": "app.sync.", "recording": "ephemeral", "max_bytes": null, "max_age_days": null}
+            ]),
+            "topic rules in prefix byte order"
+        );
+        assert!(rules["record_topics"].is_array());
+        assert_eq!(
+            body["defaults"],
+            serde_json::json!({
+                "enabled": true,
+                "max_bytes": 1_073_741_824_u64,
+                "max_age_days": 0,
+                "scope_limits": [],
+                "record_topics": [],
+                "dm_recording": "inherit",
+                "class_limits": [],
+                "topic_rules": []
+            })
+        );
+        assert_eq!(body["class_derivation"]["durable"], "replace_key IS NULL");
+        assert_eq!(
+            body["class_derivation"]["replaceable"],
+            "replace_key IS NOT NULL"
+        );
+        assert_eq!(body["store"]["text_encoding"], "UTF-8");
+        Ok(())
+    }
+
+    /// ADR 0116 §3: the policy read works when history is disabled. It
+    /// reports the configured rules, and no store or counters.
+    #[tokio::test]
+    async fn adr0116_policy_works_with_history_disabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), None).await?;
+        assert!(state.agent.history().is_none(), "fixture: history disabled");
+        let app = policy_router(Arc::clone(&state));
+        let (status, body) = get_with(&app, "/history/policy", Some(DURABLE)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], false);
+        assert!(body["counters"].is_null());
+        assert!(body["store"].is_null());
+        assert_eq!(body["rules"]["dm_recording"], "inherit");
+        assert_eq!(body["rules"]["max_bytes"], 1_073_741_824_u64);
+        assert!(body["protected_group_exception"].is_object());
+        Ok(())
+    }
+
+    /// Validation "Policy read and counters": the protected-group
+    /// exception. Pinned (fork-quarantined) groups are listed under both
+    /// spellings with their unchanged ceiling, and group history has no
+    /// Ephemeral opt-out.
+    #[tokio::test]
+    async fn adr0116_policy_reports_the_protected_group_exception() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        quarantine_under(&state, "alias-key-e", "stable-id-e").await;
+        quarantine_under(&state, "plain-e", "plain-e").await;
+        let app = policy_router(Arc::clone(&state));
+        let (status, body) = get_with(&app, "/history/policy", Some(DURABLE)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let exception = &body["protected_group_exception"];
+        assert_eq!(exception["group_history_ephemeral"], false);
+        assert_eq!(exception["pins_win_over_every_rule"], true);
+        let ceiling = 1_073_741_824_u64 / 16;
+        assert_eq!(
+            exception["pinned_scopes"],
+            serde_json::json!([
+                {"scope": "group:alias-key-e", "ceiling_bytes": ceiling},
+                {"scope": "group:plain-e", "ceiling_bytes": ceiling},
+                {"scope": "group:stable-id-e", "ceiling_bytes": ceiling}
+            ])
+        );
+        assert_eq!(exception["ceiling"]["multiplier"], 4);
+        assert_eq!(exception["ceiling"]["base_divisor"], 64);
+        assert_eq!(exception["ceiling"]["absolute_divisor"], 16);
+        Ok(())
+    }
+
+    /// Validation "Policy read and counters": each suppression path's
+    /// counter, plus the store gauges, appear here and only as scalars. No
+    /// counter key or value carries a topic or a payload.
+    #[tokio::test]
+    async fn adr0116_policy_counters_are_bounded_scalars_without_labels() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = enabled(
+            dir.path(),
+            HistoryConfig {
+                dm_recording: DmRecording::Ephemeral,
+                topic_rules: vec![TopicRule {
+                    prefix: "app.sync.".into(),
+                    recording: TopicRecording::Ephemeral,
+                    max_bytes: None,
+                    max_age_days: None,
+                }],
+                ..HistoryConfig::daemon_default()
+            },
+        );
+        let state = state_with(dir.path(), Some(config)).await?;
+        let history = state.agent.history().expect("history").clone();
+        history.record(text_row(
+            Scope::Dm("ab".repeat(32)),
+            "secret payload words",
+            1_000,
+        ));
+        history.record(text_row(
+            Scope::Topic("app.sync.secret-topic".into()),
+            "secret topic words",
+            1_000,
+        ));
+        history
+            .counters()
+            .policy_durable_receipt_withheld_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        history.store().retain_with_pins(
+            &RetentionPolicy {
+                max_bytes: u64::MAX,
+                max_age_days: 0,
+                scope_limits: vec![ScopeLimit {
+                    scope: "not-a-scope".into(),
+                    max_bytes: 0,
+                }],
+            },
+            &PinnedScopes::none(),
+        )?;
+        let app = policy_router(Arc::clone(&state));
+        let (status, body) = get_with(&app, "/history/policy", Some(DURABLE)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["counters"],
+            serde_json::json!({
+                "policy_suppressed_dm_total": 1,
+                "policy_suppressed_topic_total": 1,
+                "policy_durable_receipt_withheld_total": 1,
+                "skipped_scope_limits": 1,
+                "skipped_topic_rules": 0
+            })
+        );
+        let counters = body["counters"].to_string();
+        assert!(
+            !counters.contains("secret") && !counters.contains("app.sync"),
+            "no topic or payload in the counters: {counters}"
+        );
+        Ok(())
+    }
+
+    /// Ruling Q11: nothing new leaks into an existing body. The
+    /// `/diagnostics/history` keys are exactly the pre-ADR-0116 set.
+    #[tokio::test]
+    async fn adr0116_diagnostics_history_body_is_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = policy_router(Arc::clone(&state));
+        let (status, body) = get_with(&app, "/diagnostics/history", Some(DURABLE)).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "abandoned_at_shutdown",
+                "dedup_hits",
+                "dropped_full",
+                "enabled",
+                "history_quarantine_pinned_evictions",
+                "history_quarantine_pinned_scopes",
+                "ok",
+                "reaper_evicted_total",
+                "write_errors",
+                "written_total"
+            ]
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adr0116_retain_tests {
+    //! ADR 0116 §4, slice D: `POST /history/retain`, driven through the
+    //! production auth middleware with the production body-limit layering
+    //! (the route's 1 KiB limit inside the router-wide 1 MiB one).
+
+    use super::adr0116_policy_tests::{enabled, quarantine_under, rider, state_with};
+    use super::discovery_auth_tests::{text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+    use x0x::history::{HistoryConfig, PinnedScopes, RetainOptions};
+
+    fn retain_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/history/retain",
+                post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
+                    HISTORY_RETAIN_BODY_LIMIT,
+                )),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn post_with(
+        app: &axum::Router,
+        uri: &str,
+        bearer: Option<&str>,
+        body: impl Into<Vec<u8>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method("POST").uri(uri);
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
+        let request = request
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.into()))
+            .expect("request builds");
+        let response = app.clone().oneshot(request).await.expect("router answers");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn aged(dir: &std::path::Path) -> HistoryConfig {
+        enabled(
+            dir,
+            HistoryConfig {
+                max_age_days: 1,
+                ..HistoryConfig::daemon_default()
+            },
+        )
+    }
+
+    fn old_rows(state: &AppState, scope: &Scope, n: usize) {
+        let history = state.agent.history().expect("history on");
+        let rows: Vec<_> = (0..n)
+            .map(|i| {
+                text_row(
+                    scope.clone(),
+                    &format!("old {i} {}", scope.canonical()),
+                    1_000,
+                )
+            })
+            .collect();
+        history.store().insert_batch(&rows).expect("rows insert");
+    }
+
+    /// Validation "Runtime bounds": the full token matrix. The durable
+    /// bearer trims; sessions and riders get 403; a missing or unknown token
+    /// 401; the durable token is never taken from the query string.
+    #[tokio::test]
+    async fn adr0116_retain_token_matrix() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let session = state.sessions.issue(std::time::Instant::now());
+        let rider = rider(&state).await;
+        let cases = [
+            (
+                "/history/retain".to_string(),
+                Some(DURABLE),
+                StatusCode::OK,
+                "durable owner",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some(session.as_str()),
+                StatusCode::FORBIDDEN,
+                "session",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some(rider.as_str()),
+                StatusCode::FORBIDDEN,
+                "rider",
+            ),
+            (
+                "/history/retain".to_string(),
+                None,
+                StatusCode::UNAUTHORIZED,
+                "no token",
+            ),
+            (
+                "/history/retain".to_string(),
+                Some("not-a-token"),
+                StatusCode::UNAUTHORIZED,
+                "unknown token",
+            ),
+            (
+                format!("/history/retain?token={DURABLE}"),
+                None,
+                StatusCode::UNAUTHORIZED,
+                "query token",
+            ),
+        ];
+        for (uri, bearer, expected, who) in cases {
+            assert_eq!(
+                post_with(&app, &uri, bearer, "{}").await.0,
+                expected,
+                "{who}"
+            );
+        }
+        Ok(())
+    }
+
+    /// §4 and ruling Q12: the body takes only `max_rows` and `budget_ms`;
+    /// an empty body means `{}`. Malformed or out-of-range values are 400
+    /// (never axum's 415 or 422); a body over 1 KiB is 413.
+    #[tokio::test]
+    async fn adr0116_retain_body_validation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let bad = [
+            "not json",
+            "{",
+            "[]",
+            "[1, 2]",
+            "null",
+            "\"x\"",
+            "{\"max_rows\":0}",
+            "{\"max_rows\":65537}",
+            "{\"budget_ms\":0}",
+            "{\"budget_ms\":10001}",
+            "{\"max_rows\":\"10\"}",
+            "{\"max_rows\":-1}",
+            "{\"max_rows\":1.5}",
+            "{\"max_rows\":4294967296}",
+            "{\"scope\":\"group:x\"}",
+            "{\"force\":true}",
+            "{\"sql\":\"DELETE FROM history\"}",
+            "{\"max_rows\":10,\"policy\":{}}",
+        ];
+        for body in bad {
+            let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+            assert_eq!(json["ok"], false, "{body}");
+        }
+        let mut exactly_1024 = String::from("{\"max_rows\":1");
+        while exactly_1024.len() < 1023 {
+            exactly_1024.push(' ');
+        }
+        exactly_1024.push('}');
+        assert_eq!(exactly_1024.len(), 1024);
+        let good = [
+            String::new(),
+            "  \n".to_string(),
+            "{}".to_string(),
+            "{\"max_rows\":1,\"budget_ms\":10000}".to_string(),
+            "{\"max_rows\":65536,\"budget_ms\":1}".to_string(),
+            "{\"max_rows\":null}".to_string(),
+            exactly_1024,
+        ];
+        for body in good {
+            let (status, json) =
+                post_with(&app, "/history/retain", Some(DURABLE), body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body:?}: {json}");
+            assert_eq!(json["ok"], true);
+        }
+        let oversized = format!("{{\"max_rows\":1{}}}", " ".repeat(1_100));
+        assert_eq!(
+            post_with(&app, "/history/retain", Some(DURABLE), oversized)
+                .await
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        Ok(())
+    }
+
+    /// §4: disabled history is 409 `history_disabled`.
+    #[tokio::test]
+    async fn adr0116_retain_disabled_history_is_409() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), None).await?;
+        let app = retain_router(Arc::clone(&state));
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_disabled");
+        Ok(())
+    }
+
+    /// §4: while the reaper holds the store, a trim is 409
+    /// `history_retention_busy` at once, not queued.
+    #[tokio::test]
+    async fn adr0116_retain_busy_is_409() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        let app = retain_router(Arc::clone(&state));
+        let store = Arc::clone(state.agent.history().expect("history on").store());
+        store.pause_pass_for_tests();
+        let pass = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.retain_with_rules(
+                    &x0x::history::RetentionPolicy {
+                        max_bytes: u64::MAX,
+                        max_age_days: 0,
+                        scope_limits: Vec::new(),
+                    },
+                    &x0x::history::HistoryPolicy::default(),
+                    &PinnedScopes::none(),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.retention_admission_free_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        store.unpause_pass_for_tests();
+        pass.join().expect("pass thread").expect("pass runs");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_retention_busy");
+        Ok(())
+    }
+
+    /// Ruling Q6 (ADR 0066 coverage row 27): the trim runs through the
+    /// daemon's live pin source, so a fork-quarantined group's rows, under
+    /// either spelling, survive a trim that removes the same rows elsewhere.
+    #[tokio::test]
+    async fn adr0116_retain_pinned_rows_survive_a_trim() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        quarantine_under(&state, "alias-key", "stable-id").await;
+        assert!(
+            ReaperQuarantinePins::install(&state),
+            "the daemon's pin source"
+        );
+        let app = retain_router(Arc::clone(&state));
+        old_rows(&state, &Scope::Group("stable-id".into()), 3);
+        old_rows(&state, &Scope::Group("alias-key".into()), 2);
+        old_rows(&state, &Scope::Group("free".into()), 4);
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["deleted"], 4, "{json}");
+        let store = state.agent.history().expect("history on").store();
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            5,
+            "both spellings survive"
+        );
+        Ok(())
+    }
+
+    /// Validation "Runtime bounds", REST/library parity: the 200 body is the
+    /// library's `RetainReport` plus `ok`.
+    #[tokio::test]
+    async fn adr0116_retain_rest_and_library_report_the_same_result() -> anyhow::Result<()> {
+        let rest_dir = tempfile::tempdir()?;
+        let rest = state_with(rest_dir.path(), Some(aged(rest_dir.path()))).await?;
+        old_rows(&rest, &Scope::Topic("t".into()), 300);
+        let app = retain_router(Arc::clone(&rest));
+        let (status, mut json) =
+            post_with(&app, "/history/retain", Some(DURABLE), "{\"max_rows\":100}").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let lib_dir = tempfile::tempdir()?;
+        let lib = state_with(lib_dir.path(), Some(aged(lib_dir.path()))).await?;
+        old_rows(&lib, &Scope::Topic("t".into()), 300);
+        let report = lib
+            .agent
+            .history()
+            .expect("history on")
+            .retain(RetainOptions {
+                max_rows: 100,
+                ..RetainOptions::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut expected = serde_json::to_value(report)?;
+        assert_eq!(json["ok"], true);
+        for body in [&mut json, &mut expected] {
+            let map = body.as_object_mut().expect("an object");
+            map.remove("ok");
+            map.remove("elapsed_ms");
+        }
+        assert_eq!(json, expected);
+        assert_eq!(json["state"], "more_work");
+        assert_eq!(json["deleted"], 100);
+        assert_eq!(json["stopped_by"], "row_budget");
+        Ok(())
+    }
+
+    /// §4: an SQLite failure is a typed 500 carrying the counts of the
+    /// batches committed before it, and never claims a rollback.
+    #[tokio::test]
+    async fn adr0116_retain_sqlite_failure_is_a_typed_500_with_counts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
+        old_rows(&state, &Scope::Topic("t".into()), 600);
+        let store = Arc::clone(state.agent.history().expect("history on").store());
+        store.fail_trim_delete_after_for_tests(1);
+        let app = retain_router(Arc::clone(&state));
+        let (status, json) = post_with(&app, "/history/retain", Some(DURABLE), "{}").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["reason"], "history_retention_failed");
+        assert_eq!(json["committed"]["deleted"], 256, "{json}");
+        let message = json["error"].as_str().unwrap_or_default();
+        assert!(message.contains("not rolled back"), "{message}");
+        assert_eq!(store.table_counts_for_tests().0, 344);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod issue1317_purge_tests {
+    //! Issue #1317: `DELETE /history` takes the retention admission
+    //! through `HistoryHandle::purge`. While a reaper pass or a trim holds
+    //! the store it answers 409 `history_retention_busy` and deletes
+    //! nothing. The ADR 0066 row 14 fork-quarantine refusal is unchanged
+    //! (its own tests).
+
+    use super::adr0116_policy_tests::{enabled, state_with};
+    use super::discovery_auth_tests::{text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+    use x0x::history::{HistoryConfig, PinnedScopes};
+
+    #[tokio::test]
+    async fn history_purge_is_409_while_the_store_is_busy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let history = state.agent.history().expect("history on");
+        let scope = Scope::Topic("purge-me".into());
+        let rows: Vec<_> = (0..3)
+            .map(|i| text_row(scope.clone(), &format!("row {i}"), 1_000 + i))
+            .collect();
+        let store = Arc::clone(history.store());
+        store.insert_batch(&rows)?;
+
+        let delete = |app: axum::Router| async move {
+            let request = Request::builder()
+                .method("DELETE")
+                .uri("/history?scope=topic:purge-me")
+                .header("authorization", format!("Bearer {DURABLE}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds");
+            let response = app.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body reads");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, json)
+        };
+
+        store.pause_pass_for_tests();
+        let pass = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.retain_with_rules(
+                    &x0x::history::RetentionPolicy {
+                        max_bytes: u64::MAX,
+                        max_age_days: 0,
+                        scope_limits: Vec::new(),
+                    },
+                    &x0x::history::HistoryPolicy::default(),
+                    &PinnedScopes::none(),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.retention_admission_free_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let (status, json) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), delete(app.clone()))
+                .await
+                .unwrap_or((StatusCode::REQUEST_TIMEOUT, serde_json::Value::Null));
+        store.unpause_pass_for_tests();
+        pass.join().expect("pass thread").expect("pass runs");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["reason"], "history_retention_busy", "{json}");
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            3,
+            "nothing deleted while busy"
+        );
+
+        let (status, json) = delete(app).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["removed"], 3);
+        Ok(())
+    }
+
+    /// Round 2 (Codex P2): a purge whose row delete committed and whose
+    /// later cleanup failed is a 500 that counts the deleted rows in
+    /// `removed`. The rows stay deleted.
+    #[tokio::test]
+    async fn history_purge_500_counts_rows_deleted_before_a_cleanup_failure() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = state_with(
+            dir.path(),
+            Some(enabled(dir.path(), HistoryConfig::daemon_default())),
+        )
+        .await?;
+        let app = axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let history = state.agent.history().expect("history on");
+        let scope = Scope::Topic("purge-me".into());
+        let rows: Vec<_> = (0..3)
+            .map(|i| text_row(scope.clone(), &format!("row {i}"), 1_000 + i))
+            .collect();
+        let store = Arc::clone(history.store());
+        store.insert_batch(&rows)?;
+
+        store.fail_purge_cleanup_for_tests(true);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/history?scope=topic:purge-me")
+            .header("authorization", format!("Bearer {DURABLE}"))
+            .body(axum::body::Body::empty())?;
+        let response = app.oneshot(request).await?;
+        store.fail_purge_cleanup_for_tests(false);
+        let status = response.status();
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_eq!(json["ok"], false, "{json}");
+        assert_eq!(json["removed"], 3, "{json}");
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("purge: "), "{json}");
+        assert!(error.contains("injected cleanup failure"), "{json}");
+        assert_eq!(
+            store.table_counts_for_tests().0,
+            0,
+            "the committed delete is not rolled back"
         );
         Ok(())
     }

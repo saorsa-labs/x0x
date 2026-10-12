@@ -1,0 +1,1 @@
+../adr-archive/0094-m2-safe-apply.md

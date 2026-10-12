@@ -733,16 +733,51 @@ async fn put(d: &AgentInstance, topic: &str, key: &str, value: &[u8]) {
     assert_eq!(response["ok"], true);
 }
 
-async fn reads(d: &AgentInstance, topic: &str, key: &str, expected: &[u8]) -> bool {
+/// The last `GET /stores/:id/:key` answer `reads` saw, for the assertion
+/// message (#1266): `store not found` and `key not found` are different
+/// failures.
+#[derive(Default)]
+struct LastRead(std::sync::Mutex<Option<String>>);
+
+impl LastRead {
+    const BODY_LIMIT: usize = 512;
+
+    fn record(&self, status: StatusCode, body: &str) {
+        let body: String = body.chars().take(Self::BODY_LIMIT).collect();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!("{status} {body}"));
+    }
+
+    fn describe(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "no response recorded".to_string())
+    }
+}
+
+async fn reads(
+    d: &AgentInstance,
+    topic: &str,
+    key: &str,
+    expected: &[u8],
+    last: &LastRead,
+) -> bool {
     let response = authed_client(d)
         .get(store_value_url(d, topic, key))
         .send()
         .await
         .expect("read store request");
-    if !response.status().is_success() {
+    let status = response.status();
+    let body = response.text().await.expect("read store body");
+    last.record(status, &body);
+    if !status.is_success() {
         return false;
     }
-    let value: Value = response.json().await.expect("read store JSON");
+    let value: Value = serde_json::from_str(&body).expect("read store JSON");
     value["value"]
         .as_str()
         .and_then(|encoded| BASE64.decode(encoded).ok())
@@ -838,7 +873,12 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
         None,
     )
     .await;
-    assert!(wait_until(|| reads(&trio.bob, &topic, &pre_key, &pre_value)).await);
+    let last_read = LastRead::default();
+    assert!(
+        wait_until(|| reads(&trio.bob, &topic, &pre_key, &pre_value, &last_read)).await,
+        "Bob never read the pre-removal key; last GET: {}",
+        last_read.describe()
+    );
     validate_phase_tail(
         &mut captures,
         "pre_write_tail",
@@ -924,7 +964,12 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     )
     .await;
     assert_eq!(post.epoch, post_epoch);
-    assert!(wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value)).await);
+    let last_read = LastRead::default();
+    assert!(
+        wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value, &last_read)).await,
+        "Bob never read the post-removal key; last GET: {}",
+        last_read.describe()
+    );
     validate_phase_tail(
         &mut captures,
         "post_removal_write_tail",
@@ -981,7 +1026,12 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     )
     .await;
     assert!(retained.epoch >= post_epoch);
-    assert!(wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value)).await);
+    let last_read = LastRead::default();
+    assert!(
+        wait_until(|| reads(&trio.bob, &topic, &post_key, &post_value, &last_read)).await,
+        "Bob never read the post-removal key after restart; last GET: {}",
+        last_read.describe()
+    );
     validate_phase_tail(
         &mut captures,
         "restart_retained_tail",
@@ -1028,7 +1078,19 @@ async fn encrypted_kv_leave_rekey_restart_has_only_sealed_transport_payloads() {
     )
     .await;
     assert!(restarted.epoch >= post_epoch);
-    assert!(wait_until(|| reads(&trio.alice, &topic, &restart_key, &restart_value)).await);
+    let last_read = LastRead::default();
+    assert!(
+        wait_until(|| reads(
+            &trio.alice,
+            &topic,
+            &restart_key,
+            &restart_value,
+            &last_read
+        ))
+        .await,
+        "Alice never read Bob's post-restart key; last GET: {}",
+        last_read.describe()
+    );
     validate_phase_tail(
         &mut captures,
         "restart_write_tail",

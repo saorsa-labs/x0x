@@ -1203,21 +1203,31 @@ impl GossipRuntime {
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> NetworkResult<()> {
-        if let Ok(mut guard) = self.keepalive_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
+        let mut handles = Vec::new();
+        for slot in [&self.keepalive_handle, &self.peer_sync_handle] {
+            if let Some(handle) = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                handles.push(handle);
             }
         }
-        if let Ok(mut guard) = self.peer_sync_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        handles.extend(
+            self.dispatcher_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..),
+        );
+        for handle in &handles {
+            handle.abort();
         }
-        if let Ok(mut guard) = self.dispatcher_handles.lock() {
-            for handle in guard.drain(..) {
-                handle.abort();
-            }
+        // Abort only requests cancellation. Join before reporting completion
+        // so dispatcher futures have dropped their in-flight transport sends.
+        for handle in handles {
+            let _ = handle.await;
         }
+        self.pubsub.shutdown().await;
         Ok(())
     }
 

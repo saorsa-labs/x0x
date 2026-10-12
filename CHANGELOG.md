@@ -4,6 +4,447 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cached peer on another gossip plane no longer becomes a HyParView JOIN
+  seed (#1321).** `join_network` built the JOIN seeds from transport dial
+  results. A cached cross-plane peer passed the dial, the plane gate (#206)
+  refused it a moment later, and it still became a seed. The JOIN then
+  dialled it up to ten times (81.1 s of backoff plus up to 10.128 s of
+  jitter, plus the dial times) and the #292 gate refused every dial, so the
+  presence beacons and the first identity announcement started that much
+  later. (In `x0xd` the capability advert service also starts from the DM
+  inbox path, so it did not wait for the JOIN.)
+  - The JOIN frame now goes only to a dialled peer that `peer_admission`
+    (#292 invariant A) admits. A suppressed peer is dropped as a seed at
+    once.
+  - saorsa-gossip still drives the JOIN and owns its retry policy, frame
+    and side effects. x0x uses its new step API (`join_dial`, `join_send`,
+    one `JoinLedger` for the whole join; **needs saorsa-gossip 0.5.88**) and
+    checks admission between the dial and the JOIN frame. Each seed address
+    has one budget of ten attempts for the whole join. Only a failed dial
+    grows the dial backoff (100 ms doubling to at most 30 s, plus jitter); a
+    failed send, or a plane verdict still open after up to 12 s, allows the
+    next attempt at once.
+  - A peer that answers the dial and then loses its connection before
+    admission (for example, the remote refused us first) waits
+    saorsa-gossip's loss cooldown before the next attempt on that address:
+    100 ms, doubled after each loss up to 30 s, plus jitter (D252). It does
+    not reset when the peer answers again. Meanwhile a ready admitted
+    address goes first. Such a peer costs at most ten dials and nine
+    cooldowns (51.1 s plus up to 6.379 s of jitter; no cooldown follows the
+    tenth dial), and gets no JOIN.
+  - The phase counts for the join's minimum of three peers include only
+    peers that are still connected and not suppressed. When peers that
+    filled that minimum with an open plane verdict are refused later, the
+    join runs the cached-peer and bootstrap phases it skipped, before the
+    JOIN. This can add time even when one seed is admitted: for example,
+    with one admitted peer and two pending peers that are refused later,
+    the join first runs the skipped bootstrap phase (up to 70 s when the
+    bootstrap addresses do not answer), where the old code joined at once.
+    Each wait for open plane verdicts adds up to 12 s. The budgets before
+    the JOIN total 136 s (100 s of dial phases plus up to three 12 s verdict
+    waits); admission reads and scheduling come on top. The JOIN then costs
+    at most 91.228 s plus ten dial times and up to 12 s of admission wait
+    per attempt, per seed address that is not suppressed. These are
+    budgets, not a deadline for the whole call.
+  - After `begin_shutdown`, no phase, fallback phase or JOIN starts, and no
+    phase or spawned dial task starts a dial; a running dial batch of any
+    phase, its retry sleeps, the JOIN attempts and the admission reads stop.
+
+  - **Needs saorsa-gossip 0.5.88.** x0x now pins the whole saorsa-gossip
+    family at `=0.5.88`, the release that adds the step API (D257). The #501
+    meter producer premise moves to `saorsa-gossip-pubsub` 0.5.88, whose
+    sources are unchanged from 0.5.87 (see `docs/legacy-compat.md`).
+
+  The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
+  rollout too.
+
+## [v0.47.1] - 2026-10-12
+
+A patch release. It contains durability fixes for named groups and share grants. It adds no breaking API change and no stored-format change.
+
+### Fixed
+
+- **Named groups keep their journals, snapshots and API results in agreement after a write fault (#1187, #1326).**
+  - A post-rename fault (the rename landed, its directory fsync did not) now completes the transaction.
+  - A kept journal is rewritten with the current group state before the daemon acts on the new state.
+  - A journal the daemon cannot read, or a rewrite whose directory fsync does not land, fails the write closed (ADR 0085).
+  - Seal callers roll back an in-memory group change after a failed persist.
+- **A share grant stays in memory when its write fails after the rename (#1101, #1322).** A failure before the rename still rolls it back. A duplicate redelivery enqueue now confirms durability before it reports success. The new `storage::DurableWriteError` and `storage::write_private_bytes_durable_typed` are additive; existing signatures do not change.
+
+### Tests and tooling
+
+- The Home e2e fixture records and checks each node's binary sha256 at every start and restart (#1208, #1314).
+
+### Documentation
+
+- ADR governance: 102 numbered ADRs archived, 15 current slots A01–A15, transient decisions in `docs/adr/transient/` (#1313, #1325). First transient record: `T-goal-e-rule-5`, added as Proposed (#1324) and accepted by David (#1328).
+
+## [v0.47.0] - 2026-10-10
+
+### Added
+
+- **`[history]` recording and retention rules are parsed and validated (ADR
+  0116 slice A, #1264).** New keys: `dm_recording`, `[[history.class_limits]]`
+  and `[[history.topic_rules]]`. History refuses to open, and x0xd refuses to
+  start (even with `enabled = false`), on a rule ADR 0116 §1 rejects: a
+  duplicate class or prefix, an unknown key or value, a class entry with no
+  bound, an empty or over-long prefix, more than 256 rules, or an
+  overflowing bound. With the keys unset nothing changes, and a serialized
+  default `HistoryConfig` is byte-identical.
+- **History retention by class and topic (ADR 0116 slice B, #1264).** The
+  reaper enforces `[[history.class_limits]]` and the `max_bytes` /
+  `max_age_days` of `[[history.topic_rules]]`, in the ADR's order: ages, pin
+  ceilings, class budgets, topic budgets, exact-scope budgets, then the
+  global budget. For Durable rows the shortest positive age wins, and a zero
+  age never disables the global one. Class and topic budgets are additional
+  aggregate ceilings on logical bytes, evicted oldest first. A topic rule
+  covers every topic its literal, case-sensitive prefix wins (the longest
+  prefix wins the whole rule). Replaceable (current-state) rows are evicted
+  only by an explicit Replaceable class limit or a matching topic limit
+  (D229); the global age, the global cap and the exact-scope limits still
+  exempt them. Fork-quarantine pins win over every new rule, and the pinned
+  ceiling is unchanged. With no class or topic bound configured, the reaper
+  runs exactly as before. Topic limits need a UTF-8 history database (every
+  database x0x creates is). On an existing UTF-16 database, history refuses
+  to open with them, and the reaper never applies them there.
+- **Ephemeral DMs and topics (ADR 0116 slice C, #1264).** `dm_recording =
+  "ephemeral"` keeps every ordinary inbound and outbound DM out of this
+  node's history, and a topic rule with `recording = "ephemeral"` keeps its
+  topics out. Nothing is written for them (no row, FTS entry or canonical
+  projection); live delivery is unchanged, and group history is never
+  dropped. Under the DM policy a generic durable (v2) DM's ACK is withheld
+  before dispatch, with no refusal sent and the v2 advert unchanged, so a
+  strict durable sender times out instead of getting a 409. A DM committed
+  before the policy was set is still answered from its row. New bounded
+  counters `HistoryCounters::policy_suppressed_dm_total`,
+  `policy_suppressed_topic_total` and
+  `policy_durable_receipt_withheld_total` record this locally. A new
+  `HistoryError::PolicySuppressed` is returned by `record_committed` for a
+  suppressed record.
+- **`GET /history/policy` and `x0x history policy` (ADR 0116 slice E,
+  #1264).** An owner-only read (durable token; sessions and riders get 403)
+  of the local history policy in force. It reports the rules, the defaults,
+  how a row's class is derived, the protected-group exception (the current
+  fork-quarantine pins and their ceiling) and the bounded counters: the
+  three suppression counters and the `skipped_scope_limits` /
+  `skipped_topic_rules` gauges. It works with history disabled. These
+  counters appear only here; no existing response changed.
+- **`POST /history/retain`, `x0x history retain` and
+  `HistoryHandle::retain` (ADR 0116 slice D, #1264).** An owner-only
+  (durable token) trim of local history now, under the startup policy:
+  the reaper's phases, pins and ceilings, within `max_rows` (1–65536,
+  default 4096; pin-ceiling deletions included) and `budget_ms` (1–10000,
+  default 2000). It deletes at most 256 rows per transaction, checks the
+  time budget before each statement (one running statement may overrun
+  it), stops at a committed boundary, and reports committed counts by
+  phase with `state` `complete`, `more_work` or
+  `blocked_by_protected_rows`. One retention operation runs per store: a
+  trim gets 409 `history_retention_busy` while the reaper or another trim
+  runs, and the reaper waits for a trim. Disabled history is 409
+  `history_disabled`; an SQLite failure is a typed 500 with the counts
+  committed before it. The body takes only the two budgets (1 KiB; 400 or
+  413 otherwise). Against an older daemon the CLI reports an unsupported
+  operation (as `x0x history policy` now does), never a bare 404.
+
+### Changed
+
+- **ant-quic 0.27.57** (from 0.27.56). Two transport fixes:
+  - Concurrent hole-punch winners for one peer no longer leave a live
+    connection orphaned (saorsa-labs/ant-quic#310).
+  - Raw coordinator, hole-punch and materialized winners now get an
+    application reader, with exactly one reader owner per connection
+    (saorsa-labs/ant-quic#313 Part 1). Before this, in the coordinator race
+    the winning connection could have no reader, so messages the peer sent
+    on it were never delivered.
+  - No wire or public-API change. Reader adoption adds no retirement
+    policy; the losing concurrent hole-punch candidate is now closed as a
+    duplicate instead of staying open and orphaned.
+
+- **Downgrading keeps history readable but drops the ADR 0116 rules (slice
+  F).** The history database stays at schema 4 with the v0.46.6 schema
+  objects, so v0.46.6 opens a database this release has written or trimmed
+  and serves every row, with full-text search and canonical ids intact. It
+  does not know the new `[history]` keys: it logs that `dm_recording`,
+  `class_limits` and `topic_rules` are "not a recognised setting and is
+  ignored", has no `/history/policy` or `/history/retain`, records DMs and
+  topics the rules would suppress, and does not apply class or topic
+  limits. Upgrading again restores them; rows recorded meanwhile stay
+  (recording rules are not retroactive), and the next trim or reaper pass
+  applies the limits. Proven against a released v0.46.6 fixture
+  (`tests/fixtures/v0466_history_db/`).
+
+- **Library API (breaking for some embedders; the release that carries this
+  is 0.47.0).** `HistoryConfig` gains three
+  public fields (`dm_recording`, `class_limits`, `topic_rules`) and
+  `HistoryError` gains `InvalidConfig`. Code that lists every
+  `HistoryConfig` field without `..HistoryConfig::default()`, or matches
+  `HistoryError` without a wildcard arm, must be updated.
+- **`HistoryHandle::store()` is no longer public (library API, breaking;
+  0.47.0; #1317).** The raw `Store` it returned bypassed the ADR 0116
+  recording policy (a direct insert could store a row the policy keeps out)
+  and the retention admission (a purge could run under a trim).
+  `HistoryHandle` now has the reads itself: `query`, `search`, `scopes`,
+  `stats`, `get_by_msg_id`, `get_by_canonical_group_msg_id`,
+  `find_by_logical_request`, `skipped_scope_limits`, `skipped_topic_rules`
+  and `text_encoding`. A new async `HistoryHandle::purge` takes the
+  admission and returns `RetainError::Busy` while a reaper pass or a trim
+  runs. `DELETE /history` uses it and answers 409 `history_retention_busy`
+  then, with nothing deleted or queued; the fork-quarantine refusal is
+  unchanged. A purge is not atomic: if its cleanup or vacuum fails after
+  the row delete committed, the rows stay deleted, and the error counts
+  them (`RetainError::Failed`'s `committed.deleted`; the 500 body's new
+  `removed` field). `Store`, `Writer` and `WriterHandle` stay public as the
+  low-level offline API. Migration: `handle.store().query(q)` becomes
+  `handle.query(q)` (the same for the other reads), and
+  `handle.store().purge(s)` becomes `handle.purge(s).await`. Code that
+  wrote through `store()` must use `record`, `record_committed`, `retain`
+  or `purge`.
+
+### Fixed
+
+- **A held `history.db` now fails as `HistoryError::Locked` (#1315).** A
+  second opener of a history database that another process (or connection)
+  holds failed on its first statement with SQLite "database is locked",
+  reported as `HistoryError::Database("pragma setup … database is
+  locked")`. It is now `HistoryError::Locked`, the variant documented for
+  this case, naming the path, after one busy-timeout window. The daemon's
+  start-up error now reads "history initialization failed: history database
+  is locked by another process: <path> …" under "failed to create agent".
+  Other setup failures keep their `HistoryError::Database` text.
+- **A newer history database in WAL mode, or settled, is refused without
+  being changed (ADR 0116 slice F).** History refused a `history.db`
+  written by a newer schema, but the refusal could still change files:
+  - its setup pragmas ran first: `PRAGMA auto_vacuum = INCREMENTAL` rewrote
+    the file header even on an already-incremental database, and a
+    rollback-journal file was converted to WAL;
+  - a WAL another writer left uncheckpointed was checkpointed into the main
+    file and deleted when the refused connection closed;
+  - a version read that failed (busy, I/O) counted as "no schema", so setup
+    could write once a lock cleared.
+
+  History now notes whether a WAL exists, and reads the stored version before
+  setup writes, apart from hot-journal recovery. Any read failure other than
+  "no schema yet" stops the open. Until the version is known to be compatible,
+  the connection does not checkpoint a WAL it did not create, on any refusal
+  path. A refused newer or unreadable schema changes no file when the database
+  is in WAL mode (with or without an uncheckpointed WAL) or is a settled
+  rollback-journal database: the main file, `-wal` and `-shm` stay
+  byte-identical.
+
+  **Limit:** a hot rollback journal is recovered first, as SQLite requires
+  before anything can be read, so such a file is refused after its journal
+  has been rolled back. x0x keeps history in WAL mode from first
+  initialization, so a history database has a hot journal only from an
+  interrupted pre-WAL initialization, before any version is committed. That
+  database, and a hot schema-4 database, recover and open as before.
+
+  New databases, upgrades and crash recovery are unchanged. (The released
+  v0.46.6 still changes two header bytes when it refuses a newer database;
+  this fix only helps a downgrade to this release or a later one.)
+- **History retention no longer stops at a bad `scope_limits` entry (#1286).**
+  One `[[history.scope_limits]]` entry whose `scope` did not parse made every
+  retention pass fail at that entry. The limits after it, the whole-database
+  `max_bytes` cap and the canonical-id cleanup never ran, so `history.db`
+  could grow without bound. The reaper now skips such an entry, logs one
+  warning per store, and enforces everything else. History still opens with
+  the entry, as before. `Store::skipped_scope_limits()` reports how many
+  entries the latest pass skipped.
+
+## [v0.46.6] - 2026-10-09
+
+### Changed
+
+- **ant-quic 0.27.56** (from 0.27.54, via 0.27.55). Node shutdown now releases the UDP
+  socket in every case found in saorsa-labs/ant-quic#305: hole-punch dials,
+  NAT-traversal session handles, relay sessions, winner-map registrations that
+  race shutdown, proactive relay setup, back-pressured stream readers, and
+  queued unaccepted streams. This closes the residual in-process relaunch
+  failure left after #1262. ant-quic's `accept_bi` now returns `ShuttingDown`
+  for streams still queued when shutdown runs; x0x's accept loops already stop
+  on shutdown.
+  0.27.56 (saorsa-labs/ant-quic#309) also releases the socket when a connection
+  driver exits or is cancelled while the application keeps the connection, closes
+  connections no map holds any more, and rebinds still-draining connections at
+  shutdown. In x0x's in-process shutdown workload: 0 failures in 1,495 shutdowns,
+  against 4 in 490 on 0.27.55.
+
+### Fixed
+
+- **Relaunch is no longer blocked by `database is locked` after a group join (#1269, #1250).**
+  Background group tasks are drained at shutdown, and group-store hooks no longer
+  hold AppState in a reference cycle, so AppState, the Agent and `history.db` are
+  released when `shutdown_and_wait` returns. State-writing group applies are
+  shielded from the shutdown abort, so they are never cut off mid-write; this
+  covers listener-driven applies too (#1275). After teardown starts, a send can no
+  longer re-insert a session into the session registry (#1277).
+- **Boot no longer stalls on a large history.db (#1263 part 2).** The canonical-id
+  backfill keeps a progress cursor, so each row is examined once instead of on
+  every start, and the open runs off the async worker.
+- **The history byte cap converges without deleting most of history (#1264 part 1).**
+  The reaper measures live pages, reclaims FTS tombstones and free pages first
+  under a time budget, then deletes close to the minimum number of oldest rows.
+- **A surviving group member keeps its encrypted store after another member is
+  removed (#1266).** A read during the rekey gap no longer retires the store, and a
+  record that arrived during the gap is recovered with a bounded state request once
+  the new key arrives. This also fixes an AppState reference cycle through the GSS
+  store hook.
+- **In-process shutdown releases the UDP socket and no longer stalls (#1262, #1263 part 1).**
+  An embedded daemon (`x0x::server::serve`) running beside other daemons in one
+  process could fail graceful shutdown with `shutdown socket release timeout ...
+  weak_socket_owner_still_live`, because bootstrap, proactive-reconnect and
+  gossip-membership dials kept an in-flight handshake on the socket. Network
+  teardown now abandons in-flight dials first. Node read guards are no longer
+  held across network sends, so a peer that stopped reading cannot stall
+  teardown for up to 30 s. A shutdown that abandons a dial takes about 5 s. The
+  remaining ant-quic residual is fixed by ant-quic 0.27.55 (see Changed).
+
+## [v0.46.5] - 2026-10-07
+
+### Security
+
+- **Identity discovery accepts authority only from authenticated evidence (ADR 0115).**
+  A peer's machine, certificate, user and name in the discovery cache now change
+  only through an announcement authenticated by the agent itself, or by its
+  current authenticated machine. Security decisions (raw message verification,
+  delivery resolution, stream gates, evidence lookup) use only these
+  authenticated records. Revocations need a certificate with authenticated
+  provenance, a revocation's own timestamp may be at most 300 s ahead, and a
+  key-move bundle needs the subject's authenticated owner. Upgrade promptly; an
+  advisory follows.
+
+### Changed
+
+- **An agent found only through rendezvous is addresses only** until its own
+  authenticated announcement or evidence arrives; sends to it fail with
+  `AgentNotFound` until then.
+- **One authenticated machine per agent at a time.** For an agent active on two
+  machines, the older machine is unconfirmed until its next announcement (up to
+  600 s).
+- **Revocations and key-move tombstones stored before this upgrade are
+  quarantined** until authenticated evidence confirms their issuer; unconfirmed
+  records lapse after 7 days. A contact blocked by such a revocation is
+  unblocked meanwhile, including one also blocked by hand.
+- `/diagnostics/gossip` reports `identity_authority` counters and the quarantine
+  summary.
+
+### Fixed
+
+- **A restarted peer gets a fresh evidence Hello (#1207 S1b).** The one-attempt
+  rule is now per connection, so a node re-sends one Hello on a peer's new
+  connection after the peer restarts. The 60 s per-machine rate limit is
+  unchanged.
+
+### Added
+
+- ADR 0094 M2 slice H: a debug-only test-signing seam and isolated systemd
+  fixtures for self-update validation (no release-build behaviour change).
+
+## [v0.46.4] - 2026-10-06
+
+### Changed
+
+- **Apps receive only verified, identified pub/sub senders (#1114).** Unsigned
+  V1 payloads are dropped silently (debug log). An invalid signature is dropped
+  with a warn log. Revoked or Blocked senders are always dropped. No released
+  x0xd sends inner V1, so only third-party publishers using
+  `PubSubManager::new(_, None)` are affected.
+
+### Fixed
+
+- **An unreadable revocation store is never overwritten (#1116 slice A).**
+  With a blocked store, an identity or binding revoke is applied and published
+  but returns 500 "applied and published; not durable".
+- **Members no longer silently stop receiving group metadata (#1256).** After
+  applying a gossip MemberAdded, a member's metadata listener exited until the
+  next restart. It now keeps the subscription unless the member left, was
+  removed or banned, or the group was deleted.
+- **Home: a promoted admin can admit devices while an anonymously announcing
+  owner is offline (#1143, ADR 0108 S2-1).** This applies only to an anonymous
+  announce from the member's authenticated bound machine.
+- **A "you are removed" notice reaches a quickly-joined member after an owner
+  restart (#1217).** The owner's MemberRemoved send waits up to 5 s for a
+  verified binding to a restart-cold recipient.
+- **Unknown-trust group peers can exchange the EvidenceV1 Hello (#1241).** This
+  goes through a bounded admission lease; every other protocol from an Unknown
+  peer is still refused.
+
+### Added
+
+- `X0X_EVIDENCE_READY_HELLO=1` (off by default) sends a deferred first evidence
+  Hello when relationship readiness arrives after connect (#1207 S1).
+
+## [v0.46.3] - 2026-10-05
+
+### Fixed
+
+- **A Home device stuck after a timed-out join recovers (#1150, ADR 0107).**
+  A device that sealed but never confirmed its join re-arms when it redeems a
+  fresh invite from the admin who sealed it within the staging window. It
+  re-fetches its original join result and Welcome, then installs its keys.
+  Join artifacts are served only to a recipient that is currently Active, not
+  banned and holds a valid certificate on the current roster. The check is made
+  at every send, including blobs, chunks and Welcome frames, and removal, ban
+  and revocation purge staged artifacts.
+- **Group key shares and Welcomes are delivered promptly after an owner restart
+  (#1213).** Class-K shares and join artifacts now resolve the recipient
+  through bounded, verified-source lookup and go out on the single
+  admission-checked raw path. In a real-network check, shares arrived in
+  0.09–0.13 s (14/14) and Welcomes in about 1.3 s; before the fix a share
+  could be lost (409 at 120 s) or a Welcome could take 86 s.
+- Every delivery or resend of a group key share requires current recipient
+  eligibility and the current secret epoch (D60).
+
+## [v0.46.2] - 2026-10-04
+
+### Fixed
+
+- **A restart now applies a pending self-update on systemd hosts (#1196).**
+  The startup update check ran about 3 s after start, inside systemd's 10 s
+  start-rate window, so the restart-safety guard always refused, and the update
+  waited for the 30-minute retry. The startup check now waits out the window
+  read from the unit (plus 2 s) and retries once. Every other refusal is
+  unchanged.
+
+- **Group task-list deltas can no longer go out in plaintext after a policy
+  flip (#1100).** A signed-public group's plaintext task delta or full-state
+  response now holds the publication gate's permit and re-checks the policy. If
+  the group became MlsEncrypted meanwhile, the payload is sealed instead.
+
+- **Pub/sub no longer stalls for 22–60 s after a whole-network restart (#857).**
+  The saorsa-gossip-* pins move to 0.5.87 (saorsa-gossip #106). A local publish
+  whose eager candidates were all claim-skipped is queued for the next IHAVE
+  flush, with unresolved connected targets retained for up to 30 seconds, and deferred IWANT replies are retried through the bounded,
+  Critical-gated send path. The #501 meter premise moves to the 0.5.87 registry
+  package; its meter accounting is unchanged.
+
+## [v0.46.1] - 2026-10-03
+
+### Fixed
+
+- **Fork-quarantine clears are durable before they are published (#1103).**
+  The explicit seal's eviction and all-clean arms, the owner-mandate
+  MemberAdded arm and gap adoption now clear a fork quarantine through the
+  same candidate-gated write as the manual clear (#1073). While the write is
+  in flight, and on NotReplaced or Err, the group stays quarantined. On
+  ReplacedNotDurable the clear is already published (as in #759) and the
+  route returns 503. The lookup resolves both group-id spellings.
+
+- **The startup update check no longer delays the REST API (#1086).** The
+  check runs in the background after the API binds, so an unreachable
+  GitHub no longer holds `/health` for about 30 s. Release builds have no
+  configurable update source.
+
+- **Self-update extraction matches the exact binary basename (#1144).**
+  Archive extraction for the `x0xd`/`x0x` self-update now accepts only a
+  regular file whose final path component is exactly the binary name,
+  refuses archives holding more than one such entry, and requires the
+  extracted file to carry the platform's native executable magic (ELF,
+  Mach-O including 64-bit fat binaries, or MZ). A macOS AppleDouble sidecar
+  (`._x0xd`), a same-named symlink, hard link or directory entry can no
+  longer be staged as the replacement binary.
+
 ## [v0.46.0] - 2026-10-01
 
 ### Added

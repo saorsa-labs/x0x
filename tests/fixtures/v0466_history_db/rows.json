@@ -1,0 +1,145 @@
+{
+ "ids": {
+  "agent_id": "778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558",
+  "public_group": "40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8",
+  "secure_group": "992056be58db82bb4fe365fe181690de5089794c369d320076cbf990910c8ef2"
+ },
+ "rows": [
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "4551dafdcac5067d99b850579ae7ae2b29760cc528621a049d98963297f1945d",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "dm:778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558"
+  },
+  {
+   "content_type": "application/json",
+   "direction": "Inbound",
+   "msg_id": "d99dc64589d94e041322215ef250e364f518bc151c034b8d69d754ea24cf4c2a",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": "agent-card:778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558",
+   "scope": "dm:778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "e557f7d73717560497eba30d5d1b5b358d99ee39ee90ec4b4868f900ad244e33",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "dm:778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "fa224d04feb65cda3c0998952c46ab102bffe4fbc686998aa9028269174a2099",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "dm:778f61d1858f7cd73cc6c70442844fa33c3d44e495ca4449598bf42a3cef3558"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "144739def4983b76001f78b89277c6db399ed7d3eeee86695773ef1909ac88ae",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "group:40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "6d2a2b06ff82b259468dbe33fd4f5985f27974037b73cd270e3a387f0c3f1412",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "group:40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "a9f23e62f57b08f58bd520ed011fd3d3662ecc1b2341b68dfc0a922d8a1381b9",
+   "provenance": "LocalSend",
+   "replace_key": null,
+   "scope": "group:40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8"
+  },
+  {
+   "content_type": "application/json",
+   "direction": "Inbound",
+   "msg_id": "e860958339446c881a84d76f682e390c6bc09db815b503eaba6ebac245674b51",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": "group-card:40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8",
+   "scope": "group:40ce9dbb9f4fc03e540c35aa7e983e0c47960d722a815a301b2f20edb34d9fa8"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "36cfb9604f5ef8248666756154c65810ad623cfbaf43dc0ef008639d3640cc1f",
+   "provenance": "LocalAppDecrypt",
+   "replace_key": null,
+   "scope": "group:992056be58db82bb4fe365fe181690de5089794c369d320076cbf990910c8ef2"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Outbound",
+   "msg_id": "c364225d2afff19c94b8d8bbcf6268acf5365cf612fe04fb69b3453c4f8671c3",
+   "provenance": "LocalAppDecrypt",
+   "replace_key": null,
+   "scope": "group:992056be58db82bb4fe365fe181690de5089794c369d320076cbf990910c8ef2"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Inbound",
+   "msg_id": "6e5c6f9063513a2f438d60023c4e5b5eabe412b19d4bd9f91d5a64275a9a1c02",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": null,
+   "scope": "topic:fixture.chat"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Inbound",
+   "msg_id": "741fab3562bba8f0b472ea76817ac2dd746da627c835f7852442f15f57da66e6",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": null,
+   "scope": "topic:fixture.chat"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Inbound",
+   "msg_id": "accdb6c313ebd0f6614a4f418cdfc94c0299df68c909595bb51e23238e40fe22",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": null,
+   "scope": "topic:fixture.chat"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Inbound",
+   "msg_id": "4038d8074de987f763555f7a972b2afbad2b59cb81f36232f137cabe3aeb4e88",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": null,
+   "scope": "topic:fixture.notes"
+  },
+  {
+   "content_type": "text/plain",
+   "direction": "Inbound",
+   "msg_id": "fcca69863772e1337b47573d14918a1aa11c61763c59d5aef96551e18202d767",
+   "provenance": "VerifiedEnvelope",
+   "replace_key": null,
+   "scope": "topic:fixture.notes"
+  }
+ ],
+ "stats": {
+  "ok": true,
+  "retention": {
+   "max_age_days": 0,
+   "max_bytes": 1073741824,
+   "scope_limits": []
+  },
+  "stats": {
+   "db_bytes": 172032,
+   "durable_rows": 13,
+   "newest_ms": 1791614455273,
+   "oldest_ms": 1791614455168,
+   "replaceable_rows": 2,
+   "rows": 15
+  }
+ }
+}

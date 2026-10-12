@@ -1,0 +1,42 @@
+# #1166 S5 — the group-access ceiling (plan `d-groupaccess-plan.md` §5,
+# controller condition 2). These are the route-ADMISSION helpers the
+# S1–S4 migrations absorbed into `src/server/group_access.rs`: a new
+# inline call to any of them outside that module is the #821/#870/#877
+# defect class re-appearing (each hand-rolled copy drifted), so CI's
+# `cargo clippy --all-targets --all-features -- -D warnings` fails on
+# it. The one module-level allow is in `group_access.rs` itself; the
+# handful of legitimate outside callers carry a commented
+# `#[allow(clippy::disallowed_methods)]` at their site.
+#
+# Deliberately NOT listed (controller ruling, review-d condition 2 +
+# the same audit applied in S5):
+# - `ActorContext::is_durable_owner` — ~50 legitimate non-group callers.
+# - `GroupInfo::has_active_member` — the roster predicate is DOMAIN
+#   vocabulary, not a route helper: ~25 production callers are TreeKEM
+#   apply/leave/causal-queue/seat-cert/bootstrap logic and the
+#   S2/S4-ruled handler-side data gates, plus ~55 test assertions. A
+#   ceiling that is 80 allows of legitimate use protects nothing; see
+#   the S5 report. Route admission that needs the seat goes through the
+#   group_access cores, which are not disallowed.
+disallowed-methods = [
+    # The #447/#458 seat-label vocabulary — feeds the read-family
+    # admission cores; outside callers are the join-status body field,
+    # the join-flow classification and test state probes, each allowed
+    # at its site.
+    { path = "x0x::server::routes::named_groups::local_join_membership_state", reason = "#1166: seat labels feed the GroupAccess cores in server/group_access.rs; new route admission must go through them" },
+    # The Admin authority pair (`require_admin_or_above` + withdrawn
+    # 409) is `group_access::admin_route_gate` /
+    # `admit_admin_group_route`; the remaining direct callers are the
+    # conditional leg in `withdraw_named_group_terminal`, identity's
+    # background card mint filter and one authority test.
+    { path = "x0x::server::routes::named_groups::require_admin_or_above", reason = "#1166: the admin admission pair lives in group_access::admin_route_gate / admit_admin_group_route" },
+    # The #877 session-seat fork-quarantine gate is wired inside the
+    # group_access admission wrappers; the remaining direct callers
+    # (history purge, the task-list gates, the TreeKEM Option<actor>
+    # helpers) are allowed at their sites.
+    { path = "x0x::server::routes::named_groups::reject_fork_quarantined_for_actor", reason = "#1166: the #877 gate is wired inside the group_access admission wrappers; handler-side gates are allow-listed at their sites" },
+    # Rider group grants evaluate inside group_access (and the
+    # per-route ADR-0039 ladders it deliberately leaves in the two
+    # write handlers, pinned by the rider tests).
+    { path = "x0x::server::rider_auth::ActorContext::rider_allows_group", reason = "#1166: rider grant admission lives in server/group_access.rs; the ADR-0039 ladders stay handler-side by the S2 ruling" },
+]

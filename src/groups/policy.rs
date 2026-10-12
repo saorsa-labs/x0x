@@ -115,6 +115,26 @@ impl Default for GroupPolicy {
     }
 }
 
+impl GroupPolicy {
+    /// ADR-0038 Home policy for `owner`: Hidden, `OwnerCertified(owner)`,
+    /// MlsEncrypted, members-only read and write.
+    ///
+    /// The single definition of the Home shape: the server's Home routes
+    /// delegate to it, and ADR 0108 §1's Home scope
+    /// ([`crate::groups::GroupInfo::is_home_scope`]) requires a group's
+    /// policy to equal it exactly, on all five axes.
+    #[must_use]
+    pub fn home(owner: &UserId) -> Self {
+        Self {
+            discoverability: GroupDiscoverability::Hidden,
+            admission: GroupAdmission::OwnerCertified(*owner),
+            confidentiality: GroupConfidentiality::MlsEncrypted,
+            read_access: GroupReadAccess::MembersOnly,
+            write_access: GroupWriteAccess::MembersOnly,
+        }
+    }
+}
+
 /// Named preset bundle for common policy shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

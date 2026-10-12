@@ -1848,3 +1848,115 @@ async fn adr0064_s4_eviction_arm_non_durable_clear_keeps_marker_and_503s() -> Re
     );
     Ok(())
 }
+
+/// Both SEAL arms must keep the marker visible until the clear's save lands.
+/// The eviction case faults the SECOND save: the first eviction really commits,
+/// so this cannot accidentally test only the removal's persistence failure.
+async fn issue1103_seal_clear_failure(evict: bool) -> Result<()> {
+    for fault in [SaveFault::Error, SaveFault::NotReplaced] {
+        let (state, _dir, owner_kp) = owner_authority_state().await?;
+        let group_id = "76".repeat(32);
+        insert_owner_group(
+            &state,
+            &group_id,
+            owner_certified_policy(&owner_kp),
+            "unused",
+        )
+        .await;
+        let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let member = AgentKeypair::generate()?;
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        if evict {
+            let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+            announce_cert_for(&state, cert.clone()).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let revocation = x0x::revocation::RevocationRecord::sign(
+                x0x::revocation::RevokedSubject::Agent(member.agent_id()),
+                member.public_key(),
+                member.secret_key(),
+                now,
+                Some("issue1103 eviction clear".to_string()),
+            )?;
+            state
+                .agent
+                .revocation_set()
+                .write()
+                .await
+                .verify_and_insert(revocation, Some(&cert))?;
+        }
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            info.shared_secret = Some(vec![7; 32]);
+            if evict {
+                info.add_member(
+                    member_hex.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(authority_hex.clone()),
+                    None,
+                );
+            }
+            let header = info.terminal_commit_header();
+            info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                revision: 0,
+                state_hash: "issue1103-conflict".to_string(),
+                committed_by: authority_hex,
+                observed_at_ms: now_millis_u64(),
+                snapshot: x0x::groups::ForkSnapshot {
+                    terminal_commit: header.clone(),
+                    conflicting_commit: header,
+                    classification: None,
+                },
+                no_anchor: false,
+            });
+        }
+        assert_eq!(
+            persist_named_groups_mutation(&state, |_| true).await?,
+            AtomicWriteOutcome::Durable
+        );
+        let task_state = Arc::clone(&state);
+        let task_id = group_id.clone();
+        let response = super::fork_quarantine::fail_clear_before_publication(
+            &state,
+            &group_id,
+            usize::from(evict),
+            fault,
+            async move {
+                seal_group_state(
+                    State(task_state),
+                    axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                        durable: true,
+                    }),
+                    Path(task_id),
+                )
+                .await
+                .into_response()
+            },
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        assert_eq!(info.state_revision, u64::from(evict));
+        if evict {
+            assert!(
+                !info.has_active_member(&member_hex),
+                "the eviction committed before its separate clear failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue1103_all_clean_seal_does_not_publish_a_failed_clear() -> Result<()> {
+    issue1103_seal_clear_failure(false).await
+}
+
+#[tokio::test]
+async fn issue1103_eviction_seal_does_not_publish_a_failed_clear() -> Result<()> {
+    issue1103_seal_clear_failure(true).await
+}

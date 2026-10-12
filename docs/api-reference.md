@@ -1020,6 +1020,12 @@ upgraded matters more than the stronger receipt: a durable send to a peer
 running 0.37.x — or to any peer without durable history enabled — answers
 **409 `recipient_ack_semantics_unavailable`** instead of delivering.
 
+A recipient that sets `[history] dm_recording = "ephemeral"` (ADR 0116)
+still advertises durable ACKs but does not commit ordinary DMs. It
+withholds the durable ACK and sends no refusal, so a durable send to it
+ends in the ordinary ACK timeout, not a 409. Use
+`require_durable_app_ack: false` to reach such a recipient.
+
 Two consequences worth planning for:
 
 - A durable send never uses the raw-QUIC fast path, because raw QUIC yields a
@@ -1989,7 +1995,9 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 | GET | `/history/message/:msg_id` | `x0x history message <MSG_ID>` | Point lookup of one row by exposed `msg_id` (`?scope=` for canonical group ids; 404 when absent, 400 malformed) |
 | GET | `/history/search` | `x0x history search [SCOPE] <QUERY>` | Full-text search over text payloads. `scope` is **optional**: omitted, it searches every retained scope |
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
-| DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
+| GET | `/history/policy` | `x0x history policy` | Local history policy in force (ADR 0116): rules, defaults, protected groups, counters. **Owner-only** (durable token) |
+| POST | `/history/retain` | `x0x history retain [--max-rows N] [--budget-ms MS]` | Trim local history now under its startup policy, within a row and time budget (ADR 0116). **Owner-only** (durable token) |
+| DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only). 409 `history_retention_busy` while a retention operation runs |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
 limit clamped to 100. Durable DM sends (`require_durable_app_ack: true`)
@@ -2052,6 +2060,143 @@ owner-only. The ADR-0039 rider allowlist admits exactly `GET /history`, so
 the auth middleware answers `403` on both before the handler runs; a rider
 can neither read rows nor learn row counts for scopes outside its grants.
 That boundary is unchanged by this issue.
+
+### Local history policy — `GET /history/policy` (ADR 0116)
+
+Owner-only: only the durable API token in `Authorization: Bearer …` reads
+it. A session or rider token gets **403**, and a missing or unknown token,
+or a token in the query string, gets **401**. The read works when history is
+disabled.
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether durable history is enabled on this daemon |
+| `rules` | The rules in force: `max_bytes`, `max_age_days`, `scope_limits`, `record_topics`, `dm_recording`, `class_limits` (Durable then Replaceable), `topic_rules` (prefix byte order). With history enabled these are what the open store enforces; with it disabled, the configured `[history]` table |
+| `defaults` | The same fields with every key unset (the daemon defaults) |
+| `class_derivation` | How a stored row's class is derived: `replace_key IS NULL` is Durable, `IS NOT NULL` is Replaceable; Ephemeral is never stored |
+| `protected_group_exception` | Group history has no Ephemeral opt-out (`group_history_ephemeral: false`), and fork-quarantine pins win over every rule. `pinned_scopes` lists each pinned group under both spellings with its `ceiling_bytes`; `ceiling` gives the ADR 0068 formula and constants |
+| `counters` | `null` when history is disabled. Otherwise bounded, unlabelled counters: `policy_suppressed_dm_total`, `policy_suppressed_topic_total`, `policy_durable_receipt_withheld_total` (cumulative), and `skipped_scope_limits`, `skipped_topic_rules` (entries the latest retention pass skipped) |
+| `store` | `null` when history is disabled; otherwise `text_encoding` of the history database. Topic-rule limits need `UTF-8` |
+
+These counters appear only here; `/diagnostics/history` is unchanged. An
+older daemon has no such route and answers 404. A client must report that
+the operation is unsupported, and must not fall back to reading the
+database.
+
+### Purge — `DELETE /history` (issue #1317)
+
+```
+DELETE /history?scope=<SCOPE>
+```
+
+Deletes every row of one scope from the local store. It is local-only and
+is not propagated. `scope` is required; there is no purge-everything form.
+
+| Status | When |
+|---|---|
+| 200 | The purge ran: `{"ok": true, "removed": <rows>}` |
+| 400 | `scope` is missing or malformed |
+| 409 `fork_quarantined` | The scope is a fork-quarantined group (ADR-0066 §3a, below). Nothing is deleted |
+| 409 `history_retention_busy` | A reaper pass or a runtime trim holds the store. Nothing is deleted or queued; try again |
+| 500 | SQLite failed: `{"ok": false, "error": "purge: …", "removed": <rows>}`. Rows deleted before the failure stay deleted, and `removed` counts them (below) |
+| 503 | History is disabled on this daemon |
+
+A purge takes the same retention admission as the reaper and
+`POST /history/retain`, so it never deletes under a trim. The library
+equivalent is `HistoryHandle::purge(&scope).await`, which returns
+`RetainError::Busy` in the same case.
+
+A purge is not atomic. Its row delete commits first; then a canonical-id
+cleanup and an incremental vacuum run. If one of those later steps fails, the
+scope's rows stay deleted (they are not rolled back), and the 500's `removed`
+counts them. `removed` counts the rows removed by the committed DELETE. It is
+0 if that DELETE failed or matched no rows, so 0 does not show which step
+failed. In the library, `RetainError::Failed`'s `committed.deleted` carries
+the same count. When the error says the count is unknown (the blocking task
+did not finish), a 0 is not proof that nothing was deleted.
+
+### Runtime trim — `POST /history/retain` (ADR 0116 §4)
+
+Trims local history now, under the policy the daemon started with: the same
+phases, pins and ceilings as the periodic retention reaper, within a row
+budget and a time budget. It applies policy; it is not a purge. The library
+equivalent is `HistoryHandle::retain(RetainOptions)`, which embedders can
+call before `serve()` without opening SQLite themselves. Policy changes
+still need a restart.
+
+**Auth.** Owner-only, like the policy read: the durable API token in
+`Authorization: Bearer …`. Sessions and riders get **403**; a missing or
+unknown token, or a token in the query string, gets **401**.
+
+**Body.** At most 1 KiB (larger is **413**). Only two keys; an empty body
+means `{}`:
+
+| Key | Range | Default | Meaning |
+|---|---|---|---|
+| `max_rows` | 1–65536 | 4096 | Most rows to delete, pin-ceiling deletions included |
+| `budget_ms` | 1–10000 | 2000 | Work-admission budget: checked before each statement |
+
+Anything else (malformed JSON, a non-object, an unknown key, a wrong type, a
+value out of range) is **400**. There is no SQL, path, force flag,
+replacement policy or scope selector.
+
+**Results.**
+
+| Status | When |
+|---|---|
+| 200 | The trim ran. Body below |
+| 409 `history_disabled` | History is disabled on this daemon |
+| 409 `history_retention_busy` | A reaper pass or another trim holds the store; nothing is queued, try again |
+| 500 `history_retention_failed` | SQLite failed. `committed` carries the counts of the batches committed before the failure; they are not rolled back |
+
+```json
+{
+  "ok": true,
+  "state": "more_work",
+  "deleted": 4096,
+  "deleted_by_phase": {
+    "global_age": 4000, "rule_ages": 0, "pin_ceilings": 96,
+    "class_budgets": 0, "topic_budgets": 0, "scope_budgets": 0,
+    "global_budget": 0
+  },
+  "pin_ceiling_deleted": 96,
+  "elapsed_ms": 412,
+  "stopped_by": "row_budget"
+}
+```
+
+| `state` | Meaning |
+|---|---|
+| `complete` | This observed pass found no eligible policy work pending. It promises neither a smaller file nor a bound on future writes |
+| `more_work` | Work remains: a budget ran out (`stopped_by`: `row_budget`, `time_budget`), the caller went away (`cancelled`), or index reclamation is still pending (`reclamation`) |
+| `blocked_by_protected_rows` | No eligible work remains, but pinned (fork-quarantined) or exempt (Replaceable) rows alone keep a configured bound exceeded. Never returned while eligible work remains |
+
+Bounds, as ADR 0116 §4 requires:
+
+- One retention operation per store at a time, shared with the reaper. The
+  reaper waits for a trim; a trim never waits for the reaper (it gets the
+  409).
+- At most 256 rows per transaction, age eviction included. Each batch
+  commits on its own; a trim stops only at a committed boundary.
+- The time budget is checked before every statement. The one statement
+  already running when it runs out may overrun it, so it is not a hard
+  response deadline. The trim holds the store while it runs, so writes wait
+  for up to the budget plus that statement.
+- The whole-database budget keeps part 1's rules: no eviction before the
+  full-text index settles (`more_work`, `reclamation` until it does), and the
+  forced path only after three unsettled reaper passes. Trims never count as
+  such passes.
+- Repeated small trims take turns across phases: each starts after the phase
+  the previous one stopped in, so a large backlog in one phase cannot starve
+  the others.
+- Fork-quarantine pins are read fresh for every call; a marker installed
+  during a trim applies from the next call.
+- Pin-ceiling deletions also count in
+  `history_quarantine_pinned_evictions` (`GET /diagnostics/history`).
+
+An older daemon has no such route and answers 404; `x0x history retain`
+reports that the operation is unsupported and never falls back to the
+database.
 
 ### Fork quarantine on the history surface (ADR-0066 §3a)
 
@@ -2530,11 +2675,11 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
-| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
+| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, `incomplete_retained_images_pruned` (paged retained images discarded after the inflight TTL), and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |

@@ -5021,3 +5021,451 @@ async fn issue732_valid_card_import_cannot_clear_a_quarantined_alias() -> Result
     );
     Ok(())
 }
+
+/// Pause the real save before any write, then fail it. Reading the live map
+/// HERE catches #1103; checking only after rollback would pass on broken main.
+/// `preceding_saves` lets eviction commit its MemberRemoved before testing the
+/// separate marker clear. Release the writer before asserting to avoid a
+/// stranded task on the failing baseline.
+pub(super) async fn fail_clear_before_publication<F, T>(
+    state: &Arc<AppState>,
+    group_id: &str,
+    preceding_saves: usize,
+    fault: SaveFault,
+    operation: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let marker = live_record(state, group_id)
+        .await
+        .fork_quarantine
+        .expect("fixture is quarantined");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save hook") = Some((Arc::clone(&reached), Arc::clone(&release)));
+    let task = tokio::spawn(operation);
+    for _ in 0..preceding_saves {
+        tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+        assert!(live_record(state, group_id).await.is_fork_quarantined());
+        release.notify_one();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+    let visible_before_write = live_record(state, group_id).await.fork_quarantine;
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save hook") = None;
+    let fault_guard = set_save_fault(state, fault);
+    release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), task).await??;
+    drop(fault_guard);
+    assert_eq!(
+        visible_before_write,
+        Some(marker.clone()),
+        "#1103: an in-flight clear must never be published to the live map"
+    );
+    assert_eq!(
+        live_record(state, group_id).await.fork_quarantine,
+        Some(marker.clone()),
+        "failed persistence must keep containment"
+    );
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert_eq!(
+        reloaded
+            .get(group_id)
+            .expect("durable fixture")
+            .fork_quarantine,
+        Some(marker),
+        "failed persistence must keep the durable marker"
+    );
+    Ok(result)
+}
+
+/// Both spelling directions must gate the clear and replace/rebind the
+/// existing entry, without creating another record under the caller's key.
+#[tokio::test]
+async fn issue1103_record_clear_other_spelling_stays_gated() -> Result<()> {
+    for stored_under_stable in [true, false] {
+        for fault in [SaveFault::Error, SaveFault::NotReplaced] {
+            let fixture = member_joined_treekem_fixture(0xD7, 0xD8).await?;
+            let state = &fixture.state;
+            let alias_key = fixture.group_id.clone();
+            let stable_key = live_record(state, &alias_key)
+                .await
+                .stable_group_id()
+                .to_string();
+            assert_ne!(alias_key, stable_key);
+            let (stored_key, request_key) = if stored_under_stable {
+                {
+                    let mut groups = state.named_groups.write().await;
+                    let info = groups.remove(&alias_key).expect("fixture record");
+                    groups.insert(stable_key.clone(), info);
+                }
+                {
+                    let mut groups = state.treekem_groups.write().await;
+                    let group = groups.remove(&alias_key).expect("fixture TreeKEM group");
+                    groups.insert(stable_key.clone(), group);
+                }
+                (stable_key, alias_key)
+            } else {
+                (alias_key, stable_key)
+            };
+            {
+                let mut groups = state.named_groups.write().await;
+                groups
+                    .get_mut(&stored_key)
+                    .expect("stored record")
+                    .fork_quarantine = Some(synthetic_marker(false)?);
+            }
+            let mut cleared = live_record(state, &stored_key).await;
+            assert_eq!(
+                persist_named_group_info(state, &stored_key, cleared.clone()).await?,
+                AtomicWriteOutcome::Durable
+            );
+            let snapshot_path = treekem_snapshot_path(&state.treekem_dir, &stored_key);
+            let original_snapshot = tokio::fs::read(&snapshot_path).await?;
+            cleared.name = "clear-from-other-spelling".to_string();
+            cleared.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+            cleared.fork_quarantine = None;
+            cleared.reset_fork_evidence_after_quarantine_clear();
+            let task_state = Arc::clone(state);
+            let task_key = request_key.clone();
+            let task_candidate = cleared.clone();
+            let outcome = fail_clear_before_publication(state, &stored_key, 0, fault, async move {
+                persist_named_group_info(&task_state, &task_key, task_candidate).await
+            })
+            .await?;
+            assert!(!matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+            assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
+            assert!(!treekem_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_home_suite_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!state.named_groups.read().await.contains_key(&request_key));
+
+            assert_eq!(
+                persist_named_group_info(state, &request_key, cleared.clone()).await?,
+                AtomicWriteOutcome::Durable,
+                "retry must replace and rebind the resolved entry"
+            );
+            assert_eq!(live_record(state, &stored_key).await, cleared);
+            assert!(!state.named_groups.read().await.contains_key(&request_key));
+            let reloaded =
+                load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                    .await?;
+            assert!(!reloaded[&stored_key].is_fork_quarantined());
+            assert!(!reloaded.contains_key(&request_key));
+            let bytes = tokio::fs::read(&snapshot_path).await?;
+            let envelope = decode_treekem_snapshot_envelope(&bytes)?.expect("rebound snapshot");
+            assert!(treekem_snapshot_envelope_matches_info(&envelope, &cleared));
+            assert!(!treekem_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_home_suite_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_snapshot_path(&state.treekem_dir, &request_key).exists());
+        }
+    }
+    Ok(())
+}
+
+/// The shared record-clear gate must preserve the TreeKEM rebind transaction:
+/// failed clears discard journals and keep the old snapshot, and a durable
+/// retry publishes the clear with a snapshot bound to the new commit. Cover
+/// both a live TreeKEM group and repair from a stale metadata-only snapshot.
+#[tokio::test]
+async fn issue1103_record_clear_preserves_treekem_rebind_and_retry() -> Result<()> {
+    for (fault, repair_snapshot) in [
+        (SaveFault::Error, false),
+        (SaveFault::NotReplaced, false),
+        (SaveFault::Error, true),
+        (SaveFault::NotReplaced, true),
+    ] {
+        let fixture = member_joined_treekem_fixture(0xD3, 0xD3).await?;
+        let state = &fixture.state;
+        let group_id = &fixture.group_id;
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.get_mut(group_id).expect("group").fork_quarantine =
+                Some(synthetic_marker(false)?);
+        }
+        let mut initial = live_record(state, group_id).await;
+        assert_eq!(
+            persist_named_group_info(state, group_id, initial.clone()).await?,
+            AtomicWriteOutcome::Durable
+        );
+        let snapshot_path = treekem_snapshot_path(&state.treekem_dir, group_id);
+        let original_snapshot = tokio::fs::read(&snapshot_path).await?;
+        if repair_snapshot {
+            // Advance only named metadata through the ordinary mutation
+            // path, which deliberately does not rebind the seeded snapshot.
+            initial.description = "metadata-only advance before repair".to_string();
+            initial.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+            assert_eq!(
+                persist_named_groups_mutation(state, |groups| {
+                    groups.insert(group_id.clone(), initial.clone());
+                    true
+                })
+                .await?,
+                AtomicWriteOutcome::Durable
+            );
+            assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
+            let envelope =
+                decode_treekem_snapshot_envelope(&original_snapshot)?.expect("seeded snapshot");
+            assert!(!treekem_snapshot_envelope_matches_info(&envelope, &initial));
+            assert_eq!(envelope.security_binding, initial.security_binding);
+            assert!(state
+                .treekem_groups
+                .write()
+                .await
+                .remove(group_id)
+                .is_some());
+        }
+        let mut cleared = initial;
+        cleared.name = "durably-cleared".to_string();
+        cleared.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        cleared.fork_quarantine = None;
+        cleared.reset_fork_evidence_after_quarantine_clear();
+        let task_state = Arc::clone(state);
+        let task_id = group_id.clone();
+        let task_candidate = cleared.clone();
+        let outcome = fail_clear_before_publication(state, group_id, 0, fault, async move {
+            persist_named_group_info(&task_state, &task_id, task_candidate).await
+        })
+        .await?;
+        assert!(!matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+        assert_eq!(
+            state.treekem_groups.read().await.contains_key(group_id),
+            !repair_snapshot,
+            "a failed repair must not restore a live TreeKEM group"
+        );
+        assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
+        assert!(!treekem_journal_path(&state.treekem_dir, group_id).exists());
+        assert!(!treekem_home_suite_journal_path(&state.treekem_dir, group_id).exists());
+        assert_eq!(
+            persist_named_group_info(state, group_id, cleared.clone()).await?,
+            AtomicWriteOutcome::Durable,
+            "retry must durably clear and rebind"
+        );
+        assert!(!live_record(state, group_id).await.is_fork_quarantined());
+        assert!(state.treekem_groups.read().await.contains_key(group_id));
+        let bytes = tokio::fs::read(&snapshot_path).await?;
+        let envelope = decode_treekem_snapshot_envelope(&bytes)?.expect("bound snapshot");
+        assert!(treekem_snapshot_envelope_matches_info(&envelope, &cleared));
+        assert!(!treekem_journal_path(&state.treekem_dir, group_id).exists());
+        assert!(!treekem_home_suite_journal_path(&state.treekem_dir, group_id).exists());
+    }
+    Ok(())
+}
+
+/// A raw TARGET write rejects a private clear, preserves memory, and re-saves
+/// it with or without a TreeKEM rebind. Journals can only be discarded after
+/// that corrective save is durable; the next persist confirms memory first.
+#[tokio::test]
+async fn issue1103_target_conflict_resaves_memory_before_next_mutation() -> Result<()> {
+    for rebind in [false, true] {
+        for fault in [None, Some(SaveFault::ReplacedNotDurableAfterWriteThenError)] {
+            let fixture = member_joined_treekem_fixture(0xD6, 0xD6).await?;
+            let state = &fixture.state;
+            let group_id = &fixture.group_id;
+            {
+                let mut groups = state.named_groups.write().await;
+                groups.get_mut(group_id).expect("group").fork_quarantine =
+                    Some(synthetic_marker(false)?);
+            }
+            let mut cleared = live_record(state, group_id).await;
+            assert_eq!(
+                persist_named_group_info(state, group_id, cleared.clone()).await?,
+                AtomicWriteOutcome::Durable
+            );
+            let snapshot_path = treekem_snapshot_path(&state.treekem_dir, group_id);
+            let original_snapshot = tokio::fs::read(&snapshot_path).await?;
+            cleared.description = "rejected candidate clear".to_string();
+            cleared.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+            cleared.fork_quarantine = None;
+            cleared.reset_fork_evidence_after_quarantine_clear();
+
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *state
+                .named_groups_save_after_snapshot_notify
+                .lock()
+                .expect("save hook") = Some((Arc::clone(&reached), Arc::clone(&release)));
+            let task_state = Arc::clone(state);
+            let task_id = group_id.clone();
+            let task_candidate = cleared.clone();
+            let task = tokio::spawn(async move {
+                if rebind {
+                    persist_named_group_info(&task_state, &task_id, task_candidate).await
+                } else {
+                    persist_named_groups_quarantine_clear_gated(&task_state, |groups| {
+                        groups.insert(task_id, task_candidate);
+                        true
+                    })
+                    .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+            let concurrent = {
+                // Bypass P at the candidate save hook, as raw map writers do.
+                let mut groups = state.named_groups.write().await;
+                let target = groups.get_mut(group_id).expect("target group");
+                target.description = "concurrent target write".to_string();
+                target.owner_cert_reverify_required = true;
+                target.clone()
+            };
+            let journal_path = treekem_journal_path(&state.treekem_dir, group_id);
+            let hs_journal_path = treekem_home_suite_journal_path(&state.treekem_dir, group_id);
+            assert_eq!(journal_path.exists(), rebind, "candidate journal prepared");
+            assert_eq!(hs_journal_path.exists(), rebind);
+            *state
+                .named_groups_save_after_snapshot_notify
+                .lock()
+                .expect("save hook") = None;
+            let fault_guard = fault.map(|fault| set_save_fault(state, fault));
+            release.notify_one();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), task).await??;
+            drop(fault_guard);
+            let error = outcome.expect_err("a TARGET conflict must reject the clear");
+            assert_eq!(
+                error.to_string(),
+                "named-group record changed during the gated quarantine clear"
+            );
+            assert_eq!(live_record(state, group_id).await, concurrent);
+            assert!(state
+                .named_groups_requires_durability_confirmation
+                .load(Ordering::Acquire));
+            assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
+            assert_eq!(journal_path.exists(), rebind && fault.is_some());
+            assert_eq!(hs_journal_path.exists(), rebind && fault.is_some());
+            let disk =
+                load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                    .await?;
+            if fault.is_some() {
+                assert_eq!(disk[group_id].description, cleared.description);
+                assert!(!disk[group_id].is_fork_quarantined());
+            } else {
+                assert_eq!(disk[group_id].description, concurrent.description);
+                assert_eq!(disk[group_id].fork_quarantine, concurrent.fork_quarantine);
+            }
+
+            // Keep the hook armed for BOTH saves: confirmation must reach it
+            // before the next mutation, then disk must hold memory before the
+            // mutation's own save starts.
+            *state
+                .named_groups_save_after_snapshot_notify
+                .lock()
+                .expect("save hook") = Some((Arc::clone(&reached), Arc::clone(&release)));
+            let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_mutated = Arc::clone(&mutated);
+            let task_state = Arc::clone(state);
+            let task_id = group_id.clone();
+            let next = tokio::spawn(async move {
+                persist_named_groups_mutation(&task_state, |groups| {
+                    task_mutated.store(true, Ordering::Release);
+                    groups.get_mut(&task_id).expect("target group").description =
+                        "next mutation".to_string();
+                    true
+                })
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+            assert!(!mutated.load(Ordering::Acquire), "confirm memory first");
+            assert_eq!(live_record(state, group_id).await, concurrent);
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+            assert!(mutated.load(Ordering::Acquire));
+            assert!(!state
+                .named_groups_requires_durability_confirmation
+                .load(Ordering::Acquire));
+            let confirmed =
+                load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                    .await?;
+            assert_eq!(confirmed[group_id].description, concurrent.description);
+            assert_eq!(
+                confirmed[group_id].fork_quarantine,
+                concurrent.fork_quarantine
+            );
+            *state
+                .named_groups_save_after_snapshot_notify
+                .lock()
+                .expect("save hook") = None;
+            release.notify_one();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(20), next).await???,
+                AtomicWriteOutcome::Durable
+            );
+            assert_eq!(
+                live_record(state, group_id).await.description,
+                "next mutation"
+            );
+            assert!(live_record(state, group_id).await.is_fork_quarantined());
+        }
+    }
+    Ok(())
+}
+
+/// #470: a raw writer on another key must not reject a durably saved clear
+/// or lose its concurrent record when the candidate is published.
+#[tokio::test]
+async fn issue1103_record_clear_preserves_unrelated_raw_writer() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0xD4, 0xD4).await?;
+    let state = &fixture.state;
+    let group_id = &fixture.group_id;
+    let unrelated_id = "d5".repeat(32);
+    sealed_group_with_lineage(state, &unrelated_id, invite_only_policy()).await?;
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.get_mut(group_id).expect("group").fork_quarantine = Some(synthetic_marker(false)?);
+    }
+    let mut cleared = live_record(state, group_id).await;
+    assert_eq!(
+        persist_named_group_info(state, group_id, cleared.clone()).await?,
+        AtomicWriteOutcome::Durable
+    );
+    cleared.name = "clear-with-unrelated-writer".to_string();
+    cleared.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    cleared.fork_quarantine = None;
+    cleared.reset_fork_evidence_after_quarantine_clear();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save hook") = Some((Arc::clone(&reached), Arc::clone(&release)));
+    let task_state = Arc::clone(state);
+    let task_id = group_id.clone();
+    let task_candidate = cleared.clone();
+    let task = tokio::spawn(async move {
+        persist_named_group_info(&task_state, &task_id, task_candidate).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified()).await?;
+    let still_quarantined = live_record(state, group_id).await.is_fork_quarantined();
+    let concurrent = {
+        // Deliberately bypass P, matching owner-cert verdict stamping.
+        let mut groups = state.named_groups.write().await;
+        let unrelated = groups.get_mut(&unrelated_id).expect("unrelated group");
+        unrelated.owner_cert_reverify_required = true;
+        unrelated.clone()
+    };
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save hook") = None;
+    release.notify_one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), task).await???;
+    assert!(still_quarantined, "the candidate stays private during save");
+    assert_eq!(outcome, AtomicWriteOutcome::Durable);
+    assert_eq!(live_record(state, group_id).await, cleared);
+    assert_eq!(live_record(state, &unrelated_id).await, concurrent);
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(!reloaded[group_id].is_fork_quarantined());
+    let bytes = tokio::fs::read(treekem_snapshot_path(&state.treekem_dir, group_id)).await?;
+    let envelope = decode_treekem_snapshot_envelope(&bytes)?.expect("rebound snapshot");
+    assert!(treekem_snapshot_envelope_matches_info(&envelope, &cleared));
+    assert!(!treekem_journal_path(&state.treekem_dir, group_id).exists());
+    assert!(!treekem_home_suite_journal_path(&state.treekem_dir, group_id).exists());
+    Ok(())
+}

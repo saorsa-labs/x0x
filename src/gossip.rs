@@ -5,6 +5,7 @@
 
 pub mod config;
 mod egress;
+pub(crate) mod join_seeds;
 pub mod participation;
 pub mod pubsub;
 pub(crate) mod relay_fanout;

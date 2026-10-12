@@ -25,7 +25,11 @@ src/history/
 
 `HistoryService` is owned by `AppState` (daemon) or `Agent` (library, opt-in
 via `AgentBuilder::with_history`). All producers hold a cheap
-`HistoryHandle` (clonable mpsc sender + Arc<Store> for reads).
+`HistoryHandle` (clonable mpsc sender + Arc<Store>). Embedders read through
+the handle's own methods (`query`, `search`, `scopes`, `stats`, …) and purge
+through `HistoryHandle::purge`, which takes the retention admission; the raw
+`Arc<Store>` is crate-only (issue #1317), because it bypasses the recording
+policy and the admission.
 
 ## 3. Schema
 
@@ -164,6 +168,74 @@ max_age_days = 0          # 0 = no age bound
 scope = "group:<stable_id>"
 max_bytes = 268435456
 ```
+
+A `scope_limits` entry whose `scope` does not parse (it must be
+`dm:<agent>`, `group:<id>` or `topic:<name>`) is not in force. History still
+opens with it. The reaper skips the entry, logs one warning per store, and
+reports the number skipped by the latest pass through
+`Store::skipped_scope_limits`. The other limits and `max_bytes` still apply
+(#1286).
+
+ADR 0116 adds three optional keys. `dm_recording` is `inherit` (the default)
+or `ephemeral`. `[[history.class_limits]]` takes `class` (`durable` or
+`replaceable`) and an optional `max_bytes` and `max_age_days`.
+`[[history.topic_rules]]` takes a literal `prefix` and an optional
+`recording`, `max_bytes` and `max_age_days`. The library validates them
+before history opens, and the daemon validates them at config load, even
+with `enabled = false`. Left unset, they change nothing.
+
+The reaper enforces the class limits and the topic-rule limits (ADR 0116
+slice B). Each pass applies, in order:
+1. the global age, then the class and topic ages;
+2. the pin ceilings;
+3. the class budgets (Durable, then Replaceable);
+4. the topic budgets, in prefix byte order;
+5. the exact-scope budgets;
+6. the global budget.
+
+How the rules combine:
+- For a Durable row every positive age applies, so the shortest wins; a
+  zero age adds no bound and never disables the global one. Rows strictly
+  older than a cutoff go.
+- A topic rule selects the topics its literal, case-sensitive prefix wins:
+  the longest matching prefix takes the whole rule.
+- Class and topic budgets are aggregate ceilings on payload plus signed
+  artifact bytes over unpinned rows. They evict oldest first by
+  `(seen_at_ms, id)`, a row larger than the remaining excess included.
+- Replaceable rows go only under a Replaceable class limit or a matching
+  topic limit; the global age, the global cap and the exact-scope limits
+  still exempt them.
+- Fork-quarantine pins win over every new rule, and the pinned ceiling is
+  unchanged.
+- With no class or topic bound configured, no new statement runs.
+- Topic-rule limits match topic names as UTF-8 bytes, so they need a UTF-8
+  database (every database x0x creates is). History refuses to open with
+  topic limits on an existing UTF-16 database. If a direct `Store` caller
+  passes them anyway, the topic phases delete nothing, and the skip is
+  counted (`Store::skipped_topic_rules`) and logged once. Class limits and
+  every other bound still apply.
+
+The `ephemeral` recording modes (ADR 0116 slice C) act at the history
+handle, before a record is queued. `dm_recording = "ephemeral"` drops every
+ordinary DM (a `Scope::Dm` record with no `replace_key`), inbound and
+outbound, from the gossip inbox, the raw-QUIC path and the outbound
+record. A topic rule with `recording = "ephemeral"` drops messages on the
+topics it wins; it only filters `record_topics`. A dropped record writes no
+row, payload, artifact, FTS entry, canonical projection or backfill source.
+Group history is never dropped. Live delivery is unchanged. Each drop is
+counted (`HistoryCounters::policy_suppressed_dm_total`,
+`policy_suppressed_topic_total`), with no topic or payload label.
+
+DM receipts (ADR 0030): a generic durable (v2) DM cannot be committed under
+`dm_recording = "ephemeral"`, so its durable ACK is withheld before
+dispatch. The receiver counts it (`policy_durable_receipt_withheld_total`)
+and sends nothing back: no typed refusal and no weaker ACK. The v2
+capability advert is unchanged, so the sender sees its ordinary bounded
+retry or timeout, not a 409. A request whose row was committed before the
+policy was set is answered from that row as before: re-dispatched and
+re-ACKed, with no new commit. Typed durable routes keep their own receipts.
+Senders that need delivery to such a node use the non-durable send mode
+(`require_durable_app_ack: false`).
 
 Reaper task every 300 s (constant, `HISTORY_REAPER_INTERVAL_SECS`), evicts
 oldest-first by `seen_at_ms` until under bounds, then `PRAGMA

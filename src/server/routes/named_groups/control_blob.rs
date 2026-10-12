@@ -41,6 +41,18 @@ pub(in crate::server) struct ControlBlobRef {
     join_attempt_id: Option<String>,
 }
 
+impl ControlBlobRef {
+    /// The group this staged copy belongs to.
+    pub(super) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// The hex agent id this staged copy is addressed to.
+    pub(super) fn recipient(&self) -> &str {
+        &self.recipient
+    }
+}
+
 /// Distinct `type` names prevent older Welcome/file listeners from treating
 /// a control chunk as their own. Legacy small event/result JSON is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +82,20 @@ pub(in crate::server) enum ControlBlobMessage {
 struct StagedBlob {
     bytes: Arc<Vec<u8>>,
     created_at: Instant,
+    /// ADR 0107 (review r2 P2-4): a join-result copy is bound to its
+    /// ORIGINAL artifact: it expires no later than the original's deadline,
+    /// and a re-stage never extends that bound.
+    bound: Option<StagedOrigin>,
+}
+
+/// ADR 0107 (review r2 P2-4): the original staged artifact a blob copies.
+#[derive(Clone, Copy)]
+pub(super) struct StagedOrigin {
+    /// The original artifact's own staging instant (its identity: a purge or
+    /// re-seal replaces it).
+    pub(super) staged_at: Instant,
+    /// The original artifact's deadline.
+    pub(super) deadline: Instant,
 }
 
 struct IncomingBlob {
@@ -103,8 +129,11 @@ struct Registry {
 
 impl Registry {
     fn prune_expired(&mut self) {
-        self.staged
-            .retain(|_, entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        let now = Instant::now();
+        self.staged.retain(|_, entry| {
+            entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+                && entry.bound.is_none_or(|bound| now < bound.deadline)
+        });
         // Expiry removes routing only; the owning lease keeps the declared
         // bytes accounted until its task actually ends.
         self.incoming
@@ -150,11 +179,29 @@ impl ControlBlobState {
         f(&mut guard)
     }
 
+    /// An unbound stage (test fixtures); production copies of join
+    /// artifacts always stage through [`Self::stage_with_origin`].
+    #[cfg(test)]
     pub(super) fn stage(
         &self,
         reference: ControlBlobRef,
         bytes: Vec<u8>,
     ) -> Result<(), &'static str> {
+        self.stage_with_origin(reference, bytes, None)
+    }
+
+    /// [`Self::stage`] for a copy of an original artifact: the entry expires
+    /// with the original (`origin.deadline`), and re-staging the identical
+    /// copy never moves that bound later.
+    pub(super) fn stage_with_origin(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+        origin: Option<StagedOrigin>,
+    ) -> Result<(), &'static str> {
+        if origin.is_some_and(|origin| Instant::now() >= origin.deadline) {
+            return Err("the original artifact has expired");
+        }
         if bytes.len() as u64 != reference.byte_len
             || reference.byte_len <= x0x::dm::MAX_PAYLOAD_BYTES as u64
             || reference.byte_len > MAX_BLOB_BYTES
@@ -168,6 +215,13 @@ impl ControlBlobState {
                     return Err("conflicting control blob digest");
                 }
                 existing.created_at = Instant::now();
+                existing.bound = match (existing.bound, origin) {
+                    (Some(old), Some(new)) => Some(StagedOrigin {
+                        staged_at: new.staged_at,
+                        deadline: old.deadline.min(new.deadline),
+                    }),
+                    (old, new) => new.or(old),
+                };
                 return Ok(());
             }
             let peer_count = registry
@@ -195,13 +249,65 @@ impl ControlBlobState {
                 StagedBlob {
                     bytes: Arc::new(bytes),
                     created_at: Instant::now(),
+                    bound: origin,
                 },
             );
             Ok(())
         })
     }
 
-    fn staged_chunk(&self, reference: &ControlBlobRef, sequence: u32) -> Option<Vec<u8>> {
+    /// ADR 0107 (review r2 P2-4): the original artifact a staged copy is
+    /// bound to, while the copy is still staged.
+    pub(super) fn staged_origin(&self, reference: &ControlBlobRef) -> Option<StagedOrigin> {
+        self.with_registry(|registry| registry.staged.get(reference).and_then(|entry| entry.bound))
+    }
+
+    /// ADR 0107 (r6, P2): [`Self::staged_origin`] for the synchronous stream
+    /// seam: it never blocks and never prunes. `Err(())` when the registry
+    /// is contended (the caller withholds and retries); `Ok(None)` when the
+    /// copy is absent, unbound or past its original's deadline or its own
+    /// TTL.
+    pub(super) fn try_staged_origin(
+        &self,
+        reference: &ControlBlobRef,
+    ) -> Result<Option<StagedOrigin>, ()> {
+        let registry = match self.0.registry.try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+        };
+        let now = Instant::now();
+        Ok(registry
+            .staged
+            .get(reference)
+            .filter(|entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+            .and_then(|entry| entry.bound)
+            .filter(|origin| now < origin.deadline))
+    }
+
+    /// ADR 0107 (r6, test only): hold the staging registry's lock on
+    /// another thread for `hold`; the receiver fires once it is held.
+    #[cfg(test)]
+    pub(super) fn hold_registry_for_test(&self, hold: Duration) -> std::sync::mpsc::Receiver<()> {
+        let store = self.clone();
+        let (held, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = store
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = held.send(());
+            std::thread::sleep(hold);
+        });
+        rx
+    }
+
+    pub(super) fn staged_chunk(
+        &self,
+        reference: &ControlBlobRef,
+        sequence: u32,
+    ) -> Option<Vec<u8>> {
         self.with_registry(|registry| {
             let bytes = &registry.staged.get(reference)?.bytes;
             let start = (sequence as usize).checked_mul(CHUNK_BYTES)?;
@@ -368,6 +474,45 @@ impl ControlBlobState {
         self.with_registry(|registry| registry.staged.len())
     }
 
+    /// ADR 0107 (review r2): test inspection — the staged JoinResult
+    /// references addressed to `recipient`.
+    #[cfg(test)]
+    pub(in crate::server) fn staged_join_result_refs_for_test(
+        &self,
+        recipient: &str,
+    ) -> Vec<ControlBlobRef> {
+        self.with_registry(|registry| {
+            registry
+                .staged
+                .keys()
+                .filter(|reference| {
+                    reference.kind == ControlBlobKind::JoinResult
+                        && reference.recipient == recipient
+                })
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// ADR 0107: drop every staged JoinResult blob addressed to `recipient`
+    /// for any spelling of the group (a removed, banned or otherwise
+    /// ineligible member). Returns how many were dropped.
+    pub(super) fn purge_join_results(
+        &self,
+        group_aliases: &HashSet<String>,
+        recipient: &str,
+    ) -> usize {
+        self.with_registry(|registry| {
+            let before = registry.staged.len();
+            registry.staged.retain(|reference, _| {
+                !(reference.kind == ControlBlobKind::JoinResult
+                    && reference.recipient == recipient
+                    && group_aliases.contains(&reference.group_id))
+            });
+            before - registry.staged.len()
+        })
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -440,15 +585,100 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
     }
 }
 
+/// One control-blob frame's wire bytes, refusing a frame over the
+/// direct-message limit.
+pub(super) fn encode_message(message: &ControlBlobMessage) -> std::result::Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
+    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return Err("control blob frame exceeds direct-message limit".to_string());
+    }
+    // A chunk is recorded only after its admitted send. Encoding alone
+    // must not publish bytes the transport refused.
+    #[cfg(test)]
+    if !matches!(message, ControlBlobMessage::Chunk { .. }) {
+        frame_capture::record_frame(&bytes);
+    }
+    Ok(bytes)
+}
+
+/// Test-only copies of control-blob frames a test may hand to the other
+/// in-process handler, and of the pull task's finished result. Reference
+/// and fetch frames are copied when encoded. A join-result chunk is copied
+/// only after `send_join_artifact` reports the exchange admitted (an `Ok`
+/// write, or the in-process stand-in's admission marker). The stand-in
+/// then drops the bytes. A refusal after encoding publishes nothing, so a
+/// test cannot deliver a chunk the authority did not admit. Capture is off
+/// unless a test arms it. Pull results are recorded only while capture is
+/// armed.
+#[cfg(test)]
+pub(super) mod frame_capture {
+    use std::sync::Mutex;
+
+    static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FRAMES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    static OUTCOMES: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+
+    pub(in crate::server) fn set_capture(on: bool) {
+        if on {
+            if let Ok(mut frames) = FRAMES.lock() {
+                frames.clear();
+            }
+            if let Ok(mut outcomes) = OUTCOMES.lock() {
+                outcomes.clear();
+            }
+        }
+        CAPTURE.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn record_frame(bytes: &[u8]) {
+        if !CAPTURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut frames) = FRAMES.lock() {
+            frames.push(bytes.to_vec());
+        }
+    }
+
+    /// Frames encoded since the last drain. The caller filters them.
+    pub(in crate::server) fn drain_frames() -> Vec<Vec<u8>> {
+        FRAMES
+            .lock()
+            .map(|mut frames| std::mem::take(&mut *frames))
+            .unwrap_or_default()
+    }
+
+    pub(in crate::server) fn record_outcome(digest: &str, reason: &'static str) {
+        if !CAPTURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut outcomes) = OUTCOMES.lock() {
+            outcomes.push((digest.to_string(), reason));
+            if outcomes.len() > 64 {
+                let drop_n = outcomes.len() - 64;
+                outcomes.drain(0..drop_n);
+            }
+        }
+    }
+
+    /// The latest finished pull result for `digest`, if the pull task has
+    /// recorded one.
+    pub(in crate::server) fn outcome(digest: &str) -> Option<&'static str> {
+        OUTCOMES.lock().ok().and_then(|outcomes| {
+            outcomes
+                .iter()
+                .rev()
+                .find(|(recorded, _)| recorded == digest)
+                .map(|(_, reason)| *reason)
+        })
+    }
+}
+
 async fn send_message(
     agent: &Agent,
     recipient: &AgentId,
     message: &ControlBlobMessage,
 ) -> std::result::Result<(), String> {
-    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
-    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        return Err("control blob frame exceeds direct-message limit".to_string());
-    }
+    let bytes = encode_message(message)?;
     agent
         .send_direct_with_config(recipient, bytes, control_config(message))
         .await
@@ -466,6 +696,7 @@ async fn send_message(
 /// refusal is retried briefly before this returns an error (the caller
 /// still logs on final failure). The bounds above (entry cap, global and
 /// per-recipient byte budgets, per-blob maximum) keep retention finite.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_reference(
     store: &ControlBlobState,
     agent: &Agent,
@@ -475,7 +706,80 @@ pub(super) async fn send_reference(
     group_id: &str,
     join_attempt_id: Option<&str>,
     bytes: Vec<u8>,
+    cold_removal: bool,
 ) -> std::result::Result<(), String> {
+    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
+    // recipients release their completed pulls — retry it briefly before
+    // giving up, instead of dropping the event on the floor. Any other
+    // refusal (invalid blob, digest conflict) returns immediately.
+    let mut attempt = 0;
+    let reference = loop {
+        match stage_reference(
+            store,
+            agent,
+            recipient,
+            kind,
+            group_id,
+            join_attempt_id,
+            bytes.clone(),
+            None,
+        ) {
+            Ok(reference) => break reference,
+            Err(STAGING_BUDGET_EXHAUSTED) if attempt < STAGING_BUDGET_RETRIES => {
+                tracing::warn!(
+                    kind = ?kind,
+                    group_id = %group_id,
+                    recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+                    attempt,
+                    "control blob staging budget exhausted; retrying (#876)"
+                );
+                attempt += 1;
+                tokio::time::sleep(STAGING_BUDGET_RETRY_DELAY).await;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    };
+    if cold_removal {
+        // #1217: only the owner's spawned removal notice opts in, including
+        // an oversized notice carried by reference. Chunk and join senders
+        // still use the ordinary send_reference_message/send_message paths.
+        let message = ControlBlobMessage::Reference { reference };
+        agent
+            .send_direct_with_config_cold_wait(
+                recipient,
+                encode_message(&message)?,
+                control_config(&message),
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        send_reference_message(agent, recipient, reference).await
+    }
+}
+
+/// The refusal [`ControlBlobState::stage`] returns while the staging budget
+/// is exhausted (transient: recipients release completed pulls).
+pub(super) const STAGING_BUDGET_EXHAUSTED: &str = "control blob staging budget exhausted";
+/// #876: bounded retries of a budget-exhausted staging.
+pub(super) const STAGING_BUDGET_RETRIES: usize = 6;
+pub(super) const STAGING_BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Stage the exact original JSON once and return its bounded reference
+/// (no retry, no send). ADR 0107 (review r2): join-result staging calls
+/// this under the group's membership lock, after the eligibility check.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_reference(
+    store: &ControlBlobState,
+    agent: &Agent,
+    recipient: &AgentId,
+    kind: ControlBlobKind,
+    group_id: &str,
+    join_attempt_id: Option<&str>,
+    bytes: Vec<u8>,
+    origin: Option<StagedOrigin>,
+) -> std::result::Result<ControlBlobRef, &'static str> {
     let reference = ControlBlobRef {
         kind,
         group_id: group_id.to_string(),
@@ -485,28 +789,17 @@ pub(super) async fn send_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
-    // recipients release their completed pulls — retry it briefly before
-    // giving up, instead of dropping the event on the floor. Any other
-    // refusal (invalid blob, digest conflict) returns immediately.
-    const BUDGET_RETRIES: usize = 6;
-    const BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
-    for attempt in 0..=BUDGET_RETRIES {
-        match store.stage(reference.clone(), bytes.clone()) {
-            Ok(()) => break,
-            Err("control blob staging budget exhausted") if attempt < BUDGET_RETRIES => {
-                tracing::warn!(
-                    kind = ?reference.kind,
-                    group_id = %reference.group_id,
-                    recipient = %LogHexId::agent(&reference.recipient),
-                    attempt,
-                    "control blob staging budget exhausted; retrying (#876)"
-                );
-                tokio::time::sleep(BUDGET_RETRY_DELAY).await;
-            }
-            Err(other) => return Err(other.to_string()),
-        }
-    }
+    store.stage_with_origin(reference.clone(), bytes, origin)?;
+    Ok(reference)
+}
+
+/// Send a staged blob's bounded reference (metadata only; the bytes are
+/// pulled chunk by chunk).
+pub(super) async fn send_reference_message(
+    agent: &Agent,
+    recipient: &AgentId,
+    reference: ControlBlobRef,
+) -> std::result::Result<(), String> {
     send_message(
         agent,
         recipient,
@@ -615,19 +908,36 @@ pub(in crate::server) async fn handle_control_blob_message(
                 return;
             };
             // The lease owns the declared-byte accounting for the whole
-            // task lifetime: cancellation or expiry elsewhere cannot free
-            // these bytes while this task still runs.
+            // pull, fetch and apply: cancellation or expiry elsewhere cannot
+            // free these bytes while either half still runs.
             let Some(lease) = state.control_blobs.reserve_incoming(&reference) else {
                 return;
             };
             let generation = lease.generation;
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _lease = lease;
-                if let Err(reason) = fetch_and_apply(&state, &reference, generation).await {
-                    tracing::warn!(kind = ?reference.kind, byte_len = reference.byte_len, reason, "control blob pull failed");
-                }
+            let task_state = Arc::clone(state);
+            // #1269: the fetch holds the AppState until its fetch deadline,
+            // also when the source has gone, and has no durable effect, so
+            // the shutdown drain may abort it at any await. The apply that
+            // follows persists group state and is shielded (r2).
+            state.spawn_detached(async move {
+                let state = task_state;
+                let digest = reference.digest.clone();
+                let reason = match fetch_blob(&state, &reference, generation).await {
+                    Ok((source, bytes)) => {
+                        spawn_blob_apply(&state, reference, source, bytes, permit, lease);
+                        "verified"
+                    }
+                    Err(reason) => {
+                        tracing::warn!(kind = ?reference.kind, byte_len = reference.byte_len, reason, "control blob pull failed");
+                        reason
+                    }
+                };
+                // Recorded as the task's last step, so a test that observes
+                // it is observing a finished pull, not an in-flight one.
+                #[cfg(test)]
+                frame_capture::record_outcome(&digest, reason);
+                #[cfg(not(test))]
+                let _ = (digest, reason);
             });
         }
         ControlBlobMessage::Fetch {
@@ -635,6 +945,120 @@ pub(in crate::server) async fn handle_control_blob_message(
             sequence,
         } => {
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
+                return;
+            }
+            if reference.kind == ControlBlobKind::JoinResult {
+                // ADR 0107 (review r2): a staged join result is a COPY of a
+                // join artifact, so each chunk is a serve. The chunk is read
+                // only while the recipient is eligible, under the group's
+                // membership lock, inside a registered egress task (a
+                // removal or ban cancels it before committing). The lock is
+                // taken in the task, never on this listener.
+                // r5 (G8): validate before taking any capacity — the copy
+                // is staged and bound to an original, and the sequence
+                // exists — then fair admission: one in-flight task per
+                // chunk (duplicates coalesce) and a per-group share of the
+                // global cap. The authoritative checks run in the task.
+                let Some(origin) = state.control_blobs.staged_origin(&reference) else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        "join-result chunk fetch for no staged copy; dropped"
+                    );
+                    return;
+                };
+                if u64::from(sequence) >= reference.byte_len.div_ceil(CHUNK_BYTES as u64) {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        sequence,
+                        "join-result chunk fetch past the copy's last chunk; dropped"
+                    );
+                    return;
+                }
+                let admission_key =
+                    format!("{}:{}:{sequence}", reference.digest, reference.recipient);
+                let ticket = match state
+                    .join_result_chunk_admission
+                    .try_admit(&admission_key, &reference.group_id)
+                {
+                    Ok(ticket) => ticket,
+                    Err(refusal) => {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&reference.group_id),
+                            sequence,
+                            ?refusal,
+                            "join-result chunk fetch not admitted; the joiner retries"
+                        );
+                        return;
+                    }
+                };
+                let task_state = Arc::clone(state);
+                let recipient = *sender;
+                let group_id = reference.group_id.clone();
+                let member_hex = reference.recipient.clone();
+                // r5: the task, like the copy, dies at the original's
+                // deadline.
+                let deadline = origin.deadline;
+                super::spawn_join_artifact_egress(
+                    state,
+                    &group_id,
+                    &member_hex,
+                    "join_result_chunk",
+                    deadline,
+                    async move {
+                        let _ticket = ticket;
+                        let Some(chunk) =
+                            super::join_result_chunk_if_servable(&task_state, &reference, sequence)
+                                .await
+                        else {
+                            tracing::debug!(
+                                group_id = %LogHexId::group(&reference.group_id),
+                                recipient = %LogHexId::agent(&reference.recipient),
+                                "ADR 0107: join-result chunk withheld; the recipient is not eligible, or the blob or its original expired or was purged"
+                            );
+                            return;
+                        };
+                        let admission = super::join_result_chunk_admission(&task_state, &reference);
+                        let group = reference.group_id.clone();
+                        let message = ControlBlobMessage::Chunk {
+                            reference,
+                            sequence,
+                            data_b64: BASE64.encode(chunk),
+                        };
+                        let payload = match encode_message(&message) {
+                            Ok(payload) => payload,
+                            Err(reason) => {
+                                tracing::warn!(reason, "control blob chunk encode failed");
+                                return;
+                            }
+                        };
+                        match super::send_join_artifact(
+                            &task_state,
+                            &recipient,
+                            &payload,
+                            &group,
+                            "join_result_chunk",
+                            admission,
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                frame_capture::record_frame(&payload);
+                            }
+                            Err(reason) => {
+                                // The stand-in admits by returning its marker
+                                // error, after the seam check. That payload
+                                // is the one the exchange accepted.
+                                #[cfg(test)]
+                                if reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED) {
+                                    frame_capture::record_frame(&payload);
+                                }
+                                tracing::warn!(reason, "control blob chunk send failed");
+                            }
+                        }
+                    },
+                );
                 return;
             }
             let Some(chunk) = state.control_blobs.staged_chunk(&reference, sequence) else {
@@ -647,7 +1071,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             };
             let agent = Arc::clone(&state.agent);
             let recipient = *sender;
-            tokio::spawn(async move {
+            // #1269: shutdown-owned; the send holds the Agent.
+            state.spawn_detached(async move {
                 let _permit = permit;
                 let message = ControlBlobMessage::Chunk {
                     reference,
@@ -701,11 +1126,123 @@ pub(in crate::server) async fn handle_control_blob_message(
     }
 }
 
+/// The whole pull in one future: [`fetch_blob`] then [`apply_fetched_blob`].
+/// Tests drive it directly; the daemon splits the two halves across a
+/// detached and a shielded task (#1269 r2, [`spawn_blob_apply`]).
+#[cfg(test)]
 async fn fetch_and_apply(
     state: &Arc<AppState>,
     reference: &ControlBlobRef,
     generation: u64,
 ) -> std::result::Result<(), &'static str> {
+    let (source, bytes) = fetch_blob(state, reference, generation).await?;
+    apply_fetched_blob(state, reference, source, bytes).await
+}
+
+/// #1269 r2: run the apply of a fetched, digest-verified blob as a shielded
+/// task. The apply enters roster and TreeKEM persistence
+/// (`apply_named_group_metadata_event`, the join-result handler), so
+/// shutdown never aborts it once it has started; it holds the fetch slot and
+/// the lease until it ends. Refused (and the bytes dropped, as if they had
+/// arrived after the stop) once shutdown has closed admission.
+fn spawn_blob_apply(
+    state: &Arc<AppState>,
+    reference: ControlBlobRef,
+    source: AgentId,
+    bytes: Vec<u8>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    lease: IncomingLease,
+) -> bool {
+    let task_state = Arc::clone(state);
+    let admitted = state.spawn_shielded(async move {
+        let _permit = permit;
+        let _lease = lease;
+        #[cfg(test)]
+        blob_apply_test_seam::park(&reference.digest).await;
+        if let Err(reason) = apply_fetched_blob(&task_state, &reference, source, bytes).await {
+            tracing::warn!(kind = ?reference.kind, byte_len = reference.byte_len, reason, "control blob apply failed");
+        }
+    });
+    if !admitted {
+        tracing::debug!("control blob apply refused: the daemon is shutting down");
+    }
+    admitted
+}
+
+/// #1269 r2: test-only seam that parks a shielded blob apply at its start,
+/// so a test can stop the daemon while the apply is in progress.
+///
+/// r3: each pause is keyed by the blob digest and owns its own state, so
+/// other tests that apply blobs in the same process cannot consume, reset
+/// or release it.
+#[cfg(test)]
+pub(super) mod blob_apply_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// One armed pause; the test keeps it to observe and release the apply.
+    #[derive(Default)]
+    pub(in crate::server) struct ApplyPause {
+        reached: AtomicBool,
+        released: AtomicBool,
+        finished: AtomicBool,
+    }
+
+    impl ApplyPause {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::server) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+
+        /// Whether the parked apply resumed after its release.
+        pub(in crate::server) fn finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<ApplyPause>>>> = Mutex::new(None);
+
+    /// Park the next apply of the blob with this digest (one-shot).
+    pub(in crate::server) fn arm(digest: &str) -> Arc<ApplyPause> {
+        let pause = Arc::new(ApplyPause::default());
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(digest.to_string(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(super) async fn park(digest: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(digest));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        pause.finished.store(true, Ordering::SeqCst);
+    }
+}
+
+/// #1269 r2: the cancellable half of a pull: chunk fetch, reassembly, the
+/// exact length and digest check, and the best-effort release notice.
+/// Nothing durable happens here, so an abort at any await is safe. Returns
+/// the source and the verified bytes.
+async fn fetch_blob(
+    state: &Arc<AppState>,
+    reference: &ControlBlobRef,
+    generation: u64,
+) -> std::result::Result<(AgentId, Vec<u8>), &'static str> {
     let source = parse_agent_id_hex(&reference.source).map_err(|_| "invalid source")?;
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
     let total_chunks = reference.byte_len.div_ceil(CHUNK_BYTES as u64);
@@ -770,7 +1307,8 @@ async fn fetch_and_apply(
     let release_state = Arc::clone(state);
     let release_source = source;
     let release_reference = reference.clone();
-    tokio::spawn(async move {
+    // #1269: shutdown-owned; the notice holds the AppState.
+    state.spawn_detached(async move {
         let release = ControlBlobMessage::Release {
             reference: release_reference,
         };
@@ -781,6 +1319,19 @@ async fn fetch_and_apply(
             );
         }
     });
+    Ok((source, bytes))
+}
+
+/// #1269 r2: the durable half of a pull: re-check the reference against
+/// current state, parse, and hand the payload to its handler, which can
+/// persist roster and TreeKEM state. The daemon runs it shielded
+/// ([`spawn_blob_apply`]).
+async fn apply_fetched_blob(
+    state: &Arc<AppState>,
+    reference: &ControlBlobRef,
+    source: AgentId,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), &'static str> {
     if !reference_admitted(state, reference).await {
         return Err("control blob binding no longer current");
     }
@@ -972,6 +1523,86 @@ mod tests {
             byte_len: bytes.len() as u64,
             join_attempt_id: None,
         }
+    }
+
+    /// ADR 0107 (r6 boundary): the seam's non-blocking staged-copy lookup
+    /// agrees with the locked (pruning) one on every TTL and deadline case,
+    /// and reports contention instead of blocking.
+    #[test]
+    fn try_staged_origin_matches_the_locked_lookup() {
+        let store = ControlBlobState::default();
+        let bytes = |fill: u8| vec![fill; x0x::dm::MAX_PAYLOAD_BYTES + 64];
+        let join_ref = |data: &[u8]| ControlBlobRef {
+            kind: ControlBlobKind::JoinResult,
+            join_attempt_id: Some("attempt".to_string()),
+            ..reference(data)
+        };
+        let now = Instant::now();
+        let far = StagedOrigin {
+            staged_at: now,
+            deadline: now + Duration::from_secs(60),
+        };
+        // Bound and current.
+        let live = join_ref(&bytes(1));
+        store
+            .stage_with_origin(live.clone(), bytes(1), Some(far))
+            .expect("stage live copy");
+        // Bound to an original whose deadline is about to pass.
+        let near = join_ref(&bytes(2));
+        store
+            .stage_with_origin(
+                near.clone(),
+                bytes(2),
+                Some(StagedOrigin {
+                    staged_at: now,
+                    deadline: Instant::now() + Duration::from_millis(30),
+                }),
+            )
+            .expect("stage near-deadline copy");
+        // The copy's own TTL has elapsed (its original is still current).
+        let stale = join_ref(&bytes(3));
+        store
+            .stage_with_origin(stale.clone(), bytes(3), Some(far))
+            .expect("stage stale copy");
+        store.with_registry(|registry| {
+            if let Some(entry) = registry.staged.get_mut(&stale) {
+                entry.created_at = Instant::now()
+                    .checked_sub(PENDING_JOIN_RESULT_TTL + Duration::from_secs(1))
+                    .expect("monotonic clock far enough from boot");
+            }
+        });
+        // Unbound (no original).
+        let unbound = join_ref(&bytes(4));
+        store
+            .stage(unbound.clone(), bytes(4))
+            .expect("stage unbound copy");
+        std::thread::sleep(Duration::from_millis(60));
+        let deadline_of = |origin: Option<StagedOrigin>| origin.map(|o| (o.staged_at, o.deadline));
+        for (case, reference, present) in [
+            ("live", &live, true),
+            ("past the original's deadline", &near, false),
+            ("past the copy's own TTL", &stale, false),
+            ("unbound", &unbound, false),
+        ] {
+            // Non-blocking first: the locked lookup prunes.
+            let seam = store
+                .try_staged_origin(reference)
+                .expect("uncontended registry");
+            let locked = store.staged_origin(reference);
+            assert_eq!(seam.is_some(), present, "[{case}] seam lookup");
+            assert_eq!(
+                deadline_of(seam),
+                deadline_of(locked),
+                "[{case}] the seam and locked lookups disagree"
+            );
+        }
+        let held = store.hold_registry_for_test(Duration::from_millis(500));
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the holder took the lock");
+        assert!(
+            store.try_staged_origin(&live).is_err(),
+            "contention is reported, not waited out"
+        );
     }
 
     /// The Home oversize fixture fails unless it parses this exact line, and the
@@ -1572,6 +2203,99 @@ mod tests {
             .expect("attempt registry")
             .remove(&key);
         assert!(!reference_admitted(&state, &reference).await);
+        Ok(())
+    }
+
+    /// #1269 r2: a fetched blob's apply runs shielded. A shutdown drain that
+    /// starts while the apply is in progress waits for it past the 2 s grace
+    /// instead of aborting it, the lease stays held until the apply ends, and
+    /// an apply that has not started when shutdown begins is refused (its
+    /// lease released). The parked apply is the real `spawn_blob_apply` path;
+    /// only the payload (not valid event JSON) is synthetic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue1269_blob_apply_is_shielded_from_the_shutdown_drain() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = super::super::super::home::tests::owned_state(dir.path(), [0x74; 32]).await?;
+        let store = state.control_blobs.clone();
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let group_key = "74".repeat(32);
+        state.named_groups.write().await.insert(
+            group_key.clone(),
+            x0x::groups::GroupInfo::with_policy(
+                group_key.clone(),
+                String::new(),
+                local,
+                group_key.clone(),
+                x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+            ),
+        );
+        let bytes = vec![0x5a; x0x::dm::MAX_PAYLOAD_BYTES + 1];
+        let reference = ControlBlobRef {
+            kind: ControlBlobKind::NamedGroupEvent,
+            group_id: group_key,
+            source: local_hex.clone(),
+            recipient: local_hex,
+            digest: hex::encode(blake3::hash(&bytes).as_bytes()),
+            byte_len: bytes.len() as u64,
+            join_attempt_id: None,
+        };
+        let slot = || {
+            Arc::clone(&store.0.fetch_slots)
+                .try_acquire_owned()
+                .expect("fetch slot")
+        };
+
+        let pause = blob_apply_test_seam::arm(&reference.digest);
+        let lease = store.reserve_incoming(&reference).expect("lease");
+        assert!(spawn_blob_apply(
+            &state,
+            reference.clone(),
+            local,
+            bytes.clone(),
+            slot(),
+            lease
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !pause.reached() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(pause.reached(), "the apply parks at its start");
+
+        let drain_state = Arc::clone(&state);
+        let drain = tokio::spawn(async move {
+            crate::server::drain_server_tasks(&drain_state, Vec::new()).await;
+        });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(
+            !drain.is_finished(),
+            "the drain must wait for the shielded apply, not abort it"
+        );
+        assert_eq!(
+            store.incoming_bytes_held(),
+            reference.byte_len,
+            "the apply in progress still holds its lease"
+        );
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(15), drain).await??;
+        assert!(pause.finished(), "the apply resumed and ended");
+        assert_eq!(store.incoming_bytes_held(), 0);
+
+        // A blob fetched after shutdown began is never applied.
+        let lease = store.reserve_incoming(&reference).expect("lease");
+        assert!(!spawn_blob_apply(
+            &state,
+            reference,
+            local,
+            bytes,
+            slot(),
+            lease
+        ));
+        assert_eq!(
+            store.incoming_bytes_held(),
+            0,
+            "a refused apply drops its lease"
+        );
         Ok(())
     }
 }

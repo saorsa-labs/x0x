@@ -204,15 +204,19 @@ fn publish_err(e: impl std::fmt::Display) -> crate::crdt::CrdtError {
     crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
 }
 
-/// #895/#975: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
+/// #895/#975/#1100: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
 ///
 /// Without a protector, or for a signed-public group, `plain` is published
-/// as is. Otherwise it is sealed, the protector confirms the seal is still
-/// under the group's CURRENT epoch, and the sealed record is published while
-/// the protector's permit holds that epoch fixed. A member removal that
-/// commits after the seal makes the confirmation `Stale` and the payload is
-/// sealed again, so a record under a pre-removal epoch is never published
-/// after the removal. Never falls back to plaintext on a seal error.
+/// as is — for a group, only under the plaintext publication permit, which
+/// re-checks the plane and holds the group's policy commits off through the
+/// publish (#1100), so a flip to `MlsEncrypted` that commits after the seal
+/// sends the payload back through the sealing path instead. Otherwise the
+/// payload is sealed, the protector confirms the seal is still under the
+/// group's CURRENT epoch, and the sealed record is published while the
+/// protector's permit holds that epoch fixed. A member removal that commits
+/// after the seal makes the confirmation `Stale` and the payload is sealed
+/// again, so a record under a pre-removal epoch is never published after the
+/// removal. Never falls back to plaintext on a seal error.
 async fn seal_and_publish(
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
     pubsub: &PubSubManager,
@@ -230,11 +234,36 @@ async fn seal_and_publish(
     for _ in 0..TASK_SEAL_ATTEMPTS {
         // The seal runs with no permit held: the protector's seal may take
         // the same group locks the permit does (not re-entrant).
-        let Some(body) = protector.seal(kind, &plain).await? else {
-            return pubsub
-                .publish(topic.to_string(), bytes::Bytes::from(plain))
-                .await
-                .map_err(publish_err);
+        let sealed = protector.seal(kind, &plain).await?;
+        let Some(body) = sealed else {
+            // #1100: the group was signed-public when sealed. Publish the
+            // plaintext only under the publication permit — if the plane has
+            // since left signed-public, that is `Stale` and the payload
+            // re-enters the loop to be sealed under the now-current key
+            // (the sealed branch's own refusal handling), never plaintext.
+            let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
+                match protector.confirm_plaintext_publication().await? {
+                    TaskPublication::Stale => Ok(false),
+                    TaskPublication::Current(permit) => {
+                        let published = pubsub
+                            .publish(topic.to_string(), bytes::Bytes::copy_from_slice(&plain))
+                            .await
+                            .map_err(publish_err);
+                        drop(permit);
+                        published.map(|()| true)
+                    }
+                }
+            })
+            .await
+            .map_err(|_| publish_err("plaintext publish exceeded its deadline"))?;
+            if guarded? {
+                return Ok(());
+            }
+            tracing::debug!(
+                topic,
+                "group policy left signed-public after a plaintext seal; re-sealing (#1100)"
+            );
+            continue;
         };
         let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
             match protector.confirm_publication(&body).await? {
@@ -261,7 +290,8 @@ async fn seal_and_publish(
         );
     }
     Err(crate::crdt::CrdtError::Gossip(format!(
-        "group epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; task delta not published"
+        "group policy or epoch changed during each of {TASK_SEAL_ATTEMPTS} seals; \
+         task delta not published"
     )))
 }
 
@@ -2482,10 +2512,25 @@ mod tests {
     }
 
     /// Build a `TaskListSync` that shares its pubsub with the caller (so the
-    /// caller can subscribe before the sync publishes).
+    /// caller can subscribe before the sync publishes). The pubsub signs: since
+    /// #1114 nothing unsigned is delivered, its own subscribers included.
     async fn make_sync_with_pubsub(topic: &str) -> (TaskListSync, Arc<PubSubManager>) {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        sync_on_pubsub(topic, signed_pubsub().await)
+    }
+
+    /// As [`make_sync_with_pubsub`], with the pubsub signed by `kp` — the
+    /// production shape for a group list whose protector seals as `kp`.
+    async fn make_sync_with_pubsub_signed_by(
+        topic: &str,
+        kp: &crate::identity::AgentKeypair,
+    ) -> (TaskListSync, Arc<PubSubManager>) {
+        sync_on_pubsub(topic, pubsub_signed_by(kp).await)
+    }
+
+    fn sync_on_pubsub(
+        topic: &str,
+        pubsub: Arc<PubSubManager>,
+    ) -> (TaskListSync, Arc<PubSubManager>) {
         let list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         let sync = TaskListSync::new(list, Arc::clone(&pubsub), topic.to_string(), peer(1))
             .expect("task list sync");
@@ -2880,7 +2925,7 @@ mod tests {
     async fn group_list_state_serve_is_sealed() {
         let topic = "x0x.group.g895.symphony.serve";
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
-        let (sync, pubsub) = make_sync_with_pubsub(topic).await;
+        let (sync, pubsub) = make_sync_with_pubsub_signed_by(topic, &kp).await;
         assert!(sync.install_protector(GssFixtureProtector::new(
             gss_group(kp.agent_id()),
             topic,
@@ -3136,7 +3181,7 @@ mod tests {
     async fn seal_failure_publishes_nothing() {
         let topic = "x0x.group.g895.symphony.sealfail";
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
-        let (sync, pubsub) = make_sync_with_pubsub(topic).await;
+        let (sync, pubsub) = make_sync_with_pubsub_signed_by(topic, &kp).await;
         let protector = GssFixtureProtector::new(gss_group(kp.agent_id()), topic, &kp);
         protector
             .fail_seal
@@ -3172,9 +3217,14 @@ mod tests {
         // The side topic also carries state REQUESTS (ours, and the sync's
         // own bootstrap requester); only a served marker is a failure.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut saw_our_request = false;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, side.recv()).await {
+            let decoded = bincode::deserialize::<TaskListSyncMessage>(&msg.payload);
+            if let Ok(TaskListSyncMessage::StateRequest { requester }) = &decoded {
+                saw_our_request |= *requester == peer(9);
+            }
             let marker = matches!(
-                bincode::deserialize::<TaskListSyncMessage>(&msg.payload),
+                decoded,
                 Ok(TaskListSyncMessage::StateServed { .. }
                     | TaskListSyncMessage::StateServedV2 { .. })
             );
@@ -3183,6 +3233,9 @@ mod tests {
                 "no served marker without a real (sealed) broadcast"
             );
         }
+        // Liveness (#1114): the side topic delivered our request, so the
+        // silence above is the responder's decision, not a dead topic.
+        assert!(saw_our_request, "the side probe must see our StateRequest");
     }
 
     /// omp review finding 1 WHY (crdt half): a list with a serve gate
@@ -3288,15 +3341,26 @@ mod tests {
     #[tokio::test]
     async fn start_default_spawner_merges_remote_delta() {
         // End-to-end exercise of the delta-merge listener through the Layer A
-        // gate (issue #349, I2): a delta published on the topic is received
+        // gate (issue #349, I2/I8): a delta published on the topic is received
         // by the background loop spawned by start() and merged with the
-        // V2-envelope-verified sender as the writer. A PubSubManager with no
-        // signing context publishes UNSIGNED (anonymous-sender) messages, so
-        // the listener must fail closed on content: the delta's first-seen
-        // task add must NOT land, while an attested checkbox claim on a task
-        // the receiver already holds must still converge (checkbox admission
-        // is gated by OpAttestation, not by the envelope writer).
-        let sync = make_sync("tasks/F").await;
+        // V2-envelope-verified sender as the writer. The publisher signs
+        // (#1114: nothing unsigned is delivered at all) but is NOT in the
+        // list's authorized set, so the listener must fail closed on content:
+        // the delta's first-seen task add must NOT land, while a member's
+        // attested checkbox claim on a task the receiver already holds must
+        // still converge (checkbox admission is gated by OpAttestation and
+        // membership, not by the envelope writer). The anonymous-writer case
+        // is covered off-wire by
+        // `merge_delta_anonymous_writer_drops_content_but_admits_attested_claim`.
+        let (pubsub, publisher) = signed_pubsub_with_signer().await;
+        let (sync, _pubsub) = sync_on_pubsub("tasks/F", pubsub);
+        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
+        let signing = crate::gossip::SigningContext::from_keypair(&kp);
+        let claimer = kp.agent_id();
+        assert_ne!(publisher, claimer);
+        sync.write()
+            .await
+            .set_authorized_agents(std::collections::HashSet::from([claimer]));
 
         sync.start().await.expect("start");
 
@@ -3313,13 +3377,10 @@ mod tests {
             list.add_task(existing, remote, 1).expect("seed local task");
         }
 
-        // Unsigned delta: a first-seen add PLUS a validly-attested claim on
-        // the existing task. The claim is the positive evidence that the
-        // listener processed the message, so "add did not land" below is a
-        // real gate decision, not a dead listener.
-        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
-        let signing = crate::gossip::SigningContext::from_keypair(&kp);
-        let claimer = kp.agent_id();
+        // Non-member delta: a first-seen add PLUS a member's validly-attested
+        // claim on the existing task. The claim is the positive evidence that
+        // the listener processed the message, so "add did not land" below is
+        // a real gate decision, not a dead listener.
         let mut claimed = make_task(5, remote);
         claimed
             .claim(list_id(1), claimer, remote, 1, &signing)
@@ -3334,7 +3395,7 @@ mod tests {
         delta.task_updates.insert(existing_id, claimed);
         sync.publish_delta(remote, delta).await.expect("publish");
 
-        // The claim applies (checkbox path still runs for writer=None)…
+        // The claim applies (checkbox path still runs for a non-member writer)…
         let claim_applied = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let claimed_landed = sync
@@ -3351,13 +3412,13 @@ mod tests {
         .await;
         assert!(
             claim_applied.is_ok(),
-            "unsigned publish must still reach checkbox admission"
+            "a non-member's signed publish must still reach checkbox admission"
         );
 
-        // …but the unsigned content must NOT land (I2).
+        // …but the non-member's content must NOT land (I2/I8).
         assert!(
             sync.read().await.get_task(&new_task_id).is_none(),
-            "unsigned (anonymous-sender) publish must not create a task (I2)"
+            "a non-member writer's publish must not create a task (I2/I8)"
         );
         assert_eq!(
             sync.read().await.task_count(),
@@ -4062,8 +4123,9 @@ mod tests {
     /// CORRECT, and the chatter tail terminates.
     #[tokio::test(start_paused = true)]
     async fn empty_holder_v2_marker_terminates_empty_requester() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // #1114: signed, or the probe (and both syncs) would hear nothing and
+        // `late == 0` below would hold trivially.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-240-empty-silence";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -4084,7 +4146,9 @@ mod tests {
         // declarations arrive; convergence should follow within a few tail
         // checks.
         tokio::time::sleep(Duration::from_secs(160)).await;
-        drain_state_requests(&mut probe, peer(2)).await;
+        let warm = drain_state_requests(&mut probe, peer(2)).await;
+        // Liveness: the front attempts always run, so the probe hears them.
+        assert!(warm > 0, "the probe must hear the joiner's front requests");
         let mut late = 0;
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_secs(30)).await;

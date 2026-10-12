@@ -1369,7 +1369,9 @@ mod tests {
         let agent_id = kp.agent_id();
         let machine_id = MachineId([9u8; 32]);
 
-        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
         // Subscribe BEFORE spawning so we observe the advert the publisher
         // actually places on the wire.
         let mut sub = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
@@ -2060,7 +2062,9 @@ mod tests {
         let agent_id = kp.agent_id();
         let machine_id = MachineId([0x61; 32]);
 
-        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
         let mut ext_sub = pubsub
             .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
             .await;
@@ -2107,7 +2111,9 @@ mod tests {
         let mut caps = DmCapabilities::v2_durable_gossip_ready(vec![0x63; 1184]);
         caps.digest_support = false;
 
-        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
         let mut ext_sub = pubsub
             .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
             .await;

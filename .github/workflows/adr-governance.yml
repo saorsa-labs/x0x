@@ -4,9 +4,14 @@ on:
   pull_request:
     paths:
       - 'docs/adr/**'
+      - 'docs/adr-archive/**'
       - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
+      - 'scripts/check-adr-consolidation.py'
+      - 'scripts/check-adr-count.py'
+      - 'scripts/test_adr_consolidation.py'
+      - 'scripts/test_adr_count.py'
       - '.github/workflows/adr-governance.yml'
   push:
     branches:
@@ -14,9 +19,14 @@ on:
       - master
     paths:
       - 'docs/adr/**'
+      - 'docs/adr-archive/**'
       - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
+      - 'scripts/check-adr-consolidation.py'
+      - 'scripts/check-adr-count.py'
+      - 'scripts/test_adr_consolidation.py'
+      - 'scripts/test_adr_count.py'
       - '.github/workflows/adr-governance.yml'
 
 jobs:
@@ -36,3 +46,11 @@ jobs:
         run: python3 scripts/test_adr_governance.py
       - name: Run ADR governance checks
         run: python3 scripts/adr-governance.py
+      - name: Test the 15-slot transition rules
+        run: python3 scripts/test_adr_consolidation.py
+      - name: Check the 15-slot replacement set
+        run: python3 scripts/check-adr-consolidation.py
+      - name: Test the current ADR count
+        run: python3 scripts/test_adr_count.py
+      - name: Check the current ADR count
+        run: python3 scripts/check-adr-count.py

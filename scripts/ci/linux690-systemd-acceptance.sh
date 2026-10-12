@@ -37,6 +37,25 @@ probe=$(cd "$(dirname "$probe")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$p
 printf '%s\n' "$probe" >"$artifact_root/probe-path.txt"
 sha256sum "$probe" >"$artifact_root/probe-sha256.txt"
 status_log="$artifact_root/command-statuses.txt"
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+fixture_uid=$(id -u)
+fixture_gid=$(id -g)
+if [ "$manager" = system ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "--manager system requires an already-root shell on a disposable host" >&2; exit 77; }
+  # The probe and artifacts may be below the sudo caller's private home.
+  # Chowning only the leaf directories cannot admit a different uid there.
+  fixture_identity=$(python3 -B - "$script_dir" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from systemd_isolation import fixture_identity
+print(*fixture_identity(os.environ))
+PY
+  )
+  fixture_uid=${fixture_identity% *}
+  fixture_gid=${fixture_identity#* }
+  chown "$fixture_uid:$fixture_gid" "$artifact_root"
+fi
+parent_netns=$(readlink /proc/self/ns/net)
 
 record_status() {
   label=$1 status=$2
@@ -124,6 +143,11 @@ cleanup() {
   for unit in $units; do
     safe=$(printf '%s' "$unit" | tr -c 'A-Za-z0-9._-' '_')
     [ ! -e "$artifact_root/.cleaned-$safe" ] || continue
+    # Admission/exec failures happen before invocation-1.json exists. Preserve
+    # their journal and loaded state before stop/reset discards the unit.
+    journal_bounded "trap-journal-$safe" "$unit" "$artifact_root/trap-journal-$safe.txt" "$artifact_root/trap-journal-$safe.err" || true
+    systemctl_bounded "trap-show-$safe" "$artifact_root/trap-show-$safe.txt" "$artifact_root/trap-show-$safe.err" show "$unit" \
+      -p User -p Group -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts || true
     systemctl_bounded "trap-stop-$safe" "$artifact_root/trap-stop-$safe.out" "$artifact_root/trap-stop-$safe.err" stop "$unit" || true
     systemctl_bounded "trap-reset-$safe" "$artifact_root/trap-reset-$safe.out" "$artifact_root/trap-reset-$safe.err" reset-failed "$unit" || true
     if ! wait_unit_absent "$unit" "$artifact_root/cleanup.log" 10; then final_status=1; fi
@@ -148,11 +172,14 @@ wait_file() {
 
 assert_verdict() {
   file=$1 invocation=$2 expected=$3 expected_unit=$4 expected_manager=$5 expected_reason=$6
-  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" <<'PY'
+  python3 - "$file" "$invocation" "$expected" "$expected_unit" "$expected_manager" "$expected_reason" "$script_dir" "$parent_netns" <<'PY'
 import json, sys
-p, invocation, expected, unit, manager, reason = sys.argv[1:]
+p, invocation, expected, unit, manager, reason, script_dir, parent_netns = sys.argv[1:]
+sys.path.insert(0, script_dir)
+from systemd_isolation import validate
 with open(p, encoding="utf-8") as f:
     value = json.load(f)
+validate(value.get("isolation"), parent_netns)
 assert value["schema"] == 1
 assert value["invocation"] == int(invocation)
 assert isinstance(value["pid"], int) and value["pid"] > 1
@@ -178,6 +205,12 @@ run_case() {
   unit="$run_id-$case_name.service"
   case_dir="$artifact_root/$case_name"
   mkdir -m 700 "$case_dir"
+  if [ "$manager" = system ]; then
+    chown "$fixture_uid:$fixture_gid" "$case_dir"
+    set -- "--property=User=$fixture_uid" "--property=Group=$fixture_gid"
+  else
+    set --
+  fi
   units="$unit $units"
   systemd_run_bounded "run-$case_name" "$case_dir/systemd-run.out" "$case_dir/systemd-run.err" \
     --unit="$unit" --collect \
@@ -186,7 +219,13 @@ run_case() {
     --property="RestartPreventExitStatus=$prevent" \
     --property="RemainAfterExit=$remain" \
     --property="StartLimitIntervalSec=0" \
+    --property=PrivateNetwork=yes \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property=NoNewPrivileges=yes \
+    "$@" \
     --setenv=X0X_TEMPLATE_VERSION=1 \
+    "--setenv=X0X_FIXTURE_PARENT_NETNS=$parent_netns" \
     "$probe" --artifact "$case_dir"
   wait_file "$case_dir/invocation-1.json" 20
   systemctl_bounded "show-first-$case_name" "$case_dir/systemctl-show-first.txt" "$case_dir/systemctl-show-first.err" show "$unit" \

@@ -185,8 +185,8 @@ fn requeue_salvaged(
 /// [`StreamType`]. The recv half is parked alongside so the peer's stream
 /// state stays open for the lane's lifetime.
 struct OutboundLane {
-    send: ant_quic::HighLevelSendStream,
-    _recv: ant_quic::HighLevelRecvStream,
+    send: crate::network::StreamSend,
+    _recv: crate::network::StreamRecv,
     /// The most recent frames written to THIS stream, bounded by
     /// [`LANE_REPLAY_MAX_FRAMES`] / [`LANE_REPLAY_MAX_BYTES`].
     ///
@@ -571,21 +571,24 @@ impl X0xLinkTransport {
         }
 
         // Resolve the gate-cleared machine for the advert binding check
-        // (the same cache the gate consulted; a changed binding here can
-        // only fail-safe — adverts stop matching and audio stays
-        // reliable).
-        let machine = {
+        // (the same cache and authority rule the gate used, ADR 0115 §2:
+        // the route counts only when an authority store confirms it; a
+        // changed binding here can only fail-safe — adverts stop matching
+        // and audio stays reliable).
+        let routing = {
             let cache = self.agent.identity_discovery_cache.read().await;
-            cache
-                .get(&self.remote)
-                .map(|entry| entry.machine_id)
-                .ok_or_else(|| {
-                    LinkTransportError::IoError(
-                        "remote binding vanished after lane gate — datagram lane not started"
-                            .to_owned(),
-                    )
-                })?
+            cache.get(&self.remote).map(|entry| entry.machine_id)
         };
+        let machine = self
+            .agent
+            .authorized_routing_machine(&self.remote, routing)
+            .await
+            .ok_or_else(|| {
+                LinkTransportError::IoError(
+                    "remote binding vanished after lane gate — datagram lane not started"
+                        .to_owned(),
+                )
+            })?;
         let our_nonce = hex::encode(rand::random::<[u8; 16]>());
         *self
             .datagram_session

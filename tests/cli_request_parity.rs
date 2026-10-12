@@ -1069,6 +1069,9 @@ fn keywords() -> BTreeSet<&'static str> {
 /// change on an existing one is a conscious edit, not silent drift
 /// (review r2, finding 2c).
 const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
+    // ADR 0116 §4: raw Bytes, decoded by parse_retain_body so every refusal
+    // is a 400 (axum's Json would answer 415/422).
+    ("POST", "/history/retain", &["budget_ms", "max_rows"]),
     // parse_optional_json over raw Bytes (announce_identity)
     (
         "POST",

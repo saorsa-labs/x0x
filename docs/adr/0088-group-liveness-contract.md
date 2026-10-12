@@ -1,0 +1,1 @@
+../adr-archive/0088-group-liveness-contract.md

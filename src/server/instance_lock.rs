@@ -16,8 +16,8 @@
 //! The replacement is an advisory exclusive lock on
 //! `<data_dir>/instance.lock`, taken in
 //! [`crate::server::serve_with_options`] immediately after the data dir is
-//! created — before the startup update check, the API listener, identity
-//! load/generation, or any other subsystem touches the directory — and held
+//! created — before the API listener, identity load/generation, or any other
+//! subsystem touches the directory — and held
 //! by the spawned supervisor task until it has finished draining (#645):
 //! the guard must outlive [`crate::server::ServerHandle`]'s `Drop`, or an
 //! embedded caller that drops and immediately re-serves the same data dir

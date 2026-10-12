@@ -156,6 +156,8 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 mod evidence_wire;
+/// ADR 0115: identity discovery authority rules.
+mod identity_authority;
 /// Relationship-peer evidence store and point-of-use runtime (ADR 0089).
 pub mod peer_evidence;
 
@@ -236,6 +238,376 @@ pub use direct::{DirectMessage, DirectMessageReceiver, DirectMessaging};
 // Import Membership trait for HyParView join() method
 use saorsa_gossip_membership::Membership as _;
 
+/// x0x #1150: a raw-QUIC send target after resolution, repair and the B/P
+/// pairing checks (see `Agent::resolve_raw_quic_target`).
+struct RawQuicTarget {
+    machine_id: identity::MachineId,
+    ant_peer_id: ant_quic::PeerId,
+    machine_prefix: String,
+    resolution: &'static str,
+}
+
+/// x0x #1150 (g10-1190a): the verified source that names a pinned
+/// recipient's machine (see [`select_pinned_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedMachineSource {
+    Announcement,
+    DmRegistry,
+    AuthenticatedBinding,
+    PeerEvidence,
+}
+
+/// x0x #1150 (r7b): a pinned recipient's machine and the verified source
+/// that names it. The provenance is kept apart from the target's
+/// diagnostic label, so repair or redial can never re-label a machine past
+/// its binding checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedBinding {
+    machine: identity::MachineId,
+    source: PinnedMachineSource,
+}
+
+/// x0x #1150 (g10-1190a, r7b, r7c): the one rule for which verified binding
+/// names a pinned recipient's machine. The bounded resolution, the re-check
+/// after repair and the seam all apply it, to async or `try_*` reads of the
+/// same sources.
+///
+/// Live authority comes first, as on the receive path (#1088, #1098). It is
+/// the newer of two bindings: the recipient's latest verified identity
+/// announcement (`announced`, from the announced-binding store, which
+/// routing never writes) and its ADR-0021 authenticated machine binding
+/// (`attested`, an origin attestation or a direct-origin announcement). The
+/// certificate expiry carried with it applies. A known live binding is
+/// never overridden: if it is expired, nothing resolves. With no live
+/// binding, the DM registry (a machine a verified frame came from) names
+/// the machine, then peer evidence (`evidence`, its own point-of-use
+/// check). The discovery cache's `machine_id` is routing state, which the
+/// connector reconciles to any connected machine. It is never authority
+/// here (r7c).
+fn select_pinned_binding(
+    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
+    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+    registry: Option<identity::MachineId>,
+    evidence: impl FnOnce() -> Option<identity::MachineId>,
+    now_secs: u64,
+) -> Option<PinnedBinding> {
+    let announced = announced.filter(|binding| binding.machine_id.0 != [0u8; 32]);
+    let live = match attested {
+        Some(binding)
+            if announced.is_none_or(|announced| binding.announced_at > announced.announced_at) =>
+        {
+            Some((
+                binding.machine_id,
+                binding
+                    .cert_not_after
+                    .or_else(|| announced.and_then(|announced| announced.cert_not_after)),
+                PinnedMachineSource::AuthenticatedBinding,
+            ))
+        }
+        _ => announced.map(|announced| {
+            (
+                announced.machine_id,
+                announced.cert_not_after,
+                PinnedMachineSource::Announcement,
+            )
+        }),
+    };
+    if let Some((machine, not_after, source)) = live {
+        return (!identity::is_expired(not_after, now_secs))
+            .then_some(PinnedBinding { machine, source });
+    }
+    if let Some(machine) = registry {
+        return Some(PinnedBinding {
+            machine,
+            source: PinnedMachineSource::DmRegistry,
+        });
+    }
+    evidence().map(|machine| PinnedBinding {
+        machine,
+        source: PinnedMachineSource::PeerEvidence,
+    })
+}
+
+impl PinnedMachineSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Announcement => "announcement",
+            Self::DmRegistry => "dm_registry",
+            Self::AuthenticatedBinding => "authenticated_binding",
+            Self::PeerEvidence => "peer_evidence",
+        }
+    }
+}
+
+/// x0x #1150 (g10-1190a): how often a pinned send's bounded wait re-reads
+/// the verified sources of its recipient's machine.
+const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
+/// uses (connection state, send-readiness repair, discovery redial).
+/// Production always uses the network; test builds can script them, so the
+/// production resolution logic runs in process without a network.
+enum RawQuicTransport<'a> {
+    Network(&'a std::sync::Arc<network::NetworkNode>),
+    #[cfg(test)]
+    Scripted(std::sync::Arc<PinnedTransportScript>),
+}
+
+impl RawQuicTransport<'_> {
+    async fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        match self {
+            Self::Network(network) => network.is_connected(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.is_connected(peer),
+        }
+    }
+
+    async fn ensure_peer_send_ready(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        match self {
+            Self::Network(network) => network.ensure_peer_send_ready(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.repair(peer).await,
+        }
+    }
+
+    /// x0x #1150 (r7c): dial exactly `machine`, using only address hints
+    /// that name it ([`Agent::pinned_redial_hints`]). Reports whether that
+    /// machine is now connected. It never runs the general connector, which
+    /// reconciles routing state to whatever machine is connected.
+    async fn pinned_redial(
+        &self,
+        agent: &Agent,
+        agent_id: &identity::AgentId,
+        machine: identity::MachineId,
+    ) -> bool {
+        let peer = ant_quic::PeerId(machine.0);
+        match self {
+            Self::Network(network) => {
+                let addrs = agent.pinned_redial_hints(
+                    agent_id,
+                    machine,
+                    allow_local_discovery_addresses(network.config()),
+                );
+                if addrs.is_empty() {
+                    return false;
+                }
+                matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        network.connect_peer_with_addrs(peer, addrs),
+                    )
+                    .await,
+                    Ok(Ok((_, connected))) if connected == peer
+                )
+            }
+            #[cfg(test)]
+            Self::Scripted(script) => {
+                let _ = agent.pinned_redial_hints(agent_id, machine, true);
+                script.pinned_dial(&peer)
+            }
+        }
+    }
+
+    async fn redial(
+        &self,
+        agent: &Agent,
+        agent_id: &identity::AgentId,
+        cold: ColdResolution,
+    ) -> Option<identity::MachineId> {
+        // Scripted too: the production redial over the script's connection
+        // state (r7c).
+        agent
+            .redial_direct_machine_from_discovery(agent_id, self, cold)
+            .await
+    }
+}
+
+/// Crate-private opt-in budget for the owner removal notice (#1217).
+#[derive(Debug, Clone, Copy)]
+struct ColdWait(std::time::Duration);
+
+/// Public sends keep the existing path. Removal sends use one deadline.
+#[derive(Debug, Clone, Copy)]
+enum ColdResolution {
+    Off,
+    Until(tokio::time::Instant),
+}
+
+impl ColdResolution {
+    fn starting_now(cold_wait: Option<ColdWait>) -> Self {
+        cold_wait.map_or(Self::Off, |cold| {
+            Self::Until(tokio::time::Instant::now() + cold.0)
+        })
+    }
+
+    fn opted_in(self) -> bool {
+        matches!(self, Self::Until(_))
+    }
+
+    fn deadline(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Off => None,
+        }
+    }
+}
+
+/// x0x #1150 (r7b, r7c): a scripted connection state for the strict
+/// in-process pinned stand-in. The default reports every machine
+/// connected. Test builds only.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PinnedTransportScript {
+    only_listed_connected: bool,
+    repair_connects: bool,
+    repair_delay: std::time::Duration,
+    repair_gate: Option<std::sync::Arc<PinnedRepairGate>>,
+    connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+/// Test seam (x0x #1207, P3): parks the scripted send-readiness repair on
+/// entry until the test releases it, so a test can change state while a
+/// repair is under way without assuming scheduler timing.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PinnedRepairGate {
+    /// One permit each time a repair enters.
+    pub(crate) reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PinnedRepairGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Let every current and future repair through.
+    pub(crate) fn release(&self) {
+        self.release.close();
+    }
+
+    async fn park(&self) {
+        self.reached.add_permits(1);
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+#[cfg(test)]
+impl PinnedTransportScript {
+    /// Only `machines` are connected. The send-readiness repair connects
+    /// the machine it repairs when `repair_connects`. The discovery redial
+    /// is the production one, over this connection state.
+    pub(crate) fn connected_only(machines: &[identity::MachineId], repair_connects: bool) -> Self {
+        Self {
+            only_listed_connected: true,
+            repair_connects,
+            repair_delay: std::time::Duration::ZERO,
+            repair_gate: None,
+            connected: std::sync::Mutex::new(machines.iter().copied().collect()),
+        }
+    }
+
+    /// The send-readiness repair parks on entry at `gate` until released.
+    pub(crate) fn with_repair_gate(mut self, gate: std::sync::Arc<PinnedRepairGate>) -> Self {
+        self.repair_gate = Some(gate);
+        self
+    }
+
+    /// The send-readiness repair takes `delay` before it reports.
+    pub(crate) fn with_repair_delay(mut self, delay: std::time::Duration) -> Self {
+        self.repair_delay = delay;
+        self
+    }
+
+    fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        !self.only_listed_connected
+            || self
+                .connected
+                .lock()
+                .is_ok_and(|connected| connected.contains(&identity::MachineId(peer.0)))
+    }
+
+    /// The pinned dial reaches the bound machine when `repair_connects` (the
+    /// machine is reachable at all).
+    fn pinned_dial(&self, peer: &ant_quic::PeerId) -> bool {
+        if self.repair_connects {
+            if let Ok(mut connected) = self.connected.lock() {
+                connected.insert(identity::MachineId(peer.0));
+            }
+        }
+        self.repair_connects
+    }
+
+    async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if let Some(gate) = &self.repair_gate {
+            gate.park().await;
+        }
+        tokio::time::sleep(self.repair_delay).await;
+        if !self.repair_connects {
+            return Err(error::NetworkError::ConnectionFailed(
+                "scripted repair failed".to_string(),
+            ));
+        }
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.insert(identity::MachineId(peer.0));
+        }
+        Ok(())
+    }
+}
+
+/// x0x #1150 (r7b): per-agent transport scripts for the strict stand-in.
+#[cfg(test)]
+static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            identity::AgentId,
+            identity::AgentId,
+            identity::MachineId,
+            Vec<u8>,
+        )>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedTransportScript> {
+    PINNED_STANDIN_TRANSPORT
+        .lock()
+        .ok()
+        .and_then(|scripts| scripts.get(agent).cloned())
+        .unwrap_or_default()
+}
+
+/// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
+/// the recipient's machine strictly, as the real path does (see
+/// `Agent::set_pinned_standin_strict_resolution_for_testing`).
+#[cfg(test)]
+static PINNED_STANDIN_STRICT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<identity::AgentId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
+    PINNED_STANDIN_STRICT
+        .lock()
+        .is_ok_and(|agents| agents.contains(agent))
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -304,6 +676,20 @@ pub struct Agent {
     /// to the observable claimed-machine fallback until a verified announcement
     /// repopulates the binding. Protocol-level closure is tracked in issue #213.
     authenticated_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
+    /// x0x #1150 (r7c): the agent→machine binding of each peer's latest
+    /// VERIFIED identity announcement (direct or rebroadcast), with its
+    /// certificate expiry. It is recorded at announcement ingest only.
+    /// Routing never writes it, unlike the discovery cache, whose
+    /// `machine_id` the connector reconciles to whatever machine is
+    /// connected. The pinned recovery-response path takes its live
+    /// authority from here. A bounded in-memory LRU, like
+    /// `authenticated_machine_bindings`.
+    announced_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
+    /// ADR 0115 D214: pre-upgrade issuer revocations and bundle
+    /// tombstones held unenforced until authenticated evidence confirms
+    /// their issuer (7-day lapse).
+    revocation_quarantine:
+        std::sync::Arc<tokio::sync::Mutex<identity_authority::quarantine::Quarantine>>,
     /// Cache of discovered machine endpoints from machine announcements and
     /// agent→machine identity links.
     machine_discovery_cache: std::sync::Arc<
@@ -2248,26 +2634,107 @@ pub struct DiscoveredMachine {
     pub user_ids: Vec<identity::UserId>,
 }
 
-/// Build a `subject AgentId → AgentCertificate` lookup from the discovery
-/// cache, used to authority-verify gossiped **issuer-revocations** (a user
-/// un-vouching a certified agent) on receipt (issue #191).
+/// ADR 0115 §3: where a subject certificate may come from to
+/// count as issuer-revocation or bundle authority (issue #191 resolves a
+/// gossiped record's subject certificate here).
+struct ProvenanceSources<'a> {
+    /// The discovery cache.
+    cache: &'a std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+    /// The announced-binding store (written only by class A and B
+    /// announcements); it keeps the digest each committed to.
+    announced: &'a dm_inbox::AuthenticatedMachineBindingCache,
+    /// ADR 0089 evidence: a usable record's certificate counts.
+    evidence: Option<&'a peer_evidence::EvidenceRuntime>,
+    /// The local user: a certificate it issued counts (the local
+    /// certificate journal rule).
+    local_user: Option<identity::UserId>,
+    /// Certificates read from the local certificate journal.
+    journal: &'a [identity::AgentCertificate],
+}
+
+/// ADR 0115 §3: every certificate for `subject` with authenticated
+/// provenance:
+/// - the cached certificate, when its digest is the one a class A or B
+///   announcement committed to (the announced-binding record);
+/// - the certificate of a usable ADR 0089 evidence record;
+/// - any certificate the local user issued (the cached one or one from the
+///   local certificate journal).
 ///
-/// `verify_authority` for an issuer-revocation requires the subject agent's
-/// certificate; self-revocations and machine-revocations need none. Only
-/// entries that actually carry a cert contribute; entries without one
-/// (pre-#130 peers, machine/rendezvous-only entries) are absent, so an
-/// issuer-revocation for such a subject is rejected fail-closed by the
-/// caller — the cert must have been announced first (EP1).
+/// Each certificate is still verified by `verify_authority` at use. An
+/// issuer-revocation whose subject has none is rejected, fail closed.
+fn subject_certs_with_provenance(
+    sources: &ProvenanceSources<'_>,
+    subject: &identity::AgentId,
+) -> Vec<identity::AgentCertificate> {
+    let local_issued = |cert: &identity::AgentCertificate| {
+        sources.local_user.is_some() && cert.user_id().ok() == sources.local_user
+    };
+    let mut certs: Vec<identity::AgentCertificate> = Vec::new();
+    let mut push = |cert: identity::AgentCertificate| {
+        if !certs.contains(&cert) {
+            certs.push(cert);
+        }
+    };
+    if let Some(cert) = sources
+        .cache
+        .get(subject)
+        .and_then(|entry| entry.agent_certificate.as_ref())
+    {
+        if identity_authority::has_authenticated_provenance(cert, sources.announced.peek(subject))
+            || local_issued(cert)
+        {
+            push(cert.clone());
+        }
+    }
+    if let Some(cert) = sources
+        .evidence
+        .and_then(|runtime| runtime.usable_certificate(*subject, dm_capability::now_unix_ms()))
+    {
+        push(cert);
+    }
+    for cert in sources.journal {
+        if cert.agent_id().is_ok_and(|agent| agent == *subject) && local_issued(cert) {
+            push(cert.clone());
+        }
+    }
+    certs
+}
+
+/// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
 fn collect_subject_certs(
-    cache: &std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
-) -> std::collections::HashMap<identity::AgentId, identity::AgentCertificate> {
-    cache
-        .values()
-        .filter_map(|a| {
-            a.agent_certificate
-                .as_ref()
-                .map(|c| (a.agent_id, c.clone()))
-        })
+    sources: &ProvenanceSources<'_>,
+    subjects: impl IntoIterator<Item = identity::AgentId>,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    subjects
+        .into_iter()
+        .map(|subject| (subject, subject_certs_with_provenance(sources, &subject)))
+        .filter(|(_, certs)| !certs.is_empty())
+        .collect()
+}
+
+/// The provenance certificate that can authorize `record`: one owned by
+/// the record's issuer, else any (which `verify_authority` then rejects).
+fn pick_subject_cert<'a>(
+    certs: Option<&'a Vec<identity::AgentCertificate>>,
+    record: &revocation::RevocationRecord,
+) -> Option<&'a identity::AgentCertificate> {
+    let certs = certs?;
+    let issuer = record.issuer_user_id();
+    certs
+        .iter()
+        .find(|cert| issuer.is_some() && cert.user_id().ok() == issuer)
+        .or_else(|| certs.first())
+}
+
+/// The certificates of the local certificate journal (ADR 0115 §3).
+async fn load_journal_certs(path: Option<&std::path::Path>) -> Vec<identity::AgentCertificate> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    profile::IssuedCertRecord::load(path)
+        .await
+        .iter()
+        .filter_map(decode_journal_cert)
         .collect()
 }
 
@@ -2562,6 +3029,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
     blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
@@ -2583,8 +3051,15 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
-        let mut cache = cache.write().await;
-        if let Some(entry) = cache.get_mut(agent_id) {
+        // x0x #1150 (r7g): the announced-binding store is taken FIRST and
+        // held until the binding carries the landed expiry, so no pinned
+        // reader (the resolver waits, the seam's try_read refuses) sees the
+        // binding while discovery publishes the certificate without its
+        // expiry. Lock order: the announced-binding store, then discovery.
+        // No path takes them the other way round.
+        let mut store = announced.write().await;
+        let mut discovery = cache.write().await;
+        if let Some(entry) = discovery.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
             // must still commit to the digest this fetch resolved. Between
             // the fetch being triggered and landing, a newer announce can
@@ -2598,9 +3073,7 @@ async fn patch_discovery_entry_when_blob_lands(
                     current_digest = ?entry.cert_digest.map(hex::encode),
                     "announce blob landed for a superseded digest; not patching (#447 r2)"
                 );
-                return;
-            }
-            if entry.agent_certificate.is_none() {
+            } else if entry.agent_certificate.is_none() {
                 entry.user_id = blob.user_id;
                 entry.cert_not_after = cert.not_after();
                 entry.agent_certificate = Some(cert.clone());
@@ -2613,6 +3086,20 @@ async fn patch_discovery_entry_when_blob_lands(
                 publish_verified_certificate(cert_events, *agent_id, cert);
             }
         }
+        drop(discovery);
+        #[cfg(test)]
+        announced_record_barrier::park(agent_id, announced_record_barrier::HYDRATION_PUBLISH).await;
+        // x0x #1150 (r7d-r7g): still under the store lock taken above, the
+        // binding whose announcement committed to THIS digest learns the
+        // landed expiry. The update is keyed on the digest, whatever the
+        // discovery entry's state. Ingest registers its binding (and digest)
+        // in the store BEFORE it publishes its discovery merge
+        // (`cache_verified_announcement`). So if this hydration patched the
+        // discovery entry, the binding with this digest already existed and
+        // is updated here, before the store lock is released. Nothing
+        // depends on the blob surviving for a later lookup.
+        store.record_certificate_landed(agent_id, *digest, cert.not_after());
+        drop(store);
         return;
     }
 }
@@ -2758,6 +3245,228 @@ async fn upsert_discovered_machine(
 /// failing reconnect attempts.
 fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
     !address.ip().is_unspecified() && address.port() != 0
+}
+
+/// x0x #1150 (r7c, r7d, r7e): record a verified identity announcement's
+/// agent→machine binding in the announced-binding store, apart from the
+/// discovery cache's mutable routing `machine_id`. Only a signed, non-zero
+/// machine is recorded, and an older announcement never rolls a binding
+/// back.
+///
+/// The store keeps the certificate expiry coupled to the digest the
+/// announcement committed to
+/// ([`dm_inbox::AuthenticatedMachineBindingCache::record_announcement`]),
+/// whether or not the discovery entry survives. The write runs under the
+/// store's write lock, which also serialises it with blob hydration's
+/// conditional update ([`patch_discovery_entry_when_blob_lands`]). Ingest
+/// runs it BEFORE publishing its discovery merge, and hydration updates
+/// the store AFTER patching discovery, so a landed certificate's expiry
+/// always reaches the binding (r7f). As a best-effort extra (nothing
+/// depends on it), a certificate-less announcement also takes the expiry
+/// of a verified blob for its digest that is still cached.
+async fn record_announced_machine_binding(
+    bindings: &dm_inbox::AuthenticatedMachineBindings,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    announced_at: u64,
+    cert_digest: Option<[u8; 32]>,
+    inline_not_after: Option<u64>,
+) {
+    if machine_id.0 == [0u8; 32] {
+        return;
+    }
+    let mut store = bindings.write().await;
+    let landed_not_after = match (inline_not_after, cert_digest, blob_cache) {
+        (None, Some(digest), Some(blob_cache)) => blob_cache.get(&digest).await.and_then(|blob| {
+            blob.agent_certificate
+                .as_ref()
+                .filter(|cert| {
+                    cert.agent_id().is_ok_and(|id| id == agent_id)
+                        && cert.user_id().ok() == blob.user_id
+                })
+                .and_then(identity::AgentCertificate::not_after)
+        }),
+        _ => None,
+    };
+    store.record_announcement(
+        agent_id,
+        machine_id,
+        announced_at,
+        cert_digest,
+        inline_not_after.or(landed_not_after),
+    );
+}
+
+/// x0x #1150 (r7e, r7f, r7g): test-only barriers keyed by (agent, point).
+/// The points are `INGEST_BETWEEN_WRITES` (between an ingest's
+/// announced-binding store registration and its discovery merge) and
+/// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
+/// before the binding's expiry update). Unarmed points pass straight
+/// through.
+/// x0x #1207 (test builds): a barrier at the entry of the general path's
+/// cold-recipient wait, keyed by (sender, recipient), so a test can inject
+/// the recipient's binding only after the send has entered the wait. An
+/// optional payload length selects one send among others to the same
+/// recipient. `reached` counts arrivals; `release` (closed) lets every
+/// current and future arrival through. Other sends pass straight through.
+#[cfg(test)]
+pub(crate) mod general_cold_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        bytes: Option<usize>,
+    }
+
+    impl Gate {
+        /// Let every current and future arrival through.
+        pub(crate) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type Key = (crate::identity::AgentId, crate::identity::AgentId);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        sender: crate::identity::AgentId,
+        recipient: crate::identity::AgentId,
+        payload_len: Option<usize>,
+    ) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            bytes: payload_len,
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((sender, recipient), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(sender: crate::identity::AgentId, recipient: crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            if let Some(gate) = gates.remove(&(sender, recipient)) {
+                gate.release();
+            }
+        }
+    }
+
+    pub(crate) async fn park(
+        sender: &crate::identity::AgentId,
+        recipient: &crate::identity::AgentId,
+        bytes: usize,
+    ) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
+            .filter(|gate| gate.bytes.is_none_or(|selected| selected == bytes));
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod announced_record_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
+    pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
+
+    pub(crate) struct Gate {
+        /// One permit each time a task parks here.
+        pub(crate) reached: tokio::sync::Semaphore,
+        /// One permit releases one parked task.
+        pub(crate) release: tokio::sync::Semaphore,
+    }
+
+    type Key = (crate::identity::AgentId, &'static str);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(agent: crate::identity::AgentId, point: &'static str) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((agent, point), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(agent: &crate::identity::AgentId, point: &'static str) {
+        if let Ok(mut gates) = GATES.lock() {
+            gates.remove(&(*agent, point));
+        }
+    }
+
+    pub(crate) async fn park(agent: &crate::identity::AgentId, point: &'static str) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*agent, point)).cloned());
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
+/// The identity listener's cache step for one announcement that passed its
+/// signature, timestamp, trust, revocation, pairing and freshness gates:
+/// the machine cache, the announced-binding store (x0x #1150 r7c) and the
+/// discovery cache.
+async fn cache_verified_announcement(
+    machine_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
+    discovered_agent: DiscoveredAgent,
+) {
+    upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
+    let (agent_id, machine_id, announced_at, cert_digest, inline_not_after) = (
+        discovered_agent.agent_id,
+        discovered_agent.machine_id,
+        discovered_agent.announced_at,
+        discovered_agent.cert_digest,
+        discovered_agent.cert_not_after,
+    );
+    // x0x #1150 (r7f): the store registration (binding and digest) comes
+    // BEFORE the discovery merge is published, so a blob hydration that
+    // patches the merged entry always finds the matching binding
+    // (`patch_discovery_entry_when_blob_lands`).
+    record_announced_machine_binding(
+        announced,
+        blob_cache,
+        agent_id,
+        machine_id,
+        announced_at,
+        cert_digest,
+        inline_not_after,
+    )
+    .await;
+    #[cfg(test)]
+    announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
+        .await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -3625,7 +4334,8 @@ impl HeartbeatContext {
         //    July testnet records die here).
         // 2. Publish the full set only when the change_generation advanced
         //    since our last broadcast (a record was inserted or expired).
-        // 3. Every 12th heartbeat (300 s × 12 = 1 h), republish regardless
+        // 3. Every 12th heartbeat (12 × 600 s = 2 h at the default
+        //    IDENTITY_HEARTBEAT_INTERVAL_SECS), republish regardless
         //    — the partition-tolerance fallback for nodes that joined or
         //    recovered mid-partition.
         //
@@ -3806,7 +4516,7 @@ pub(crate) async fn ingest_share_grant_revocations(
             {
                 continue;
             }
-            match set.verify_and_insert(record, None) {
+            match set.verify_and_insert_at(record, None, Agent::unix_timestamp_secs()) {
                 Ok(true) => inserted = true,
                 Ok(false) => {}
                 Err(e) => tracing::debug!("v3 share-grant revocation rejected: {e}"),
@@ -3827,7 +4537,9 @@ pub(crate) async fn persist_share_grant_revocations(
     identity_dir: Option<&std::path::Path>,
 ) {
     if let Err(e) = persist_share_grant_revocations_durable(revocation_set, identity_dir).await {
-        tracing::warn!("revocations-v3 persist failed: {e}");
+        if !storage::revocation_persistence_is_blocked(&e) {
+            tracing::warn!("revocations-v3 persist failed: {e}");
+        }
     }
 }
 
@@ -3857,18 +4569,16 @@ const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
 pub(crate) async fn persist_share_grant_revocations_durable(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
-) -> std::result::Result<(), String> {
+) -> error::Result<()> {
     let Some(dir) = identity_dir
         .map(std::path::Path::to_path_buf)
         .or_else(storage::x0x_home_dir)
     else {
         return Ok(());
     };
-    let live = revocation_set
-        .read()
-        .await
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let live = revocation_set.read().await.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
     let _in_process = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
     merge_write_share_grant_revocations(
         &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
@@ -3904,15 +4614,18 @@ pub(crate) async fn merge_write_share_grant_revocations<A, AF>(
     now_unix: u64,
     on_contended: impl Fn(),
     after_read: A,
-) -> std::result::Result<(), String>
+) -> error::Result<()>
 where
     A: FnOnce() -> AF,
     AF: std::future::Future<Output = ()>,
 {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "revocations-v3 dir {}: {e}",
+                parent.display()
+            )))
+        })?;
     }
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -3923,28 +4636,26 @@ where
         on_contended,
     )
     .await
-    .map_err(|e| format!("revocations-v3 lock: {e}"))?;
-    let mut merged = match tokio::fs::read(path).await {
-        Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
-            revocation::RevocationSet::new()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
-        Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
-    };
+    .map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 lock: {e}")))
+    })?;
+    let (disk, guard) =
+        storage::read_revocation_store_for_write(path, storage::RevocationStore::V3).await?;
+    let mut merged = disk.unwrap_or_default();
     after_read().await;
-    let live = revocation::RevocationSet::from_bytes_v3(live_v3)
-        .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    let live = revocation::RevocationSet::from_bytes_v3(live_v3).map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!(
+            "revocations-v3 re-decode: {e}"
+        )))
+    })?;
     merged.merge_v3(live);
     if now_unix != 0 {
         merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
     }
-    let bytes = merged
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    storage::write_private_bytes_durable(path, bytes)
-        .await
-        .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
+    let bytes = merged.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
+    storage::write_revocation_bytes_durable(bytes, guard).await
 }
 
 struct RawDirectDelivery {
@@ -5177,7 +5888,20 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
-        let outcome = self.connect_to_agent_inner(agent_id).await?;
+        self.connect_to_agent_with(agent_id, ColdResolution::Off)
+            .await
+    }
+
+    /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
+    /// is `cold` (x0x #1207). An opted-in send never takes a blocking
+    /// peer-evidence check or runs a Lookup on itself
+    /// ([`Self::connect_from_evidence_with`]); `Off` is today's connector.
+    async fn connect_to_agent_with(
+        &self,
+        agent_id: &identity::AgentId,
+        cold: ColdResolution,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self.connect_to_agent_inner(agent_id, cold).await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
         }
@@ -5186,17 +5910,39 @@ impl Agent {
 
     /// Dial from a freshly checked evidence view, without creating any agent
     /// binding or discovery entry. ant-quic authenticates the expected machine.
-    async fn connect_from_evidence(
+    ///
+    /// `cold` is the sending side's cold-recipient handling (x0x #1207;
+    /// `Off` for every ordinary caller). An opted-in send never waits on the
+    /// evidence load barrier, never takes a blocking point-of-use check
+    /// (contention: no dial), and never runs a Lookup on itself: the
+    /// Lookup's responder selection blocks synchronously. An opted-in send
+    /// starts the Lookup in the background.
+    async fn connect_from_evidence_with(
         &self,
         agent: identity::AgentId,
+        cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
-        if !self.peer_evidence().wait(0).await {
-            return None;
+        let nonblocking = cold.opted_in();
+        if nonblocking {
+            if !self.peer_evidence().ready_now() {
+                return None;
+            }
+            self.peer_evidence().spawn_agent_lookup(agent);
+        } else {
+            if !self.peer_evidence().wait(0).await {
+                return None;
+            }
+            self.peer_evidence().lookup(agent, None).await;
         }
-        self.peer_evidence().lookup(agent, None).await;
-        let view = self
-            .peer_evidence()
-            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        let view = if nonblocking {
+            self.peer_evidence()
+                .try_usable_agent(agent, now)
+                .ok()
+                .flatten()
+        } else {
+            self.peer_evidence().usable_agent(agent, now)
+        }?;
         let machine = view.announcement.machine_id;
         if self
             .recipient_pairing_denied(&agent, &machine)
@@ -5219,8 +5965,15 @@ impl Agent {
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
-        self.peer_evidence()
-            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        let now = dm_capability::now_unix_ms();
+        if nonblocking {
+            self.peer_evidence()
+                .try_usable(agent, machine, now)
+                .ok()
+                .flatten()?;
+        } else {
+            self.peer_evidence().usable(agent, machine, now)?;
+        }
         Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
                 connectivity::ConnectOutcome::Direct(addr)
@@ -5229,10 +5982,48 @@ impl Agent {
         })
     }
 
+    /// ADR 0115 §2: a dial result becomes routing state only
+    /// when an authority store confirms that `agent_id` lives on the machine
+    /// that answered. Otherwise the connection serves this call as an
+    /// unverified hint: the discovery entry keeps its machine and the DM
+    /// registry learns nothing, so no binding is ever manufactured from an
+    /// address (for example a rendezvous summary).
+    async fn record_dialed_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: identity::MachineId,
+        nonblocking_evidence: bool,
+    ) {
+        if !self
+            .authority_confirms_with(agent_id, &machine_id, nonblocking_evidence)
+            .await
+        {
+            tracing::debug!(
+                target: "x0x::connect",
+                agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                "dialed machine has no authority record; not binding it (ADR 0115 §2)"
+            );
+            return;
+        }
+        {
+            let mut cache = self.identity_discovery_cache.write().await;
+            if let Some(entry) = cache.get_mut(agent_id) {
+                entry.machine_id = machine_id;
+            }
+        }
+        self.direct_messaging
+            .mark_connected(*agent_id, machine_id)
+            .await;
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
+        cold: ColdResolution,
     ) -> error::Result<connectivity::ConnectOutcome> {
+        // x0x #1207: an opted-in send never takes a blocking evidence check.
+        let nonblocking_evidence = cold.opted_in();
         let call_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         tracing::debug!(
@@ -5253,14 +6044,24 @@ impl Agent {
         if discovered
             .as_ref()
             .is_some_and(|entry| entry.addresses.is_empty())
-            && self.peer_evidence().wait(0).await
+            && if nonblocking_evidence {
+                self.peer_evidence().ready_now()
+            } else {
+                self.peer_evidence().wait(0).await
+            }
         {
             if let Some(entry) = discovered.as_mut() {
-                if let Some(view) = self.peer_evidence().usable(
-                    *agent_id,
-                    entry.machine_id,
-                    dm_capability::now_unix_ms(),
-                ) {
+                let now = dm_capability::now_unix_ms();
+                let view = if nonblocking_evidence {
+                    self.peer_evidence()
+                        .try_usable(*agent_id, entry.machine_id, now)
+                        .ok()
+                        .flatten()
+                } else {
+                    self.peer_evidence()
+                        .usable(*agent_id, entry.machine_id, now)
+                };
+                if let Some(view) = view {
                     let local_scope = self
                         .network
                         .as_ref()
@@ -5276,7 +6077,7 @@ impl Agent {
         let agent = match discovered {
             Some(a) => a,
             None => {
-                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                if let Some(outcome) = self.connect_from_evidence_with(*agent_id, cold).await {
                     return Ok(outcome);
                 }
 
@@ -5359,14 +6160,7 @@ impl Agent {
             }
         };
         if let Some(machine_id) = connected_machine_id {
-            if machine_id != agent.machine_id {
-                let mut cache = self.identity_discovery_cache.write().await;
-                if let Some(entry) = cache.get_mut(agent_id) {
-                    entry.machine_id = machine_id;
-                }
-            }
-            self.direct_messaging
-                .mark_connected(agent.agent_id, machine_id)
+            self.record_dialed_machine(agent_id, machine_id, nonblocking_evidence)
                 .await;
             let dur_ms = call_start.elapsed().as_millis() as u64;
             return if let Some(addr) = info.addresses.first() {
@@ -5437,14 +6231,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![selected_addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -5500,14 +6287,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -5562,14 +6342,7 @@ impl Agent {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
                                 .await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         tracing::info!(
                             target: "x0x::connect",
@@ -5634,14 +6407,7 @@ impl Agent {
                             .await;
                         bc.record_success(&verified_peer_id, 0).await;
                     }
-                    {
-                        let mut cache = self.identity_discovery_cache.write().await;
-                        if let Some(entry) = cache.get_mut(agent_id) {
-                            entry.machine_id = verified_machine_id;
-                        }
-                    }
-                    self.direct_messaging
-                        .mark_connected(agent.agent_id, verified_machine_id)
+                    self.record_dialed_machine(agent_id, verified_machine_id, nonblocking_evidence)
                         .await;
                     let family = if addr.is_ipv4() { "v4" } else { "v6" };
                     tracing::info!(
@@ -5721,15 +6487,8 @@ impl Agent {
                                 .await;
                         }
                         // Update discovery cache with real machine_id
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = real_machine_id;
-                            }
-                        }
                         // Register agent mapping for direct messaging
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, real_machine_id)
+                        self.record_dialed_machine(agent_id, real_machine_id, nonblocking_evidence)
                             .await;
                         let family = if addr.is_ipv4() { "v4" } else { "v6" };
                         tracing::info!(
@@ -5854,12 +6613,6 @@ impl Agent {
                                 .await;
                             bc.record_success(&verified_peer_id, 0).await;
                         }
-                        {
-                            let mut cache = self.identity_discovery_cache.write().await;
-                            if let Some(entry) = cache.get_mut(agent_id) {
-                                entry.machine_id = verified_machine_id;
-                            }
-                        }
                     }
 
                     // Only register for direct messaging and update caches when the hint
@@ -5869,9 +6622,12 @@ impl Agent {
                     // agent_id could corrupt the direct-messaging registry with the
                     // wrong peer's identity.
                     if !hint_was_zeroed {
-                        self.direct_messaging
-                            .mark_connected(agent.agent_id, verified_machine_id)
-                            .await;
+                        self.record_dialed_machine(
+                            agent_id,
+                            verified_machine_id,
+                            nonblocking_evidence,
+                        )
+                        .await;
                     }
                     let family = if addr.is_ipv4() { "v4" } else { "v6" };
                     tracing::info!(
@@ -6303,7 +7059,7 @@ impl Agent {
     /// teardown. Returns without spawning once the registry is `closed` (i.e.
     /// `shutdown()` has begun) — this is what closes the join_network race:
     /// a listener requested after shutdown started must never run.
-    fn spawn_tracked<F>(&self, fut: F)
+    pub(crate) fn spawn_tracked<F>(&self, fut: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -6317,6 +7073,12 @@ impl Agent {
             return;
         }
         guard.handles.push(tokio::spawn(fut));
+    }
+
+    /// The token `begin_shutdown`/`shutdown` cancel first. Crate tasks that
+    /// hold resources across awaits select on it so they stop promptly.
+    pub(crate) fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
     }
 
     /// Begin shutdown WITHOUT tearing anything down yet: cancel the shutdown
@@ -6398,16 +7160,21 @@ impl Agent {
         self.stop_discovery_cache_reaper().await;
 
         // 2b. Drain and stop the ADR-0023 history writer (bounded grace,
-        // then abandon-with-count — never abort mid-batch).
-        {
+        // then abandon-with-count — never abort mid-batch). A writer still
+        // in SQLite is an incomplete shutdown. A later call has already
+        // taken the service, so it reads the same flag and still fails.
+        let history_writer_unfinished = {
             let service = {
                 let mut guard = self.history_service.lock().await;
                 guard.take()
             };
             if let Some(service) = service {
-                service.shutdown().await;
+                !service.shutdown().await
+            } else {
+                self.history()
+                    .is_some_and(history::HistoryHandle::writer_shutdown_incomplete)
             }
-        }
+        };
 
         // 3. Stop the DM inbox and the capability advert service (current gaps:
         //    neither was stopped by shutdown() before). Both abort their own
@@ -6532,6 +7299,10 @@ impl Agent {
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
         let mut shutdown_errors = Vec::new();
+        if history_writer_unfinished {
+            shutdown_errors
+                .push("history writer still owns the store after the shutdown grace".to_string());
+        }
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
@@ -6830,6 +7601,36 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None)
+            .await
+    }
+
+    /// Owner removal notices may wait for a verified cold recipient (#1217).
+    /// Call only from one spawned delivery per recipient, holding no lock.
+    /// The budget starts at raw resolution and bounds its reads and cold
+    /// repair. Preflight and the existing transport ACK budget are separate.
+    pub(crate) async fn send_direct_with_config_cold_wait(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// The single DM egress funnel with its ADR-0023 history wiring;
+    /// `cold_wait` is `None` (not opted in) for every caller except the
+    /// crate-internal opt-in above.
+    async fn send_direct_with_history(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -6844,7 +7645,7 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -6897,6 +7698,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -7216,7 +8018,9 @@ impl Agent {
         }
 
         if cap_source == "peer_evidence" {
-            let _ = self.connect_from_evidence(*to).await;
+            let _ = self
+                .connect_from_evidence_with(*to, ColdResolution::Off)
+                .await;
             let still_usable = cap_machine.and_then(|m| {
                 self.peer_evidence()
                     .usable(*to, m, dm_capability::now_unix_ms())
@@ -7230,6 +8034,12 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
+        // x0x #1207, #1217: `cold_wait` is the OPT-IN handling of a
+        // restart-cold recipient (`send_direct_with_config_cold_wait`;
+        // `None` for every other caller: today's instant failure). It
+        // applies only where raw QUIC is the path that delivers (no
+        // gossip-inbox capability), so a gossip-capable send still falls
+        // back to gossip at once, as before.
         // The raw-QUIC path returns a transport receipt, never an application
         // ACK, so it can never satisfy a strict send.
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
@@ -7242,6 +8052,7 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    if gossip_ok { None } else { cold_wait },
                 )
                 .await
             {
@@ -7324,6 +8135,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        cold_wait,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -7544,31 +8356,67 @@ impl Agent {
     /// repair. Discovery can lag the direct-messaging registry during a
     /// machine transition, so prefer whichever mapping ant-quic reports as
     /// connected and reconcile the discovery entry when the registry wins.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`), every read here ends at
+    /// its resolution deadline (a read still waiting there finds no machine)
+    /// and the evidence check never blocks.
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        let cached_machine_id = {
-            let cache = self.identity_discovery_cache.read().await;
-            cache
-                .get(agent_id)
-                .map(|entry| entry.machine_id)
-                .filter(|machine_id| machine_id.0 != [0_u8; 32])
-        };
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "redial discovery", async {
+            let routing = {
+                let cache = self.identity_discovery_cache.read().await;
+                cache
+                    .get(agent_id)
+                    .map(|entry| entry.machine_id)
+                    .filter(|machine_id| machine_id.0 != [0_u8; 32])
+            };
+            // ADR 0115 §2: a route counts only when an
+            // authority store confirms it.
+            self.authorized_routing_machine_with(agent_id, routing, cold.opted_in())
+                .await
+        })
+        .await
+        .ok()?;
         if let Some(machine_id) = cached_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 return Some(machine_id);
             }
         }
 
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "redial registry",
+            self.authorized_registry_machine(agent_id, cold.opted_in()),
+        )
+        .await
+        .ok()?;
         if let Some(machine_id) = registry_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 if cached_machine_id != Some(machine_id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = machine_id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = machine_id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 return Some(machine_id);
@@ -7576,11 +8424,17 @@ impl Agent {
         }
 
         if cached_machine_id.is_none() && registry_machine_id.is_none() {
-            if let Some(view) = self
-                .peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-            {
-                if network
+            let now = dm_capability::now_unix_ms();
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            if let Some(view) = view {
+                if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
                 {
@@ -7594,12 +8448,18 @@ impl Agent {
     /// Re-run the complete identity-discovery dial after the narrow
     /// bootstrap-cache repair path fails. A fresh presence card can contain
     /// usable addresses even when no cached transport route exists.
+    ///
+    /// x0x #1207 (P2): for an opted-in send (`cold`) the dial's evidence
+    /// checks are the non-blocking ones and the resolution reads that follow
+    /// end at its deadline ([`Self::connected_direct_machine`]). The dial
+    /// itself is transport, with its own per-address timeouts.
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
+        cold: ColdResolution,
     ) -> Option<identity::MachineId> {
-        if let Err(error) = self.connect_to_agent(agent_id).await {
+        if let Err(error) = self.connect_to_agent_with(agent_id, cold).await {
             tracing::debug!(
                 target: "x0x::direct",
                 stage = "send",
@@ -7610,7 +8470,8 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, network).await
+        self.connected_direct_machine(agent_id, transport, cold)
+            .await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -7686,67 +8547,875 @@ impl Agent {
         }
     }
 
-    async fn send_direct_raw_quic(
+    /// x0x #1150 (ADR 0107; lifecycle note section 2.7): send one
+    /// recovery-response frame to `to` in ONE physical exchange on x0x's
+    /// own raw-QUIC path. It never uses the gossip inbox or a relay, never
+    /// waits for an ACK-v2 receive acknowledgement (whose internal retry
+    /// and the X0X-0053 reissue would write again without admission), and
+    /// never retries: the caller's protocol owns every resend, and each one
+    /// runs both admission phases again.
+    ///
+    /// The recipient's machine comes from a verified binding only (see
+    /// [`Self::await_pinned_recipient_binding`]). When none names it yet, as
+    /// on a daemon that has just restarted, the send waits up to
+    /// `resolve_within` for one to learn it, holding no lock, then fails
+    /// with the typed, retryable [`dm::DmError::RecipientUndiscovered`]
+    /// before any admission runs (g10-1190a). The write goes only to the
+    /// machine that binding names: repair and redial cannot move it, and the
+    /// binding is re-checked after repair and at the seam (r7b,
+    /// [`Self::resolve_pinned_target`]).
+    ///
+    /// `admission` runs in two phases. Its async pre-phase runs after
+    /// machine resolution, repair or redial and the B/P pairing checks; it
+    /// is advisory and returns the synchronous seam check bound to its
+    /// snapshot. The seam check runs once inside ant-quic's
+    /// `send_on_generation_with_admission`, after `open_uni` and
+    /// immediately before `write_all`, together with this agent's own
+    /// agent, machine and pairing revocation checks. Any refusal, or lock
+    /// contention at the seam, writes nothing. The caller bounds the whole
+    /// call with its exchange deadline, and `resolve_within` must leave
+    /// part of that deadline for the exchange itself.
+    pub(crate) async fn send_direct_pinned_admitted(
         &self,
-        agent_id: &identity::AgentId,
+        to: &identity::AgentId,
         payload: &[u8],
-        receive_ack_timeout: Option<std::time::Duration>,
-        prefer_newest_grace: std::time::Duration,
-    ) -> error::NetworkResult<dm::DmPath> {
-        let send_start = std::time::Instant::now();
-        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
-        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
-        let bytes = payload.len();
-        let digest = direct::dm_payload_digest_hex(payload);
-        let target_path_label = if receive_ack_timeout.is_some() {
-            "raw_quic_acked"
-        } else {
-            "raw_quic"
-        };
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "a pinned recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        // G14: a logical DM send like any other. No phi "likely offline"
+        // short-circuit: these sends answer the recipient's own fetch, and a
+        // stale suspicion must not suppress the recovery.
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_pinned_admitted_inner(to, payload, admission, resolve_within)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::RawQuic),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
 
-        let network = self.network.as_ref().ok_or_else(|| {
+    async fn send_direct_pinned_admitted_inner(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if self.network.is_none() {
+            return self
+                .pinned_admission_standin(to, admission, resolve_within)
+                .await;
+        }
+        let send_start = std::time::Instant::now();
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        // g10-1190a, r7b: a verified binding names the machine (bounded),
+        // and the target stays on the machine that binding names.
+        let deadline = tokio::time::Instant::now() + resolve_within;
+        let binding = self.await_pinned_recipient_binding(to, deadline).await?;
+        let target = self
+            .resolve_pinned_target(
+                to,
+                binding,
+                &RawQuicTransport::Network(network),
+                send_start,
+                deadline,
+            )
+            .await?;
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, target.machine_id, true, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
+            .send_direct_pinned(
+                &target.ant_peer_id,
+                &self.identity.agent_id().0,
+                payload,
+                seam,
+            )
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "pinned_exchange_written",
+            recipient = %hex::encode(to.as_bytes()),
+            machine_prefix = %crate::logging::LogHexId::new("machine", &target.machine_prefix),
+            resolution = target.resolution,
+            bytes = payload.len(),
+            dur_ms = send_start.elapsed().as_millis() as u64,
+        );
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic))
+    }
+
+    /// The seam check for a pinned send to `(agent, machine)`: this agent's
+    /// own revocation (agent AND resolved machine) and ADR-0043 B/P pairing
+    /// checks, then (with `check_binding`, r7b) that the recipient's verified
+    /// binding still names `machine`, then the caller's. Synchronous;
+    /// contention refuses.
+    fn pinned_admission_seam(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        check_binding: bool,
+        caller: dm::SeamAdmission,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let revocation = std::sync::Arc::clone(&self.revocation_set);
+        let moves = std::sync::Arc::clone(&self.move_state);
+        let binding = check_binding.then(|| self.pinned_binding_seam_check(agent, machine));
+        move || {
+            let admitted = {
+                let Ok(revoked) = revocation.try_read() else {
+                    return false;
+                };
+                if revoked.is_agent_revoked(&agent) || revoked.is_machine_revoked(&machine) {
+                    return false;
+                }
+                let Ok(placements) = moves.try_read() else {
+                    return false;
+                };
+                key_move::enforce_pairing(&revoked, placements.placement_view(), &agent, &machine)
+                    .is_none()
+            };
+            admitted && binding.is_none_or(|still_names| still_names()) && caller()
+        }
+    }
+
+    /// In-process stand-in for the pinned transport (an agent built
+    /// without a network): resolve the machine the way the real path's
+    /// lookups would (no connect), run both admission phases exactly where
+    /// the transport runs them, and report the outcome through a marker
+    /// error. Test builds only.
+    #[cfg(test)]
+    async fn pinned_admission_standin(
+        &self,
+        to: &identity::AgentId,
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let strict = pinned_standin_is_strict(&self.identity.agent_id());
+        let machine = if strict {
+            // The real path's resolution and target selection (repair,
+            // redial, binding and B/P checks), shared code, over a scripted
+            // transport (r7b).
+            let deadline = tokio::time::Instant::now() + resolve_within;
+            let binding = self.await_pinned_recipient_binding(to, deadline).await?;
+            let transport =
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+            let target = self
+                .resolve_pinned_target(to, binding, &transport, std::time::Instant::now(), deadline)
+                .await?;
+            Some(target.machine_id)
+        } else {
+            let cached = self
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(to)
+                .map(|d| d.machine_id)
+                .filter(|m| m.0 != [0u8; 32]);
+            match cached {
+                Some(machine) => Some(machine),
+                None => self.direct_messaging.get_machine_id(to).await,
+            }
+        };
+        let refused = || {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ))
+        };
+        if let Some(machine) = machine {
+            if self.recipient_pairing_denied(to, &machine).await.is_some() {
+                return refused();
+            }
+        }
+        let Some(seam) = admission().await else {
+            return refused();
+        };
+        let admitted = match machine {
+            Some(machine) => self.pinned_admission_seam(*to, machine, strict, seam)(),
+            None => {
+                let agent_clear = self
+                    .revocation_set
+                    .try_read()
+                    .is_ok_and(|revoked| !revoked.is_agent_revoked(to));
+                agent_clear && seam()
+            }
+        };
+        if admitted {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_STANDIN_ADMITTED.to_string(),
+            ))
+        } else {
+            refused()
+        }
+    }
+
+    /// Test seam (x0x #1150, g10-1190a): make this agent's in-process
+    /// pinned stand-in resolve the recipient's machine as the real path
+    /// does, and fail where the real path fails, instead of admitting an
+    /// unresolved recipient on its agent alone. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn set_pinned_standin_strict_resolution_for_testing(&self, strict: bool) {
+        if let Ok(mut agents) = PINNED_STANDIN_STRICT.lock() {
+            if strict {
+                agents.insert(self.identity.agent_id());
+            } else {
+                agents.remove(&self.identity.agent_id());
+            }
+        }
+    }
+
+    /// Test seam (x0x #1150, r7h): whether this agent's pinned stand-in is
+    /// strict. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn pinned_standin_strict_for_testing(&self) -> bool {
+        pinned_standin_is_strict(&self.identity.agent_id())
+    }
+
+    /// Test seam (x0x #1150, r7b): the transport the strict stand-in's
+    /// target selection sees (connection state, repair, redial). Without a
+    /// script every machine reports connected. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn script_pinned_standin_transport_for_testing(
+        &self,
+        script: PinnedTransportScript,
+    ) {
+        if let Ok(mut scripts) = PINNED_STANDIN_TRANSPORT.lock() {
+            scripts.insert(self.identity.agent_id(), std::sync::Arc::new(script));
+        }
+    }
+
+    /// x0x #1150 (g10-1190a, r7b, r7c): the pinned recipient's binding from
+    /// ONE read of its verified sources, under [`select_pinned_binding`]'s
+    /// rule. Each source is read where it is used and copied nowhere. The
+    /// stores are async locks the caller bounds; the peer-evidence check is
+    /// the non-blocking one, so a contended store or policy reads as unknown.
+    async fn pinned_binding_now(&self, to: &identity::AgentId) -> Option<PinnedBinding> {
+        let announced = self.announced_machine_bindings.read().await.peek(to);
+        let attested = self.authenticated_machine_bindings.read().await.peek(to);
+        let now_ms = dm_capability::now_unix_ms();
+        // ADR 0115 §2: the DM registry names the machine only
+        // when an authority store confirms it, never alone.
+        let registry = self
+            .direct_messaging
+            .get_machine_id(to)
+            .await
+            .filter(|machine| {
+                identity_authority::confirms(*machine, announced, attested, || {
+                    self.peer_evidence()
+                        .try_confirms_pairing(*to, *machine, now_ms)
+                        == Some(true)
+                })
+            });
+        select_pinned_binding(
+            announced,
+            attested,
+            registry,
+            || {
+                self.peer_evidence()
+                    .try_usable_agent(*to, now_ms)
+                    .ok()
+                    .flatten()
+                    .map(|view| view.announcement.machine_id)
+            },
+            now_ms / 1000,
+        )
+    }
+
+    /// x0x #1150 (r7c): the typed, retryable refusal of a pinned send whose
+    /// verified-binding sources stayed locked past its resolution bound.
+    fn pinned_bound_expired(stage: &str) -> dm::DmError {
+        dm::DmError::RecipientUndiscovered(format!(
+            "the recipient's binding sources stayed locked past the resolution bound ({stage})"
+        ))
+    }
+
+    /// x0x #1150 (r7c, r7d): `read`, whose lock waits all end at the one
+    /// absolute `deadline` shared by the resolution and every re-check.
+    /// There is no per-check grace. `timeout_at` polls the read before its
+    /// timer, so a read that does not have to wait still completes after the
+    /// deadline. A read that would wait is refused at it.
+    async fn pinned_bounded<T>(
+        deadline: tokio::time::Instant,
+        stage: &str,
+        read: impl std::future::Future<Output = T>,
+    ) -> Result<T, dm::DmError> {
+        tokio::time::timeout_at(deadline, read)
+            .await
+            .map_err(|_| Self::pinned_bound_expired(stage))
+    }
+
+    /// x0x #1150 (ADR 0107, g10-1190a, r7b, r7c): resolve a pinned
+    /// recipient's binding by `deadline`.
+    ///
+    /// A daemon that has just restarted has a cold discovery cache, DM
+    /// registry and peer evidence, and the gossip fallback that used to hide
+    /// that is gone (single admission, no hidden resend). So: read the
+    /// verified sources ([`Self::pinned_binding_now`]). While none names the
+    /// recipient, let the evidence store finish loading, ask once for the
+    /// recipient's relationship evidence (an EvidenceV1 Lookup over
+    /// connected peers), and re-read the sources until one learns the
+    /// recipient (an identity announcement, an attested DM, the Lookup's
+    /// answer). `deadline` is absolute and bounds everything here, including
+    /// each lock wait. [`Self::resolve_pinned_target`] carries the same
+    /// deadline through its re-checks. It holds no lock between reads,
+    /// writes nothing and runs before any admission. An unresolved recipient,
+    /// or one whose sources stay locked past the deadline, is the typed,
+    /// retryable [`dm::DmError::RecipientUndiscovered`]: the caller's own
+    /// protocol resends, and every resend is admitted afresh.
+    async fn await_pinned_recipient_binding(
+        &self,
+        to: &identity::AgentId,
+        deadline: tokio::time::Instant,
+    ) -> Result<PinnedBinding, dm::DmError> {
+        let started = tokio::time::Instant::now();
+        let resolution = async {
+            if let Some(binding) = self.pinned_binding_now(to).await {
+                return Some(binding);
+            }
+            let evidence = self.peer_evidence();
+            let lookup = async {
+                if evidence.wait(0).await {
+                    evidence.lookup(*to, None).await;
+                }
+            };
+            tokio::pin!(lookup);
+            let mut lookup_done = false;
+            loop {
+                tokio::select! {
+                    () = &mut lookup, if !lookup_done => lookup_done = true,
+                    () = tokio::time::sleep(PINNED_RESOLUTION_POLL) => {}
+                    () = self.shutdown_token.cancelled() => return None,
+                }
+                if let Some(binding) = self.pinned_binding_now(to).await {
+                    return Some(binding);
+                }
+            }
+        };
+        let waited_ms = || started.elapsed().as_millis() as u64;
+        match tokio::time::timeout_at(deadline, resolution).await {
+            Ok(Some(binding)) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %network::hex_prefix(&to.0, 4),
+                    source = binding.source.label(),
+                    waited_ms = waited_ms(),
+                    "pinned recipient resolved"
+                );
+                Ok(binding)
+            }
+            Ok(None) | Err(_) => {
+                let waited_ms = waited_ms();
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
+                    outcome = "err_recipient_undiscovered",
+                    waited_ms,
+                    "pinned send: no verified source named the recipient's machine within the bound; the caller resends"
+                );
+                Err(dm::DmError::RecipientUndiscovered(format!(
+                    "no verified machine for the recipient after {waited_ms} ms \
+                     (announcement, authenticated binding, DM registry, peer evidence)"
+                )))
+            }
+        }
+    }
+
+    /// x0x #1150 (r7c): address hints for dialling exactly `machine` for
+    /// `to`: the discovery entry's addresses only while that entry names
+    /// `machine`, and the usable peer-evidence announcement's only while it
+    /// names `machine`. Both reads are non-blocking (contention: no hints from
+    /// that source). Nothing is written.
+    fn pinned_redial_hints(
+        &self,
+        to: &identity::AgentId,
+        machine: identity::MachineId,
+        allow_local_scope: bool,
+    ) -> Vec<std::net::SocketAddr> {
+        let mut hints = Vec::new();
+        if let Ok(cache) = self.identity_discovery_cache.try_read() {
+            if let Some(entry) = cache.get(to).filter(|entry| entry.machine_id == machine) {
+                hints.extend(entry.addresses.iter().copied());
+            }
+        }
+        if let Ok(Some(view)) = self
+            .peer_evidence()
+            .try_usable_agent(*to, dm_capability::now_unix_ms())
+        {
+            if view.announcement.machine_id == machine {
+                hints.extend(view.announcement.addresses.iter().copied());
+            }
+        }
+        filter_discovery_announcement_addrs(hints, allow_local_scope)
+    }
+
+    /// x0x #1150 (r7b, r7c): the connected target for a pinned send to the
+    /// machine `binding` names.
+    ///
+    /// Provenance is kept apart from the diagnostic label. Repair and the
+    /// pinned redial try to connect only THAT machine: the redial dials it
+    /// on hints that name it ([`Self::pinned_redial_hints`]), and it never
+    /// runs the general connector, which reconciles routing state to
+    /// whatever machine is connected. After repair, the binding is re-read
+    /// where it is used ([`Self::pinned_binding_now`], certificate expiry
+    /// included) and must still name that machine. The seam checks it once
+    /// more ([`Self::pinned_admission_seam`]). The ADR-0043 B/P checks run
+    /// before and after. Every lock wait here is bounded by the absolute
+    /// `deadline` of the resolution ([`Self::pinned_bounded`]), and expiry is
+    /// the typed, retryable `RecipientUndiscovered`. The lifecycle-block
+    /// handling is the shared raw path's.
+    async fn resolve_pinned_target(
+        &self,
+        to: &identity::AgentId,
+        binding: PinnedBinding,
+        transport: &RawQuicTransport<'_>,
+        send_start: std::time::Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<RawQuicTarget, dm::DmError> {
+        let agent_prefix = network::hex_prefix(&to.0, 4);
+        let machine_id = binding.machine;
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        let mut resolution = binding.source.label();
+        let pairing_denied = |stage: &'static str| async move {
+            Self::pinned_bounded(
+                deadline,
+                stage,
+                self.recipient_pairing_denied(to, &machine_id),
+            )
+            .await
+        };
+        if let Some(denial) = pairing_denied("pairing").await? {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "drop_pairing",
+                reason = ?denial,
+                "pinned send refused: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::PeerNotVerified { agent_id: to.0 },
+            ));
+        }
+        let mut connected = transport.is_connected(&ant_peer_id).await;
+        let mut repair_outcome: Option<&'static str> = None;
+        if !connected {
+            const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+            let outcome = match tokio::time::timeout(
+                REPAIR_TIMEOUT,
+                transport.ensure_peer_send_ready(&ant_peer_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => "repaired",
+                Ok(Err(_)) => "repair_failed",
+                Err(_) => "repair_timeout",
+            };
+            repair_outcome = Some(outcome);
+            connected = transport.is_connected(&ant_peer_id).await;
+            if !connected && transport.pinned_redial(self, to, machine_id).await {
+                connected = true;
+                resolution = "pinned_redial";
+            }
+        }
+        // r7b/r7c: the binding is re-read where it is used, after any
+        // repair, inside the resolution bound.
+        let current =
+            Self::pinned_bounded(deadline, "revalidation", self.pinned_binding_now(to)).await?;
+        if current.map(|b| b.machine) != Some(machine_id) {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                outcome = "drop_binding_changed",
+                "pinned send: the recipient's verified binding no longer names this machine"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::AgentNotFound(to.0),
+            ));
+        }
+        if let Some(denial) = pairing_denied("pairing after repair").await? {
+            tracing::info!(
+                target: "x0x::direct",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                outcome = "drop_pairing_post_resolution",
+                reason = ?denial,
+                "pinned send refused after repair: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::PeerNotVerified { agent_id: to.0 },
+            ));
+        }
+        if connected {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    resolution,
+                    ?repair_outcome,
+                    reason = %reason,
+                    "ignoring stale lifecycle block because ant-quic reports a live connection"
+                );
+                self.direct_messaging
+                    .record_lifecycle_established(machine_id, None);
+            }
+        } else {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    resolution,
+                    ?repair_outcome,
+                    outcome = "err_peer_disconnected",
+                    reason = %reason,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                    "lifecycle watcher says peer is disconnected"
+                );
+                return Err(Self::map_raw_quic_dm_error(
+                    error::NetworkError::ConnectionFailed(format!("peer disconnected: {reason}")),
+                ));
+            }
             tracing::warn!(
                 target: "x0x::direct",
                 stage = "send",
                 agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                outcome = "err_no_network",
-                "network not initialised"
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                ?repair_outcome,
+                outcome = "err_not_connected",
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "pinned send: the bound machine is not connected after repair"
             );
-            error::NetworkError::NodeCreation("network not initialized".to_string())
-        })?;
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::AgentNotConnected(to.0),
+            ));
+        }
+        Ok(RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        })
+    }
 
+    /// x0x #1150 (r7b, r7c): the seam's binding check: the recipient's
+    /// verified binding, re-selected without blocking
+    /// ([`select_pinned_binding`] over `try_*` reads, and the non-blocking
+    /// evidence check whose policy reads are non-blocking too), still names
+    /// `machine`. Contention refuses.
+    fn pinned_binding_seam_check(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let announced = std::sync::Arc::clone(&self.announced_machine_bindings);
+        let attested = std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let registry = std::sync::Arc::clone(&self.direct_messaging);
+        let evidence = std::sync::Arc::clone(self.peer_evidence());
+        move || {
+            let now_ms = dm_capability::now_unix_ms();
+            let Ok(announced) = announced.try_read() else {
+                return false;
+            };
+            let Ok(attested) = attested.try_read() else {
+                return false;
+            };
+            let Some(registry) = registry.try_machine_id(&agent) else {
+                return false;
+            };
+            let mut evidence_busy = false;
+            let (announced, attested) = (announced.peek(&agent), attested.peek(&agent));
+            // ADR 0115 §2: as `pinned_binding_now`, the
+            // registry counts only when an authority store confirms it.
+            let registry = registry.filter(|machine| {
+                identity_authority::confirms(*machine, announced, attested, || {
+                    match evidence.try_confirms_pairing(agent, *machine, now_ms) {
+                        Some(confirmed) => confirmed,
+                        None => {
+                            evidence_busy = true;
+                            false
+                        }
+                    }
+                })
+            });
+            let selected = select_pinned_binding(
+                announced,
+                attested,
+                registry,
+                || match evidence.try_usable_agent(agent, now_ms) {
+                    Ok(view) => view.map(|view| view.announcement.machine_id),
+                    Err(()) => {
+                        evidence_busy = true;
+                        None
+                    }
+                },
+                now_ms / 1000,
+            );
+            !evidence_busy && selected.is_some_and(|binding| binding.machine == machine)
+        }
+    }
+
+    /// x0x #1207: whether `agent` or `machine` is revoked, read within the
+    /// resolution `deadline` (a held revocation lock past it is
+    /// `AgentNotFound`, the typed retryable outcome).
+    async fn pinned_awaited_binding_revoked(
+        &self,
+        agent: &identity::AgentId,
+        machine: identity::MachineId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<bool> {
+        Self::pinned_bounded(deadline, "revocation", async {
+            let revoked = self.revocation_set.read().await;
+            revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(&machine)
+        })
+        .await
+        .map_err(|_| error::NetworkError::AgentNotFound(agent.0))
+    }
+
+    /// x0x #1207 (P2): `read`, bounded by an opted-in send's ONE resolution
+    /// deadline ([`ColdResolution::Until`]); every other send reads as
+    /// before. A read still waiting at the deadline is `AgentNotFound`, the
+    /// typed, retryable outcome.
+    async fn cold_bounded<T>(
+        cold: ColdResolution,
+        agent_id: &identity::AgentId,
+        stage: &'static str,
+        read: impl std::future::Future<Output = T>,
+    ) -> error::NetworkResult<T> {
+        let Some(deadline) = cold.deadline() else {
+            return Ok(read.await);
+        };
+        match tokio::time::timeout_at(deadline, read).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&agent_id.0, 4)),
+                    read = stage,
+                    outcome = "err_agent_not_found",
+                    "a resolution read was still waiting at the deadline"
+                );
+                Err(error::NetworkError::AgentNotFound(agent_id.0))
+            }
+        }
+    }
+
+    /// Accept a verified cold-recipient binding (#1217). Neither the agent
+    /// nor its machine may be revoked. An evidence binding is dialled within
+    /// the same resolution deadline.
+    async fn accept_cold_binding(
+        &self,
+        agent_id: &identity::AgentId,
+        agent_prefix: &str,
+        binding: PinnedBinding,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<()> {
+        let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+        if self
+            .pinned_awaited_binding_revoked(agent_id, binding.machine, deadline)
+            .await?
+        {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(agent_prefix),
+                outcome = "drop_revoked",
+                "raw-QUIC send refused: the awaited binding names a revoked agent or machine"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
+        if binding.source == PinnedMachineSource::PeerEvidence && cold.opted_in() {
+            let _ =
+                tokio::time::timeout_at(deadline, self.connect_from_evidence_with(*agent_id, cold))
+                    .await;
+        }
+        Ok(())
+    }
+
+    /// Cold removal resolution shares the pinned verified sources, but runs
+    /// Lookup in the background so synchronous evidence locks cannot hold
+    /// this wait past its deadline. No lock survives a source read.
+    async fn await_removal_recipient_binding(
+        &self,
+        to: &identity::AgentId,
+        deadline: tokio::time::Instant,
+    ) -> error::NetworkResult<PinnedBinding> {
+        let started = std::time::Instant::now();
+        let wait = async {
+            if let Some(binding) = self.pinned_binding_now(to).await {
+                return Some(binding);
+            }
+            self.peer_evidence().spawn_agent_lookup(*to);
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(PINNED_RESOLUTION_POLL) => {}
+                    () = self.shutdown_token.cancelled() => return None,
+                }
+                if let Some(binding) = self.pinned_binding_now(to).await {
+                    return Some(binding);
+                }
+            }
+        };
+        let binding = tokio::time::timeout_at(deadline, wait)
+            .await
+            .ok()
+            .flatten()
+            .ok_or(error::NetworkError::AgentNotFound(to.0))?;
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "send",
+            agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
+            source = binding.source.label(),
+            waited_ms = started.elapsed().as_millis() as u64,
+            "removal recipient resolved"
+        );
+        Ok(binding)
+    }
+
+    /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
+    /// discovery cache, DM registry or peer evidence, any send-readiness
+    /// repair or discovery redial, and the ADR-0043 B/P pairing check before
+    /// AND after resolution. Shared by the general raw path and the x0x
+    /// #1150 pinned single-exchange path.
+    ///
+    /// `transport` supplies connection state, repair and redial (r7b). The
+    /// pinned path resolves its target with [`Self::resolve_pinned_target`].
+    /// `cold` is the opted-in handling of a restart-cold recipient (x0x
+    /// #1207, #1217; [`ColdResolution`]).
+    async fn resolve_raw_quic_target(
+        &self,
+        agent_id: &identity::AgentId,
+        transport: &RawQuicTransport<'_>,
+        agent_prefix: &str,
+        bytes: usize,
+        send_start: std::time::Instant,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
         // the direct-messaging registry when an inbound connection is accepted
         // and later reconciled from transport events.
-        let cached_machine_id = {
-            let cache = self.identity_discovery_cache.read().await;
-            cache
-                .get(agent_id)
-                .map(|d| d.machine_id)
-                .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
-        };
-        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        //
+        // x0x #1207 (P2): for an opted-in send, every resolution read below
+        // ends at the one deadline (`cold_bounded`).
+        let cached_machine_id = Self::cold_bounded(cold, agent_id, "discovery", async {
+            let routing = {
+                let cache = self.identity_discovery_cache.read().await;
+                cache
+                    .get(agent_id)
+                    .map(|d| d.machine_id)
+                    .filter(|m| m.0 != [0u8; 32]) // Ignore placeholder zeroed IDs
+            };
+            // ADR 0115 §2: a route counts only when an
+            // authority store confirms it.
+            self.authorized_routing_machine_with(agent_id, routing, cold.opted_in())
+                .await
+        })
+        .await?;
+        let registry_machine_id = Self::cold_bounded(
+            cold,
+            agent_id,
+            "registry",
+            self.authorized_registry_machine(agent_id, cold.opted_in()),
+        )
+        .await?;
 
         let evidence_machine = if cached_machine_id.is_none()
             && registry_machine_id.is_none()
-            && self.peer_evidence().wait(0).await
+            && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
         {
-            self.peer_evidence()
-                .usable_agent(*agent_id, dm_capability::now_unix_ms())
-                .map(|v| v.announcement.machine_id)
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store (contention reads as no evidence).
+            let view = if cold.opted_in() {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.peer_evidence().usable_agent(*agent_id, now)
+            };
+            view.map(|v| v.announcement.machine_id)
         } else {
             None
         };
+        // x0x #1207: whether the machine came from a cold-recipient binding
+        // (re-validated against the final machine after repair).
+        let mut awaited = false;
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
-            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
-            (_, Some(id)) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (_, Some(id)) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
-                    let mut cache = self.identity_discovery_cache.write().await;
-                    if let Some(entry) = cache.get_mut(agent_id) {
-                        entry.machine_id = id;
+                    let reconcile = async {
+                        let mut cache = self.identity_discovery_cache.write().await;
+                        if let Some(entry) = cache.get_mut(agent_id) {
+                            entry.machine_id = id;
+                        }
+                    };
+                    // A best-effort reconcile; an opted-in send skips it at
+                    // the deadline rather than wait on.
+                    match cold.deadline() {
+                        Some(deadline) => {
+                            let _ = tokio::time::timeout_at(deadline, reconcile).await;
+                        }
+                        None => reconcile.await,
                     }
                 }
                 (id, "registry_connected")
@@ -7756,7 +9425,15 @@ impl Agent {
             (None, Some(id)) => (id, "registry_not_connected"),
             (None, None) if evidence_machine.is_some() => {
                 let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
-                let _ = self.connect_from_evidence(*agent_id).await;
+                let dial = self.connect_from_evidence_with(*agent_id, cold);
+                match cold.deadline() {
+                    Some(deadline) => {
+                        let _ = tokio::time::timeout_at(deadline, dial).await;
+                    }
+                    None => {
+                        let _ = dial.await;
+                    }
+                }
                 (id, "peer_evidence")
             }
             (None, None) => {
@@ -7767,23 +9444,67 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
-                let _ = self.connect_to_agent(agent_id).await;
-                let id = self
-                    .direct_messaging
-                    .get_machine_id(agent_id)
-                    .await
-                    .ok_or_else(|| {
-                        tracing::warn!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                            outcome = "err_agent_not_found",
-                            dur_ms = send_start.elapsed().as_millis() as u64,
-                            "no machine_id after connect_to_agent"
-                        );
-                        error::NetworkError::AgentNotFound(agent_id.0)
-                    })?;
-                (id, "post_connect")
+                #[cfg(test)]
+                general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes).await;
+                match cold {
+                    // Not opted in: today's behaviour, an instant failure
+                    // (a gossip fallback, if any, follows).
+                    ColdResolution::Off => {
+                        let _ = self.connect_to_agent(agent_id).await;
+                        match self.authorized_registry_machine(agent_id, false).await {
+                            Some(id) => (id, "post_connect"),
+                            None => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no machine_id after connect_to_agent"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                    // x0x #1207, #1217 (opt-in, `send_direct_with_config_cold_wait`):
+                    // a restart leaves the discovery cache and the DM registry
+                    // cold. Wait, within the ONE absolute deadline (from the
+                    // start of this raw attempt), for a VERIFIED binding. The
+                    // sources and order are the pinned path's
+                    // (`select_pinned_binding`): the announced-binding store, the
+                    // ADR-0021 attestation, the DM registry, then peer evidence,
+                    // with one EvidenceV1 Lookup. The binding is re-validated
+                    // against the FINAL machine after repair (below).
+                    ColdResolution::Until(deadline) => {
+                        let _ = tokio::time::timeout_at(
+                            deadline,
+                            self.connect_to_agent_with(agent_id, cold),
+                        )
+                        .await;
+                        match self
+                            .await_removal_recipient_binding(agent_id, deadline)
+                            .await
+                        {
+                            Ok(binding) => {
+                                self.accept_cold_binding(agent_id, agent_prefix, binding, cold)
+                                    .await?;
+                                awaited = true;
+                                (binding.machine, binding.source.label())
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "send",
+                                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                                    outcome = "err_agent_not_found",
+                                    dur_ms = send_start.elapsed().as_millis() as u64,
+                                    "no verified machine for the recipient within the resolution deadline"
+                                );
+                                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -7791,7 +9512,14 @@ impl Agent {
         // resolve a machine the discovery cache never saw (raw-QUIC
         // fallback) — evaluate B+P for whatever machine was resolved so a
         // DM cannot reach a retired old-source binding through it.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 stage = "send",
@@ -7813,7 +9541,7 @@ impl Agent {
         // until a raw probe/send path observes the live connection.
         let mut ant_peer_id = ant_quic::PeerId(machine_id.0);
         let mut machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        let mut connected = network.is_connected(&ant_peer_id).await;
+        let mut connected = transport.is_connected(&ant_peer_id).await;
 
         // X0X-0033: when machine_id is known (resolved from cache or registry)
         // but ant-quic isn't currently connected, the X0X-0031 send-readiness
@@ -7824,11 +9552,20 @@ impl Agent {
         // Skip when resolution == "post_connect" (last-resort branch already
         // invoked connect_to_agent above).
         let mut repair_outcome: Option<&'static str> = None;
+        // A cold binding may be repaired, but never redialled to another
+        // discovery machine. Its repair shares the resolution deadline.
         if !connected && resolution != "post_connect" {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let outcome = match tokio::time::timeout(
-                REPAIR_TIMEOUT,
-                network.ensure_peer_send_ready(&ant_peer_id),
+            // x0x #1207 (Codex r5): the repair of a cold binding is newly
+            // reachable, so it ends at the send's absolute deadline too.
+            let repair_until = tokio::time::Instant::now() + REPAIR_TIMEOUT;
+            let repair_until = match (awaited, cold.deadline()) {
+                (true, Some(deadline)) => deadline.min(repair_until),
+                _ => repair_until,
+            };
+            let outcome = match tokio::time::timeout_at(
+                repair_until,
+                transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await
             {
@@ -7846,17 +9583,14 @@ impl Agent {
                 outcome,
                 "send-readiness repair on disconnected peer"
             );
-            connected = network.is_connected(&ant_peer_id).await;
+            connected = transport.is_connected(&ant_peer_id).await;
 
             // Presence/discovery and transport readiness are deliberately
             // separate. If the fast bootstrap-cache repair cannot recover a
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
-            if !connected {
-                if let Some(redialed_machine_id) = self
-                    .redial_direct_machine_from_discovery(agent_id, network)
-                    .await
-                {
+            if !connected && !awaited {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id, cold).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -7866,13 +9600,80 @@ impl Agent {
             }
         }
 
-        if resolution == "peer_evidence"
-            && self
-                .peer_evidence()
-                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
-                .is_none()
-        {
+        if awaited && !connected {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                resolution,
+                ?repair_outcome,
+                outcome = "err_agent_not_found",
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "raw-QUIC send: the cold recipient's bound machine is not connected; the caller retries"
+            );
             return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        }
+
+        if resolution == "peer_evidence" {
+            let now = dm_capability::now_unix_ms();
+            // x0x #1207 (P2): an opted-in send never blocks on the evidence
+            // store; contention fails closed (typed, retryable).
+            let usable = if cold.opted_in() {
+                matches!(
+                    self.peer_evidence().try_usable(*agent_id, machine_id, now),
+                    Ok(Some(_))
+                )
+            } else {
+                self.peer_evidence()
+                    .usable(*agent_id, machine_id, now)
+                    .is_some()
+            };
+            if !usable {
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+        }
+
+        // x0x #1207 (P1): a cold-recipient binding is re-validated against
+        // the FINAL machine (repair or redial may have replaced it): the
+        // current verified binding (expiry included) must still name it, and
+        // neither the agent nor the machine may be revoked. Every read ends
+        // at the same resolution deadline.
+        if awaited {
+            let deadline = cold.deadline().unwrap_or_else(tokio::time::Instant::now);
+            let current = Self::pinned_bounded(
+                deadline,
+                "general revalidation",
+                self.pinned_binding_now(agent_id),
+            )
+            .await
+            .map_err(|_| error::NetworkError::AgentNotFound(agent_id.0))?;
+            if current.map(|binding| binding.machine) != Some(machine_id) {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_binding_changed",
+                    "raw-QUIC send refused: the recipient's verified binding no longer names the final machine"
+                );
+                return Err(error::NetworkError::AgentNotFound(agent_id.0));
+            }
+            if self
+                .pinned_awaited_binding_revoked(agent_id, machine_id, deadline)
+                .await?
+            {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    resolution,
+                    outcome = "drop_revoked_post_resolution",
+                    "raw-QUIC send refused: the agent or the final machine is revoked"
+                );
+                return Err(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                });
+            }
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -7880,8 +9681,16 @@ impl Agent {
         // check never saw — re-run B/P against the FINAL machine
         // immediately before transmission, so a retired or
         // pinned-elsewhere binding reached through the repair path is
-        // refused here regardless of how it was resolved.
-        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+        // refused here regardless of how it was resolved. x0x #1207 (P2):
+        // for an opted-in send this read too ends at the deadline.
+        if let Some(denial) = Self::cold_bounded(
+            cold,
+            agent_id,
+            "pairing after resolution",
+            self.recipient_pairing_denied(agent_id, &machine_id),
+        )
+        .await?
+        {
             tracing::info!(
                 target: "x0x::direct",
                 agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
@@ -7952,6 +9761,126 @@ impl Agent {
             );
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
+
+        Ok(RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        })
+    }
+
+    /// In-process stand-in for the GENERAL raw-QUIC send (x0x #1207,
+    /// #1217): the production target resolution (`resolve_raw_quic_target`,
+    /// over the strict stand-in's scripted transport), with the network
+    /// write replaced by a delivery witness. Strict test agents only.
+    #[cfg(test)]
+    async fn general_raw_standin(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        agent_prefix: &str,
+        send_start: std::time::Instant,
+        cold: ColdResolution,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let transport =
+            RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+        let target = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &transport,
+                agent_prefix,
+                payload.len(),
+                send_start,
+                cold,
+            )
+            .await?;
+        if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
+            deliveries.push((
+                self.identity.agent_id(),
+                *agent_id,
+                target.machine_id,
+                payload.to_vec(),
+            ));
+        }
+        Ok(dm::DmPath::RawQuic)
+    }
+
+    /// Test seam (x0x #1207): the general raw-QUIC deliveries this agent's
+    /// strict stand-in made, as `(recipient, machine, payload)`.
+    #[cfg(test)]
+    pub(crate) fn general_raw_standin_deliveries_for_testing(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::MachineId, Vec<u8>)> {
+        let me = self.identity.agent_id();
+        GENERAL_RAW_STANDIN_DELIVERIES
+            .lock()
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter(|(from, ..)| *from == me)
+                    .map(|(_, to, machine, payload)| (*to, *machine, payload.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn send_direct_raw_quic(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+        cold_wait: Option<ColdWait>,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let send_start = std::time::Instant::now();
+        // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
+        // attempt, for every resolution read of an opted-in send. The
+        // existing warm-recipient transport and ACK budgets are unchanged;
+        // a newly learned cold binding's repair also ends at this deadline.
+        let cold = ColdResolution::starting_now(cold_wait);
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
+        let bytes = payload.len();
+        let digest = direct::dm_payload_digest_hex(payload);
+        let target_path_label = if receive_ack_timeout.is_some() {
+            "raw_quic_acked"
+        } else {
+            "raw_quic"
+        };
+
+        #[cfg(test)]
+        if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            return self
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start, cold)
+                .await;
+        }
+        let network = self.network.as_ref().ok_or_else(|| {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "err_no_network",
+                "network not initialised"
+            );
+            error::NetworkError::NodeCreation("network not initialized".to_string())
+        })?;
+
+        let RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        } = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &RawQuicTransport::Network(network),
+                &agent_prefix,
+                bytes,
+                send_start,
+                cold,
+            )
+            .await?;
 
         tracing::debug!(
             target: "dm.trace",
@@ -8425,6 +10354,15 @@ impl Agent {
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
         std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// Test seam (x0x #1150 r7d): the announced-binding store. Test builds
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn announced_machine_bindings_for_testing(
+        &self,
+    ) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.announced_machine_bindings)
     }
 
     /// Test seam for #1088: record an authenticated machine binding the
@@ -9329,6 +11267,7 @@ impl Agent {
         let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let announced_machine_bindings = std::sync::Arc::clone(&self.announced_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let user_cache = std::sync::Arc::clone(&self.user_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
@@ -9383,6 +11322,28 @@ impl Agent {
         let move_state_for_listener = std::sync::Arc::clone(&self.move_state);
 
         let own_peer_id_for_cache_exclude = ant_quic::PeerId(self.machine_id().0);
+        // ADR 0115 §1: a usable ADR 0089 record also authenticates a pairing.
+        let evidence_for_listener = std::sync::Arc::clone(self.peer_evidence());
+        // ADR 0115 §3: the local certificate journal is a provenance source.
+        let journal_path_for_listener = self.cert_journal_path.clone();
+        // ADR 0115 D214: confirm or lapse quarantined
+        // pre-upgrade records while the listener feeds discovery.
+        self.spawn_tracked(identity_authority::quarantine::run(
+            identity_authority::quarantine::TickInputs {
+                quarantine: std::sync::Arc::clone(&self.revocation_quarantine),
+                discovery: std::sync::Arc::clone(&self.identity_discovery_cache),
+                machines: std::sync::Arc::clone(&self.machine_discovery_cache),
+                announced: std::sync::Arc::clone(&self.announced_machine_bindings),
+                revoked: std::sync::Arc::clone(&self.revocation_set),
+                moves: std::sync::Arc::clone(&self.move_state),
+                contacts: std::sync::Arc::clone(&self.contact_store),
+                identity_dir: self.identity_dir.clone(),
+                evidence: std::sync::Arc::clone(self.peer_evidence()),
+                local_user: self.user_id(),
+                journal_path: self.cert_journal_path.clone(),
+                shutdown: self.shutdown_token.clone(),
+            },
+        ));
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
@@ -9652,7 +11613,24 @@ impl Agent {
                         // — the cert must have been announced first (EP1).
                         // Built before taking the revocation-set write lock so
                         // no two identity locks are held at once.
-                        let subject_certs = collect_subject_certs(&*cache.read().await);
+                        let subject_certs = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            collect_subject_certs(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
+                            )
+                        };
                         {
                             let _share_grant_barrier = owner_trust_for_listener
                                 .share_grant_revocation_barrier(&records, &revocation_set)
@@ -9664,11 +11642,15 @@ impl Agent {
                                 }
                                 let subject_cert = match &record.subject {
                                     revocation::RevokedSubject::Agent(agent_id) => {
-                                        subject_certs.get(agent_id)
+                                        pick_subject_cert(subject_certs.get(agent_id), &record)
                                     }
                                     _ => None,
                                 };
-                                match set.verify_and_insert(record.clone(), subject_cert) {
+                                match set.verify_and_insert_at(
+                                    record.clone(),
+                                    subject_cert,
+                                    Agent::unix_timestamp_secs(),
+                                ) {
                                     Ok(true) => newly_inserted.push(record),
                                     Ok(false) => {} // dup
                                     Err(e) => {
@@ -9712,9 +11694,11 @@ impl Agent {
                                         )
                                         .await
                                         {
-                                            tracing::warn!(
-                                                "failed to persist revocation set: {e}"
-                                            );
+                                            if !storage::revocation_persistence_is_blocked(&e) {
+                                                tracing::warn!(
+                                                    "failed to persist revocation set: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => tracing::warn!(
@@ -9830,7 +11814,24 @@ impl Agent {
                         else {
                             continue;
                         };
-                        let subject_certs = collect_subject_certs(&*cache.read().await);
+                        let subject_certs = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            collect_subject_certs(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
+                            )
+                        };
                         let mut inserted = false;
                         let mut share_grant_inserted = false;
                         {
@@ -9844,7 +11845,7 @@ impl Agent {
                                 }
                                 let subject_cert = match &record.subject {
                                     revocation::RevokedSubject::AgentMachineBinding(binding) => {
-                                        subject_certs.get(&binding.agent)
+                                        pick_subject_cert(subject_certs.get(&binding.agent), &record)
                                     }
                                     _ => None,
                                 };
@@ -9852,7 +11853,11 @@ impl Agent {
                                     record.subject,
                                     revocation::RevokedSubject::ShareGrant(_)
                                 );
-                                match set.verify_and_insert(record, subject_cert) {
+                                match set.verify_and_insert_at(
+                                    record,
+                                    subject_cert,
+                                    Agent::unix_timestamp_secs(),
+                                ) {
                                     Ok(true) => {
                                         inserted = true;
                                         share_grant_inserted |= is_share_grant;
@@ -9918,10 +11923,12 @@ impl Agent {
                         else {
                             continue;
                         };
-                        let agent = match &record.record {
+                        let (agent, bundle_cert) = match &record.record {
                             key_move::MoveRecord::ActivationBundle {
-                                authorization, ..
-                            } => authorization.agent_id,
+                                authorization,
+                                agent_certificate,
+                                ..
+                            } => (authorization.agent_id, agent_certificate.clone()),
                             _ => {
                                 tracing::debug!(
                                     "ignoring non-bundle payload on activation topic"
@@ -9929,6 +11936,37 @@ impl Agent {
                                 continue;
                             }
                         };
+                        // ADR 0115 §4: the bundle owner must be
+                        // the subject's authenticated owner (a certificate
+                        // with §3 provenance). Otherwise reject; the owner's
+                        // republication brings it back later (D215).
+                        let authenticated = {
+                            let journal =
+                                load_journal_certs(journal_path_for_listener.as_deref()).await;
+                            let announced = announced_machine_bindings.read().await;
+                            let cache = cache.read().await;
+                            subject_certs_with_provenance(
+                                &ProvenanceSources {
+                                    cache: &cache,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                &agent,
+                            )
+                        };
+                        if !authenticated
+                            .iter()
+                            .any(|cert| identity_authority::same_owner(cert, &bundle_cert))
+                        {
+                            identity_authority::note_bundle_owner_unauthenticated();
+                            tracing::debug!(
+                                agent = %hex::encode(agent.as_bytes()),
+                                "activation bundle rejected: owner is not the subject's authenticated owner (ADR 0115 §4)"
+                            );
+                            continue;
+                        }
                         let changed = {
                             let mut state = move_state_for_listener.write().await;
                             let mut revoked = revocation_set.write().await;
@@ -10069,6 +12107,8 @@ impl Agent {
                                 // lands (bounded: the fetch itself gives up
                                 // after BLOB_FETCH_TIMEOUT_SECS).
                                 let watch_cache = std::sync::Arc::clone(&cache);
+                                let watch_announced =
+                                    std::sync::Arc::clone(&announced_machine_bindings);
                                 let watch_blob_cache =
                                     std::sync::Arc::clone(&announce_blob_cache);
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
@@ -10077,6 +12117,7 @@ impl Agent {
                                 tokio::spawn(async move {
                                     patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
+                                        &watch_announced,
                                         &watch_blob_cache,
                                         &watch_cert_events,
                                         &watch_digest,
@@ -10213,6 +12254,29 @@ impl Agent {
                     }
                 }
 
+                // ADR 0115 §1: only an agent-authenticated
+                // announcement (class A) or one from the agent's
+                // authenticated machine (class B) may set authority fields
+                // or write an authority store. Any other one (class C)
+                // changes nothing for the agent.
+                let announcement_class = identity_authority::classify_announcement(
+                    &msg,
+                    &announcement,
+                    &revocation_set,
+                    &authenticated_machine_bindings,
+                    &evidence_for_listener,
+                )
+                .await;
+                if !announcement_class.grants_authority() {
+                    identity_authority::note_unauthenticated_announce();
+                    tracing::debug!(
+                        agent = %hex::encode(&announcement.agent_id.0[..8]),
+                        machine = %hex::encode(&announcement.machine_id.0[..8]),
+                        "ignoring unauthenticated identity announcement (ADR 0115 class C)"
+                    );
+                    continue;
+                }
+
                 // Update machine records in the contact store.
                 //
                 // The daemon never registers its own agent as a contact: a self
@@ -10333,8 +12397,15 @@ impl Agent {
                     now,
                     cache_freshness_ttl_secs,
                 ) {
-                    upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                    upsert_discovered_agent(&cache, &cert_events, discovered_agent).await;
+                    cache_verified_announcement(
+                        &machine_cache,
+                        &announced_machine_bindings,
+                        Some(&announce_blob_cache),
+                        &cache,
+                        &cert_events,
+                        discovered_agent,
+                    )
+                    .await;
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -10651,7 +12722,10 @@ impl Agent {
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
         let min_connected = 3;
-        let mut all_connected: Vec<std::net::SocketAddr> = Vec::new();
+        // x0x#1321: dial results with the answered peer ids. A dial that
+        // returned Ok is transport truth only; the plane gate (#206) and the
+        // #292 tombstones decide gossip admission after it.
+        let mut all_connected = gossip::join_seeds::JoinCandidates::default();
 
         // ant-quic now owns first-party mDNS discovery and auto-connect.
         // x0x keeps bootstrap/cache orchestration here, while the transport
@@ -10660,6 +12734,8 @@ impl Agent {
         // Phase 0: Try quality-scored coordinator peers from bootstrap cache.
         // The bootstrap cache learns about coordinator-capable peers passively
         // through normal connections — no coordinator gossip topic needed.
+        // x0x#1321: after shutdown began (also during the cache read), the
+        // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
@@ -10667,16 +12743,20 @@ impl Agent {
                 .flat_map(|peer| peer.preferred_addresses())
                 .collect();
 
-            if !coordinator_addrs.is_empty() {
+            if !coordinator_addrs.is_empty() && !self.shutdown_token.is_cancelled() {
                 tracing::info!(
                     "Phase 0: Trying {} addresses from {} cached coordinators",
                     coordinator_addrs.len(),
                     coordinators.len()
                 );
                 let (succeeded, _failed) = self
-                    .connect_peers_parallel_tracked(network, &coordinator_addrs)
+                    .connect_peers_parallel_tracked(
+                        network,
+                        &coordinator_addrs,
+                        &self.shutdown_token,
+                    )
                     .await;
-                all_connected.extend(&succeeded);
+                all_connected.extend(succeeded.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
                     succeeded.len(),
@@ -10685,78 +12765,42 @@ impl Agent {
             }
         }
 
+        // x0x#1321: the seed choice reads #292 admission from the node.
+        let node: &network::NetworkNode = network;
+
         // Phase 1: Try cached peers first using the real ant-quic peer IDs.
-        if all_connected.len() < min_connected {
-            if let Some(ref cache) = self.bootstrap_cache {
-                const PHASE1_PEER_CANDIDATES: usize = 12;
-                let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-                if !cached_peers.is_empty() {
-                    tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
-                    let (succeeded, _failed) = self
-                        .connect_cached_peers_parallel_tracked(network, &cached_peers)
-                        .await;
-                    all_connected.extend(&succeeded);
-                    tracing::info!(
-                        "Phase 1: {}/{} cached peers connected",
-                        succeeded.len(),
-                        cached_peers.len()
-                    );
-                }
-            }
-        } // end Phase 1 min_connected check
+        // x0x#1321: the phase counts re-read admission, so a peer that is
+        // already refused or disconnected does not fill min_connected. The
+        // count is `None` after shutdown began: then no phase starts. A
+        // phase that starts gets the shutdown token too, so a shutdown
+        // between the count and the dials (or during them) stops it.
+        let mut ran_phase1 = false;
+        if matches!(
+            all_connected.usable(node, &self.shutdown_token).await,
+            Some(usable) if usable < min_connected
+        ) {
+            ran_phase1 = true;
+            self.join_phase1_cached_peers(network, &mut all_connected, &self.shutdown_token)
+                .await;
+        }
 
         // Phase 2: Connect to hardcoded bootstrap nodes if we need more peers.
         // This is the fallback for when coordinator cache and cached peers aren't enough.
-        if all_connected.len() < min_connected && !bootstrap_nodes.is_empty() {
-            let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
-                .iter()
-                .filter(|addr| !all_connected.contains(addr))
-                .copied()
-                .collect();
-
-            // Round 1: Connect to all bootstrap peers in parallel
-            let (succeeded, mut failed) = self
-                .connect_peers_parallel_tracked(network, &remaining)
-                .await;
-            all_connected.extend(&succeeded);
-            tracing::info!(
-                "Phase 2 round 1: {}/{} bootstrap peers connected",
-                succeeded.len(),
-                remaining.len()
-            );
-
-            // Retry rounds for failed peers
-            for round in 2..=3 {
-                if failed.is_empty() {
-                    break;
-                }
-                let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
-                tracing::info!(
-                    "Retrying {} failed peers in {}s (round {})",
-                    failed.len(),
-                    delay.as_secs(),
-                    round
-                );
-                tokio::time::sleep(delay).await;
-
-                let (succeeded, still_failed) =
-                    self.connect_peers_parallel_tracked(network, &failed).await;
-                all_connected.extend(&succeeded);
-                failed = still_failed;
-                tracing::info!(
-                    "Phase 2 round {}: {} total peers connected",
-                    round,
-                    all_connected.len()
-                );
-            }
-
-            if !failed.is_empty() {
-                tracing::warn!(
-                    "Could not connect to {} bootstrap peers: {:?}",
-                    failed.len(),
-                    failed
-                );
-            }
+        let mut ran_phase2 = false;
+        if !bootstrap_nodes.is_empty()
+            && matches!(
+                all_connected.usable(node, &self.shutdown_token).await,
+                Some(usable) if usable < min_connected
+            )
+        {
+            ran_phase2 = true;
+            self.join_phase2_bootstrap(
+                network,
+                &bootstrap_nodes,
+                &mut all_connected,
+                &self.shutdown_token,
+            )
+            .await;
         }
 
         tracing::info!(
@@ -10764,11 +12808,66 @@ impl Agent {
             all_connected.len()
         );
 
-        // Join the HyParView membership overlay via connected peers.
-        if let Some(ref runtime) = self.gossip_runtime {
-            let seeds: Vec<String> = all_connected.iter().map(|addr| addr.to_string()).collect();
-            if !seeds.is_empty() {
-                if let Err(e) = runtime.membership().join(seeds).await {
+        // x0x#1321: the counts above include peers whose plane verdict was
+        // still open. Settle those verdicts. If the settled admitted set is
+        // below min_connected, run each phase that an open verdict made the
+        // join skip. Each phase runs at most once per join. After shutdown
+        // began, no fallback phase starts, and a running one stops.
+        let shutdown = &self.shutdown_token;
+        let mut plan = all_connected.settle(node, min_connected, shutdown).await;
+        if plan.admitted_peers < min_connected && !ran_phase1 && !shutdown.is_cancelled() {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers after Phase 0; trying cached peers (issue #1321)"
+            );
+            self.join_phase1_cached_peers(network, &mut all_connected, shutdown)
+                .await;
+            plan = all_connected.settle(node, min_connected, shutdown).await;
+        }
+        if plan.admitted_peers < min_connected
+            && !ran_phase2
+            && !bootstrap_nodes.is_empty()
+            && !shutdown.is_cancelled()
+        {
+            tracing::info!(
+                target: "x0x::connect",
+                admitted = plan.admitted_peers,
+                "join fallback: too few admitted peers; trying bootstrap nodes (issue #1321)"
+            );
+            self.join_phase2_bootstrap(network, &bootstrap_nodes, &mut all_connected, shutdown)
+                .await;
+            plan = all_connected.settle(node, min_connected, shutdown).await;
+        }
+
+        // Join the HyParView membership overlay via gossip-admitted peers
+        // only (x0x#1321): a seed the plane gate refused or #292 suppressed
+        // can only make the JOIN retry it.
+        if shutdown.is_cancelled() {
+            tracing::info!(
+                target: "x0x::connect",
+                "shutdown began: skipping the HyParView JOIN (issue #1321)"
+            );
+        } else if let Some(ref runtime) = self.gossip_runtime {
+            all_connected.log_plan(&plan);
+            // x0x#1321 (D248): saorsa-gossip drives each JOIN attempt
+            // (`join_dial` / `join_send`, one `JoinLedger` for the whole
+            // join); x0x picks the candidate and checks admission between
+            // the dial and the JOIN frame.
+            match all_connected
+                .join_overlay(runtime.membership().as_ref(), node, shutdown)
+                .await
+            {
+                gossip::join_seeds::JoinOutcome::Joined(_)
+                | gossip::join_seeds::JoinOutcome::Cancelled => {}
+                gossip::join_seeds::JoinOutcome::NoSeed { attempts } => {
+                    if attempts > 0 {
+                        tracing::warn!(
+                            "HyParView membership join failed: JOIN: Failed to connect to any seed nodes"
+                        );
+                    }
+                }
+                gossip::join_seeds::JoinOutcome::Failed(e) => {
                     tracing::warn!("HyParView membership join failed: {e}");
                 }
             }
@@ -11229,26 +13328,181 @@ impl Agent {
         self.dm_capabilities_tx.borrow().clone()
     }
 
-    /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
+    /// `join_network` Phase 1: dial up to 12 cached peers by peer id and
+    /// record the dials that returned `Ok`. `stop` is the agent's shutdown
+    /// token (x0x#1321): after it is cancelled the phase starts no dial,
+    /// and a cancellation ends the dial batch at once.
+    async fn join_phase1_cached_peers(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        let Some(ref cache) = self.bootstrap_cache else {
+            return;
+        };
+        const PHASE1_PEER_CANDIDATES: usize = 12;
+        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        if cached_peers.is_empty() || stop.is_cancelled() {
+            return;
+        }
+        tracing::info!("Phase 1: Trying {} cached peers", cached_peers.len());
+        let (succeeded, _failed) = self
+            .connect_cached_peers_parallel_tracked(network, &cached_peers, stop)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 1: {}/{} cached peers connected",
+            succeeded.len(),
+            cached_peers.len()
+        );
+    }
+
+    /// `join_network` Phase 2: dial the configured bootstrap nodes that this
+    /// join has not dialled yet, with two retry rounds for failed dials, and
+    /// record the dials that returned `Ok`. `stop` is the agent's shutdown
+    /// token (x0x#1321): after it is cancelled the phase starts no dial, and
+    /// a cancellation ends the dial batches and the retry sleeps at once.
+    async fn join_phase2_bootstrap(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        bootstrap_nodes: &[std::net::SocketAddr],
+        candidates: &mut gossip::join_seeds::JoinCandidates,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        let stopped = || stop.is_cancelled();
+        if stopped() {
+            return;
+        }
+        let remaining: Vec<std::net::SocketAddr> = bootstrap_nodes
+            .iter()
+            .filter(|addr| !candidates.contains_addr(addr))
+            .copied()
+            .collect();
+
+        // Round 1: Connect to all bootstrap peers in parallel
+        let (succeeded, mut failed) = self
+            .connect_peers_parallel_tracked(network, &remaining, stop)
+            .await;
+        candidates.extend(succeeded.iter().copied());
+        tracing::info!(
+            "Phase 2 round 1: {}/{} bootstrap peers connected",
+            succeeded.len(),
+            remaining.len()
+        );
+
+        // Retry rounds for failed peers
+        for round in 2..=3 {
+            if failed.is_empty() || stopped() {
+                break;
+            }
+            let delay = std::time::Duration::from_secs(if round == 2 { 10 } else { 15 });
+            tracing::info!(
+                "Retrying {} failed peers in {}s (round {})",
+                failed.len(),
+                delay.as_secs(),
+                round
+            );
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+
+            let (succeeded, still_failed) = self
+                .connect_peers_parallel_tracked(network, &failed, stop)
+                .await;
+            candidates.extend(succeeded.iter().copied());
+            failed = still_failed;
+            tracing::info!(
+                "Phase 2 round {}: {} total peers connected",
+                round,
+                candidates.len()
+            );
+        }
+
+        if !failed.is_empty() && !stopped() {
+            tracing::warn!(
+                "Could not connect to {} bootstrap peers: {:?}",
+                failed.len(),
+                failed
+            );
+        }
+    }
+
+    /// Await the dial tasks of one `join_network` batch, in order. A
+    /// cancellation of `stop` aborts every task that has not finished and
+    /// ends the batch at once; it goes first when a result is also ready.
+    async fn collect_join_dials<S, F>(
+        handles: Vec<tokio::task::JoinHandle<Result<S, F>>>,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (Vec<S>, Vec<F>) {
+        let aborts: Vec<tokio::task::AbortHandle> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            let joined = tokio::select! {
+                biased;
+                () = stop.cancelled() => {
+                    for abort in aborts.iter().skip(index) {
+                        abort.abort();
+                    }
+                    break;
+                }
+                joined = handle => joined,
+            };
+            match joined {
+                Ok(Ok(dialled)) => succeeded.push(dialled),
+                Ok(Err(failure)) => failed.push(failure),
+                Err(e) => tracing::error!("Connection task panicked: {}", e),
+            }
+        }
+        (succeeded, failed)
+    }
+
+    /// Connect to cached peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, peer id)`; `connect_cached_peer` returns
+    /// `Ok` only for the requested, authenticated peer. After `stop` is
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_cached_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         peers: &[ant_quic::CachedPeer],
-    ) -> (Vec<std::net::SocketAddr>, Vec<ant_quic::PeerId>) {
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<ant_quic::PeerId>,
+    ) {
         use tokio::time::{timeout, Duration};
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+        if stop.is_cancelled() {
+            return (Vec::new(), Vec::new());
+        }
 
         let handles: Vec<_> = peers
             .iter()
             .map(|peer| {
                 let net = network.clone();
                 let peer_id = peer.peer_id;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to cached peer: {:?}", peer_id);
-                    match timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)).await {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(peer_id),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)) => dialled,
+                    };
+                    match dialled {
                         Ok(Ok(addr)) => {
                             tracing::info!("Connected to cached peer {:?} at {}", peer_id, addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to cached peer {:?}: {}", peer_id, e);
@@ -11267,41 +13521,51 @@ impl Agent {
             })
             .collect();
 
-        let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
-                Ok(Err(peer_id)) => failed.push(peer_id),
-                Err(e) => tracing::error!("Connection task panicked: {}", e),
-            }
-        }
-        (succeeded, failed)
+        Self::collect_join_dials(handles, stop).await
     }
 
-    /// Connect to multiple peers in parallel, returning (succeeded, failed) address lists.
+    /// Connect to multiple peers in parallel, returning (succeeded, failed).
+    /// Each success is `(address, answered peer id)`. After `stop` is
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
         addrs: &[std::net::SocketAddr],
-    ) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> (
+        Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
+        Vec<std::net::SocketAddr>,
+    ) {
         use tokio::time::{timeout, Duration};
 
         // Per-connection timeout prevents hanging when connecting to
         // ourselves or to unreachable addresses.
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+        if stop.is_cancelled() {
+            return (Vec::new(), Vec::new());
+        }
+
         let handles: Vec<_> = addrs
             .iter()
             .map(|addr| {
                 let net = network.clone();
                 let addr = *addr;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
-                    match timeout(CONNECT_TIMEOUT, net.connect_addr(addr)).await {
-                        Ok(Ok(_)) => {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(addr),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_addr(addr)) => dialled,
+                    };
+                    match dialled {
+                        Ok(Ok(peer_id)) => {
                             tracing::info!("Connected to peer: {}", addr);
-                            Ok(addr)
+                            Ok((addr, peer_id))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Failed to connect to {}: {}", addr, e);
@@ -11320,16 +13584,7 @@ impl Agent {
             })
             .collect();
 
-        let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(addr)) => succeeded.push(addr),
-                Ok(Err(addr)) => failed.push(addr),
-                Err(e) => tracing::error!("Connection task panicked: {}", e),
-            }
-        }
-        (succeeded, failed)
+        Self::collect_join_dials(handles, stop).await
     }
 
     /// Subscribe to messages on a given topic.
@@ -11537,11 +13792,155 @@ impl Agent {
         self.identity_discovery_cache.read().await.get(id).cloned()
     }
 
+    /// ADR 0115 §1: the identity listener's ingest gates for a
+    /// beat read from an agent's shard topic in `find_agent`: timestamp,
+    /// trust (Blocked, machine pin), revocation, the ADR-0043 pairing and
+    /// certificate expiry. Each lock is taken alone except the
+    /// revocation-then-placement pair, in the listener's order.
+    async fn shard_announcement_passes_listener_gates(&self, ann: &IdentityAnnouncement) -> bool {
+        let now = Self::unix_timestamp_secs();
+        if !identity_announcement_timestamp_is_acceptable(ann.announced_at, now) {
+            return false;
+        }
+        if ann
+            .agent_certificate
+            .as_ref()
+            .is_some_and(|cert| identity::is_expired(cert.not_after(), now))
+        {
+            return false;
+        }
+        let decision = {
+            let store = self.contact_store.read().await;
+            trust::TrustEvaluator::new(&store).evaluate(&trust::TrustContext {
+                agent_id: &ann.agent_id,
+                machine_id: &ann.machine_id,
+            })
+        };
+        if matches!(
+            decision,
+            trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch
+        ) {
+            return false;
+        }
+        let revoked = self.revocation_set.read().await;
+        if revoked.is_agent_revoked(&ann.agent_id) || revoked.is_machine_revoked(&ann.machine_id) {
+            return false;
+        }
+        let placements = self.move_state.read().await;
+        key_move::enforce_pairing(
+            &revoked,
+            placements.placement_view(),
+            &ann.agent_id,
+            &ann.machine_id,
+        )
+        .is_none()
+    }
+
+    /// ADR 0115 diagnostics: the identity-authority counters
+    /// and the D214 quarantine summary.
+    pub(crate) async fn identity_authority_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = identity_authority::counters_json();
+        diagnostics["quarantine"] = self.revocation_quarantine.lock().await.summary();
+        diagnostics
+    }
+
+    /// ADR 0115 §2: whether an authority store confirms that
+    /// `agent_id` lives on `machine_id` (the announced binding, the
+    /// authenticated binding or a usable ADR 0089 record). The local agent
+    /// lives on the local machine.
+    async fn authority_confirms(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        self.authority_confirms_with(agent_id, machine_id, false)
+            .await
+    }
+
+    /// [`Self::authority_confirms`]; with `nonblocking_evidence` (an
+    /// opted-in cold send, x0x #1207) the evidence check never blocks.
+    async fn authority_confirms_with(
+        &self,
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+        nonblocking_evidence: bool,
+    ) -> bool {
+        if *agent_id == self.agent_id() {
+            return *machine_id == self.machine_id();
+        }
+        self.owner_trust
+            .authority_confirms_with(agent_id, machine_id, nonblocking_evidence)
+            .await
+    }
+
+    /// ADR 0115 §2 (strict): the machine a security reader may
+    /// use for `agent_id`, whose discovery entry routes to `routing`. The
+    /// route counts only when [`Self::authority_confirms`] says so;
+    /// otherwise the authority stores' machine is used. With no discovery
+    /// entry the reader keeps its own fallbacks.
+    async fn authorized_routing_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        routing: Option<identity::MachineId>,
+    ) -> Option<identity::MachineId> {
+        self.authorized_routing_machine_with(agent_id, routing, false)
+            .await
+    }
+
+    /// [`Self::authorized_routing_machine`] with the non-blocking evidence
+    /// option of [`Self::authority_confirms_with`].
+    async fn authorized_routing_machine_with(
+        &self,
+        agent_id: &identity::AgentId,
+        routing: Option<identity::MachineId>,
+        nonblocking_evidence: bool,
+    ) -> Option<identity::MachineId> {
+        let routing = routing.filter(|machine| machine.0 != [0u8; 32])?;
+        let confirmed = self
+            .authority_confirms_with(agent_id, &routing, nonblocking_evidence)
+            .await;
+        identity_authority::authorized_machine(
+            Some(routing),
+            confirmed,
+            self.authority_machine(agent_id).await,
+        )
+    }
+
+    /// ADR 0115 §2: the DM registry's machine for `agent_id`.
+    /// It counts only when an authority store confirms it; the registry
+    /// alone never names a machine.
+    async fn authorized_registry_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        nonblocking_evidence: bool,
+    ) -> Option<identity::MachineId> {
+        let machine = self.direct_messaging.get_machine_id(agent_id).await?;
+        self.authority_confirms_with(agent_id, &machine, nonblocking_evidence)
+            .await
+            .then_some(machine)
+    }
+
+    /// ADR 0115 §2: the machine `agent_id`'s authority stores
+    /// name (announced-binding and authenticated-binding records; each lock
+    /// is taken alone).
+    async fn authority_machine(&self, agent_id: &identity::AgentId) -> Option<identity::MachineId> {
+        let announced = self.announced_machine_bindings.read().await.peek(agent_id);
+        let attested = self
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .peek(agent_id);
+        identity_authority::authority_machine(announced, attested)
+    }
+
     /// Check whether a claimed `AgentId` is verified as belonging to the
     /// given `MachineId` in the identity discovery cache.
     ///
     /// Returns `true` if the cache contains a signed identity announcement
-    /// binding this agent to this machine.  Returns `false` if:
+    /// binding this agent to this machine, and the agent's authority
+    /// stores do not name another machine (ADR 0115 §2: only an
+    /// agent-authenticated announcement, or one from the agent's
+    /// authenticated machine, sets the binding).  Returns `false` if:
     /// - the agent is unknown or bound to a different machine, OR
     /// - the agent or its bound machine has been revoked, OR
     /// - the cached agent certificate has expired (past `not_after` + 300 s
@@ -11566,6 +13965,11 @@ impl Agent {
             }
         }
 
+        // ADR 0115 §2: only an authority store (or the local
+        // identity) confirms a binding; the routing entry alone never does.
+        if !self.authority_confirms(agent_id, machine_id).await {
+            return false;
+        }
         let cache = self.identity_discovery_cache.read().await;
         let Some(entry) = cache.get(agent_id) else {
             return false;
@@ -11600,6 +14004,21 @@ impl Agent {
         std::sync::Arc::clone(&self.identity_discovery_cache)
     }
 
+    /// `agent_id`'s current authenticated bound machine: the retained
+    /// binding from its latest direct-origin identity announcement or fresh
+    /// origin attestation, read without touching its recency. ADR 0108 §4:
+    /// the OwnerCertified evidence builder reads an anonymous announce as
+    /// absence of disclosure only when this machine signed it.
+    pub(crate) async fn authenticated_bound_machine(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<dm_inbox::AuthenticatedMachineBinding> {
+        self.authenticated_machine_bindings
+            .read()
+            .await
+            .peek(agent_id)
+    }
+
     /// Return the shared contact store (`pub(crate)` — used by the forwarder
     /// to evaluate trust for ForwardV2 attestation, #204 must-fix 3).
     pub(crate) fn contact_store(
@@ -11624,14 +14043,15 @@ impl Agent {
     /// - **Issuer-revocation**: the issuer is the user who signed the subject
     ///   agent's certificate (the certificate must be passed as `subject_cert`).
     ///
-    /// On success, the record is inserted into the local revocation set,
-    /// persisted to `revocations.bin`, published on [`REVOCATION_TOPIC`], and
-    /// the subject is evicted from all discovery caches.
+    /// The record is inserted into the local revocation set, persisted to
+    /// its subject's v1/v2/v3 store, published on the matching revocation
+    /// topic, and the subject is evicted from all discovery caches.
     ///
     /// # Errors
     ///
     /// Returns an error if signing fails, the authority check fails, or the
-    /// gossip publish fails.
+    /// gossip publish fails. A [`error::IdentityError::Storage`] error can
+    /// be returned after the record was applied and published: it is not durable.
     pub async fn revoke(
         &self,
         issuer_keypair: &identity::AgentKeypair,
@@ -11673,7 +14093,9 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error when no owner key is loaded, signing fails, or
-    /// the authority check rejects the record.
+    /// the authority check rejects the record. A [`error::IdentityError::Storage`]
+    /// error can be returned after the record was applied and published:
+    /// it is not durable.
     pub async fn revoke_as_owner(
         &self,
         subject_cert: &identity::AgentCertificate,
@@ -11714,27 +14136,53 @@ impl Agent {
                 .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
                 .await;
             let mut set = self.revocation_set.write().await;
-            if let Err(e) = set.verify_and_insert(record.clone(), subject_cert) {
+            if let Err(e) =
+                set.verify_and_insert_at(record.clone(), subject_cert, Self::unix_timestamp_secs())
+            {
                 return Err(error::IdentityError::CertificateVerification(format!(
                     "revocation rejected: {e}"
                 )));
             }
         }
 
-        // 2. Persist. The legacy file filters share-grant records out
-        //    (#926 r3), so those also go to `revocations-v3.bin`.
-        storage::save_revocation_set(
-            &*self.revocation_set.read().await,
-            self.identity_dir.as_deref(),
-        )
-        .await?;
-        if matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)) {
-            persist_share_grant_revocations_durable(
-                &self.revocation_set,
-                self.identity_dir.as_deref(),
-            )
-            .await
-            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(e)))?;
+        // 2. Return only the subject's own store result. V1 does not
+        //    change for binding/share-grant subjects; its unreadability
+        //    must not turn their successful v2/v3 save into a failure.
+        let persisted = match &record.subject {
+            revocation::RevokedSubject::ShareGrant(_) => {
+                persist_share_grant_revocations_durable(
+                    &self.revocation_set,
+                    self.identity_dir.as_deref(),
+                )
+                .await
+            }
+            revocation::RevokedSubject::AgentMachineBinding(_) => {
+                match self.revocation_set.read().await.to_bytes_v2() {
+                    Ok(bytes) => match self.move_file_path("revocations-v2.bin") {
+                        Some(path) => storage::save_private_bytes_to(&path, bytes).await,
+                        None => Ok(()),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            _ => {
+                storage::save_revocation_set(
+                    &*self.revocation_set.read().await,
+                    self.identity_dir.as_deref(),
+                )
+                .await
+            }
+        };
+        if matches!(
+            record.subject,
+            revocation::RevokedSubject::AgentMachineBinding(_)
+                | revocation::RevokedSubject::ShareGrant(_)
+        ) {
+            // Structural probe logs a blocked legacy store at the same
+            // rate limit, without rewriting its unchanged record set.
+            if let Some(path) = storage::revocation_path(self.identity_dir.as_deref()) {
+                let _ = storage::probe_revocation_store(&path, storage::RevocationStore::V1).await;
+            }
         }
 
         // 3. Evict from caches.
@@ -11742,19 +14190,30 @@ impl Agent {
 
         // 4. Publish on gossip (best-effort — local enforcement happens regardless).
         if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.all_records();
+            let (topic, records) = {
+                let set = self.revocation_set.read().await;
+                match &record.subject {
+                    revocation::RevokedSubject::AgentMachineBinding(_) => {
+                        (REVOCATION_V2_TOPIC, set.binding_records())
+                    }
+                    revocation::RevokedSubject::ShareGrant(_) => {
+                        (REVOCATION_V3_TOPIC, set.share_grant_records())
+                    }
+                    _ => (REVOCATION_TOPIC, set.all_records()),
+                }
+            };
             match bincode::serialize(&records) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = rt
                         .pubsub()
-                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .publish(topic.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
                 _ => {}
             }
         }
 
-        Ok(())
+        persisted
     }
 
     // === ADR-0043: agent key-move ceremony ===
@@ -11838,7 +14297,9 @@ impl Agent {
     /// step calls this and propagates the failure; the in-memory append
     /// that preceded it is idempotent on retry (identical bytes →
     /// identical fold), so the operator re-runs the command and the
-    /// persist retries. `Ok(())` means every file encoded AND wrote.
+    /// persist retries. An unreadable v2 revocation file is logged and
+    /// preserved without failing the ceremony: bundle tombstones rebuild
+    /// from `move-bundles.bin`. The three move-state files remain required.
     ///
     /// # Errors
     ///
@@ -11862,7 +14323,15 @@ impl Agent {
         ] {
             let bytes = bytes?;
             if let Some(path) = self.move_file_path(name) {
-                storage::save_private_bytes_to(&path, bytes).await?;
+                if let Err(e) = storage::save_private_bytes_to(&path, bytes).await {
+                    if name != "revocations-v2.bin"
+                        || !storage::revocation_persistence_is_blocked(&e)
+                    {
+                        return Err(e);
+                    }
+                    // The guard already emitted the rate-limited
+                    // persistence_blocked WARN for this v2 write.
+                }
             }
         }
         Ok(())
@@ -11911,7 +14380,11 @@ impl Agent {
                 }
             }
             let is_local = agent_id == local_agent;
-            let known_machine = machine_of.get(&agent_id).copied();
+            // ADR 0115 §2: an owner-signed placement names a
+            // machine only when an authority store confirms it.
+            let known_machine = self
+                .authorized_routing_machine(&agent_id, machine_of.get(&agent_id).copied())
+                .await;
             let placement = if is_local {
                 key_move::Placement::Roaming
             } else if record.mode == profile::CertMode::Acp {
@@ -12827,7 +15300,8 @@ impl Agent {
     ///
     /// # Errors
     /// Returns an error when no owner key is loaded or the authority
-    /// check rejects the record.
+    /// check rejects the record. A [`error::IdentityError::Storage`] error can
+    /// be returned after the record was applied and published: it is not durable.
     pub async fn revoke_binding(
         &self,
         agent: &identity::AgentId,
@@ -12904,25 +15378,6 @@ impl Agent {
         )?;
         self.apply_and_publish_revocation(record.clone(), Some(&cert))
             .await?;
-        // v2 carrier: binding records ride their own topic + file.
-        if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.binding_records();
-            if let Ok(bytes) = bincode::serialize(&records) {
-                if !bytes.is_empty() {
-                    let _ = rt
-                        .pubsub()
-                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
-                }
-            }
-        }
-        if let Ok(v2) = self.revocation_set.read().await.to_bytes_v2() {
-            if let Some(path) = self.move_file_path("revocations-v2.bin") {
-                if let Err(e) = storage::save_private_bytes_to(&path, v2).await {
-                    tracing::warn!("revocations-v2 persist failed: {e}");
-                }
-            }
-        }
         Ok(record)
     }
 
@@ -13234,7 +15689,25 @@ impl Agent {
             tokio::select! {
                 Some(msg) = sub.recv() => {
                     if let Ok(ann) = deserialize_identity_announcement(&msg.payload) {
-                        if ann.verify().is_ok() && ann.agent_id == agent_id {
+                        // ADR 0115 §1: only class A or B may write the cache,
+                        // and only past the identity listener's gates
+                        // (timestamp, trust, revocation, ADR-0043 pairing,
+                        // certificate expiry).
+                        let class = if ann.verify().is_ok() && ann.agent_id == agent_id {
+                            identity_authority::classify_announcement(
+                                &msg,
+                                &ann,
+                                &self.revocation_set,
+                                &self.authenticated_machine_bindings,
+                                self.peer_evidence(),
+                            )
+                            .await
+                        } else {
+                            identity_authority::AnnouncementClass::Unauthenticated
+                        };
+                        if class.grants_authority()
+                            && self.shard_announcement_passes_listener_gates(&ann).await
+                        {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
@@ -13243,6 +15716,11 @@ impl Agent {
                                 allow_local_scope,
                             );
                             let addrs = filtered.clone();
+                            let cert_not_after =
+                                ann.agent_certificate.as_ref().and_then(|c| c.not_after());
+                            let cert_digest = ann.agent_certificate.as_ref().map(|_| {
+                                announce_v3::cert_digest(&ann.user_id, &ann.agent_certificate)
+                            });
                             let discovered_agent = DiscoveredAgent {
                                 agent_id: ann.agent_id,
                                 machine_id: ann.machine_id,
@@ -13257,17 +15735,32 @@ impl Agent {
                                 is_coordinator: ann.is_coordinator,
                                 reachable_via: ann.reachable_via.clone(),
                                 relay_candidates: ann.relay_candidates.clone(),
-                                cert_not_after: ann
-                                    .agent_certificate
-                                    .as_ref()
-                                    .and_then(|c| c.not_after()),
+                                cert_not_after,
                                 agent_certificate: ann.agent_certificate.clone(),
                                 agent_public_key: ann.agent_public_key.clone(),
                                 self_name: ann.self_name.clone(),
-                                cert_digest: None,
+                                cert_digest,
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
+                            // ADR 0115 §3: an agent-authenticated
+                            // shard beat, past the listener's gates above,
+                            // records the announced binding and its digest,
+                            // so a shard-only subject keeps issuer-revocation
+                            // provenance. The store registration comes before
+                            // the discovery merge (x0x #1150 r7f).
+                            if class == identity_authority::AnnouncementClass::AgentAuthenticated {
+                                record_announced_machine_binding(
+                                    &self.announced_machine_bindings,
+                                    Some(&self.announce_blob_cache),
+                                    ann.agent_id,
+                                    ann.machine_id,
+                                    ann.announced_at,
+                                    cert_digest,
+                                    cert_not_after,
+                                )
+                                .await;
+                            }
                             upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
@@ -13292,7 +15785,9 @@ impl Agent {
                     machine_id: identity::MachineId([0u8; 32]),
                     user_id: None,
                     addresses: addrs.clone(),
-                    announced_at: now,
+                    // ADR 0115 §1: an unsigned rendezvous hint never
+                    // out-ranks a signed beat. Liveness reads `last_seen`.
+                    announced_at: 0,
                     last_seen: now,
                     machine_public_key: Vec::new(),
                     nat_type: None,
@@ -13964,6 +16459,7 @@ impl Agent {
         let dm_inbox_service = std::sync::Arc::clone(&self.dm_inbox_service);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let announced_for_direct = std::sync::Arc::clone(&self.announced_machine_bindings);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -14037,9 +16533,22 @@ impl Agent {
                     &sender,
                 )
                 .await;
+                // ADR 0115 §2: the routing entry stands for the
+                // sender only when an authority store confirms its machine.
+                let announced = announced_for_direct.read().await.peek(&sender);
                 let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    raw_delivery_from_ingress(cache.get(&sender), registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
+                    let entry = cache.get(&sender).filter(|entry| {
+                        identity_authority::confirms(entry.machine_id, announced, registry, || {
+                            evidence_ready
+                                && evidence.confirms_pairing(
+                                    sender,
+                                    entry.machine_id,
+                                    dm_capability::now_unix_ms(),
+                                )
+                        })
+                    });
+                    raw_delivery_from_ingress(entry, registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
@@ -14410,7 +16919,7 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::NetworkResult<identity::MachineId> {
-        let (machine_id, cert_not_after) = {
+        let (routing, cert_not_after) = {
             let cache = self.identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
@@ -14419,6 +16928,14 @@ impl Agent {
                     agent_id: agent_id.0,
                 })?
         };
+        // ADR 0115 §2: a route counts only when an authority
+        // store confirms it.
+        let machine_id = self
+            .authorized_routing_machine(agent_id, Some(routing))
+            .await
+            .ok_or(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            })?;
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
@@ -14544,6 +17061,36 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            call_caller,
+            false,
+        )
+        .await
+    }
+
+    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
+    /// peers gain evidence admission; every other check remains unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_peer_machine_inbound_for_evidence(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        call_caller: Option<&identity::AgentId>,
+        evidence_only: bool,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -14621,9 +17168,18 @@ impl Agent {
                     grant_only.push(*agent_id);
                 }
             }
+            let evidence_relationship = evidence_only
+                && pair.decision == trust::TrustDecision::Unknown
+                && evidence_wire::unknown_relationship(
+                    discovery_cache,
+                    owner_trust,
+                    agent_id,
+                    machine_id,
+                )
+                .await;
             let trust_decision = Some(
                 pair.decision
-                    .with_owner_trust(has_connect_grant || has_call_grant),
+                    .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
             );
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
@@ -14688,8 +17244,30 @@ impl Agent {
             });
         }
 
-        // Gate cleared — keep the ordered surviving agent list for the
-        // stream/lane handle.
+        // ADR 0115 §2: a routing entry alone never makes an
+        // agent occupy this machine. Every routed agent above can still
+        // deny (fail-closed, #192); only an agent that an authority store
+        // confirms on this machine is admitted.
+        let mut confirmed: Vec<identity::AgentId> = Vec::with_capacity(surviving.len());
+        for agent_id in &surviving {
+            if owner_trust.authority_confirms(agent_id, machine_id).await {
+                confirmed.push(*agent_id);
+            }
+        }
+        if confirmed.is_empty() {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                outcome = "deny_not_verified",
+                "inbound traffic denied — no agent on the machine has an authenticated pairing"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
+        }
+
+        // Connect-ACL gate input: every surviving routed agent stays listed
+        // (fail-closed second layer below).
         let agents: Vec<identity::AgentId> = surviving;
 
         // Connect-ACL gate (#131 × #132): with an Enabled policy every
@@ -14722,7 +17300,9 @@ impl Agent {
             );
             return Err(e);
         }
-        Ok(agents)
+        // Gate cleared — the ordered, authority-confirmed agent list for
+        // the stream/lane handle.
+        Ok(confirmed)
     }
 
     /// Open the unreliable datagram lane to a verified, trusted peer
@@ -14929,7 +17509,8 @@ impl Agent {
     }
 
     /// Keep the main gate-first path independent of strangers' prefix reads.
-    /// Known denials never get a pre-identity exception, including EvidenceV1.
+    /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
+    /// All other denials remain on the shared gate.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -14958,11 +17539,35 @@ impl Agent {
                 owner_trust,
                 machine_id,
             )
-            .await
-            .ok()?;
+            .await;
+            let agents = match agents {
+                Ok(agents) => agents,
+                Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                    Self::gate_peer_machine_inbound_for_evidence(
+                        discovery_cache,
+                        contact_store,
+                        revocation_set,
+                        move_state,
+                        connect_policy,
+                        owner_trust,
+                        machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .ok()?;
+                    return Some(streams::InboundAdmission {
+                        agents: None,
+                        prefix: Some(limits.admit_prefix(*machine_id)?),
+                        evidence_only: true,
+                    });
+                }
+                Err(_) => return None,
+            };
             return Some(streams::InboundAdmission {
                 agents: Some(agents),
                 prefix: None,
+                evidence_only: false,
             });
         }
         if owner_trust
@@ -14972,11 +17577,13 @@ impl Agent {
             return Some(streams::InboundAdmission {
                 agents: None,
                 prefix: None,
+                evidence_only: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
+            evidence_only: false,
         })
     }
 
@@ -15007,8 +17614,8 @@ impl Agent {
         evidence: std::sync::Arc<peer_evidence::EvidenceRuntime>,
         admission: streams::InboundAdmission,
         machine_id: identity::MachineId,
-        send: ant_quic::HighLevelSendStream,
-        mut recv: ant_quic::HighLevelRecvStream,
+        send: network::StreamSend,
+        mut recv: network::StreamRecv,
     ) {
         let protocol = match tokio::time::timeout(
             streams::PREFIX_READ_TIMEOUT,
@@ -15046,6 +17653,33 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
+            // Recheck live denials and relationships after the prefix wait.
+            // A previously known machine cannot turn into a stranger bypass
+            // if its discovery entries disappear during that wait.
+            let known = discovery_cache
+                .read()
+                .await
+                .values()
+                .any(|a| a.machine_id == machine_id);
+            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
+            if machine_revoked
+                || ((known || admission.agents.is_some() || admission.evidence_only)
+                    && Self::gate_peer_machine_inbound_for_evidence(
+                        &discovery_cache,
+                        &contact_store,
+                        &revocation_set,
+                        &move_state,
+                        &connect_policy,
+                        &owner_trust,
+                        &machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .is_err())
+            {
+                return;
+            }
             if let (Some(sender), Some(lease)) = (
                 incoming.registered_sender(protocol),
                 evidence_limits.admit(
@@ -15151,7 +17785,8 @@ impl Agent {
     /// Called automatically by [`Agent::join_network`]. The loop is the sole
     /// transport acceptor. Known peers clear the identity and ACL gates before
     /// any prefix read. Verified enrollment bypasses the pre-identity pool;
-    /// strangers alone use its two-per-machine, 32-total slots. Body bytes
+    /// strangers and Unknown relationship peers use its two-per-machine,
+    /// 32-total slots. Body bytes
     /// reach only the selected acceptor after protocol admission.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
@@ -15509,13 +18144,21 @@ impl Agent {
         .await;
     }
 
-    /// # Arguments
+    /// ADR 0115: the LOCAL-USER PIN authority source.
     ///
-    /// * `agent` - The agent entry to insert.
-    #[doc(hidden)]
-    pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
-        let agent_id = agent.agent_id;
-        let machine_id = agent.machine_id;
+    /// `POST /agent/card/import` (local, token-authenticated) calls this for
+    /// a card the local user chose to import. It writes the routing entry
+    /// (discovery and machine caches), the DM registry and, for a non-zero
+    /// machine, the authenticated binding (agent, machine), so the strict
+    /// §2 readers accept the pinned pair. The binding is newest-wins: a
+    /// stale card never rolls back a fresher binding.
+    ///
+    /// Besides class A announcements and ADR 0021 origin attestations, this
+    /// is the only writer of the authenticated-binding store. No network
+    /// input reaches it; only the local user's card import calls it.
+    pub(crate) async fn pin_card_binding(&self, agent: DiscoveredAgent) {
+        let (agent_id, machine_id, pinned_at) =
+            (agent.agent_id, agent.machine_id, agent.announced_at);
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
         upsert_discovered_agent(
             &self.identity_discovery_cache,
@@ -15523,20 +18166,94 @@ impl Agent {
             agent,
         )
         .await;
+        self.record_pinned_pairing(agent_id, machine_id, pinned_at)
+            .await;
+    }
 
-        if machine_id.0 != [0u8; 32] {
-            self.direct_messaging
-                .register_agent(agent_id, machine_id)
-                .await;
-            if let Some(ref network) = self.network {
-                let ant_peer_id = ant_quic::PeerId(machine_id.0);
-                if network.is_connected(&ant_peer_id).await {
-                    self.direct_messaging
-                        .mark_connected(agent_id, machine_id)
-                        .await;
-                }
+    /// The authenticated binding and DM-registry writes of
+    /// [`Self::pin_card_binding`] and the test seed. A zero machine writes
+    /// nothing.
+    async fn record_pinned_pairing(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+        pinned_at: u64,
+    ) {
+        if machine_id.0 == [0u8; 32] {
+            return;
+        }
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent_id,
+            machine_id,
+            pinned_at,
+        )
+        .await;
+        self.direct_messaging
+            .register_agent(agent_id, machine_id)
+            .await;
+        if let Some(ref network) = self.network {
+            let ant_peer_id = ant_quic::PeerId(machine_id.0);
+            if network.is_connected(&ant_peer_id).await {
+                self.direct_messaging
+                    .mark_connected(agent_id, machine_id)
+                    .await;
             }
         }
+    }
+
+    /// Test-only seed: insert `agent` as if a class A announcement had
+    /// delivered it. It writes what [`Self::pin_card_binding`] writes
+    /// (routing, DM registry and the authenticated binding for a non-zero
+    /// machine), and under `cfg(test)` also the announced-binding record.
+    /// Integration tests (built without `cfg(test)`) rely on the
+    /// authenticated binding. Production code calls
+    /// [`Self::pin_card_binding`], never this seam.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent` - The agent entry to insert.
+    #[doc(hidden)]
+    pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
+        let agent_id = agent.agent_id;
+        let machine_id = agent.machine_id;
+        let seeded_at = agent.announced_at;
+        // ADR 0115 §3: like V2 ingest, a seeded certificate commits to its
+        // own digest when the seed names none (test-only class A seed).
+        #[cfg(test)]
+        let (announced_at, cert_digest, inline_not_after) = (
+            agent.announced_at,
+            agent.cert_digest.or_else(|| {
+                agent
+                    .agent_certificate
+                    .as_ref()
+                    .map(identity_authority::certificate_digest)
+            }),
+            agent.cert_not_after,
+        );
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
+        upsert_discovered_agent(
+            &self.identity_discovery_cache,
+            &self.verified_cert_tx,
+            agent,
+        )
+        .await;
+        // x0x #1150 (r7d): pinned authority comes from gated announcement
+        // ingest only. This unchecked seam writes it in test builds only.
+        #[cfg(test)]
+        record_announced_machine_binding(
+            &self.announced_machine_bindings,
+            None,
+            agent_id,
+            machine_id,
+            announced_at,
+            cert_digest,
+            inline_not_after,
+        )
+        .await;
+
+        self.record_pinned_pairing(agent_id, machine_id, seeded_at)
+            .await;
     }
 
     /// Test-only: mark `agent_id` as a `Trusted` contact so
@@ -17025,22 +19742,42 @@ impl AgentBuilder {
             }
             // Ad-hoc binding records (v2 file) merge into the same set.
             if let Some(dir) = dir {
-                if let Ok(bytes) = tokio::fs::read(dir.join("revocations-v2.bin")).await {
-                    match revocation::RevocationSet::from_bytes_v2(&bytes) {
-                        Ok(v2) => revoked_for_load.merge_v2(v2),
-                        Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v2)) = storage::read_revocation_store(
+                    &dir.join("revocations-v2.bin"),
+                    storage::RevocationStore::V2,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v2(v2);
                 }
                 // ADR-0070: share-grant revocations (v3 file).
-                if let Ok(bytes) = tokio::fs::read(dir.join(SHARE_GRANT_REVOCATIONS_FILE)).await {
-                    match revocation::RevocationSet::from_bytes_v3(&bytes) {
-                        Ok(v3) => revoked_for_load.merge_v3(v3),
-                        Err(e) => tracing::warn!("revocations-v3.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v3)) = storage::read_revocation_store(
+                    &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
+                    storage::RevocationStore::V3,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v3(v3);
                 }
             }
             (state, logs_corrupt)
         };
+        // ADR 0115 §5: a persisted record whose `revoked_at`
+        // is beyond the future-skew bound never expires; drop it at load.
+        {
+            let dropped = revocation_set
+                .write()
+                .await
+                .drop_future_records(Agent::unix_timestamp_secs());
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "dropped persisted revocations with a far-future revoked_at (ADR 0115 §5)"
+                );
+            }
+        }
         let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
         let move_state_load_failed =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
@@ -17056,6 +19793,19 @@ impl AgentBuilder {
         });
         let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
             contacts::ContactStore::new(contacts_path),
+        ));
+        // ADR 0115 D214: quarantine pre-upgrade issuer
+        // revocations and bundle tombstones before anything reads them.
+        let revocation_quarantine = std::sync::Arc::new(tokio::sync::Mutex::new(
+            identity_authority::quarantine::start(
+                identity_dir_or_home.as_deref(),
+                identity.user_id(),
+                &revocation_set,
+                &move_state,
+                &contact_store,
+                Agent::unix_timestamp_secs(),
+            )
+            .await,
         ));
 
         // X0X-0070b: spawn the inbound RelayedDm listener so this Agent can
@@ -17121,6 +19871,12 @@ impl AgentBuilder {
             identity.user_id(),
             std::sync::Arc::clone(&authenticated_machine_bindings),
         );
+        // ADR 0115 §2: the announced-binding store is an
+        // authority store for every OwnerTrust-held reader.
+        let announced_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        owner_trust.install_announced_bindings(std::sync::Arc::clone(&announced_machine_bindings));
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
@@ -17185,8 +19941,27 @@ impl AgentBuilder {
                                 .into(),
                         )
                     })?;
-                let service = history::HistoryService::start(cfg, &data_dir)
-                    .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
+                // `HistoryService::start` stays synchronous (public 0.46.x
+                // API), but its `Store::open` — migrations plus the
+                // canonical-id backfill — can block for minutes on a large
+                // history, so it runs on the blocking pool with owned
+                // config/path values (issue #1263 part 2: the open never
+                // parks an async worker). Only the NOT-YET-STARTED opened
+                // store crosses the `await`: if this build future is
+                // cancelled while the open runs, the runtime drops that
+                // value when the task completes — closing the store —
+                // instead of leaking an unowned writer/reaper holding the
+                // exclusive lock (review round 2, R2-E). The tasks are
+                // started here, after the `await`, where the service has an
+                // owner.
+                let start_cfg = cfg.clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    history::HistoryService::open(&start_cfg, &data_dir)
+                })
+                .await
+                .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?
+                .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
+                let service = history::HistoryService::start_tasks(opened);
                 let handle = service.handle();
                 (Some(service), Some(handle))
             }
@@ -17218,6 +19993,8 @@ impl AgentBuilder {
             machine_kem,
             identity_discovery_cache,
             authenticated_machine_bindings,
+            announced_machine_bindings,
+            revocation_quarantine,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -19335,10 +22112,6 @@ impl KvStoreHandle {
         self.sync.state_sync_snapshot()
     }
 
-    pub(crate) async fn retained_content_digest_hex(&self) -> String {
-        hex::encode(self.sync.read().await.served_digest())
-    }
-
     pub(crate) async fn legacy_import_conflicts(&self, source: &kv::KvStore) -> Vec<String> {
         self.sync.read().await.legacy_import_conflicts(source)
     }
@@ -19371,6 +22144,37 @@ impl KvStoreHandle {
         self.sync.wait_receive_merged_for_test().await;
     }
 
+    /// Ask the group once for current state after this store's group key
+    /// re-armed (#1266). See `KvStoreSync::request_state_repair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when a
+    /// publish fails. Otherwise returns the number of requests published.
+    pub(crate) async fn request_state_repair(&self) -> error::Result<u8> {
+        self.sync
+            .request_state_repair()
+            .await
+            .map_err(|error| kv_storage_err(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.sync.wait_receive_rejected_for_test().await;
+    }
+
+    /// Stop only the bootstrap requester, as a converged requester would.
+    #[cfg(test)]
+    pub(crate) fn silence_bootstrap_for_test(&self) {
+        self.sync.silence_bootstrap();
+    }
+
+    /// A weak reference to this handle's sync, to prove its release.
+    #[cfg(test)]
+    pub(crate) fn sync_weak_for_test(&self) -> std::sync::Weak<kv::KvStoreSync> {
+        std::sync::Arc::downgrade(&self.sync)
+    }
+
     #[cfg(test)]
     pub(crate) fn receive_section_active_for_test(&self) -> bool {
         self.sync.receive_section_active_for_test()
@@ -19398,45 +22202,6 @@ impl KvStoreHandle {
     #[cfg(test)]
     pub(crate) fn clear_retained_publish_failure_for_test(&self) {
         self.sync.clear_retained_publish_failure_for_test();
-    }
-
-    /// Merge one validated local legacy Signed-store image into this group
-    /// store, persist the result, and retain current-writer endorsement.
-    pub(crate) async fn import_legacy_signed_history(
-        &self,
-        source: &kv::KvStore,
-        source_owner: identity::AgentId,
-    ) -> error::Result<()> {
-        self.sync
-            .authorize_local_write(&self.agent_id)
-            .await
-            .map_err(|error| match error {
-                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
-                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
-            })?;
-        self.sync.ensure_durable().await.map_err(|error| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv store durability degraded before legacy import: {error}"
-            )))
-        })?;
-        {
-            let mut destination = self.sync.write().await;
-            destination
-                .merge_legacy_signed_history(source, source_owner, self.agent_id, self.peer_id)
-                .map_err(|error| match error {
-                    kv::KvError::Unauthorized(message) => {
-                        error::IdentityError::Unauthorized(message)
-                    }
-                    other => {
-                        error::IdentityError::Storage(std::io::Error::other(other.to_string()))
-                    }
-                })?;
-        }
-        self.sync.persist().await.map_err(|error| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "legacy import applied in memory but destination persistence failed: {error}"
-            )))
-        })
     }
 
     /// Check a cached encrypted handle against its current authoritative group.
@@ -20669,6 +23434,404 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+
+    mod unreadable_revocation_files_1116 {
+        use super::*;
+
+        fn agent_builder(dir: &std::path::Path) -> AgentBuilder {
+            Agent::builder()
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_identity_dir(dir)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_user_key(identity::UserKeypair::generate().expect("owner key"))
+                .with_peer_cache_disabled()
+        }
+
+        async fn load_agent(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
+                .build()
+                .await
+                .expect("fail-open agent load")
+        }
+
+        async fn load_agent_with_gossip(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("fail-open agent load with loopback gossip")
+        }
+
+        /// A local durability refusal must still enforce, evict and hand
+        /// the revocation to its gossip carrier before returning the error.
+        #[tokio::test]
+        async fn blocked_local_revocations_still_enforce_and_publish_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                tokio::fs::write(dir.path().join(name), b"unreadable")
+                    .await
+                    .unwrap();
+            }
+            let agent = load_agent_with_gossip(dir.path()).await;
+            let owner = agent.identity.user_keypair().unwrap();
+            let cert = agent.identity.agent_certificate().unwrap();
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
+            let subjects = [
+                (
+                    revocation::RevokedSubject::Agent(agent.agent_id()),
+                    REVOCATION_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::AgentMachineBinding(
+                        revocation::AgentMachineBinding {
+                            agent: agent.agent_id(),
+                            machine: agent.machine_id(),
+                            move_epoch: 1,
+                        },
+                    ),
+                    REVOCATION_V2_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                        grant_id: [0x33; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: u64::MAX,
+                    }),
+                    REVOCATION_V3_TOPIC,
+                ),
+            ];
+            for (subject, topic) in subjects {
+                let _subscription = pubsub.subscribe(topic.to_string()).await;
+                let before = pubsub.stats().publish_total;
+                let record = revocation::RevocationRecord::sign(
+                    subject,
+                    owner.public_key(),
+                    owner.secret_key(),
+                    Agent::unix_timestamp_secs(),
+                    None,
+                )
+                .unwrap();
+                let hash = record.record_hash();
+                let err = agent
+                    .apply_and_publish_revocation(record, Some(cert))
+                    .await
+                    .unwrap_err();
+                assert!(storage::revocation_persistence_is_blocked(&err));
+                assert!(agent.revocation_set.read().await.contains_hash(&hash));
+                assert_eq!(
+                    pubsub.stats().publish_total,
+                    before + 1,
+                    "blocked revoke must still publish"
+                );
+            }
+            assert!(agent
+                .contact_store
+                .read()
+                .await
+                .is_blocked(&agent.agent_id()));
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                    b"unreadable"
+                );
+            }
+            agent.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn unchanged_v1_does_not_fail_binding_or_share_grant_revokes_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("revocations.bin");
+            tokio::fs::write(&path, b"unreadable v1").await.unwrap();
+            let agent = load_agent_with_gossip(dir.path()).await;
+            let owner = agent.identity.user_keypair().unwrap();
+            let cert = agent.identity.agent_certificate().unwrap();
+            let subjects = [
+                (
+                    revocation::RevokedSubject::AgentMachineBinding(
+                        revocation::AgentMachineBinding {
+                            agent: agent.agent_id(),
+                            machine: agent.machine_id(),
+                            move_epoch: 1,
+                        },
+                    ),
+                    REVOCATION_V2_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                        grant_id: [0x44; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: u64::MAX,
+                    }),
+                    REVOCATION_V3_TOPIC,
+                ),
+            ];
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
+            for (subject, topic) in subjects {
+                let mut subscription = pubsub.subscribe(topic.to_string()).await;
+                let before = pubsub.stats().publish_total;
+                let record = revocation::RevocationRecord::sign(
+                    subject.clone(),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    Agent::unix_timestamp_secs(),
+                    None,
+                )
+                .unwrap();
+                let mut hash = record.record_hash();
+                if matches!(subject, revocation::RevokedSubject::ShareGrant(_)) {
+                    let issuer = identity::AgentKeypair::from_bytes(
+                        owner.public_key().as_bytes(),
+                        owner.secret_key().as_bytes(),
+                    )
+                    .unwrap();
+                    let published = agent
+                        .revoke(&issuer, subject.clone(), None, None)
+                        .await
+                        .unwrap();
+                    hash = published.record_hash();
+                } else {
+                    agent
+                        .apply_and_publish_revocation(record, Some(cert))
+                        .await
+                        .unwrap();
+                }
+                assert!(agent.revocation_set.read().await.contains_hash(&hash));
+                assert_eq!(pubsub.stats().publish_total, before + 1);
+                let message = tokio::time::timeout(
+                    std::time::Duration::from_secs(5 * u64::from(test_time_multiplier())),
+                    subscription.recv(),
+                )
+                .await
+                .expect("revocation must reach its own local topic subscription")
+                .expect("topic subscription remains open");
+                assert_eq!(message.topic, topic);
+                let published: Vec<revocation::RevocationRecord> =
+                    bincode::deserialize(&message.payload)
+                        .expect("decode revocation topic payload");
+                assert_eq!(published.len(), 1, "only this topic's subject is published");
+                assert_eq!(published[0].record_hash(), hash);
+                let (name, restored) = match subject {
+                    revocation::RevokedSubject::AgentMachineBinding(_) => {
+                        let name = "revocations-v2.bin";
+                        (
+                            name,
+                            revocation::RevocationSet::from_bytes_v2(
+                                &tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => {
+                        let name = SHARE_GRANT_REVOCATIONS_FILE;
+                        (
+                            name,
+                            revocation::RevocationSet::from_bytes_v3(
+                                &tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                };
+                assert!(restored.contains_hash(&hash), "subject persisted in {name}");
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v1");
+            agent.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn key_move_step_succeeds_with_unreadable_v2_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("revocations-v2.bin");
+            tokio::fs::write(&path, b"unreadable v2").await.unwrap();
+            let agent = load_agent(dir.path()).await;
+            assert_eq!(agent.move_mint_placements().await.unwrap(), 1);
+            assert!(agent
+                .move_state
+                .read()
+                .await
+                .placement(&agent.agent_id())
+                .is_some());
+            let restored = key_move::MoveState::logs_from_bytes(
+                &tokio::fs::read(dir.path().join("moves.bin")).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored.log(&agent.agent_id()).len(), 1);
+            for name in ["move-bundles.bin", "placement-blobs.bin"] {
+                assert!(tokio::fs::read(dir.path().join(name)).await.is_ok());
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v2");
+
+            // Only a blocked v2 is tolerated; required move journals still fail.
+            tokio::fs::remove_file(dir.path().join("moves.bin"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir(dir.path().join("moves.bin"))
+                .await
+                .unwrap();
+            assert!(agent.persist_move_state().await.is_err());
+            agent.shutdown().await;
+        }
+
+        /// #1116 / ADR 0085 rule 4: the real startup load and local binding
+        /// revocation writer must preserve an unreadable v2 binding-tombstone file.
+        #[tokio::test]
+        async fn unreadable_v2_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("revocations-v2.bin");
+            let garbage = b"unreadable v2 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v2 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let cert = agent.identity().agent_certificate().expect("agent cert");
+            let own = agent.agent_id();
+            let machine = agent.machine_id();
+            let placement = key_move::PlacementRecord::sign(
+                own,
+                owner.public_key().as_bytes(),
+                key_move::Placement::Roaming,
+                1,
+                1,
+                owner.secret_key(),
+            )
+            .expect("sign placement");
+            let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+            agent
+                .move_state
+                .write()
+                .await
+                .cache_placement(placement, authority)
+                .expect("cache placement for revocation epoch");
+
+            // Drive the real v2 writer on both 6544555 and the fixed tree.
+            // Check byte preservation BEFORE the result: old revoke_binding
+            // returns Ok after replacing the corrupt file with a v2 set.
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_binding_revoked(&own, &machine));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v2.bin byte-identical"
+            );
+            let refused = outcome.expect_err("v2 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v2().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            agent
+                .revoke_binding(&own, &machine, 1, None)
+                .await
+                .expect("repair unblocks v2");
+            let restored =
+                revocation::RevocationSet::from_bytes_v2(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_binding_revoked(&own, &machine));
+            agent.shutdown().await;
+        }
+
+        /// #1116 / ADR 0085 rule 4: startup ignores an unreadable v3 file,
+        /// but the real gossip ingestion/merge writer must not replace it.
+        #[tokio::test]
+        async fn unreadable_v3_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(SHARE_GRANT_REVOCATIONS_FILE);
+            let garbage = b"unreadable v3 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v3 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let grant_id = [0x11; 32];
+            let record = revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                    grant_id,
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                Agent::unix_timestamp_secs(),
+                None,
+            )
+            .expect("sign share-grant revocation");
+            let payload = bincode::serialize(&vec![record]).expect("encode v3 carrier");
+            assert!(
+                ingest_share_grant_revocations(
+                    &agent.owner_trust,
+                    &agent.revocation_set,
+                    Some(dir.path().to_path_buf()),
+                    &payload,
+                )
+                .await,
+                "real v3 ingestion must accept the new revocation"
+            );
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v3.bin byte-identical"
+            );
+            let refused =
+                persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                    .await
+                    .expect_err("v3 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v3().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                .await
+                .expect("repair unblocks v3");
+            let restored =
+                revocation::RevocationSet::from_bytes_v3(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+        }
+    }
 
     /// #1135: a gossip publish that reaches zero eager peers is counted
     /// (`publish_with_fanout` == 0 on a solo node), so
@@ -25103,6 +28266,11 @@ mod tests {
         }
         assert!(alice_network.is_connected(&bob_peer).await);
 
+        // ADR 0115 §2: the DM registry names Bob's machine only with an
+        // authority record (Bob's class A announcement in production).
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -25264,6 +28432,11 @@ mod tests {
         // Phase 4: verify a subsequent DM succeeds over the recovered
         // connection. Mark connected (the PeerConnected handler does this
         // in production, but may race with our assertion in the test).
+        // ADR 0115 §2: the registry entry counts only with an authority
+        // record (Bob's class A announcement in production).
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -25438,7 +28611,11 @@ mod tests {
              even with allow_local_scope=FALSE"
         );
 
-        // Verify DM succeeds over the recovered connection.
+        // Verify DM succeeds over the recovered connection. ADR 0115 §2:
+        // the registry entry counts only with an authority record.
+        alice
+            .record_authenticated_binding_for_testing(bob.agent_id(), bob.machine_id(), 1)
+            .await;
         alice
             .direct_messaging()
             .mark_connected(bob.agent_id(), bob.machine_id())
@@ -28607,10 +31784,46 @@ mod tests {
             },
         );
 
+        // ADR 0115 §3: without authenticated provenance the cached cert is
+        // not revocation authority.
+        let mut announced = dm_inbox::AuthenticatedMachineBindingCache::default();
+        let sources = |announced: &dm_inbox::AuthenticatedMachineBindingCache,
+                       local_user: Option<identity::UserId>| {
+            collect_subject_certs(
+                &ProvenanceSources {
+                    cache: &cache,
+                    announced,
+                    evidence: None,
+                    local_user,
+                    journal: &[],
+                },
+                [agent_id],
+            )
+        };
+        assert!(
+            !sources(&announced, None).contains_key(&agent_id),
+            "a cert no class A or B announcement committed to must not count"
+        );
+        // The local certificate journal rule: a cert the local user issued
+        // counts without any announcement.
+        assert!(
+            sources(&announced, Some(user.user_id())).contains_key(&agent_id),
+            "a cert the local user issued has provenance"
+        );
+        // A class A or B announcement records the digest it committed to.
+        announced.record_announcement(
+            agent_id,
+            identity::MachineId([1u8; 32]),
+            1,
+            Some(identity_authority::certificate_digest(&cert)),
+            cert.not_after(),
+        );
+
         // The gossip-receive path resolves subject certs from the cache.
-        let subject_certs = collect_subject_certs(&cache);
+        let subject_certs = sources(&announced, None);
         let looked_up = subject_certs
             .get(&agent_id)
+            .and_then(|certs| certs.first())
             .expect("the cache lookup must find the subject cert");
 
         let now = std::time::SystemTime::now()
@@ -29360,23 +32573,34 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         announcement
     }
 
-    async fn publish(receiver: &Agent, announcement: &IdentityAnnouncement) {
-        // A verified relay envelope is valid for discovery; the listener still
-        // verifies the subject's machine attestation and owner certificate.
-        let fanout = receiver
-            .gossip_runtime
-            .as_ref()
-            .expect("private runtime")
-            .pubsub()
-            .publish_with_fanout(
-                IDENTITY_ANNOUNCE_TOPIC.to_string(),
-                serialize_identity_announcement(announcement)
-                    .expect("wire announcement")
-                    .into(),
+    async fn publish(
+        receiver: &Agent,
+        author: &identity::AgentKeypair,
+        announcement: &IdentityAnnouncement,
+    ) {
+        // ADR 0115 §1: the subject signs its own pubsub envelope
+        // (class A), as a real daemon does; a relay envelope no longer sets
+        // discovery authority. The signed frame enters the receiver's real
+        // PubSub and listener; nothing is sent to a remote peer.
+        use crate::gossip::pubsub::test_support::{outer_v2_frame, signed_inner_v2};
+        let inner = signed_inner_v2(
+            &gossip::SigningContext::from_keypair(author),
+            IDENTITY_ANNOUNCE_TOPIC,
+            &bytes::Bytes::from(
+                serialize_identity_announcement(announcement).expect("wire announcement"),
+            ),
+        );
+        let msg_id = *blake3::hash(&inner).as_bytes();
+        receiver
+            .handle_gossip_incoming_for_test(
+                saorsa_gossip_types::PeerId::new([0x51; 32]),
+                outer_v2_frame(
+                    saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC),
+                    inner,
+                    msg_id,
+                ),
             )
-            .await
-            .expect("publish through real PubSub");
-        assert_eq!(fanout, 0, "fixture must never send to remote peers");
+            .await;
     }
 
     async fn await_certificate(
@@ -29408,6 +32632,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         .expect("sentinel certificate");
         publish(
             receiver,
+            &sentinel,
             &certified_announcement(&sentinel, machine, &cert, now),
         )
         .await;
@@ -29501,7 +32726,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
     // First prove the asynchronously installed subscription is ready.
     listener_barrier(&receiver, &pinned, &mut events, now).await;
     let denied = certified_announcement(&subject, &third, &cert, now);
-    publish(&receiver, &denied).await;
+    publish(&receiver, &subject, &denied).await;
     // FIFO delivery on one subscribed topic plus a fresh accepted sentinel
     // proves the preceding rejected announce reached the listener (no sleep).
     listener_barrier(&receiver, &pinned, &mut events, now).await;
@@ -29520,7 +32745,7 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         .contains_key(&third.machine_id()));
 
     let accepted = certified_announcement(&subject, &pinned, &cert, now);
-    publish(&receiver, &accepted).await;
+    publish(&receiver, &subject, &accepted).await;
     await_certificate(&mut events, subject.agent_id()).await;
     assert_eq!(
         receiver
@@ -29596,6 +32821,11 @@ async fn placement_mint_acp_waits_for_discovery_and_never_rewrites_existing_pin(
 
     let harness_machine = identity::MachineId([0x22; 32]);
     assert_ne!(harness_machine, agent.machine_id());
+    // ADR 0115 §2: the harness's class A announcement records its binding;
+    // a routing entry alone never names a pinned machine.
+    agent
+        .record_authenticated_binding_for_testing(harness.agent_id(), harness_machine, 1)
+        .await;
     discovered.machine_id = harness_machine;
     agent
         .identity_discovery_cache
@@ -30056,6 +33286,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &digest,
@@ -30105,6 +33336,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
         .await;
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &other_digest,
@@ -30170,6 +33402,7 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &d1,
@@ -30190,6 +33423,418 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
         entry.cert_digest,
         Some(d2),
         "#447 r2: the entry keeps its CURRENT announce digest"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a V3 announcement whose certificate
+/// blob was not yet cached records only the digest, with no expiry. When
+/// the verified blob lands, the announced binding (the pinned path's live
+/// authority) must learn the certificate's expiry, as the discovery entry
+/// does. Then a certificate that has since expired is refused.
+#[tokio::test]
+async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5d; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut entry = discovered_agent_fixture(0x5d, 100, &[], None);
+    entry.agent_id = joiner.agent_id();
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner.agent_id(),
+    )
+    .await;
+    let binding = announced.read().await.peek(&joiner.agent_id());
+    assert_eq!(
+        binding.and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "the announced binding never learned the landed certificate's expiry"
+    );
+    assert!(
+        select_pinned_binding(
+            binding,
+            None,
+            None,
+            || None,
+            not_after + identity::EXPIRY_CLOCK_SKEW_SECS + 1
+        )
+        .is_none(),
+        "an expired announced binding still resolved"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a later announcement that commits to
+/// the SAME certificate digest, but whose blob is not cached here (no
+/// inline certificate, so no expiry), must not erase the expiry already
+/// known for that unchanged evidence. The discovery entry keeps it; so must
+/// the announced binding.
+#[tokio::test]
+async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5e; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut first = discovered_agent_fixture(0x5e, 100, &[], cert.user_id().ok());
+    first.agent_id = joiner.agent_id();
+    first.cert_not_after = cert.not_after();
+    first.agent_certificate = Some(cert);
+    first.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        first,
+    )
+    .await;
+    let mut miss = discovered_agent_fixture(0x5e, 200, &[], None);
+    miss.agent_id = joiner.agent_id();
+    miss.cert_digest = Some(digest);
+    cache_verified_announcement(&machine_cache, &announced, None, &cache, &cert_events, miss).await;
+    assert_eq!(
+        announced
+            .read()
+            .await
+            .peek(&joiner.agent_id())
+            .and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "a same-digest blob miss erased the known expiry"
+    );
+}
+
+/// WHY (x0x #1150 r7e, r7f; Codex NEW 1): ingest and hydration race. An
+/// ingest of a V3 announcement whose certificate blob is not yet cached is
+/// parked between its two writes (the discovery merge and the
+/// announced-binding store write, in either order) by the test-only
+/// barrier. The verified blob lands, hydration runs to completion, and
+/// other inserts evict the blob from the 256-entry cache. Only then is the
+/// ingest released. The landed expiry must survive: correctness may not
+/// depend on the blob surviving for a second lookup. Whenever discovery
+/// holds the certificate, the announced binding must hold its expiry.
+#[tokio::test]
+async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6a; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6a, 100, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let ingest = {
+        let (machine_cache, announced, blob_cache, cache, cert_events) = (
+            std::sync::Arc::clone(&machine_cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            std::sync::Arc::clone(&cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            cache_verified_announcement(
+                &machine_cache,
+                &announced,
+                Some(&blob_cache),
+                &cache,
+                &cert_events,
+                entry,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(5), gate.reached.acquire())
+        .await
+        .expect("the ingest reached its store write")
+        .expect("barrier open");
+    parked.forget();
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner_id,
+    )
+    .await;
+    // r7f: other verified inserts evict the landed blob before the ingest
+    // resumes.
+    for i in 0..announce_blob::BLOB_CACHE_MAX_ENTRIES as u64 {
+        blob_cache
+            .insert_verified(announce_blob::CachedBlob {
+                digest: blake3::hash(&i.to_le_bytes()).into(),
+                user_id: None,
+                agent_certificate: None,
+                payload_version: 1,
+                fetched_at_unix: 1,
+            })
+            .await;
+    }
+    assert!(
+        blob_cache.get(&digest).await.is_none(),
+        "precondition: the landed blob was evicted"
+    );
+    gate.release.add_permits(1);
+    ingest.await.expect("ingest task");
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let stored = announced
+        .read()
+        .await
+        .peek(&joiner_id)
+        .and_then(|b| b.cert_not_after);
+    let discovered = cache
+        .read()
+        .await
+        .get(&joiner_id)
+        .and_then(|entry| entry.agent_certificate.as_ref().map(|c| c.not_after()));
+    if let Some(discovered) = discovered {
+        assert_eq!(
+            stored, discovered,
+            "discovery holds the landed certificate but the announced binding lost its expiry"
+        );
+    }
+    assert_eq!(
+        stored,
+        Some(not_after),
+        "a late ingest write erased the expiry its racing hydration landed"
+    );
+}
+
+/// WHY (x0x #1150 r7g, Codex r7f): a certificate is never published before
+/// its expiry. Blob verification checks the signature, not the expiry, so
+/// an already-expired certificate can land. Hydration is parked at the
+/// moment the certificate is published (after its discovery patch, before
+/// the binding's expiry update). At that moment, a pinned read of the
+/// announced-binding store, the non-blocking read the seam makes, must not
+/// accept the binding: either the expiry is already there, or the store is
+/// held and the seam refuses.
+#[tokio::test]
+async fn r7g_a_landed_certificate_is_never_published_before_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6c; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let now = Agent::unix_timestamp_secs();
+    let expired = now - 86_400;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(expired))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6c, now, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    let hydration = {
+        let (cache, announced, blob_cache, cert_events) = (
+            std::sync::Arc::clone(&cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            patch_discovery_entry_when_blob_lands(
+                &cache,
+                &announced,
+                &blob_cache,
+                &cert_events,
+                &digest,
+                &joiner_id,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), gate.reached.acquire())
+        .await
+        .expect("hydration reached the publication point")
+        .expect("barrier open");
+    parked.forget();
+    // The seam's read: try_read the store; contention refuses.
+    let seam_accepts = match announced.try_read() {
+        Ok(store) => {
+            select_pinned_binding(store.peek(&joiner_id), None, None, || None, now).is_some()
+        }
+        Err(_) => false,
+    };
+    let published = cache.try_read().ok().and_then(|discovery| {
+        discovery
+            .get(&joiner_id)
+            .map(|e| e.agent_certificate.is_some())
+    });
+    gate.release.add_permits(1);
+    hydration.await.expect("hydration task");
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    assert!(
+        !seam_accepts,
+        "the seam accepted the binding while discovery held its expired certificate \
+         (discovery published: {published:?})"
+    );
+    assert!(
+        select_pinned_binding(
+            announced.read().await.peek(&joiner_id),
+            None,
+            None,
+            || None,
+            now
+        )
+        .is_none(),
+        "after hydration the expired certificate's binding still resolves"
+    );
+}
+
+/// WHY (x0x #1150 r7e, Codex NEW 2): the announced binding keeps the
+/// certificate expiry for an unchanged digest whether or not the discovery
+/// entry survives. After the entry is evicted (TTL or the cache cap), a
+/// same-digest V3 blob miss must not erase the known expiry. A verified
+/// digest change does clear it.
+#[tokio::test]
+async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6b; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let ingest = |at: u64, digest: [u8; 32], cert: Option<identity::AgentCertificate>| {
+        let mut entry = discovered_agent_fixture(0x6b, at, &[], None);
+        entry.agent_id = joiner_id;
+        entry.cert_digest = Some(digest);
+        entry.cert_not_after = cert
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after);
+        entry.user_id = cert.as_ref().and_then(|c| c.user_id().ok());
+        entry.agent_certificate = cert;
+        entry
+    };
+    let expiry = || async {
+        announced
+            .read()
+            .await
+            .peek(&joiner_id)
+            .and_then(|b| b.cert_not_after)
+    };
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(100, digest, Some(cert)),
+    )
+    .await;
+    assert_eq!(expiry().await, Some(not_after), "control: inline expiry");
+    cache.write().await.remove(&joiner_id);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(200, digest, None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        Some(not_after),
+        "a same-digest blob miss after discovery eviction erased the retained expiry"
+    );
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(300, [0x77; 32], None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        None,
+        "control: a verified digest change clears the expiry"
     );
 }
 

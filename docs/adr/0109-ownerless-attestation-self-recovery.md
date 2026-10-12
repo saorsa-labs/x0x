@@ -1,0 +1,1 @@
+../adr-archive/0109-ownerless-attestation-self-recovery.md

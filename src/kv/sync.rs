@@ -35,6 +35,7 @@ struct StateSyncCounters {
     requests_received: AtomicU64,
     requests_answered: AtomicU64,
     retained_pages_served: AtomicU64,
+    incomplete_retained_images_pruned: AtomicU64,
     rejected_verify: AtomicU64,
     rejected_unauthorized_request: AtomicU64,
     rejected_unauthorized_control: AtomicU64,
@@ -53,6 +54,8 @@ pub struct StateSyncSnapshot {
     pub requests_received: u64,
     pub requests_answered: u64,
     pub retained_pages_served: u64,
+    /// Incomplete paged retained images discarded after the inflight TTL.
+    pub incomplete_retained_images_pruned: u64,
     pub rejected_verify: u64,
     pub rejected_unauthorized_request: u64,
     pub rejected_unauthorized_control: u64,
@@ -72,6 +75,7 @@ impl StateSyncCounters {
             requests_received: get(&self.requests_received),
             requests_answered: get(&self.requests_answered),
             retained_pages_served: get(&self.retained_pages_served),
+            incomplete_retained_images_pruned: get(&self.incomplete_retained_images_pruned),
             rejected_verify: get(&self.rejected_verify),
             rejected_unauthorized_request: get(&self.rejected_unauthorized_request),
             rejected_unauthorized_control: get(&self.rejected_unauthorized_control),
@@ -271,6 +275,21 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
 /// main topic); a request that lands inside the window is served by the
 /// requester's next scheduled attempt.
 const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
+
+/// A key-gap repair (#1266) sends one request and exactly one retry.
+const KEY_GAP_REPAIR_ATTEMPTS: u8 = 2;
+
+/// The retry waits out the holders' response cooldown, plus a margin.
+const KEY_GAP_REPAIR_RETRY_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS + 1);
+
+/// An incomplete retained image is re-requested once, then once more after
+/// every holder's response cooldown. The second attempt covers a holder that
+/// suppressed the first. Seal and publish failures use that same retry.
+const RETAINED_IMAGE_REPAIR_ATTEMPTS: u8 = 2;
+
+/// Same spacing as a key-gap repair: past `STATE_RESPONSE_COOLDOWN_SECS`.
+const RETAINED_IMAGE_REPAIR_RETRY_AFTER: std::time::Duration = KEY_GAP_REPAIR_RETRY_AFTER;
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
@@ -318,6 +337,313 @@ fn treekem_page_authorization(binding: [u8; 32], epoch: u64) -> [u8; 32] {
     hasher.update(&binding);
     hasher.update(&epoch.to_le_bytes());
     *hasher.finalize().as_bytes()
+}
+
+/// Pieces the listener needs to count a pruned retained image and ask for
+/// the full state again. ADR 0047 already republishes full state on
+/// `StateRequest`. This uses that recovery when the inflight TTL discards a
+/// partial image. It is not a post-convergence digest beacon.
+struct RetainedPruneRepair<'a> {
+    pages: &'a Arc<std::sync::Mutex<RetainedPagePool>>,
+    counters: &'a StateSyncCounters,
+    repair_state: &'a std::sync::Mutex<RetainedImageRepair>,
+    pubsub: &'a PubSubManager,
+    state_sync_topic: &'a str,
+    local_peer_id: PeerId,
+    store_id: &'a KvStoreId,
+    secure: Option<&'a SharedKvSecureContext>,
+    treekem: Option<&'a SharedTreeKemKvProtector>,
+    refresh: Option<&'a SecureRefreshFn>,
+    gate: Option<&'a GssPublicationGate>,
+    signing: Option<&'a Arc<AuthorSigning>>,
+    encrypted: bool,
+    cancel: &'a tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    retry_override: &'a AtomicU64,
+    #[cfg(test)]
+    fail_publishes: &'a AtomicU64,
+    #[cfg(test)]
+    repair_started: &'a tokio::sync::Notify,
+}
+
+/// One bounded re-request left after the inflight TTL drops a partial image.
+///
+/// Shared by the listener and a direct reap. The dropped page itself is
+/// already gone, so this is the only record that a holder may still owe us
+/// the image.
+#[derive(Debug, Default)]
+struct RetainedImageRepair {
+    /// Attempts still owed, including one that may be in flight.
+    remaining: u8,
+    /// Earliest time the next attempt may publish. `None` means immediately.
+    not_before: Option<std::time::Instant>,
+    /// A publish is in progress. A second reap must not send a duplicate.
+    in_flight: bool,
+}
+
+impl RetainedImageRepair {
+    fn note_drop(&mut self) {
+        self.remaining = RETAINED_IMAGE_REPAIR_ATTEMPTS;
+        if !self.in_flight {
+            self.not_before = None;
+        }
+    }
+
+    /// `true` when this caller owns the next publish.
+    fn claim(&mut self) -> bool {
+        if self.in_flight || self.remaining == 0 {
+            return false;
+        }
+        if self
+            .not_before
+            .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    fn finish(&mut self, retry_after: std::time::Duration) {
+        self.in_flight = false;
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 {
+            self.not_before = None;
+        } else {
+            self.not_before = Some(std::time::Instant::now() + retry_after);
+        }
+    }
+
+    fn release(&mut self) {
+        self.in_flight = false;
+    }
+
+    fn retry_deadline(&self) -> Option<std::time::Instant> {
+        if self.remaining == 0 || self.in_flight {
+            None
+        } else {
+            self.not_before
+        }
+    }
+}
+
+fn lock_retained_repair(
+    state: &std::sync::Mutex<RetainedImageRepair>,
+) -> std::sync::MutexGuard<'_, RetainedImageRepair> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+enum RetainedRepairPoll {
+    Continue,
+    Cancelled,
+}
+
+enum RepairAttempt {
+    Published,
+    SealFailed,
+    PublishFailed(String),
+}
+
+/// Count incomplete retained images the inflight TTL dropped, and publish
+/// one owed `StateRequest` when its attempt is due.
+///
+/// The dropped count is cleared by the pool, so the pending repair is what
+/// survives a holder that suppresses the request and a seal or publish that
+/// fails. Two attempts, the second after the holder cooldown. `Cancelled`
+/// means the sync token fired during the gate, seal, or publish wait.
+async fn reap_pruned_retained_images(repair: &RetainedPruneRepair<'_>) -> RetainedRepairPoll {
+    let dropped = {
+        let Ok(mut pool) = repair.pages.lock() else {
+            return RetainedRepairPoll::Continue;
+        };
+        pool.take_pruned_incomplete()
+    };
+    if dropped > 0 {
+        repair
+            .counters
+            .incomplete_retained_images_pruned
+            .fetch_add(dropped, Ordering::Relaxed);
+        tracing::warn!(
+            store_id = %repair.store_id,
+            dropped,
+            "pruned incomplete retained image after the inflight TTL; re-requesting full state"
+        );
+        lock_retained_repair(repair.repair_state).note_drop();
+    }
+    if repair.cancel.is_cancelled() {
+        return RetainedRepairPoll::Cancelled;
+    }
+    if !lock_retained_repair(repair.repair_state).claim() {
+        return RetainedRepairPoll::Continue;
+    }
+    let attempt = publish_retained_image_repair(repair);
+    tokio::pin!(attempt);
+    // Cancel drops the gate wait and a TreeKEM seal that is still acquiring
+    // its group locks. After `encrypt_message` advances the send ratchet,
+    // `TreeKemGroupStoreProtector::seal_record` keeps those locks until the
+    // snapshot write or its rollback finishes, even if this select drops.
+    tokio::select! {
+        biased;
+        () = repair.cancel.cancelled() => {
+            lock_retained_repair(repair.repair_state).release();
+            RetainedRepairPoll::Cancelled
+        }
+        result = &mut attempt => {
+            match &result {
+                RepairAttempt::Published => {
+                    repair.counters.requests_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                RepairAttempt::SealFailed => {
+                    repair
+                        .counters
+                        .request_seal_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        store_id = %repair.store_id,
+                        "retained-image re-request could not be sealed"
+                    );
+                }
+                RepairAttempt::PublishFailed(error) => {
+                    tracing::warn!(
+                        store_id = %repair.store_id,
+                        %error,
+                        "retained-image re-request publish failed"
+                    );
+                }
+            }
+            lock_retained_repair(repair.repair_state).finish(retained_repair_retry_after(repair));
+            RetainedRepairPoll::Continue
+        }
+    }
+}
+
+fn retained_repair_retry_after(repair: &RetainedPruneRepair<'_>) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let millis = repair.retry_override.load(Ordering::Relaxed);
+        if millis > 0 {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = repair;
+    RETAINED_IMAGE_REPAIR_RETRY_AFTER
+}
+
+/// Sleep long enough for `deadline` to pass without spinning when it is due.
+fn wake_after(deadline: std::time::Instant) -> std::time::Duration {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        std::time::Duration::from_millis(1)
+    } else {
+        remaining
+    }
+}
+
+/// Gate acquire, seal, and publish for one retained-image re-request.
+///
+/// The caller selects this future against cancellation. Dropping it aborts
+/// `gate.read()`, which otherwise cannot be cancelled.
+async fn publish_retained_image_repair(repair: &RetainedPruneRepair<'_>) -> RepairAttempt {
+    #[cfg(test)]
+    repair.repair_started.notify_one();
+    #[cfg(test)]
+    if repair
+        .fail_publishes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return RepairAttempt::PublishFailed("test publish failure".to_string());
+    }
+    let request = KvSyncMessage::StateRequest {
+        requester: repair.local_peer_id,
+    };
+    let _publication_guard = if repair.encrypted {
+        match repair.gate {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let publication_deadline = gss_deadline(_publication_guard.is_some());
+    let serialized = if let (Some(protector), Some(signing)) = (repair.treekem, repair.signing) {
+        KvStoreSync::seal_treekem_control(
+            protector,
+            signing,
+            repair.store_id,
+            repair.local_peer_id,
+            &request,
+        )
+        .await
+    } else if let (Some(ctx), Some(signing)) = (repair.secure, repair.signing) {
+        if repair.encrypted {
+            within_gss_deadline(
+                KvStoreSync::seal_control_message(
+                    ctx,
+                    repair.refresh,
+                    signing,
+                    repair.store_id,
+                    repair.local_peer_id,
+                    &request,
+                ),
+                publication_deadline,
+            )
+            .await
+            .flatten()
+        } else {
+            KvStoreSync::sign_public_control_message(
+                ctx,
+                repair.refresh,
+                signing,
+                repair.store_id,
+                repair.local_peer_id,
+                &request,
+            )
+            .await
+        }
+    } else {
+        bincode::serialize(&request).ok()
+    };
+    let Some(serialized) = serialized else {
+        return RepairAttempt::SealFailed;
+    };
+    let wire = bytes::Bytes::from(serialized);
+    if repair.secure.is_some() && repair.treekem.is_none() && !repair.encrypted {
+        trace_group_signed_record(
+            "state_request_publish_attempted",
+            "control",
+            repair.store_id,
+            &wire,
+        );
+    }
+    let result = publish_with_gss_deadline(
+        repair.pubsub,
+        repair.state_sync_topic.to_string(),
+        wire.clone(),
+        publication_deadline,
+    )
+    .await;
+    if repair.secure.is_some() && repair.treekem.is_none() && !repair.encrypted {
+        trace_group_signed_record(
+            if result.is_ok() {
+                "state_request_publish_api_ok"
+            } else {
+                "state_request_publish_failed"
+            },
+            "control",
+            repair.store_id,
+            &wire,
+        );
+    }
+    match result {
+        Ok(()) => RepairAttempt::Published,
+        Err(error) => RepairAttempt::PublishFailed(error.to_string()),
+    }
 }
 
 /// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
@@ -892,6 +1218,9 @@ pub struct KvStoreSync {
     /// sign-then-encrypt flow).
     author_signing: Option<std::sync::Arc<AuthorSigning>>,
     retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
+    /// Bounded re-request still owed after an incomplete retained image is
+    /// pruned. The listener and a direct reap share it.
+    retained_image_repair: Arc<std::sync::Mutex<RetainedImageRepair>>,
     #[cfg(test)]
     retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
     #[cfg(test)]
@@ -900,6 +1229,10 @@ pub struct KvStoreSync {
     /// its snapshot write. Tests use the stored permit; production has no hook.
     #[cfg(test)]
     receive_merged_test: Arc<tokio::sync::Notify>,
+    /// #1266 test barrier fired when the listener drops a sealed main-topic
+    /// record of an encrypted store without merging it.
+    #[cfg(test)]
+    receive_rejected_test: Arc<tokio::sync::Notify>,
     /// #765 test instrument: termination counter for the background loop
     /// futures `start_with_spawner` spawns for this sync. Dropping the
     /// last `KvStoreSync` reference (or a shutdown sweep's `cancel_sync`)
@@ -917,6 +1250,18 @@ pub struct KvStoreSync {
     /// #976 test hook: force the NEXT publish_delta to fail deterministically.
     #[cfg(test)]
     fail_next_publish: std::sync::atomic::AtomicBool,
+    /// Milliseconds. Zero uses the real inflight deadline.
+    #[cfg(test)]
+    retained_prune_wait_override: Arc<AtomicU64>,
+    /// Milliseconds. Zero uses `RETAINED_IMAGE_REPAIR_RETRY_AFTER`.
+    #[cfg(test)]
+    retained_repair_retry_override: Arc<AtomicU64>,
+    /// How many retained-image repair publishes to fail before a real one.
+    #[cfg(test)]
+    fail_retained_repair_publishes: Arc<AtomicU64>,
+    /// Fired when a retained-image repair publish future starts.
+    #[cfg(test)]
+    retained_repair_started: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
@@ -1093,6 +1438,7 @@ impl KvStoreSync {
             gss_publication_gate: None,
             author_signing: None,
             retained_pages: Arc::new(std::sync::Mutex::new(RetainedPagePool::default())),
+            retained_image_repair: Arc::new(std::sync::Mutex::new(RetainedImageRepair::default())),
             #[cfg(test)]
             retained_publish_test: Arc::new(std::sync::Mutex::new(
                 RetainedPublishTestState::default(),
@@ -1102,9 +1448,19 @@ impl KvStoreSync {
             #[cfg(test)]
             receive_merged_test: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
+            receive_rejected_test: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
             loop_exits: Arc::new(LoopExitTracker::default()),
             #[cfg(test)]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            retained_prune_wait_override: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            retained_repair_retry_override: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_retained_repair_publishes: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            retained_repair_started: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2411,6 +2767,8 @@ impl KvStoreSync {
         #[cfg(test)]
         let listener_receive_merged_test = Arc::clone(&self.receive_merged_test);
         #[cfg(test)]
+        let listener_receive_rejected_test = Arc::clone(&self.receive_rejected_test);
+        #[cfg(test)]
         let listener_loop_exits = Arc::clone(&self.loop_exits);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
@@ -2432,12 +2790,91 @@ impl KvStoreSync {
         let listener_served = Arc::clone(&served_evidence);
         let listener_counters = Arc::clone(&self.state_sync_counters);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
+        let listener_pubsub = Arc::clone(&self.pubsub);
+        let listener_signing = self.author_signing.clone();
+        let listener_gate = self.gss_publication_gate.clone();
+        let listener_state_topic = self.state_sync_topic();
+        let listener_repair = Arc::clone(&self.retained_image_repair);
+        #[cfg(test)]
+        let listener_prune_wait_override = Arc::clone(&self.retained_prune_wait_override);
+        #[cfg(test)]
+        let listener_retry_override = Arc::clone(&self.retained_repair_retry_override);
+        #[cfg(test)]
+        let listener_fail_publishes = Arc::clone(&self.fail_retained_repair_publishes);
+        #[cfg(test)]
+        let listener_repair_started = Arc::clone(&self.retained_repair_started);
         // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
         // termination is recorded only after this future — and every
         // capture it holds, including the persist context — is destroyed
         // (see `TrackedLoopFuture`).
         let listener_loop = async move {
             loop {
+                // #1117: a partial retained image that ages out is counted
+                // and re-requested here, before the next recv wait. The
+                // same reap runs when the inflight deadline fires with no
+                // further page. A second attempt waits out the holder
+                // cooldown. This is not the ADR 0092 digest beacon.
+                if listener_cancel.is_cancelled() {
+                    return;
+                }
+                if matches!(
+                    reap_pruned_retained_images(&RetainedPruneRepair {
+                        pages: &listener_pages,
+                        counters: &listener_counters,
+                        repair_state: &listener_repair,
+                        pubsub: listener_pubsub.as_ref(),
+                        state_sync_topic: &listener_state_topic,
+                        local_peer_id: listener_local_peer_id,
+                        store_id: &listener_store_id,
+                        secure: listener_secure.as_ref(),
+                        treekem: listener_treekem.as_ref(),
+                        refresh: listener_refresh.as_ref(),
+                        gate: listener_gate.as_ref(),
+                        signing: listener_signing.as_ref(),
+                        encrypted: listener_is_encrypted,
+                        cancel: &listener_cancel,
+                        #[cfg(test)]
+                        retry_override: listener_retry_override.as_ref(),
+                        #[cfg(test)]
+                        fail_publishes: listener_fail_publishes.as_ref(),
+                        #[cfg(test)]
+                        repair_started: listener_repair_started.as_ref(),
+                    })
+                    .await,
+                    RetainedRepairPoll::Cancelled
+                ) {
+                    return;
+                }
+                let retry_at = lock_retained_repair(&listener_repair).retry_deadline();
+                let prune_at = listener_pages
+                    .lock()
+                    .ok()
+                    .and_then(|pool| pool.next_prune_deadline());
+                #[cfg(test)]
+                let prune_override = {
+                    let millis = listener_prune_wait_override.load(Ordering::Relaxed);
+                    (millis > 0 && prune_at.is_some())
+                        .then_some(std::time::Duration::from_millis(millis))
+                };
+                let retry_wait = async {
+                    match retry_at {
+                        Some(deadline) => tokio::time::sleep(wake_after(deadline)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let prune_wait = async {
+                    #[cfg(test)]
+                    if let Some(wait) = prune_override {
+                        tokio::time::sleep(wait).await;
+                        return;
+                    }
+                    match prune_at {
+                        Some(deadline) => tokio::time::sleep(wake_after(deadline)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(retry_wait);
+                tokio::pin!(prune_wait);
                 let msg = tokio::select! {
                     // Cancel-first (#757): an unbiased select picks at
                     // random when a queued message and the cancel are both
@@ -2447,6 +2884,8 @@ impl KvStoreSync {
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
                     () = listener_cancel.cancelled() => return,
+                    () = &mut retry_wait, if retry_at.is_some() => continue,
+                    () = &mut prune_wait, if prune_at.is_some() => continue,
                     msg = sub.recv() => msg,
                 };
                 let Some(msg) = msg else {
@@ -2530,6 +2969,10 @@ impl KvStoreSync {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
+                    }
+                    #[cfg(test)]
+                    if !merged && listener_is_encrypted {
+                        listener_receive_rejected_test.notify_one();
                     }
                     continue;
                 }
@@ -3624,6 +4067,124 @@ impl KvStoreSync {
         self.bootstrap_cancel.cancel();
     }
 
+    /// Ask the group for current state after this GSS-encrypted store's key
+    /// re-armed (#1266), outside the bootstrap schedule.
+    ///
+    /// A sealed record that arrives while this replica has no secret for the
+    /// current epoch cannot be opened, so the listener drops it. Once the
+    /// bootstrap requester has converged, nothing asks for that record
+    /// again. The daemon calls this once when the store's key re-arms. It
+    /// sends the existing sealed `StateRequest`; holders answer with their
+    /// existing sealed full-state serve at the current epoch.
+    ///
+    /// Bounded: exactly `KEY_GAP_REPAIR_ATTEMPTS` requests. A holder that
+    /// served a full state less than `STATE_RESPONSE_COOLDOWN_SECS` ago
+    /// suppresses a request, and nothing on the side topic proves that this
+    /// replica received the state: a `StateServed` marker can be late, can
+    /// describe a serve this replica dropped while keyless, and an empty
+    /// holder sends one without serving anything. So the retry is
+    /// unconditional: `KEY_GAP_REPAIR_RETRY_AFTER` after the first request
+    /// (past every holder's cooldown), this re-authorizes, re-seals and
+    /// sends exactly one more. Every wait ends when the sync is cancelled
+    /// (retire, shutdown).
+    ///
+    /// Returns the number of requests published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store that is not GSS-encrypted, or when a
+    /// publish fails.
+    pub(crate) async fn request_state_repair(&self) -> Result<u8> {
+        let cancel = self.cancel.clone();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(0),
+            result = self.request_state_repair_attempts() => result,
+        }
+    }
+
+    async fn request_state_repair_attempts(&self) -> Result<u8> {
+        let (Some(ctx), Some(signing)) = (self.secure.as_ref(), self.author_signing.as_ref())
+        else {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        };
+        let (encrypted, store_id) = {
+            let store = self.store.read().await;
+            (store.is_encrypted(), *store.id())
+        };
+        if !encrypted || self.treekem_secure.is_some() {
+            return Err(KvError::Unauthorized(
+                "state repair needs a GSS-encrypted store".to_string(),
+            ));
+        }
+        let mut published = 0u8;
+        for attempt in 0..KEY_GAP_REPAIR_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+            }
+            if !self
+                .publish_state_repair_request(ctx, signing, &store_id)
+                .await?
+            {
+                break;
+            }
+            published = published.saturating_add(1);
+        }
+        Ok(published)
+    }
+
+    /// Authorize, seal and publish one `StateRequest` under the GSS
+    /// publication gate. `Ok(false)` when it cannot be sealed (the local
+    /// agent is no current reader, or holds no key).
+    async fn publish_state_repair_request(
+        &self,
+        ctx: &SharedKvSecureContext,
+        signing: &Arc<AuthorSigning>,
+        store_id: &KvStoreId,
+    ) -> Result<bool> {
+        let request = KvSyncMessage::StateRequest {
+            requester: self.local_peer_id,
+        };
+        let _publication_guard = match self.gss_publication_gate.as_ref() {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        let deadline = gss_deadline(_publication_guard.is_some());
+        let sealed = within_gss_deadline(
+            Self::seal_control_message(
+                ctx,
+                self.secure_refresh.as_ref(),
+                signing,
+                store_id,
+                self.local_peer_id,
+                &request,
+            ),
+            deadline,
+        )
+        .await
+        .flatten();
+        let Some(sealed) = sealed else {
+            self.state_sync_counters
+                .request_seal_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        publish_with_gss_deadline(
+            self.pubsub.as_ref(),
+            self.state_sync_topic(),
+            bytes::Bytes::from(sealed),
+            deadline,
+        )
+        .await
+        .map_err(|e| KvError::Gossip(format!("state repair request publish failed: {e}")))?;
+        self.state_sync_counters
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Tear down ALL of this sync's background loops (delta listener,
     /// state-request responder, bootstrap requester) WITHOUT touching topic
     /// subscriptions.
@@ -3672,6 +4233,53 @@ impl KvStoreSync {
     #[cfg(test)]
     pub(crate) async fn wait_receive_merged_for_test(&self) {
         self.receive_merged_test.notified().await;
+    }
+
+    /// Wait until the listener has dropped a sealed record of this encrypted
+    /// store without merging it (#1266). One permit is retained, as above.
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_rejected_for_test(&self) {
+        self.receive_rejected_test.notified().await;
+    }
+
+    /// Publish the sealed `StateServedV2` marker this holder's responder
+    /// sends after a serve, on its own (#1266 r3): models a marker that
+    /// reaches a requester late, separated from the state it describes.
+    #[cfg(test)]
+    pub(crate) async fn publish_served_marker_for_test(&self) -> Result<()> {
+        let (Some(ctx), Some(signing)) = (self.secure.as_ref(), self.author_signing.as_ref())
+        else {
+            return Err(KvError::SecureRecord(
+                "marker needs a sealed store".to_string(),
+            ));
+        };
+        let (store_id, digest, entry_count) = {
+            let store = self.store.read().await;
+            (
+                *store.id(),
+                store.served_digest(),
+                store.checkpoint_pairs().len() as u32,
+            )
+        };
+        let marker = KvSyncMessage::StateServedV2 {
+            responder: self.local_peer_id,
+            digest,
+            entry_count,
+        };
+        let sealed = Self::seal_control_message(
+            ctx,
+            self.secure_refresh.as_ref(),
+            signing,
+            &store_id,
+            self.local_peer_id,
+            &marker,
+        )
+        .await
+        .ok_or_else(|| KvError::SecureRecord("marker seal failed".to_string()))?;
+        self.pubsub
+            .publish(self.state_sync_topic(), bytes::Bytes::from(sealed))
+            .await
+            .map_err(|e| KvError::Gossip(format!("marker publish failed: {e}")))
     }
 
     /// This sync's background-loop termination counter (#765): the
@@ -3924,6 +4532,109 @@ impl KvStoreSync {
             &retained,
         )
         .await
+    }
+
+    /// Age every incomplete retained image past the inflight TTL and run the
+    /// production prune repair. Tests use this instead of sleeping 120s.
+    #[cfg(test)]
+    pub(crate) async fn expire_and_reap_retained_images_for_test(&self) {
+        if let Ok(mut pool) = self.retained_pages.lock() {
+            pool.expire_pending_for_test();
+        }
+        self.reap_pruned_retained_images_now().await;
+    }
+
+    #[cfg(test)]
+    async fn reap_pruned_retained_images_now(&self) {
+        let (store_id, encrypted) = {
+            let store = self.store.read().await;
+            (*store.id(), store.is_encrypted())
+        };
+        let state_sync_topic = self.state_sync_topic();
+        reap_pruned_retained_images(&RetainedPruneRepair {
+            pages: &self.retained_pages,
+            counters: &self.state_sync_counters,
+            repair_state: &self.retained_image_repair,
+            pubsub: self.pubsub.as_ref(),
+            state_sync_topic: &state_sync_topic,
+            local_peer_id: self.local_peer_id,
+            store_id: &store_id,
+            secure: self.secure.as_ref(),
+            treekem: self.treekem_secure.as_ref(),
+            refresh: self.secure_refresh.as_ref(),
+            gate: self.gss_publication_gate.as_ref(),
+            signing: self.author_signing.as_ref(),
+            encrypted,
+            cancel: &self.cancel,
+            #[cfg(test)]
+            retry_override: self.retained_repair_retry_override.as_ref(),
+            #[cfg(test)]
+            fail_publishes: self.fail_retained_repair_publishes.as_ref(),
+            #[cfg(test)]
+            repair_started: self.retained_repair_started.as_ref(),
+        })
+        .await;
+    }
+
+    /// Shorten the listener's prune sleep while an image is still pending.
+    #[cfg(test)]
+    fn set_retained_prune_wait_override_for_test(&self, wait: std::time::Duration) {
+        self.retained_prune_wait_override
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Shorten the gap before the second retained-image re-request.
+    #[cfg(test)]
+    fn set_retained_repair_retry_override_for_test(&self, wait: std::time::Duration) {
+        self.retained_repair_retry_override
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Fail the next `count` retained-image repair publishes.
+    #[cfg(test)]
+    fn fail_next_retained_repair_publishes_for_test(&self, count: u64) {
+        self.fail_retained_repair_publishes
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// Age every incomplete retained image past the inflight TTL. Does not
+    /// publish the repair; the listener's prune deadline does that.
+    #[cfg(test)]
+    fn expire_pending_retained_images_for_test(&self) {
+        if let Ok(mut pool) = self.retained_pages.lock() {
+            pool.expire_pending_for_test();
+        }
+    }
+
+    #[cfg(test)]
+    async fn seed_incomplete_retained_page_for_test(&self) {
+        let store_id = *self.store.read().await.id();
+        let image_id = [9u8; 32];
+        self.retained_pages
+            .lock()
+            .expect("retained page pool")
+            .push(
+                RetainedPageBinding {
+                    store_id: *store_id.as_bytes(),
+                    endorser: [4u8; 32],
+                    authorization: [5u8; 32],
+                    image_id,
+                },
+                RetainedPageV1::Page {
+                    image_id,
+                    index: 0,
+                    bytes: vec![1, 2, 3, 4],
+                },
+            )
+            .expect("seed incomplete retained page");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_retained_page_count_for_test(&self) -> usize {
+        self.retained_pages
+            .lock()
+            .map(|pool| pool.pending_page_count_for_test())
+            .unwrap_or(0)
     }
 
     /// True while a background receive section holds the lifecycle lock.
@@ -4891,7 +5602,7 @@ mod tests {
         policy: AccessPolicy,
     ) -> (KvStoreSync, Arc<PubSubManager>) {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let store =
             KvStore::new(store_id(1), "Test".to_string(), agent(1), policy).expect("kv store");
         let sync = KvStoreSync::new(
@@ -4905,13 +5616,22 @@ mod tests {
         (sync, pubsub)
     }
 
+    /// A fresh pubsub signer. Production pubsub always signs, and since #1114
+    /// nothing unsigned is delivered, so a fixture whose test reads the topic
+    /// (or relies on a started sync's own listener) must sign.
+    fn test_signing() -> Option<Arc<crate::gossip::SigningContext>> {
+        Some(Arc::new(crate::gossip::SigningContext::from_keypair(
+            &crate::identity::AgentKeypair::generate().expect("pubsub signer"),
+        )))
+    }
+
     #[tokio::test]
     async fn group_signed_responder_serves_tombstone_only_history() {
         let _ = tracing_subscriber::fmt::try_init();
         let node = make_node().await;
         let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
             String::new(),
@@ -5154,7 +5874,7 @@ mod tests {
     #[tokio::test]
     async fn group_signed_responder_reports_missing_retained_history() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let keypair = AgentKeypair::generate().expect("owner keypair");
         let owner = keypair.agent_id();
         let mut group = crate::groups::GroupInfo::new(
@@ -5239,6 +5959,402 @@ mod tests {
         assert_eq!(counters.requests_answered, 0);
         assert_eq!(counters.rejected_other, 0);
         sync.stop().await.expect("stop");
+    }
+
+    /// Holder and reader with one page of a multi-page retained image missing.
+    /// `prepare_reader` runs after bootstrap is silenced and before start, so
+    /// a test can arm the listener's prune-wait override first.
+    async fn start_partial_retained_image(
+        prepare_reader: impl FnOnce(&KvStoreSync),
+    ) -> (KvStoreSync, KvStoreSync) {
+        let node = make_node().await;
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "11".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(17);
+        let mut source = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            context.clone(),
+        )
+        .expect("holder store");
+        source
+            .put(
+                "kept".to_string(),
+                b"yes".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        for index in 0..17 {
+            source
+                .put(
+                    format!("large-{index}"),
+                    vec![index as u8; crate::kv::entry::MAX_INLINE_SIZE],
+                    "application/octet-stream".to_string(),
+                    peer(1),
+                )
+                .expect("large entry");
+        }
+        source.remove("kept").expect("tombstone");
+        source
+            .put(
+                "kept".to_string(),
+                b"yes".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("restore kept");
+        let target = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            context.clone(),
+        )
+        .expect("reader store");
+        let topic = "group/1117-retained-prune";
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+        let mut holder = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("holder sync");
+        holder.set_secure_context(secure.clone(), None);
+        holder.set_author_signing((*signing).clone());
+        let mut reader = KvStoreSync::new(
+            target,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(owner),
+        )
+        .expect("reader sync");
+        reader.set_secure_context(secure.clone(), None);
+        reader.set_author_signing((*signing).clone());
+        // The repair request is the only state request in this test. Both
+        // stores are group-signed, so each would otherwise bootstrap.
+        holder.silence_bootstrap();
+        reader.silence_bootstrap();
+        prepare_reader(&reader);
+        holder.start().await.expect("start holder");
+        reader.start().await.expect("start reader");
+
+        let retained = {
+            let store = holder.read().await;
+            serialize_retained_group_image(&store).expect("retained image")
+        };
+        let max_wire =
+            crate::gossip::pubsub::max_signed_v3_payload_bytes(topic).expect("wire budget");
+        let frames =
+            crate::kv::retained_paging::split_image(&retained, max_wire.saturating_sub(16 * 1024))
+                .expect("paged frames");
+        assert!(
+            frames.len() > 2,
+            "history must span a manifest and more than one data page, got {}",
+            frames.len()
+        );
+        let expected_buffered_pages = frames.len() - 2;
+        for (index, frame) in frames.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            let wire = KvStoreSync::sign_publication(
+                &holder.store,
+                &secure,
+                None,
+                &signing,
+                KvMutationKind::RetainedState,
+                peer(1),
+                frame.clone(),
+            )
+            .await
+            .expect("sign retained frame");
+            pubsub
+                .publish(topic.to_string(), bytes::Bytes::from(wire))
+                .await
+                .expect("publish retained frame");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reader.pending_retained_page_count_for_test() < expected_buffered_pages {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial retained image was not buffered");
+        assert!(
+            reader.read().await.get("large-0").is_none(),
+            "a missing page must not apply the image"
+        );
+        assert_eq!(
+            reader
+                .state_sync_snapshot()
+                .incomplete_retained_images_pruned,
+            0
+        );
+        assert_eq!(reader.state_sync_snapshot().requests_sent, 0);
+        (holder, reader)
+    }
+
+    /// #1117 prune half: one dropped page of a multi-page retained image is
+    /// counted when the inflight TTL discards it, and that drop re-requests
+    /// the full state so the replica converges. The post-convergence digest
+    /// beacon is ADR 0092 and is not this path.
+    #[tokio::test]
+    async fn incomplete_retained_image_prune_counts_the_drop_and_rerequests() {
+        let (holder, reader) = start_partial_retained_image(|_| {}).await;
+        reader.expire_and_reap_retained_images_for_test().await;
+
+        let after = reader.state_sync_snapshot();
+        assert_eq!(
+            after.incomplete_retained_images_pruned, 1,
+            "the TTL drop must be counted"
+        );
+        assert_eq!(
+            after.requests_sent, 1,
+            "the drop must re-request the full retained state"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if reader.read().await.get("large-0").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("re-requested retained image did not converge");
+        assert_eq!(
+            reader.read().await.get("large-0").expect("converged").value,
+            vec![0; crate::kv::entry::MAX_INLINE_SIZE]
+        );
+        assert!(holder.state_sync_snapshot().requests_received >= 1);
+        assert!(holder.state_sync_snapshot().requests_answered >= 1);
+    }
+
+    /// The listener's prune-deadline arm must reap with no further page.
+    /// Calling repair directly would still pass if that arm were removed.
+    #[tokio::test]
+    async fn incomplete_retained_image_prune_wakes_the_listener_on_the_deadline() {
+        let (holder, reader) = start_partial_retained_image(|reader| {
+            reader.set_retained_prune_wait_override_for_test(Duration::from_millis(20));
+        })
+        .await;
+        reader.expire_pending_retained_images_for_test();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reader.state_sync_snapshot().requests_sent == 0
+                || reader
+                    .state_sync_snapshot()
+                    .incomplete_retained_images_pruned
+                    == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener did not wake on the prune deadline");
+        let after = reader.state_sync_snapshot();
+        assert_eq!(after.incomplete_retained_images_pruned, 1);
+        assert_eq!(after.requests_sent, 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while holder.state_sync_snapshot().requests_received == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("holder did not see the listener's re-request");
+    }
+
+    /// The listener retry arm must publish the second attempt after the
+    /// first publish fails. No further page arrives, and nothing calls
+    /// `reap_pruned_retained_images_now`. Removing the retry select arm
+    /// leaves the listener blocked on recv, so this times out.
+    #[tokio::test]
+    async fn retained_image_repair_listener_retries_after_a_failed_publish() {
+        let retry_after = Duration::from_millis(400);
+        let (holder, reader) = start_partial_retained_image(|reader| {
+            reader.set_retained_prune_wait_override_for_test(Duration::from_millis(20));
+            reader.set_retained_repair_retry_override_for_test(retry_after);
+            reader.fail_next_retained_repair_publishes_for_test(1);
+        })
+        .await;
+        let started = Arc::clone(&reader.retained_repair_started);
+        reader.expire_pending_retained_images_for_test();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("listener did not attempt the first re-request");
+        let failed = reader.state_sync_snapshot();
+        assert_eq!(
+            failed.incomplete_retained_images_pruned, 1,
+            "the TTL drop must be counted before the retry"
+        );
+        assert_eq!(
+            failed.requests_sent, 0,
+            "the failed first publish must not count as sent"
+        );
+        assert_eq!(
+            holder.state_sync_snapshot().requests_received,
+            0,
+            "the holder must not see the failed first publish"
+        );
+
+        tokio::time::timeout(retry_after + Duration::from_secs(2), async {
+            while reader.state_sync_snapshot().requests_sent == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener retry arm did not publish the second request");
+        assert_eq!(reader.state_sync_snapshot().requests_sent, 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while holder.state_sync_snapshot().requests_received == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("holder did not receive the listener retry");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if reader.read().await.get("large-0").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retried retained image did not converge");
+        assert_eq!(
+            reader.read().await.get("large-0").expect("converged").value,
+            vec![0; crate::kv::entry::MAX_INLINE_SIZE]
+        );
+        tokio::time::sleep(retry_after + Duration::from_millis(200)).await;
+        assert_eq!(
+            reader.state_sync_snapshot().requests_sent,
+            1,
+            "a failed first attempt plus one retry must not send a third"
+        );
+        assert_eq!(
+            holder.state_sync_snapshot().requests_received,
+            1,
+            "the holder must see only the retry"
+        );
+        assert!(holder.state_sync_snapshot().requests_answered >= 1);
+    }
+
+    /// A published re-request can still be suppressed by the holder's
+    /// cooldown. The repair stays pending and sends one more attempt after
+    /// that window, then stops.
+    #[tokio::test]
+    async fn retained_image_repair_retries_after_the_holder_cooldown() {
+        let sync = make_sync("1117-repair-cooldown", AccessPolicy::Signed).await;
+        sync.set_retained_repair_retry_override_for_test(Duration::from_millis(80));
+        sync.seed_incomplete_retained_page_for_test().await;
+        sync.expire_and_reap_retained_images_for_test().await;
+        assert_eq!(
+            sync.state_sync_snapshot().incomplete_retained_images_pruned,
+            1
+        );
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 1);
+        sync.reap_pruned_retained_images_now().await;
+        assert_eq!(
+            sync.state_sync_snapshot().requests_sent,
+            1,
+            "the cooldown retry must not publish immediately"
+        );
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        sync.reap_pruned_retained_images_now().await;
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 2);
+        assert_eq!(
+            sync.state_sync_snapshot().incomplete_retained_images_pruned,
+            1
+        );
+        sync.reap_pruned_retained_images_now().await;
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 2);
+    }
+
+    /// A failed publish keeps the pending repair and retries after the
+    /// holder cooldown.
+    #[tokio::test]
+    async fn retained_image_repair_retries_when_publish_fails() {
+        let sync = make_sync("1117-repair-fail", AccessPolicy::Signed).await;
+        sync.set_retained_repair_retry_override_for_test(Duration::from_millis(80));
+        sync.fail_next_retained_repair_publishes_for_test(1);
+        sync.seed_incomplete_retained_page_for_test().await;
+        sync.expire_and_reap_retained_images_for_test().await;
+        assert_eq!(
+            sync.state_sync_snapshot().incomplete_retained_images_pruned,
+            1
+        );
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 0);
+        sync.reap_pruned_retained_images_now().await;
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 0);
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        sync.reap_pruned_retained_images_now().await;
+        assert_eq!(sync.state_sync_snapshot().requests_sent, 1);
+        assert_eq!(
+            sync.state_sync_snapshot().incomplete_retained_images_pruned,
+            1
+        );
+    }
+
+    /// Cancel during the publication-gate wait must end the repair. The
+    /// gate read itself cannot be cancelled unless the whole wait is inside
+    /// `select`.
+    #[tokio::test]
+    async fn retained_image_repair_wait_ends_when_sync_is_cancelled() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let owner_kp = crate::identity::AgentKeypair::generate().expect("owner");
+        let owner = owner_kp.agent_id();
+        let (_info, mut contexts, group_id) = encrypted_group(&[owner]);
+        let ctx = contexts.remove(0);
+        let mut sync = make_encrypted_sync(
+            "group/1117-repair-cancel",
+            pubsub,
+            21,
+            owner,
+            owner,
+            &owner_kp,
+            ctx,
+            group_id,
+            peer(1),
+        )
+        .await;
+        let gate: GssPublicationGate = Arc::new(tokio::sync::RwLock::new(()));
+        sync.set_gss_publication_gate(Arc::clone(&gate));
+        sync.seed_incomplete_retained_page_for_test().await;
+        let _held = gate.write().await;
+        let started = Arc::clone(&sync.retained_repair_started);
+        let cancel = sync.cancel.clone();
+        let repair = tokio::spawn(async move {
+            sync.expire_and_reap_retained_images_for_test().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("repair did not reach the gate wait");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), repair)
+            .await
+            .expect("cancel did not end the retained-image repair wait")
+            .expect("repair task");
     }
 
     #[tokio::test]
@@ -6284,7 +7400,7 @@ mod tests {
         let writer_keypair = crate::identity::AgentKeypair::generate().expect("writer keypair");
         let owner = owner_keypair.agent_id();
         let writer = writer_keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let mut group = crate::groups::GroupInfo::new(
             "public".to_string(),
             String::new(),
@@ -7574,7 +8690,7 @@ mod tests {
         let node = make_node().await;
         let keypair = AgentKeypair::generate().expect("keypair");
         let owner = keypair.agent_id();
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let (_, contexts, group_id) = encrypted_group(&[owner]);
         let context = contexts[0].clone();
         let id = store_id(13);
@@ -7860,7 +8976,7 @@ mod tests {
         // refresh. The writer may commit first on the old code; with the
         // publication gate it waits until the pending publish is enqueued.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let topic = "group/private/epoch-race".to_string();
         let mut captured = pubsub.subscribe(topic.clone()).await;
         let owner_keypair = AgentKeypair::generate().expect("owner");
@@ -7964,7 +9080,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_publication_cannot_enqueue_pre_removal_sealed_wire_after_commit() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let topic = "group/private/queued-epoch-race".to_string();
         let mut captured = pubsub.subscribe(topic.clone()).await;
         let owner_keypair = AgentKeypair::generate().expect("owner");
@@ -8617,7 +9733,7 @@ mod tests {
         // membership, and merges. No plaintext delta is involved at any
         // point on the wire.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -8695,7 +9811,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_put_publishes_no_unsealed_bytes_on_the_topic() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -8955,7 +10071,7 @@ mod tests {
         // through merge AND persist, and a draining retire must wait for it.
         use std::sync::atomic::Ordering::SeqCst;
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
         let owner = owner_kp.agent_id();
@@ -9098,7 +10214,7 @@ mod tests {
     #[tokio::test]
     async fn treekem_responder_pages_large_history_and_receiver_reassembles_out_of_order() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let writer_kp = AgentKeypair::generate().expect("writer kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
@@ -9356,7 +10472,7 @@ mod tests {
     #[tokio::test]
     async fn treekem_retained_publisher_retries_partial_frames_and_receiver_reassembles() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner kp");
         let writer_kp = AgentKeypair::generate().expect("writer kp");
         let reader_kp = AgentKeypair::generate().expect("reader kp");
@@ -9584,7 +10700,7 @@ mod tests {
         // receiver — even though its record decrypts and its signature is
         // valid.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let kp_c = AgentKeypair::generate().expect("kp"); // holds a context, NOT a member
@@ -9675,7 +10791,7 @@ mod tests {
         // injected onto an encrypted store's topic must not decode as a
         // sealed envelope and must never reach the merge.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let a = kp_a.agent_id();
         let (_info, ctxs, group_id) = encrypted_group(&[a]);
@@ -9730,7 +10846,7 @@ mod tests {
         // must hard-error at this boundary instead of falling into the
         // plaintext branch, and a subscribed observer must receive NOTHING.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp = AgentKeypair::generate().expect("kp");
         let a = kp.agent_id();
         let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
@@ -9779,6 +10895,21 @@ mod tests {
         // The observer heard nothing: no plaintext ever left the process.
         let leak = tokio::time::timeout(Duration::from_millis(300), observer.recv()).await;
         assert!(leak.is_err(), "plaintext delta was published to the topic");
+
+        // Liveness control (#1114): the observer does hear this pubsub's
+        // signed publishes, so the silence above is not a delivery failure.
+        pubsub
+            .publish(
+                "store/enc-unpub".to_string(),
+                bytes::Bytes::from_static(b"sentinel"),
+            )
+            .await
+            .expect("sentinel publish");
+        let sentinel = tokio::time::timeout(Duration::from_secs(5), observer.recv())
+            .await
+            .expect("observer must hear the sentinel")
+            .expect("observer open");
+        assert_eq!(sentinel.payload.as_ref(), b"sentinel");
     }
 
     #[tokio::test]
@@ -9828,7 +10959,7 @@ mod tests {
         // ALL travel sealed. B joins after A's write and must still receive
         // the pre-join key.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let kp_a = AgentKeypair::generate().expect("kp");
         let kp_b = AgentKeypair::generate().expect("kp");
         let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
@@ -9887,7 +11018,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_bootstrap_recovers_when_membership_arrives_after_open() {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
         let owner_kp = AgentKeypair::generate().expect("owner keypair");
         let joiner_kp = AgentKeypair::generate().expect("joiner keypair");
         let owner = owner_kp.agent_id();

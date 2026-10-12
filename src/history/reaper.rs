@@ -5,6 +5,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use super::policy::HistoryPolicy;
 use super::store::{RetentionPolicy, Store};
 use super::writer::HistoryCounters;
 
@@ -16,6 +17,7 @@ pub const HISTORY_REAPER_INTERVAL_SECS: u64 = 300;
 pub(super) fn spawn(
     store: Arc<Store>,
     policy: RetentionPolicy,
+    rules: Arc<HistoryPolicy>,
     counters: Arc<HistoryCounters>,
     interval_secs: u64,
     pins: Arc<super::QuarantinePinSlot>,
@@ -26,6 +28,7 @@ pub(super) fn spawn(
             tokio::time::sleep(interval).await;
             let store = Arc::clone(&store);
             let policy = policy.clone();
+            let rules = Arc::clone(&rules);
             // ADR-0068 D1: the pinned set is derived live from the marker
             // state, once per pass and BEFORE the blocking retain — so the
             // async read the source takes is never held across the
@@ -35,8 +38,10 @@ pub(super) fn spawn(
             counters
                 .quarantine_pinned_scopes
                 .store(pinned.len() as u64, Ordering::Relaxed);
-            let result =
-                tokio::task::spawn_blocking(move || store.retain_with_pins(&policy, &pinned)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                store.retain_with_rules(&policy, &rules, &pinned)
+            })
+            .await;
             match result {
                 Ok(Ok(outcome)) => {
                     if outcome.pinned_evicted > 0 {

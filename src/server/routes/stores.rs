@@ -165,7 +165,13 @@ fn spawn_kv_store_delta_delivery_one(
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let store_label = store_id.to_string();
-    tokio::spawn(async move {
+    // #1274: a best-effort copy of a delta the local store has already
+    // written, so the task only sends. It is detached
+    // (`AppState::spawn_detached`) and the shutdown drain may abort it,
+    // which loses no more than a process exit would. Before this, the
+    // delayed copy kept the Agent, and its `history.db` connection, alive
+    // for its delay plus the send after `shutdown_and_wait`.
+    state.spawn_detached(async move {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
@@ -852,13 +858,21 @@ struct GssGroupStoreBinding {
 /// The group mutex covers crypto and the durable snapshot write. A failed
 /// write restores the pre-operation ratchet before releasing the mutex, so a
 /// record is never acknowledged or published from state that only existed in
-/// memory.
+/// memory. After `encrypt_message` advances the send ratchet, that commit
+/// keeps the membership and group locks until the snapshot rename or its
+/// rollback finishes, even when the caller is cancelled.
+///
+/// The protector holds the daemon state only weakly (#1250, #1269): the
+/// store's sync owns the protector, and the daemon state owns the store
+/// (`kv_stores`, or `task_lists` for a group task list), so a strong capture
+/// is a cycle that keeps the state, the Agent and its history database alive
+/// after shutdown. Once the state is gone every operation fails closed.
 struct TreeKemGroupStoreProtector {
-    state: Arc<AppState>,
+    state: std::sync::Weak<AppState>,
     group_key: String,
     stable_group_id: String,
     authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
-    invalid: std::sync::atomic::AtomicBool,
+    invalid: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// #895: the live TreeKEM protector for a group-scoped task list — the same
@@ -874,12 +888,55 @@ pub(in crate::server) fn treekem_task_list_protector(
         info,
     )?);
     Some(Arc::new(TreeKemGroupStoreProtector {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         group_key: group_key.to_string(),
         stable_group_id: info.stable_group_id().to_string(),
         authorization,
-        invalid: std::sync::atomic::AtomicBool::new(false),
+        invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }))
+}
+
+#[cfg(test)]
+struct TreeKemSealPersistPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn treekem_seal_persist_pauses() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<TreeKemSealPersistPause>>,
+> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<TreeKemSealPersistPause>>,
+        >,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Park the next send-ratchet snapshot write for `group_key` after the
+/// ratchet has advanced and before the rename. One-shot.
+#[cfg(test)]
+fn arm_treekem_seal_persist_pause(group_key: &str) -> std::sync::Arc<TreeKemSealPersistPause> {
+    let pause = std::sync::Arc::new(TreeKemSealPersistPause {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    treekem_seal_persist_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(group_key.to_string(), std::sync::Arc::clone(&pause));
+    pause
+}
+
+#[cfg(test)]
+fn take_treekem_seal_persist_pause(
+    group_key: &str,
+) -> Option<std::sync::Arc<TreeKemSealPersistPause>> {
+    treekem_seal_persist_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(group_key)
 }
 
 impl TreeKemGroupStoreProtector {
@@ -889,12 +946,19 @@ impl TreeKemGroupStoreProtector {
         authorization: Arc<x0x::groups::TreeKemKvAuthorizationContext>,
     ) -> Self {
         Self {
-            state: Arc::clone(state),
+            state: Arc::downgrade(state),
             group_key: binding.group_key.clone(),
             stable_group_id: binding.stable_group_id.clone(),
             authorization,
-            invalid: std::sync::atomic::AtomicBool::new(false),
+            invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The daemon state, or a fail-closed refusal once it is gone.
+    fn state(&self) -> x0x::kv::Result<Arc<AppState>> {
+        self.state.upgrade().ok_or_else(|| {
+            x0x::kv::KvError::Unauthorized("TreeKEM group store is retired".to_string())
+        })
     }
 
     async fn current_info(&self) -> x0x::kv::Result<x0x::groups::GroupInfo> {
@@ -903,7 +967,8 @@ impl TreeKemGroupStoreProtector {
                 "TreeKEM group store is retired".to_string(),
             ));
         }
-        let groups = self.state.named_groups.read().await;
+        let state = self.state()?;
+        let groups = state.named_groups.read().await;
         // ADR-0067 hard requirement: BOTH spellings. This was a bare
         // `groups.get(&self.group_key)`. It failed closed rather than open
         // (the `stable_group_id()` comparison below catches a mismatch), but a
@@ -973,15 +1038,16 @@ impl TreeKemGroupStoreProtector {
     async fn live_group(
         &self,
     ) -> x0x::kv::Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
-        self.state
+        let state = self.state()?;
+        let live = state
             .treekem_groups
             .read()
             .await
             .get(&self.group_key)
-            .cloned()
-            .ok_or_else(|| {
-                x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
-            })
+            .cloned();
+        live.ok_or_else(|| {
+            x0x::kv::KvError::SecureRecord("live TreeKEM ratchet is unavailable".to_string())
+        })
     }
 
     fn map_crypto_error(error: impl std::fmt::Display) -> x0x::kv::KvError {
@@ -994,11 +1060,14 @@ impl TreeKemGroupStoreProtector {
         snapshot: &[u8],
         group: &mut x0x::mls::TreeKemMlsGroup,
     ) {
-        match super::named_groups::restore_local_treekem_group_from_snapshot(
-            &self.state,
-            info,
-            snapshot,
-        ) {
+        let Ok(state) = self.state() else {
+            // The daemon is gone: nothing can use this ratchet again.
+            self.invalid
+                .store(true, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        match super::named_groups::restore_local_treekem_group_from_snapshot(&state, info, snapshot)
+        {
             Ok(restored) => *group = restored,
             Err(error) => {
                 self.invalid
@@ -1023,11 +1092,12 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         payload: &[u8],
         reader_only: bool,
     ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
-        let _membership_guard = membership.lock().await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
+        // Lock waits stay on this future, so cancel_sync drops them.
+        let membership_guard = membership.lock_owned().await;
         let live = self.live_group().await?;
-        let mut group = live.lock().await;
+        let mut group = live.lock_owned().await;
         // Re-read authority only after acquiring the ratchet mutex. Membership
         // commits use the same mutex, so this snapshot cannot predate a commit
         // that won while this operation was waiting.
@@ -1040,12 +1110,13 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         }
         let rollback = group.to_snapshot_bytes().map_err(Self::map_crypto_error)?;
         let epoch = group.epoch();
+        let group_id = self.group_id();
         let inner = x0x::kv::treekem::sign_inner_mutation(
             signing,
             kind,
             payload,
             x0x::kv::treekem::TreeKemInnerBinding {
-                group_id: self.group_id(),
+                group_id: group_id.clone(),
                 epoch,
                 store_id,
                 authorization_binding: Self::authorization_binding(&info),
@@ -1059,26 +1130,60 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 return Err(Self::map_crypto_error(error));
             }
         };
-        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
-            &self.state,
-            &self.group_key,
-            &group,
-        )
-        .await
-        {
-            self.rollback(&info, &rollback, &mut group).await;
-            return Err(x0x::kv::KvError::Gossip(format!(
-                "persist TreeKEM send ratchet: {error}"
-            )));
-        }
-        Ok(x0x::kv::TreeKemKvStoreRecordV1 {
+        let record = x0x::kv::TreeKemKvStoreRecordV1 {
             version: 1,
-            group_id: self.group_id(),
+            group_id,
             store_id: *store_id.as_bytes(),
             epoch,
             reader_only,
             ciphertext,
-        })
+        };
+        // The send ratchet has moved. A dropped caller must not release
+        // these locks while the snapshot rename is still running: that
+        // rename keeps going in Tokio's blocking pool and can replace a
+        // newer generation written after the locks were freed.
+        let group_key = self.group_key.clone();
+        let invalid = Arc::clone(&self.invalid);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Detach. Dropping this caller must not abort the commit.
+        drop(tokio::spawn(async move {
+            let _membership_guard = membership_guard;
+            #[cfg(test)]
+            if let Some(pause) = take_treekem_seal_persist_pause(&group_key) {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+            let outcome = match super::named_groups::persist_treekem_snapshot_bound(
+                &state, &group_key, &group,
+            )
+            .await
+            {
+                Ok(()) => Ok(record),
+                Err(error) => {
+                    match super::named_groups::restore_local_treekem_group_from_snapshot(
+                        &state, &info, &rollback,
+                    ) {
+                        Ok(restored) => *group = restored,
+                        Err(restore_error) => {
+                            invalid.store(true, std::sync::atomic::Ordering::Release);
+                            tracing::error!(
+                                "failed to rollback TreeKEM store ratchet: {restore_error}"
+                            );
+                        }
+                    }
+                    Err(x0x::kv::KvError::Gossip(format!(
+                        "persist TreeKEM send ratchet: {error}"
+                    )))
+                }
+            };
+            drop(group);
+            let _ = tx.send(outcome);
+        }));
+        rx.await.map_err(|_| {
+            x0x::kv::KvError::Gossip(
+                "TreeKEM send ratchet commit ended before the snapshot write".to_string(),
+            )
+        })?
     }
 
     async fn open_record(
@@ -1094,8 +1199,8 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "TreeKEM record binding mismatch".to_string(),
             ));
         }
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
         let _membership_guard = membership.lock().await;
         let live = self.live_group().await?;
         let mut group = live.lock().await;
@@ -1135,12 +1240,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "TreeKEM mutation author is not currently authorized".to_string(),
             ));
         }
-        if let Err(error) = super::named_groups::persist_treekem_snapshot_bound(
-            &self.state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        if let Err(error) =
+            super::named_groups::persist_treekem_snapshot_bound(&state, &self.group_key, &group)
+                .await
         {
             self.rollback(&info, &rollback, &mut group).await;
             return Err(x0x::kv::KvError::Gossip(format!(
@@ -1188,8 +1290,8 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 "read-side TreeKEM record cannot mutate a store".to_string(),
             ));
         }
-        let membership =
-            super::named_groups::group_membership_lock(&self.state, &self.group_key).await;
+        let state = self.state()?;
+        let membership = super::named_groups::group_membership_lock(&state, &self.group_key).await;
         let _membership_guard = membership.lock().await;
         let info = self.current_info().await?;
         if opened.authorization_binding != Self::authorization_binding(&info)
@@ -1258,6 +1360,22 @@ fn validate_gss_store_group(
     info: &x0x::groups::GroupInfo,
     caller: &AgentId,
 ) -> Result<(), GroupStoreResponse> {
+    validate_gss_store_membership(info, caller)?;
+    if info.shared_secret.is_none() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "local daemon holds no shared secret for this group yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Every GSS store eligibility rule except holding the current secret. The
+/// secret is a separate, transient condition for a bound handle (#1266).
+fn validate_gss_store_membership(
+    info: &x0x::groups::GroupInfo,
+    caller: &AgentId,
+) -> Result<(), GroupStoreResponse> {
     if info.withdrawn {
         return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
     }
@@ -1288,12 +1406,6 @@ fn validate_gss_store_group(
     if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
         return Err(bad_request(
             "encrypted stores v1 are GSS-backed; other planes are not supported yet",
-        ));
-    }
-    if info.shared_secret.is_none() {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "local daemon holds no shared secret for this group yet",
         ));
     }
     Ok(())
@@ -1428,13 +1540,21 @@ fn public_kv_refresh(
     topic: String,
     creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
-    let state = Arc::clone(state);
+    // Weak (#1269): the store's sync owns this closure and the daemon state
+    // owns the store, so a strong capture would keep the state (and the
+    // Agent and its history database) alive after shutdown. Once the state
+    // is gone the context is invalidated (fail closed).
+    let state = Arc::downgrade(state);
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
-        let state = Arc::clone(&state);
+        let state = state.clone();
         let group_key = group_key.clone();
         let topic = topic.clone();
         Box::pin(async move {
+            let Some(state) = state.upgrade() else {
+                ctx.invalidate();
+                return;
+            };
             let valid = {
                 let groups = state.named_groups.read().await;
                 refresh_public_store_binding(
@@ -1456,31 +1576,62 @@ fn public_kv_refresh(
     })
 }
 
+/// Result of re-checking a bound GSS store against its live group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GssBindingRefresh {
+    /// Eligible and keyed: the context mirrors the live group.
+    Current,
+    /// Eligible, but this daemon has no secret for the current epoch yet.
+    /// A removal-first GSS rotation (ADR 0024 §6) clears the secret before
+    /// the survivor's `SecureShareDelivered` lands (#1266). The context
+    /// mirrors that keyless state, so seal, open and local writes fail
+    /// closed. The handle stays bound, and the first refresh after the share
+    /// installs re-arms the same context.
+    KeyPending,
+    /// The binding is no longer eligible: the context is invalidated and the
+    /// handle must be retired.
+    Ineligible,
+}
+
 /// Used by the real per-record refresh hook; invalidation also fences clones.
 fn refresh_gss_store_binding(
     ctx: &x0x::groups::GssKvSecureContext,
     info: Option<&x0x::groups::GroupInfo>,
     creator: AgentId,
     caller: &AgentId,
-) -> bool {
+) -> GssBindingRefresh {
     if let Some(info) = info {
         if info.creator == creator
             && info.stable_group_id().as_bytes() == ctx.group_id()
-            && validate_gss_store_group(info, caller).is_ok()
+            && validate_gss_store_membership(info, caller).is_ok()
         {
             ctx.update_from_group(info);
-            return true;
+            return if info.shared_secret.is_some() {
+                GssBindingRefresh::Current
+            } else {
+                GssBindingRefresh::KeyPending
+            };
         }
     }
     ctx.invalidate();
-    false
+    GssBindingRefresh::Ineligible
 }
 
 /// Deterministic refresh hook for a GSS encrypted-store context: re-reads
 /// the authoritative group from the daemon's named-groups map (under the
 /// read guard — no `GroupInfo` clone) and refreshes the context snapshot.
 /// The sync loops call this before every seal/open, so a rekey or roster
-/// change takes effect on the very next record.
+/// change takes effect on the very next record. Only an ineligible binding
+/// retires the handle; a pending key for the current epoch does not (#1266).
+/// The first refresh that finds the key installed again after a pending
+/// one starts one bounded state repair, so records dropped in the gap come
+/// back.
+///
+/// The hook holds the daemon state only weakly: the store's sync owns this
+/// closure, and the daemon state owns the store, so a strong capture would
+/// keep the state (and the Agent and its history database) alive after
+/// shutdown. Once the state is gone the context is invalidated (fail
+/// closed).
 pub(in crate::server) fn gss_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::GssKvSecureContext>,
@@ -1488,23 +1639,48 @@ pub(in crate::server) fn gss_kv_refresh(
     topic: String,
     creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
-    let state = Arc::clone(state);
+    let state = Arc::downgrade(state);
+    // Set by a KeyPending refresh; taken by the next Current one. Both are
+    // decided under the named-groups read guard, and a share installs under
+    // its write guard, so a stale KeyPending refresh cannot set the latch
+    // again after the Current refresh that took it.
+    let key_gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
-        let state = Arc::clone(&state);
+        let state = state.clone();
         let group_key = group_key.clone();
         let topic = topic.clone();
+        let key_gap = Arc::clone(&key_gap);
         Box::pin(async move {
-            let valid = {
+            let Some(state) = state.upgrade() else {
+                ctx.invalidate();
+                return;
+            };
+            let (outcome, start_repair) = {
                 let groups = state.named_groups.read().await;
-                refresh_gss_store_binding(
+                let outcome = refresh_gss_store_binding(
                     &ctx,
                     groups.get(&group_key),
                     creator,
                     &state.agent.agent_id(),
-                )
+                );
+                #[cfg(test)]
+                key_gap_test_seam::pause_point(&topic, outcome).await;
+                let start_repair = match outcome {
+                    GssBindingRefresh::Current => {
+                        key_gap.swap(false, std::sync::atomic::Ordering::AcqRel)
+                    }
+                    GssBindingRefresh::KeyPending => {
+                        key_gap.store(true, std::sync::atomic::Ordering::Release);
+                        false
+                    }
+                    GssBindingRefresh::Ineligible => false,
+                };
+                (outcome, start_repair)
             };
-            if !valid {
+            if start_repair {
+                spawn_gss_key_gap_repair(&state, topic);
+            } else if outcome == GssBindingRefresh::Ineligible {
                 tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
                 let mut stores = state.kv_stores.write().await;
                 if let Some(h) = stores.get(&topic).cloned() {
@@ -1514,6 +1690,137 @@ pub(in crate::server) fn gss_kv_refresh(
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
+}
+
+/// Upper bound for one whole key-gap repair (#1266): the store lookup, the
+/// first request, the wait out of the holders' response cooldown and the
+/// single retry, including waits for the GSS publication gate.
+const GSS_KEY_GAP_REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// #1266: after a key gap, ask the group for this store's current state.
+///
+/// The repair runs as a tracked Agent task, because the refresh hook runs
+/// inside receive and seal sections: it is refused once shutdown has begun,
+/// every wait ends when the Agent's shutdown token is cancelled, and Agent
+/// shutdown joins it before the daemon releases its instance locks. It holds
+/// the daemon state only weakly and only for the store lookup.
+fn spawn_gss_key_gap_repair(state: &Arc<AppState>, topic: String) {
+    #[cfg(test)]
+    key_gap_test_seam::record_repair(&topic);
+    let weak = Arc::downgrade(state);
+    let shutdown = state.agent.shutdown_token();
+    state.agent.spawn_tracked(async move {
+        let outcome = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            outcome = tokio::time::timeout(
+                GSS_KEY_GAP_REPAIR_DEADLINE,
+                run_gss_key_gap_repair(weak, &topic),
+            ) => outcome,
+        };
+        match outcome {
+            Ok(Ok(0)) => tracing::debug!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state request not sent"
+            ),
+            Ok(Ok(requests)) => tracing::info!(
+                target: "x0x::kv",
+                "encrypted store {topic}: group key re-armed after a gap; sent {requests} state request(s)"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state request failed: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                target: "x0x::kv",
+                "encrypted store {topic}: key-gap state repair timed out"
+            ),
+        }
+    });
+}
+
+async fn run_gss_key_gap_repair(
+    state: std::sync::Weak<AppState>,
+    topic: &str,
+) -> x0x::error::Result<u8> {
+    let handle = {
+        let Some(state) = state.upgrade() else {
+            return Ok(0);
+        };
+        let handle = state.kv_stores.read().await.get(topic).cloned();
+        handle
+    };
+    match handle {
+        Some(handle) => handle.request_state_repair().await,
+        None => Ok(0),
+    }
+}
+
+/// #1266 test seam, keyed by store topic so parallel tests in one process
+/// cannot interfere: a one-shot pause between a refresh's `KeyPending`
+/// observation and its latch decision, and a count of started repairs.
+#[cfg(test)]
+pub(in crate::server) mod key_gap_test_seam {
+    use super::GssBindingRefresh;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Default)]
+    pub(in crate::server) struct Pause {
+        pub(in crate::server) reached: tokio::sync::Notify,
+        pub(in crate::server) release: tokio::sync::Notify,
+    }
+
+    fn pauses() -> &'static Mutex<HashMap<String, Arc<Pause>>> {
+        static PAUSES: OnceLock<Mutex<HashMap<String, Arc<Pause>>>> = OnceLock::new();
+        PAUSES.get_or_init(Default::default)
+    }
+
+    fn repairs_started() -> &'static Mutex<HashMap<String, usize>> {
+        static REPAIRS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        REPAIRS.get_or_init(Default::default)
+    }
+
+    /// Pause the next `KeyPending` refresh of `topic` once.
+    pub(in crate::server) fn arm(topic: &str) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(topic.to_string(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(super) async fn pause_point(topic: &str, outcome: GssBindingRefresh) {
+        if outcome != GssBindingRefresh::KeyPending {
+            return;
+        }
+        let pause = pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(topic);
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    pub(super) fn record_repair(topic: &str) {
+        *repairs_started()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(topic.to_string())
+            .or_default() += 1;
+    }
+
+    pub(in crate::server) fn repairs(topic: &str) -> usize {
+        repairs_started()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(topic)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 /// Retire EVERY encrypted store handle bound to `stable_group_id` (topic
@@ -1903,8 +2210,14 @@ pub(in crate::server) async fn create_group_kv_store(
             Err(response) => return response,
         }
     };
-    if !actor.rider_allows_group(&binding.stable_group_id) {
-        return forbidden("rider token is not granted this group");
+    // S4 group-access core: the rider grant on the binding's stable id,
+    // at the inline check's exact position (owners pass on class; the
+    // middleware's deny-by-default allowlist keeps riders off this
+    // route, so the 403 is defence in depth).
+    if let Err((code, body)) =
+        crate::server::group_access::admit_group_store_route(&actor, &binding.stable_group_id)
+    {
+        return (code, body);
     }
     let snapshot_lease = claim_bound_store_open(&state, &binding).await;
     let reservation = crdt_subscriptions::handle_reservation(
@@ -2328,14 +2641,12 @@ pub(in crate::server) async fn list_legacy_page_imports(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
-        }
-        if !actor.rider_allows_group(&stable) {
-            return forbidden("rider token is not granted this group");
+        // S4 group-access core: the owner-authority gate (durable or
+        // session owner; every rider refused — the grant check that
+        // followed inline was unreachable for riders and always-true
+        // for owners, so the core folds it away).
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         let Some(prefix) = stable.get(..16) else {
             return bad_request("stable group id is too short for a legacy alias");
@@ -2537,11 +2848,10 @@ pub(in crate::server) async fn download_legacy_page_import(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
+        // S4 group-access core: the owner-authority gate, as on the
+        // listing route.
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         stable
     };
@@ -2598,6 +2908,166 @@ pub(in crate::server) async fn download_legacy_page_import(
         Ok(None) => not_found("legacy source is not registered on this device"),
         Err(response) => response,
     }
+}
+
+/// Test seam immediately before the destination write lock.
+///
+/// The import notifies `entered`, then waits on `release`, only for this
+/// idempotency key. Other imports do not wait. Growth injected here is
+/// visible to the locked retained-image measurement.
+#[cfg(test)]
+struct LegacyImportGap {
+    key: &'static str,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static LEGACY_IMPORT_GAP: std::sync::Mutex<Option<std::sync::Arc<LegacyImportGap>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn legacy_import_gap_point(idempotency_key: &str) {
+    let gap = LEGACY_IMPORT_GAP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(gap) = gap else {
+        return;
+    };
+    if gap.key != idempotency_key {
+        return;
+    }
+    gap.entered.notify_one();
+    gap.release.notified().await;
+}
+
+/// Post-merge retained-image length for a destination that is not open yet.
+///
+/// The caller uses this only before open, so a refusal does not create an
+/// empty snapshot. An already-open destination is measured later, under the
+/// write lock that commits the merge. `None` means the trial merge failed;
+/// the locked merge then reports that error.
+async fn legacy_import_retained_image_len(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    source: &x0x::kv::KvStore,
+    source_owner: AgentId,
+    endorser: AgentId,
+    public: bool,
+    treekem: bool,
+) -> Result<Option<usize>, GroupStoreResponse> {
+    let (destination, peer) =
+        destination_for_legacy_budget(state, binding, public, treekem).await?;
+    let mut trial = destination;
+    // A live destination's clone shares the sequence allocator. This
+    // measurement must not `fetch_max` it when the import is later refused.
+    trial.detach_seq_counter();
+    if trial
+        .merge_legacy_signed_history(source, source_owner, endorser, peer)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let image = bincode::serialize(&trial).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import retained image could not be measured: {error}"),
+        )
+    })?;
+    Ok(Some(image.len()))
+}
+
+/// Live destination when it is open. Otherwise the snapshot on disk, or the
+/// empty store the opener would create. This reads. It does not open or write.
+async fn destination_for_legacy_budget(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    public: bool,
+    treekem: bool,
+) -> Result<(x0x::kv::KvStore, saorsa_gossip_types::PeerId), GroupStoreResponse> {
+    if let Some(handle) = state.kv_stores.read().await.get(&binding.topic).cloned() {
+        let peer = handle.peer_id();
+        let store = handle.sync.read().await.clone();
+        return Ok((store, peer));
+    }
+    let path = x0x::kv_snapshot_path(&state.kv_store_state_dir, &binding.store_id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let store = x0x::kv::sync::load_snapshot_bytes(&bytes).map_err(|error| {
+                api_error(
+                    StatusCode::CONFLICT,
+                    format!("destination snapshot cannot be measured: {error}"),
+                )
+            })?;
+            Ok((store, saorsa_gossip_types::PeerId::new([0; 32])))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let store = empty_legacy_import_destination(state, binding, public, treekem).await?;
+            Ok((store, saorsa_gossip_types::PeerId::new([0; 32])))
+        }
+        Err(error) => Err(api_error(
+            StatusCode::CONFLICT,
+            format!("destination snapshot cannot be measured: {error}"),
+        )),
+    }
+}
+
+async fn empty_legacy_import_destination(
+    state: &AppState,
+    binding: &GssGroupStoreBinding,
+    public: bool,
+    treekem: bool,
+) -> Result<x0x::kv::KvStore, GroupStoreResponse> {
+    let groups = state.named_groups.read().await;
+    let info = groups
+        .get(&binding.group_key)
+        .ok_or_else(|| not_found("group not found"))?;
+    let group_id = binding.stable_group_id.as_bytes().to_vec();
+    let store = if public {
+        let context = std::sync::Arc::new(
+            x0x::groups::PublicGroupKvContext::from_group(info)
+                .ok_or_else(|| bad_request("group is not SignedPublic"))?,
+        );
+        x0x::kv::KvStore::new_group_signed(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            context,
+        )
+    } else if treekem {
+        let authorization = std::sync::Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(info)
+                .ok_or_else(|| api_error(StatusCode::CONFLICT, "TreeKEM group unavailable"))?,
+        );
+        let secure: std::sync::Arc<dyn x0x::kv::encrypted::KvSecureContext> = authorization;
+        x0x::kv::KvStore::new_treekem_encrypted(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            secure,
+        )
+    } else {
+        let secure = std::sync::Arc::new(
+            x0x::groups::GssKvSecureContext::from_group(info)
+                .ok_or_else(|| api_error(StatusCode::CONFLICT, "group secret unavailable"))?,
+        );
+        x0x::kv::KvStore::new_encrypted(
+            binding.store_id,
+            binding.name.clone(),
+            binding.creator,
+            group_id,
+            secure,
+        )
+    };
+    store.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import destination could not be measured: {error}"),
+        )
+    })
 }
 
 /// Rebuild the reviewed legacy source from a durable pre-merge intent.
@@ -2661,6 +3131,128 @@ async fn recover_intended_legacy_source(
     })
 }
 
+struct LegacyImportApplied {
+    conflicts: Vec<String>,
+    before: String,
+    after: String,
+}
+
+struct LegacyImportCommit<'a> {
+    idempotency_key: &'a str,
+    group_id: &'a str,
+    app: &'a str,
+    authority_binding: &'a str,
+    persist_intent: bool,
+}
+
+/// Trial-merge, measure, and commit one legacy import under the destination
+/// write lock.
+///
+/// The retained-image length is the merged store held by that lock. Above
+/// the cap, nothing is journalled and the destination is left unchanged.
+/// Under the cap, the intent is written before the destination is replaced,
+/// still under the same lock. Persistence runs after the lock is dropped:
+/// `persist` takes its own store read lock.
+async fn commit_legacy_import_under_cap(
+    state: &AppState,
+    handle: &x0x::KvStoreHandle,
+    source: &LoadedLegacyStore,
+    commit: LegacyImportCommit<'_>,
+) -> Result<LegacyImportApplied, GroupStoreResponse> {
+    handle
+        .sync
+        .authorize_local_write(&handle.agent_id)
+        .await
+        .map_err(|error| match error {
+            x0x::kv::KvError::Unauthorized(message) => forbidden(message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    handle.sync.ensure_durable().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("kv store durability degraded before legacy import: {error}"),
+        )
+    })?;
+    // Growth injected here is included in the measurement below. The
+    // destination lock is still free, so the injector can write.
+    #[cfg(test)]
+    legacy_import_gap_point(commit.idempotency_key).await;
+
+    let mut destination = handle.sync.write().await;
+    let conflicts = destination.legacy_import_conflicts(&source.store);
+    let before = hex::encode(destination.served_digest());
+    // Independent allocator: the merge floors the trial's counter only.
+    // `*destination = trial` below is what installs that counter, and only
+    // after the image fits and the intent is durable.
+    let mut trial = destination.clone();
+    trial.detach_seq_counter();
+    trial
+        .merge_legacy_signed_history(
+            &source.store,
+            source.owner,
+            handle.agent_id,
+            handle.peer_id(),
+        )
+        .map_err(|error| match error {
+            x0x::kv::KvError::Unauthorized(message) => forbidden(message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    let image = bincode::serialize(&trial).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import retained image could not be measured: {error}"),
+        )
+    })?;
+    let limit = x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+    if image.len() > limit {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "legacy import would retain {} bytes, above the {limit} byte group image limit",
+                image.len()
+            ),
+        ));
+    }
+    if commit.persist_intent {
+        super::super::legacy_store_migration::write_intent(
+            &state.kv_store_state_dir,
+            super::super::legacy_store_migration::LegacyImportIntentInput {
+                idempotency_key: commit.idempotency_key.to_string(),
+                group_id: commit.group_id.to_string(),
+                app: commit.app.to_string(),
+                source_store_id: source.store_id_hex.clone(),
+                source_digest: source.digest.clone(),
+                endorser: hex::encode(state.agent.agent_id().as_bytes()),
+                authority_binding: commit.authority_binding.to_string(),
+                source_snapshot: source.bytes.clone(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
+                ),
+            )
+        })?;
+    }
+    *destination = trial;
+    let after = hex::encode(destination.served_digest());
+    drop(destination);
+    handle.sync.persist().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("legacy import applied in memory but destination persistence failed: {error}"),
+        )
+    })?;
+    Ok(LegacyImportApplied {
+        conflicts,
+        before,
+        after,
+    })
+}
+
 pub(in crate::server) async fn import_legacy_page_store(
     State(state): State<Arc<AppState>>,
     Path((id, app, source_id)): Path<(String, String, String)>,
@@ -2697,14 +3289,11 @@ pub(in crate::server) async fn import_legacy_page_store(
         if id != stable {
             return bad_request("legacy imports require the full canonical group id");
         }
-        if !matches!(
-            &actor,
-            crate::server::rider_auth::ActorContext::Owner { .. }
-        ) {
-            return forbidden("legacy source export requires the local owner authority");
-        }
-        if !actor.rider_allows_group(stable) {
-            return forbidden("rider token is not granted this group");
+        // S4 group-access core: the owner-authority gate, as on the
+        // listing route (the rider-grant check it folded away could
+        // never fire — see the core's doc).
+        if let Err((code, body)) = crate::server::group_access::admit_legacy_import_route(&actor) {
+            return (code, body);
         }
         if !group_writer(info, &state.agent.agent_id()) {
             return forbidden("current group role cannot endorse legacy history");
@@ -2860,37 +3449,38 @@ pub(in crate::server) async fn import_legacy_page_store(
             );
         }
     }
-    if existing_intent.is_none() && existing_receipt.is_none() {
-        // Durable intent BEFORE any canonical mutation: bind the reviewed
-        // snapshot to this idempotency key first, so a crash or receipt
-        // append failure after the merge can still finish this exact import.
-        let Some(source) = source.as_ref() else {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "legacy source unavailable",
-            );
-        };
-        if let Err(error) = super::super::legacy_store_migration::write_intent(
-            &state.kv_store_state_dir,
-            super::super::legacy_store_migration::LegacyImportIntentInput {
-                idempotency_key: request.idempotency_key.clone(),
-                group_id: binding.stable_group_id.clone(),
-                app: app.to_string(),
-                source_store_id: source.store_id_hex.clone(),
-                source_digest: source.digest.clone(),
-                endorser: hex::encode(state.agent.agent_id().as_bytes()),
-                authority_binding: authority_binding.clone(),
-                source_snapshot: source.bytes.clone(),
-            },
-        )
-        .await
-        {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "legacy import intent did not persist; canonical destination is unmodified: {error}"
-                ),
-            );
+    // #1118: a destination that is not open yet is measured from its
+    // snapshot, or from the empty store open would create, before that open
+    // creates a file. An already-open destination is measured under the
+    // write lock that commits the merge. A snapshot inside the 20 MiB file
+    // gate can still exceed the 16 MiB image cap.
+    if existing_receipt.is_none() && !state.kv_stores.read().await.contains_key(&binding.topic) {
+        if let Some(source) = source.as_ref() {
+            match legacy_import_retained_image_len(
+                &state,
+                &binding,
+                &source.store,
+                source.owner,
+                state.agent.agent_id(),
+                public,
+                treekem,
+            )
+            .await
+            {
+                Err(response) => return response,
+                Ok(Some(image_len)) => {
+                    let limit = x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+                    if image_len > limit {
+                        return api_error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "legacy import would retain {image_len} bytes, above the {limit} byte group image limit"
+                            ),
+                        );
+                    }
+                }
+                Ok(None) => {}
+            }
         }
     }
     let (handle, created) = if public {
@@ -2925,18 +3515,23 @@ pub(in crate::server) async fn import_legacy_page_store(
                 "legacy source unavailable",
             );
         };
-        let conflicts = handle.legacy_import_conflicts(&source.store).await;
-        let before = handle.retained_content_digest_hex().await;
-        if let Err(error) = handle
-            .import_legacy_signed_history(&source.store, source.owner)
-            .await
+        let applied = match commit_legacy_import_under_cap(
+            &state,
+            &handle,
+            &source,
+            LegacyImportCommit {
+                idempotency_key: &request.idempotency_key,
+                group_id: &binding.stable_group_id,
+                app,
+                authority_binding: &authority_binding,
+                persist_intent: existing_intent.is_none(),
+            },
+        )
+        .await
         {
-            return match error {
-                x0x::error::IdentityError::Unauthorized(message) => forbidden(message),
-                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-            };
-        }
-        let after = handle.retained_content_digest_hex().await;
+            Ok(applied) => applied,
+            Err(response) => return response,
+        };
         let receipt = super::super::legacy_store_migration::new_receipt(
             super::super::legacy_store_migration::LegacyImportReceiptInput {
                 idempotency_key: request.idempotency_key.clone(),
@@ -2946,8 +3541,8 @@ pub(in crate::server) async fn import_legacy_page_store(
                 source_digest: source.digest,
                 endorser: hex::encode(state.agent.agent_id().as_bytes()),
                 authority_binding,
-                destination_digest_before: before,
-                destination_digest_after: after,
+                destination_digest_before: applied.before,
+                destination_digest_after: applied.after,
             },
         );
         if let Err(error) =
@@ -2966,7 +3561,7 @@ pub(in crate::server) async fn import_legacy_page_store(
             &request.idempotency_key,
         )
         .await;
-        (receipt, conflicts)
+        (receipt, applied.conflicts)
     };
     drop(membership_guard);
     if let Err(error) = handle.publish_retained_group_history().await {
@@ -3208,14 +3803,21 @@ mod tests {
             let ctx = GssKvSecureContext::from_group(&base).unwrap();
             let cloned = ctx.clone();
             let current = (case != 7).then_some(&info);
-            assert!(
-                !refresh_gss_store_binding(&ctx, current, base.creator, &AgentId([2; 32])),
-                "case {case}"
-            );
-            assert!(
-                !cloned.is_active_member(&AgentId([2; 32])),
-                "clone fenced case {case}"
-            );
+            let outcome = refresh_gss_store_binding(&ctx, current, base.creator, &AgentId([2; 32]));
+            if case == 4 {
+                // #1266: a missing secret alone is a pending key, not
+                // ineligibility. The member keeps its binding, but the
+                // keyless context cannot seal or authorize a writer.
+                assert_eq!(outcome, GssBindingRefresh::KeyPending);
+                assert!(cloned.is_active_member(&AgentId([2; 32])));
+                assert!(!cloned.is_authorized_writer(&AgentId([2; 32])));
+            } else {
+                assert_eq!(outcome, GssBindingRefresh::Ineligible, "case {case}");
+                assert!(
+                    !cloned.is_active_member(&AgentId([2; 32])),
+                    "clone fenced case {case}"
+                );
+            }
             let id = x0x::kv::encrypted::group_store_identity(&gid, "Wiki").0;
             assert!(cloned.seal(&id, b"private").is_err());
             if !(5..8).contains(&case) {
@@ -3226,13 +3828,33 @@ mod tests {
         let ctx = GssKvSecureContext::from_group(&base).unwrap();
         let mut advanced = base.clone();
         advanced.secret_epoch += 1;
-        assert!(refresh_gss_store_binding(
-            &ctx,
-            Some(&advanced),
-            base.creator,
-            &AgentId([2; 32])
-        ));
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&advanced), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::Current
+        );
         assert_eq!(ctx.current_epoch(), advanced.secret_epoch);
+
+        // #1266: a removal-first rotation leaves the survivor keyless at the
+        // new epoch. The same context fails closed, then re-arms when the
+        // share installs the new secret.
+        let id = x0x::kv::encrypted::group_store_identity(&gid, "Wiki").0;
+        let mut pending = advanced.clone();
+        pending.secret_epoch += 1;
+        pending.shared_secret = None;
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&pending), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::KeyPending
+        );
+        assert_eq!(ctx.current_epoch(), pending.secret_epoch);
+        assert!(ctx.seal(&id, b"private").is_err(), "no seal while pending");
+        let mut installed = pending.clone();
+        installed.shared_secret = Some(vec![8; 32]);
+        assert_eq!(
+            refresh_gss_store_binding(&ctx, Some(&installed), base.creator, &AgentId([2; 32])),
+            GssBindingRefresh::Current
+        );
+        let (epoch, _, _) = ctx.seal(&id, b"private").expect("re-armed seal");
+        assert_eq!(epoch, installed.secret_epoch);
         let groups = std::collections::HashMap::from([(gid.clone(), base)]);
         assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([3; 32])).is_err());
         assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());
@@ -3581,6 +4203,446 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+
+    /// #1118: a legacy snapshot between the 16 MiB retained-image cap and the
+    /// 20 MiB file gate must be refused before merge. The fixture stays inside
+    /// the file gate, so the old check cannot be what refuses it.
+    #[tokio::test]
+    async fn issue1118_oversize_legacy_import_is_refused_before_merge() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "18".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        {
+            let mut store = source_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("page-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        source_handle.peer_id(),
+                    )
+                    .expect("large legacy page");
+            }
+        }
+        source_handle
+            .sync
+            .persist()
+            .await
+            .expect("persist oversize legacy source");
+        let source_path = state.kv_store_state_dir.join(format!("{source_id}.bin"));
+        let source_len = tokio::fs::metadata(&source_path)
+            .await
+            .expect("source snapshot")
+            .len();
+        assert!(
+            source_len <= LEGACY_PAGE_SNAPSHOT_MAX_BYTES,
+            "fixture must pass the 20 MiB file gate, got {source_len}"
+        );
+        assert!(
+            source_len > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64,
+            "fixture snapshot must sit above the retained-image cap, got {source_len}"
+        );
+
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let projected = {
+            let source_store = source_handle.sync.read().await.clone();
+            let mut trial = dest_handle.sync.read().await.clone();
+            // A shared clone would floor the live allocator before the route.
+            trial.detach_seq_counter();
+            trial
+                .merge_legacy_signed_history(
+                    &source_store,
+                    state.agent.agent_id(),
+                    state.agent.agent_id(),
+                    dest_handle.peer_id(),
+                )
+                .expect("trial merge of the fixture");
+            bincode::serialize(&trial)
+                .expect("projected retained image")
+                .len()
+        };
+        assert!(
+            projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
+            "post-merge image {projected} must exceed the retained-image cap"
+        );
+
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let (code, body) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "oversize-image".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert!(
+            body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("group image limit")),
+            "{body:?}"
+        );
+        assert_ne!(body.0["imported_locally"], true, "{body:?}");
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        assert!(
+            dest_handle
+                .get("page-000")
+                .await
+                .expect("destination read")
+                .is_none(),
+            "refusal must not merge the legacy pages"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts")
+                .is_empty(),
+            "refusal must not leave a pending publication receipt"
+        );
+        assert!(
+            crate::server::legacy_store_migration::read_intent(
+                &state.kv_store_state_dir,
+                "oversize-image",
+            )
+            .await
+            .expect("intent")
+            .is_none(),
+            "refusal must not persist an import intent"
+        );
+    }
+
+    /// #1118: a refused over-cap import must not advance the live sequence
+    /// allocator. The source carries a same-peer tag at `u64::MAX - 2`, which
+    /// the merge would otherwise `fetch_max` through the shared counter.
+    #[tokio::test]
+    async fn issue1118_refused_import_leaves_sequence_allocator_unchanged() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "1d".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let counter_before_fixture = dest_handle.sync.read().await.seq_counter_value();
+        {
+            let mut store = source_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("page-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        source_handle.peer_id(),
+                    )
+                    .expect("large legacy page");
+            }
+            // One reserved sequence lands the retained tag at `u64::MAX - 2`,
+            // the highest floor the merge still accepts.
+            store.restore_seq_counter(u64::MAX - 3);
+            store
+                .put(
+                    "allocator-floor".to_string(),
+                    b"floor".to_vec(),
+                    "text/plain".to_string(),
+                    dest_handle.peer_id(),
+                )
+                .expect("near-exhaustion retained tag");
+            assert_eq!(store.seq_counter_value(), u64::MAX - 2);
+        }
+        source_handle
+            .sync
+            .persist()
+            .await
+            .expect("persist oversize legacy source");
+        // The projection must not share the destination allocator. A plain
+        // clone would `fetch_max` the live counter before the route runs.
+        let projected = {
+            let source_store = source_handle.sync.read().await.clone();
+            let mut trial = dest_handle.sync.read().await.clone();
+            trial.detach_seq_counter();
+            trial
+                .merge_legacy_signed_history(
+                    &source_store,
+                    state.agent.agent_id(),
+                    state.agent.agent_id(),
+                    dest_handle.peer_id(),
+                )
+                .expect("trial merge of the fixture");
+            bincode::serialize(&trial)
+                .expect("projected retained image")
+                .len()
+        };
+        assert!(
+            projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
+            "post-merge image {projected} must exceed the retained-image cap"
+        );
+        let counter_before = dest_handle.sync.read().await.seq_counter_value();
+        assert_eq!(
+            counter_before, counter_before_fixture,
+            "the fixture projection must not advance the live allocator"
+        );
+
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let (code, body) = import_legacy_page_store(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string(), source_id)),
+            Extension(owner_actor()),
+            Json(ImportLegacyStoreRequest {
+                source_digest: digest,
+                idempotency_key: "allocator-floor".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert_eq!(
+            dest_handle.sync.read().await.seq_counter_value(),
+            counter_before,
+            "a 413 refusal must not fetch_max the live sequence allocator"
+        );
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        dest_handle
+            .put(
+                "after-refusal".to_string(),
+                b"one".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("first write after a refused near-exhaustion floor");
+        dest_handle
+            .put(
+                "after-refusal-2".to_string(),
+                b"two".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("second write must still reserve sequences; a floor of u64::MAX - 2 leaves room for only one put");
+        assert!(
+            dest_handle.sync.read().await.seq_counter_value() < u64::MAX - 2,
+            "subsequent writes must not be spending a refused near-exhaustion floor"
+        );
+    }
+
+    /// #1118: growth that lands before the destination write lock must be
+    /// included in the retained-image measurement. The seam pauses
+    /// immediately before that lock, so the live store can cross the cap
+    /// before the merge is committed.
+    #[tokio::test]
+    async fn issue1118_growth_during_import_gap_is_refused_before_merge() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_id = "1c".repeat(16);
+        seed_public_migration_group(&state, &group_id).await;
+        let (source_id, _source_handle) = seed_legacy_page_source(&state, &group_id, "wiki").await;
+        let (code, opened) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Extension(owner_actor()),
+            Json(CreateGroupStoreRequest {
+                name: "wiki".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::CREATED),
+            "{opened:?}"
+        );
+        let topic = opened.0["topic"].as_str().expect("topic").to_string();
+        let dest_id = opened.0["store_id"].as_str().expect("store id").to_string();
+        let dest_path = state.kv_store_state_dir.join(format!("{dest_id}.bin"));
+        let dest_before = tokio::fs::read(&dest_path)
+            .await
+            .expect("destination snapshot");
+        let dest_handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("destination handle");
+        let (_, listing) = list_legacy_page_imports(
+            State(Arc::clone(&state)),
+            Path((group_id.clone(), "wiki".to_string())),
+            Extension(owner_actor()),
+        )
+        .await;
+        let digest = listing.0["candidates"][0]["source_digest"]
+            .as_str()
+            .expect("source digest")
+            .to_string();
+        let gap = std::sync::Arc::new(LegacyImportGap {
+            key: "gap-growth",
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LEGACY_IMPORT_GAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::clone(&gap));
+        struct ReleaseGap(std::sync::Arc<LegacyImportGap>);
+        impl Drop for ReleaseGap {
+            fn drop(&mut self) {
+                self.0.release.notify_one();
+                *LEGACY_IMPORT_GAP
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+        }
+        let _release_gap = ReleaseGap(std::sync::Arc::clone(&gap));
+        let state_for_import = Arc::clone(&state);
+        let group_for_import = group_id.clone();
+        let source_for_import = source_id.clone();
+        let digest_for_import = digest.clone();
+        let import = tokio::spawn(async move {
+            import_legacy_page_store(
+                State(state_for_import),
+                Path((group_for_import, "wiki".to_string(), source_for_import)),
+                Extension(owner_actor()),
+                Json(ImportLegacyStoreRequest {
+                    source_digest: digest_for_import,
+                    idempotency_key: "gap-growth".to_string(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), gap.entered.notified())
+            .await
+            .expect("import reaches the post-check gap");
+        {
+            let mut store = dest_handle.sync.write().await;
+            for index in 0..256 {
+                store
+                    .put(
+                        format!("grown-{index:03}"),
+                        vec![index as u8; x0x::kv::entry::MAX_INLINE_SIZE],
+                        "application/octet-stream".to_string(),
+                        dest_handle.peer_id(),
+                    )
+                    .expect("grow the live destination during the gap");
+            }
+        }
+        gap.release.notify_one();
+        let (code, body) = import.await.expect("import task");
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{body:?}");
+        assert!(
+            body.0["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("group image limit")),
+            "{body:?}"
+        );
+        assert_ne!(body.0["imported_locally"], true, "{body:?}");
+        assert!(
+            dest_handle
+                .get("legacy-only")
+                .await
+                .expect("destination read")
+                .is_none(),
+            "the gap growth must be included in the cap check, so the source is not merged"
+        );
+        assert_eq!(
+            tokio::fs::read(&dest_path)
+                .await
+                .expect("destination after"),
+            dest_before,
+            "refusal must not rewrite the destination snapshot"
+        );
+        let receipt_path =
+            crate::server::legacy_store_migration::journal_path(&state.kv_store_state_dir);
+        assert!(
+            crate::server::legacy_store_migration::read_receipts(&receipt_path)
+                .await
+                .expect("receipts")
+                .is_empty()
+        );
+        assert!(crate::server::legacy_store_migration::read_intent(
+            &state.kv_store_state_dir,
+            "gap-growth"
+        )
+        .await
+        .expect("intent")
+        .is_none());
     }
 
     #[tokio::test]
@@ -5002,6 +6064,181 @@ mod tests {
             group_key.to_string(),
             Arc::new(tokio::sync::Mutex::new(live)),
         );
+    }
+
+    fn treekem_store_protector(
+        state: &Arc<AppState>,
+        group_key: &str,
+        info: &x0x::groups::GroupInfo,
+    ) -> TreeKemGroupStoreProtector {
+        let authorization = Arc::new(
+            x0x::groups::TreeKemKvAuthorizationContext::from_group(info).expect("treekem auth"),
+        );
+        TreeKemGroupStoreProtector::new(
+            state,
+            &GssGroupStoreBinding {
+                group_key: group_key.to_string(),
+                stable_group_id: info.stable_group_id().to_string(),
+                creator: info.creator,
+                name: "sealed".to_string(),
+                store_id: x0x::kv::KvStoreId::new([7; 32]),
+                topic: format!("group/{group_key}/sealed"),
+            },
+            authorization,
+        )
+    }
+
+    /// Cancel while the seal is still waiting for the group lock. The
+    /// ratchet must not move.
+    #[tokio::test]
+    async fn cancelled_treekem_seal_does_not_advance_while_waiting_for_the_group_lock() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e1".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("seeded group")
+            .clone();
+        let protector = treekem_store_protector(&state, &group_key, &info);
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let live = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .expect("live ratchet");
+        let guard = live.lock().await;
+        let before = guard.to_snapshot_bytes().expect("snapshot before cancel");
+        let seal = tokio::spawn(async move {
+            protector
+                .seal_record(
+                    &signing,
+                    x0x::kv::KvMutationKind::Control,
+                    &x0x::kv::KvStoreId::new([7; 32]),
+                    b"state-request",
+                    true,
+                )
+                .await
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!seal.is_finished(), "seal acquired the lock the test holds");
+        seal.abort();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = live
+            .lock()
+            .await
+            .to_snapshot_bytes()
+            .expect("snapshot after cancel");
+        assert_eq!(
+            before, after,
+            "a seal cancelled during lock acquisition must not advance the ratchet"
+        );
+    }
+
+    /// Drop the caller while the snapshot write is in progress. The group
+    /// locks stay held until that write finishes, so a later seal cannot
+    /// persist a newer generation underneath it.
+    #[tokio::test]
+    async fn cancelled_treekem_seal_holds_the_group_lock_through_snapshot_persist() {
+        use x0x::kv::TreeKemKvProtector;
+
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e2".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("seeded group")
+            .clone();
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let live = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .expect("live ratchet");
+        let pause = arm_treekem_seal_persist_pause(&group_key);
+        let first = {
+            let protector = treekem_store_protector(&state, &group_key, &info);
+            let signing = signing.clone();
+            tokio::spawn(async move {
+                protector
+                    .seal_record(
+                        &signing,
+                        x0x::kv::KvMutationKind::Delta,
+                        &x0x::kv::KvStoreId::new([7; 32]),
+                        b"first-generation",
+                        false,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("first seal did not reach the snapshot write");
+        first.abort();
+        tokio::task::yield_now().await;
+        assert!(
+            live.try_lock().is_err(),
+            "dropping the caller released the group lock during the snapshot write"
+        );
+        let second = {
+            let protector = treekem_store_protector(&state, &group_key, &info);
+            let signing = signing.clone();
+            tokio::spawn(async move {
+                protector
+                    .seal_record(
+                        &signing,
+                        x0x::kv::KvMutationKind::Delta,
+                        &x0x::kv::KvStoreId::new([7; 32]),
+                        b"second-generation",
+                        false,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a later seal persisted while the cancelled seal still owned the ratchet"
+        );
+        pause.release.notify_one();
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("later seal did not finish after the snapshot write")
+            .expect("later seal task")
+            .expect("later seal");
+        let live_bytes = live
+            .lock()
+            .await
+            .to_snapshot_bytes()
+            .expect("live snapshot");
+        let path = state.treekem_dir.join(format!("{group_key}.snap"));
+        let durable = tokio::fs::read(&path).await.expect("durable snapshot");
+        assert!(
+            durable
+                .windows(live_bytes.len())
+                .any(|window| window == live_bytes.as_slice()),
+            "durable snapshot is not the live ratchet after the later seal"
+        );
+        assert!(record.ciphertext.len() > 16);
     }
 
     #[tokio::test]

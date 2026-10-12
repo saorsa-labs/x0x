@@ -1230,6 +1230,18 @@ impl KvStore {
         self.seq_counter.fetch_max(floor, Ordering::Relaxed);
     }
 
+    /// Give this store its own sequence allocator at the current counter.
+    ///
+    /// [`Clone`] shares the `Arc<AtomicU64>`. `merge_legacy_signed_history`
+    /// then `fetch_max`s that allocator, so a trial clone would move the live
+    /// counter even when the caller discards the trial. Detach before the
+    /// trial merge. Move the trial into the live store only if the merge is
+    /// accepted; dropping the trial leaves the live allocator untouched.
+    pub(crate) fn detach_seq_counter(&mut self) {
+        let current = self.seq_counter.load(Ordering::Relaxed);
+        self.seq_counter = Arc::new(AtomicU64::new(current));
+    }
+
     /// Convert a store decoded through the frozen v1 (≤ v0.45.0) snapshot
     /// shape into the current in-memory form. Every field added after
     /// v0.45.0 takes its default; the struct literal is exhaustive so a new

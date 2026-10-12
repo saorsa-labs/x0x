@@ -88,6 +88,47 @@ impl EvidencePolicy for RuntimePolicy {
             || r.is_machine_revoked(&machine)
             || r.is_binding_revoked(&agent, &machine)
     }
+    fn try_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now: u64,
+    ) -> Option<u8> {
+        if agent == self.local_agent {
+            return Some(0);
+        }
+        let revoked = self.revoked.try_read().ok()?;
+        let mut flags = self
+            .owner
+            .try_evidence_relation(agent, machine, cert, &revoked, now)?;
+        let groups = match self.groups.try_read() {
+            Ok(slot) => slot.clone(),
+            Err(std::sync::TryLockError::Poisoned(_)) => None,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if let Some(groups) = groups {
+            match groups(agent) {
+                Some(true) => flags |= GROUP,
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        Some(flags)
+    }
+    fn try_revoked(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        _user: Option<UserId>,
+    ) -> Option<bool> {
+        let r = self.revoked.try_read().ok()?;
+        Some(
+            r.is_agent_revoked(&agent)
+                || r.is_machine_revoked(&machine)
+                || r.is_binding_revoked(&agent, &machine),
+        )
+    }
     fn contains_agent(&self, agent: AgentId, now: u64) -> bool {
         // Without a record, only explicit agent grants and active rosters
         // resolve this agent. Enrollment/user-grant resolution needs a record;
@@ -154,6 +195,30 @@ impl EvidenceRuntime {
             return;
         };
         self.lookup_with_permit(agent, machine, permit).await;
+    }
+
+    /// x0x #1207: start a Lookup for `agent` in the background (the permit
+    /// is reserved first, as in [`Self::spawn_lookup`]). The caller never
+    /// runs the Lookup's load barrier or its responder selection, whose
+    /// evidence and policy reads block synchronously, so a bounded wait can
+    /// start one. It re-reads its sources afterwards, as after
+    /// [`Self::lookup`].
+    pub(crate) fn spawn_agent_lookup(self: &Arc<Self>, agent: AgentId) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if runtime.wait(0).await {
+                runtime.lookup_with_permit(agent, None, permit).await;
+            }
+        });
+    }
+
+    /// x0x #1207: [`Self::wait`] without waiting: whether the evidence is
+    /// loaded (or the store never started) right now.
+    pub(crate) fn ready_now(&self) -> bool {
+        !self.started.load(Ordering::Acquire) || self.ready.is_cancelled()
     }
 
     /// Reserve before spawning: raw frames never wait for a Lookup or queue
@@ -243,6 +308,23 @@ impl EvidenceRuntime {
         });
         true
     }
+    /// True after load and captured move adverts have both been applied.
+    /// This non-blocking probe does not enter or charge the load barrier.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.is_cancelled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loading_store_for_test(
+        store: Arc<PeerEvidenceStore>,
+    ) -> (Arc<Self>, tokio_util::sync::CancellationToken) {
+        let runtime = Arc::new(Self::default());
+        runtime.started.store(true, Ordering::Release);
+        assert!(runtime.store.set(store).is_ok());
+        let ready = runtime.ready.clone();
+        (runtime, ready)
+    }
+
     /// Await load within the frame/byte cap. Cancellation releases both permits.
     pub async fn wait(&self, bytes: usize) -> bool {
         if self.ready.is_cancelled() {
@@ -290,12 +372,80 @@ impl EvidenceRuntime {
         }
         self.store.get()?.usable(agent, machine, now)
     }
+    /// ADR 0115 §2: whether a usable record exists for exactly
+    /// (agent, machine), without the store's use counters.
+    pub(crate) fn confirms_pairing(&self, agent: AgentId, machine: MachineId, now: u64) -> bool {
+        self.ready.is_cancelled()
+            && self
+                .store
+                .get()
+                .is_some_and(|store| store.confirms_pairing(agent, machine, now))
+    }
+    /// [`Self::confirms_pairing`] for synchronous seams: `None` while a lock
+    /// is contended.
+    pub(crate) fn try_confirms_pairing(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> Option<bool> {
+        if !self.ready.is_cancelled() {
+            return Some(false);
+        }
+        match self.store.get() {
+            Some(store) => store.try_confirms_pairing(agent, machine, now),
+            None => Some(false),
+        }
+    }
+    /// ADR 0115 §3: the owner certificate of `agent`'s usable
+    /// record, if any, without the store's use counters.
+    pub(crate) fn usable_certificate(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> Option<crate::identity::AgentCertificate> {
+        if !self.ready.is_cancelled() {
+            return None;
+        }
+        self.store.get()?.usable_certificate(agent, now)
+    }
+    /// [`Self::usable`] without blocking on the store lock or a policy read
+    /// (x0x #1207); `Err(())` while a lock is contended.
+    pub(crate) fn try_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        if !self.ready.is_cancelled() {
+            return Ok(None);
+        }
+        match self.store.get() {
+            Some(store) => store.try_usable(agent, machine, now),
+            None => Ok(None),
+        }
+    }
     /// Resolve a recipient when its live sources are empty.
     pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {
         if !self.ready.is_cancelled() {
             return None;
         }
         self.store.get()?.usable_agent(agent, now)
+    }
+    /// [`Self::usable_agent`] without blocking on the store lock (x0x #1150
+    /// r7b); `Err(())` while the lock is contended.
+    pub(crate) fn try_usable_agent(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        if !self.ready.is_cancelled() {
+            return Ok(None);
+        }
+        match self.store.get() {
+            Some(store) => store.try_usable_agent(agent, now),
+            None => Ok(None),
+        }
     }
     /// Startup, barrier and persistence diagnostics.
     pub fn diagnostics(&self) -> serde_json::Value {

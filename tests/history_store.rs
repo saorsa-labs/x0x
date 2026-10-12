@@ -1,6 +1,7 @@
 //! ADR-0023 history store — public-API unit/behavioral tests (§9).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use x0x::error::HistoryError;
 use x0x::history::{
     Direction, HistoryConfig, HistoryQuery, HistoryRecord, HistoryService, InsertOutcome,
     Provenance, RetentionPolicy, Scope, ScopeLimit, Store,
@@ -292,13 +293,93 @@ fn wal_crash_recovery_reopen() {
 
 /// A second process (simulated by a second open) must fail loud, not
 /// silently interleave (ADR-0023 §6 shared-data-dir posture).
+///
+/// Issue #1315: it fails as `HistoryError::Locked`, the variant documented
+/// for "already exclusively held by another process", naming the path, and
+/// within one busy-timeout window. Before the fix it failed as
+/// `HistoryError::Database("pragma setup … database is locked")`.
 #[test]
 fn exclusive_open_fails_loud() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");
     let _held = Store::open(&path).unwrap();
-    let second = Store::open_with_busy_timeout(&path, std::time::Duration::from_millis(100));
-    assert!(second.is_err(), "second exclusive open must fail");
+    // A 1 s busy timeout: one window is about 1 s, and the old three-window
+    // retry took over 3 s. The < 2.5x bound below separates the two with wide
+    // margin, so a loaded CI runner does not fail it.
+    let busy = std::time::Duration::from_millis(1000);
+    let started = std::time::Instant::now();
+    let second = Store::open_with_busy_timeout(&path, busy);
+    let waited = started.elapsed();
+    assert!(
+        matches!(&second, Err(HistoryError::Locked(_))),
+        "second exclusive open must fail as Locked: {:?}",
+        second.as_ref().err()
+    );
+    let message = second.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(
+        waited < busy * 5 / 2,
+        "one busy window, not three: {waited:?}"
+    );
+}
+
+/// Issue #1315, through the service (what `AgentBuilder::build` opens).
+#[tokio::test]
+async fn exclusive_service_open_fails_as_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    let _held = Store::open(&path).unwrap();
+    let config = HistoryConfig {
+        enabled: true,
+        db_path: Some(path.clone()),
+        ..HistoryConfig::default()
+    };
+    match HistoryService::start(&config, dir.path()) {
+        Ok(_) => panic!("a held history.db must not open twice"),
+        Err(e) => assert!(matches!(e, HistoryError::Locked(_)), "{e:?}"),
+    }
+}
+
+/// Issue #1315, the daemon's start-up message: x0xd wraps the builder error
+/// with `.context("failed to create agent")` and prints it in anyhow's Debug
+/// form (with its "Caused by" chain). The cause must name the lock and the
+/// path, not read as a generic history database error.
+#[tokio::test]
+async fn an_agent_on_a_held_history_db_names_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    let _held = Store::open(&path).unwrap();
+    let built = x0x::Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_peer_cache_disabled()
+        .with_network_config(x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        })
+        .with_history(HistoryConfig {
+            enabled: true,
+            db_path: Some(path.clone()),
+            ..HistoryConfig::default()
+        })
+        .build()
+        .await;
+    let error = match built {
+        Ok(_) => panic!("an agent must not start on a held history.db"),
+        Err(e) => e,
+    };
+    let shown = format!(
+        "{:?}",
+        anyhow::Error::new(error).context("failed to create agent")
+    );
+    println!("x0xd start-up error, as printed:\n{shown}");
+    assert!(shown.contains("failed to create agent"), "{shown}");
+    assert!(shown.contains("locked by another process"), "{shown}");
+    assert!(shown.contains(&path.display().to_string()), "{shown}");
 }
 
 /// Writer service: records flow through the bounded writer thread; a
@@ -334,7 +415,7 @@ async fn writer_service_writes_and_sheds() {
             .load(std::sync::atomic::Ordering::Relaxed),
         100
     );
-    let rows = handle.store().query(&HistoryQuery::default()).unwrap();
+    let rows = handle.query(&HistoryQuery::default()).unwrap();
     assert_eq!(rows.len(), 100);
 
     // Shutdown drains; post-shutdown records shed (counted, never block).
@@ -707,4 +788,61 @@ fn scopes_on_empty_store_and_past_the_end_cursor_are_empty_pages() {
             .is_empty(),
         "the cursor is exclusive — the scope it names is not repeated"
     );
+}
+
+/// Issue #1317: under an Ephemeral policy no public write path stores a
+/// suppressed record. The handle's public writes are `record` and
+/// `record_committed` (the raw store is not public: see the `compile_fail`
+/// doctest on `HistoryHandle`), and both obey the ADR 0116 gate. The public
+/// read methods then find no suppressed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_public_write_stores_a_suppressed_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = HistoryConfig {
+        enabled: true,
+        db_path: Some(dir.path().join("history.db")),
+        dm_recording: x0x::history::DmRecording::Ephemeral,
+        topic_rules: vec![x0x::history::TopicRule {
+            prefix: "quiet.".into(),
+            recording: x0x::history::TopicRecording::Ephemeral,
+            max_bytes: None,
+            max_age_days: None,
+        }],
+        ..HistoryConfig::default()
+    };
+    let service = HistoryService::start(&config, dir.path()).unwrap();
+    let handle = service.handle();
+    let dm = Scope::Dm("ab".repeat(32));
+    let quiet = Scope::Topic("quiet.room".into());
+    handle.record(record(b"dm via record", dm.clone(), 1_000));
+    handle.record(record(b"quiet via record", quiet.clone(), 1_000));
+    assert!(matches!(
+        handle
+            .record_committed(record(b"dm via record_committed", dm.clone(), 1_000))
+            .await,
+        Err(x0x::error::HistoryError::PolicySuppressed)
+    ));
+    assert!(matches!(
+        handle
+            .record_committed(record(b"quiet via record_committed", quiet.clone(), 1_000))
+            .await,
+        Err(x0x::error::HistoryError::PolicySuppressed)
+    ));
+    // A recorded row on the same writer queue: every earlier record was
+    // processed before it commits.
+    handle
+        .record_committed(record(b"barrier", Scope::Topic("loud".into()), 1_000))
+        .await
+        .unwrap();
+    for scope in [dm, quiet] {
+        let rows = handle
+            .query(&HistoryQuery {
+                scope: Some(scope.clone()),
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        assert!(rows.is_empty(), "{scope:?}: {rows:?}");
+    }
+    assert_eq!(handle.stats().unwrap().rows, 1, "only the barrier row");
+    service.shutdown().await;
 }

@@ -357,6 +357,134 @@ async fn corrupt_outbox_fails_closed() {
     assert_eq!(std::fs::read(world.outbox_path()).unwrap(), b"X0GOgarbage");
 }
 
+/// WHY (#1101): when the durable outbox write fails AFTER the atomic
+/// rename, the entry is already in `share-grant-outbox.bin`. The outbox
+/// must keep it in memory (memory == disk, so a later persist cannot
+/// silently drop a queued delivery) and still report the failure — the
+/// write is not confirmed durable.
+///
+/// WHY (#1322 review P2): `Ok` from `enqueue` means "durably queued"
+/// (ADR 0077). A duplicate of the retained, unconfirmed entry must not
+/// return `Ok` until a write with a successful directory sync confirms
+/// it. While the fault persists, both calls fail. After the fault
+/// clears, the retry must write and sync before it reports success.
+#[tokio::test]
+async fn enqueue_post_rename_failure_keeps_entry_and_reload_agrees() {
+    let world = World::new().await;
+    let outbox = world.outbox(world.now).await;
+    let grant = world.grant(0x7F, 3_600);
+
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&world.outbox_path());
+    let err = outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OutboxError::Store(_)), "{err:?}");
+
+    // Memory keeps the entry: it matches the advanced disk.
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 1, "the entry stays queued in memory");
+    assert_eq!(pending[0].grant, grant);
+    assert_eq!(pending[0].recipient, world.a1);
+
+    // A reload from disk agrees with memory.
+    let reloaded = world.outbox(world.now).await;
+    assert_eq!(reloaded.pending().len(), 1, "the entry is on disk");
+    assert_eq!(reloaded.pending()[0].grant, grant);
+
+    // The same pair again, while the fault persists: still unconfirmed.
+    let again = outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await;
+    assert!(
+        matches!(again, Err(OutboxError::Store(_))),
+        "a duplicate must not confirm an unconfirmed write: {again:?}"
+    );
+    assert_eq!(outbox.pending().len(), 1, "the entry stays queued");
+
+    // The fault clears. Then remove the file: this is what a power loss
+    // can do to a rename whose directory was never synced.
+    drop(seam);
+    std::fs::remove_file(world.outbox_path()).expect("remove the unsynced outbox file");
+
+    // The retry writes and syncs the entry before it reports success.
+    let confirmed = outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await;
+    assert_eq!(confirmed, Ok(false), "a confirmed duplicate");
+    let after_retry = world.outbox(world.now).await;
+    assert_eq!(
+        after_retry.pending().len(),
+        1,
+        "the retry rewrote the entry to disk before its Ok"
+    );
+    assert_eq!(after_retry.pending()[0].grant, grant);
+}
+
+/// WHY (#1322 review P2): `GrantDelivery.queued` promises a durable
+/// outbox entry. After a post-rename failure, neither the first POST nor
+/// a retried POST of the same grant may claim it while the fault
+/// persists. After the fault clears, a retry confirms the entry, and only
+/// then reports `queued`.
+#[tokio::test]
+async fn delivery_is_not_reported_queued_until_the_outbox_write_is_durable() {
+    let world = World::new().await;
+    let outbox = world.outbox(world.now).await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    let grant = world.grant(0x7E, 3_600);
+
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&world.outbox_path());
+    let first = issue_to(&world, &grant, &outbox, &receiver).await;
+    assert!(!first.delivered, "A1 is offline");
+    assert!(
+        !first.queued,
+        "an unconfirmed outbox write is not a durable queue entry: {first:?}"
+    );
+    let second = issue_to(&world, &grant, &outbox, &receiver).await;
+    assert!(
+        !second.queued,
+        "a retried POST must not confirm the unconfirmed entry: {second:?}"
+    );
+
+    drop(seam);
+    std::fs::remove_file(world.outbox_path()).expect("remove the unsynced outbox file");
+    let third = issue_to(&world, &grant, &outbox, &receiver).await;
+    assert!(
+        third.queued,
+        "after the fault clears, the retry confirms the entry: {third:?}"
+    );
+    assert_eq!(
+        world.outbox(world.now).await.pending().len(),
+        1,
+        "the confirmed entry is on disk"
+    );
+}
+
+/// WHY (#1322 review P3): after a post-rename failure the entry IS queued
+/// (in memory and in the file; the worker retries it). The delivery error
+/// must say that the entry is queued but not confirmed durable. It must
+/// not say "not queued".
+#[tokio::test]
+async fn post_rename_outbox_failure_reports_the_entry_as_queued_not_absent() {
+    let world = World::new().await;
+    let outbox = world.outbox(world.now).await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    let grant = world.grant(0x7D, 3_600);
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&world.outbox_path());
+    let delivery = issue_to(&world, &grant, &outbox, &receiver).await;
+    assert_eq!(outbox.pending().len(), 1, "the entry is queued in memory");
+    let error = delivery.error.unwrap_or_default();
+    assert!(
+        !error.contains("not queued"),
+        "the entry is queued, so the error must not say otherwise: {error}"
+    );
+    assert!(
+        error.contains("queued for redelivery, but not confirmed durable"),
+        "the error says the entry is queued but unconfirmed: {error}"
+    );
+}
+
 /// WHY (#926 test c): revoking a queued grant removes the entry and nothing
 /// is ever delivered — including after a restart.
 #[tokio::test]

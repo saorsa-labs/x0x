@@ -27,6 +27,14 @@ use crate::error::{NetworkError, NetworkResult};
 mod churn;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
+mod link;
+use self::link::LinkNode;
+mod stream;
+pub use self::stream::{StreamRecv, StreamSend};
+// W3-H (#1164): deterministic in-memory transport for the simulation
+// harness. Test builds only (`#![cfg(test)]` inside the file); production
+// `NetworkNode`s always run on QUIC.
+pub(crate) mod sim;
 
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
@@ -114,20 +122,81 @@ struct GossipPayload {
 /// aliased by a replacement connection for the same peer: a new connection
 /// has a different stable id and therefore must mint a new token.
 struct SessionEntry {
-    connection: ant_quic::high_level::Connection,
+    connection: SessionConnection,
     ant_generation: u64,
     token: AuthenticatedSession,
     last_used: Instant,
+}
+
+/// The backend connection a session token is bound to: the live QUIC
+/// connection in production, or a W3-H simulated link generation in test
+/// builds. The registry rules (reuse while the same live connection is
+/// current, mint on replacement, evict closed then LRU) are identical for
+/// both.
+enum SessionConnection {
+    Quic(ant_quic::high_level::Connection),
+    #[cfg(test)]
+    Sim(sim::SimConnection),
+}
+
+impl SessionConnection {
+    fn stable_id(&self) -> usize {
+        match self {
+            Self::Quic(connection) => connection.stable_id(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.stable_id(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Quic(connection) => connection.close_reason().is_some(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.is_closed(),
+        }
+    }
 }
 
 /// Bounded per-peer registry of live authenticated sessions.
 ///
 /// `next` mints process-unique SG token generations; it is unrelated to ant's
 /// connection generation namespace stored alongside in each entry.
-#[derive(Default)]
+///
+/// `teardown` is the node's teardown token (#1262). Once it is cancelled the
+/// registry resolves no session and accepts no insert (#1277). The check
+/// runs under the registry lock, which the teardown clear also takes, and
+/// the coordinator cancels the token before the teardown worker starts. So
+/// an insert either precedes the clear (and the clear removes it) or sees
+/// the cancelled token and is refused: no entry can follow the clear.
 struct AuthenticatedSessions {
     next: u64,
     peers: HashMap<AntPeerId, SessionEntry>,
+    teardown: tokio_util::sync::CancellationToken,
+}
+
+impl AuthenticatedSessions {
+    fn new(teardown: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            next: 0,
+            peers: HashMap::new(),
+            teardown,
+        }
+    }
+
+    /// Whether network teardown has started. Callers hold the registry lock.
+    fn closed(&self) -> bool {
+        self.teardown.is_cancelled()
+    }
+}
+
+/// Drop every retained session handle. Network teardown calls this before
+/// and after the transport shutdown (#1277).
+fn clear_session_registry(registry: &Mutex<AuthenticatedSessions>) {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .peers
+        .clear();
 }
 
 /// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
@@ -201,6 +270,7 @@ impl std::fmt::Debug for AuthenticatedSessions {
         f.debug_struct("AuthenticatedSessions")
             .field("next", &self.next)
             .field("live_entries", &self.peers.len())
+            .field("closed", &self.closed())
             .finish()
     }
 }
@@ -1343,7 +1413,7 @@ pub const MAX_PLANE_ID_LEN: usize = 64;
 /// after this elapses. New-code cross-plane peers present a mismatched hello
 /// within milliseconds of connecting, long before grace expiry, so the grace
 /// only ever gates truly legacy peers.
-const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const PLANE_LEGACY_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a successful plane verification stays trusted across connection
 /// generations (issue #206). Connection churn (mutual-dial supersedes,
@@ -1362,7 +1432,7 @@ const PLANE_REVERIFY_TTL: Duration = Duration::from_secs(600);
 /// cross-plane peer as legacy. Retrying every 2s gives ~4 further chances
 /// inside the grace window, so legacy admission is reserved for peers that
 /// genuinely never speak the hello protocol.
-const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Per-peer gossip-plane state, tracked only when plane isolation is
 /// configured (`NetworkConfig::network_id` is `Some`).
@@ -1876,7 +1946,7 @@ async fn forward_gossip_payload(
 }
 
 async fn disconnect_pool_candidates(
-    node: &Node,
+    node: &LinkNode,
     event_sender: &broadcast::Sender<NetworkEvent>,
     connection_pool: &ConnectionPool,
     reconnect_suppressions: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
@@ -1930,7 +2000,7 @@ async fn disconnect_pool_candidates(
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
-    node: Arc<RwLock<Option<Node>>>,
+    node: Arc<RwLock<Option<LinkNode>>>,
     /// Configuration for this node.
     config: NetworkConfig,
     /// Sender for broadcasting network events.
@@ -2018,12 +2088,10 @@ pub struct NetworkNode {
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
-    /// Tracked so `shutdown` can abort them: the receiver and accept loops park
-    /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
-    /// they must be aborted before `shutdown` can take the *write* lock to drop
-    /// the node. Without this, `shutdown` would deadlock on an idle node that
-    /// never receives another packet/connection. The typed ant-quic shutdown
-    /// then verifies release of the bound UDP socket before reporting success.
+    /// Tracked so `shutdown` can abort and join them, releasing their endpoint
+    /// clones before consuming the node. Network awaits never retain a guard
+    /// on the shared node slot. Typed ant-quic shutdown then verifies release
+    /// of the bound UDP socket before reporting success.
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// One-shot shutdown coordinator shared by every clone. The ant node is
     /// consumed by shutdown, so both success and failure must remain visible
@@ -2036,7 +2104,25 @@ pub struct NetworkNode {
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+    /// W3-H (#1164): the simulated link this node runs on, if any, so the
+    /// pub-sub publish funnel can record attempts before mesh fan-out.
+    #[cfg(test)]
+    sim_link: Option<Arc<sim::SimLink>>,
+    /// #1277 test-only seam: a one-shot pause in the teardown worker right
+    /// after it clears the session registry (see
+    /// [`NetworkNode::pause_shutdown_after_registry_clear_for_test`]).
+    #[cfg(test)]
+    registry_clear_pause_for_test: Arc<Mutex<Option<RegistryClearPause>>>,
 }
+
+/// #1277 test seam: the worker reports on the sender that it cleared the
+/// session registry, then waits on the receiver before it shuts the
+/// transport down.
+#[cfg(test)]
+type RegistryClearPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 #[derive(Clone, Debug)]
 enum NetworkShutdownOutcome {
@@ -2047,6 +2133,10 @@ enum NetworkShutdownOutcome {
 #[derive(Debug)]
 struct NetworkShutdownCoordinator {
     started: std::sync::atomic::AtomicBool,
+    /// Cancelled when teardown starts, before the node is taken. Outbound
+    /// dials select on it (see [`NetworkNode::dial_until_teardown`]), so no
+    /// handshake outlives the start of teardown (#1262).
+    teardown: tokio_util::sync::CancellationToken,
     outcome: tokio::sync::watch::Sender<NetworkShutdownOutcome>,
 }
 
@@ -2055,6 +2145,7 @@ impl NetworkShutdownCoordinator {
         let (outcome, _receiver) = tokio::sync::watch::channel(NetworkShutdownOutcome::Pending);
         Self {
             started: std::sync::atomic::AtomicBool::new(false),
+            teardown: tokio_util::sync::CancellationToken::new(),
             outcome,
         }
     }
@@ -2069,6 +2160,8 @@ impl NetworkShutdownCoordinator {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Abandon every in-flight dial before the teardown worker runs.
+            self.teardown.cancel();
             let completion = self.outcome.clone();
             tokio::spawn(async move {
                 // Keep custody independent of the initiating caller: dropping
@@ -2105,6 +2198,17 @@ impl NetworkShutdownCoordinator {
             }
         }
     }
+}
+
+/// The error a dial reports when network teardown abandons it (see
+/// [`NetworkNode::dial_until_teardown`]).
+fn dial_abandoned(origin: &'static str) -> NetworkError {
+    tracing::debug!(
+        target: "x0x::connect",
+        origin,
+        "dial abandoned: network teardown started"
+    );
+    NetworkError::ConnectionFailed("dial abandoned: network is shutting down".to_string())
 }
 
 /// #677 test-only seam: when armed for a node id, THAT node's accept loop
@@ -2248,6 +2352,20 @@ impl NetworkNode {
             builder = builder.mdns_namespace(id.clone());
         }
 
+        // W3-H (#1164): a test-build node whose plane has a registered
+        // simulation fabric runs on it instead of binding a QUIC socket.
+        #[cfg(test)]
+        if let Some(link) = sim::claim(&config, expected_peer_id) {
+            return Ok(Self::assemble(
+                config,
+                LinkNode::Sim(link),
+                expected_peer_id,
+                transport_signing_key,
+                None,
+            )
+            .await);
+        }
+
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
@@ -2262,6 +2380,32 @@ impl NetworkNode {
         // Share the endpoint's cache instance (never a second handle on the
         // same file). The endpoint runs cache maintenance itself.
         let bootstrap_cache = Some(node.bootstrap_cache());
+        Ok(Self::assemble(
+            config,
+            LinkNode::Quic(node),
+            peer_id,
+            transport_signing_key,
+            bootstrap_cache,
+        )
+        .await)
+    }
+
+    /// Everything in [`Self::new`] after the transport backend exists:
+    /// channels, pools, the receive pump and the other background tasks.
+    /// Split out (behaviour unchanged) so the W3-H simulation backend
+    /// (#1164) is assembled by exactly the production code.
+    async fn assemble(
+        config: NetworkConfig,
+        node: LinkNode,
+        peer_id: AntPeerId,
+        transport_signing_key: TransportSigningKey,
+        bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    ) -> Self {
+        #[cfg(test)]
+        let sim_link = match &node {
+            LinkNode::Sim(link) => Some(Arc::clone(link)),
+            LinkNode::Quic(_) => None,
+        };
         let (event_sender, _event_receiver) = broadcast::channel(32);
         // Inbound gossip buffers are split by stream type so PubSub back-pressure
         // cannot block Bulk presence beacons or Membership/SWIM control traffic.
@@ -2286,6 +2430,12 @@ impl NetworkNode {
             pool_max_connections,
             CONNECTION_POOL_IDLE_EVICT_AFTER,
         ));
+        let shutdown_state = Arc::new(NetworkShutdownCoordinator::new());
+        // The registry shares the teardown token so it refuses inserts once
+        // teardown has started (#1277).
+        let authenticated_sessions = Arc::new(Mutex::new(AuthenticatedSessions::new(
+            shutdown_state.teardown.clone(),
+        )));
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -2310,7 +2460,7 @@ impl NetworkNode {
             transport_signing_key,
             bootstrap_cache,
             connection_pool,
-            authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
+            authenticated_sessions,
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -2318,19 +2468,23 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
-            shutdown_state: Arc::new(NetworkShutdownCoordinator::new()),
+            shutdown_state,
             #[cfg(test)]
             shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            sim_link,
+            #[cfg(test)]
+            registry_clear_pause_for_test: Arc::new(Mutex::new(None)),
         };
 
         let receiver = network_node.spawn_receiver();
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
         let plane_gatekeeper = network_node.spawn_plane_gatekeeper();
-        // Record the handles so `shutdown` can abort them (letting it take the
-        // node write lock and shut the node down without deadlocking). This runs
+        // Record the handles so `shutdown` can abort and join their endpoint
+        // operations before consuming the node. This runs
         // at construction before the node is shared, so there is no contention;
         // if the lock is somehow poisoned, recover the guard rather than panic
         // (the handles are only used for clean teardown).
@@ -2346,11 +2500,26 @@ impl NetworkNode {
         // #368 gate 2: pure-observation churn counters over ant-quic's
         // event streams (connect direction, redials-of-connected,
         // generation replace/close lifecycle). Zero behaviour change.
-        if let Some(node) = network_node.node.read().await.as_ref() {
+        if let Some(node) = network_node
+            .node
+            .read()
+            .await
+            .as_ref()
+            .and_then(LinkNode::quic)
+        {
             Arc::clone(&network_node.churn).spawn_observer(node);
         }
 
-        Ok(network_node)
+        network_node
+    }
+
+    /// W3-H (#1164): record a pub-sub publish attempt on the simulated
+    /// fabric's trace before any mesh fan-out (no-op on QUIC).
+    #[cfg(test)]
+    pub(crate) fn sim_note_publish(&self, topic: &str, payload: &[u8]) {
+        if let Some(link) = &self.sim_link {
+            link.note_publish(topic, payload);
+        }
     }
 
     /// Get the configuration for this node.
@@ -2436,13 +2605,13 @@ impl NetworkNode {
     /// external addresses, connection stats, and relay/coordinator state.
     pub async fn node_status(&self) -> Option<ant_quic::NodeStatus> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.status().await)
+        Some(node.quic()?.status().await)
     }
 
     /// Snapshot ACK-v2 per-stage latency and outcome diagnostics.
     pub async fn ack_diagnostics(&self) -> Option<ant_quic::AckDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.ack_diagnostics())
+        Some(node.quic()?.ack_diagnostics())
     }
 
     /// Snapshot `data_tx` channel saturation diagnostics (X0X-0039).
@@ -2454,7 +2623,7 @@ impl NetworkNode {
         &self,
     ) -> Option<ant_quic::DataChannelDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.data_channel_diagnostics())
+        Some(node.quic()?.data_channel_diagnostics())
     }
 
     /// Snapshot GSO bundle send diagnostics (X0X-0043).
@@ -2464,7 +2633,7 @@ impl NetworkNode {
     /// Returns `None` when the network node is not yet initialised.
     pub async fn gso_diagnostics(&self) -> Option<ant_quic::GsoDiagnosticsSnapshot> {
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.gso_diagnostics())
+        Some(node.quic()?.gso_diagnostics())
     }
 
     /// Active liveness probe for a peer (ant-quic 0.27.2 #173).
@@ -2500,7 +2669,7 @@ impl NetworkNode {
         peer_id: AntPeerId,
     ) -> Option<ant_quic::ConnectionTransportStats> {
         let node = self.node.read().await.as_ref().cloned()?;
-        node.connection_transport_stats(&peer_id).await
+        node.quic()?.connection_transport_stats(&peer_id).await
     }
 
     /// Send data and wait for the remote receive pipeline to acknowledge
@@ -2541,7 +2710,10 @@ impl NetworkNode {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return NetworkStats::default();
         };
-        let status = node.status().await;
+        let Some(quic) = node.quic() else {
+            return NetworkStats::default();
+        };
+        let status = quic.status().await;
         NetworkStats {
             total_connections: status.direct_connections + status.relayed_connections,
             active_connections: status.active_connections as u32,
@@ -2565,7 +2737,7 @@ impl NetworkNode {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return 0;
         };
-        node.status().await.connected_peers
+        node.connection_count().await
     }
 
     /// Subscribe to network events.
@@ -2620,7 +2792,8 @@ impl NetworkNode {
     }
 
     /// Current `(ant generation, SG token)` for a peer with a live, open QUIC
-    /// connection, minting/reusing a registry entry as needed.
+    /// connection, minting/reusing a registry entry as needed. Returns `None`
+    /// once network teardown has started (#1277).
     ///
     /// A returned entry proves: a non-sentinel current ant generation, a
     /// non-closed retained QUIC connection whose stable id matches the one
@@ -2628,7 +2801,7 @@ impl NetworkNode {
     /// and after the registry lock. Eviction is LRU over closed connections
     /// first, then oldest-used, bounded by `max_peers`.
     fn current_session_for_peer(
-        node: &Node,
+        node: &LinkNode,
         registry: &Arc<Mutex<AuthenticatedSessions>>,
         max_peers: usize,
         ant_peer: &AntPeerId,
@@ -2640,17 +2813,21 @@ impl NetworkNode {
         if ant_generation == STALE_GENERATION_SENTINEL {
             return None;
         }
-        let connection = node
-            .inner_endpoint()
-            .get_quic_connection(ant_peer)
-            .ok()
-            .flatten()?;
-        if connection.close_reason().is_some()
+        let connection = node.session_connection(ant_peer)?;
+        if connection.is_closed()
             || node.current_connection_generation(ant_peer) != Some(ant_generation)
         {
             return None;
         }
         let mut sessions = registry.lock().ok()?;
+        // #1277: once teardown has started, resolve nothing and insert
+        // nothing. A send that took its `LinkNode` before teardown can reach
+        // here after the teardown clear while its connection is still open;
+        // this check, under the lock the clear takes, keeps that connection
+        // out of the registry.
+        if sessions.closed() {
+            return None;
+        }
         if let Some(entry) = sessions.peers.get_mut(ant_peer) {
             if entry.connection.stable_id() == connection.stable_id()
                 && entry.ant_generation == ant_generation
@@ -2662,7 +2839,7 @@ impl NetworkNode {
         let next = sessions.next.checked_add(1)?;
         sessions
             .peers
-            .retain(|_, entry| entry.connection.close_reason().is_none());
+            .retain(|_, entry| !entry.connection.is_closed());
         if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(ant_peer) {
             let oldest = sessions
                 .peers
@@ -3076,8 +3253,8 @@ impl NetworkNode {
         }
 
         if self.is_connected(&peer_id).await {
-            let node_guard = self.node.read().await;
-            if let Some(node) = node_guard.as_ref() {
+            let node = self.node.read().await.as_ref().cloned();
+            if let Some(node) = node {
                 if let Some(addr) = node
                     .connected_peers()
                     .await
@@ -3202,7 +3379,9 @@ impl NetworkNode {
             "starting direct dial"
         );
         let start = std::time::Instant::now();
-        let result = node.connect_addr(addr).await;
+        let Some(result) = self.dial_until_teardown(node.connect_addr(addr)).await else {
+            return Err(dial_abandoned(origin));
+        };
         let dur_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -3286,9 +3465,10 @@ impl NetworkNode {
         self.dial_gated(&peer_id, "peer").await?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
-        let peer_conn = node
-            .connect_peer(peer_id)
+        let peer_conn = self
+            .dial_until_teardown(node.connect_peer(peer_id))
             .await
+            .ok_or_else(|| dial_abandoned("peer"))?
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
         // Issue #292 invariant C: a tombstone that landed mid-handshake
@@ -3388,7 +3568,12 @@ impl NetworkNode {
             .collect();
 
         let start = std::time::Instant::now();
-        let peer_conn_res = node.connect_peer_with_addrs(peer_id, addrs).await;
+        let Some(peer_conn_res) = self
+            .dial_until_teardown(node.connect_peer_with_addrs(peer_id, addrs))
+            .await
+        else {
+            return Err(dial_abandoned("peer_with_addrs"));
+        };
         let dur_ms = start.elapsed().as_millis() as u64;
 
         let peer_conn = match peer_conn_res {
@@ -3760,7 +3945,7 @@ impl NetworkNode {
     /// `suppress_reconnect` would refresh the tombstone (invariant F).
     async fn dial_gated_answered(
         &self,
-        node: &Node,
+        node: &LinkNode,
         answered: &AntPeerId,
         origin: &'static str,
     ) -> NetworkResult<()> {
@@ -4022,8 +4207,8 @@ impl NetworkNode {
                         };
                         if !pending.is_empty() {
                             let frame = build_plane_hello_frame(&plane_id);
-                            let guard = node.read().await;
-                            if let Some(node) = guard.as_ref() {
+                            let node = node.read().await.as_ref().cloned();
+                            if let Some(node) = node {
                                 for peer in pending {
                                     let _ = node.send(&peer, &frame).await;
                                 }
@@ -4115,8 +4300,8 @@ impl NetworkNode {
     ///
     /// Vector of connected peer IDs.
     pub async fn connected_peers(&self) -> Vec<AntPeerId> {
-        let node_guard = self.node.read().await;
-        match node_guard.as_ref() {
+        let node = self.node.read().await.as_ref().cloned();
+        match node {
             Some(node) => node
                 .connected_peers()
                 .await
@@ -4137,8 +4322,8 @@ impl NetworkNode {
     ///
     /// True if connected to the peer.
     pub async fn is_connected(&self, peer_id: &AntPeerId) -> bool {
-        let node_guard = self.node.read().await;
-        match node_guard.as_ref() {
+        let node = self.node.read().await.as_ref().cloned();
+        match node {
             Some(node) => node.is_connected(peer_id).await,
             None => false,
         }
@@ -4186,7 +4371,10 @@ impl NetworkNode {
         let Some(node) = node else {
             return TransportDiagnosticsSnapshot::default();
         };
-        let endpoint = node.inner_endpoint();
+        let Some(quic) = node.quic() else {
+            return TransportDiagnosticsSnapshot::default();
+        };
+        let endpoint = quic.inner_endpoint();
         let stats = endpoint.stats().await;
         let conns = endpoint.connected_peers().await;
         let mut snap = TransportDiagnosticsSnapshot::from_parts(&stats, &conns);
@@ -4215,10 +4403,8 @@ impl NetworkNode {
     /// connections, and shut down the ant-quic node.
     ///
     /// The background receiver and accept loops park in `recv()`/`accept().await`
-    /// while holding a *read* guard on `node`, so they are aborted FIRST —
-    /// otherwise taking the *write* lock below would deadlock on an idle node
-    /// that never receives another packet. After the tasks are aborted (releasing
-    /// their read guards and `node` clones), the node is taken and shut down.
+    /// with endpoint clones. They are aborted and joined before the node is
+    /// taken and shut down, so those operations no longer own the transport.
     ///
     /// Compatibility wrapper for callers that cannot consume a typed shutdown
     /// result. Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
@@ -4240,6 +4426,8 @@ impl NetworkNode {
         let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
         #[cfg(test)]
         let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
+        #[cfg(test)]
+        let registry_clear_pause = Arc::clone(&self.registry_clear_pause_for_test);
         self.shutdown_state
             .run(async move {
                 let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
@@ -4259,20 +4447,32 @@ impl NetworkNode {
                     let mut node_guard = node.write().await;
                     node_guard.take()
                 };
-                // Drop retained session-registry connections alongside the
-                authenticated_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .peers
-                    .clear();
+                // Drop the retained session-registry connections before the
+                // transport shuts down. The registry has refused inserts
+                // since teardown started (#1277), so nothing re-enters it.
+                clear_session_registry(&authenticated_sessions);
+                #[cfg(test)]
+                {
+                    let pause = registry_clear_pause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some((cleared, resume)) = pause {
+                        let _ = cleared.send(());
+                        let _ = resume.await;
+                    }
+                }
                 let Some(node) = node else {
                     return Err(
                         "network node was absent before shutdown established a result".to_string(),
                     );
                 };
-                node.try_shutdown()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let released = node.try_shutdown().await;
+                // Belt and braces (#1277): clear again once the transport is
+                // down, whatever its result, so no session handle outlives
+                // teardown even if an insert path ever skips the check.
+                clear_session_registry(&authenticated_sessions);
+                released.map_err(|error| error.to_string())?;
                 #[cfg(test)]
                 if let Some(error) = shutdown_failure
                     .lock()
@@ -4295,11 +4495,58 @@ impl NetworkNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
     }
 
+    /// Arm a one-shot pause in the teardown worker right after it clears the
+    /// session registry, before it shuts the transport down (#1277). The
+    /// worker sends on `cleared`, then waits for `resume` (or for its sender
+    /// to drop).
+    #[cfg(test)]
+    pub(crate) fn pause_shutdown_after_registry_clear_for_test(
+        &self,
+        cleared: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .registry_clear_pause_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((cleared, resume));
+    }
+
+    /// Drive one outbound dial unless network teardown has started (#1262).
+    ///
+    /// A QUIC handshake in flight owns ant-quic connection state, and that
+    /// state owns the endpoint's original UDP socket. ant-quic's shutdown
+    /// closes the connections it has registered, but not a handshake that
+    /// is still being dialled. A dial that outlives the start of teardown
+    /// (a bootstrap dial to an offline seed, or a reconnect to a peer that
+    /// already stopped) therefore keeps the bound port open past the
+    /// socket-release deadline, and shutdown fails with
+    /// `weak_socket_owner_still_live`. Dropping the dial future drops the
+    /// handshake, which closes it; it then drains inside ant-quic's bounded
+    /// idle wait.
+    ///
+    /// Returns `None` when teardown starts first. The caller reports a
+    /// [`NetworkError::ConnectionFailed`] from [`dial_abandoned`] and records
+    /// nothing about the peer: an abandoned dial is not evidence that the
+    /// peer is unreachable.
+    async fn dial_until_teardown<F: std::future::Future>(&self, dial: F) -> Option<F::Output> {
+        let teardown = &self.shutdown_state.teardown;
+        tokio::select! {
+            biased;
+            () = teardown.cancelled() => None,
+            output = dial => Some(output),
+        }
+    }
+
     /// Get a clone of the inner node, returning an error if not initialized.
     ///
     /// This helper reduces boilerplate in methods that need exclusive
     /// access to the node after releasing the read lock.
-    async fn require_node(&self) -> NetworkResult<Node> {
+    async fn require_node(&self) -> NetworkResult<LinkNode> {
+        if self.shutdown_state.started.load(Ordering::Acquire) {
+            return Err(NetworkError::NodeError(
+                "network is shutting down".to_string(),
+            ));
+        }
         self.node
             .read()
             .await
@@ -4333,7 +4580,7 @@ impl NetworkNode {
     pub(crate) async fn open_bi(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4346,6 +4593,19 @@ impl NetworkNode {
             .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
     }
 
+    /// Current transport generation for readiness fencing (QUIC and Sim).
+    /// Busy/uninitialized state is distinct from an absent connection, so a
+    /// transient read failure cannot clear a live connection's Hello marker.
+    /// The outer node read uses try_read; the inner generation lookup briefly
+    /// takes the ant-quic lifecycle lock or the Sim fabric lock.
+    pub(crate) fn try_connection_generation(&self, peer_id: &AntPeerId) -> Result<Option<u64>, ()> {
+        let node = self.node.try_read().map_err(|_| ())?;
+        let node = node.as_ref().ok_or(())?;
+        Ok(node
+            .current_connection_generation(peer_id)
+            .filter(|generation| *generation != STALE_GENERATION_SENTINEL))
+    }
+
     /// Test-only: open a raw application byte-stream WITHOUT writing the
     /// protocol prefix. Used by the FIX 1 regression to simulate a peer that
     /// opens a QUIC stream and never sends the prefix (the accept-loop
@@ -4355,7 +4615,7 @@ impl NetworkNode {
     pub async fn open_bi_raw_for_testing(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         self.open_bi(peer_id).await
     }
 
@@ -4367,13 +4627,7 @@ impl NetworkNode {
     /// the accept loop never surfaces an internal stream. The identity gate +
     /// protocol handshake run in the Agent's single accept loop, the sole
     /// consumer of this method.
-    pub(crate) async fn accept_bi(
-        &self,
-    ) -> NetworkResult<(
-        AntPeerId,
-        ant_quic::HighLevelSendStream,
-        ant_quic::HighLevelRecvStream,
-    )> {
+    pub(crate) async fn accept_bi(&self) -> NetworkResult<(AntPeerId, StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4416,6 +4670,8 @@ impl NetworkNode {
             .cloned()
             .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
         let conn = node
+            .quic()
+            .ok_or(NetworkError::NotConnected(peer_id.0))?
             .inner_endpoint()
             .get_quic_connection(peer_id)
             .map_err(|e| NetworkError::NodeError(format!("get_quic_connection: {e}")))?
@@ -4453,6 +4709,65 @@ impl NetworkNode {
             payload,
         )
         .await
+    }
+
+    /// x0x #1150 (ADR 0107; lifecycle note section 2.7): send ONE direct
+    /// message frame (`[0x10][sender_agent_id][payload]`) to `peer_id` on
+    /// its CURRENT authenticated connection generation, admitting it at the
+    /// stream seam. `admit` runs at most once, synchronously, after
+    /// `open_uni` and immediately before `write_all` (ant-quic
+    /// `send_on_generation_with_admission`); `false` writes nothing. One
+    /// physical exchange: no receive ACK, no retry, no reconnect, no
+    /// constrained-transport fallback, and a connection replaced before the
+    /// write refuses. The caller resolves and connects the peer first and
+    /// bounds this call with its deadline; dropping the future before
+    /// `finish()` resets the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if there is no live connection generation,
+    /// the admission refuses, or the write fails.
+    pub(crate) async fn send_direct_pinned<F>(
+        &self,
+        peer_id: &AntPeerId,
+        sender_agent_id: &[u8; 32],
+        payload: &[u8],
+        admit: F,
+    ) -> NetworkResult<()>
+    where
+        F: FnOnce() -> bool + Send,
+    {
+        let mut buf = Vec::with_capacity(1 + 32 + payload.len());
+        buf.push(DIRECT_MESSAGE_STREAM_TYPE);
+        buf.extend_from_slice(sender_agent_id);
+        buf.extend_from_slice(payload);
+        let node = self.require_node().await?;
+        let generation = node
+            .current_connection_generation(peer_id)
+            .filter(|generation| *generation != STALE_GENERATION_SENTINEL)
+            .ok_or_else(|| {
+                NetworkError::ConnectionFailed(
+                    "no live connection generation for a pinned send".to_string(),
+                )
+            })?;
+        node.send_on_generation_with_admission(peer_id, generation, move |actual| {
+            if actual != generation {
+                return Err(ant_quic::EndpointError::Connection(
+                    "connection generation changed before a pinned send".to_string(),
+                ));
+            }
+            if admit() {
+                Ok(buf)
+            } else {
+                Err(ant_quic::EndpointError::Connection(
+                    "pinned send refused at the stream seam".to_string(),
+                ))
+            }
+        })
+        .await
+        .map_err(|e| NetworkError::ConnectionFailed(format!("pinned send failed: {e}")))?;
+        self.note_connection_pool_activity(*peer_id).await;
+        Ok(())
     }
 
     /// Send a direct stream framed with an arbitrary application
@@ -4744,9 +5059,8 @@ impl NetworkNode {
             debug!("NetworkNode receiver task started");
 
             loop {
-                // Get node read lock
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
+                let node_handle = node.read().await.as_ref().cloned();
+                let node_ref = match node_handle.as_ref() {
                     Some(n) => n,
                     None => {
                         debug!("Node not initialized, receiver stopping");
@@ -4755,11 +5069,8 @@ impl NetworkNode {
                 };
 
                 let recv_result = node_ref.recv_with_generation().await;
-                // Explicitly drop the read lock guard so we don't hold it
-                // across channel sends — otherwise a backpressured direct_tx
-                // or stream-specific gossip channel can stall every other caller
-                // that wants the same read lock and masks as a delivery bug.
-                drop(node_guard);
+                // Release this endpoint clone before any channel backpressure.
+                drop(node_handle);
 
                 match recv_result {
                     Ok((peer_id, source_generation, data)) => {
@@ -5073,8 +5384,8 @@ impl NetworkNode {
             debug!("NetworkNode accept loop started");
 
             loop {
-                let node_guard = node.read().await;
-                let node_ref = match node_guard.as_ref() {
+                let node_handle = node.read().await.as_ref().cloned();
+                let node_ref = match node_handle.as_ref() {
                     Some(n) => n,
                     None => {
                         debug!("Node not initialized, accept loop stopping");
@@ -5820,7 +6131,7 @@ async fn plane_note_connected(
     plane_id: &str,
     plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
     plane_cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
-    node: &Arc<RwLock<Option<Node>>>,
+    node: &Arc<RwLock<Option<LinkNode>>>,
     peer_id: [u8; 32],
     reset: bool,
 ) {
@@ -5851,8 +6162,8 @@ async fn plane_note_connected(
     let frame = build_plane_hello_frame(plane_id);
     let node = Arc::clone(node);
     tokio::spawn(async move {
-        let guard = node.read().await;
-        if let Some(node) = guard.as_ref() {
+        let node = node.read().await.as_ref().cloned();
+        if let Some(node) = node {
             if let Err(e) = node.send(&peer, &frame).await {
                 tracing::debug!(
                     target: "x0x::connect",
@@ -6025,10 +6336,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // per-peer sends in a small timeout; a multi-second liveness repair on
         // this path turns healthy gossip degradation into a timeout/log storm.
         {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
 
             node.send(&ant_peer, &buf)
                 .await
@@ -6083,12 +6391,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // allocation. Policy is *not* settled here — the authoritative
         // rechecks run inside the post-`open_uni` callback below.
         let (ant_generation, session) = {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
             Self::current_session_for_peer(
-                node,
+                &node,
                 &self.authenticated_sessions,
                 self.session_registry_cap(),
                 &ant_peer,
@@ -6108,10 +6413,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         }
 
         {
-            let node_guard = self.node.read().await;
-            let node = node_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            let node = self.require_node().await?;
             node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
                 frame_guarded_admission(
                     stream_type,
@@ -6119,7 +6421,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                     actual,
                     session,
                     Self::current_session_for_peer(
-                        node,
+                        &node,
                         &self.authenticated_sessions,
                         self.session_registry_cap(),
                         &ant_peer,
@@ -6354,7 +6656,7 @@ fn reconnect_suppression_is_live_locked(
 ///
 /// Never calls [`NetworkNode::suppress_reconnect`]: a refused accept must
 /// not refresh an existing tombstone (invariant F).
-async fn close_suppressed_inbound(node: &Node, peer_id: &AntPeerId) {
+async fn close_suppressed_inbound(node: &LinkNode, peer_id: &AntPeerId) {
     tracing::warn!(
         target: "x0x::connect",
         origin = "accept",
@@ -6859,6 +7161,106 @@ mod tests {
         assert!(error
             .to_string()
             .contains("release failed after caller cancellation"));
+    }
+
+    fn session_registry_len(node: &NetworkNode) -> usize {
+        node.authenticated_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peers
+            .len()
+    }
+
+    /// #1277: a guarded gossip send that passed `require_node` before
+    /// teardown started, and resolves its session after the teardown worker
+    /// cleared the registry, must not put the still-open connection back.
+    ///
+    /// Inert: both nodes run on the W3-H simulation fabric (no socket). The
+    /// test-only pause holds the worker between the registry clear and the
+    /// transport shutdown, and the racing step runs in that window. It is
+    /// the first step of `send_to_peer_guarded`: resolve the session with
+    /// the `LinkNode` clone that `require_node` returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1277_send_racing_teardown_cannot_reinsert_a_session() {
+        let plane = "issue1277-registry-teardown";
+        let fabric = sim::SimFabric::new(1277);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+
+        // The send task: `require_node` passes before teardown starts, and
+        // the session it resolves now is minted into the registry.
+        let held = a.require_node().await.unwrap();
+        let cap = a.session_registry_cap();
+        assert!(
+            NetworkNode::current_session_for_peer(&held, &a.authenticated_sessions, cap, &peer_b)
+                .is_some(),
+            "the live simulated connection mints a session before teardown"
+        );
+        assert_eq!(session_registry_len(&a), 1);
+
+        let (cleared_tx, cleared_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        a.pause_shutdown_after_registry_clear_for_test(cleared_tx, resume_rx);
+        let shutdown = tokio::spawn({
+            let a = a.clone();
+            async move { a.try_shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleared_rx)
+            .await
+            .expect("teardown reached the registry clear in time")
+            .expect("teardown worker reports the clear");
+        assert_eq!(
+            session_registry_len(&a),
+            0,
+            "the teardown worker cleared the registry"
+        );
+
+        // The race: the send resolves its session between the clear and
+        // the transport shutdown. Its connection is still open.
+        assert!(
+            held.session_connection(&peer_b)
+                .is_some_and(|connection| !connection.is_closed()),
+            "the held link still reports the open connection in the window"
+        );
+        let raced =
+            NetworkNode::current_session_for_peer(&held, &a.authenticated_sessions, cap, &peer_b);
+        let in_window = session_registry_len(&a);
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), shutdown)
+            .await
+            .expect("teardown finished in time")
+            .expect("teardown task joins")
+            .expect("teardown succeeds");
+        drop(held);
+
+        assert_eq!(
+            session_registry_len(&a),
+            0,
+            "no session handle may outlive network teardown"
+        );
+        assert_eq!(
+            in_window, 0,
+            "an insert after the teardown clear must be refused"
+        );
+        assert!(
+            raced.is_none(),
+            "a registry whose teardown has started must not resolve a session"
+        );
+        b.try_shutdown().await.unwrap();
     }
 
     /// Boundary regression for ant-quic's transport-aware connected snapshot.

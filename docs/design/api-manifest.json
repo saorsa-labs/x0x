@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 201,
+  "endpoint_count": 203,
   "endpoints": [
     {
       "category": "status",
@@ -1079,6 +1079,40 @@
       "path": "/history/stats",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "history",
+      "cli_name": "history policy",
+      "description": "Local history policy in force (ADR 0116): rules, defaults, pins and counters (owner-only)",
+      "method": "GET",
+      "path": "/history/policy",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "history",
+      "cli_name": "history retain",
+      "description": "Trim local history now under its startup policy, within a row and time budget (ADR 0116, owner-only)",
+      "method": "POST",
+      "path": "/history/retain",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "max_rows",
+            "required": false
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "budget_ms",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
