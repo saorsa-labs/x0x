@@ -41151,7 +41151,6 @@ pub(in crate::server) mod tests {
     mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
-    mod issue1224_unsigned_group_card;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -41164,6 +41163,8 @@ pub(in crate::server) mod tests {
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
     mod requester_offer;
+    #[path = "issue1224_unsigned_group_card.rs"]
+    mod unsigned_group_card_1224;
     mod wp_c;
 
     fn fake_group_state_commit(
