@@ -461,11 +461,15 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
   override in place. The ambient-load attribution stays unverified (#702).
 - **A mesh that never forms now says which kind it was (#1283).** When the
   harness's zero-peers check fails, the panic carries a live
-  `/network/status` snapshot of every daemon in the mesh: the address the
-  QUIC listener actually bound against the reserved port, and each side's
-  transport connection count. That classifies the failure (no QUIC
-  connection, one side only, or a listener off its reserved port) even though
-  fixtures log at `warn`, where dial and join activity is not recorded.
+  `/diagnostics/connectivity` snapshot of every daemon in the mesh: the
+  address the QUIC listener actually bound against the reserved port, the
+  registered-peer count (the same set `/peers` reads), and the live
+  transport-connection count. That classifies the failure — no transport
+  connection at all, transport up but registration incomplete, a one-sided
+  disconnect, a poll that raced a mesh completing late, or a listener off
+  its reserved port — even though fixtures log at `warn`, where dial and
+  join activity is not recorded. A daemon that does not answer keeps
+  unknown counts; it is never reported as zero connections.
 
 ## [v0.48.0] - 2026-10-13
 

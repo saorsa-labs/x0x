@@ -785,10 +785,11 @@ async fn assert_mesh_connected(
 /// propagation results, so we fail loudly here rather than let the test proceed
 /// and time out on a downstream convergence assertion.
 ///
-/// On failure the panic carries a live `/network/status` snapshot of every
-/// daemon in the mesh ([`mesh_failure_evidence`]): issue #1283's flake left no
-/// other usable evidence, because fixtures run at `log_level = "warn"` and dial
-/// or join activity is not logged at that level.
+/// On failure the panic carries a live `/diagnostics/connectivity` snapshot
+/// of every daemon in the mesh ([`mesh_failure_evidence`]): issue #1283's
+/// flake left no other usable evidence, because fixtures run at
+/// `log_level = "warn"` and dial or join activity is not logged at that
+/// level.
 async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
     for node in nodes {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -818,7 +819,7 @@ async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
                      Daemon logs: {}/daemon.stdout.log and daemon.stderr.log \
                      (kept by the failure-only fixture diagnostics collector).",
                     node.name,
-                    classify_mesh_failure(&evidence),
+                    classify_mesh_failure(&node.name, &evidence),
                     node.data_dir.display(),
                 );
             }
@@ -834,20 +835,34 @@ struct MeshFailureEvidence {
     /// UDP port the harness reserved for this daemon's QUIC listener; the
     /// address its joiner peers are told to dial.
     expected_bind_port: u16,
-    /// `/network/status` `local_addr` — where the QUIC listener actually
-    /// bound. `None` when the diagnostics request itself failed.
+    /// Diagnostics `local_addr` — where the QUIC listener actually bound.
+    /// `None` when the diagnostics request itself failed: unknown, not
+    /// "bound nowhere".
     local_addr: Option<String>,
-    /// `/network/status` `connected_peers` — live transport connections.
-    connected_peers: u64,
+    /// Diagnostics `connections.connected_peers` — the size of the same
+    /// registered-peer set `GET /peers` reads (`Agent::peers()` and
+    /// `NodeStatus::connected_peers` both project ant-quic's connection
+    /// pool). On its own it says nothing about transport handshakes or
+    /// gossip-plane admission. `None` when the request failed or the field
+    /// was absent — unknown, never folded into zero.
+    registered_peers: Option<u64>,
+    /// Diagnostics `connections.active` — live transport connections
+    /// (ant-quic `EndpointStats::active_connections`, a live count kept
+    /// equal to direct+relayed across connect/disconnect churn). This is
+    /// the count that separates "no transport connection" from "connected
+    /// but not registered". `None` — unknown, like the other counts.
+    active_connections: Option<u64>,
 }
 
 impl MeshFailureEvidence {
-    fn from_status(name: &str, expected_bind_port: u16, status: &serde_json::Value) -> Self {
+    fn from_diagnostics(name: &str, expected_bind_port: u16, status: &serde_json::Value) -> Self {
+        let connections = &status["connections"];
         Self {
             name: name.to_owned(),
             expected_bind_port,
             local_addr: status["local_addr"].as_str().map(str::to_owned),
-            connected_peers: status["connected_peers"].as_u64().unwrap_or(0),
+            registered_peers: connections["connected_peers"].as_u64(),
+            active_connections: connections["active"].as_u64(),
         }
     }
 
@@ -856,7 +871,8 @@ impl MeshFailureEvidence {
             name: name.to_owned(),
             expected_bind_port,
             local_addr: None,
-            connected_peers: 0,
+            registered_peers: None,
+            active_connections: None,
         }
     }
 
@@ -870,7 +886,9 @@ impl MeshFailureEvidence {
             .is_some_and(|port| port.parse::<u16>() == Ok(self.expected_bind_port))
     }
 
-    /// One compact, greppable line for the panic message.
+    /// One compact, greppable line for the panic message. Unknown counts
+    /// print as `unknown`, so a daemon that did not answer is never mistaken
+    /// for one that answered zero.
     fn summary(&self) -> String {
         let mismatch = if self.local_addr.is_some() && !self.listener_on_reserved_port() {
             " MISMATCH"
@@ -878,21 +896,28 @@ impl MeshFailureEvidence {
             ""
         };
         format!(
-            "{} quic_local={} expected=:{}{mismatch} connected={}",
+            "{} quic_local={} expected=:{}{mismatch} registered={} active={}",
             self.name,
             self.local_addr.as_deref().unwrap_or("unreachable"),
             self.expected_bind_port,
-            self.connected_peers,
+            Self::count(self.registered_peers),
+            Self::count(self.active_connections),
         )
+    }
+
+    fn count(value: Option<u64>) -> String {
+        value.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
     }
 }
 
-/// Best-effort `/network/status` snapshot of every daemon in a mesh that just
-/// failed to form (#1283). The failure-only fixture collector retains daemon
-/// logs, but fixtures run at `log_level = "warn"`, so the live transport
+/// Best-effort `/diagnostics/connectivity` snapshot of every daemon in a mesh
+/// that just failed to form (#1283). The failure-only fixture collector
+/// retains daemon logs, but fixtures run at `log_level = "warn"`, so the live
 /// snapshot is the evidence that classifies the failure: `local_addr` proves
-/// where the QUIC listener actually bound, and the per-side `connected_peers`
-/// counts show whether a QUIC connection existed at all.
+/// where the QUIC listener actually bound, `connections.active` counts live
+/// transport connections, and `connections.connected_peers` sizes the same
+/// registered-peer set `/peers` reads. Daemons that do not answer keep `None`
+/// counts — unknown, not zero.
 async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvidence> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -901,7 +926,7 @@ async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvide
     let mut evidence = Vec::with_capacity(nodes.len());
     for node in nodes {
         let status: Option<serde_json::Value> = match client
-            .get(format!("http://{}/network/status", node.api_addr))
+            .get(format!("http://{}/diagnostics/connectivity", node.api_addr))
             .header("Authorization", format!("Bearer {}", node.api_token))
             .send()
             .await
@@ -910,27 +935,113 @@ async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvide
             Err(_) => None,
         };
         evidence.push(match status {
-            Some(status) => MeshFailureEvidence::from_status(&node.name, node.bind_port, &status),
+            Some(status) => {
+                MeshFailureEvidence::from_diagnostics(&node.name, node.bind_port, &status)
+            }
             None => MeshFailureEvidence::unreachable(&node.name, node.bind_port),
         });
     }
     evidence
 }
 
-/// Classify a mesh that never formed (#1283): no QUIC connection, a connection
-/// registered on one side only, or a listener that is not on the port its
-/// peers dial.
-fn classify_mesh_failure(evidence: &[MeshFailureEvidence]) -> &'static str {
-    if evidence
-        .iter()
-        .any(|e| e.local_addr.is_some() && !e.listener_on_reserved_port())
-    {
-        return "a QUIC listener is NOT on its reserved port — peers dial a dead port";
+/// Classify a mesh that never formed (#1283), claiming only what the
+/// collected evidence supports. `/peers` and `connections.connected_peers`
+/// read the same ant-quic registered-peer set, so registry counts cannot
+/// establish transport handshake or gossip-plane completion; the live
+/// `connections.active` count is what separates "never connected" from
+/// "connected but not registered". Daemons that did not answer are carried as
+/// unknown — a missing response must not be read as a zero count.
+fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> String {
+    /// Join names, or `none` when the list is empty.
+    fn listed(names: &[&str]) -> String {
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.join(", ")
+        }
     }
-    match evidence.iter().filter(|e| e.connected_peers > 0).count() {
-        0 => "no QUIC connection formed between the daemons",
-        1 => "a connection is registered on one side only (hello/plane incomplete on the other)",
-        _ => "both sides report connections — the /peers poll raced a forming mesh",
+
+    if let Some(mismatch) = evidence
+        .iter()
+        .find(|e| e.local_addr.is_some() && !e.listener_on_reserved_port())
+    {
+        return format!(
+            "a QUIC listener is NOT on its reserved port — peers dial a dead port ({} bound {})",
+            mismatch.name,
+            mismatch.local_addr.as_deref().unwrap_or("?"),
+        );
+    }
+    let Some(failing_ev) = evidence.iter().find(|e| e.name == failing) else {
+        return format!("no diagnostics evidence for {failing}");
+    };
+    let unknown: Vec<&str> = evidence
+        .iter()
+        .filter(|e| e.registered_peers.is_none())
+        .map(|e| e.name.as_str())
+        .collect();
+    let note = if unknown.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " No diagnostics answer (counts unknown): {}.",
+            unknown.join(", ")
+        )
+    };
+    let peers_registered: Vec<&str> = evidence
+        .iter()
+        .filter(|e| e.name != failing && e.registered_peers.is_some_and(|n| n > 0))
+        .map(|e| e.name.as_str())
+        .collect();
+    let peers_live: Vec<&str> = evidence
+        .iter()
+        .filter(|e| e.name != failing && e.active_connections.is_some_and(|n| n > 0))
+        .map(|e| e.name.as_str())
+        .collect();
+    let registered = |n: u64| format!("registers {n} peer{}", if n == 1 { "" } else { "s" });
+    match (failing_ev.registered_peers, failing_ev.active_connections) {
+        // The failing daemon is gone or wedged; its counts are unknown and
+        // must not be read as zero connections.
+        (None, _) => format!(
+            "the failing daemon did not answer the diagnostics API — dead or wedged \
+             when the mesh was declared disconnected; peers that register peers: \
+             {}.{note}",
+            listed(&peers_registered),
+        ),
+        (Some(0), Some(a)) if a > 0 => format!(
+            "the failing daemon holds {a} live transport connection{} but registers no \
+             peer — the transport formed and peer registration did not; peers: {}.{note}",
+            if a == 1 { "" } else { "s" },
+            listed(&peers_registered),
+        ),
+        (Some(0), Some(0)) => {
+            if peers_registered.is_empty() && peers_live.is_empty() {
+                format!(
+                    "no daemon reports a live transport connection or a registered peer \
+                     — the mesh never formed.{note}"
+                )
+            } else {
+                format!(
+                    "the failing daemon has no live transport connection and no registered \
+                     peer, while {} register peers and {} hold live connections — the \
+                     disconnect is one-sided.{note}",
+                    listed(&peers_registered),
+                    listed(&peers_live),
+                )
+            }
+        }
+        (Some(0), None) => format!(
+            "the failing daemon registers no peer and its live transport count is \
+             unknown; peers that register peers: {}.{note}",
+            listed(&peers_registered),
+        ),
+        // Any remaining case has the failing daemon registering peers: /peers
+        // reads that same registry, so its poll raced a mesh that completed
+        // after the last read.
+        (Some(n), _) => format!(
+            "the failing daemon {} — /peers reads that same registry, so its 30s poll \
+             raced a mesh that completed after the last read.{note}",
+            registered(n),
+        ),
     }
 }
 
@@ -1191,91 +1302,185 @@ mod mesh_failure_evidence_tests {
         name: &str,
         expected_bind_port: u16,
         local_addr: Option<&str>,
-        connected_peers: u64,
+        registered_peers: Option<u64>,
+        active_connections: Option<u64>,
     ) -> MeshFailureEvidence {
         MeshFailureEvidence {
             name: name.to_owned(),
             expected_bind_port,
             local_addr: local_addr.map(str::to_owned),
-            connected_peers,
+            registered_peers,
+            active_connections,
         }
     }
 
-    #[test]
-    fn status_json_populates_listener_address_and_peer_count() {
-        // The exact `/network/status` shape the panic path depends on (#1283):
-        // `local_addr` after the daemon's dual-stack promotion of a
-        // `0.0.0.0:<reserved>` config bind, plus the transport-level count.
-        let status = json!({
+    fn diagnostics_json(connected_peers: u64, active: u64) -> serde_json::Value {
+        // The `/diagnostics/connectivity` shape the panic path parses
+        // (#1283): `local_addr` plus the `connections` table, where
+        // `connected_peers` sizes the registered-peer set `/peers` reads
+        // and `active` counts live transport connections.
+        json!({
             "ok": true,
             "local_addr": "[::]:40211",
-            "external_addrs": [],
-            "nat_type": "None",
-            "connected_peers": 0,
-            "direct_connections": 0,
-            "relayed_connections": 0,
-            "uptime_secs": 47,
-        });
-        let parsed = MeshFailureEvidence::from_status("pair-alice-7", 40211, &status);
+            "connections": {
+                "connected_peers": connected_peers,
+                "active": active,
+                "direct": active,
+                "relayed": 0,
+                "hole_punch_success_rate": 0.0,
+            },
+            "uptime_s": 47,
+        })
+    }
+
+    #[test]
+    fn diagnostics_json_populates_listener_and_both_counts() {
+        let parsed =
+            MeshFailureEvidence::from_diagnostics("pair-alice-7", 40211, &diagnostics_json(0, 0));
         assert_eq!(parsed.local_addr.as_deref(), Some("[::]:40211"));
-        assert_eq!(parsed.connected_peers, 0);
+        assert_eq!(parsed.registered_peers, Some(0));
+        assert_eq!(parsed.active_connections, Some(0));
         assert!(parsed.listener_on_reserved_port());
-        assert!(!parsed.summary().contains("MISMATCH"));
+        let summary = parsed.summary();
+        assert!(summary.contains("registered=0"), "got {summary}");
+        assert!(summary.contains("active=0"), "got {summary}");
+        assert!(!summary.contains("MISMATCH"), "got {summary}");
     }
 
     #[test]
     fn ipv4_listener_address_is_also_recognised() {
-        let parsed = MeshFailureEvidence::from_status(
+        let parsed = MeshFailureEvidence::from_diagnostics(
             "pair-bob-7",
             5111,
-            &json!({"local_addr": "0.0.0.0:5111", "connected_peers": 1}),
+            &json!({"local_addr": "0.0.0.0:5111", "connections": {"connected_peers": 1, "active": 1}}),
         );
         assert!(parsed.listener_on_reserved_port());
     }
 
     #[test]
+    fn missing_fields_and_failed_requests_stay_unknown_not_zero() {
+        // A daemon that did not answer, or answered without the fields we
+        // read, must keep UNKNOWN counts — never zero (#1283 review).
+        let empty = MeshFailureEvidence::from_diagnostics("pair-bob-7", 5111, &json!({}));
+        assert_eq!(empty.registered_peers, None);
+        assert_eq!(empty.active_connections, None);
+        let unreachable = MeshFailureEvidence::unreachable("pair-alice-7", 40211);
+        assert_eq!(unreachable.registered_peers, None);
+        assert_eq!(unreachable.active_connections, None);
+        for summary in [empty.summary(), unreachable.summary()] {
+            assert!(summary.contains("registered=unknown"), "got {summary}");
+            assert!(summary.contains("active=unknown"), "got {summary}");
+            assert!(!summary.contains("registered=0"), "got {summary}");
+            assert!(!summary.contains("MISMATCH"), "got {summary}");
+        }
+    }
+
+    #[test]
     fn listener_off_the_reserved_port_is_flagged_and_classified() {
-        let alice = evidence("pair-alice-7", 40211, Some("[::]:60304"), 0);
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:60304"), Some(0), Some(0));
         assert!(!alice.listener_on_reserved_port());
         let summary = alice.summary();
         assert!(summary.contains("expected=:40211"), "got {summary}");
         assert!(summary.contains("MISMATCH"), "got {summary}");
-        assert_eq!(
-            classify_mesh_failure(&[alice]),
-            "a QUIC listener is NOT on its reserved port — peers dial a dead port"
+        let classification = classify_mesh_failure("pair-alice-7", &[alice]);
+        assert!(
+            classification.contains("NOT on its reserved port"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("bound [::]:60304"),
+            "got {classification}"
         );
     }
 
     #[test]
-    fn both_sides_idle_classifies_as_no_quic_connection() {
-        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), 0);
-        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), 0);
-        assert_eq!(
-            classify_mesh_failure(&[alice, bob]),
-            "no QUIC connection formed between the daemons"
+    fn dark_pair_classifies_as_never_formed() {
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(0));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(0), Some(0));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
+        assert!(
+            classification.contains("never formed"),
+            "got {classification}"
         );
+        assert!(!classification.contains("raced"), "got {classification}");
     }
 
     #[test]
-    fn one_sided_connection_classifies_as_incomplete_hello_or_plane() {
-        // #1283's open classification question: connected-but-incomplete shows
-        // up as an asymmetric connected_peers count.
-        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), 0);
-        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), 1);
-        assert_eq!(
-            classify_mesh_failure(&[alice, bob]),
-            "a connection is registered on one side only (hello/plane incomplete on the other)"
+    fn disconnected_trio_zero_one_one_is_one_sided_not_a_polling_race() {
+        // The #1283 review case: counts [0, 1, 1] are a disconnected trio,
+        // not a poll racing a forming mesh. The zero side is the failing
+        // node — /peers on it legitimately stayed empty.
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(0));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let carol = evidence("pair-carol-7", 6222, Some("[::]:6222"), Some(1), Some(1));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
+        assert!(classification.contains("one-sided"), "got {classification}");
+        assert!(
+            classification.contains("pair-bob-7"),
+            "got {classification}"
         );
+        assert!(
+            classification.contains("pair-carol-7"),
+            "got {classification}"
+        );
+        assert!(!classification.contains("raced"), "got {classification}");
     }
 
     #[test]
-    fn unreachable_daemon_is_reported_without_a_port_mismatch() {
+    fn unreachable_failing_daemon_is_unknown_not_zero_and_no_race_claim() {
+        // The #1283 review case: a missing response must not become "zero
+        // connections", and the surviving counts must not be read as a
+        // completed mesh the poll merely raced.
         let alice = MeshFailureEvidence::unreachable("pair-alice-7", 40211);
-        let summary = alice.summary();
-        assert!(summary.contains("quic_local=unreachable"), "got {summary}");
-        assert!(!summary.contains("MISMATCH"), "got {summary}");
-        // Missing fields must degrade the same way as a failed request.
-        let empty = MeshFailureEvidence::from_status("pair-bob-7", 5111, &json!({}));
-        assert!(empty.summary().contains("quic_local=unreachable"));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let carol = evidence("pair-carol-7", 6222, Some("[::]:6222"), Some(1), Some(1));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
+        assert!(
+            classification.contains("did not answer"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("counts unknown"),
+            "got {classification}"
+        );
+        assert!(!classification.contains("raced"), "got {classification}");
+    }
+
+    #[test]
+    fn failing_daemon_now_registering_peers_is_a_poll_race() {
+        // Same registry on both reads: the poll saw empty for 30s, the
+        // snapshot sees peers — the mesh completed after the last read.
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(1), Some(1));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
+        assert!(classification.contains("raced"), "got {classification}");
+        assert!(
+            classification.contains("same registry"),
+            "got {classification}"
+        );
+    }
+
+    #[test]
+    fn live_transport_without_registration_is_distinguished() {
+        // Registry counts alone cannot show this; `active` can: the
+        // transport formed and registration did not.
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(1));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
+        assert!(
+            classification.contains("transport formed and peer registration did not"),
+            "got {classification}"
+        );
+    }
+
+    #[test]
+    fn unknown_transport_count_on_the_failing_daemon_is_preserved() {
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), None);
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
+        assert!(
+            classification.contains("live transport count is unknown"),
+            "got {classification}"
+        );
     }
 }
