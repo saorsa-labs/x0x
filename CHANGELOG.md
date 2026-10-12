@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.47.1] - 2026-10-12
+
+A patch release. It contains durability fixes for named groups and share grants. It adds no breaking API change and no stored-format change.
+
+### Fixed
+
+- **Named groups keep their journals, snapshots and API results in agreement after a write fault (#1187, #1326).**
+  - A post-rename fault (the rename landed, its directory fsync did not) now completes the transaction.
+  - A kept journal is rewritten with the current group state before the daemon acts on the new state.
+  - A journal the daemon cannot read, or a rewrite whose directory fsync does not land, fails the write closed (ADR 0085).
+  - Seal callers roll back an in-memory group change after a failed persist.
+- **A share grant stays in memory when its write fails after the rename (#1101, #1322).** A failure before the rename still rolls it back. A duplicate redelivery enqueue now confirms durability before it reports success. The new `storage::DurableWriteError` and `storage::write_private_bytes_durable_typed` are additive; existing signatures do not change.
+
+### Tests and tooling
+
+- The Home e2e fixture records and checks each node's binary sha256 at every start and restart (#1208, #1314).
+
+### Documentation
+
+- ADR governance: 102 numbered ADRs archived, 15 current slots A01–A15, transient decisions in `docs/adr/transient/` (#1313, #1325). First transient record: `T-goal-e-rule-5`, added as Proposed (#1324) and accepted by David (#1328).
+
 ## [v0.47.0] - 2026-10-10
 
 ### Added
