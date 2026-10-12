@@ -41,9 +41,11 @@ const JOIN_BOUND: Duration = Duration::from_secs(60);
 /// Upper bound for a join whose only candidates are cross-plane peers.
 /// Sometimes the cross-plane peer refuses us first: it closes each of our
 /// connections at accept, before its plane hello reaches us. Then we never
-/// write a tombstone for it. Such a peer keeps one old JOIN retry budget
-/// (ten dials, 81.1 s of backoff plus up to about 10.1 s of jitter) and
-/// gets no JOIN. This bound covers that case and is used only there.
+/// write a tombstone for it. Such a peer keeps one JOIN retry budget (ten
+/// dials) and gets no JOIN. Each dial answers and the connection closes,
+/// so the attempts are spaced by saorsa-gossip's loss cooldown (D252: 100 ms
+/// doubled up to 30 s, 81.1 s plus up to 10.128 s of jitter in total). This
+/// bound covers that case and is used only there.
 const REFUSAL_JOIN_BOUND: Duration = Duration::from_secs(150);
 
 const JOIN_CONNECTING: &str = "JOIN: Connecting to bootstrap node";

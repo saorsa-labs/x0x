@@ -66,6 +66,10 @@ struct FakeState {
     send_plan: HashMap<ant_quic::PeerId, Vec<FakeSend>>,
     dials: Vec<(SocketAddr, Instant)>,
     join_sends: Vec<(ant_quic::PeerId, Instant)>,
+    /// Admission reads made so far.
+    reads: usize,
+    /// After this many reads, each admission read takes this long.
+    slow_reads_after: Option<(usize, Duration)>,
 }
 
 /// A scripted saorsa-gossip transport that is also the admission source.
@@ -88,6 +92,11 @@ impl Fake {
 
     fn plan_sends(&self, peer: ant_quic::PeerId, sends: Vec<FakeSend>) {
         self.state.lock().unwrap().send_plan.insert(peer, sends);
+    }
+
+    /// After `reads` fast admission reads, each read takes `took`.
+    fn slow_reads_after(&self, reads: usize, took: Duration) {
+        self.state.lock().unwrap().slow_reads_after = Some((reads, took));
     }
 
     fn dials_to(&self, target: SocketAddr) -> Vec<Instant> {
@@ -127,6 +136,17 @@ fn is_join_frame(data: &[u8]) -> bool {
 #[async_trait::async_trait]
 impl SeedAdmission for Fake {
     async fn admission(&self, peer: &ant_quic::PeerId) -> PeerAdmission {
+        let slow = {
+            let mut state = self.state.lock().unwrap();
+            state.reads += 1;
+            state
+                .slow_reads_after
+                .filter(|(fast, _)| state.reads > *fast)
+                .map(|(_, took)| took)
+        };
+        if let Some(took) = slow {
+            tokio::time::sleep(took).await;
+        }
         let state = self.state.lock().unwrap();
         state
             .verdicts
@@ -938,4 +958,185 @@ async fn the_join_stops_a_send_in_flight_on_shutdown() {
     assert_eq!(outcome, JoinOutcome::Cancelled);
     assert_eq!(started.elapsed(), Duration::from_secs(1));
     assert!(active(&membership).is_empty());
+}
+
+/// D252: a peer that answers the dial and then closes (it lost its
+/// connection before admission; for example the remote refused us first)
+/// is redialled only after the loss cooldown: 100 ms, doubled after each
+/// loss up to 30 s, plus at most 1/8 jitter. The cooldown does not reset
+/// when the peer answers again. The budget stays ten attempts, and no JOIN
+/// frame goes out.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_answers_and_closes_is_paced_by_the_loss_cooldown() {
+    let fake = fake();
+    fake.plan_dials(
+        addr(1),
+        vec![FakeDial::Answer(
+            Duration::ZERO,
+            peer(1),
+            Some(PeerAdmission::NotConnected),
+        )],
+    );
+    let membership = membership(&fake);
+    let mut candidates = candidates(&[(addr(1), peer(1))]);
+
+    let outcome = join(
+        &mut candidates,
+        &fake,
+        &membership,
+        &CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        JoinOutcome::NoSeed {
+            attempts: JOIN_MAX_ATTEMPTS
+        }
+    );
+    assert_eq!(fake.sends_to(peer(1)), 0);
+    let dials = fake.dials_to(addr(1));
+    assert_eq!(dials.len(), JOIN_MAX_ATTEMPTS);
+    let mut cooldown = 100_u64;
+    for (i, pair) in dials.windows(2).enumerate() {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= Duration::from_millis(cooldown)
+                && gap <= Duration::from_millis(cooldown + cooldown / 8),
+            "gap {i} is {gap:?}, expected the {cooldown} ms loss cooldown plus at most 1/8 jitter"
+        );
+        cooldown = (cooldown * 2).min(30_000);
+    }
+}
+
+/// D252: while a lost address waits for its cooldown, another address that
+/// becomes admitted goes first. The lost address is not redialled meanwhile.
+#[tokio::test(start_paused = true)]
+async fn another_admitted_address_goes_first_while_a_lost_one_waits() {
+    let fake = fake();
+    fake.plan_dials(
+        addr(1),
+        vec![FakeDial::Answer(
+            Duration::ZERO,
+            peer(1),
+            Some(PeerAdmission::NotConnected),
+        )],
+    );
+    fake.plan_dials(
+        addr(2),
+        vec![FakeDial::Answer(Duration::ZERO, peer(2), None)],
+    );
+    let reconnect = {
+        let fake = Arc::clone(&fake);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fake.set(peer(2), PeerAdmission::Admitted);
+        })
+    };
+    let membership = membership(&fake);
+    let mut candidates = candidates(&[(addr(1), peer(1)), (addr(2), peer(2))]);
+
+    let outcome = join(
+        &mut candidates,
+        &fake,
+        &membership,
+        &CancellationToken::new(),
+    )
+    .await;
+    reconnect.await.unwrap();
+
+    assert_eq!(outcome, JoinOutcome::Joined(addr(2)));
+    assert_eq!(
+        fake.dials_to(addr(1)).len(),
+        1,
+        "the lost address waits for its cooldown while the admitted one joins"
+    );
+}
+
+/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
+/// read in the candidate scan.
+#[tokio::test(start_paused = true)]
+async fn the_join_stops_on_shutdown_during_a_slow_admission_read() {
+    let fake = fake();
+    fake.set(peer(1), PeerAdmission::Admitted);
+    fake.plan_dials(
+        addr(1),
+        vec![FakeDial::Answer(Duration::ZERO, peer(1), None)],
+    );
+    fake.slow_reads_after(0, Duration::from_secs(60));
+    let shutdown = CancellationToken::new();
+    let canceller = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown.cancel();
+        })
+    };
+    let membership = membership(&fake);
+    let mut candidates = candidates(&[(addr(1), peer(1))]);
+    let started = Instant::now();
+
+    let outcome = join(&mut candidates, &fake, &membership, &shutdown).await;
+    canceller.await.unwrap();
+
+    assert_eq!(outcome, JoinOutcome::Cancelled);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert!(fake.dials_to(addr(1)).is_empty());
+}
+
+/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
+/// read in the gate after an answered dial, and no JOIN frame goes out.
+#[tokio::test(start_paused = true)]
+async fn the_join_stops_on_shutdown_during_the_gate_read() {
+    let fake = fake();
+    fake.set(peer(1), PeerAdmission::Admitted);
+    fake.plan_dials(
+        addr(1),
+        vec![FakeDial::Answer(Duration::ZERO, peer(1), None)],
+    );
+    // The candidate scan reads once; the gate read after the dial is slow.
+    fake.slow_reads_after(1, Duration::from_secs(60));
+    let shutdown = CancellationToken::new();
+    let canceller = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown.cancel();
+        })
+    };
+    let membership = membership(&fake);
+    let mut candidates = candidates(&[(addr(1), peer(1))]);
+    let started = Instant::now();
+
+    let outcome = join(&mut candidates, &fake, &membership, &shutdown).await;
+    canceller.await.unwrap();
+
+    assert_eq!(outcome, JoinOutcome::Cancelled);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert_eq!(fake.dials_to(addr(1)).len(), 1);
+    assert_eq!(fake.sends_to(peer(1)), 0);
+}
+
+/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
+/// read in the seed settlement.
+#[tokio::test(start_paused = true)]
+async fn settle_stops_on_shutdown_during_a_slow_admission_read() {
+    let fake = fake();
+    fake.set(peer(1), PeerAdmission::PlanePending);
+    fake.slow_reads_after(0, Duration::from_secs(60));
+    let shutdown = CancellationToken::new();
+    let canceller = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown.cancel();
+        })
+    };
+    let candidates = candidates(&[(addr(1), peer(1))]);
+    let started = Instant::now();
+
+    let _plan = candidates.settle(fake.as_ref(), 3, &shutdown).await;
+    canceller.await.unwrap();
+
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
 }
