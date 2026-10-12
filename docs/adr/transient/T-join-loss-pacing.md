@@ -12,7 +12,7 @@
 
 `join_network` joins the HyParView overlay through its dialled peers. For #1321, the JOIN frame goes only to a peer that the plane gate admits (#292 invariant A). saorsa-gossip drives each attempt through its step API (D248): `join_dial`, then x0x checks admission, then `join_send`. One `JoinLedger` per join keeps ten attempts per seed address (C-1321-2).
 
-Sometimes a peer answers the dial and then closes the connection before its plane hello reaches us. For example, the remote has already refused us. We then have no tombstone for it, and it reads as not connected. The old JOIN treated this case like a failed send and retried at once. Round 5 did the same. So a peer that answers and closes got up to ten handshakes in a burst, with no wait.
+Sometimes a peer answers the dial and then closes the connection before its plane hello reaches us. For example, the remote has already refused us. We then have no tombstone for it, and it reads as not connected. The old JOIN treated this case like a failed send and retried at once. So a peer that answers and closes got up to ten handshakes in a burst, with no wait.
 
 E-D15 rule 22 requires backoff when a peer is known to be gone. A burst of handshakes to such a peer breaks that rule.
 
@@ -24,7 +24,7 @@ When the peer that answered a JOIN dial is not connected at the admission check,
 2. The cooldown belongs to the address for the whole join. It does not reset when the peer answers and closes again.
 3. The next attempt starts at the later of the dial backoff and the loss cooldown. The delays are not added.
 4. `join_dial` makes no dial before that time, and uses no attempt.
-5. Another admitted address can go while a lost address waits.
+5. While a lost address waits, a ready admitted address goes first.
 
 These rules do not change:
 
@@ -36,7 +36,7 @@ These rules do not change:
 ## Attempt limit and timing
 
 - **Attempt limit:** at most ten dials per seed address per join, as before. With C distinct candidate addresses, the JOIN makes at most 10C dial calls.
-- **Timing change:** this applies only to a peer that answers and then loses its connection before admission. Before, its ten attempts came in a burst. Now nine cooldowns separate them: 81.1 s, plus up to 10.128 s of jitter in total. Such a peer gets no JOIN frame. The join can take longer only when no other admitted address exists.
+- **Timing change:** this applies only to a peer that answers and then loses its connection before admission. Before, its ten attempts came in a burst. Now nine cooldowns separate them (100 ms to 25.6 s): 51.1 s, plus up to 6.379 s of jitter in total. No cooldown follows the tenth attempt. Such a peer gets no JOIN frame. The join can take longer only when no other admitted address is ready.
 
 ## Rejected options
 
@@ -48,4 +48,4 @@ These rules do not change:
 
 - The known-loss path follows rule 22, with exponential pacing that does not reset.
 - The attempt budget and the failed-dial schedule stay the same as before.
-- The loss timing is a deliberate change. It is not equal, byte for byte, to the old timing.
+- The loss timing is a deliberate change from the old timing.
