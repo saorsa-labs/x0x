@@ -1,6 +1,6 @@
 # T-goal-e-rule-5: goal E can stand in for an R under rule 5
 
-- **Status:** Proposed
+- **Status:** Accepted (David, D255, 2026-10-12)
 - **Target slot:** A01
 - **Date:** 2026-10-11
 - **Ruling:** D246 (David, in chat, 11 Oct 2026). D247 asks for this record.
