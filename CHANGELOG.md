@@ -448,6 +448,25 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
   clear does not roll the sealed TreeKEM epoch back.
   `T-self-leave-fork-quarantine-clear` (Proposed, slot A14).
 
+### Tests and tooling
+
+- **The `delegation_spaces` binary joined the `quic-localhost` nextest group
+  (#1283).** The groups job's issue #321 acceptance selector runs three
+  daemon-mesh tests from that binary in one nextest invocation; nextest runs
+  each test as its own process, so the in-process suite lock cannot serialise
+  them, and all three pairs formed at once in the one loopback-only network
+  namespace the isolated runtime grants the invocation. Run 37898362740 lost
+  two of the three meshes (`pair-alice` at zero peers after 30 s); a new
+  structural test, `scripts/ci/test_nextest_mesh_serialization.py`, keeps the
+  override in place. The ambient-load attribution stays unverified (#702).
+- **A mesh that never forms now says which kind it was (#1283).** When the
+  harness's zero-peers check fails, the panic carries a live
+  `/network/status` snapshot of every daemon in the mesh: the address the
+  QUIC listener actually bound against the reserved port, and each side's
+  transport connection count. That classifies the failure (no QUIC
+  connection, one side only, or a listener off its reserved port) even though
+  fixtures log at `warn`, where dial and join activity is not recorded.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
