@@ -2086,13 +2086,15 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.87 retains the reviewed git producer's outbound meter,
-    // wire_bytes_for_peer and key-cache accounting semantics. Group-roster
-    // eager selection can change attempt counts without changing the meter.
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.87";
+    // crates.io 0.5.88 retains the reviewed git producer's outbound meter,
+    // wire_bytes_for_peer and key-cache accounting semantics (its pubsub
+    // sources are byte-identical to 0.5.87; 0.5.88 changes only membership).
+    // Group-roster eager selection can change attempt counts without
+    // changing the meter.
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.88";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "d3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502";
+        "accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2116,7 +2118,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.87'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'd3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502'",
+        "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2142,9 +2144,16 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("stale registry fixture");
     assert!(!reviewed_pubsub_producer(&stale_registry));
-    // The previously reviewed 0.5.86 registry package is superseded too.
-    let prior_registry: toml::Value = toml::from_str(
+    // The earlier reviewed 0.5.86 registry package is superseded too.
+    let older_registry: toml::Value = toml::from_str(
         "version = '0.5.86'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82'",
+    )
+    .expect("older registry fixture");
+    assert!(!reviewed_pubsub_producer(&older_registry));
+    // The previously reviewed 0.5.87 registry package is superseded by
+    // 0.5.88 (#1321, D257), although its pubsub sources are identical.
+    let prior_registry: toml::Value = toml::from_str(
+        "version = '0.5.87'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'd3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502'",
     )
     .expect("prior registry fixture");
     assert!(!reviewed_pubsub_producer(&prior_registry));

@@ -52,6 +52,11 @@ All notable changes to this project will be documented in this file.
     phase or spawned dial task starts a dial; a running dial batch of any
     phase, its retry sleeps, the JOIN attempts and the admission reads stop.
 
+  - **Needs saorsa-gossip 0.5.88.** x0x now pins the whole saorsa-gossip
+    family at `=0.5.88`, the release that adds the step API (D257). The #501
+    meter producer premise moves to `saorsa-gossip-pubsub` 0.5.88, whose
+    sources are unchanged from 0.5.87 (see `docs/legacy-compat.md`).
+
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
 
