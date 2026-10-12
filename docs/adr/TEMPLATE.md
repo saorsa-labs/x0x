@@ -1,6 +1,8 @@
 # ADR NNNN: <Decision Title>
 
-<!-- File name: docs/adr/NNNN-short-title.md (e.g. 0001-bootstrap-peers-are-seed-hints-only.md) -->
+<!-- The numbered ADRs are archived (#1313). A new decision is
+docs/adr/transient/T-<slug>.md. It has a "- **Target slot:** A0x" line
+instead of a number. See docs/adr/transient/README.md. -->
 
 - **Status:** Proposed
 - **Date:** YYYY-MM-DD
@@ -11,11 +13,12 @@
 - **Related:** <issues/PRs/specs>
 
 <!-- Use approximately 80% ASD-STE100 style. See docs/documentation-style.md.
-D199: during transfer, new or changed decisions use this numbered ADR
-series only, through the ADR 0087 process. A01-A15 slot revisions are drafts
-until David accepts the transfer. Keep reserved numbers 0090/0091 (D18),
-0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue
-through numbered acceptance. -->
+D242: the 15 current ADRs are the A01-A15 slots. Do not add a new numbered
+ADR. Record a new or changed decision as a transient decision in
+docs/adr/transient/T-<slug>.md that names one target slot (see
+docs/adr/transient/README.md). Only David accepts it. Keep reserved numbers
+0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices
+0109–0114 continue through numbered acceptance. -->
 
 ## Context
 

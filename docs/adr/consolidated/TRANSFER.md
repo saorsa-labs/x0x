@@ -214,7 +214,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 | D196 | 20 verdict-stable CI reruns with complete receipts; exact traces non-blocking | [A08](A08-r01-groups-home-membership-and-repair.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D197 | EvidenceV1: Unknown relationship peers admitted, Blocked refused, evidence verified | [A03](A03-r01-trust-permissions-sharing-and-revocation.md) | Pending |
 | D198 | 15-slot direction and writing target confirmed; transfer stays Proposed | A01–A15 | Pending |
-| D199 | Numbered decisions only during transfer; slots are drafts | A01–A15 | Pending |
+| D199 | Numbered decisions only during transfer; slots are drafts (new-decision route superseded by D242: transient records) | A01–A15 | Pending |
 | D200 | 0040 stands: owner_agent and current-owner-signed transfers | [A12](A12-r01-agent-teams-delegation-and-task-coordination.md) | Pending |
 | E-D1–E-D2 | Measured efficiency budgets and release targets | [A06](A06-r01-gossip-relay-roles-and-resource-limits.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | E-D6 | Leaf egress order with protected delivery | [A06](A06-r01-gossip-relay-roles-and-resource-limits.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
