@@ -3083,6 +3083,12 @@ const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
     // cannot wait behind Bulk cooling.
     "x0x/caps/v1/request/targeted-v2",
     "x0x/caps/v1/response/targeted-v2",
+    // D23 / #1111: the three revocation carriers. They are exact topic names.
+    // Normal is sheddable; Critical is not. A shed_normal Leaf must still
+    // forward these.
+    crate::REVOCATION_TOPIC,
+    crate::REVOCATION_V2_TOPIC,
+    crate::REVOCATION_V3_TOPIC,
 ];
 
 const BULK_TOPIC_PREFIXES: &[&str] = &[
@@ -3163,6 +3169,19 @@ fn register_x0x_topic_priorities(
         TopicId::from_entity("x0x/caps/v1/response/targeted-v2".as_bytes()),
         TopicPriority::Critical,
     );
+    // #1111: seed the revocation carriers so the receive-pump resolver
+    // (which reads this registry, not the classifier) exempts them before
+    // the first local subscribe.
+    for topic in [
+        crate::REVOCATION_TOPIC,
+        crate::REVOCATION_V2_TOPIC,
+        crate::REVOCATION_V3_TOPIC,
+    ] {
+        registry.register(
+            TopicId::from_entity(topic.as_bytes()),
+            TopicPriority::Critical,
+        );
+    }
     // Per-recipient DM inbox topics (`x0x/dm/v1/inbox/<hash>`) are
     // dynamic — they're registered through `register_dynamic_topic_priority`
     // when the runtime subscribes to its own inbox. The prefix
@@ -3839,6 +3858,57 @@ mod tests {
             classify_x0x_topic("my.custom.app.topic"),
             TopicPriority::Normal
         );
+    }
+
+    /// D23 / #1111: revocation records must not sit in the sheddable Normal
+    /// band. The three carriers are exact names. A neighbouring name stays
+    /// Normal so the prefixes are not a catch-all.
+    #[test]
+    fn classify_x0x_topic_routes_revocation_carriers_to_critical() {
+        for topic in [
+            crate::REVOCATION_TOPIC,
+            crate::REVOCATION_V2_TOPIC,
+            crate::REVOCATION_V3_TOPIC,
+        ] {
+            assert_eq!(
+                classify_x0x_topic(topic),
+                TopicPriority::Critical,
+                "{topic} must be Critical"
+            );
+        }
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.other"),
+            TopicPriority::Normal,
+            "only the three revocation carriers move to Critical"
+        );
+    }
+
+    /// #1111: the receive pump and Leaf egress read the seeded registry.
+    /// `shed_normal` drops forwarded Normal and Bulk only. These carriers
+    /// have to already be Critical in that registry, or the first frames
+    /// are sheddable until something subscribes.
+    #[test]
+    fn revocation_carriers_are_seeded_critical_for_shed_normal() {
+        let leaf = GossipConfig {
+            byte_policy: LeafBytePolicy::ShedNormal,
+            ..GossipConfig::default()
+        };
+        let accepted = leaf_egress_config(&leaf).expect("opted-in Leaf sheds Normal");
+        assert_eq!(accepted.policy, BytePolicy::ShedNormal);
+
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::default();
+        register_x0x_topic_priorities(&registry);
+        for topic in [
+            crate::REVOCATION_TOPIC,
+            crate::REVOCATION_V2_TOPIC,
+            crate::REVOCATION_V3_TOPIC,
+        ] {
+            assert_eq!(
+                registry.priority_for(&TopicId::from_entity(topic.as_bytes())),
+                TopicPriority::Critical,
+                "{topic} must be seeded Critical so shed_normal cannot drop it"
+            );
+        }
     }
 
     /// Helper to create a test network node.
