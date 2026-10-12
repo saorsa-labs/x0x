@@ -49,8 +49,8 @@ All notable changes to this project will be documented in this file.
     per attempt, per seed address that is not suppressed. These are
     budgets, not a deadline for the whole call.
   - After `begin_shutdown`, no phase, fallback phase or JOIN starts, and no
-    phase starts a dial; a running dial batch of any phase, its retry
-    sleeps, the JOIN attempts and the admission reads stop.
+    phase or spawned dial task starts a dial; a running dial batch of any
+    phase, its retry sleeps, the JOIN attempts and the admission reads stop.
 
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.

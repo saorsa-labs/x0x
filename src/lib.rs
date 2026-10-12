@@ -13471,7 +13471,8 @@ impl Agent {
     /// Connect to cached peers in parallel, returning (succeeded, failed).
     /// Each success is `(address, peer id)`; `connect_cached_peer` returns
     /// `Ok` only for the requested, authenticated peer. After `stop` is
-    /// cancelled, no dial starts (x0x#1321).
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_cached_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
@@ -13493,9 +13494,17 @@ impl Agent {
             .map(|peer| {
                 let net = network.clone();
                 let peer_id = peer.peer_id;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to cached peer: {:?}", peer_id);
-                    match timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)).await {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(peer_id),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_cached_peer(peer_id)) => dialled,
+                    };
+                    match dialled {
                         Ok(Ok(addr)) => {
                             tracing::info!("Connected to cached peer {:?} at {}", peer_id, addr);
                             Ok((addr, peer_id))
@@ -13522,7 +13531,8 @@ impl Agent {
 
     /// Connect to multiple peers in parallel, returning (succeeded, failed).
     /// Each success is `(address, answered peer id)`. After `stop` is
-    /// cancelled, no dial starts (x0x#1321).
+    /// cancelled, no task is spawned, a spawned task does not start its dial,
+    /// and a running dial stops (x0x#1321).
     async fn connect_peers_parallel_tracked(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
@@ -13547,9 +13557,17 @@ impl Agent {
             .map(|addr| {
                 let net = network.clone();
                 let addr = *addr;
+                let stop = stop.clone();
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
-                    match timeout(CONNECT_TIMEOUT, net.connect_addr(addr)).await {
+                    // x0x#1321: shutdown can begin after the parent's check.
+                    // Then the dial does not start, and a running one stops.
+                    let dialled = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return Err(addr),
+                        dialled = timeout(CONNECT_TIMEOUT, net.connect_addr(addr)) => dialled,
+                    };
+                    match dialled {
                         Ok(Ok(peer_id)) => {
                             tracing::info!("Connected to peer: {}", addr);
                             Ok((addr, peer_id))
