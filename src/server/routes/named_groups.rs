@@ -6610,9 +6610,24 @@ async fn prepare_rebind_journal_for_groups(
         let journal_path = treekem_journal_path(&state.treekem_dir, group_id);
         // Durable + crash-atomic (temp → fsync → rename → dir fsync) so a
         // power loss can never leave a torn journal.
-        x0x::storage::write_private_bytes_durable(&journal_path, journal_bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
+        match x0x::storage::write_private_bytes_durable_typed(&journal_path, journal_bytes).await {
+            Ok(()) => {}
+            Err(e) if e.crossed_rename() => {
+                // #1187: the journal is the COMMIT POINT and it is already
+                // in place; a restart replays it. A rollback must delete it
+                // again, and nothing makes that delete durable, so a failed
+                // or lost delete would replay a rebind the API reported as
+                // failed. Treat the journal as written and complete the
+                // transaction: the apply's snapshot write fsyncs this same
+                // directory, and the journal is consumed after it.
+                tracing::error!(
+                    group_id = %LogHexId::group(group_id),
+                    error = %e.with_path(&journal_path),
+                    "#1187: rebind journal is in place but its directory fsync failed; completing the rebind (a rollback cannot remove the commit point durably)"
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
+        }
         Ok(())
     }
     .await;
@@ -6644,9 +6659,30 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
     // file is durable — a crash anywhere before the deletes is replayed
     // forward by the still-present journals.
     apply_home_suite_sidecar_journal(state, group_id).await?;
-    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, journal.snapshot_envelope)
-        .await
-        .map_err(|e| anyhow::anyhow!("snapshot write: {e}"))?;
+    match persist_treekem_snapshot_bytes_typed(
+        &state.treekem_dir,
+        group_id,
+        journal.snapshot_envelope,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(e) if e.crossed_rename() => {
+            // #1187: the rebound snapshot is in place (only its directory
+            // fsync failed), so complete the apply and consume the
+            // journals. Keeping them would let a restart replay this
+            // envelope over a newer ratchet state that a later encrypt
+            // persists. A rebind changes metadata only, so if a power loss
+            // reverts this rename, `restore_treekem_groups` re-binds the
+            // older snapshot at startup.
+            tracing::error!(
+                group_id = %LogHexId::group(group_id),
+                error = %e,
+                "#1187: rebound TreeKEM snapshot is in place but its directory fsync failed; completing the rebind"
+            );
+        }
+        Err(e) => return Err(anyhow::anyhow!("snapshot write: {e}")),
+    }
     // Restore the repaired group into the live map when it was missing.
     rebind_restore_live_group(state, group_id).await;
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
@@ -6684,7 +6720,19 @@ async fn apply_home_suite_sidecar_journal(state: &AppState, group_id: &str) -> a
 /// startup and resurrect the rejected state.
 async fn discard_rebind_journal(state: &AppState, group_id: &str) {
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id);
-    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+    // #1187 test seam (path-scoped, cfg(test) only): fail this discard.
+    #[cfg(test)]
+    let removed =
+        if tests::issue1187_durable_journal::journal_discard_fails_for_testing(&journal_path) {
+            Err(std::io::Error::other(
+                "injected journal discard failure (#1187 test seam)",
+            ))
+        } else {
+            tokio::fs::remove_file(&journal_path).await
+        };
+    #[cfg(not(test))]
+    let removed = tokio::fs::remove_file(&journal_path).await;
+    if let Err(e) = removed {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::error!(
                 group_id = %LogHexId::group(group_id),
@@ -15017,6 +15065,12 @@ pub(in crate::server) async fn create_named_group(
                     )
                     .await
                     {
+                        // #1187: the create did not become durable (and the
+                        // seal discarded its journal), so remove the freshly
+                        // created group from the live map. A restart finds no
+                        // named record for it; the live state now agrees.
+                        drop(guard);
+                        state.treekem_groups.write().await.remove(&group_id_hex);
                         tracing::error!(group_id = %group_id_hex, "failed to atomically persist TreeKEM group create: {e}");
                         return api_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -20326,6 +20380,23 @@ async fn add_treekem_named_group_member(
             );
         }
     };
+    // #1187: capture the pre-add snapshot so a failed seal can roll the
+    // in-memory group back to the state a restart loads (the seal discards
+    // its journal when the named half does not land). Fail the request
+    // BEFORE the mutation if the snapshot cannot be taken, rather than
+    // advancing a group that could not then be rolled back.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::error!(group_id = %LogHexId::group(&id), "failed to snapshot TreeKEM group before direct add: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "failed to prepare secure group state" }),
+                ),
+            );
+        }
+    };
     let out = match guard.add_member(agent_id, &kp_bytes) {
         Ok(out) => out,
         Err(e) => {
@@ -20348,6 +20419,14 @@ async fn add_treekem_named_group_member(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "direct_add_persist_failed",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after direct add: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -21835,6 +21914,22 @@ async fn remove_treekem_named_group_member(
             );
         }
     };
+    // #1187: capture the pre-removal snapshot so a failed seal can roll the
+    // in-memory group back to the state a restart loads. Fail the request
+    // BEFORE the mutation if the snapshot cannot be taken.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::error!(group_id = %LogHexId::group(&id), "failed to snapshot TreeKEM group before removal: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "failed to prepare secure group state"
+                })),
+            );
+        }
+    };
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
@@ -21864,6 +21959,14 @@ async fn remove_treekem_named_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_remove_persist_failed",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -22417,6 +22520,19 @@ async fn owner_certified_seal_with_eviction(
                         )))
                     }
                 };
+                // #1187: capture the pre-eviction snapshot so a failed seal
+                // can roll the in-memory group back to what a restart loads.
+                // Fail the request BEFORE the mutation if it cannot be taken.
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        tracing::error!(group_id = %id, "failed to snapshot TreeKEM group before eviction: {e}");
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to prepare secure group state",
+                        )));
+                    }
+                };
                 let treekem_commit =
                     match guard.remove_member_verified(target_agent, &target_kp_bytes) {
                         Ok(commit) => commit,
@@ -22456,6 +22572,14 @@ async fn owner_certified_seal_with_eviction(
                         .await;
                 purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
                 if let Err(e) = persisted {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        id,
+                        &delivery_roster,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_evict_persist_failed",
+                    );
                     tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after eviction: {e}");
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -25151,6 +25275,21 @@ async fn ban_treekem_group_member(
             );
         }
     };
+    // #1187: capture the pre-ban snapshot so a failed seal can roll the
+    // in-memory group back to the state a restart loads. Fail the request
+    // BEFORE the mutation if the snapshot cannot be taken.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::error!(group_id = %LogHexId::group(&id), "failed to snapshot TreeKEM group before ban: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": "failed to prepare secure group state" }),
+                ),
+            );
+        }
+    };
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
@@ -25178,6 +25317,14 @@ async fn ban_treekem_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_ban_persist_failed",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -26427,6 +26574,19 @@ async fn approve_treekem_join_request(
                 );
             }
         };
+    // #1187: capture the pre-add snapshot so a failed seal can roll the
+    // in-memory group back to the state a restart loads. Fail the request
+    // BEFORE the mutation if the snapshot cannot be taken.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::error!(group_id = %LogHexId::group(&id), "failed to snapshot TreeKEM group before approval: {e}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to prepare secure group state",
+            );
+        }
+    };
     let out = match guard.add_member(requester_id, &kp_bytes) {
         Ok(out) => out,
         Err(e) => {
@@ -26445,6 +26605,14 @@ async fn approve_treekem_join_request(
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "approve_join_persist_failed",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after approval: {e}");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -28307,6 +28475,20 @@ async fn persist_treekem_snapshot_bytes(
     Ok(())
 }
 
+/// [`persist_treekem_snapshot_bytes`] with the typed #1101 error (#1187):
+/// [`x0x::storage::DurableWriteError::crossed_rename`] says the new
+/// snapshot was already renamed into place when the write failed, so a
+/// journaled caller must not keep a journal that a restart would replay
+/// over it.
+async fn persist_treekem_snapshot_bytes_typed(
+    treekem_dir: &FsPath,
+    group_id_hex: &str,
+    bytes: Vec<u8>,
+) -> Result<(), x0x::storage::DurableWriteError> {
+    let path = treekem_snapshot_path(treekem_dir, group_id_hex);
+    x0x::storage::write_private_bytes_durable_typed(&path, bytes).await
+}
+
 /// Persist a TreeKEM snapshot bound to the currently durable named-group state.
 ///
 /// The roster entry is resolved under BOTH spellings
@@ -28335,13 +28517,22 @@ pub(super) async fn persist_treekem_snapshot_bound(
     group_id_hex: &str,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    // #1187 (ADR 0085): the whole write runs under the named-groups
+    // persistence lock, so this snapshot and the startup journal replay
+    // cannot disagree. A `<gid>.journal` left on disk by a prior
+    // transaction that did not complete still carries the group state
+    // captured at journal time; the startup replay writes that state over
+    // `<gid>.snap`. Holding the lock here lets the write keep a retained
+    // journal in step (below) before the caller returns, so a restart
+    // loads the state the daemon just served — not an earlier one.
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let info = {
         let groups = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&groups, group_id_hex)
             .map(|(_, info)| info.clone())
             .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
     };
-    ensure_treekem_persistence_allowed(
+    ensure_treekem_persistence_allowed_locked(
         state,
         group_id_hex,
         Some(info.stable_group_id()),
@@ -28350,23 +28541,131 @@ pub(super) async fn persist_treekem_snapshot_bound(
     .await?;
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
-    ensure_treekem_persistence_allowed(
+    ensure_treekem_persistence_allowed_locked(
         state,
         group_id_hex,
         Some(info.stable_group_id()),
         "withdrawn_snapshot_persist",
     )
-    .await
+    .await?;
+    // #1187: keep a retained journal's snapshot in step with the state just
+    // written, so a restart replay agrees with it. Runs before the caller
+    // returns (and therefore before any caller acts on the persisted state).
+    refresh_retained_treekem_journal_snapshot(state, group_id_hex, group).await
 }
 
-async fn ensure_treekem_persistence_allowed(
+/// [`ensure_named_group_key_material_install_allowed`] for a caller that
+/// already holds `named_groups_persistence_lock` (#1187): same withdrawn
+/// check, without re-acquiring the lock.
+async fn ensure_treekem_persistence_allowed_locked(
     state: &AppState,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     reason: &str,
 ) -> anyhow::Result<()> {
-    ensure_named_group_key_material_install_allowed(state, group_id_hex, stable_group_id, reason)
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id_hex, stable_group_id).await;
+    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+        state,
+        group_id_hex,
+        stable_group_id,
+        reason,
+    )
+    .await?
+    {
+        anyhow::bail!("refusing to install key material for withdrawn group");
+    }
+    Ok(())
+}
+
+/// #1187: a `<gid>.journal` on disk is a prior named-groups transaction that
+/// did not complete; its embedded snapshot envelope is the group state at
+/// journal time. Left unchanged, the startup replay writes that older state
+/// over `<gid>.snap`, so a restart loads a group behind the one the daemon
+/// served. Rewrite the retained journal's snapshot envelope with the state
+/// just persisted, keeping the journal's own record binding (the same v1
+/// postcard shape, bound to the journal record), and make it durable before
+/// the caller returns.
+///
+/// Called under `named_groups_persistence_lock` (held by
+/// [`persist_treekem_snapshot_bound`]). The common case is no retained
+/// journal, which returns immediately. An unreadable, undecodable or
+/// unsupported-version journal fails the write CLOSED (ADR 0085 rule 4:
+/// never overwrite a file this binary cannot read), so the caller never
+/// treats the state as persisted.
+async fn refresh_retained_treekem_journal_snapshot(
+    state: &AppState,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    let journal_bytes = match tokio::fs::read(&journal_path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("retained TreeKEM journal read: {e}")),
+    };
+    let mut journal: TreeKemNamedPersistJournal = postcard::from_bytes(&journal_bytes)
+        .map_err(|e| anyhow::anyhow!("retained TreeKEM journal decode: {e}"))?;
+    if journal.version != TREEKEM_NAMED_JOURNAL_VERSION {
+        anyhow::bail!(
+            "retained TreeKEM journal version {} is not supported by this binary",
+            journal.version
+        );
+    }
+    // Keep every binding field of the envelope and replace only the group
+    // snapshot bytes with the current state, so the envelope stays bound to
+    // the journal's own record. A legacy unbound snapshot cannot be updated
+    // this way and fails closed.
+    let mut envelope =
+        decode_treekem_snapshot_envelope(&journal.snapshot_envelope)?.ok_or_else(|| {
+            anyhow::anyhow!("retained TreeKEM journal carries a legacy unbound snapshot")
+        })?;
+    envelope.snapshot = group
+        .to_snapshot_bytes()
+        .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    let mut refreshed_bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+    refreshed_bytes.extend(
+        postcard::to_stdvec(&envelope)
+            .map_err(|e| anyhow::anyhow!("treekem snapshot envelope encode: {e}"))?,
+    );
+    journal.snapshot_envelope = refreshed_bytes;
+    let updated_bytes = postcard::to_stdvec(&journal)
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
+    // The refresh must be DURABLE before the caller proceeds. A crossed-rename
+    // error means the rewrite reached the file but its directory fsync did
+    // not, so a crash can still revert it to the journal-time snapshot; a
+    // restart would then replay that older snapshot over the newer `.snap`.
+    // Fail the write closed on any error, so the caller does not act on an
+    // unconfirmed refresh (the same posture `persist_treekem_snapshot_bytes`
+    // takes for the snapshot write itself).
+    x0x::storage::write_private_bytes_durable_typed(&journal_path, updated_bytes)
         .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "retained TreeKEM journal refresh write: {}",
+                e.with_path(&journal_path)
+            )
+        })
+}
+
+/// #1187: discard this group's seal journal pair (legacy + sidecar) when the
+/// seal fails WITHOUT durably committing the named half. The legacy journal
+/// is the commit point: left on disk, a restart replays the new state that
+/// the caller reports as failed and rolls back. Discarding it only when the
+/// named write did not land keeps the #457 rule "never discard a journal
+/// whose named half is durable" (the caller then aligns the live group).
+async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!(
+                group_id = %LogHexId::group(group_id_hex),
+                error = %e,
+                "#1187: discarding the seal journal failed — a restart may replay a transaction the caller reported as failed"
+            );
+        }
+    }
+    remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
 }
 
 /// Persist a supplied named-group state and matching TreeKEM snapshot with a
@@ -28544,24 +28843,77 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         &home_suite_json,
     )
     .await?;
-    x0x::storage::write_private_bytes_durable(&journal_path, journal_bytes)
-        .await
-        .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
+    match x0x::storage::write_private_bytes_durable_typed(&journal_path, journal_bytes).await {
+        Ok(()) => {}
+        Err(e) if e.crossed_rename() => {
+            // #1187: the legacy journal is the COMMIT POINT and it is
+            // already in place, so a restart replays this transaction.
+            // Every caller rolls its TreeKEM group back on an error, which
+            // would leave the daemon behind that replay. Complete the
+            // transaction instead: the snapshot write below fsyncs this
+            // same directory before the journals are consumed.
+            tracing::error!(
+                group_id = %LogHexId::group(group_id_hex),
+                error = %e.with_path(&journal_path),
+                "#1187: TreeKEM seal journal is in place but its directory fsync failed; completing the transaction (a restart would replay it)"
+            );
+        }
+        Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
+    }
     // 2) Live files, each now repairable from the journals above.
-    let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
+    // #1187: past the commit point, a failure that does NOT durably commit
+    // the named half discards the journal pair, so a restart agrees with the
+    // error the caller reports (the caller then aligns the live group).
+    let sidecar_outcome = match write_home_suite_sidecar(state, &home_suite_json).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            discard_seal_journal_pair(state, group_id_hex).await;
+            return Err(anyhow::anyhow!("Home-Suite sidecar write: {e}"));
+        }
+    };
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
+        discard_seal_journal_pair(state, group_id_hex).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
-    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
-    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+    match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
+        .await
+    {
+        Ok(()) => {}
+        Err(e) if e.crossed_rename() => {
+            // #1187: the new snapshot is in place (only its directory
+            // fsync failed). An error here makes the caller roll its
+            // TreeKEM group back while the journals replay this snapshot at
+            // restart; keeping the journals would also let a restart replay
+            // this snapshot over a newer ratchet state that a later encrypt
+            // persists. Complete the transaction and consume the journals.
+            tracing::error!(
+                group_id = %LogHexId::group(group_id_hex),
+                error = %e,
+                "#1187: TreeKEM seal snapshot is in place but its directory fsync failed; completing the transaction"
+            );
+        }
+        Err(e) => {
+            discard_seal_journal_pair(state, group_id_hex).await;
+            return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
+        }
+    }
+    match repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
         group_id_hex,
         Some(&stable_group_id),
         "withdrawn_atomic_persist_late",
     )
-    .await?
+    .await
     {
-        anyhow::bail!("refusing to persist key material for withdrawn group");
+        Ok(true) => {
+            discard_seal_journal_pair(state, group_id_hex).await;
+            anyhow::bail!("refusing to persist key material for withdrawn group");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            discard_seal_journal_pair(state, group_id_hex).await;
+            return Err(e);
+        }
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
@@ -28591,6 +28943,9 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             anyhow::bail!("named groups replacement was not directory-durable");
         }
         AtomicWriteOutcome::NotReplaced => {
+            // #1187: the named half did not land, so the journal must not
+            // replay this transaction at restart (the caller rolls back).
+            discard_seal_journal_pair(state, group_id_hex).await;
             anyhow::bail!("named groups replacement did not occur");
         }
     }
@@ -29969,12 +30324,28 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             if replay_fault_active(ReplayFault::AfterNamedApply) {
                 anyhow::bail!("injected failure between the named and snapshot writes");
             }
-            persist_treekem_snapshot_bytes(
+            match persist_treekem_snapshot_bytes_typed(
                 treekem_dir,
                 &journal.group_id_hex,
                 journal.snapshot_envelope.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.crossed_rename() => {
+                    // #1187: the replayed snapshot is in place, so every
+                    // live file now holds the journal's state. Consume the
+                    // pair: a pair kept for the next boot would replay this
+                    // snapshot over a newer ratchet state that this boot
+                    // persists after an encrypt.
+                    tracing::error!(
+                        group_id = %journal.group_id_hex,
+                        error = %e,
+                        "#1187: replayed TreeKEM snapshot is in place but its directory fsync failed; consuming the journal pair"
+                    );
+                }
+                Err(e) => return Err(anyhow::anyhow!("treekem snapshot write: {e}")),
+            }
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
@@ -40007,6 +40378,7 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
+    pub(in crate::server) mod issue1187_durable_journal;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
