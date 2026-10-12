@@ -508,6 +508,11 @@ pub struct RevocationSet {
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
     change_generation: u64,
+    /// A persisted v1, v2 or v3 file was present but could not be decoded
+    /// (#1116). Not serialized: disk and gossip still carry only verified
+    /// records. Gate checks fail closed until a later load of a readable
+    /// file builds a set without this flag.
+    store_unreadable: bool,
 }
 
 impl RevocationSet {
@@ -517,23 +522,55 @@ impl RevocationSet {
         Self::default()
     }
 
+    /// A load found a revocation file that exists but cannot be decoded.
+    ///
+    /// The set then holds no records from that file. Agent, machine,
+    /// binding and share-grant gates still fail closed, so a subject that
+    /// was revoked in the unreadable bytes is not accepted. Repair the
+    /// file, or remove it, and restart. This flag is not written to disk
+    /// and is not published.
+    #[must_use]
+    pub fn revocation_store_unreadable(&self) -> bool {
+        self.store_unreadable
+    }
+
+    /// Empty set whose gates fail closed (#1116).
+    ///
+    /// Used when a revocation file is present but cannot be decoded. A
+    /// missing file stays [`Self::new`]: there is nothing to forget.
+    pub(crate) fn unreadable_store() -> Self {
+        Self {
+            store_unreadable: true,
+            ..Self::new()
+        }
+    }
+
     /// Whether an agent id is revoked.
+    ///
+    /// Also true when [`Self::revocation_store_unreadable`] is set.
     #[must_use]
     pub fn is_agent_revoked(&self, id: &AgentId) -> bool {
-        self.revoked_agents.contains(id)
+        self.store_unreadable || self.revoked_agents.contains(id)
     }
 
     /// Whether a machine id is revoked.
+    ///
+    /// Also true when [`Self::revocation_store_unreadable`] is set.
     #[must_use]
     pub fn is_machine_revoked(&self, id: &MachineId) -> bool {
-        self.revoked_machines.contains(id)
+        self.store_unreadable || self.revoked_machines.contains(id)
     }
 
     /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
     /// **B**): the grow-only union of bundle `retired_bindings` and ad-hoc
     /// v2 tombstones.
+    ///
+    /// Also true when [`Self::revocation_store_unreadable`] is set.
     #[must_use]
     pub fn is_binding_revoked(&self, agent: &AgentId, machine: &MachineId) -> bool {
+        if self.store_unreadable {
+            return true;
+        }
         let key = (*agent, *machine);
         self.binding_epochs.contains_key(&key) || self.bundle_retired_epochs.contains_key(&key)
     }
@@ -541,9 +578,11 @@ impl RevocationSet {
     /// Whether the share grant `grant_id` signed by `owner` is revoked
     /// (ADR-0070 §2). A revocation by any other owner for the same id does
     /// not match.
+    ///
+    /// Also true when [`Self::revocation_store_unreadable`] is set.
     #[must_use]
     pub fn is_share_grant_revoked(&self, grant_id: &[u8; 32], owner: &UserId) -> bool {
-        self.revoked_share_grants.contains_key(&(*grant_id, *owner))
+        self.store_unreadable || self.revoked_share_grants.contains_key(&(*grant_id, *owner))
     }
 
     /// Highest epoch of any tombstone for the agent across both carriers,
@@ -1042,7 +1081,13 @@ impl RevocationSet {
     }
 
     /// Merge a decoded v3 set into this one (grow-only union).
+    ///
+    /// An unreadable source keeps this set fail-closed. A readable source
+    /// does not clear a fail-closed flag already set by another file.
     pub fn merge_v3(&mut self, other: Self) {
+        if other.store_unreadable {
+            self.store_unreadable = true;
+        }
         let mut changed = false;
         for (key, expiry) in other.revoked_share_grants {
             let entry = self.revoked_share_grants.entry(key).or_insert(0);
@@ -1065,7 +1110,13 @@ impl RevocationSet {
     }
 
     /// Merge a decoded v2 set into this one (grow-only union).
+    ///
+    /// An unreadable source keeps this set fail-closed. A readable source
+    /// does not clear a fail-closed flag already set by another file.
     pub fn merge_v2(&mut self, other: Self) {
+        if other.store_unreadable {
+            self.store_unreadable = true;
+        }
         for ((agent, machine), epoch) in other.binding_epochs {
             let key = (agent, machine);
             let entry = self.binding_epochs.entry(key).or_insert(0);
@@ -1159,12 +1210,15 @@ mod tests {
             assert!(RevocationSet::validate_persisted_bytes(&garbage, magic).is_err());
             let path = dir.path().join(name);
             tokio::fs::write(&path, &garbage).await.unwrap();
-            let unreadable = crate::storage::read_revocation_store(&path, store, false)
+            let loaded = crate::storage::read_revocation_store(&path, store, false)
                 .await
-                .expect_err("trailing bytes make the store unreadable");
-            assert!(crate::storage::revocation_persistence_is_blocked(
-                &unreadable
-            ));
+                .expect("a present file returns a set");
+            let loaded = loaded.expect("the file exists");
+            assert!(
+                loaded.revocation_store_unreadable(),
+                "trailing bytes fail the {name} gates closed"
+            );
+            assert!(loaded.is_empty(), "{name} contributes no records");
             let outcome = crate::storage::save_private_bytes_to(&path, valid).await;
             assert_eq!(
                 tokio::fs::read(&path).await.unwrap(),
@@ -1174,6 +1228,60 @@ mod tests {
             let refused = outcome.expect_err("trailing bytes block overwrite");
             assert!(crate::storage::revocation_persistence_is_blocked(&refused));
         }
+    }
+
+    /// #1116: the hold is in memory only. A readable merge does not clear
+    /// it, and encoding still writes verified records alone.
+    #[test]
+    fn unreadable_store_stays_local_and_merge_keeps_it_1116() {
+        let agent = AgentId([0x11; 32]);
+        let machine = MachineId([0x22; 32]);
+        let grant = [0x33; 32];
+        let owner = UserId([0x44; 32]);
+        let closed = RevocationSet::unreadable_store();
+        assert!(closed.is_empty());
+        assert!(closed.is_agent_revoked(&agent));
+        assert!(closed.is_machine_revoked(&machine));
+        assert!(closed.is_binding_revoked(&agent, &machine));
+        assert!(closed.is_share_grant_revoked(&grant, &owner));
+        assert!(closed.max_revoked_binding_epoch(&agent).is_none());
+        assert_eq!(closed.generation(), 0);
+        assert_eq!(
+            closed.to_bytes().unwrap(),
+            RevocationSet::new().to_bytes().unwrap()
+        );
+        assert_eq!(
+            closed.to_bytes_v2().unwrap(),
+            RevocationSet::new().to_bytes_v2().unwrap()
+        );
+        assert_eq!(
+            closed.to_bytes_v3().unwrap(),
+            RevocationSet::new().to_bytes_v3().unwrap()
+        );
+        let decoded = RevocationSet::from_bytes(&closed.to_bytes().unwrap()).unwrap();
+        assert!(!decoded.revocation_store_unreadable());
+        assert!(!decoded.is_agent_revoked(&agent));
+
+        let mut held = RevocationSet::new();
+        let generation = held.generation();
+        held.merge_v2(RevocationSet::unreadable_store());
+        assert!(held.revocation_store_unreadable());
+        assert!(held.is_binding_revoked(&agent, &machine));
+        assert_eq!(held.generation(), generation);
+        held.merge_v2(RevocationSet::new());
+        assert!(
+            held.revocation_store_unreadable(),
+            "a readable v2 merge does not clear the hold"
+        );
+
+        let mut held = RevocationSet::new();
+        held.merge_v3(RevocationSet::unreadable_store());
+        assert!(held.is_share_grant_revoked(&grant, &owner));
+        held.merge_v3(RevocationSet::new());
+        assert!(
+            held.revocation_store_unreadable(),
+            "a readable v3 merge does not clear the hold"
+        );
     }
 
     #[tokio::test]

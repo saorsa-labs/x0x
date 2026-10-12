@@ -1170,8 +1170,12 @@ async fn lock_revocation_path(path: &Path) -> RevocationWriteGuard {
     }
 }
 
-/// Load-only callers keep their fail-open fallback and verify authority
-/// after releasing storage serialization.
+/// Load one revocation file.
+///
+/// A missing file is `Ok(None)`. A file that exists but cannot be read or
+/// decoded is `Ok(Some)` of an empty set whose gates fail closed (#1116).
+/// Writers keep using [`read_revocation_store_locked`], which still returns
+/// the typed refusal and does not replace the bytes.
 pub(crate) async fn read_revocation_store(
     path: &Path,
     store: RevocationStore,
@@ -1179,9 +1183,33 @@ pub(crate) async fn read_revocation_store(
 ) -> Result<Option<RevocationSet>> {
     let bytes = {
         let _guard = lock_revocation_path(path).await;
-        read_revocation_store_locked(path, store, persist_attempt).await?
+        match read_revocation_store_locked(path, store, persist_attempt).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(Some(RevocationSet::unreadable_store())),
+        }
     };
-    bytes.map(|bytes| store.decode(&bytes)).transpose()
+    match bytes.map(|bytes| store.decode(&bytes)).transpose() {
+        Ok(set) => Ok(set),
+        Err(error) => {
+            // Structural validation passed and cleared the block. The
+            // authority decoder then rejected the same bytes. Restore the
+            // block so a writer cannot replace the file with an empty set.
+            remember_unreadable_store(path, error.to_string()).await;
+            Ok(Some(RevocationSet::unreadable_store()))
+        }
+    }
+}
+
+/// Record a decode failure after structural validation cleared the block.
+async fn remember_unreadable_store(path: &Path, error: String) {
+    let mut states = revocation_store_states().lock().await;
+    let state = states.entry(path.to_path_buf()).or_default();
+    state.unreadable = Some(error);
+    tracing::warn!(
+        path = %path.display(),
+        persistence_blocked = true,
+        "revocation store failed to decode; gates fail closed and persistence stays refused"
+    );
 }
 
 /// V3 merge keeps this guard through the final durable write, and reads
@@ -1215,13 +1243,14 @@ async fn revocation_write_guard(path: &Path) -> Result<Option<RevocationWriteGua
     Ok(Some(guard))
 }
 
-/// Load the local revocation set from disk.
+/// Load the local v1 revocation set from disk.
 ///
-/// Returns an empty `RevocationSet` if the file does not exist or cannot be
-/// read — the caller treats absence as "no revocations known yet" (safe
-/// default).  Corrupt or tampered files are logged and ignored (each record is
-/// re-verified on load, so a forged entry is simply skipped rather than
-/// poisoning the whole set).
+/// A missing file is an empty set: no revocations are known yet. A file
+/// that exists but cannot be read or decoded is an empty set whose gates
+/// fail closed (#1116). The unreadable bytes stay on disk. Repair that
+/// file, or remove it, and restart the daemon. A record that decodes but
+/// fails authority verification is still dropped on its own; that does not
+/// hold the gates.
 pub async fn load_revocation_set(identity_dir: Option<&Path>) -> RevocationSet {
     let Some(path) = revocation_path(identity_dir) else {
         return RevocationSet::new();
@@ -1279,7 +1308,7 @@ mod tests {
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
 
-    /// #1116 / ADR 0085 rule 4: a fail-open load must not authorize
+    /// #1116 / ADR 0085 rule 4: a fail-closed load must not authorize
     /// overwriting an unreadable v1 file on the next ordinary persist.
     #[tokio::test]
     async fn unreadable_v1_revocations_survive_persist() {
@@ -1291,7 +1320,16 @@ mod tests {
             .expect("seed garbage");
 
         let mut set = load_revocation_set(Some(dir.path())).await;
-        assert!(set.is_empty(), "ADR 0018 load remains fail-open");
+        assert!(set.is_empty(), "undecodable bytes contribute no records");
+        assert!(
+            set.revocation_store_unreadable(),
+            "a present but undecodable v1 file fails the gates closed"
+        );
+        let stranger = AgentKeypair::generate().expect("stranger");
+        assert!(
+            set.is_agent_revoked(&stranger.agent_id()),
+            "an unknown agent is refused while revocations.bin is unreadable"
+        );
         let issuer = AgentKeypair::generate().expect("issuer key");
         let record = crate::revocation::RevocationRecord::sign(
             crate::revocation::RevokedSubject::Agent(issuer.agent_id()),
@@ -1321,9 +1359,186 @@ mod tests {
         save_revocation_set(&set, Some(dir.path()))
             .await
             .expect("repair unblocks v1");
-        assert!(load_revocation_set(Some(dir.path()))
+        let repaired = load_revocation_set(Some(dir.path())).await;
+        assert!(repaired.is_agent_revoked(&issuer.agent_id()));
+        assert!(
+            !repaired.revocation_store_unreadable(),
+            "a readable file loads without the hold"
+        );
+        assert!(
+            !repaired.is_agent_revoked(&stranger.agent_id()),
+            "a repaired file does not refuse an unknown agent"
+        );
+    }
+
+    /// #1116: startup load of a present but undecodable v1, v2 or v3 file
+    /// fails the gates closed. A missing file does not. The bytes stay put.
+    #[tokio::test]
+    async fn corrupt_revocation_files_fail_closed_on_load_1116() {
+        use crate::identity::{AgentId, MachineId, UserId};
+
+        let agent = AgentId([0x11; 32]);
+        let machine = MachineId([0x22; 32]);
+        let grant = [0x33; 32];
+        let owner = UserId([0x44; 32]);
+        let assert_closed = |set: &RevocationSet, label: &str| {
+            assert!(set.revocation_store_unreadable(), "{label} holds the gates");
+            assert!(set.is_empty(), "{label} contributes no records");
+            assert!(set.is_agent_revoked(&agent), "{label} refuses an agent");
+            assert!(
+                set.is_machine_revoked(&machine),
+                "{label} refuses a machine"
+            );
+            assert!(
+                set.is_binding_revoked(&agent, &machine),
+                "{label} refuses a binding"
+            );
+            assert!(
+                set.is_share_grant_revoked(&grant, &owner),
+                "{label} refuses a share grant"
+            );
+            assert!(
+                set.max_revoked_binding_epoch(&agent).is_none(),
+                "{label} does not invent a binding epoch"
+            );
+        };
+        let assert_open = |set: &RevocationSet, label: &str| {
+            assert!(!set.revocation_store_unreadable(), "{label} has no hold");
+            assert!(!set.is_agent_revoked(&agent), "{label} accepts an agent");
+            assert!(
+                !set.is_machine_revoked(&machine),
+                "{label} accepts a machine"
+            );
+            assert!(
+                !set.is_binding_revoked(&agent, &machine),
+                "{label} accepts a binding"
+            );
+            assert!(
+                !set.is_share_grant_revoked(&grant, &owner),
+                "{label} accepts a share grant"
+            );
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_open(
+            &load_revocation_set(Some(dir.path())).await,
+            "missing files",
+        );
+
+        let garbage = b"not a revocation store";
+        let names = [
+            "revocations.bin",
+            "revocations-v2.bin",
+            "revocations-v3.bin",
+        ];
+        for name in names {
+            tokio::fs::write(dir.path().join(name), garbage)
+                .await
+                .expect("seed garbage");
+        }
+
+        // Same order as daemon startup: v1 load, then v2 merge, then v3 merge.
+        let mut set = load_revocation_set(Some(dir.path())).await;
+        assert_closed(&set, "corrupt v1");
+        let v2 = read_revocation_store(
+            &dir.path().join("revocations-v2.bin"),
+            RevocationStore::V2,
+            false,
+        )
+        .await
+        .expect("v2 load")
+        .expect("v2 file exists");
+        set.merge_v2(v2);
+        let v3 = read_revocation_store(
+            &dir.path().join("revocations-v3.bin"),
+            RevocationStore::V3,
+            false,
+        )
+        .await
+        .expect("v3 load")
+        .expect("v3 file exists");
+        set.merge_v3(v3);
+        assert_closed(&set, "corrupt v1 v2 and v3");
+
+        let empty = RevocationSet::new();
+        for name in names {
+            let path = dir.path().join(name);
+            assert_eq!(tokio::fs::read(&path).await.expect("read"), garbage);
+            let refused = save_private_bytes_to(&path, empty.to_bytes().expect("encode"))
+                .await
+                .expect_err("overwrite refused");
+            assert!(revocation_persistence_is_blocked(&refused));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read after refuse"),
+                garbage
+            );
+        }
+
+        tokio::fs::write(
+            dir.path().join("revocations.bin"),
+            empty.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join("revocations-v2.bin"),
+            empty.to_bytes_v2().unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join("revocations-v3.bin"),
+            empty.to_bytes_v3().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut repaired = load_revocation_set(Some(dir.path())).await;
+        let v2 = read_revocation_store(
+            &dir.path().join("revocations-v2.bin"),
+            RevocationStore::V2,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        repaired.merge_v2(v2);
+        let v3 = read_revocation_store(
+            &dir.path().join("revocations-v3.bin"),
+            RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        repaired.merge_v3(v3);
+        assert_open(&repaired, "repaired files");
+
+        // One corrupt carrier is enough. A readable sibling does not clear it.
+        tokio::fs::write(dir.path().join("revocations-v2.bin"), garbage)
             .await
-            .is_agent_revoked(&issuer.agent_id()));
+            .unwrap();
+        let mut mixed = load_revocation_set(Some(dir.path())).await;
+        assert_open(&mixed, "readable v1 before the v2 merge");
+        let v2 = read_revocation_store(
+            &dir.path().join("revocations-v2.bin"),
+            RevocationStore::V2,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        mixed.merge_v2(v2);
+        assert_closed(&mixed, "corrupt v2");
+        let v3 = read_revocation_store(
+            &dir.path().join("revocations-v3.bin"),
+            RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        mixed.merge_v3(v3);
+        assert_closed(&mixed, "corrupt v2 with a readable v3");
     }
 
     /// Missing stores are healthy, independent, and may be created by every
@@ -1456,7 +1671,15 @@ mod tests {
         ] {
             let path = dir.path().join(name);
             fs::create_dir(&path).await.unwrap();
-            assert!(read_revocation_store(&path, store, false).await.is_err());
+            let loaded = read_revocation_store(&path, store, false)
+                .await
+                .expect("an unreadable path returns a quarantined set");
+            assert!(
+                loaded
+                    .expect("the path exists")
+                    .revocation_store_unreadable(),
+                "{name} io failure fails the gates closed"
+            );
             {
                 let states = revocation_store_states().lock().await;
                 assert!(states[&path].unreadable.is_some());
