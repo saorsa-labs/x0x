@@ -3873,6 +3873,15 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
     {
         return None;
     }
+    // Ordinary PolicyUpdated rejects a commit that changes or removes an
+    // installed OwnerCertified owner. Catch-up uses the same rule. The
+    // incoming snapshot is checked only against its own policy, so an
+    // OpenJoin head would otherwise drop the axis.
+    if let Some(current_owner) = local.policy.admission.owner_certified_user_id() {
+        if snapshot.policy.admission.owner_certified_user_id() != Some(current_owner) {
+            return None;
+        }
+    }
     let mut next = local.clone();
     next.name.clone_from(&snapshot.name);
     next.description.clone_from(&snapshot.description);
@@ -3921,6 +3930,16 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
 ) {
     let author_hex = hex::encode(author.as_bytes());
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // The bootstrap worker holds this lock from the quarantine check through
+    // delivery. Take it before selecting the snapshot, and hold the guard
+    // across the send below. A marker install uses the same lock, so it
+    // either lands before this check or after the send.
+    let membership_lock = group_membership_lock(state, group_key).await;
+    let membership_guard = membership_lock.lock().await;
+    if super::public_group_bootstrap_outbox::withhold_bootstrap_publication(state, group_key).await
+    {
+        return;
+    }
     let Some(snapshot) = ({
         let groups = state.named_groups.read().await;
         // #732: the map key and the stable id are different spellings. The
@@ -3950,7 +3969,10 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
         return;
     }
     super::public_group_bootstrap_outbox::push_signed_public_catchup_snapshot(
-        state, author, snapshot,
+        state,
+        author,
+        snapshot,
+        &membership_guard,
     )
     .await;
 }

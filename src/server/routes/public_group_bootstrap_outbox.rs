@@ -319,10 +319,15 @@ async fn public_group_bootstrap_wire_version(
 
 /// One best-effort send of a SignedPublic head to a member who is one
 /// revision behind. This does not write an outbox obligation.
+///
+/// `membership_guard` is the per-group membership lock. The caller takes it
+/// before it selects the snapshot, checks quarantine under it, and holds it
+/// across this await. Delivery then cannot race a marker install.
 pub(in crate::server) async fn push_signed_public_catchup_snapshot(
     state: &AppState,
     recipient: AgentId,
     snapshot: x0x::groups::GroupInfo,
+    membership_guard: &tokio::sync::MutexGuard<'_, ()>,
 ) {
     let obligation = match prepare_public_group_bootstrap_obligation(recipient, snapshot) {
         Ok(obligation) => obligation,
@@ -331,6 +336,9 @@ pub(in crate::server) async fn push_signed_public_catchup_snapshot(
             return;
         }
     };
+    // Keep the caller's membership guard borrowed across delivery. The lock
+    // stays taken until this function returns.
+    let _held_across_delivery = membership_guard;
     if let Err(error) = deliver_public_group_bootstrap(state, &obligation).await {
         tracing::debug!("signed-public catch-up snapshot was not delivered: {error}");
     }
@@ -710,7 +718,10 @@ async fn quarantined_markers(
 /// that nobody remembers to bootstrap is the failure this outbox exists to
 /// prevent) and delivery resumes on its own after `POST
 /// /groups/:id/quarantine/clear`.
-async fn withhold_bootstrap_publication(state: &Arc<AppState>, group_id: &str) -> bool {
+pub(in crate::server) async fn withhold_bootstrap_publication(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> bool {
     let Some(marker) = crate::server::delegations::fork_quarantine_marker(state, group_id).await
     else {
         return false;
