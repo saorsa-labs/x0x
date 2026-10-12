@@ -1561,15 +1561,13 @@ fn install_public_kv_revision_catchup(
     group_key: String,
 ) {
     let state = Arc::downgrade(state);
-    let ctx = ctx.clone();
-    let hook_ctx = ctx.clone();
     let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Do not capture `ctx`. Clones share `skew_hook`, so a hook that owns a
+    // clone keeps that context's roster, watch sender, and queue alive after
+    // the caller drops it. `note_public_revision_skew` already admits only a
+    // valid context, an active member, and exactly one revision of lag.
     ctx.set_revision_skew_hook(Arc::new(move |skew| {
-        // The context already drops ineligible skew. Check again here so a
-        // hook invocation cannot spawn before those gates.
-        if skew.signed_revision.saturating_add(1) != skew.local_revision
-            || !hook_ctx.is_active_member(&skew.author)
-        {
+        if skew.signed_revision.saturating_add(1) != skew.local_revision {
             return;
         }
         let Some(state) = state.upgrade() else {
@@ -7088,6 +7086,80 @@ mod tests {
         );
         let _ = GssKvSecureContext::from_group; // keep backend import referenced
         let _ = GroupPolicy::default();
+    }
+
+    #[tokio::test]
+    async fn public_store_open_drops_its_authorization_context() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "47".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (handle, context, created) = open_bound_public_store(&state, &binding, snapshot_lease)
+            .await
+            .expect("new public store open");
+        assert!(created, "the first open creates the store");
+        let opened = context.authorization_weak();
+        assert_eq!(
+            opened.strong_count(),
+            1,
+            "the skew hook must not keep a second copy of a new open's authorization context"
+        );
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (cached_handle, cached_context, created) =
+            open_bound_public_store(&state, &binding, snapshot_lease)
+                .await
+                .expect("cached public store open");
+        assert!(!created, "the second open reuses the cached store");
+        let cached = cached_context.authorization_weak();
+        assert_eq!(
+            cached.strong_count(),
+            1,
+            "the skew hook must not keep a second copy of a cached open's authorization context"
+        );
+        drop(cached_context);
+        drop(cached_handle);
+        assert!(
+            !cached.alive(),
+            "a cached public-store open must drop the context it built"
+        );
+
+        state.kv_stores.write().await.remove(&binding.topic);
+        handle.retire_and_drain().await;
+        drop(context);
+        drop(handle);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while opened.alive() && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !opened.alive(),
+            "a new public-store open must drop its authorization context"
+        );
     }
 
     #[tokio::test]

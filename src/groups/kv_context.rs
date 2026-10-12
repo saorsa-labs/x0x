@@ -210,6 +210,23 @@ pub struct PublicGroupKvContext {
     skew_notices: Arc<std::sync::Mutex<Vec<SkewNotice>>>,
 }
 
+/// Test probe for the roster snapshot. `alive` is false once every owner,
+/// including a skew hook, has dropped it.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PublicAuthorizationWeak(std::sync::Weak<std::sync::RwLock<PublicState>>);
+
+#[cfg(test)]
+impl PublicAuthorizationWeak {
+    pub(crate) fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    pub(crate) fn alive(&self) -> bool {
+        self.strong_count() > 0
+    }
+}
+
 impl std::fmt::Debug for PublicGroupKvContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -241,11 +258,21 @@ impl PublicGroupKvContext {
 
     /// Install the daemon hook that offers a missing SignedPublic commit.
     /// A later call replaces the previous hook.
+    ///
+    /// The hook must not own this context. Clones share `skew_hook`, so that
+    /// capture would keep the roster snapshot alive after the last owner drops.
     pub fn set_revision_skew_hook(&self, hook: PublicRevisionSkewHook) {
         *self
             .skew_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Weak handle on the roster snapshot. A hook that captures this context
+    /// keeps the snapshot alive after the last owner drops.
+    #[cfg(test)]
+    pub(crate) fn authorization_weak(&self) -> PublicAuthorizationWeak {
+        PublicAuthorizationWeak(std::sync::Arc::downgrade(&self.state))
     }
 
     pub fn update_from_group(&self, info: &GroupInfo) {
