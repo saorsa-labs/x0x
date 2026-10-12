@@ -40393,6 +40393,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
+    mod r2_journal_ratchet_regression;
     mod requester_offer;
     mod wp_c;
 
