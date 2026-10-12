@@ -77,6 +77,8 @@ David ruled D246 on 11 Oct 2026. He closed ADR 0095 open question 4 (Goal E unde
 
 Goal E counts in place of an R under rule 5 when the change keeps the wire format, API, stored format and dependencies unchanged, and the rule-21 delivery matrix shows no loss. The decision states a target gain when Proposed. It is Folded only after a measured before-and-after result that meets E-D15 rule 15. Any wire, protocol, API or dependency change needs a transient ADR (D242) that names an R.
 
+The full record is the transient decision [T-goal-e-rule-5](../transient/T-goal-e-rule-5.md) (D247). It stays Proposed until David accepts it.
+
 ## Existing decision records
 
 Read the [design direction and rulings digest](../../design/x0x-direction.md)
