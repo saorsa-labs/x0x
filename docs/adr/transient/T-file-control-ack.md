@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-12
-- **Slot:** A10 Shared Data Files and Synchronization
+- **Target slot:** A10
 - **Decision owners:** David Irvine must accept this record before merge
 - **Reviewers:** pending
 - **Supersedes:** none
