@@ -1,6 +1,6 @@
 # T-join-loss-pacing: a JOIN seed that answers and then closes waits a loss cooldown
 
-- **Status:** Proposed
+- **Status:** Accepted (David, D256, 2026-10-12)
 - **Target slot:** A05
 - **Date:** 2026-10-12
 - **Decision owners:** David Irvine
