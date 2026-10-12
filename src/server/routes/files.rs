@@ -736,9 +736,12 @@ pub(in crate::server) async fn file_reject_handler(
         }
     }
 
-    // Send reject message back to the sender
+    // The local transfer is already Rejected. A peer that advertises bit 3
+    // must confirm that reject. A missing ack fails the call.
     let mut delivery_failed = false;
+    let mut required_ack_missing = false;
     if let Ok(agent_id) = parse_agent_id_hex(&remote_agent_hex) {
+        required_ack_missing = peer_advertises_file_control_ack(&state, &agent_id);
         let reject_msg = x0x::files::FileMessage::Reject {
             transfer_id: id.clone(),
             reason,
@@ -749,7 +752,12 @@ pub(in crate::server) async fn file_reject_handler(
         }
     }
 
-    if delivery_failed {
+    if delivery_failed && required_ack_missing {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rejected locally but the peer did not confirm",
+        )
+    } else if delivery_failed {
         (
             StatusCode::OK,
             Json(
@@ -2436,6 +2444,71 @@ mod tests {
         assert!(
             entered.load(Ordering::SeqCst),
             "a peer that advertises bit 3 must receive file-control-ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_with_required_bit_fails_when_ack_is_withheld() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([16; 32]);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        state.file_transfers.write().await.insert(
+            transfer_id.clone(),
+            x0x::files::TransferState {
+                transfer_id: transfer_id.clone(),
+                direction: x0x::files::TransferDirection::Receiving,
+                remote_agent_id: hex::encode(peer.as_bytes()),
+                filename: "reject-me.bin".to_string(),
+                total_size: 4,
+                bytes_transferred: 0,
+                status: x0x::files::TransferStatus::Pending,
+                sha256: "abc".to_string(),
+                error: None,
+                started_at: 0,
+                started_at_unix_ms: 0,
+                completed_at_unix_ms: None,
+                source_path: None,
+                output_path: None,
+                chunk_size: x0x::files::DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                accept_dispatched: false,
+                chunk_admit_held: false,
+            },
+        );
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(12),
+            file_reject_handler(State(Arc::clone(&state)), Path(transfer_id.clone()), None),
+        )
+        .await
+        .expect("a withheld ack must fail inside the control wait")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("reject body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("reject json");
+        assert_eq!(body["ok"], false, "{body}");
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("local receive");
+        assert_eq!(
+            transfer.status,
+            x0x::files::TransferStatus::Rejected,
+            "the local rejection stays"
         );
     }
 }
