@@ -57,15 +57,23 @@
 //!   - A failed send, or a verdict that stays open for the whole gate
 //!     wait, ends the attempt; the next attempt may start at once.
 //!   - A suppressed candidate is dropped at once, with no attempt.
-//!   - An admitted candidate goes first. Otherwise the candidates are tried
-//!     in dial order, one after another, as the old JOIN tried its seeds.
+//!   - An admitted candidate goes first. Among the admitted candidates, a
+//!     ready one goes before one that waits for its backoff or loss
+//!     cooldown; when all of them wait, the one that is ready first goes.
+//!     So another admitted address goes while a lost one cools down
+//!     (D252). A candidate that is not admitted does not go while an
+//!     admitted one waits.
+//!   - When no candidate is admitted, the candidates are tried in dial
+//!     order, one after another, as the old JOIN tried its seeds.
 //!
 //! `join_network` awaits all of this, as it awaited the old JOIN. There is
 //! no new time limit for a candidate and no retry after its budget. The
 //! admission reads, the verdict waits, the JOIN dials, the backoffs and the
 //! JOIN send stop on the shutdown token; when the token and a result are
-//! both ready, cancellation goes first. `join_network` checks the token
-//! before each phase and before the JOIN.
+//! both ready, cancellation goes first. After cancellation, the phase count
+//! is `None` even with no candidate. `join_network` checks the token
+//! before each phase and before the JOIN, and every phase's dial batch
+//! starts no dial after cancellation and stops at once on it.
 //!
 //! None of these steps weakens the plane gate or the #292 dial gates; they
 //! only read their verdicts.
@@ -295,6 +303,10 @@ impl JoinCandidates {
         budgeted: bool,
         shutdown: &CancellationToken,
     ) -> Option<Vec<(SocketAddr, ant_quic::PeerId, PeerAdmission)>> {
+        // Also with no record to read: the caller must see the shutdown.
+        if shutdown.is_cancelled() {
+            return None;
+        }
         let mut read = Vec::with_capacity(self.connected.len());
         for candidate in &self.connected {
             if !budgeted || !self.ledger.is_exhausted(candidate.addr) {
@@ -349,6 +361,9 @@ impl JoinCandidates {
             .map(|candidate| (candidate.addr, candidate.peer))
             .collect();
         loop {
+            if shutdown.is_cancelled() {
+                return JoinSeedPlan::default();
+            }
             let mut verdicts = Vec::with_capacity(records.len());
             for (_, peer) in &records {
                 match read_admission(admission, peer, shutdown).await {
@@ -392,12 +407,7 @@ impl JoinCandidates {
             let Some(live) = self.read_verdicts(admission, true, shutdown).await else {
                 return JoinOutcome::Cancelled;
             };
-            let pick = live
-                .iter()
-                .find(|(_, _, verdict)| *verdict == PeerAdmission::Admitted)
-                .map(|(addr, _, _)| (*addr, true))
-                .or_else(|| live.first().map(|(addr, _, _)| (*addr, false)));
-            let Some((addr, admitted)) = pick else {
+            let Some((addr, ready_at)) = self.choose(&live, gate) else {
                 // As in the old JOIN, the last failed attempt's backoff
                 // ends before the JOIN gives up.
                 if let Some(wait) = remaining(gate) {
@@ -407,17 +417,9 @@ impl JoinCandidates {
                 }
                 return JoinOutcome::NoSeed { attempts };
             };
-            // saorsa-gossip's readiness for this address: the later of its
-            // dial backoff and its loss cooldown.
-            let own = self.ledger.ready_at(addr);
-            let ready_at = if admitted {
-                own
-            } else {
-                Some(own.map_or(gate, |own| own.max(gate)))
-            };
             if let Some(wait) = ready_at.and_then(remaining) {
                 // Not yet: wait (a little at a time, so that a candidate
-                // that becomes admitted can go first).
+                // that becomes admitted or ready can go first).
                 if !nap(wait.min(JOIN_SEED_VERDICT_POLL), shutdown).await {
                     return JoinOutcome::Cancelled;
                 }
@@ -434,6 +436,40 @@ impl JoinCandidates {
                 Attempt::Cancelled => return JoinOutcome::Cancelled,
             }
         }
+    }
+
+    /// The next JOIN attempt among the `live` candidates (dial order), with
+    /// the earliest time it may start (`None`: at once). saorsa-gossip's
+    /// readiness for an address (`JoinLedger::ready_at`) is the later of its
+    /// dial backoff and its loss cooldown.
+    ///
+    /// - An admitted candidate goes first, and a ready one before one that
+    ///   waits; when every admitted candidate waits, the one that is ready
+    ///   first is chosen (D252: another admitted address goes meanwhile).
+    /// - With no admitted candidate, the first candidate goes, at the later
+    ///   of its own readiness and `gate` (the old JOIN's seed order).
+    fn choose(
+        &self,
+        live: &[(SocketAddr, ant_quic::PeerId, PeerAdmission)],
+        gate: Instant,
+    ) -> Option<(SocketAddr, Option<Instant>)> {
+        let admitted = || {
+            live.iter()
+                .filter(|(_, _, verdict)| *verdict == PeerAdmission::Admitted)
+                .map(|(addr, _, _)| (*addr, self.ledger.ready_at(*addr)))
+        };
+        if let Some((addr, _)) =
+            admitted().find(|(_, ready_at)| ready_at.and_then(remaining).is_none())
+        {
+            return Some((addr, None));
+        }
+        if let Some(waiting) = admitted().min_by_key(|(_, ready_at)| *ready_at) {
+            return Some(waiting);
+        }
+        live.first().map(|(addr, _, _)| {
+            let own = self.ledger.ready_at(*addr);
+            (*addr, Some(own.map_or(gate, |own| own.max(gate))))
+        })
     }
 
     /// One JOIN attempt on `addr`: saorsa-gossip's dial, x0x's admission

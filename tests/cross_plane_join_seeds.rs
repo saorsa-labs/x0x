@@ -43,9 +43,10 @@ const JOIN_BOUND: Duration = Duration::from_secs(60);
 /// connections at accept, before its plane hello reaches us. Then we never
 /// write a tombstone for it. Such a peer keeps one JOIN retry budget (ten
 /// dials) and gets no JOIN. Each dial answers and the connection closes,
-/// so the attempts are spaced by saorsa-gossip's loss cooldown (D252: 100 ms
-/// doubled up to 30 s, 81.1 s plus up to 10.128 s of jitter in total). This
-/// bound covers that case and is used only there.
+/// so the attempts are spaced by saorsa-gossip's loss cooldown (D252: nine
+/// cooldowns of 100 ms doubled up to 25.6 s, 51.1 s plus up to 6.379 s of
+/// jitter in total; no cooldown follows the tenth dial). This bound covers
+/// that case and is used only there.
 const REFUSAL_JOIN_BOUND: Duration = Duration::from_secs(150);
 
 const JOIN_CONNECTING: &str = "JOIN: Connecting to bootstrap node";

@@ -43,7 +43,8 @@ and, after a dial that answered, lets the JOIN frame go out only once the peer
 is `Admitted`; a peer that is not suppressed but not admitted yet (lost
 connection, open verdict) uses its attempts until then. After a lost
 connection, the next attempt on that address waits saorsa-gossip's loss
-cooldown (100 ms doubling to 30 s, with jitter; D252).
+cooldown (100 ms doubling to 30 s, with jitter; D252); meanwhile a ready
+admitted address goes first.
 
 **Test:** `tests/gossip_plane_isolation.rs` (causal oracle, all five cases);
 `tests/cross_plane_join_seeds.rs` (JOIN seeds)

@@ -30,9 +30,10 @@ All notable changes to this project will be documented in this file.
     admission (for example, the remote refused us first) waits
     saorsa-gossip's loss cooldown before the next attempt on that address:
     100 ms, doubled after each loss up to 30 s, plus jitter (D252). It does
-    not reset when the peer answers again. Another admitted address can go
-    meanwhile. Such a peer costs at most ten dials and 81.1 s plus up to
-    10.128 s of cooldown, and gets no JOIN.
+    not reset when the peer answers again. Meanwhile a ready admitted
+    address goes first. Such a peer costs at most ten dials and nine
+    cooldowns (51.1 s plus up to 6.379 s of jitter; no cooldown follows the
+    tenth dial), and gets no JOIN.
   - The phase counts for the join's minimum of three peers include only
     peers that are still connected and not suppressed. When peers that
     filled that minimum with an open plane verdict are refused later, the
@@ -44,11 +45,12 @@ All notable changes to this project will be documented in this file.
     Each wait for open plane verdicts adds up to 12 s. The budgets before
     the JOIN total 136 s (100 s of dial phases plus up to three 12 s verdict
     waits); admission reads and scheduling come on top. The JOIN then costs
-    at most 91.228 s plus ten dial times per seed address that is not
-    suppressed. These are budgets, not a deadline for the whole call.
-  - After `begin_shutdown`, no phase, fallback phase or JOIN starts; a
-    running fallback dial batch, its retry sleeps, the JOIN attempts and the
-    admission reads stop.
+    at most 91.228 s plus ten dial times and up to 12 s of admission wait
+    per attempt, per seed address that is not suppressed. These are
+    budgets, not a deadline for the whole call.
+  - After `begin_shutdown`, no phase, fallback phase or JOIN starts, and no
+    phase starts a dial; a running dial batch of any phase, its retry
+    sleeps, the JOIN attempts and the admission reads stop.
 
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
