@@ -204,6 +204,21 @@ const DIAL_STARTED: &str = "starting direct dial";
 /// Captured [`DIAL_STARTED`] events: `(seq, address)`, in order.
 static DIAL_STARTS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
+/// `NetworkNode::connect_peer_with_addrs` logs an event (target
+/// `x0x::connect`, debug, no message) with this `strategy` when a dial by
+/// peer id starts. A cached-peer dial goes through it.
+const PEER_DIAL_STRATEGY: &str = "peer_with_addrs";
+
+/// Captured [`PEER_DIAL_STRATEGY`] events: `(seq, peer id prefix)`.
+static PEER_DIAL_STARTS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
+/// A spawned address-dial task of `join_network` logs this (debug, target
+/// `x0x`) after the parent's token check and before its dial.
+static ADDR_DIAL_TASK_GATE: Gate = Gate::new("Connecting to peer: ");
+/// A spawned cached-peer dial task of `join_network` logs this (debug,
+/// target `x0x`) after the parent's token check and before its dial.
+static CACHED_DIAL_TASK_GATE: Gate = Gate::new("Connecting to cached peer: ");
+
 /// `plane_handle_hello` logs this (warn) before it refuses a peer.
 const PLANE_REFUSED: &str = "gossip-plane mismatch: refusing cross-plane peer (issue #206)";
 
@@ -215,6 +230,7 @@ struct JoinVisitor {
     addr: Option<String>,
     our_plane: Option<String>,
     peer_id_prefix: Option<String>,
+    strategy: Option<String>,
 }
 
 impl Visit for JoinVisitor {
@@ -226,6 +242,7 @@ impl Visit for JoinVisitor {
             "addr" => self.addr = Some(value.to_string()),
             "our_plane" => self.our_plane = Some(value.to_string()),
             "peer_id_prefix" => self.peer_id_prefix = Some(value.to_string()),
+            "strategy" => self.strategy = Some(value.to_string()),
             _ => {}
         }
     }
@@ -238,6 +255,7 @@ impl Visit for JoinVisitor {
             "addr" => self.addr = Some(format!("{value:?}")),
             "our_plane" => self.our_plane = Some(format!("{value:?}")),
             "peer_id_prefix" => self.peer_id_prefix = Some(format!("{value:?}")),
+            "strategy" => self.strategy = Some(format!("{value:?}")),
             _ => {}
         }
     }
@@ -269,6 +287,14 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
                     .push((seq, addr));
             }
         }
+        if visitor.strategy.as_deref() == Some(PEER_DIAL_STRATEGY) {
+            if let Some(prefix) = visitor.peer_id_prefix.clone() {
+                PEER_DIAL_STARTS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((seq, prefix));
+            }
+        }
         if visitor.message == PLANE_REFUSED {
             if let (Some(our_plane), Some(peer_id_prefix)) =
                 (visitor.our_plane.clone(), visitor.peer_id_prefix.clone())
@@ -288,7 +314,20 @@ impl<S: tracing::Subscriber> Layer<S> for JoinCapture {
         PLANE_REFUSAL_GATE.pass(&visitor.message);
         PHASE0_START_GATE.pass(&visitor.message);
         PHASE1_START_GATE.pass(&visitor.message);
+        ADDR_DIAL_TASK_GATE.pass(&visitor.message);
+        CACHED_DIAL_TASK_GATE.pass(&visitor.message);
     }
+}
+
+/// How many dials by peer id to `peer` have started.
+fn peer_dials_started_to(peer: ant_quic::PeerId) -> usize {
+    let prefix: String = peer.0[..4].iter().map(|b| format!("{b:02x}")).collect();
+    PEER_DIAL_STARTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(_, started)| *started == prefix)
+        .count()
 }
 
 /// How many address dials to `addr` have started.
@@ -339,10 +378,21 @@ fn first_refusal_of(peer: ant_quic::PeerId, our_plane: &str) -> Option<u64> {
 /// starts). Only these targets are enabled, so other crates' callsites stay
 /// disabled.
 fn install_join_capture() {
+    install_capture(tracing::Level::INFO);
+}
+
+/// [`install_join_capture`] with every x0x debug event too (the dial-task
+/// events). Each nextest test runs in its own process, so only the test
+/// that calls this pays for the extra events.
+fn install_join_capture_with_x0x_debug() {
+    install_capture(tracing::Level::DEBUG);
+}
+
+fn install_capture(x0x_level: tracing::Level) {
     CAPTURE.get_or_init(|| {
         let targets = tracing_subscriber::filter::Targets::new()
             .with_target("saorsa_gossip_membership", tracing::Level::DEBUG)
-            .with_target("x0x", tracing::Level::INFO)
+            .with_target("x0x", x0x_level)
             .with_target("x0x::connect", tracing::Level::DEBUG);
         let subscriber = tracing_subscriber::registry().with(JoinCapture.with_filter(targets));
         tracing::subscriber::set_global_default(subscriber)
@@ -1398,4 +1448,87 @@ async fn issue1321_shutdown_between_the_phase1_count_and_its_dials_starts_no_dia
         1,
         "scenario: only Phase 0 dialled the silent address"
     );
+}
+
+/// Codex re-review of dd36b40, finding 2. A spawned dial task of the
+/// bootstrap phase is held at its "Connecting to peer" event: after the
+/// parent's token check, before its dial. Shutdown begins, then the task
+/// resumes. It must not start its dial (no address dial to the silent
+/// address at all). At dd36b40 the task did not get the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_a_dial_task_starts_no_dial_after_shutdown() {
+    install_join_capture_with_x0x_debug();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let prod = Arc::new(
+        build_agent_with_bootstrap(dir.path(), "prod", Some(PROD_PLANE), vec![silent_addr]).await,
+    );
+
+    ADDR_DIAL_TASK_GATE.arm();
+    let join = spawn_join(&prod);
+    assert!(
+        ADDR_DIAL_TASK_GATE.wait_held(1, JOIN_BOUND).await,
+        "scenario: the bootstrap dial task must reach its start event"
+    );
+    prod.begin_shutdown();
+    ADDR_DIAL_TASK_GATE.open();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, join).await;
+    // Give a resumed dial task time to start its dial.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must return within {SHUTDOWN_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_eq!(
+        dials_started_to(silent_addr),
+        0,
+        "the dial task started its dial after shutdown began"
+    );
+    drop(silent);
+}
+
+/// Codex re-review of dd36b40, finding 2, the cached-peer helper. Phase 0
+/// dials the cached peer's silent address and fails. Then a Phase 1 dial
+/// task is held at its "Connecting to cached peer" event. Shutdown begins,
+/// then the task resumes. It must not start its dial by peer id. At dd36b40
+/// the task did not get the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn issue1321_a_cached_dial_task_starts_no_dial_after_shutdown() {
+    install_join_capture_with_x0x_debug();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent udp socket");
+    let silent_addr = silent.local_addr().expect("silent addr");
+    let prod = Arc::new(build_agent(dir.path(), "prod", Some(PROD_PLANE)).await);
+    let cached = ant_quic::PeerId([0x51; 32]);
+    cache_peer(&prod, cached, silent_addr).await;
+
+    CACHED_DIAL_TASK_GATE.arm();
+    let join = spawn_join(&prod);
+    assert!(
+        CACHED_DIAL_TASK_GATE.wait_held(1, JOIN_BOUND).await,
+        "scenario: the Phase 1 dial task must reach its start event"
+    );
+    assert_eq!(
+        peer_dials_started_to(cached),
+        0,
+        "scenario: no dial by peer id before the held task"
+    );
+    prod.begin_shutdown();
+    CACHED_DIAL_TASK_GATE.open();
+    let joined = tokio::time::timeout(SHUTDOWN_JOIN_BOUND, join).await;
+    // Give a resumed dial task time to start its dial.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        matches!(joined, Ok(Ok(Ok(())))),
+        "join_network must return within {SHUTDOWN_JOIN_BOUND:?}: {joined:?}"
+    );
+    assert_eq!(
+        peer_dials_started_to(cached),
+        0,
+        "the cached-peer dial task started its dial after shutdown began"
+    );
+    drop(silent);
 }
