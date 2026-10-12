@@ -41144,7 +41144,6 @@ pub(in crate::server) mod tests {
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
-    mod issue1224_unsigned_group_card;
     mod issue1228_actor_checks;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
@@ -41152,6 +41151,7 @@ pub(in crate::server) mod tests {
     mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
+    mod issue1224_unsigned_group_card;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
