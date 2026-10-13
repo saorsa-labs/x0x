@@ -1031,12 +1031,13 @@ impl PubSubManager {
     /// Install the live security views used to authorize roster preferences.
     ///
     /// `AgentBuilder::build` passes the agent's revocation set here and does
-    /// not call `set_revocation_set` or `set_contacts`. Delivery uses this
-    /// set when the delivery lock is empty, so a bare agent drops a revoked
-    /// sender (#1230). `set_revocation_set` is preferred once it has run.
-    /// A later `set_contacts` with a different contact store installs that
-    /// store only when none is installed yet. A second contact store has no
-    /// effect. x0xd passes the same revocation `Arc` that `build` passed here.
+    /// not call `set_revocation_set`. It does call `set_contacts` with the
+    /// agent's contact store. Delivery uses this revocation set when the
+    /// delivery lock is empty, so a bare agent drops a revoked sender
+    /// (#1230). `set_revocation_set` wins once it has run. A later
+    /// `set_contacts` with a different contact store has no effect (first
+    /// caller wins). x0xd passes the same revocation `Arc` and the same
+    /// contact store.
     pub fn set_group_identity_context(
         &self,
         bindings: crate::dm_inbox::AuthenticatedMachineBindings,
@@ -1785,10 +1786,10 @@ impl PubSubManager {
     ///
     /// Call this once after construction. A second call is a no-op (first
     /// caller wins), including a later call with a different store.
-    /// `AgentBuilder::build` does not call this. The first call after build
-    /// installs the store, and Blocked filtering starts. Delivery reads the
-    /// store when it decodes each payload, so a subscription opened before
-    /// this call still drops `Blocked` senders (#1230).
+    /// `AgentBuilder::build` calls this with the agent's contact store when
+    /// a gossip runtime exists. Delivery reads the store when it decodes
+    /// each payload, so a subscription opened before this call still drops
+    /// `Blocked` senders (#1230).
     pub fn set_contacts(&self, store: Arc<tokio::sync::RwLock<ContactStore>>) {
         let _ = self.contacts.set(store);
     }
@@ -2063,13 +2064,14 @@ impl PubSubManager {
                             );
                             continue;
                         }
-                        DeliveryVerdict::Refused => {
+                        DeliveryVerdict::Refused(sender) => {
                             stats
                                 .incoming_sender_refused
                                 .fetch_add(1, Ordering::Relaxed);
                             if sender_refusal_log_due(&stats.sender_refusal_logged_at_ms) {
                                 tracing::debug!(
                                     topic = %sub_topic,
+                                    %sender,
                                     "dropping a pubsub payload from a revoked or blocked sender"
                                 );
                             }
@@ -3032,24 +3034,13 @@ pub(crate) fn select_one_full_bootstrap_eager_peer(
         .or_else(|| plane.iter().copied().filter(|id| pinned.contains(id)).min())
 }
 
-/// Decode and filter a delivered payload before exposing it to x0x subscribers.
-///
-/// Only a payload from an identified sender whose inner ML-DSA-65 signature
-/// verified is delivered (charter I3, #1114). Unsigned V1 payloads decode with
-/// `sender = None` and are dropped here: every identity check below keys off
-/// the sender, so delivering them skipped the revocation and Blocked checks.
-///
-/// Revocation is checked against the authoritative gossiped `RevocationSet`
-/// (issue #191) before the operator-local `ContactStore`, so a gossiped
-/// issuer/agent revocation closes delivery even before the eviction loop sets
-/// `trust = Blocked`.
 /// Why a payload did not become a subscriber message.
 enum DeliveryVerdict {
     Delivered(PubSubMessage),
     /// Malformed, unsigned, or unverified. Counted as `incoming_decode_failed`.
     Rejected,
     /// Revoked or Blocked. Counted as `incoming_sender_refused`.
-    Refused,
+    Refused(AgentId),
 }
 
 impl DeliveryVerdict {
@@ -3057,7 +3048,7 @@ impl DeliveryVerdict {
     fn into_message(self) -> Option<PubSubMessage> {
         match self {
             Self::Delivered(message) => Some(message),
-            Self::Rejected | Self::Refused => None,
+            Self::Rejected | Self::Refused(_) => None,
         }
     }
 }
@@ -3080,6 +3071,17 @@ fn sender_refusal_log_due(last_ms: &AtomicU64) -> bool {
 
 const SENDER_REFUSAL_LOG_WINDOW_MS: u64 = 30_000;
 
+/// Decode and filter a delivered payload before exposing it to x0x subscribers.
+///
+/// Only a payload from an identified sender whose inner ML-DSA-65 signature
+/// verified is delivered (charter I3, #1114). Unsigned V1 payloads decode with
+/// `sender = None` and are dropped here: every identity check below keys off
+/// the sender, so delivering them skipped the revocation and Blocked checks.
+///
+/// Revocation is checked against the authoritative gossiped `RevocationSet`
+/// (issue #191) before the operator-local `ContactStore`, so a gossiped
+/// issuer/agent revocation closes delivery even before the eviction loop sets
+/// `trust = Blocked`.
 async fn decode_for_delivery(
     encoded_payload: Bytes,
     contacts: Option<&Arc<RwLock<ContactStore>>>,
@@ -3114,7 +3116,7 @@ async fn decode_for_delivery(
     // set trust = Blocked (a race reopens it).
     if let Some(rev_set) = revocation_set {
         if rev_set.read().await.is_agent_revoked(&sender) {
-            return DeliveryVerdict::Refused;
+            return DeliveryVerdict::Refused(sender);
         }
     }
 
@@ -3122,12 +3124,12 @@ async fn decode_for_delivery(
         let guard = store.read().await;
         // Check revocation first — revoked keys are permanently rejected.
         if guard.is_revoked(&sender) {
-            return DeliveryVerdict::Refused;
+            return DeliveryVerdict::Refused(sender);
         }
         let trust = guard.trust_level(&sender);
         drop(guard);
         if trust == TrustLevel::Blocked {
-            return DeliveryVerdict::Refused;
+            return DeliveryVerdict::Refused(sender);
         }
         message.trust_level = Some(trust);
     }
@@ -8931,11 +8933,12 @@ mod tests {
         );
     }
 
-    /// WHY (#1230): `AgentBuilder::build` does not call `set_contacts`. It
-    /// does pass the agent's revocation set to `set_group_identity_context`.
-    /// A subscription on that bare agent must deliver an author, drop that
-    /// author after a revocation lands in the agent's set, count the refusal
-    /// apart from decode failures, and still deliver a clean author.
+    /// WHY (#1230): `AgentBuilder::build` attaches the agent's contact store
+    /// and passes the revocation set to `set_group_identity_context`. The
+    /// test never calls `Agent::set_contacts`. A subscription on that bare
+    /// agent must deliver an author, drop that author after a revocation
+    /// lands, drop a sender marked `Blocked` on `agent.contacts()`, count
+    /// both refusals, and still deliver a clean author.
     #[tokio::test]
     async fn issue1230_bare_agent_drops_revoked_author_without_set_contacts() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8963,6 +8966,7 @@ mod tests {
         let pubsub = agent.pubsub().expect("gossip runtime");
         let author_kp = AgentKeypair::generate().expect("author");
         let author = SigningContext::from_keypair(&author_kp);
+        let blocked_ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("blocked"));
         let clean = SigningContext::from_keypair(&AgentKeypair::generate().expect("clean"));
         let outer_key = outer_signing_key();
         let from = PeerId::new([0x51; 32]);
@@ -9007,7 +9011,13 @@ mod tests {
             .verify_and_insert(record, None)
             .expect("self-revocation verifies without a cert");
 
+        agent
+            .contacts()
+            .write()
+            .await
+            .set_trust(&blocked_ctx.agent_id, TrustLevel::Blocked);
         let after_revoke = Bytes::from("author-after-revoke");
+        let blocked_payload = Bytes::from("blocked-author");
         let clean_payload = Bytes::from("clean-author");
         pubsub
             .handle_incoming(
@@ -9019,6 +9029,19 @@ mod tests {
                     signed_inner_v2(&author, topic, &after_revoke),
                     true,
                     [0x52; 32],
+                ),
+            )
+            .await;
+        pubsub
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(
+                    &outer_key,
+                    topic_id,
+                    signed_inner_v2(&blocked_ctx, topic, &blocked_payload),
+                    true,
+                    [0x54; 32],
                 ),
             )
             .await;
@@ -9042,13 +9065,13 @@ mod tests {
             .expect("subscription open");
         assert_eq!(
             next.payload, clean_payload,
-            "#1230: a bare agent must drop an author revoked after subscribe"
+            "#1230: a bare agent must drop a revoked author and a Blocked author"
         );
         assert_eq!(next.sender, Some(clean.agent_id));
         let stats = pubsub.stats();
         assert_eq!(
-            stats.incoming_sender_refused, 1,
-            "#1230: a revoked sender is counted apart from a decode failure"
+            stats.incoming_sender_refused, 2,
+            "#1230: the revoked author and the Blocked author each increment the refusal counter"
         );
         assert_eq!(stats.incoming_decode_failed, 0);
         assert_eq!(stats.in_flight_decode, 0);

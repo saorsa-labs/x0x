@@ -39,14 +39,17 @@ A minor release. It removes one unused public module and changes two public file
   revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
   store and the revocation set when it decodes each payload. A store
   attached after subscribe still filters that subscription.
-  - `AgentBuilder::build` does not call `set_contacts`. It passes the
-    agent's revocation set to `set_group_identity_context`. Delivery uses
-    that set when `set_revocation_set` has not run. A bare agent drops an
-    author revoked after subscribe. A clean author is still delivered.
-  - The first `set_contacts` installs the contact store. A later call with
-    a different store has no effect. Once `set_revocation_set` has run,
-    delivery uses that set. A second call has no effect. x0xd passes the
-    same revocation `Arc`.
+  - `AgentBuilder::build` attaches the agent's contact store with
+    `set_contacts` when a gossip runtime exists. It also passes the agent's
+    revocation set to `set_group_identity_context`. Delivery uses that set
+    when `set_revocation_set` has not run. A bare agent drops an author
+    revoked after subscribe, and a sender marked `Blocked` on
+    `agent.contacts()`, with no later `set_contacts` call. A clean author
+    is still delivered.
+  - A later `set_contacts` with a different store has no effect. Once
+    `set_revocation_set` has run, delivery uses that set. A second call has
+    no effect. x0xd passes the same contact store and the same revocation
+    `Arc`.
   - A revoked or Blocked drop increments `incoming_sender_refused` on
     `GET /diagnostics/gossip` (`stats`). The log is debug, once per 30
     seconds. The decode-failure counter stays unchanged.
