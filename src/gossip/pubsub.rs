@@ -167,10 +167,18 @@ pub struct PubSubStats {
     pub incoming_total: AtomicU64,
     /// Messages that decoded successfully + passed trust filter.
     pub incoming_decoded: AtomicU64,
-    /// Messages that failed decode (malformed, unsupported version) OR were
-    /// dropped by the delivery guard: unsigned (V1) or unverified sender
-    /// (#1114), revoked or blocked sender.
+    /// Messages that failed decode (malformed, unsupported version) or were
+    /// dropped by the identity guard: unsigned (V1) or unverified sender
+    /// (#1114). A revoked or Blocked sender is `incoming_sender_refused`,
+    /// not a decode failure.
     pub incoming_decode_failed: AtomicU64,
+    /// Verified payloads dropped because the sender is revoked or Blocked.
+    ///
+    /// Not a decode failure. The subscriber task logs the first refusal in
+    /// each 30s window at debug.
+    pub incoming_sender_refused: AtomicU64,
+    /// Millis since the unix epoch of the last sender-refusal debug log.
+    sender_refusal_logged_at_ms: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
     /// Subscriber channel was full and got dropped to isolate the dispatcher
@@ -206,6 +214,8 @@ pub struct PubSubStatsSnapshot {
     pub incoming_total: u64,
     pub incoming_decoded: u64,
     pub incoming_decode_failed: u64,
+    /// Verified payloads dropped because the sender is revoked or Blocked.
+    pub incoming_sender_refused: u64,
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
@@ -214,9 +224,10 @@ pub struct PubSubStatsSnapshot {
     pub subscriber_task_ended: u64,
     /// Local publishes whose eager-peer fan-out was zero.
     pub publish_zero_fanout: u64,
-    /// `incoming_total - incoming_decoded - incoming_decode_failed` — messages
-    /// that entered the pipeline but did not reach a decision yet (usually 0,
-    /// non-zero means a worker panicked or the decode task is blocked).
+    /// `incoming_total - incoming_decoded - incoming_decode_failed -
+    /// incoming_sender_refused` — messages that entered the pipeline but did
+    /// not reach a decision yet (usually 0, non-zero means a worker panicked
+    /// or the decode task is blocked).
     pub in_flight_decode: i64,
     /// `incoming_decoded - delivered_to_subscriber - subscriber_channel_closed`
     /// — messages decoded but never handed off (drop signal).
@@ -235,13 +246,16 @@ impl PubSubStats {
         let incoming_total = self.incoming_total.load(Ordering::Relaxed);
         let incoming_decoded = self.incoming_decoded.load(Ordering::Relaxed);
         let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
+        let incoming_sender_refused = self.incoming_sender_refused.load(Ordering::Relaxed);
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
         let subscriber_task_ended = self.subscriber_task_ended.load(Ordering::Relaxed);
         let publish_zero_fanout = self.publish_zero_fanout.load(Ordering::Relaxed);
-        let in_flight_decode =
-            incoming_total as i64 - incoming_decoded as i64 - incoming_decode_failed as i64;
+        let in_flight_decode = incoming_total as i64
+            - incoming_decoded as i64
+            - incoming_decode_failed as i64
+            - incoming_sender_refused as i64;
         let decode_to_delivery_drops = incoming_decoded as i64
             - delivered_to_subscriber as i64
             - subscriber_channel_closed as i64;
@@ -251,6 +265,7 @@ impl PubSubStats {
             incoming_total,
             incoming_decoded,
             incoming_decode_failed,
+            incoming_sender_refused,
             delivered_to_subscriber,
             slow_subscriber_dropped,
             subscriber_channel_closed,
@@ -830,7 +845,10 @@ pub struct PubSubManager {
     group_rosters: RwLock<HashMap<String, GroupEagerRoster>>,
     /// Locally named group topics. Unknown Full pass-through ids stay ordinary relays.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
-    group_identity: std::sync::OnceLock<GroupIdentityContext>,
+    /// Shared so a subscriber task can read the builder's revocation set at
+    /// delivery time (#1230). `AgentBuilder::build` fills this and does not
+    /// call `set_revocation_set`.
+    group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
     #[cfg(test)]
     drop_completed: Arc<AtomicU64>,
@@ -1011,6 +1029,14 @@ impl PubSubManager {
     }
 
     /// Install the live security views used to authorize roster preferences.
+    ///
+    /// `AgentBuilder::build` passes the agent's revocation set here and does
+    /// not call `set_revocation_set` or `set_contacts`. Delivery uses this
+    /// set when the delivery lock is empty, so a bare agent drops a revoked
+    /// sender (#1230). `set_revocation_set` is preferred once it has run.
+    /// A later `set_contacts` with a different contact store installs that
+    /// store only when none is installed yet. A second contact store has no
+    /// effect. x0xd passes the same revocation `Arc` that `build` passed here.
     pub fn set_group_identity_context(
         &self,
         bindings: crate::dm_inbox::AuthenticatedMachineBindings,
@@ -1410,7 +1436,7 @@ impl PubSubManager {
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             group_rosters: RwLock::new(HashMap::new()),
             group_topic_by_id: Arc::new(RwLock::new(HashMap::new())),
-            group_identity: std::sync::OnceLock::new(),
+            group_identity: Arc::new(std::sync::OnceLock::new()),
             group_preference_apply_locks: Arc::new(GroupTopicApplyLocks::new()),
             #[cfg(test)]
             drop_completed: Arc::new(AtomicU64::new(0)),
@@ -1758,9 +1784,11 @@ impl PubSubManager {
     /// annotated with their trust level.
     ///
     /// Call this once after construction. A second call is a no-op (first
-    /// caller wins). Delivery reads the store when it decodes each payload,
-    /// so a subscription opened before this call still drops `Blocked`
-    /// senders (#1230).
+    /// caller wins), including a later call with a different store.
+    /// `AgentBuilder::build` does not call this. The first call after build
+    /// installs the store, and Blocked filtering starts. Delivery reads the
+    /// store when it decodes each payload, so a subscription opened before
+    /// this call still drops `Blocked` senders (#1230).
     pub fn set_contacts(&self, store: Arc<tokio::sync::RwLock<ContactStore>>) {
         let _ = self.contacts.set(store);
     }
@@ -1770,9 +1798,13 @@ impl PubSubManager {
     /// the revocation set are dropped before reaching subscribers — closing
     /// the window between a gossiped revocation arriving and the eviction
     /// loop setting `trust = Blocked`. Call once after construction. A second
-    /// call is a no-op (first caller wins), matching `set_contacts`. Delivery
-    /// reads the set when it decodes each payload, so a subscription opened
-    /// before this call still drops revoked senders (#1230).
+    /// call is a no-op (first caller wins), matching `set_contacts`. When
+    /// this lock is empty, delivery uses the set from
+    /// `set_group_identity_context` instead. That is the set
+    /// `AgentBuilder::build` installs. A later call here replaces that
+    /// fallback. Delivery reads the chosen set when it decodes each payload,
+    /// so a subscription opened before this call still drops revoked senders
+    /// (#1230).
     pub fn set_revocation_set(
         &self,
         set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
@@ -1892,9 +1924,11 @@ impl PubSubManager {
         let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
         let (tx, rx) = mpsc::channel(10_000);
         // #1230: the task holds the locks, not a subscribe-time snapshot.
-        // `OnceLock::get` is empty until `set_contacts` / `set_revocation_set`.
+        // `set_revocation_set` wins when it has run. Otherwise delivery uses
+        // the revocation set `AgentBuilder::build` stored on group identity.
         let contacts = Arc::clone(&self.contacts);
         let revocation_set = Arc::clone(&self.revocation_set);
+        let group_identity = Arc::clone(&self.group_identity);
 
         let active_generation = {
             let _name_guard = self
@@ -2015,17 +2049,33 @@ impl PubSubManager {
                     payload_len = encoded_payload.len(),
                     "[4/6 pubsub] received from PlumTree, decoding"
                 );
-                let Some(message) =
-                    decode_for_delivery(encoded_payload, contacts.get(), revocation_set.get())
-                        .await
-                else {
-                    stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        topic = %sub_topic,
-                        "[4/6 pubsub] decode_for_delivery returned None, skipping"
-                    );
-                    continue;
-                };
+                let installed = revocation_set.get();
+                let from_builder = group_identity.get().map(|ctx| &ctx.revoked);
+                let revocation = installed.or(from_builder);
+                let message =
+                    match decode_for_delivery(encoded_payload, contacts.get(), revocation).await {
+                        DeliveryVerdict::Delivered(message) => message,
+                        DeliveryVerdict::Rejected => {
+                            stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                topic = %sub_topic,
+                                "[4/6 pubsub] decode_for_delivery rejected the payload, skipping"
+                            );
+                            continue;
+                        }
+                        DeliveryVerdict::Refused => {
+                            stats
+                                .incoming_sender_refused
+                                .fetch_add(1, Ordering::Relaxed);
+                            if sender_refusal_log_due(&stats.sender_refusal_logged_at_ms) {
+                                tracing::debug!(
+                                    topic = %sub_topic,
+                                    "dropping a pubsub payload from a revoked or blocked sender"
+                                );
+                            }
+                            continue;
+                        }
+                    };
                 stats.incoming_decoded.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     topic = %sub_topic,
@@ -2993,16 +3043,53 @@ pub(crate) fn select_one_full_bootstrap_eager_peer(
 /// (issue #191) before the operator-local `ContactStore`, so a gossiped
 /// issuer/agent revocation closes delivery even before the eviction loop sets
 /// `trust = Blocked`.
+/// Why a payload did not become a subscriber message.
+enum DeliveryVerdict {
+    Delivered(PubSubMessage),
+    /// Malformed, unsigned, or unverified. Counted as `incoming_decode_failed`.
+    Rejected,
+    /// Revoked or Blocked. Counted as `incoming_sender_refused`.
+    Refused,
+}
+
+impl DeliveryVerdict {
+    #[cfg(test)]
+    fn into_message(self) -> Option<PubSubMessage> {
+        match self {
+            Self::Delivered(message) => Some(message),
+            Self::Rejected | Self::Refused => None,
+        }
+    }
+}
+
+/// One debug line per 30s for revoked and Blocked drops. A per-frame line
+/// looks like a decode storm and hides a real corrupt payload.
+fn sender_refusal_log_due(last_ms: &AtomicU64) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let prev = last_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < SENDER_REFUSAL_LOG_WINDOW_MS {
+        return false;
+    }
+    last_ms
+        .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+const SENDER_REFUSAL_LOG_WINDOW_MS: u64 = 30_000;
+
 async fn decode_for_delivery(
     encoded_payload: Bytes,
     contacts: Option<&Arc<RwLock<ContactStore>>>,
     revocation_set: Option<&Arc<RwLock<crate::revocation::RevocationSet>>>,
-) -> Option<PubSubMessage> {
+) -> DeliveryVerdict {
     let mut message = match decode_auto(encoded_payload) {
         Ok(msg) => msg,
         Err(e) => {
             tracing::warn!("Failed to decode x0x payload from PlumTree message: {}", e);
-            return None;
+            return DeliveryVerdict::Rejected;
         }
     };
 
@@ -3014,11 +3101,11 @@ async fn decode_for_delivery(
                 "Dropping pubsub payload with invalid signature from sender {:?}",
                 sender
             );
-            return None;
+            return DeliveryVerdict::Rejected;
         }
         None => {
             tracing::debug!("Dropping unsigned (V1) pubsub payload: no verified sender");
-            return None;
+            return DeliveryVerdict::Rejected;
         }
     };
     // Authoritative gossiped revocation set (issue #191). Checked before the
@@ -3027,11 +3114,7 @@ async fn decode_for_delivery(
     // set trust = Blocked (a race reopens it).
     if let Some(rev_set) = revocation_set {
         if rev_set.read().await.is_agent_revoked(&sender) {
-            tracing::debug!(
-                "Dropping delivered payload from revoked sender {} (RevocationSet)",
-                sender
-            );
-            return None;
+            return DeliveryVerdict::Refused;
         }
     }
 
@@ -3039,19 +3122,17 @@ async fn decode_for_delivery(
         let guard = store.read().await;
         // Check revocation first — revoked keys are permanently rejected.
         if guard.is_revoked(&sender) {
-            tracing::debug!("Dropping delivered payload from revoked sender {}", sender);
-            return None;
+            return DeliveryVerdict::Refused;
         }
         let trust = guard.trust_level(&sender);
         drop(guard);
         if trust == TrustLevel::Blocked {
-            tracing::debug!("Dropping delivered payload from blocked sender {}", sender);
-            return None;
+            return DeliveryVerdict::Refused;
         }
         message.trust_level = Some(trust);
     }
 
-    Some(message)
+    DeliveryVerdict::Delivered(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -6537,6 +6618,7 @@ mod tests {
         assert!(
             decode_for_delivery(encoded.clone(), None, Some(&rev_set))
                 .await
+                .into_message()
                 .is_none(),
             "payload from a RevocationSet-revoked sender must be dropped"
         );
@@ -6557,6 +6639,7 @@ mod tests {
         assert!(
             decode_for_delivery(encoded2, None, Some(&rev_set))
                 .await
+                .into_message()
                 .is_some(),
             "payload from a non-revoked sender must be delivered"
         );
@@ -6966,6 +7049,7 @@ mod tests {
                     .contains("Invalid V3 signature"));
                 assert!(decode_for_delivery(Bytes::from(rewritten), None, None)
                     .await
+                    .into_message()
                     .is_none());
             }
         }
@@ -8133,6 +8217,7 @@ mod tests {
         assert_eq!(snap.incoming_total, 0);
         assert_eq!(snap.incoming_decoded, 0);
         assert_eq!(snap.incoming_decode_failed, 0);
+        assert_eq!(snap.incoming_sender_refused, 0);
         assert_eq!(snap.delivered_to_subscriber, 0);
         assert_eq!(snap.slow_subscriber_dropped, 0);
         assert_eq!(snap.subscriber_channel_closed, 0);
@@ -8722,6 +8807,7 @@ mod tests {
                 Some(&rev_set),
             )
             .await
+            .into_message()
             .is_none(),
             "control: a revoked sender's signed V2 is dropped"
         );
@@ -8732,6 +8818,7 @@ mod tests {
                 Some(&rev_set),
             )
             .await
+            .into_message()
             .is_none(),
             "control: a Blocked sender's signed V2 is dropped"
         );
@@ -8741,11 +8828,15 @@ mod tests {
         assert!(
             decode_for_delivery(unsigned.clone(), Some(&contacts), Some(&rev_set))
                 .await
+                .into_message()
                 .is_none(),
             "#1114: unsigned V1 must not bypass the RevocationSet and Blocked checks"
         );
         assert!(
-            decode_for_delivery(unsigned, None, None).await.is_none(),
+            decode_for_delivery(unsigned, None, None)
+                .await
+                .into_message()
+                .is_none(),
             "#1114: unsigned V1 is never deliverable, even with no identity stores"
         );
     }
@@ -8837,6 +8928,137 @@ mod tests {
                 .flatten()
                 .is_none(),
             "#1230: nothing after the clean sender may be delivered"
+        );
+    }
+
+    /// WHY (#1230): `AgentBuilder::build` does not call `set_contacts`. It
+    /// does pass the agent's revocation set to `set_group_identity_context`.
+    /// A subscription on that bare agent must deliver an author, drop that
+    /// author after a revocation lands in the agent's set, count the refusal
+    /// apart from decode failures, and still deliver a clean author.
+    #[tokio::test]
+    async fn issue1230_bare_agent_drops_revoked_author_without_set_contacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = crate::Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_identity_dir(dir.path())
+            .with_peer_cache_disabled()
+            .with_network_config(crate::network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..crate::network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("bare agent");
+
+        let topic = "issue1230-bare-agent";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = agent.subscribe(topic).await.expect("subscribe");
+        let pubsub = agent.pubsub().expect("gossip runtime");
+        let author_kp = AgentKeypair::generate().expect("author");
+        let author = SigningContext::from_keypair(&author_kp);
+        let clean = SigningContext::from_keypair(&AgentKeypair::generate().expect("clean"));
+        let outer_key = outer_signing_key();
+        let from = PeerId::new([0x51; 32]);
+
+        let before = Bytes::from("author-before-revoke");
+        pubsub
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(
+                    &outer_key,
+                    topic_id,
+                    signed_inner_v2(&author, topic, &before),
+                    true,
+                    [0x51; 32],
+                ),
+            )
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("the author must be delivered before revocation")
+            .expect("subscription open");
+        assert_eq!(delivered.payload, before);
+        assert_eq!(delivered.sender, Some(author.agent_id));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(author.agent_id),
+            author_kp.public_key(),
+            author_kp.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign revocation");
+        agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies without a cert");
+
+        let after_revoke = Bytes::from("author-after-revoke");
+        let clean_payload = Bytes::from("clean-author");
+        pubsub
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(
+                    &outer_key,
+                    topic_id,
+                    signed_inner_v2(&author, topic, &after_revoke),
+                    true,
+                    [0x52; 32],
+                ),
+            )
+            .await;
+        pubsub
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(
+                    &outer_key,
+                    topic_id,
+                    signed_inner_v2(&clean, topic, &clean_payload),
+                    true,
+                    [0x53; 32],
+                ),
+            )
+            .await;
+
+        let next = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("the clean author must still be delivered")
+            .expect("subscription open");
+        assert_eq!(
+            next.payload, clean_payload,
+            "#1230: a bare agent must drop an author revoked after subscribe"
+        );
+        assert_eq!(next.sender, Some(clean.agent_id));
+        let stats = pubsub.stats();
+        assert_eq!(
+            stats.incoming_sender_refused, 1,
+            "#1230: a revoked sender is counted apart from a decode failure"
+        );
+        assert_eq!(stats.incoming_decode_failed, 0);
+        assert_eq!(stats.in_flight_decode, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "#1230: nothing after the clean author may be delivered"
         );
     }
 
