@@ -1581,8 +1581,6 @@ mod tests {
     /// live path must not hold it. Membership stays closed.
     #[tokio::test]
     async fn next_start_leaves_the_live_path_and_does_not_reread_1116() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let garbage = b"corrupt payload must leave the live path";
@@ -1601,8 +1599,12 @@ mod tests {
         let quarantined = quarantine_files(dir.path(), REVOCATION_FILE).await;
         assert_eq!(quarantined.len(), 1, "one timestamped quarantine file");
         assert_eq!(std::fs::read(&quarantined[0]).expect("quarantine"), garbage);
-        std::fs::set_permissions(&quarantined[0], std::fs::Permissions::from_mode(0o000))
-            .expect("deny reads of the quarantined payload");
+        // A decodable replacement must not be loaded. The next start looks
+        // at the quarantine name only.
+        let readable = RevocationSet::new().to_bytes().expect("empty store");
+        tokio::fs::write(&quarantined[0], &readable)
+            .await
+            .expect("replace quarantined payload");
         let second = load_revocation_set(Some(dir.path())).await;
         assert!(
             second.revocation_resync_required(),
@@ -1614,8 +1616,6 @@ mod tests {
             Some(garbage.as_slice()),
             "the next start does not put the corrupt payload back"
         );
-        std::fs::set_permissions(&quarantined[0], std::fs::Permissions::from_mode(0o600))
-            .expect("restore quarantine permissions for cleanup");
     }
 
     /// #1116: startup load of a present but undecodable v1, v2 or v3 file

@@ -2,7 +2,6 @@
 //! status reports the hold, and named-group membership stays closed.
 
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -202,8 +201,11 @@ async fn corrupt_revocation_store_quarantines_starts_and_reports_1116() {
 
     let quarantine_path = quarantined.path();
     daemon.stop().await;
-    std::fs::set_permissions(&quarantine_path, std::fs::Permissions::from_mode(0o000))
-        .expect("deny reads of the quarantined payload");
+    let readable = x0x::revocation::RevocationSet::new()
+        .to_bytes()
+        .expect("empty store");
+    std::fs::write(&quarantine_path, readable)
+        .expect("replace quarantined payload with a decodable store");
     let again = start_daemon(dir.path()).await;
     let restarted: serde_json::Value = again
         .client
@@ -229,7 +231,5 @@ async fn corrupt_revocation_store_quarantines_starts_and_reports_1116() {
         Some(garbage.as_slice()),
         "the next start does not put the corrupt payload back on the live path"
     );
-    std::fs::set_permissions(&quarantine_path, std::fs::Permissions::from_mode(0o600))
-        .expect("restore quarantine permissions");
     again.stop().await;
 }
