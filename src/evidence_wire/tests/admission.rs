@@ -1630,6 +1630,85 @@ fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget(
     assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
 }
 
+// #1346: from ant-quic 0.27.58 (#313 Part 2, ADR-017), the follower end of a
+// pair (the lower PeerId) makes the arbiter's winner its own winner. That
+// winner can have a lower generation than one the follower already saw.
+// Pure budget tests: no sockets, no daemon, no disk.
+fn issue1346_age_hello_gate(limits: &Limits, machine: MachineId) {
+    let aged = Instant::now() - HELLO_INTERVAL;
+    let mut state = limits.state.lock().unwrap();
+    let budget = state.machines.get_mut(&machine).unwrap();
+    budget.hello_out = Some(aged);
+    budget.hello_in = Some(aged);
+}
+
+#[test]
+fn issue1346_red_follower_replies_once_on_lower_generation_winner() {
+    let limits = Arc::new(Limits::default());
+    let machine = MachineId([46; 32]);
+    let mut connections = ReadyConnections::new(1);
+    let jobs = WireJobs::default();
+    assert!(connections.insert(machine));
+    // 1. B sees generation 2 for A. A job for A holds the budget entry, so
+    //    the readiness pass records generation 2. No Hello goes out on it.
+    let job = limits.pin_machine(machine).unwrap();
+    connections.generation(machine, 2, &jobs, &limits);
+    // 2. B follows A's winner. Generation 1 is now B's Live connection. The
+    //    generation-2 job ends before it opens a stream.
+    connections.generation(machine, 1, &jobs, &limits);
+    drop(job);
+    assert!(
+        limits.hello_pending(machine),
+        "the readiness pass must re-arm the Live winner"
+    );
+    assert!(limits.hello_candidate(machine, 1));
+    // 3. A's Hello on generation 1 reaches B. The reply gate
+    //    (begin_hello_current) must let B send its own Hello once.
+    assert!(limits.request(machine, true));
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(1)),
+        "B must reply with its Hello on the Live winner"
+    );
+    // 4. A second Hello on generation 1, after the attempt, must not re-arm
+    //    it. This holds also after the 60 s machine gates expire.
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(limits.request(machine, true));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    assert!(!limits.hello_candidate(machine, 1));
+    connections.generation(machine, 1, &jobs, &limits);
+    assert!(!limits.hello_pending(machine));
+}
+
+#[test]
+fn issue1346_red_follower_own_hello_then_one_attempt_on_lower_winner() {
+    let limits = Limits::default();
+    let machine = MachineId([47; 32]);
+    // B sends its on-connect Hello on generation 2, its own winner.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    // B follows A's winner, generation 1. The 60 s machine gate is shared by
+    // all connections of one machine, so it still holds.
+    limits.hello_connection(machine, 1);
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(1)),
+        "the machine gate is shared across connections"
+    );
+    issue1346_age_hello_gate(&limits, machine);
+    // Generation 1 never attempted Hello: it gets exactly one attempt.
+    assert!(limits.hello_pending(machine));
+    assert!(limits.hello_candidate(machine, 1));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    // Generation 2 already attempted Hello. If ant-quic makes it Live
+    // again, a readiness pass, a delayed job or a reply cannot re-arm it.
+    limits.hello_connection(machine, 2);
+    assert!(!limits.hello_pending(machine));
+    assert!(!limits.hello_candidate(machine, 2));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(2)));
+    // A new connection still gets one attempt.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+}
+
 #[test]
 fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budgets() {
     let limits = Arc::new(Limits::default());
