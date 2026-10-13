@@ -10,7 +10,7 @@
 
 These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
-x0x connects people, their machines, and their chosen agents. It supplies identity, permissions, communication, shared data, and work coordination. This decision sets the boundary for the other 14 ADRs.
+x0x connects people, their agents and their machines so they can collaborate. It supplies identity, permissions, communication, shared data and work coordination. This decision sets the boundary for the other 14 ADRs.
 
 ## Context
 
@@ -27,7 +27,10 @@ Core capabilities are:
 - Identity, owner authority, trust, enrollment and revocation.
 - Peer discovery, connectivity and controlled access to machine services.
 - Direct and group messages, durable delivery and recoverable agent inboxes.
-- Groups, agent teams, delegated authority and shared work.
+- Private, public and discoverable groups, with agent teams, delegated authority and shared work. Home stays private. [A08](A08-r01-groups-home-membership-and-repair.md) records the public and discoverable forms.
+- Projects, as a target: one group, the shared data that group may use, and the agents shared into that work. The proposed record is [T-projects-and-agent-rental](../transient/T-projects-and-agent-rental.md).
+- Agent rental, as a target: time-bounded use of a shared agent through ShareGrant expiry and revocation. It is not a shipped billing service.
+- Partition-first operation: peers that can still reach each other keep their messages and authorized shared data when the wider network is partitioned.
 - Files, key-value stores, task lists, boards and scoped scratchpads.
 - Human control, clear status, and maintenance under owner policy.
 - Measured limits for network traffic, CPU, memory, disk and idle cost.
@@ -38,11 +41,13 @@ A human owner is the authority for an owned installation. A standalone agent can
 
 ## Product limits
 
-x0x does not provide a global storage network or a global directory that must be available for existing peers to work. Availability depends on reachable peers, authorized data holders and the retention policy.
+Partition-first operation is a core capability. x0x does not provide a global storage network or a global directory that existing peers must reach before they can work. Peers that can still reach each other keep their messages and the authorized shared data they hold when the wider network is partitioned. Availability still depends on reachable peers, authorized data holders and the retention policy.
 
 Machine connectivity does not mean unrestricted access to the machine. A peer still needs permission for each protected service.
 
-Voice and video remain part of the product direction. Their current parked priority remains in force. Rich collaborative text also remains parked. Existing code continues to receive required security and bug fixes.
+x0x does not host a model, settle payments, or define the meaning of an agent task. Agent rental remains in scope as a target. Rental is time-bounded access through an expiring, revocable ShareGrant. It adds no price, invoice or marketplace to x0xd.
+
+Voice and video are a vision target for people and their agents. Implementation stays sequenced. The current parked priority remains in force, so this text starts no new media slice. Rich collaborative text remains parked. Existing code continues to receive required security and bug fixes.
 
 New core requirements do not automatically lift a parked work item or an implementation hold.
 
@@ -50,7 +55,7 @@ New core requirements do not automatically lift a parked work item or an impleme
 
 A transport-only product would leave identity sharing, durable agent delivery and group recovery to each application. This would duplicate important security work.
 
-A complete hosted agent platform would expand x0x into model operation, billing and application task semantics. We will keep that work outside x0xd.
+A complete hosted agent platform would expand x0x into model operation, payment settlement and application task semantics. We will keep model hosting, payment settlement and task meaning outside x0xd. That limit leaves agent rental in scope. Rental stays the ShareGrant target in the core capabilities.
 
 ## Consequences
 
@@ -66,7 +71,7 @@ Before this replacement is accepted, the capability map must identify an owning 
 
 ## Matters to settle
 
-Confirm that reliable inbound events are part of every supported agent attachment. Confirm that voice/video and rich text retain their current priority.
+Confirm that reliable inbound events are part of every supported agent attachment. Confirm that voice and video stay a vision target while their implementation stays sequenced. Confirm that rich collaborative text stays parked.
 
 ## Open questions
 
@@ -88,5 +93,7 @@ These records are the primary sources for this draft. This mapping does not comp
 [ADR 0017 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0017-x0x-as-agent-transport-layer.md) · [ADR 0058 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0058-compile-time-embedded-constitution.md) · [ADR 0072 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0072-scope-freeze-deferred-and-legacy-maintenance.md) · [ADR 0095 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0095-scope-x0x-is-glue.md)
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
+
+Vision text for projects, public and private groups, rental, partition-first operation, and voice and video as a sequenced target was added on 13 October 2026 against commit `86a1d395`. It does not replace that implementation check, and it does not mark the targets shipped.
 
 [All 15 ADRs](README.md)

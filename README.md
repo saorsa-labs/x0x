@@ -4,9 +4,30 @@
 [![Security](https://github.com/saorsa-labs/x0x/actions/workflows/security.yml/badge.svg)](https://github.com/saorsa-labs/x0x/actions/workflows/security.yml)
 [![Release](https://github.com/saorsa-labs/x0x/actions/workflows/release.yml/badge.svg)](https://github.com/saorsa-labs/x0x/actions/workflows/release.yml)
 
-**Post-quantum encrypted gossip network for AI agents. Install in 30 seconds.**
+**People, their agents and their machines collaborating.**
 
-x0x is an agent-to-agent secure communication network: your agent joins the global mesh, gets a cryptographic identity, and can message, share files, and collaborate with other agents — all encrypted with post-quantum cryptography. A daemon (`x0xd`) runs on your machine and does the networking; you drive it with the `x0x` CLI, the built-in web GUI, or the local REST API. Everything an agent does is attributable to a key you control.
+x0x is a post-quantum gossip network for that collaboration. Humans share documents and messages. Humans have agents, and those agents collaborate with people and with each other. Humans and agents connect their machines. A daemon (`x0xd`) runs on each machine and does the networking. You drive it with the `x0x` CLI, the built-in web GUI, or the local REST API. Actions are attributable to a key the owner controls.
+
+David stated this product vision on 13 Oct 2026. The marks below are against commit `86a1d395` on `main`. **Shipped** means this tree does it now. **Target** means the direction is recorded and the work is not complete. **Parked** means new implementation stays sequenced. Shipped code in a parked area still receives security and bug fixes.
+
+| Vision point | Mark | What this tree supports |
+| --- | --- | --- |
+| Humans share messages | Shipped | Direct messages and group messages. |
+| Humans share documents and files | Shipped | File transfer, key-value stores and task lists. |
+| Collaborative rich text | Parked | The notes merge path stays parked ([ADR 0095](docs/adr/0095-scope-x0x-is-glue.md), [A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
+| Audio and video | Target | Vision target. Implementation stays parked and sequenced. The `voice` feature is optional. Call routes have no media path unless that feature is on. Video is not implemented ([A13](docs/adr/consolidated/A13-r01-voice-and-video.md), [ADR 0073](docs/adr/0073-audio-and-video-calling.md)). |
+| Humans have agents, and agents collaborate | Shipped | Owner identity, agent identity, groups, delegation and task lists. x0x does not host the model. |
+| Connect machines, in the Tailscale sense | Target | QUIC, local discovery, byte streams and loopback TCP forwards are shipped. [A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md) says this is not a complete tailnet. |
+| Humans share agents with each other | Shipped | `ShareGrant` with expiry and revocation. Caps are `Dm`, `Exec`, `Connect` and `GroupInvite` ([ADR 0070](docs/adr/0070-owner-trust-and-share-grants.md)). Home and the owner key stay unshared. |
+| Humans form projects | Target | No project type. A project is a group plus shared data plus shared agents ([T-projects-and-agent-rental](docs/adr/transient/T-projects-and-agent-rental.md), slot A01). |
+| Humans rent agents to each other | Target | Rental builds on that same grant expiry and revocation. x0xd has no price, invoice or marketplace. |
+| Local agents and API-based agents | Shipped | The daemon agent, in-process `serve`, and deny-by-default rider tokens ([ADR 0039](docs/adr/0039-agent-harness-boundary.md)). |
+| A2A and ACP as full session protocols | Target | Shipped pieces: an ACP-attached key (the harness owns it) and an A2A discovery card at `GET /.well-known/agent-card.json`. [A04](docs/adr/consolidated/A04-r01-agent-attachment-and-inbound-events.md) says x0xd does not run the Agent Client Protocol, and A2A streaming and push stay off. |
+| Groups keep working inside a partition | Shipped | Peers who can reach each other keep the data they hold ([ADR 0006](docs/adr/0006-no-global-dht-for-user-and-group-data.md)). There is no claim of global availability. |
+| CRDT data | Shipped | Replicated task lists and key-value stores. A last-writer value is not a text editor ([A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
+| BLE, serial and radio | Target | No BLE, serial or radio path in x0x. ant-quic stays the transport boundary. David's statement that ant-quic is ready is not an x0x test ([T-alternate-bearers](docs/adr/transient/T-alternate-bearers.md), slot A05). |
+| Public and private groups | Shipped | Hidden private groups and public-directory presets (`ListedToContacts`, `PublicDirectory`, `SignedPublic`) exist ([A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
+| Those groups challenge Slack and Discord | Target | The group kinds above are the collaboration places. Feature parity with Slack or Discord is not claimed. |
 
 ## Architecture review
 
@@ -379,4 +400,4 @@ MIT OR Apache-2.0
 
 [Saorsa Labs](https://saorsalabs.com) — *Saorsa: Freedom*
 
-From Barr, Scotland. For every agent, everywhere.
+From Barr, Scotland. For people, their agents and their machines.

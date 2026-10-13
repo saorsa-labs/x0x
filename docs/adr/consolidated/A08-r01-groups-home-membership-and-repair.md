@@ -26,6 +26,18 @@ The normal role model remains Admin and Member. Admin authority is substantial: 
 
 Home remains an owner-certified private group. Sharing an agent does not admit another owner to Home.
 
+### Public and private groups
+
+A group may be private, discoverable or public. `GroupPolicy` already separates discoverability, admission, confidentiality, read access and write access.
+
+The private preset is hidden, invite-only, MLS-encrypted, and members-only for read and write. Home uses that private shape with owner-certified admission.
+
+Discoverable groups use `ListedToContacts` or `PublicDirectory`. Public content uses `SignedPublic` when the preset says so. The presets `public_request_secure`, `public_open` and `public_announce` are the shipped examples. A directory card grants neither membership nor write permission.
+
+Public and discoverable groups stand beside private ones. People and agents can offer a shared place that others can find. That direction is how these groups can challenge a hosted chat product. It is not a claim that x0x matches Slack or Discord feature for feature.
+
+Members who already hold the group do not need the public directory. When those members can still reach each other, they keep the state they hold if the wider network is partitioned. Discovery may degrade on that partition.
+
 The target Home model uses explicit owner setup and a durable binding to one group. An existing device must not move to a different Home because a later register value wins a background election. This is a target from the proposed Home work, not a description of current startup behavior.
 
 ## Liveness
@@ -68,7 +80,7 @@ Allowing every admin to act immediately improves local progress but can create c
 
 ## Current implementation
 
-The group foundation and Home-scoped certificate checks exist. Home still auto-provisions and uses the owner-sync Home register to select the canonical group. The explicit Home transition is not implemented. The full liveness contract, any-holder repair and any-admin redemption remain incomplete.
+The group foundation and Home-scoped certificate checks exist. Private, contact-listed and public-directory policies exist, including MLS groups and signed-public groups. Home still auto-provisions and uses the owner-sync Home register to select the canonical group. The explicit Home transition is not implemented. The full liveness contract, any-holder repair and any-admin redemption remain incomplete for every group, public groups included.
 
 D63 keeps separate numbered slice acceptance in this order:
 **S2 & S8 → S4 & S3 → S5 → S6 → S7**. D65 clarifies that S8 here means
@@ -108,5 +120,7 @@ These records are the primary sources for this draft. This mapping does not comp
 [ADR 0016 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0016-role-based-group-authority-flat-admin.md) · [ADR 0031 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0031-sole-member-self-leave-deletes-group.md) · [ADR 0038 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0038-home-owner-certified-personal-space.md) · [ADR 0059 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0059-invite-authentication-and-seating-provenance.md) · [ADR 0060 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0060-one-home-per-owner.md) · [ADR 0062 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0062-home-persistence-pair-recovery.md) · [ADR 0064 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0064-owner-anchored-fork-authority.md) · [ADR 0065 Superseded](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0065-duplicate-home-inventory-retirement-deferred.md) · [ADR 0066 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md) · [ADR 0067 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0067-lifecycle-epoch-token-is-derived-marker-identity.md) · [ADR 0068 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0068-quarantine-pinned-history-retention-and-buffered-task-deltas.md) · [ADR 0069 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0069-home-wait-for-sync-before-auto-provisioning.md) · [ADR 0088 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0088-group-liveness-contract.md) · [ADR 0106 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0106-join-result-carries-intervening-membership-events.md) · [ADR 0107 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0107-stuck-join-rearm-and-serving-guard.md) · [ADR 0108 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0108-home-scoped-owner-certificate.md) · [ADR 0109 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0109-ownerless-attestation-self-recovery.md) · [ADR 0111 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0111-evidence-size-k-and-fetch-by-hash.md) · [ADR 0112 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0112-any-admin-invite-redemption.md) · [ADR 0113 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0113-home-is-an-explicit-owner-group-adopted-in-place.md) · [ADR 0114 Proposed](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0114-authority-re-welcome.md)
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
+
+The public and discoverable group text was added on 13 October 2026 against commit `86a1d395`. It records policy that is already in the tree. It does not mark liveness or repair complete.
 
 [All 15 ADRs](README.md)

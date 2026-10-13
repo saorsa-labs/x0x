@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Product vision, 13 Oct 2026.** The README introduces x0x as people, their agents and their machines collaborating, and marks each vision point shipped, target or parked against commit `86a1d395`. A01 adds projects, public and private groups, partition-first operation, and agent rental as a target. The billing exclusion no longer rules rental out. Voice and video are a vision target; implementation stays sequenced. A08 records public and discoverable groups beside private ones. Proposed transients, not folded and not Accepted: `T-projects-and-agent-rental` (slot A01) and `T-alternate-bearers` (slot A05). No version section and no version bump.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
