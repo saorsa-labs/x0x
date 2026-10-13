@@ -1603,11 +1603,15 @@ async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
     f.shutdown().await;
 }
 
+// Before #1346 a high-water mark closed every older generation. Now only a
+// generation that already attempted Hello stays closed when ant-quic makes
+// it Live again. An older Live winner with no attempt re-arms once (the
+// issue1346_* tests below).
 #[test]
-fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget() {
+fn issue1207_s1b_promoted_used_generation_fails_closed_without_spending_budget() {
     let limits = Limits::default();
     let machine = MachineId([19; 32]);
-    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
     let aged = Instant::now() - HELLO_INTERVAL;
     limits
         .state
@@ -1617,13 +1621,16 @@ fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget(
         .get_mut(&machine)
         .unwrap()
         .hello_out = Some(aged);
+    // A newer generation is seen, then the used generation 1 is Live again.
+    limits.hello_connection(machine, 2);
     limits.hello_connection(machine, 1);
+    assert!(!limits.hello_pending(machine));
     assert!(!limits.hello_candidate(machine, 1));
     assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
     {
         let state = limits.state.lock().unwrap();
         let budget = &state.machines[&machine];
-        assert_eq!(budget.hello_generation, Some(2));
+        assert_eq!(budget.hello_generation, Some(1));
         assert!(budget.attempted);
         assert_eq!(budget.hello_out, Some(aged));
     }
@@ -1710,6 +1717,51 @@ fn issue1346_red_follower_own_hello_then_one_attempt_on_lower_winner() {
 }
 
 #[test]
+fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
+    let limits = Limits::default();
+    let machine = MachineId([48; 32]);
+    for generation in 1..=6 {
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+        issue1346_age_hello_gate(&limits, machine);
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let attempts = &state.machines[&machine].hello_attempts;
+        assert_eq!(attempts.recent.iter().flatten().count(), HELLO_ATTEMPT_CAP);
+        assert_eq!(
+            attempts.floor,
+            Some(2),
+            "the lowest entries moved to the floor"
+        );
+    }
+    // Every used generation stays closed, in a slot or under the floor.
+    for generation in 1..=6 {
+        limits.hello_connection(machine, generation);
+        assert!(!limits.hello_pending(machine), "generation {generation}");
+        assert!(!limits.hello_candidate(machine, generation));
+        assert!(!limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    // A forgotten older generation fails closed, also with no attempt.
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(0)));
+    // The refusals spent no budget. A new connection gets one attempt.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(7)));
+
+    // A full record and a generation below every slot: only the floor moves.
+    let mut attempts = HelloAttempts::default();
+    for generation in [40, 30, 20, 10, 5] {
+        attempts.insert(generation);
+    }
+    assert_eq!(attempts.floor, Some(5));
+    assert_eq!(attempts.recent.iter().flatten().count(), HELLO_ATTEMPT_CAP);
+    assert!(attempts.contains(4) && attempts.contains(10) && !attempts.contains(15));
+    assert_eq!(
+        std::mem::size_of::<HelloAttempts>(),
+        std::mem::size_of::<Option<u64>>() * (HELLO_ATTEMPT_CAP + 1),
+        "inline, fixed size: no heap growth"
+    );
+}
+
+#[test]
 fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budgets() {
     let limits = Arc::new(Limits::default());
     let machine = |id: usize| {
@@ -1761,7 +1813,7 @@ fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budget
     assert!(!limits.begin_hello_on_connection(machine(6), true, Some(100)));
     assert!(!limits.request(machine(4), true), "inbound gate retained");
     assert!(!limits.begin_hello_on_connection(machine(3), true, Some(101)));
-    // Eviction forgets the old high-water marker. One new attempt is allowed,
+    // Eviction forgets the old attempt record. One new attempt is allowed,
     // but the shared 60-second gate still blocks even a newer generation.
     assert!(limits.begin_hello_on_connection(machine(7), true, Some(1)));
     assert!(!limits.begin_hello_on_connection(machine(7), true, Some(2)));
