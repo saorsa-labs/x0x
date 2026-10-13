@@ -89,6 +89,27 @@ async fn agent_with_network_cache(
     }
 }
 
+/// Helper: like `agent_with_network_cache`, but with the peer cache
+/// disabled (in-memory only: nothing loaded, nothing saved).
+async fn agent_with_disabled_network_cache(
+    temp_dir: &TempDir,
+    cache_dir: &Path,
+) -> x0x::error::Result<Option<Agent>> {
+    match Agent::builder()
+        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_agent_key_path(temp_dir.path().join("agent.key"))
+        .with_peer_cache_dir(cache_dir)
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .build()
+        .await
+    {
+        Ok(agent) => Ok(Some(agent)),
+        Err(err) if is_network_bind_permission_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 #[tokio::test]
 async fn test_agent_builds_with_peer_cache_dir() {
     let temp = TempDir::new().unwrap();
@@ -183,7 +204,7 @@ async fn test_cache_persists_across_restarts() {
     {
         let agent = agent_with_network_cache(&temp, &cache_dir)
             .await
-            .expect("failed to build second agent")
+            .expect("failed to build a restarted agent")
             .expect("network should still be available for second agent");
         let adapter = agent
             .gossip_cache_adapter()
@@ -298,6 +319,53 @@ async fn test_default_cache_dir_when_not_specified() {
     }
 }
 
+/// Rewrite one peer id in a saved ant-quic bootstrap cache file and
+/// recompute the file checksum the way `CacheData::calculate_checksum`
+/// does (`DefaultHasher` over the version, the entry count and the sorted
+/// 32-byte ids). Test-only: it builds the file shape an older build wrote.
+fn rewrite_cache_entry_id(cache_file: &Path, from: [u8; 32], to: [u8; 32]) {
+    use std::hash::{Hash, Hasher};
+    let raw = std::fs::read_to_string(cache_file).expect("read cache file");
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("cache file is JSON");
+    let from_hex = hex::encode(from);
+    let to_hex = hex::encode(to);
+    let peers = doc
+        .get_mut("peers")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("cache file has a peers map");
+    let mut entry = peers.remove(&from_hex).expect("stand-in entry present");
+    if let Some(id) = entry.get_mut("peer_id") {
+        *id = serde_json::Value::String(to_hex.clone());
+    }
+    peers.insert(to_hex, entry);
+    let mut ids: Vec<[u8; 32]> = peers
+        .keys()
+        .map(|k| {
+            let bytes = hex::decode(k).expect("hex peer key");
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&bytes);
+            id
+        })
+        .collect();
+    ids.sort();
+    let version = doc
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .expect("cache file has a version") as u32;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    version.hash(&mut hasher);
+    ids.len().hash(&mut hasher);
+    for id in &ids {
+        id.hash(&mut hasher);
+    }
+    doc["checksum"] = serde_json::Value::from(hasher.finish());
+    std::fs::write(
+        cache_file,
+        serde_json::to_string_pretty(&doc).expect("serialize cache file"),
+    )
+    .expect("write cache file");
+}
+
 /// #491 (from #484): prune-on-empty — when the startup self-entry prune
 /// leaves the persistent bootstrap cache with ZERO entries, the cache
 /// FILE must be unlinked too. WHY: ant-quic's `remove()` is memory-only
@@ -309,6 +377,13 @@ async fn test_default_cache_dir_when_not_specified() {
 /// restarts the SAME identity (same machine.key → same peer id), so the
 /// prune empties the cache and must have removed the file — and the file
 /// must STAY gone across the second shutdown's save cycle.
+///
+/// Since ant-quic 0.27.58 (#269) the cache refuses to store the node's own
+/// entry and drops it at every load, so the never-self-dial property no
+/// longer depends on unlinking the file. Phase 1 cannot insert the self
+/// entry directly any more: it saves a stand-in peer and rewrites that id in
+/// the saved file to our own id, with the checksum recomputed (the shape an
+/// older build left on disk). The later starts must never load it.
 #[tokio::test]
 async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
     let temp = TempDir::new().unwrap();
@@ -325,9 +400,14 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
         else {
             return;
         };
-        let own = PeerId::new(agent.machine_id().0);
+        let own_bytes = agent.machine_id().0;
+        let stand_in_bytes = [0x5a_u8; 32];
+        assert_ne!(
+            own_bytes, stand_in_bytes,
+            "stand-in must differ from our id"
+        );
         let advert = CoordinatorAdvert::new(
-            own,
+            PeerId::new(stand_in_bytes),
             CoordinatorRoles::default(),
             vec![AddrHint::new(addr)],
             NatClass::Unknown,
@@ -338,21 +418,26 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
             .expect("network agent should expose cache adapter");
         assert!(
             adapter.insert_advert(advert).await,
-            "seeding the self-keyed advert must succeed"
+            "seeding the stand-in advert must succeed"
         );
         assert_eq!(adapter.peer_count().await, 1);
         agent.shutdown().await;
-        own
+        (own_bytes, stand_in_bytes)
     };
+    let (own_bytes, stand_in_bytes) = own_peer_id;
+    let own_peer_id = PeerId::new(own_bytes);
     assert!(
         cache_file.exists(),
-        "shutdown must persist the single self-keyed entry (min_peers_to_save=1)"
+        "shutdown must persist the single stand-in entry (min_peers_to_save=1)"
     );
+    rewrite_cache_entry_id(&cache_file, stand_in_bytes, own_bytes);
 
-    // Phase 2: same identity, same cache dir. The #484 startup prune
-    // removes the self entry; with the cache then empty the persisted
-    // file must be unlinked, and the second shutdown must not resurrect it.
-    {
+    // Phase 2 and 3: same identity, same cache dir. ant-quic (#269) drops
+    // the self entry when it loads the file, so the node never holds or
+    // selects itself, on this start or on any later start. The legacy file
+    // may stay on disk (`save()` never rewrites below `min_peers_to_save`);
+    // it is harmless because every load drops the entry again.
+    for start in ["second", "third"] {
         let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
             .await
             .expect("failed to build second agent")
@@ -370,16 +455,135 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
         assert_eq!(
             adapter.peer_count().await,
             0,
-            "the self entry must be pruned from the loaded cache"
-        );
-        assert!(
-            !cache_file.exists(),
-            "an emptied bootstrap cache file must be pruned from disk (#484: never self-dial)"
+            "the {start} start must not load the self entry (#484: never self-dial)"
         );
         agent.shutdown().await;
-        assert!(
-            !cache_file.exists(),
-            "the pruned file must stay gone across the shutdown save cycle"
-        );
     }
+}
+
+/// A start with the peer cache disabled loads nothing, so its empty
+/// in-memory cache says nothing about the file on disk. That start (and its
+/// shutdown) must keep an existing, valid cache file unchanged for a later
+/// persistent start. No startup prune may delete it.
+#[tokio::test]
+async fn wp_c_491_disabled_peer_cache_keeps_existing_file() {
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("peers");
+    let cache_file = cache_dir.join("bootstrap_cache.json");
+    let addr: std::net::SocketAddr = "127.0.0.1:54832".parse().unwrap();
+
+    {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build persistent agent")
+        else {
+            return;
+        };
+        let advert = CoordinatorAdvert::new(
+            PeerId::new([0x6b_u8; 32]),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(addr)],
+            NatClass::Unknown,
+            60_000,
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert!(
+            adapter.insert_advert(advert).await,
+            "seeding a peer advert must succeed"
+        );
+        agent.shutdown().await;
+    }
+    assert!(
+        cache_file.exists(),
+        "the persistent start must save the peer"
+    );
+    let before = std::fs::read(&cache_file).expect("read saved cache file");
+
+    {
+        let Some(agent) = agent_with_disabled_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build disabled-cache agent")
+        else {
+            return;
+        };
+        assert!(
+            cache_file.exists(),
+            "a disabled-cache start must not delete the persisted cache file"
+        );
+        agent.shutdown().await;
+    }
+    assert_eq!(
+        std::fs::read(&cache_file).expect("cache file must still exist"),
+        before,
+        "the persisted cache file must be unchanged after a disabled-cache run"
+    );
+}
+
+/// When the persisted cache file cannot be READ (an I/O error such as
+/// `PermissionDenied`, not a checksum rejection), ant-quic falls back to an
+/// in-memory cache and loads nothing. The empty cache says nothing about
+/// the file, so no startup prune may delete it.
+#[cfg(unix)]
+#[tokio::test]
+async fn wp_c_491_unreadable_cache_file_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("peers");
+    let cache_file = cache_dir.join("bootstrap_cache.json");
+    let addr: std::net::SocketAddr = "127.0.0.1:54833".parse().unwrap();
+
+    {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build persistent agent")
+        else {
+            return;
+        };
+        let advert = CoordinatorAdvert::new(
+            PeerId::new([0x7c_u8; 32]),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(addr)],
+            NatClass::Unknown,
+            60_000,
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert!(
+            adapter.insert_advert(advert).await,
+            "seeding a peer advert must succeed"
+        );
+        agent.shutdown().await;
+    }
+    assert!(
+        cache_file.exists(),
+        "the persistent start must save the peer"
+    );
+    let before = std::fs::read(&cache_file).expect("read saved cache file");
+    std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o000))
+        .expect("make the cache file unreadable");
+    if std::fs::read(&cache_file).is_ok() {
+        // Running as a user that ignores file modes (root): no I/O error.
+        std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).ok();
+        return;
+    }
+
+    let result = agent_with_network_cache(&temp, &cache_dir).await;
+    let still_there = cache_file.exists();
+    std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).ok();
+    let Some(agent) = result.expect("failed to build agent over an unreadable cache") else {
+        return;
+    };
+    assert!(
+        still_there,
+        "an unreadable cache file must not be deleted by the startup prune"
+    );
+    agent.shutdown().await;
+    assert_eq!(
+        std::fs::read(&cache_file).expect("cache file must still exist"),
+        before,
+        "the unreadable cache file must be unchanged"
+    );
 }
