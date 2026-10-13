@@ -1,6 +1,6 @@
 # T-installed-catchup-admin-consent: installed catch-up consent
 
-- **Status:** Proposed
+- **Status:** Accepted (David, D272, 17:12 London, 13 Oct 2026, slot A08, PR #1401)
 - **Target slot:** A08
 - **Date:** 2026-10-13
 - **Decision owners:** David (D270). Only David accepts this record.
