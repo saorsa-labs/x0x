@@ -199,6 +199,22 @@ async fn corrupt_revocation_store_quarantines_starts_and_reports_1116() {
     let body: serde_json::Value = members.json().await.expect("members json");
     assert_eq!(body["error"], REVOCATION_RESYNC_STATUS, "{body}");
 
+    let added = daemon
+        .client
+        .post(daemon.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": "11".repeat(32)
+        }))
+        .send()
+        .await
+        .expect("POST member");
+    assert_eq!(added.status(), reqwest::StatusCode::FORBIDDEN);
+    let added_body: serde_json::Value = added.json().await.expect("add member json");
+    assert_eq!(
+        added_body["error"], REVOCATION_RESYNC_STATUS,
+        "adding a member stays closed: {added_body}"
+    );
+
     let quarantine_path = quarantined.path();
     daemon.stop().await;
     let readable = x0x::revocation::RevocationSet::new()

@@ -1436,7 +1436,7 @@ pub async fn save_revocation_set(set: &RevocationSet, identity_dir: Option<&Path
         )));
     };
     let bytes = set.to_bytes()?;
-    write_private_file(&path, bytes).await
+    write_private_bytes_durable(&path, bytes).await
 }
 
 /// Persist pre-encoded revocation-set bytes to disk (issue #191).
@@ -1453,18 +1453,25 @@ pub async fn save_revocation_set_bytes(bytes: Vec<u8>, identity_dir: Option<&Pat
             "no home directory and no identity_dir — cannot persist revocations",
         )));
     };
-    write_private_file(&path, bytes).await
+    write_private_bytes_durable(&path, bytes).await
 }
 
 /// Write private bytes to an explicit path (atomic rename, mode 0600 on
 /// Unix). ADR-0043 callers persist move-log/bundle/placement/v2 files
 /// through this — same guarantees as the revocation set.
 ///
+/// v1 and v2 revocation files also fsync the file and the parent directory,
+/// as v3 already does. Other callers keep the rename-only writer.
+///
 /// # Errors
 ///
 /// Returns [`IdentityError::Storage`] on any filesystem failure.
 pub async fn save_private_bytes_to(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
-    write_private_file(path, bytes).await
+    if RevocationStore::at_path(path).is_some() {
+        write_private_bytes_durable(path, bytes).await
+    } else {
+        write_private_file(path, bytes).await
+    }
 }
 
 #[cfg(test)]
@@ -1810,6 +1817,50 @@ mod tests {
         .unwrap();
         mixed.merge_v3(v3);
         assert_closed(&mixed, "corrupt v2 with a readable v3");
+    }
+
+    /// #1116: a present 0-byte file and a truncated valid file are corrupt.
+    /// Each is moved off the live path and membership stays closed.
+    #[tokio::test]
+    async fn zero_byte_and_truncated_revocation_files_fail_closed_1116() {
+        let valid = RevocationSet::new().to_bytes().expect("empty store");
+        assert!(valid.len() > 1, "a revocation file has a header");
+        let truncated = &valid[..valid.len() - 1];
+        for (name, bytes) in [
+            ("revocations.bin", &[][..]),
+            ("revocations-v2.bin", truncated),
+            ("revocations-v3.bin", &[][..]),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, bytes).await.expect("seed");
+            let store = match name {
+                "revocations.bin" => RevocationStore::V1,
+                "revocations-v2.bin" => RevocationStore::V2,
+                _ => RevocationStore::V3,
+            };
+            let loaded = read_revocation_store(&path, store, false)
+                .await
+                .expect("load")
+                .expect("present file");
+            assert!(
+                loaded.revocation_resync_required(),
+                "{name} closes membership"
+            );
+            assert!(loaded.is_empty(), "{name} contributes no records");
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(bytes),
+                "{name} no longer holds the bad payload"
+            );
+            assert!(
+                quarantine_files(dir.path(), name)
+                    .await
+                    .iter()
+                    .any(|quarantine| std::fs::read(quarantine).ok().as_deref() == Some(bytes)),
+                "{name} quarantine holds the bad payload"
+            );
+        }
     }
 
     /// Missing stores are healthy, independent, and may be created by every

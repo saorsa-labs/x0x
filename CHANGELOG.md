@@ -319,8 +319,15 @@ A minor release. It removes one unused public module and changes two public file
   the group resyncs revocations, or an operator places a readable file on
   the live path, membership fails closed. A member whose non-revocation
   cannot be verified is treated as revoked. An empty snapshot does not open
-  membership. Accepted transient record:
-  `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not folded).
+  membership. Group admission, invite accept, join-artifact and key
+  delivery are withheld, as are non-revocation pubsub, DM and direct
+  messages. The hold is not a revocation record, so those paths do not
+  purge. A carrier opens only when every record in a snapshot from
+  another peer belongs to that carrier and verifies. The node's own
+  publish does not open it, and a partial snapshot does not open it.
+  v1 and v2 revocation writes fsync the file and its directory. Accepted
+  transient record: `docs/adr/transient/T-revocation-store-corrupt.md`
+  (slot A03, not folded).
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial

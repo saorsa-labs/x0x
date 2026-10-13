@@ -16603,6 +16603,17 @@ impl Agent {
                 // the boolean — no await under it (same contract as EP4).
                 let peer_revoked = {
                     let revoked = revocation_set.read().await;
+                    if revoked.revocation_resync_required() {
+                        tracing::info!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            sender_prefix = %network::hex_prefix(&sender.0, 4),
+                            outcome = "withhold_revocation_resync",
+                            "direct message withheld until revocation resync"
+                        );
+                        drop(revoked);
+                        continue;
+                    }
                     direct::inbound_peer_revoked(&revoked, &sender, &machine_id)
                 };
                 if peer_revoked {

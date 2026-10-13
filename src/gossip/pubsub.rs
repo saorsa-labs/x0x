@@ -879,6 +879,9 @@ struct OwnerSetup {
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     stats: Arc<PubSubStats>,
     sub_topic: String,
+    /// This node's agent, captured at subscribe. A snapshot this node
+    /// published must not arm its own carrier (#1116).
+    local_agent: Option<AgentId>,
 }
 
 impl Drop for OwnerSetup {
@@ -902,6 +905,7 @@ impl Drop for OwnerSetup {
         let group_identity = Arc::clone(&self.group_identity);
         let stats = Arc::clone(&self.stats);
         let sub_topic = self.sub_topic.clone();
+        let local_agent = self.local_agent;
         // The owner task is gone. Joiners already on the slot still need
         // a reader. `subscribe_ready` runs only when this task did not
         // install one.
@@ -926,6 +930,7 @@ impl Drop for OwnerSetup {
                 revocation_set,
                 group_identity,
                 sub_topic,
+                local_agent,
                 stamped_rx,
             )
             .await;
@@ -955,6 +960,7 @@ async fn run_delivery_forwarder(
     revocation_set: Arc<std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>>,
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     sub_topic: String,
+    local_agent: Option<AgentId>,
     mut stamped_rx: mpsc::UnboundedReceiver<StampedDelivery>,
 ) {
     #[cfg(test)]
@@ -965,6 +971,7 @@ async fn run_delivery_forwarder(
         revocation_set: &revocation_set,
         group_identity: &group_identity,
         sub_topic: &sub_topic,
+        local_agent,
     };
     loop {
         if !slot.alive.load(Ordering::Acquire) {
@@ -1114,6 +1121,7 @@ struct ForwardEnv<'a> {
     revocation_set: &'a std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>,
     group_identity: &'a std::sync::OnceLock<GroupIdentityContext>,
     sub_topic: &'a str,
+    local_agent: Option<AgentId>,
 }
 
 async fn forward_plumtree_payload(
@@ -1147,6 +1155,8 @@ async fn forward_plumtree_payload(
                     set,
                     &message.topic,
                     &message.payload,
+                    message.sender.as_ref(),
+                    env.local_agent.as_ref(),
                 )
                 .await;
             }
@@ -2942,6 +2952,7 @@ impl PubSubManager {
             let contacts = Arc::clone(&self.contacts);
             let revocation_set = Arc::clone(&self.revocation_set);
             let group_identity = Arc::clone(&self.group_identity);
+            let local_agent = self.signing.as_ref().map(|ctx| ctx.agent_id);
             let mut setup = OwnerSetup {
                 deliveries: Arc::clone(&self.topic_deliveries),
                 topic_id,
@@ -2954,6 +2965,7 @@ impl PubSubManager {
                 group_identity: Arc::clone(&group_identity),
                 stats: Arc::clone(&self.stats),
                 sub_topic: topic.clone(),
+                local_agent,
             };
             // A joiner can attach to the slot while this task is still
             // inside `subscribe_ready` only if it already holds a sender.
@@ -2988,6 +3000,7 @@ impl PubSubManager {
                     revocation_set,
                     group_identity,
                     sub_topic,
+                    local_agent,
                     stamped_rx,
                 )
                 .await;
@@ -4175,8 +4188,22 @@ async fn decode_for_delivery(
     // gossiped revocation reaches delivery only once the eviction loop has
     // set trust = Blocked (a race reopens it).
     if let Some(rev_set) = revocation_set {
-        if rev_set.read().await.is_agent_revoked(&sender) {
+        let set = rev_set.read().await;
+        if set.is_agent_revoked(&sender) {
             return DeliveryVerdict::Refused(sender);
+        }
+        // #1116: while a revocation carrier is unverified, withhold every
+        // other topic. The revocation carriers themselves still flow so a
+        // group snapshot can arrive. This is not a stored revocation.
+        if set.revocation_resync_required()
+            && !crate::revocation::is_revocation_carrier_topic(&message.topic)
+        {
+            tracing::debug!(
+                "Withholding payload from {} until revocation resync ({})",
+                sender,
+                message.topic
+            );
+            return DeliveryVerdict::Rejected;
         }
     }
 

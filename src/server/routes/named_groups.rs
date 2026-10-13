@@ -11348,7 +11348,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(sender) {
+        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
             return;
         }
     }
@@ -12350,6 +12350,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 event = event_kind,
                 sender = %sender_hex,
                 "group metadata event dropped: sender is revoked"
+            );
+            return ApplyMetadataResult::REJECTED;
+        }
+        // #1116: the hold is not a revocation record. Withhold the event
+        // so a previously revoked sender is not admitted, and do not purge.
+        if revoked.revocation_resync_required() {
+            tracing::info!(
+                target: "treekem.trace",
+                stage = "apply_metadata_event_withhold",
+                reason = "revocation_resync",
+                event = event_kind,
+                sender = %sender_hex,
+                "group metadata event withheld until revocation resync"
             );
             return ApplyMetadataResult::REJECTED;
         }
@@ -15094,7 +15107,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // up. Retain the fully member-signed event so a later
                     // evidence resolution can re-apply it; every other
                     // failure is definitive and earns no retention.
-                    if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
+                    if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate
+                        || failure == x0x::groups::owner_cert::OwnerCertFailure::RevocationResync
+                    {
                         retain_pending_owner_cert_join(
                             state,
                             &resolved_group_key,
@@ -19997,6 +20012,10 @@ pub(in crate::server) async fn join_group_via_invite(
             drop(revoked);
             return refuse_invite(&state, &invite, "inviter_key_revoked");
         }
+        if revoked.revocation_resync_required() {
+            drop(revoked);
+            return refuse_invite(&state, &invite, "revocation_resync_required");
+        }
     }
     // inviter signature (A2 step 7a — r6 Codex 1a): the inviter
     // signature verifies under the just-proven BOUND key, AFTER the
@@ -21109,6 +21128,16 @@ pub(in crate::server) async fn add_named_group_member(
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
+    }
+    // #1116: do not add a member while a revocation carrier is unverified.
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return forbidden(x0x::revocation::REVOCATION_RESYNC_STATUS);
     }
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
@@ -27344,6 +27373,17 @@ async fn owner_certified_admission_check(
     let Some(owner) = info.policy.admission.owner_certified_user_id().copied() else {
         return Ok(None);
     };
+    // #1116: an unverified revocation store withholds admission. It is not
+    // a stored revocation, so the joiner is retained and can retry.
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return Err(x0x::groups::owner_cert::OwnerCertFailure::RevocationResync);
+    }
     // #842: a certificate carried by the join event itself is verified
     // INLINE — exactly the check the cache-backed evidence path applies,
     // without depending on the joiner's announce having propagated. A
@@ -40262,6 +40302,9 @@ enum JoinArtifactRefusal {
     NotActive,
     /// The recipient's agent key is in the ADR-0018 revocation set.
     Revoked,
+    /// #1116: a revocation carrier is still unverified. Withhold the
+    /// artifact. Do not purge it. This is not a stored revocation.
+    RevocationResync,
     /// OwnerCertified: the roster seat commits to a certificate digest but
     /// holds no bytes, or the recipient's roster verdict is
     /// `MemberCertStatus::DigestPending`.
@@ -40294,6 +40337,7 @@ impl JoinArtifactRefusal {
             Self::Banned => "member_banned",
             Self::NotActive => "member_not_active",
             Self::Revoked => "member_revoked",
+            Self::RevocationResync => "revocation_resync_required",
             Self::CertificateDigestPending => "certificate_digest_pending",
             Self::CertificateMissing => "certificate_missing",
             Self::CertificateInvalid(_) => "certificate_invalid",
@@ -40411,12 +40455,15 @@ async fn join_artifact_serving_check(
     member_hex: &str,
 ) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
     let revoked = match parse_agent_id_hex(member_hex) {
-        Ok(member) => state
-            .agent
-            .revocation_set()
-            .read()
-            .await
-            .is_agent_revoked(&member),
+        Ok(member) => {
+            let revocation_set = state.agent.revocation_set();
+            let set = revocation_set.read().await;
+            let record_revoked = set.is_agent_revoked(&member);
+            if set.revocation_resync_required() && !record_revoked {
+                return Err(JoinArtifactRefusal::RevocationResync);
+            }
+            record_revoked
+        }
         Err(_) => return Err(JoinArtifactRefusal::NotActive),
     };
     let now_unix = x0x::groups::owner_cert::restore_clock_now();
@@ -40500,8 +40547,15 @@ fn join_artifact_seam_refusal(
     let Ok(member) = parse_agent_id_hex(member_hex) else {
         return Some(JoinArtifactRefusal::NotActive);
     };
-    let revoked = match state.agent.revocation_set().try_read() {
-        Ok(set) => set.is_agent_revoked(&member),
+    let revocation_set = state.agent.revocation_set();
+    let revoked = match revocation_set.try_read() {
+        Ok(set) => {
+            let record_revoked = set.is_agent_revoked(&member);
+            if set.revocation_resync_required() && !record_revoked {
+                return Some(JoinArtifactRefusal::RevocationResync);
+            }
+            record_revoked
+        }
         Err(_) => return Some(JoinArtifactRefusal::SeamContended),
     };
     let now_unix = join_artifact_seam_now(state);
