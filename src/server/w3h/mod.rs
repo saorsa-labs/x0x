@@ -39,6 +39,7 @@ mod restart;
 
 // Kept apart from the list above so concurrent case branches never touch
 // the same lines.
+mod case_1105;
 mod case_1256;
 mod case_811;
 
