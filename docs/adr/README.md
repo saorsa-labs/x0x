@@ -282,7 +282,8 @@ ADR 0116 amends ADR 0023's local recording and retention policy (D228).
 | 0 | `share_grant_v1` | Understands and validates the ShareGrant v1 typed DM | ADR 0093 |
 | 1 | `predecessor_offer_v1` | Understands the predecessor/requester offer route and its application handling | ADR 0093 |
 | 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams | ADR 0089 (accepted 2026-09-30; advertised since the S5 slice) |
-| 3–63 | unallocated | Must not be advertised until allocated | — |
+| 3 | `file_control_ack_v1` | Sends and expects `file-control-ack` for file offer, accept, and reject | Accepted transient [T-file-control-ack](./transient/T-file-control-ack.md), slot A10, 2026-10-12 |
+| 4–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Rejected
 

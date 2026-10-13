@@ -339,6 +339,15 @@ impl AuthenticatedMachineBindingCache {
             .map(|binding| binding.machine_id)
     }
 
+    /// Drop every retained binding. A process restart does this by exiting.
+    /// Tests use it to empty the registry while a transport connection stays up.
+    #[cfg(test)]
+    pub(crate) fn clear_for_test(&mut self) {
+        self.entries.clear();
+        self.by_machine.clear();
+        self.recency.clear();
+    }
+
     fn resolve_evidence(&mut self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {
         let tick = self.next_tick();
         let mut binding = self.entries.get(agent_id).copied()?;

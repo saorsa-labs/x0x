@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
@@ -70,9 +70,18 @@ const FILE_CHUNK_WINDOW: u64 = 8;
 /// QUIC return path is the slow leg.
 const FILE_CHUNK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Which frame may complete this waiter. A chunk ack and a control ack
+/// share `file_chunk_acks`, so the handler must match the kind before it
+/// records a sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckSlotKind {
+    Chunk,
+    Control,
+}
+
 /// Per-transfer chunk-ack slot. The sender registers this when it begins
 /// streaming chunks; the file-message listener bumps `last_acked` and wakes
-/// any waiter every time a `FileMessage::ChunkAck` lands for this transfer;
+/// any waiter every time a matching ack lands for this transfer;
 /// the sender's chunk loop blocks on `wait_for_chunk_window` when its in-flight
 /// budget would exceed `FILE_CHUNK_WINDOW`.
 pub(crate) struct FileChunkAckSlot {
@@ -81,6 +90,14 @@ pub(crate) struct FileChunkAckSlot {
     last_acked: AtomicU64,
     /// Notified every time `last_acked` changes.
     notify: tokio::sync::Notify,
+    /// Peer allowed to complete this waiter. `None` keeps the chunk-ack
+    /// slot open to the transfer's existing sender check. A control-ack
+    /// slot stores the agent the control frame was sent to.
+    expected_sender: Option<AgentId>,
+    kind: AckSlotKind,
+    /// Control callers joined on this slot. The map entry is removed only
+    /// when the last caller releases the same `Arc`.
+    waiters: AtomicUsize,
 }
 
 impl FileChunkAckSlot {
@@ -88,7 +105,29 @@ impl FileChunkAckSlot {
         Self {
             last_acked: AtomicU64::new(u64::MAX),
             notify: tokio::sync::Notify::new(),
+            expected_sender: None,
+            kind: AckSlotKind::Chunk,
+            waiters: AtomicUsize::new(0),
         }
+    }
+
+    fn expecting(sender: AgentId) -> Self {
+        Self {
+            expected_sender: Some(sender),
+            kind: AckSlotKind::Control,
+            waiters: AtomicUsize::new(1),
+            ..Self::new()
+        }
+    }
+
+    fn accepts_sender(&self, sender: &AgentId) -> bool {
+        self.expected_sender
+            .is_none_or(|expected| expected == *sender)
+    }
+
+    /// A frame completes this waiter only when its kind and sender match.
+    fn accepts_ack(&self, kind: AckSlotKind, sender: &AgentId) -> bool {
+        self.kind == kind && self.accepts_sender(sender)
     }
 
     pub(in crate::server) fn record_ack(&self, sequence: u64) {
@@ -163,17 +202,249 @@ pub(in crate::server) async fn wait_for_chunk_window(
     }
 }
 
-async fn send_file_message(
+const CONTROL_OP_OFFER: &str = "offer";
+const CONTROL_OP_ACCEPT: &str = "accept";
+const CONTROL_OP_REJECT: &str = "reject";
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+
+static UNVERIFIED_FILE_FRAME_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(in crate::server) fn unverified_file_frame_drops() -> u64 {
+    UNVERIFIED_FILE_FRAME_DROPS.load(Ordering::Relaxed)
+}
+
+fn control_op(msg: &x0x::files::FileMessage) -> Option<&'static str> {
+    match msg {
+        x0x::files::FileMessage::Offer(_) => Some(CONTROL_OP_OFFER),
+        x0x::files::FileMessage::Accept { .. } => Some(CONTROL_OP_ACCEPT),
+        x0x::files::FileMessage::Reject { .. } => Some(CONTROL_OP_REJECT),
+        _ => None,
+    }
+}
+
+fn control_transfer_id(msg: &x0x::files::FileMessage) -> Option<&str> {
+    match msg {
+        x0x::files::FileMessage::Offer(offer) => Some(&offer.transfer_id),
+        x0x::files::FileMessage::Accept { transfer_id } => Some(transfer_id),
+        x0x::files::FileMessage::Reject { transfer_id, .. } => Some(transfer_id),
+        _ => None,
+    }
+}
+
+fn control_ack_key(op: &str, transfer_id: &str) -> String {
+    format!("ctrl:{op}:{transfer_id}")
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FileRouteTestHook {
+    stub_egress: bool,
+    /// When set, delivery waits until this notify fires. Shutdown drops that wait.
+    egress_gate: Option<Arc<tokio::sync::Notify>>,
+    egress_entered: Arc<std::sync::atomic::AtomicBool>,
+    pause_chunk_for: Option<String>,
+    chunk_entered: Arc<std::sync::atomic::AtomicBool>,
+    chunk_release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+static FILE_ROUTE_TEST_HOOK: std::sync::Mutex<Option<FileRouteTestHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static FILE_ROUTE_HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn file_route_test_hook() -> Option<FileRouteTestHook> {
+    FILE_ROUTE_TEST_HOOK
+        .lock()
+        .expect("file route test hook")
+        .clone()
+}
+
+#[cfg(test)]
+struct FileRouteHookGuard;
+
+#[cfg(test)]
+impl Drop for FileRouteHookGuard {
+    fn drop(&mut self) {
+        *FILE_ROUTE_TEST_HOOK.lock().expect("file route test hook") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_file_route_hook(hook: FileRouteTestHook) -> FileRouteHookGuard {
+    *FILE_ROUTE_TEST_HOOK.lock().expect("file route test hook") = Some(hook);
+    FileRouteHookGuard
+}
+
+async fn deliver_file_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     msg: &x0x::files::FileMessage,
 ) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    #[cfg(test)]
+    if let Some(hook) = file_route_test_hook() {
+        hook.egress_entered.store(true, Ordering::SeqCst);
+        if let Some(gate) = hook.egress_gate {
+            gate.notified().await;
+        }
+        if hook.stub_egress {
+            return Ok(x0x::dm::DmReceipt {
+                request_id: [0; 16],
+                accepted_at: std::time::Instant::now(),
+                retries_used: 0,
+                path: x0x::dm::DmPath::Loopback,
+            });
+        }
+    }
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     state
         .agent
         .send_direct_with_config(agent_id, payload, file_transfer_control_send_config())
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn wait_for_control_ack(slot: &FileChunkAckSlot) -> std::result::Result<(), String> {
+    let deadline = tokio::time::Instant::now() + CONTROL_ACK_TIMEOUT;
+    loop {
+        if slot.last_acked.load(Ordering::SeqCst) != u64::MAX {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("peer did not accept the file control frame".to_string());
+        }
+        // `record_ack` calls `notify_waiters`, which stores no permit. Recheck
+        // on a short interval so an ack that lands between the load and the
+        // wait is still observed before the deadline.
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = notified.as_mut() => {}
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+async fn register_control_waiter(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    key: &str,
+) -> Arc<FileChunkAckSlot> {
+    let mut slots = state.file_chunk_acks.write().await;
+    if let Some(existing) = slots.get(key).cloned() {
+        if existing.kind == AckSlotKind::Control && existing.accepts_sender(agent_id) {
+            existing.waiters.fetch_add(1, Ordering::SeqCst);
+            return existing;
+        }
+    }
+    let slot = Arc::new(FileChunkAckSlot::expecting(*agent_id));
+    slots.insert(key.to_string(), Arc::clone(&slot));
+    slot
+}
+
+async fn release_control_waiter(state: &Arc<AppState>, key: &str, slot: &Arc<FileChunkAckSlot>) {
+    let mut slots = state.file_chunk_acks.write().await;
+    let previous = slot.waiters.load(Ordering::SeqCst);
+    if previous == 0 {
+        return;
+    }
+    slot.waiters.fetch_sub(1, Ordering::SeqCst);
+    if previous == 1
+        && slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        slots.remove(key);
+    }
+}
+
+fn shutdown_error() -> String {
+    "shutting down".to_string()
+}
+
+async fn send_file_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &x0x::files::FileMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let Some(op) = control_op(msg) else {
+        return deliver_file_message(state, agent_id, msg).await;
+    };
+    let Some(transfer_id) = control_transfer_id(msg) else {
+        return deliver_file_message(state, agent_id, msg).await;
+    };
+    // Wait only when a current verified advert sets bit 3. A v0.47.0 peer
+    // does not advertise it. No verified advert uses that same path: the
+    // transport receipt is success and the sender does not wait.
+    if !peer_advertises_file_control_ack(state, agent_id) {
+        return deliver_file_message(state, agent_id, msg).await;
+    }
+    let key = control_ack_key(op, transfer_id);
+    let slot = register_control_waiter(state, agent_id, &key).await;
+    if state.shutdown_started.is_cancelled() {
+        release_control_waiter(state, &key, &slot).await;
+        return Err(shutdown_error());
+    }
+    let sent = tokio::select! {
+        biased;
+        _ = state.shutdown_started.cancelled() => {
+            release_control_waiter(state, &key, &slot).await;
+            return Err(shutdown_error());
+        }
+        sent = deliver_file_message(state, agent_id, msg) => sent,
+    };
+    if let Err(error) = sent {
+        release_control_waiter(state, &key, &slot).await;
+        return Err(error);
+    }
+    let waited = tokio::select! {
+        biased;
+        _ = state.shutdown_started.cancelled() => {
+            release_control_waiter(state, &key, &slot).await;
+            return Err(shutdown_error());
+        }
+        waited = wait_for_control_ack(&slot) => waited,
+    };
+    release_control_waiter(state, &key, &slot).await;
+    waited?;
+    sent
+}
+
+fn file_control_ack_support(state: &AppState, peer: &AgentId) -> Option<bool> {
+    state
+        .agent
+        .capability_store()
+        .verified_registry_supports(peer, x0x::dm::CapabilityRegistry::FILE_CONTROL_ACK_V1)
+}
+
+fn peer_advertises_file_control_ack(state: &AppState, peer: &AgentId) -> bool {
+    file_control_ack_support(state, peer) == Some(true)
+}
+
+/// `Some(false)` is a verified advert that lacks bit 3. That peer is v0.47.0.
+fn peer_lacks_file_control_ack(state: &AppState, peer: &AgentId) -> bool {
+    file_control_ack_support(state, peer) == Some(false)
+}
+
+async fn send_file_control_ack(state: &Arc<AppState>, peer: &AgentId, transfer_id: &str, op: &str) {
+    // Do not send the frame to a peer whose verified advert lacks bit 3.
+    // No verified advert still sends. That peer may already be waiting
+    // because it holds this node's advert. A v0.47.0 peer ignores the tag.
+    if peer_lacks_file_control_ack(state, peer) {
+        return;
+    }
+    let ack = x0x::files::FileMessage::ControlAck {
+        transfer_id: transfer_id.to_string(),
+        op: op.to_string(),
+    };
+    if let Err(error) = deliver_file_message(state, peer, &ack).await {
+        tracing::warn!(transfer_id, op, "failed to send file control ack: {error}");
+    }
 }
 
 async fn send_file_chunk_message(
@@ -284,6 +555,8 @@ pub(in crate::server) async fn file_send_handler(
         output_path: None,
         chunk_size,
         total_chunks,
+        accept_dispatched: false,
+        chunk_admit_held: false,
     };
 
     state
@@ -363,10 +636,19 @@ pub(in crate::server) async fn file_accept_handler(
         let mut transfers = state.file_transfers.write().await;
         match transfers.get_mut(&id) {
             Some(t)
-                if t.status == x0x::files::TransferStatus::Pending
-                    && t.direction == x0x::files::TransferDirection::Receiving =>
+                if t.direction == x0x::files::TransferDirection::Receiving
+                    && t.status == x0x::files::TransferStatus::Complete =>
+            {
+                return (StatusCode::OK, Json(serde_json::json!({"ok": true})));
+            }
+            Some(t)
+                if t.direction == x0x::files::TransferDirection::Receiving
+                    && (t.status == x0x::files::TransferStatus::Pending
+                        || (t.status == x0x::files::TransferStatus::InProgress
+                            && t.accept_dispatched)) =>
             {
                 t.status = x0x::files::TransferStatus::InProgress;
+                t.accept_dispatched = true;
                 remote_agent_hex = t.remote_agent_id.clone();
             }
             Some(_) => {
@@ -404,14 +686,18 @@ pub(in crate::server) async fn file_accept_handler(
     };
 
     if delivery_failed {
-        // Revert to Pending so the accept can be retried
+        // A missing control ack is not proof the sender ignored the accept.
+        // Keep bytes already stored. Return an empty in-progress receive to
+        // pending so the caller can retry, unless a chunk is already inside
+        // admission. accept_dispatched stays set, so a later chunk is still
+        // applied.
         let mut transfers = state.file_transfers.write().await;
         if let Some(t) = transfers.get_mut(&id) {
-            t.status = x0x::files::TransferStatus::Pending;
+            revert_unconfirmed_empty_receive(t);
         }
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "accepted but failed to notify sender — reverted to pending",
+            "accepted but failed to confirm the sender — retry is safe",
         )
     } else {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
@@ -450,9 +736,12 @@ pub(in crate::server) async fn file_reject_handler(
         }
     }
 
-    // Send reject message back to the sender
+    // The local transfer is already Rejected. A peer that advertises bit 3
+    // must confirm that reject. A missing ack fails the call.
     let mut delivery_failed = false;
+    let mut required_ack_missing = false;
     if let Ok(agent_id) = parse_agent_id_hex(&remote_agent_hex) {
+        required_ack_missing = peer_advertises_file_control_ack(&state, &agent_id);
         let reject_msg = x0x::files::FileMessage::Reject {
             transfer_id: id.clone(),
             reason,
@@ -463,7 +752,12 @@ pub(in crate::server) async fn file_reject_handler(
         }
     }
 
-    if delivery_failed {
+    if delivery_failed && required_ack_missing {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rejected locally but the peer did not confirm",
+        )
+    } else if delivery_failed {
         (
             StatusCode::OK,
             Json(
@@ -490,6 +784,14 @@ pub(in crate::server) fn decode_file_message(
     message: &x0x::direct::DirectMessage,
 ) -> Option<(&AgentId, x0x::files::FileMessage)> {
     if !message.verified {
+        if serde_json::from_slice::<x0x::files::FileMessage>(&message.payload).is_ok() {
+            let drops = UNVERIFIED_FILE_FRAME_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                sender = %hex::encode(message.sender.as_bytes()),
+                drops,
+                "dropped unverified file frame; a transport ACK is not acceptance"
+            );
+        }
         return None;
     }
     let payload = serde_json::from_slice(&message.payload).ok()?;
@@ -525,10 +827,34 @@ pub(in crate::server) async fn handle_file_message(
             transfer_id,
             sequence,
         } => {
-            // Wake the sender's chunk loop. Acks for unknown transfers
-            // (already torn down, never started here) are silently dropped.
+            // Wake the sender's chunk loop. A control waiter lives in the
+            // same map under `ctrl:<op>:<id>`. A chunk ack must not complete
+            // it, even when the sender is the addressed peer.
             if let Some(slot) = state.file_chunk_acks.read().await.get(&transfer_id) {
-                slot.record_ack(sequence);
+                if slot.accepts_ack(AckSlotKind::Chunk, sender) {
+                    slot.record_ack(sequence);
+                } else {
+                    tracing::warn!(
+                        transfer_id,
+                        sender = %hex::encode(sender.as_bytes()),
+                        "ignored file chunk ack for a control waiter"
+                    );
+                }
+            }
+        }
+        x0x::files::FileMessage::ControlAck { transfer_id, op } => {
+            let key = control_ack_key(&op, &transfer_id);
+            if let Some(slot) = state.file_chunk_acks.read().await.get(&key) {
+                if slot.accepts_ack(AckSlotKind::Control, sender) {
+                    slot.record_ack(0);
+                } else {
+                    tracing::warn!(
+                        transfer_id,
+                        op,
+                        sender = %hex::encode(sender.as_bytes()),
+                        "ignored file control ack from an unexpected agent"
+                    );
+                }
             }
         }
     }
@@ -593,6 +919,8 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         output_path: None,
         chunk_size: offer.chunk_size,
         total_chunks: offer.total_chunks,
+        accept_dispatched: false,
+        chunk_admit_held: false,
     };
 
     state
@@ -600,6 +928,8 @@ async fn handle_file_offer(state: &Arc<AppState>, sender: &AgentId, offer: x0x::
         .write()
         .await
         .insert(offer.transfer_id.clone(), transfer);
+
+    send_file_control_ack(state, sender, &offer.transfer_id, CONTROL_OP_OFFER).await;
 
     // Emit SSE event so apps can be notified
     let _ = state.broadcast_tx.send(SseEvent {
@@ -635,19 +965,15 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::info!("File accept received: {transfer_id} from {sender_hex}");
 
-    let source_path;
-    let sha256;
-    let remote_agent_hex;
+    let mut started = None;
     {
         let mut transfers = state.file_transfers.write().await;
         let Some(t) = transfers.get_mut(transfer_id) else {
             tracing::warn!("Accept for unknown transfer: {transfer_id}");
             return;
         };
-        if t.direction != x0x::files::TransferDirection::Sending
-            || t.status != x0x::files::TransferStatus::Pending
-        {
-            tracing::warn!("Accept for non-pending sending transfer: {transfer_id}");
+        if t.direction != x0x::files::TransferDirection::Sending {
+            tracing::warn!("Accept for non-sending transfer: {transfer_id}");
             return;
         }
         // Authenticate: sender must match the remote_agent_id we sent the offer to
@@ -658,11 +984,28 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
             );
             return;
         }
-        t.status = x0x::files::TransferStatus::InProgress;
-        source_path = t.source_path.clone();
-        sha256 = t.sha256.clone();
-        remote_agent_hex = t.remote_agent_id.clone();
+        match t.status {
+            x0x::files::TransferStatus::Pending => {
+                t.status = x0x::files::TransferStatus::InProgress;
+                started = Some((
+                    t.source_path.clone(),
+                    t.sha256.clone(),
+                    t.remote_agent_id.clone(),
+                ));
+            }
+            // The accept already committed. A repeat is the receiver retrying
+            // after a lost control ack. Reply again. Do not start a second stream.
+            x0x::files::TransferStatus::InProgress | x0x::files::TransferStatus::Complete => {}
+            _ => {
+                tracing::warn!("Accept for non-pending sending transfer: {transfer_id}");
+                return;
+            }
+        }
     }
+    let Some((source_path, sha256, remote_agent_hex)) = started else {
+        send_file_control_ack(state, sender, transfer_id, CONTROL_OP_ACCEPT).await;
+        return;
+    };
 
     let Some(path) = source_path else {
         tracing::error!("No source path for transfer {transfer_id}");
@@ -679,6 +1022,8 @@ async fn handle_file_accept(state: &Arc<AppState>, sender: &AgentId, transfer_id
         tracing::error!("Invalid agent_id in transfer {transfer_id}");
         return;
     };
+
+    send_file_control_ack(state, sender, transfer_id, CONTROL_OP_ACCEPT).await;
 
     // Spawn async task to stream chunks.
     //
@@ -890,21 +1235,30 @@ async fn handle_file_reject(
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::info!("File reject received: {transfer_id} from {sender_hex} — {reason}");
-    let mut transfers = state.file_transfers.write().await;
-    if let Some(t) = transfers.get_mut(transfer_id) {
-        if t.direction == x0x::files::TransferDirection::Sending {
-            // Authenticate: sender must match the remote_agent_id
-            if t.remote_agent_id != sender_hex {
+    let applied = {
+        let mut transfers = state.file_transfers.write().await;
+        match transfers.get_mut(transfer_id) {
+            Some(t)
+                if t.direction == x0x::files::TransferDirection::Sending
+                    && t.remote_agent_id == sender_hex =>
+            {
+                t.status = x0x::files::TransferStatus::Rejected;
+                t.error = Some(reason.to_string());
+                t.completed_at_unix_ms = Some(file_transfer_now().1);
+                true
+            }
+            Some(t) if t.direction == x0x::files::TransferDirection::Sending => {
                 tracing::warn!(
                     "Reject from wrong agent for {transfer_id}: expected {} got {sender_hex}",
                     t.remote_agent_id
                 );
-                return;
+                false
             }
-            t.status = x0x::files::TransferStatus::Rejected;
-            t.error = Some(reason.to_string());
-            t.completed_at_unix_ms = Some(file_transfer_now().1);
+            _ => false,
         }
+    };
+    if applied {
+        send_file_control_ack(state, sender, transfer_id, CONTROL_OP_REJECT).await;
     }
 }
 
@@ -926,40 +1280,91 @@ async fn cleanup_failed_transfer(state: &Arc<AppState>, transfer_id: &str) {
     state.pending_file_chunks.write().await.remove(transfer_id);
 }
 
+/// Timeout recovery and chunk admission share this predicate. A chunk that
+/// has been admitted holds `chunk_admit_held`, so this transition does not
+/// move the receive back to pending underneath that chunk.
+fn revert_unconfirmed_empty_receive(transfer: &mut x0x::files::TransferState) {
+    if transfer.direction == x0x::files::TransferDirection::Receiving
+        && transfer.status == x0x::files::TransferStatus::InProgress
+        && transfer.bytes_transferred == 0
+        && !transfer.chunk_admit_held
+    {
+        transfer.status = x0x::files::TransferStatus::Pending;
+    }
+}
+
+/// Promote a lost-ack receive and decide whether this chunk is admissible
+/// under one write lock. The admit flag stays set until the byte count moves.
+async fn begin_chunk_admission(
+    state: &Arc<AppState>,
+    sender_hex: &str,
+    transfer_id: &str,
+) -> Option<u64> {
+    let mut transfers = state.file_transfers.write().await;
+    let Some(transfer) = transfers.get_mut(transfer_id) else {
+        tracing::warn!("Ignoring chunk for unknown transfer {transfer_id}");
+        return None;
+    };
+    if transfer.accept_dispatched
+        && transfer.status == x0x::files::TransferStatus::Pending
+        && transfer.direction == x0x::files::TransferDirection::Receiving
+        && transfer.remote_agent_id == sender_hex
+    {
+        transfer.status = x0x::files::TransferStatus::InProgress;
+    }
+    match x0x::files::receive_chunk_expected_sequence(transfer, sender_hex) {
+        Ok(sequence) => {
+            transfer.chunk_admit_held = true;
+            Some(sequence)
+        }
+        Err(x0x::files::FileChunkValidationError::WrongSender) => {
+            tracing::warn!(
+                "Chunk from wrong agent for {transfer_id}: expected {} got {sender_hex}",
+                transfer.remote_agent_id
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Ignoring chunk for transfer {transfer_id} (dir={:?} status={:?})",
+                transfer.direction,
+                transfer.status
+            );
+            None
+        }
+    }
+}
+
+async fn end_chunk_admission(state: &Arc<AppState>, transfer_id: &str) {
+    let mut transfers = state.file_transfers.write().await;
+    if let Some(transfer) = transfers.get_mut(transfer_id) {
+        transfer.chunk_admit_held = false;
+    }
+}
+
+#[cfg(test)]
+async fn pause_after_chunk_admission(transfer_id: &str) {
+    let Some(hook) = file_route_test_hook() else {
+        return;
+    };
+    if hook.pause_chunk_for.as_deref() != Some(transfer_id) {
+        return;
+    }
+    hook.chunk_entered.store(true, Ordering::SeqCst);
+    while !hook.chunk_release.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::files::FileChunk) {
     let sender_hex = hex::encode(sender.as_bytes());
-
-    // Validate: transfer must exist, be a receiving transfer, be InProgress,
-    // and the sender must match the original offer's remote_agent_id.
-    let expected_sequence = {
-        let transfers = state.file_transfers.read().await;
-        match transfers.get(&chunk.transfer_id) {
-            Some(t) => match x0x::files::receive_chunk_expected_sequence(t, &sender_hex) {
-                Ok(sequence) => sequence,
-                Err(x0x::files::FileChunkValidationError::WrongSender) => {
-                    tracing::warn!(
-                        "Chunk from wrong agent for {}: expected {} got {sender_hex}",
-                        chunk.transfer_id,
-                        t.remote_agent_id
-                    );
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Ignoring chunk for transfer {} (dir={:?} status={:?})",
-                        chunk.transfer_id,
-                        t.direction,
-                        t.status
-                    );
-                    return;
-                }
-            },
-            None => {
-                tracing::warn!("Ignoring chunk for unknown transfer {}", chunk.transfer_id);
-                return;
-            }
-        }
+    let Some(expected_sequence) =
+        begin_chunk_admission(state, &sender_hex, &chunk.transfer_id).await
+    else {
+        return;
     };
+    #[cfg(test)]
+    pause_after_chunk_admission(&chunk.transfer_id).await;
 
     let data = match BASE64.decode(&chunk.data) {
         Ok(d) => d,
@@ -970,6 +1375,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
                 t.status = x0x::files::TransferStatus::Failed;
                 t.error = Some(format!("Chunk decode error: {e}"));
                 t.completed_at_unix_ms = Some(file_transfer_now().1);
+                t.chunk_admit_held = false;
             }
             drop(transfers);
             cleanup_failed_transfer(state, &chunk.transfer_id).await;
@@ -984,6 +1390,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             expected_sequence,
             "ignoring duplicate/stale file chunk"
         );
+        end_chunk_admission(state, &chunk.transfer_id).await;
         return;
     }
 
@@ -1005,6 +1412,8 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             );
         }
         // Ack even for buffered chunks: it lets the sender's window advance.
+        // The chunk is stored, so admission no longer blocks timeout recovery.
+        end_chunk_admission(state, &chunk.transfer_id).await;
         send_chunk_ack(state, sender, &chunk.transfer_id, chunk.sequence).await;
         return;
     }
@@ -1017,6 +1426,7 @@ async fn handle_file_chunk(state: &Arc<AppState>, sender: &AgentId, chunk: x0x::
             t.status = x0x::files::TransferStatus::Failed;
             t.error = Some(e);
             t.completed_at_unix_ms = Some(file_transfer_now().1);
+            t.chunk_admit_held = false;
         }
         drop(transfers);
         cleanup_failed_transfer(state, &chunk.transfer_id).await;
@@ -1109,6 +1519,7 @@ async fn apply_ready_file_chunks(
                 .get_mut(transfer_id)
                 .ok_or_else(|| "transfer disappeared while updating progress".to_string())?;
             t.bytes_transferred = new_total;
+            t.chunk_admit_held = false;
             if t.bytes_transferred == t.total_size {
                 Some(t.sha256.clone())
             } else {
@@ -1335,6 +1746,7 @@ mod tests {
             serde_json::json!({"type": "file-accept", "transfer_id": "id"}),
             serde_json::json!({"type": "file-reject", "transfer_id": "id", "reason": "no"}),
             serde_json::json!({"type": "file-chunk-ack", "transfer_id": "id", "sequence": 0}),
+            serde_json::json!({"type": "file-control-ack", "transfer_id": "id", "op": "offer"}),
         ];
         for frame in frames {
             let payload = serde_json::to_vec(&frame).expect("serialize frame");
@@ -1399,6 +1811,17 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn control_ack_slot_accepts_only_the_addressed_peer() {
+        let peer = x0x::identity::AgentId([1; 32]);
+        let other = x0x::identity::AgentId([2; 32]);
+        let slot = FileChunkAckSlot::expecting(peer);
+        assert!(slot.accepts_sender(&peer));
+        assert!(!slot.accepts_sender(&other));
+        let chunk_slot = FileChunkAckSlot::new();
+        assert!(chunk_slot.accepts_sender(&other));
     }
 
     #[test]
@@ -1479,6 +1902,613 @@ mod tests {
         assert_eq!(
             chunk.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
+        );
+    }
+
+    fn empty_hook_notify() -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
+
+    fn hook_flag() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for file-route test hook");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn route_state() -> (Arc<AppState>, tempfile::TempDir) {
+        super::super::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("file route test state")
+    }
+
+    /// v0.47.0 `CapabilityRegistry::current` before bit 3 existed.
+    fn v047_registry_bits() -> u64 {
+        x0x::dm::CapabilityRegistry::SHARE_GRANT_V1
+            | x0x::dm::CapabilityRegistry::PREDECESSOR_OFFER_V1
+            | x0x::dm::CapabilityRegistry::PEER_EVIDENCE_V1
+    }
+
+    fn advertise_registry(state: &AppState, peer: x0x::identity::AgentId, bits: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified capability advert"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_chunk_ack_does_not_complete_control_waiter() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([7; 32]);
+        let other = x0x::identity::AgentId([8; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_OFFER, &transfer_id);
+        let control = register_control_waiter(&state, &peer, &key).await;
+        let chunk_slot = Arc::new(FileChunkAckSlot::new());
+        state
+            .file_chunk_acks
+            .write()
+            .await
+            .insert(transfer_id.clone(), Arc::clone(&chunk_slot));
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ChunkAck {
+                transfer_id: key.clone(),
+                sequence: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            control.last_acked.load(Ordering::SeqCst),
+            u64::MAX,
+            "a chunk ack must not complete a control waiter"
+        );
+
+        handle_file_message(
+            &state,
+            &other,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id: transfer_id.clone(),
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), u64::MAX);
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ChunkAck {
+                transfer_id: transfer_id.clone(),
+                sequence: 4,
+            },
+        )
+        .await;
+        assert_eq!(chunk_slot.last_acked.load(Ordering::SeqCst), 4);
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), u64::MAX);
+
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id,
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        assert_eq!(control.last_acked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_control_waits_share_one_slot() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([3; 32]);
+        let key = control_ack_key(CONTROL_OP_ACCEPT, "same-accept");
+        let first = register_control_waiter(&state, &peer, &key).await;
+        let second = register_control_waiter(&state, &peer, &key).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second accept must join the live slot"
+        );
+        assert_eq!(first.waiters.load(Ordering::SeqCst), 2);
+
+        let first_wait = {
+            let slot = Arc::clone(&first);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        let second_wait = {
+            let slot = Arc::clone(&second);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        first.record_ack(0);
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first_wait)
+            .await
+            .expect("first wait")
+            .expect("first task");
+        let second_result = tokio::time::timeout(Duration::from_secs(2), second_wait)
+            .await
+            .expect("second wait")
+            .expect("second task");
+        first_result.expect("joined slot receives the ack");
+        second_result.expect("joined slot receives the ack");
+
+        release_control_waiter(&state, &key, &first).await;
+        assert!(state.file_chunk_acks.read().await.contains_key(&key));
+        release_control_waiter(&state, &key, &second).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn control_waiter_timeout_release_keeps_the_live_slot() {
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([5; 32]);
+        let key = control_ack_key(CONTROL_OP_ACCEPT, "live-accept");
+        let timed_out = register_control_waiter(&state, &peer, &key).await;
+        let live = register_control_waiter(&state, &peer, &key).await;
+        assert!(Arc::ptr_eq(&timed_out, &live));
+
+        let waiting = {
+            let slot = Arc::clone(&live);
+            tokio::spawn(async move { wait_for_control_ack(&slot).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The accept timeout path releases only the caller that finished.
+        release_control_waiter(&state, &key, &timed_out).await;
+        let current = state
+            .file_chunk_acks
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("live waiter must keep the map entry");
+        assert!(Arc::ptr_eq(&current, &live));
+
+        live.record_ack(0);
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("live wait")
+            .expect("live task")
+            .expect("ack still completes the remaining waiter");
+        release_control_waiter(&state, &key, &live).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn chunk_admission_holds_while_accept_wait_expires() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        tokio::fs::create_dir_all(&state.transfers_dir)
+            .await
+            .expect("transfers dir");
+        let sender = x0x::identity::AgentId([6; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let payload = b"test";
+        let sha256 = hex::encode(Sha256::digest(payload));
+        state.file_transfers.write().await.insert(
+            transfer_id.clone(),
+            x0x::files::TransferState {
+                transfer_id: transfer_id.clone(),
+                direction: x0x::files::TransferDirection::Receiving,
+                remote_agent_id: hex::encode(sender.as_bytes()),
+                filename: "note.txt".to_string(),
+                total_size: payload.len() as u64,
+                bytes_transferred: 0,
+                status: x0x::files::TransferStatus::Pending,
+                sha256,
+                error: None,
+                started_at: 0,
+                started_at_unix_ms: 0,
+                completed_at_unix_ms: None,
+                source_path: None,
+                output_path: None,
+                chunk_size: x0x::files::DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                accept_dispatched: true,
+                chunk_admit_held: false,
+            },
+        );
+        let chunk_entered = hook_flag();
+        let chunk_release = hook_flag();
+        let entered = Arc::clone(&chunk_entered);
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: Some(transfer_id.clone()),
+            chunk_entered,
+            chunk_release: Arc::clone(&chunk_release),
+        });
+        let state_for_chunk = Arc::clone(&state);
+        let chunk_id = transfer_id.clone();
+        let chunk_task = tokio::spawn(async move {
+            handle_file_chunk(
+                &state_for_chunk,
+                &sender,
+                x0x::files::FileChunk {
+                    transfer_id: chunk_id,
+                    sequence: 0,
+                    data: BASE64.encode(payload),
+                },
+            )
+            .await;
+        });
+        wait_for_flag(&entered).await;
+        {
+            let mut transfers = state.file_transfers.write().await;
+            let transfer = transfers
+                .get_mut(&transfer_id)
+                .expect("transfer remains during the pause");
+            assert!(transfer.chunk_admit_held);
+            assert_eq!(transfer.status, x0x::files::TransferStatus::InProgress);
+            assert_eq!(transfer.bytes_transferred, 0);
+            revert_unconfirmed_empty_receive(transfer);
+            assert_eq!(
+                transfer.status,
+                x0x::files::TransferStatus::InProgress,
+                "accept timeout must not return an admitted chunk to pending"
+            );
+        }
+        chunk_release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), chunk_task)
+            .await
+            .expect("chunk task")
+            .expect("chunk task join");
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("transfer after chunk");
+        assert_eq!(transfer.bytes_transferred, payload.len() as u64);
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Complete);
+        assert!(!transfer.chunk_admit_held);
+    }
+
+    #[tokio::test]
+    async fn control_ack_wait_ends_on_shutdown_when_ack_is_withheld() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([4; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_ACCEPT, &transfer_id);
+        let held = register_control_waiter(&state, &peer, &key).await;
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send_id = transfer_id.clone();
+        let send = tokio::spawn(async move {
+            send_file_message(
+                &state_for_send,
+                &peer,
+                &x0x::files::FileMessage::Accept {
+                    transfer_id: send_id,
+                },
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while held.waiters.load(Ordering::SeqCst) < 2 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("second accept did not join the control waiter");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state.shutdown_started.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("shutdown must not wait out the withheld ack")
+            .expect("send task")
+            .expect_err("withheld ack during shutdown is not success");
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(
+            state.file_chunk_acks.read().await.contains_key(&key),
+            "shutdown must release only the cancelled caller"
+        );
+        assert_eq!(held.waiters.load(Ordering::SeqCst), 1);
+        release_control_waiter(&state, &key, &held).await;
+        assert!(!state.file_chunk_acks.read().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn control_delivery_selects_shutdown() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([9; 32]);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = control_ack_key(CONTROL_OP_OFFER, &transfer_id);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let entered = hook_flag();
+        let gate = empty_hook_notify();
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: false,
+            egress_gate: Some(Arc::clone(&gate)),
+            egress_entered: Arc::clone(&entered),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send_id = transfer_id.clone();
+        let send = tokio::spawn(async move {
+            send_file_message(
+                &state_for_send,
+                &peer,
+                &x0x::files::FileMessage::Offer(x0x::files::FileOffer {
+                    transfer_id: send_id,
+                    filename: "a.bin".to_string(),
+                    size: 1,
+                    sha256: "abc".to_string(),
+                    chunk_size: 32,
+                    total_chunks: 1,
+                }),
+            )
+            .await
+        });
+        wait_for_flag(&entered).await;
+        state.shutdown_started.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("shutdown during delivery")
+            .expect("send task")
+            .expect_err("delivery must stop on shutdown");
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(
+            !state.file_chunk_acks.read().await.contains_key(&key),
+            "the only caller must drop its slot on shutdown"
+        );
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn v047_peer_without_file_control_bit_keeps_a_stored_offer() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([11; 32]);
+        advertise_registry(&state, peer, v047_registry_bits());
+        assert_eq!(
+            state.agent.capability_store().verified_registry_supports(
+                &peer,
+                x0x::dm::CapabilityRegistry::FILE_CONTROL_ACK_V1,
+            ),
+            Some(false),
+            "a v0.47.0 advert must not advertise bit 3"
+        );
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            file_send_handler(
+                State(Arc::clone(&state)),
+                Json(serde_json::json!({
+                    "agent_id": hex::encode(peer.as_bytes()),
+                    "filename": "old-peer.bin",
+                    "size": 4,
+                    "sha256": "abc",
+                })),
+            ),
+        )
+        .await
+        .expect("a peer that does not advertise the bit must not wait for file-control-ack")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .values()
+            .find(|transfer| transfer.filename == "old-peer.bin")
+            .cloned()
+            .expect("local send");
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Pending);
+        assert!(transfer.error.is_none());
+        assert!(
+            state
+                .file_chunk_acks
+                .read()
+                .await
+                .keys()
+                .all(|key| !key.starts_with("ctrl:")),
+            "the old path must not register a control waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_that_advertises_file_control_bit_waits_for_the_ack() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([12; 32]);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let state_for_send = Arc::clone(&state);
+        let send = tokio::spawn(async move {
+            file_send_handler(
+                State(state_for_send),
+                Json(serde_json::json!({
+                    "agent_id": hex::encode(peer.as_bytes()),
+                    "filename": "new-peer.bin",
+                    "size": 4,
+                    "sha256": "abc",
+                })),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let transfer_id = loop {
+            let slots = state.file_chunk_acks.read().await;
+            if let Some(key) = slots.keys().find(|key| key.starts_with("ctrl:offer:")) {
+                break key.trim_start_matches("ctrl:offer:").to_string();
+            }
+            drop(slots);
+            if tokio::time::Instant::now() >= deadline {
+                panic!("a peer that advertises bit 3 must wait for file-control-ack");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        handle_file_message(
+            &state,
+            &peer,
+            x0x::files::FileMessage::ControlAck {
+                transfer_id: transfer_id.clone(),
+                op: CONTROL_OP_OFFER.to_string(),
+            },
+        )
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(2), send)
+            .await
+            .expect("ack must release the waiter")
+            .expect("send task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("local send");
+        assert_eq!(transfer.status, x0x::files::TransferStatus::Pending);
+        assert!(transfer.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_ack_is_sent_unless_a_verified_advert_lacks_the_bit() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let unknown = x0x::identity::AgentId([13; 32]);
+        let old = x0x::identity::AgentId([14; 32]);
+        let current = x0x::identity::AgentId([15; 32]);
+        advertise_registry(&state, old, v047_registry_bits());
+        advertise_registry(&state, current, x0x::dm::CapabilityRegistry::current().bits);
+        let entered = hook_flag();
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: Arc::clone(&entered),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+
+        send_file_control_ack(&state, &unknown, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "no verified advert still sends the frame"
+        );
+
+        entered.store(false, Ordering::SeqCst);
+        send_file_control_ack(&state, &old, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "a v0.47.0 advert must not receive file-control-ack"
+        );
+
+        send_file_control_ack(&state, &current, "id", CONTROL_OP_OFFER).await;
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "a peer that advertises bit 3 must receive file-control-ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_with_required_bit_fails_when_ack_is_withheld() {
+        let _hook_tests = FILE_ROUTE_HOOK_TEST_LOCK.lock().await;
+        let (state, _dir) = route_state().await;
+        let peer = x0x::identity::AgentId([16; 32]);
+        advertise_registry(&state, peer, x0x::dm::CapabilityRegistry::current().bits);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        state.file_transfers.write().await.insert(
+            transfer_id.clone(),
+            x0x::files::TransferState {
+                transfer_id: transfer_id.clone(),
+                direction: x0x::files::TransferDirection::Receiving,
+                remote_agent_id: hex::encode(peer.as_bytes()),
+                filename: "reject-me.bin".to_string(),
+                total_size: 4,
+                bytes_transferred: 0,
+                status: x0x::files::TransferStatus::Pending,
+                sha256: "abc".to_string(),
+                error: None,
+                started_at: 0,
+                started_at_unix_ms: 0,
+                completed_at_unix_ms: None,
+                source_path: None,
+                output_path: None,
+                chunk_size: x0x::files::DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                accept_dispatched: false,
+                chunk_admit_held: false,
+            },
+        );
+        let _hook = install_file_route_hook(FileRouteTestHook {
+            stub_egress: true,
+            egress_gate: None,
+            egress_entered: hook_flag(),
+            pause_chunk_for: None,
+            chunk_entered: hook_flag(),
+            chunk_release: hook_flag(),
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(12),
+            file_reject_handler(State(Arc::clone(&state)), Path(transfer_id.clone()), None),
+        )
+        .await
+        .expect("a withheld ack must fail inside the control wait")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("reject body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("reject json");
+        assert_eq!(body["ok"], false, "{body}");
+        let transfer = state
+            .file_transfers
+            .read()
+            .await
+            .get(&transfer_id)
+            .cloned()
+            .expect("local receive");
+        assert_eq!(
+            transfer.status,
+            x0x::files::TransferStatus::Rejected,
+            "the local rejection stays"
         );
     }
 }

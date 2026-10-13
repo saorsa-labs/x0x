@@ -79,12 +79,19 @@ impl CapabilityRegistry {
     /// Hello/Lookup streams (ADR 0089, canonical bit 2 in the ADR 0093
     /// registry table in `docs/adr/README.md`).
     pub const PEER_EVIDENCE_V1: u64 = 1 << 2;
+    /// Sends and expects `file-control-ack` for file offer, accept, and
+    /// reject. Bit 3. Recorded in the accepted transient A10 decision.
+    /// ADR 0093's bytes stay unchanged.
+    pub const FILE_CONTROL_ACK_V1: u64 = 1 << 3;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
         Self {
             version: 1,
-            bits: Self::SHARE_GRANT_V1 | Self::PREDECESSOR_OFFER_V1 | Self::PEER_EVIDENCE_V1,
+            bits: Self::SHARE_GRANT_V1
+                | Self::PREDECESSOR_OFFER_V1
+                | Self::PEER_EVIDENCE_V1
+                | Self::FILE_CONTROL_ACK_V1,
         }
     }
 

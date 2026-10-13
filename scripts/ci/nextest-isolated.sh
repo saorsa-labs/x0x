@@ -35,4 +35,10 @@ cargo nextest list "${build[@]}" --locked --cargo-metadata "$scratch/cargo.json"
   --list-type binaries-only --message-format json > "$scratch/binaries.json"
 sha256sum --check "$scratch/lock.sha256"
 python3 scripts/ci/nextest-reuse.py record "$scratch"
+# file_v047_interop speaks to the published v0.47.0 daemon. Fetch it here,
+# while this process still has a network. The test namespace is loopback-only
+# and a shallow checkout does not contain that commit.
+case $(<"$scratch/binaries.json") in
+  *file_v047_interop*) bash scripts/ci/prepare-v047-pinned.sh ;;
+esac
 X0X_CUSTODY_SCRATCH="$scratch" python3 scripts/ci/isolated-runtime.py python3 scripts/ci/nextest-reuse.py run "$scratch" "$@"

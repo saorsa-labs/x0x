@@ -30,6 +30,8 @@ mod w3h;
 mod ws;
 
 #[cfg(test)]
+mod issue1102;
+#[cfg(test)]
 mod issue1288_ws_shutdown;
 #[cfg(test)]
 mod shutdown_regression;

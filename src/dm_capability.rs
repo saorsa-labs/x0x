@@ -431,6 +431,21 @@ impl CapabilityStore {
         Ok(())
     }
 
+    /// `Some(true)` only when this agent's current verified advert sets
+    /// `bit`. `Some(false)` means that advert lacks the bit. `None` means
+    /// there is no current verified advert (unknown, expired, or card-only).
+    pub fn verified_registry_supports(&self, agent_id: &AgentId, bit: u64) -> Option<bool> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        let entry = inner.adverts.get(agent_id.as_bytes())?;
+        if !entry.verified_advert || entry.machine_id == [0; 32] || now > entry.expires_at {
+            return None;
+        }
+        Some(entry.capabilities.application_registry.supports(bit))
+    }
+
     /// Whether the newest CURRENT VERIFIED advert signed by `machine`
     /// supports `bit` (ADR 0089 S5 / ADR 0093 bit 2).
     ///
@@ -1730,6 +1745,8 @@ mod s5_bit2_tests {
         assert!(registry.supports(CapabilityRegistry::PEER_EVIDENCE_V1));
         assert!(registry.supports(CapabilityRegistry::SHARE_GRANT_V1));
         assert!(registry.supports(CapabilityRegistry::PREDECESSOR_OFFER_V1));
+        assert!(registry.supports(CapabilityRegistry::FILE_CONTROL_ACK_V1));
+        assert_eq!(CapabilityRegistry::FILE_CONTROL_ACK_V1, 1 << 3);
     }
 
     #[test]

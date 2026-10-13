@@ -172,3 +172,10 @@ test-group = "membership-cluster"
 [[profile.default.overrides]]
 filter = "test(legacy_bus_interop_tests::)"
 test-group = "quic-localhost"
+
+# Pinned v0.47.0 file interop builds that daemon on a cache miss, then
+# runs two loopback daemons. The first match wins, so this stays specific.
+[[profile.default.overrides]]
+filter = "test(=v047_pinned_peer_stores_accepts_and_rejects_both_ways)"
+test-group = "quic-localhost"
+slow-timeout = { period = "120s", terminate-after = 8 }
