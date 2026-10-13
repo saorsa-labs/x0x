@@ -19,7 +19,7 @@
 //! here with a reason. That prevents the GUI from silently drifting.
 
 use std::collections::HashSet;
-use x0x::api::{Method, ENDPOINTS};
+use x0x::api::{FieldLocation, Method, RequestSpec, ENDPOINTS};
 
 const GUI_HTML: &str = include_str!("../src/gui/x0x-gui.html");
 
@@ -156,6 +156,9 @@ const DEFERRED: &[(Method, &str, &str)] = &[
 struct ApiCall {
     expr: String,
     method: Option<String>,
+    /// Text after the path argument. Holds the options object when the
+    /// call sends one.
+    options: String,
 }
 
 /// Walk the GUI HTML and capture every `api(...)` invocation. The
@@ -211,11 +214,16 @@ fn gui_api_calls() -> Vec<ApiCall> {
         let (expr, rest) = split_top_level_comma(args);
         let expr = expr.trim().to_string();
         let method = extract_method_kw(rest);
+        let options = rest.trim().trim_start_matches(',').trim().to_string();
         // Heuristic: only keep calls whose first arg looks like a
         // path literal (starts with a quote followed by `/`).
         let is_pathish = looks_like_path_arg(&expr);
         if is_pathish {
-            out.push(ApiCall { expr, method });
+            out.push(ApiCall {
+                expr,
+                method,
+                options,
+            });
         }
         i = j;
     }
@@ -576,6 +584,7 @@ fn deferred_entries_remain_deferred_when_a_gui_call_matches() {
     let calls = [ApiCall {
         expr: "'/groups/' + groupId + '/members'".to_string(),
         method: Some("POST".to_string()),
+        options: String::new(),
     }];
 
     assert!(
@@ -647,6 +656,322 @@ fn gui_renders_admin_controls_inline() {
     assert!(GUI_HTML.contains("data-nag-policy-apply"));
     assert!(GUI_HTML.contains("data-nag-state-seal"));
     assert!(GUI_HTML.contains("data-nag-state-withdraw"));
+}
+
+/// #1399: these GUI calls used to send a JSON name the route does not
+/// read. The route then returned 422. The names below are the body
+/// fields in `ENDPOINTS`.
+const BODY_SHAPE_CALLS: &[(Method, &str)] = &[
+    (Method::Post, "/mls/groups/:id/encrypt"),
+    (Method::Put, "/groups/:id/display-name"),
+];
+
+fn registry_body_fields(
+    method: Method,
+    path: &str,
+) -> Result<(Vec<&'static str>, Vec<&'static str>), String> {
+    let endpoint = ENDPOINTS
+        .iter()
+        .find(|endpoint| endpoint.method == method && endpoint.path == path)
+        .ok_or_else(|| format!("no endpoint {method} {path}"))?;
+    let RequestSpec::Fields(fields) = endpoint.request else {
+        return Err(format!("{method} {path} has no named field list"));
+    };
+    let body: Vec<_> = fields
+        .iter()
+        .filter(|field| field.location == FieldLocation::Body)
+        .collect();
+    let allowed: Vec<_> = body.iter().map(|field| field.name).collect();
+    let required: Vec<_> = body
+        .iter()
+        .filter(|field| field.required)
+        .map(|field| field.name)
+        .collect();
+    Ok((allowed, required))
+}
+
+fn body_contract_error(sent: &[&str], allowed: &[&str], required: &[&str]) -> Option<String> {
+    let missing: Vec<_> = required
+        .iter()
+        .copied()
+        .filter(|name| !sent.contains(name))
+        .collect();
+    let unknown: Vec<_> = sent
+        .iter()
+        .copied()
+        .filter(|name| !allowed.contains(name))
+        .collect();
+    if missing.is_empty() && unknown.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "missing required {missing:?}; unknown {unknown:?}; sent {sent:?}; allowed {allowed:?}"
+        ))
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn read_key(src: &str, start: usize) -> Result<(String, usize), String> {
+    let bytes = src.as_bytes();
+    let index = skip_ws(bytes, start);
+    if index >= bytes.len() {
+        return Err("missing object key".to_string());
+    }
+    let quote = bytes[index];
+    if quote == b'\'' || quote == b'"' {
+        let mut end = index + 1;
+        while end < bytes.len() {
+            if bytes[end] == b'\\' {
+                end += 2;
+                continue;
+            }
+            if bytes[end] == quote {
+                return Ok((src[index + 1..end].to_string(), end + 1));
+            }
+            end += 1;
+        }
+        return Err("unterminated object key".to_string());
+    }
+    if !(quote.is_ascii_alphabetic() || quote == b'_' || quote == b'$') {
+        return Err(format!("unsupported object key at '{}'", quote as char));
+    }
+    let mut end = index + 1;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$')
+    {
+        end += 1;
+    }
+    Ok((src[index..end].to_string(), end))
+}
+
+fn read_value(src: &str, start: usize) -> Result<(String, usize), String> {
+    let bytes = src.as_bytes();
+    let value_start = skip_ws(bytes, start);
+    let mut index = value_start;
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    while index < bytes.len() {
+        let current = bytes[index];
+        if let Some(quote) = in_str {
+            if current == b'\\' {
+                index += 2;
+                continue;
+            }
+            if current == quote {
+                in_str = None;
+            }
+            index += 1;
+            continue;
+        }
+        match current {
+            b'\'' | b'"' | b'`' => {
+                in_str = Some(current);
+                index += 1;
+            }
+            b'(' | b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' | b'}' | b']' if depth == 0 => break,
+            b')' | b'}' | b']' => {
+                depth -= 1;
+                index += 1;
+            }
+            b',' if depth == 0 => break,
+            _ => index += 1,
+        }
+    }
+    if index == value_start {
+        return Err("missing object value".to_string());
+    }
+    Ok((src[value_start..index].trim().to_string(), index))
+}
+
+fn parse_object_fields(src: &str) -> Result<(Vec<(String, String)>, usize), String> {
+    let bytes = src.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return Err("object literal must start with '{'".to_string());
+    }
+    let mut index = 1usize;
+    let mut fields = Vec::new();
+    loop {
+        index = skip_ws(bytes, index);
+        if index >= bytes.len() {
+            return Err("unterminated object literal".to_string());
+        }
+        if bytes[index] == b'}' {
+            return Ok((fields, index + 1));
+        }
+        let (name, next) = read_key(src, index)?;
+        index = skip_ws(bytes, next);
+        let value = if index < bytes.len() && bytes[index] == b':' {
+            index += 1;
+            let (value, next) = read_value(src, index)?;
+            index = next;
+            value
+        } else {
+            name.clone()
+        };
+        fields.push((name, value));
+        index = skip_ws(bytes, index);
+        if index >= bytes.len() {
+            return Err("unterminated object literal".to_string());
+        }
+        match bytes[index] {
+            b',' => index += 1,
+            b'}' => return Ok((fields, index + 1)),
+            other => {
+                return Err(format!(
+                    "expected ',' or '}}' after a field, found '{}'",
+                    other as char
+                ));
+            }
+        }
+    }
+}
+
+fn json_stringify_object_fields(options: &str) -> Result<Vec<(String, String)>, String> {
+    let marker = "JSON.stringify(";
+    let mut found = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(relative) = options[search_from..].find(marker) {
+        let start = search_from + relative + marker.len();
+        let arg = options[start..].trim_start();
+        let absolute = start + (options[start..].len() - arg.len());
+        if arg.starts_with('{') {
+            let (fields, consumed) = parse_object_fields(&options[absolute..])?;
+            found.push(fields);
+            search_from = absolute + consumed;
+        } else {
+            search_from = start;
+        }
+    }
+    match found.len() {
+        1 => found
+            .pop()
+            .ok_or_else(|| "JSON.stringify object disappeared".to_string()),
+        0 => Err("call has no JSON.stringify object literal".to_string()),
+        count => Err(format!("call has {count} JSON.stringify object literals")),
+    }
+}
+
+fn gui_call_for<'a>(
+    method: Method,
+    path: &str,
+    calls: &'a [ApiCall],
+) -> Result<&'a ApiCall, String> {
+    let wanted = format!("{method}");
+    let matches: Vec<_> = calls
+        .iter()
+        .filter(|call| {
+            let method_matches = match &call.method {
+                Some(seen) => seen.eq_ignore_ascii_case(&wanted),
+                None => wanted == "GET",
+            };
+            method_matches && expr_contains_template(&call.expr, path)
+        })
+        .collect();
+    match matches.len() {
+        1 => matches
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("call for {method} {path} disappeared")),
+        0 => Err(format!("GUI has no {method} {path} call")),
+        count => Err(format!("GUI has {count} {method} {path} calls")),
+    }
+}
+
+#[test]
+fn object_literal_keys_cover_shorthand_and_explicit_fields() {
+    let shorthand = parse_object_fields("{plaintext}").expect("shorthand object");
+    assert_eq!(
+        shorthand.0,
+        vec![("plaintext".to_string(), "plaintext".to_string())]
+    );
+    let encoded = parse_object_fields("{payload:u8encode(plaintext)}").expect("explicit object");
+    assert_eq!(
+        encoded.0,
+        vec![("payload".to_string(), "u8encode(plaintext)".to_string())]
+    );
+    let display = parse_object_fields("{display_name: name}").expect("display name object");
+    assert_eq!(
+        display.0,
+        vec![("display_name".to_string(), "name".to_string())]
+    );
+    let name = parse_object_fields("{name}").expect("name shorthand");
+    assert_eq!(name.0, vec![("name".to_string(), "name".to_string())]);
+}
+
+#[test]
+fn issue_1399_old_body_keys_do_not_match_the_routes() {
+    let (allowed, required) =
+        registry_body_fields(Method::Post, "/mls/groups/:id/encrypt").expect("encrypt fields");
+    let encrypt = body_contract_error(&["plaintext"], &allowed, &required);
+    assert!(
+        encrypt.is_some(),
+        "plaintext must not satisfy the payload field"
+    );
+
+    let (allowed, required) =
+        registry_body_fields(Method::Put, "/groups/:id/display-name").expect("display-name fields");
+    let display = body_contract_error(&["display_name"], &allowed, &required);
+    assert!(
+        display.is_some(),
+        "display_name must not satisfy the name field"
+    );
+}
+
+#[test]
+fn gui_mls_encrypt_and_display_name_send_route_field_names() {
+    let calls = gui_api_calls();
+    let mut failures = Vec::new();
+    for (method, path) in BODY_SHAPE_CALLS {
+        let (allowed, required) = match registry_body_fields(*method, path) {
+            Ok(fields) => fields,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        let call = match gui_call_for(*method, path, &calls) {
+            Ok(call) => call,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        let fields = match json_stringify_object_fields(&call.options) {
+            Ok(fields) => fields,
+            Err(error) => {
+                failures.push(format!("{method} {path}: {error}"));
+                continue;
+            }
+        };
+        let sent: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        if let Some(error) = body_contract_error(&sent, &allowed, &required) {
+            failures.push(format!("{method} {path}: {error}"));
+        }
+        if *path == "/mls/groups/:id/encrypt" {
+            let payload = fields.iter().find(|(name, _)| name == "payload");
+            let encoded = payload.is_some_and(|(_, value)| value.contains("u8encode("));
+            if !encoded {
+                failures.push(format!(
+                    "{method} {path}: payload must be standard base64 via u8encode, got {fields:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n\nGUI JSON field names do not match the routes (#1399):\n{}\n",
+        failures.join("\n")
+    );
 }
 
 const GUI_PARITY_REPORT_PATH: &str = "tests/proof-reports/parity/gui-named-groups-coverage.txt";

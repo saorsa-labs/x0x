@@ -178,6 +178,14 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
+- **The GUI sends the JSON field each of these two routes reads (#1399).**
+  The MLS encrypt pane sent `plaintext`. `POST /mls/groups/:id/encrypt`
+  reads `payload` and base64-decodes it, so the call returned 422. The pane
+  now sends `payload` as standard base64 of the UTF-8 text.
+  `setSpaceDisplayName` sent `display_name`. `PUT /groups/:id/display-name`
+  reads `name`. The call now sends `name`. The GUI parity test checks both
+  bodies against the endpoint registry. A wrong field name fails that test.
+
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)

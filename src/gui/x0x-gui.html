@@ -4343,7 +4343,7 @@ async function mlsSendWelcome(gid){
 async function mlsEncryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const plaintext=document.getElementById('mls-plain').value||'';
-  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({payload:u8encode(plaintext)})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.ciphertext){
     document.getElementById('mls-cipher').value=r.ciphertext;
@@ -5843,7 +5843,7 @@ async function genSpaceInvite(gid){
 async function setSpaceDisplayName(gid){
   const name=document.getElementById('detail-dname').value.trim();
   if(!name)return;
-  await api('/groups/'+gid+'/display-name',{method:'PUT',body:JSON.stringify({display_name:name})});
+  await api('/groups/'+gid+'/display-name',{method:'PUT',body:JSON.stringify({name})});
   toast('Display name set','success');
 }
 
