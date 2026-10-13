@@ -308,6 +308,20 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
+- **A corrupt revocation store is quarantined and x0xd keeps running (#1116).**
+  A present revocation file that cannot be decoded is moved to
+  `<file>.quarantined-<unix-ms>` (a taken name gets `-<seq>`). The live path
+  no longer holds those bytes. x0xd starts and keeps running. The next start
+  sees the quarantine name, does not read that payload, and stays closed.
+  Startup writes one error log line. `GET /status` and `x0x status` set
+  `revocation_resync_required` and include the same sentence in `warnings`.
+  The first status read also sends one `status` event on `/events`. Until
+  the group resyncs revocations, or an operator places a readable file on
+  the live path, membership fails closed. A member whose non-revocation
+  cannot be verified is treated as revoked. An empty snapshot does not open
+  membership. Accepted transient record:
+  `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not folded).
+
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
