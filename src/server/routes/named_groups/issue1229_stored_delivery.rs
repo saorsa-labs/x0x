@@ -2,11 +2,13 @@
 //! A row that was stored while the sender was allowed must disappear
 //! after that sender is Blocked or revoked. A third author stays.
 
+#![cfg(test)]
+
 use super::tests::secure_endpoint_test_state;
 use super::{build_group_public_history_record, get_group_public_messages};
 use crate as x0x;
 use crate::server::state::AppState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
@@ -37,18 +39,18 @@ async fn message_bodies(app: &axum::Router) -> Result<BTreeSet<String>> {
     let bytes = to_bytes(response.into_body(), 1 << 20).await?;
     let json: serde_json::Value = serde_json::from_slice(&bytes)?;
     assert_eq!(status, StatusCode::OK, "{json}");
-    let bodies = json["messages"]
+    let messages = json["messages"]
         .as_array()
-        .unwrap_or_else(|| panic!("messages array missing: {json}"))
+        .with_context(|| format!("messages array missing: {json}"))?;
+    messages
         .iter()
         .map(|message| {
             message["body"]
                 .as_str()
-                .unwrap_or_else(|| panic!("message body missing: {message}"))
-                .to_string()
+                .map(str::to_string)
+                .with_context(|| format!("message body missing: {message}"))
         })
-        .collect();
-    Ok(bodies)
+        .collect()
 }
 
 fn signed(
@@ -56,7 +58,7 @@ fn signed(
     keypair: &x0x::identity::AgentKeypair,
     body: &str,
     timestamp: u64,
-) -> x0x::groups::GroupPublicMessage {
+) -> Result<x0x::groups::GroupPublicMessage> {
     x0x::groups::GroupPublicMessage::sign(
         group_id.to_string(),
         "state".into(),
@@ -70,7 +72,7 @@ fn signed(
         None,
         None,
     )
-    .expect("sign public message")
+    .context("sign public message")
 }
 
 #[tokio::test]
@@ -89,9 +91,9 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
     let blocked_kp = x0x::identity::AgentKeypair::generate()?;
     let revoked_kp = x0x::identity::AgentKeypair::generate()?;
     let kept_kp = x0x::identity::AgentKeypair::generate()?;
-    let blocked = signed(&stable, &blocked_kp, "from-cache", 1);
-    let revoked = signed(&stable, &revoked_kp, "from-history", 2);
-    let kept = signed(&stable, &kept_kp, "kept", 3);
+    let blocked = signed(&stable, &blocked_kp, "from-cache", 1)?;
+    let revoked = signed(&stable, &revoked_kp, "from-history", 2)?;
+    let kept = signed(&stable, &kept_kp, "kept", 3)?;
 
     state
         .public_messages
@@ -99,9 +101,10 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
         .await
         .insert(stable.clone(), vec![blocked, kept.clone()]);
 
-    let store = state.agent.history().expect("history").store();
+    let store = state.agent.history().context("history")?.store();
     for message in [&revoked, &kept] {
-        let record = build_group_public_history_record(&state, message).expect("history record");
+        let record =
+            build_group_public_history_record(&state, message).context("history record")?;
         store.insert(&record)?;
     }
 
