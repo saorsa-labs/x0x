@@ -159,6 +159,8 @@ struct MachineBudget {
     attempted: bool,
     hello_generation: Option<u64>,
     hello_attempts: HelloAttempts,
+    // The highest generation seen. Only the reply gate reads it.
+    hello_highest: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
 }
@@ -172,6 +174,12 @@ impl MachineBudget {
     // attempted Hello. Those never re-arm, so a delayed job cannot re-arm a
     // previously used connection. Returns true when the marker moved.
     fn observe_hello_generation(&mut self, generation: u64) -> bool {
+        if self
+            .hello_highest
+            .is_none_or(|highest| highest < generation)
+        {
+            self.hello_highest = Some(generation);
+        }
         if self.hello_generation == Some(generation) {
             return false;
         }
@@ -454,11 +462,32 @@ impl Limits {
     fn begin_hello(&self, machine: MachineId, related: bool) -> bool {
         self.begin_hello_on_connection(machine, related, None)
     }
+    // Outbound Hello on a stream this node opened. The caller proves the
+    // connection: the generation is Live before and after the open.
     fn begin_hello_on_connection(
         &self,
         machine: MachineId,
         related: bool,
         generation: Option<u64>,
+    ) -> bool {
+        self.begin_hello_attempt(machine, related, generation, false)
+    }
+    // A Hello reply on an accepted stream (#1346 R2). ant-quic 0.27.57 and
+    // 0.27.58 accept_bi do not say which connection carried the stream, and
+    // a superseded connection stays open. So the reply cannot prove that
+    // `generation` (the Live one) carries it. It charges `generation` only
+    // when no higher generation was seen: then the answer is the same as
+    // before #1346 for every stream. A lower Live winner gets its Hello from
+    // the outbound paths, which prove the connection.
+    fn begin_hello_reply(&self, machine: MachineId, related: bool, generation: u64) -> bool {
+        self.begin_hello_attempt(machine, related, Some(generation), true)
+    }
+    fn begin_hello_attempt(
+        &self,
+        machine: MachineId,
+        related: bool,
+        generation: Option<u64>,
+        reply: bool,
     ) -> bool {
         if !related {
             return false;
@@ -476,6 +505,9 @@ impl Limits {
         // A generation that already attempted Hello stays consumed (#1346).
         if let Some(id) = generation {
             m.observe_hello_generation(id);
+            if reply && m.hello_highest.is_some_and(|highest| highest > id) {
+                return false;
+            }
         }
         if m.attempted
             || m.hello_out
@@ -919,6 +951,13 @@ impl Context {
         };
         let lease = Arc::new(lease);
         let machine = stream.peer();
+        // The Live connection when the request is taken (#1346 R2). A Hello
+        // reply needs the same Live connection when it is built.
+        let accepted = self
+            .network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+            .ok()
+            .flatten();
         let (mut send, mut recv) = stream.into_split();
         let result = tokio::time::timeout_at(lease.deadline, async {
             let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
@@ -1071,7 +1110,7 @@ impl Context {
                     if !crate::dm_capability_service::advert_is_publishable(
                         &self.capabilities.borrow(),
                     ) || self
-                        .begin_hello_current(machine, self.related(machine).await)
+                        .begin_hello_current(machine, self.related(machine).await, accepted)
                         .is_none()
                     {
                         let body = codec().serialize(&have_peer).map_err(io::Error::other)?;
@@ -1099,7 +1138,16 @@ impl Context {
             tracing::debug!(?machine, "evidence stream refused/reset");
         }
     }
-    fn begin_hello_current(&self, machine: MachineId, related: bool) -> Option<u64> {
+    // The reply goes back on the accepted stream. ant-quic does not say which
+    // connection carried it (#1346 R2), so this fails closed (ACK only) when
+    // the Live connection changed since the request was taken, or when it is
+    // unreadable. begin_hello_reply adds the generation rule.
+    fn begin_hello_current(
+        &self,
+        machine: MachineId,
+        related: bool,
+        accepted: Option<u64>,
+    ) -> Option<u64> {
         let Ok(Some(generation)) = self
             .network
             .try_connection_generation(&ant_quic::PeerId(machine.0))
@@ -1113,10 +1161,18 @@ impl Context {
             );
             return None;
         };
+        if accepted != Some(generation) {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_connection_changed",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        }
         if !self
             .runtime
             .wire_limits
-            .begin_hello_on_connection(machine, related, Some(generation))
+            .begin_hello_reply(machine, related, generation)
         {
             tracing::debug!(
                 %machine,

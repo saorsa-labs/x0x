@@ -1673,8 +1673,12 @@ fn issue1346_age_hello_gate(limits: &Limits, machine: MachineId) {
     budget.hello_in = Some(aged);
 }
 
+// R2: step 3 was first written as a reply. A reply cannot prove which
+// connection carried A's Hello (the R2 tests below), and B already saw
+// generation 2, so the reply is ACK only and spends nothing. B's one Hello on
+// the winner goes out on the readiness pass, which proves its connection.
 #[test]
-fn issue1346_red_follower_replies_once_on_lower_generation_winner() {
+fn issue1346_red_follower_sends_once_on_lower_generation_winner() {
     let limits = Arc::new(Limits::default());
     let machine = MachineId([46; 32]);
     let mut connections = ReadyConnections::new(1);
@@ -1693,21 +1697,63 @@ fn issue1346_red_follower_replies_once_on_lower_generation_winner() {
         "the readiness pass must re-arm the Live winner"
     );
     assert!(limits.hello_candidate(machine, 1));
-    // 3. A's Hello on generation 1 reaches B. The reply gate
-    //    (begin_hello_current) must let B send its own Hello once.
+    // 3. A's Hello on generation 1 reaches B. The reply cannot prove its
+    //    connection, and generation 2 was seen: ACK only, nothing spent.
     assert!(limits.request(machine, true));
+    assert!(!limits.begin_hello_reply(machine, true, 1));
+    assert!(limits.hello_pending(machine));
+    assert!(limits.hello_candidate(machine, 1));
+    //    The readiness pass sends B's Hello on the Live winner, once.
     assert!(
         limits.begin_hello_on_connection(machine, true, Some(1)),
-        "B must reply with its Hello on the Live winner"
+        "B must send its Hello on the Live winner"
     );
     // 4. A second Hello on generation 1, after the attempt, must not re-arm
     //    it. This holds also after the 60 s machine gates expire.
     issue1346_age_hello_gate(&limits, machine);
     assert!(limits.request(machine, true));
+    assert!(!limits.begin_hello_reply(machine, true, 1));
     assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
     assert!(!limits.hello_candidate(machine, 1));
     connections.generation(machine, 1, &jobs, &limits);
     assert!(!limits.hello_pending(machine));
+}
+
+#[test]
+fn issue1346_r2_reply_gate_charges_only_the_highest_generation_seen() {
+    let limits = Limits::default();
+    let machine = MachineId([49; 32]);
+    // No generation seen yet (#1346 default config): a reply on the Live
+    // winner carries Hello.
+    assert!(limits.begin_hello_reply(machine, true, 1));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_reply(machine, true, 1), "one try");
+    // A newer connection is the highest generation seen: one reply.
+    assert!(limits.begin_hello_reply(machine, true, 2));
+    issue1346_age_hello_gate(&limits, machine);
+    // A lower Live winner with no attempt: the reply spends nothing, and
+    // the proved outbound path still has its one attempt.
+    limits.hello_connection(machine, 3);
+    limits.hello_connection(machine, 0);
+    assert!(!limits.begin_hello_reply(machine, true, 0));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(!budget.hello_attempted(0));
+        assert_eq!(budget.hello_highest, Some(3));
+        assert!(budget
+            .hello_out
+            .is_some_and(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL));
+    }
+    assert!(limits.begin_hello_on_connection(machine, true, Some(0)));
+    issue1346_age_hello_gate(&limits, machine);
+    // The highest generation, never attempted, still gets one reply.
+    assert!(limits.begin_hello_reply(machine, true, 3));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_reply(machine, true, 3));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(3)));
+    // An unrelated machine never gets a reply.
+    assert!(!limits.begin_hello_reply(MachineId([50; 32]), false, 1));
 }
 
 #[test]
