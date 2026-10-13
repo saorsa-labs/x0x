@@ -60,6 +60,21 @@ All notable changes to this project will be documented in this file.
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
 
+- **ant-quic 0.27.58.** x0x now pins `ant-quic = "=0.27.58"`.
+  - Only one end of each peer pair retires a superseded connection: the end
+    with the greater PeerId, and only on evidence (ant-quic #313 Part 2,
+    #315, ADR-017). Before, the two ends could each close the connection
+    that the other kept, so a pair could lose every connection. No wire
+    change. A superseded connection that is read now stays open for at
+    least 30 s, and with an old-version peer that stays quiet it stays
+    until it idles out.
+  - When no hole-punch coordinator is available, a dial that carries a
+    PeerId uses the rest of its budget instead of stopping at the about
+    2 s direct stage (ant-quic #304).
+  - Happy Eyeballs stops the losing dial attempts (ant-quic #294).
+  - The bootstrap cache no longer gives a node its own entry, and it stores
+    IPv4-mapped IPv6 addresses as IPv4 (ant-quic #269).
+
 ## [v0.47.1] - 2026-10-12
 
 A patch release. It contains durability fixes for named groups and share grants. It adds no breaking API change and no stored-format change.
