@@ -20339,9 +20339,9 @@ pub(in crate::server) async fn join_group_via_invite(
 
 /// PUT /groups/:id/display-name — set your display name in a group.
 ///
-/// #1228 (C-1228-1): the caller must hold an active seat in this group,
-/// any role. The label is local and is not in the signed roster. A
-/// session token of that seat may still set the name.
+/// #1228 (C-1228-1, C-1228-3): the caller must hold an active seat in
+/// this group, any role, on any token class. The label is local and is
+/// not in the signed roster, so this route has no Home durable fence.
 pub(in crate::server) async fn set_group_display_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

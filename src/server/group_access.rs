@@ -312,8 +312,9 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // handlers keep at entry. The requests LISTING carries the same
     // seat gate but NO withdrawn check (today's shape — a withdrawn
     // shell's requests stay listable) and, since #1228, also requires
-    // the durable owner. display-name is an active local seat of any role
-    // (C-1228-1).
+    // the durable owner. display-name is an active local seat of any
+    // role on any token class. The label is local, so it has no Home
+    // durable fence (C-1228-3).
     // Request create stays PublicWrite. Request cancel is the owner
     // who filed it (SessionBearer plus the handler's requester check).
     // Leave is the daemon's own active seat (JoinSelf).
