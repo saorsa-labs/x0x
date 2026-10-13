@@ -189,13 +189,10 @@ pub(in crate::server) enum AccessLevel {
     PublicRead,
     /// No actor-based gate on a write surface; remaining gates are local
     /// policy or data checks, not principal identity — the write-side
-    /// member of the no-actor class (S2's `open-envelope`, S3's
-    /// display-name and request create/cancel). Issue #1228 tracks
-    /// that `POST /groups/:id/quarantine/clear` and the `/mls/groups*`
-    /// routes ALSO sit here with no gate at all: S4 classifies them at
-    /// that reality without tightening; each fix is a separate reviewed
-    /// change, pinned by the `s4_pins_the_no_actor_check_routes_as_unchanged`
-    /// test.
+    /// member of the no-actor class (S2's `open-envelope`, S3's request
+    /// create). #1228 labels request cancel [`AccessLevel::SessionBearer`]
+    /// and `quarantine/clear` plus `/mls/groups*` [`AccessLevel::OwnerDurable`].
+    /// Display-name is [`AccessLevel::JoinSelf`] (C-1228-1).
     PublicWrite,
 }
 
@@ -314,12 +311,13 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // the bearer matters only through the Home durable fence the
     // handlers keep at entry. The requests LISTING carries the same
     // seat gate but NO withdrawn check (today's shape — a withdrawn
-    // shell's requests stay listable). Issue #1228's no-actor family is
-    // classified at its REAL level, not the inventory's target:
-    // display-name and request create/cancel have no actor gate at all
-    // (PublicWrite — their data gates are the handler's, keyed on the
-    // local daemon), and leave is the daemon's own active seat
-    // (JoinSelf). Tightening any of these is a separate reviewed PR.
+    // shell's requests stay listable) and, since #1228, also requires
+    // the durable owner. display-name is an active local seat of any
+    // role on any token class. The label is local, so it has no Home
+    // durable fence (C-1228-3).
+    // Request create stays PublicWrite. Request cancel is the owner
+    // who filed it (SessionBearer plus the handler's requester check).
+    // Leave is the daemon's own active seat (JoinSelf).
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/invite",
@@ -363,7 +361,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::PUT,
         path: "/groups/:id/display-name",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::JoinSelf,
     },
     RouteAccess {
         method: Method::POST,
@@ -383,7 +381,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/requests",
-        level: AccessLevel::Admin,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
@@ -403,7 +401,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/requests/:request_id",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::SessionBearer,
     },
     // ── S4 long tail: classified ─────────────────────────────────────
     // Honest labels, nothing tightened (every gate below is today's,
@@ -433,10 +431,10 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     //   ungated. Rows label the scoped case (Member = the verified
     //   daemon seat); the collection never refuses — it FILTERS by the
     //   same seat rule — so it is PublicRead.
-    // - #1228's unchecked surfaces — `quarantine/clear` and every
-    //   `/mls/groups*` route — are classified at their REAL no-actor
-    //   level; tightening them is a separate reviewed PR, pinned by
-    //   `s4_pins_the_no_actor_check_routes_as_unchanged`.
+    // - #1228: `quarantine/clear` and every `/mls/groups*` route are
+    //   OwnerDurable. The handlers refuse a session token. The pin
+    //   test `issue1228_pins_quarantine_clear_and_mls_as_durable_owner`
+    //   holds that classification.
     RouteAccess {
         method: Method::POST,
         path: "/groups",
@@ -495,7 +493,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/quarantine/clear",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
@@ -589,42 +587,42 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups",
-        level: AccessLevel::PublicRead,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups/:id",
-        level: AccessLevel::PublicRead,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/members",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/mls/groups/:id/members/:agent_id",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/encrypt",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/decrypt",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/welcome",
-        level: AccessLevel::PublicWrite,
+        level: AccessLevel::OwnerDurable,
     },
     // ── S5 delegate mint: classified ────────────────────────────────
     // The #446 durable gate the handler runs FIRST (mirrored by the
@@ -1108,12 +1106,9 @@ pub(in crate::server) fn admit_self_leave<'a>(
     Ok(info)
 }
 
-/// Entry admission for issue #1228's no-actor family — `PUT
-/// /groups/:id/display-name`, request create and request cancel: raw-id
-/// lookup 404 → withdrawn 409. No actor, no seat, no role; the routes'
-/// remaining gates are data checks keyed on the local daemon's identity
-/// (request ownership, admission policy, the display-name write itself)
-/// and stay in the handlers, in their per-route order.
+/// Shared entry for display-name, request create and request cancel:
+/// raw-id lookup 404 → withdrawn 409. #1228's active seat (display-name)
+/// and owner-requester (cancel) gates run in the handlers after this.
 pub(in crate::server) fn admit_live_group_route<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
@@ -1283,6 +1278,17 @@ impl GroupAccess {
     pub(in crate::server) fn acting_hex(&self) -> &str {
         &self.acting_hex
     }
+
+    /// Snapshot for a handler test that calls `list_join_requests`
+    /// directly. The handler re-runs admission and does not trust this.
+    #[cfg(test)]
+    pub(in crate::server) fn for_handler_tests(acting_hex: impl Into<String>) -> Self {
+        Self {
+            level: AccessLevel::OwnerDurable,
+            stable_id: String::new(),
+            acting_hex: acting_hex.into(),
+        }
+    }
 }
 
 /// Fail closed when the extractor meets a request the classification
@@ -1401,21 +1407,29 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
 }
 
 /// `GET /groups/:id/requests` — the one S3 route that takes the
-/// extractor: no body argument to keep first, no directory-durability
-/// gate before the lookup, and no actor argument ever (the seat gate
-/// evaluates the local daemon, not the bearer — the route never read
-/// the actor and still does not). The handler re-runs
-/// [`admit_join_request_listing`] under its own lock before serving
-/// (the `/members` pattern, r2/P2-1).
-async fn admit_join_requests_route(state: &AppState, id: &str) -> Result<GroupAccess, Response> {
+/// extractor. #1228 refuses a session token before the local-seat
+/// admin gate. The handler re-runs [`admit_join_request_listing`]
+/// under its own lock before serving (the `/members` pattern, r2/P2-1)
+/// and repeats the durable-owner check for direct callers.
+async fn admit_join_requests_route(
+    state: &AppState,
+    actor: &ActorContext,
+    id: &str,
+) -> Result<GroupAccess, Response> {
+    if !actor.is_durable_owner() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "listing join requests requires the durable API token (not a session token)",
+        )
+        .into_response());
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let info =
         admit_join_request_listing(&groups, id, &local_hex).map_err(IntoResponse::into_response)?;
     Ok(GroupAccess {
-        level: AccessLevel::Admin,
+        level: AccessLevel::OwnerDurable,
         stable_id: info.stable_group_id().to_string(),
-        // Actor-less seat gate: the local daemon is the subject.
         acting_hex: local_hex,
     })
 }
@@ -1468,7 +1482,12 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             ("GET", "/groups/:id/state/commits") => {
                 admit_state_commits_route(state.as_ref(), &id).await
             }
-            ("GET", "/groups/:id/requests") => admit_join_requests_route(state.as_ref(), &id).await,
+            ("GET", "/groups/:id/requests") => {
+                let Extension(actor) = Extension::<ActorContext>::from_request_parts(parts, state)
+                    .await
+                    .map_err(|rejection| rejection.into_response())?;
+                admit_join_requests_route(state.as_ref(), &actor, &id).await
+            }
             // Classified routes deliberately left without an arm: the
             // S1 `GET /groups/:id` + `/delegations`, the five S2
             // secure-write handlers, the S3 mutation family, the four
@@ -1481,9 +1500,10 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             // orderings all precede the gates today). Every other S4
             // route has NO `:id`-shaped admission at all
             // (discovery/cards/join, the history scope gates, the
-            // task-list id parsers, the #1228 no-actor surfaces) —
-            // classification-only, the handler keeps today's exact
-            // checks. If a future handler wires this extractor to any
+            // task-list id parsers, quarantine/clear and `/mls/groups*`) —
+            // classification-only. #1228's durable-owner check for those
+            // last two lives in the handlers. If a future handler wires
+            // this extractor to any
             // of them, this fails closed instead of guessing — and
             // note `send` could not take this extractor anyway without
             // reordering its body validations (kind/size/thread)
@@ -1895,7 +1915,7 @@ mod tests {
             (
                 Method::PUT,
                 "/groups/:id/display-name",
-                AccessLevel::PublicWrite,
+                AccessLevel::JoinSelf,
             ),
             (Method::POST, "/groups/:id/state/seal", AccessLevel::Admin),
             (
@@ -1904,7 +1924,11 @@ mod tests {
                 AccessLevel::Admin,
             ),
             (Method::DELETE, "/groups/:id", AccessLevel::JoinSelf),
-            (Method::GET, "/groups/:id/requests", AccessLevel::Admin),
+            (
+                Method::GET,
+                "/groups/:id/requests",
+                AccessLevel::OwnerDurable,
+            ),
             (
                 Method::POST,
                 "/groups/:id/requests",
@@ -1923,7 +1947,7 @@ mod tests {
             (
                 Method::DELETE,
                 "/groups/:id/requests/:request_id",
-                AccessLevel::PublicWrite,
+                AccessLevel::SessionBearer,
             ),
             (Method::POST, "/groups", AccessLevel::PublicWrite),
             (Method::GET, "/groups", AccessLevel::PublicRead),
@@ -1963,7 +1987,7 @@ mod tests {
             (
                 Method::POST,
                 "/groups/:id/quarantine/clear",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::POST,
@@ -2018,33 +2042,33 @@ mod tests {
                 "/task-lists/:id/tasks/:tid",
                 AccessLevel::Member(MemberState::Active),
             ),
-            (Method::POST, "/mls/groups", AccessLevel::PublicWrite),
-            (Method::GET, "/mls/groups", AccessLevel::PublicRead),
-            (Method::GET, "/mls/groups/:id", AccessLevel::PublicRead),
+            (Method::POST, "/mls/groups", AccessLevel::OwnerDurable),
+            (Method::GET, "/mls/groups", AccessLevel::OwnerDurable),
+            (Method::GET, "/mls/groups/:id", AccessLevel::OwnerDurable),
             (
                 Method::POST,
                 "/mls/groups/:id/members",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::DELETE,
                 "/mls/groups/:id/members/:agent_id",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::POST,
                 "/mls/groups/:id/encrypt",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::POST,
                 "/mls/groups/:id/decrypt",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::POST,
                 "/mls/groups/:id/welcome",
-                AccessLevel::PublicWrite,
+                AccessLevel::OwnerDurable,
             ),
             (
                 Method::POST,
@@ -2066,18 +2090,12 @@ mod tests {
         }
     }
 
-    /// Issue #1228's still-unchecked surfaces, pinned at their REAL
-    /// level: `POST /groups/:id/quarantine/clear` and every
-    /// `/mls/groups*` route carry NO actor-based check today — any
-    /// valid bearer (a 10-minute session token included) reaches them;
-    /// only riders are stopped, by the auth middleware's
-    /// deny-by-default allowlist. S4 classifies them PublicRead /
-    /// PublicWrite — the no-actor class — WITHOUT tightening: each fix
-    /// is a separate reviewed change, and fixing it means editing this
-    /// list and the row together, deliberately.
+    /// #1228: quarantine clear and every legacy `/mls/groups*` route
+    /// require the durable owner. A session token is refused in the
+    /// handler. This list and the table rows move together.
     #[test]
-    fn s4_pins_the_no_actor_check_routes_as_unchanged() {
-        let unchecked: &[(Method, &str)] = &[
+    fn issue1228_pins_quarantine_clear_and_mls_as_durable_owner() {
+        let durable: &[(Method, &str)] = &[
             (Method::POST, "/groups/:id/quarantine/clear"),
             (Method::POST, "/mls/groups"),
             (Method::GET, "/mls/groups"),
@@ -2088,20 +2106,15 @@ mod tests {
             (Method::POST, "/mls/groups/:id/decrypt"),
             (Method::POST, "/mls/groups/:id/welcome"),
         ];
-        for (method, path) in unchecked {
+        for (method, path) in durable {
             let row = GROUP_PLANE_ROUTES
                 .iter()
                 .find(|row| row.method == *method && row.path == *path)
                 .unwrap_or_else(|| panic!("{method} {path} missing from the table"));
-            let expected = if *method == Method::GET {
-                AccessLevel::PublicRead
-            } else {
-                AccessLevel::PublicWrite
-            };
             assert_eq!(
-                row.level, expected,
-                "{method} {path}: #1228 unchecked surface — classifying it any tighter is a \
-                 behaviour change that needs its own reviewed PR"
+                row.level,
+                AccessLevel::OwnerDurable,
+                "{method} {path}: #1228 requires the durable API token"
             );
         }
     }
@@ -2948,9 +2961,9 @@ mod tests {
         assert!(admit_self_leave(&groups, "lv", &local_hex).is_ok());
     }
 
-    /// #1228's no-actor family (display-name, request create/cancel):
-    /// lookup 404 → withdrawn 409, nothing else — no seat, no role,
-    /// no actor.
+    /// Shared live-group entry (display-name, request create/cancel):
+    /// lookup 404 → withdrawn 409. Role and requester gates are the
+    /// handlers' (#1228).
     #[test]
     fn live_group_admission_reproduces_the_inline_decisions() {
         let mut groups = HashMap::new();

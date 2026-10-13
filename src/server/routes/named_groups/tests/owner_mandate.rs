@@ -1665,6 +1665,7 @@ async fn call_clear(
 ) -> (StatusCode, serde_json::Value) {
     let response = clear_group_quarantine(
         State(Arc::clone(state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.to_string()),
         Json(req),
     )

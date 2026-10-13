@@ -738,8 +738,9 @@ function maybeRefreshSession(){
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
 // /sync/devices*, /announce with user identity, /home/rename,
-// /upgrade/apply, PATCH on the Home group, and /direct/send with
-// reserved exec payloads) require the DURABLE API token — a session
+// /upgrade/apply, PATCH on the Home group, /direct/send with
+// reserved exec payloads, GET /groups/:id/requests, and /mls/groups*)
+// require the DURABLE API token — a session
 // bearer gets a typed 403 naming it. ownerApi() prefers a remembered
 // owner token, and on the durable-required 403 prompts once, keeps it
 // in sessionStorage ONLY (never localStorage, never a URL), and
@@ -4240,7 +4241,7 @@ function renderMls(){
 function mountMls(){ pollMlsGroups(); }
 
 async function pollMlsGroups(){
-  const r=await api('/mls/groups');
+  const r=await ownerApi('/mls/groups');
   const list=document.getElementById('mls-list');
   if(!list)return;
   const groups=(r&&r.groups)||[];
@@ -4270,7 +4271,7 @@ async function selectMlsGroup(id){
 async function refreshMlsDetail(id){
   const el=document.getElementById('mls-detail');
   if(!el)return;
-  const r=await api('/mls/groups/'+encodeURIComponent(id));
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(id));
   if(!r||!r.ok){el.innerHTML='<span style="color:var(--rd)">Failed to load group.</span>';return}
   const members=r.members||[];
   el.innerHTML=`<div><span class="k">Group</span>: <span class="aid-short">${esc(id)}</span></div>
@@ -4290,7 +4291,7 @@ async function createMlsGroup(){
   const body={};
   const id=(idInput.value||'').trim();
   if(id)body.group_id=id;
-  const r=await api('/mls/groups',{method:'POST',body:JSON.stringify(body)});
+  const r=await ownerApi('/mls/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.group_id){
     toast('MLS group created: '+short(r.group_id,12),'success');
     idInput.value='';
@@ -4305,14 +4306,14 @@ async function mlsAddMember(gid){
   const input=document.getElementById('mls-add-id');
   const aid=(input.value||'').trim();
   if(!aid){toast('Enter an agent ID','warn');return}
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
   if(r&&r.ok){toast('Member added','success');input.value='';refreshMlsDetail(gid)}
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
 
 async function mlsRemoveMember(gid,aid){
   if(!confirm('Remove '+short(aid,12)+' from the group?'))return;
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
   if(r&&r.ok){toast('Member removed','success');refreshMlsDetail(gid)}
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
@@ -4320,7 +4321,7 @@ async function mlsRemoveMember(gid,aid){
 async function mlsSendWelcome(gid){
   const aid=(document.getElementById('mls-add-id').value||'').trim();
   if(!aid){toast('Enter the agent ID to welcome','warn');return}
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/welcome',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/welcome',{method:'POST',body:JSON.stringify({agent_id:aid})});
   if(r&&r.ok)toast('Welcome sent','success');
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
@@ -4328,7 +4329,7 @@ async function mlsSendWelcome(gid){
 async function mlsEncryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const plaintext=document.getElementById('mls-plain').value||'';
-  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.ciphertext){
     document.getElementById('mls-cipher').value=r.ciphertext;
@@ -4343,7 +4344,7 @@ async function mlsDecryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const ciphertext=document.getElementById('mls-cipher').value||'';
   const epoch=parseInt(document.getElementById('mls-epoch').value||'0',10);
-  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.plaintext){
     document.getElementById('mls-plain').value=r.plaintext;
@@ -5465,23 +5466,35 @@ async function nagRequestAccess(gid){
 async function nagRenderAdmin(gid){
   const host=document.getElementById('nag-admin-'+gid);
   if(!host)return;
-  const [g,stateResp,membersResp,requestsResp,meResp]=await Promise.all([
-    api('/groups/'+gid),
+  // Learn the seat with the session token first. The join-request list
+  // needs the durable token, so it is fetched only for an Admin+ seat.
+  // A render must not prompt: a non-admin never sees the prompt, and an
+  // admin who has not saved a token sees the refusal instead of an empty
+  // list. The prompt is the panel button.
+  const [stateResp,membersResp,meResp]=await Promise.all([
     api('/groups/'+gid+'/state').catch(()=>null),
     api('/groups/'+gid+'/members').catch(()=>null),
-    api('/groups/'+gid+'/requests').catch(()=>null),
     api('/agent').catch(()=>null),
   ]);
   const members=(membersResp&&membersResp.ok&&membersResp.members)||[];
-  const requests=(requestsResp&&requestsResp.ok&&(requestsResp.requests||[]))||[];
   const myAid=(meResp&&meResp.agent_id)||null;
   const mine=members.find(m=>m.agent_id===myAid);
   const myRole=mine?mine.role:null;
   const isAdminOrAbove=myRole==='owner'||myRole==='admin';
+  let requestsHtml='';
+  if(isAdminOrAbove){
+    const requestsResp=await apiWith(OWNER_TOKEN||SESSION_TOKEN,'/groups/'+gid+'/requests').catch(()=>null);
+    if(durableRequired(requestsResp)){
+      requestsHtml=nagRequestsPanelHtml(gid,[],'durable token needed');
+    }else{
+      const requests=(requestsResp&&requestsResp.ok&&(requestsResp.requests||[]))||[];
+      requestsHtml=nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending'));
+    }
+  }
   host.innerHTML=nagPolicyPanelHtml(gid,isAdminOrAbove)
     +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isAdminOrAbove)
     +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove)
-    +(isAdminOrAbove?nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending')):'');
+    +requestsHtml;
   nagBindAdminHandlers(gid);
 }
 
@@ -5581,7 +5594,7 @@ function nagRosterPanelHtml(gid,members,myAid,canManage){
   </div>`;
 }
 
-function nagRequestsPanelHtml(gid,pending){
+function nagRequestsPanelHtml(gid,pending,notice){
   const rows=pending.map(req=>{
     const msg=req.message||'(no message)';
     return `<div class="nag-row" data-nag-request="${esc(req.request_id)}">
@@ -5596,11 +5609,23 @@ function nagRequestsPanelHtml(gid,pending){
       </div>
     </div>`;
   }).join('');
+  const body=notice
+    ? `<div class="sub">${esc(notice)}</div><div style="margin-top:8px"><button type="button" data-nag-req-token>Enter durable token</button></div>`
+    : (pending.length?rows:'<div class="sub">No pending requests.</div>');
   return `<div class="nag-panel" data-nag-requests="${esc(gid)}">
-    <h3>Join requests (${pending.length})</h3>
+    <h3>Join requests${notice?'':` (${pending.length})`}</h3>
     <div class="sub">Review pending access requests and approve or reject.</div>
-    ${pending.length?rows:'<div class="sub">No pending requests.</div>'}
+    ${body}
   </div>`;
+}
+
+async function nagEnterDurableToken(gid){
+  // The stored token was refused, or there is none. Clear it so ownerApi
+  // prompts once for this click, then render again without prompting.
+  OWNER_TOKEN='';
+  try{sessionStorage.removeItem('x0x_owner_token')}catch(e){}
+  await ownerApi('/groups/'+gid+'/requests');
+  nagRenderAdmin(gid);
 }
 
 function nagBindAdminHandlers(gid){
@@ -5615,6 +5640,7 @@ function nagBindAdminHandlers(gid){
   host.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
   host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
   host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  host.querySelectorAll('[data-nag-req-token]').forEach(btn=>btn.addEventListener('click',()=>nagEnterDurableToken(gid)));
   host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
   host.querySelectorAll('[data-nag-req-reject]').forEach(btn=>btn.addEventListener('click',()=>nagRejectRequest(gid,btn.getAttribute('data-nag-req-reject'))));
 }

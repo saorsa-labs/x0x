@@ -357,6 +357,12 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_grants_path(path) {
         return true;
     }
+    // #1228: legacy MLS control is an owner act on every method. The
+    // join-request list and quarantine clear are owner acts too. Approve,
+    // reject, and request cancel keep their current token rules.
+    if is_legacy_mls_group_path(path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -372,11 +378,12 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     // ADR 0116 §4: the runtime history trim.
                     | "/history/retain"
             ) || is_two_segment_action(path, "delegate")
+                || is_group_quarantine_clear(path)
         }
         Method::DELETE => is_sync_device_path(path),
         // ADR 0116 §3: the local history policy, with its counters and the
         // fork-quarantine pins, is an owner-only read.
-        Method::GET => path == "/history/policy",
+        Method::GET => path == "/history/policy" || is_join_request_list(path),
         _ => false,
     }
 }
@@ -403,6 +410,39 @@ fn is_grants_path(path: &str) -> bool {
         || path
             .strip_prefix("/grants/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// `true` for exactly `/groups/<nonempty-id>/quarantine/clear`.
+fn is_group_quarantine_clear(path: &str) -> bool {
+    match path.strip_prefix("/groups/") {
+        Some(rest) => {
+            let mut segs = rest.split('/');
+            segs.next().is_some_and(|id| !id.is_empty())
+                && segs.next() == Some("quarantine")
+                && segs.next() == Some("clear")
+                && segs.next().is_none()
+        }
+        None => false,
+    }
+}
+
+/// `true` for exactly `/groups/<nonempty-id>/requests` (the list, not
+/// approve, reject, create, or cancel).
+fn is_join_request_list(path: &str) -> bool {
+    match path.strip_prefix("/groups/") {
+        Some(rest) => {
+            let mut segs = rest.split('/');
+            segs.next().is_some_and(|id| !id.is_empty())
+                && segs.next() == Some("requests")
+                && segs.next().is_none()
+        }
+        None => false,
+    }
+}
+
+/// `true` for `/mls/groups` and every path under it.
+fn is_legacy_mls_group_path(path: &str) -> bool {
+    path == "/mls/groups" || path.starts_with("/mls/groups/")
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/delegate`.
@@ -1337,6 +1377,50 @@ mod tests {
         assert!(requires_durable_owner(&Method::POST, "/history/retain"));
         assert!(!requires_durable_owner(&Method::GET, "/history/retain"));
         assert!(!requires_durable_owner(&Method::DELETE, "/history"));
+    }
+
+    #[test]
+    fn issue1228_owner_acts_require_the_durable_token_before_the_body() {
+        let group = "ab".repeat(32);
+        let request = "cd".repeat(16);
+        assert!(requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{group}/quarantine/clear")
+        ));
+        assert!(requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{group}/requests")
+        ));
+        assert!(requires_durable_owner(&Method::GET, "/mls/groups"));
+        assert!(requires_durable_owner(
+            &Method::POST,
+            &format!("/mls/groups/{group}/welcome")
+        ));
+        assert!(requires_durable_owner(
+            &Method::DELETE,
+            &format!("/mls/groups/{group}/members/{request}")
+        ));
+        // C-1228-2: approve and reject keep the session token.
+        assert!(!requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{group}/requests/{request}/approve")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{group}/requests/{request}/reject")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::DELETE,
+            &format!("/groups/{group}/requests/{request}")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{group}/requests")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::PUT,
+            &format!("/groups/{group}/display-name")
+        ));
     }
 
     #[test]
