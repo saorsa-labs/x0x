@@ -9675,14 +9675,19 @@ async fn recover_member_treekem_key_package_locked(
 ) -> bool {
     {
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(group_id) {
-            if info
-                .members_v2
-                .get(member_agent_id)
-                .and_then(current_member_treekem_key_package)
-                .is_some()
-            {
+        if let Some(member) = groups
+            .get(group_id)
+            .and_then(|info| info.members_v2.get(member_agent_id))
+        {
+            if current_member_treekem_key_package(member).is_some() {
                 return true;
+            }
+            // #205: a Removed seat is not refilled from this local cache.
+            // An authority-attested catch-up still installs through
+            // `apply_recovered_member_key_package_locked` when the
+            // committed hash matches, which is what a self-leave rekey needs.
+            if member.state == x0x::groups::GroupMemberState::Removed {
+                return false;
             }
         }
     }
