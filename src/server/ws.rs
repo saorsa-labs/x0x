@@ -890,6 +890,17 @@ async fn abandon_ws_session(
     state.ws_sessions.write().await.remove(session_id);
 }
 
+/// #1229: a backfill row is refused when its author is revoked or Blocked.
+/// A row with no author stays. That row has no sender to check.
+async fn history_backfill_author_refused(state: &AppState, author: Option<&str>) -> bool {
+    match author {
+        Some(author) => {
+            super::routes::named_groups::stored_sender_delivery_refused(state, author).await
+        }
+        None => false,
+    }
+}
+
 /// Core WebSocket connection lifecycle.
 async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
@@ -1002,6 +1013,14 @@ async fn handle_ws_connection(
                         let mut hashes = std::collections::HashSet::new();
                         for row in &rows {
                             let r = &row.record;
+                            // #1229: same refusal as live delivery. Skip the
+                            // hash too, so a later live frame is not dropped
+                            // if the sender is allowed again.
+                            if history_backfill_author_refused(&state, r.author_agent.as_deref())
+                                .await
+                            {
+                                continue;
+                            }
                             hashes.insert(*blake3::hash(&r.payload).as_bytes());
                             let out = WsOutbound::DirectMessage {
                                 sender: r.author_agent.clone().unwrap_or_default(),
@@ -1444,6 +1463,17 @@ async fn handle_ws_command(
                                 let mut hashes = std::collections::HashSet::new();
                                 for row in &rows {
                                     let r = &row.record;
+                                    // #1229: topic history is replayed without
+                                    // the live revocation and Blocked checks.
+                                    // Apply them here, before the frame leaves.
+                                    if history_backfill_author_refused(
+                                        state,
+                                        r.author_agent.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        continue;
+                                    }
                                     hashes.insert(*blake3::hash(&r.payload).as_bytes());
                                     let out = WsOutbound::Message {
                                         topic: topic.clone(),
@@ -3203,5 +3233,118 @@ mod tests {
         );
 
         agent.shutdown().await;
+    }
+
+    /// #1229: topic backfill must drop a sender who is Blocked after the
+    /// row was stored. A clean author and a row with no author stay.
+    #[tokio::test]
+    async fn issue1229_topic_backfill_hides_a_blocked_author() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let topic = "issue1229.backfill";
+        let blocked_kp = crate::identity::AgentKeypair::generate()?;
+        let kept_kp = crate::identity::AgentKeypair::generate()?;
+        let store = state.agent.history().expect("history").store();
+        for (author, body, seen_at_ms) in [
+            (
+                Some(hex::encode(blocked_kp.agent_id().as_bytes())),
+                "blocked-row",
+                1,
+            ),
+            (
+                Some(hex::encode(kept_kp.agent_id().as_bytes())),
+                "kept-row",
+                2,
+            ),
+            (None, "no-author-row", 3),
+        ] {
+            store.insert(&topic_history_row(topic, author, body, seen_at_ms))?;
+        }
+
+        let before = topic_backfill_bodies(&state, topic, "s-before").await;
+        assert_eq!(
+            before,
+            std::collections::BTreeSet::from([
+                "blocked-row".to_string(),
+                "kept-row".to_string(),
+                "no-author-row".to_string(),
+            ]),
+            "topic backfill serves every stored row before the author is Blocked"
+        );
+
+        let blocked_id = blocked_kp.agent_id();
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&blocked_id, TrustLevel::Blocked);
+
+        let after = topic_backfill_bodies(&state, topic, "s-after").await;
+        assert_eq!(
+            after,
+            std::collections::BTreeSet::from(["kept-row".to_string(), "no-author-row".to_string()]),
+            "topic backfill must omit the Blocked author and keep the other rows"
+        );
+        Ok(())
+    }
+
+    fn topic_history_row(
+        topic: &str,
+        author: Option<String>,
+        body: &str,
+        seen_at_ms: i64,
+    ) -> crate::history::HistoryRecord {
+        let payload = body.as_bytes().to_vec();
+        crate::history::HistoryRecord {
+            msg_id: crate::history::HistoryRecord::compute_msg_id(None, &payload),
+            scope: crate::history::Scope::Topic(topic.to_string()),
+            author_agent: author,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: crate::history::Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: crate::history::Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    async fn topic_backfill_bodies(
+        state: &Arc<AppState>,
+        topic: &str,
+        session_id: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(16);
+        let stats = WsOutboundStats::default();
+        register_test_session(state, session_id).await;
+        let subscribe = serde_json::json!({
+            "type": "subscribe",
+            "topics": [topic],
+            "backfill": { "limit": 8 },
+        })
+        .to_string();
+        handle_ws_command(state, session_id, &subscribe, &tx, &stats, false).await;
+        let mut bodies = std::collections::BTreeSet::new();
+        loop {
+            match next_frame(&mut rx).await {
+                WsOutbound::Message { payload, .. } => {
+                    let bytes = BASE64.decode(&payload).expect("backfill payload is base64");
+                    bodies.insert(String::from_utf8(bytes).expect("backfill payload is utf-8"));
+                }
+                WsOutbound::Live { .. } => break,
+                WsOutbound::Subscribed { .. } => {}
+                other => panic!("unexpected backfill frame: {other:?}"),
+            }
+        }
+        bodies
     }
 }

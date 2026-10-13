@@ -194,6 +194,20 @@ pub(super) async fn direct_events_sse(
                     let mut hashes = std::collections::HashSet::new();
                     for row in &rows {
                         let r = &row.record;
+                        // #1229: direct-event backfill uses the same sender
+                        // refusal as live delivery and topic backfill.
+                        let author_refused = match r.author_agent.as_deref() {
+                            Some(author) => {
+                                super::routes::named_groups::stored_sender_delivery_refused(
+                                    &state, author,
+                                )
+                                .await
+                            }
+                            None => false,
+                        };
+                        if author_refused {
+                            continue;
+                        }
                         hashes.insert(*blake3::hash(&r.payload).as_bytes());
                         backfill_rows.push(serde_json::json!({
                             "sender": r.author_agent,

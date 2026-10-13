@@ -19,6 +19,8 @@ pub(in crate::server) use seat_cert_fetch::{
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
 
+#[cfg(test)]
+mod issue1229_stored_delivery;
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
     insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
@@ -16928,6 +16930,68 @@ pub(in crate::server) struct GetMessagesQuery {
     thread_root: Option<String>,
 }
 
+/// #1229: true when live delivery would drop this sender.
+///
+/// The check matches `decode_for_delivery`: the revocation set, then
+/// the contact store's revoked keys, then `Blocked`. An author hex
+/// that does not decode to an agent id returns false.
+pub(in crate::server) async fn stored_sender_delivery_refused(
+    state: &AppState,
+    author_hex: &str,
+) -> bool {
+    let Ok(agent) = parse_agent_id_hex(author_hex) else {
+        return false;
+    };
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .is_agent_revoked(&agent)
+    {
+        tracing::debug!(
+            author = %author_hex,
+            "stored delivery skipped: sender is revoked"
+        );
+        return true;
+    }
+    let contacts = state.contacts.read().await;
+    if contacts.is_revoked(&agent) || contacts.trust_level(&agent) == TrustLevel::Blocked {
+        tracing::debug!(
+            author = %author_hex,
+            "stored delivery skipped: sender is blocked"
+        );
+        return true;
+    }
+    false
+}
+
+/// Drop public messages whose author [`stored_sender_delivery_refused`]
+/// refuses. History rows and the in-memory cache both pass through here.
+async fn retain_deliverable_public_messages(
+    state: &AppState,
+    msgs: Vec<x0x::groups::GroupPublicMessage>,
+) -> Vec<x0x::groups::GroupPublicMessage> {
+    let mut denied = HashSet::new();
+    let mut allowed = HashSet::new();
+    let mut kept = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        let author = msg.author_agent_id.as_str();
+        if denied.contains(author) {
+            continue;
+        }
+        if !allowed.contains(author) {
+            if stored_sender_delivery_refused(state, author).await {
+                denied.insert(msg.author_agent_id.clone());
+                continue;
+            }
+            allowed.insert(msg.author_agent_id.clone());
+        }
+        kept.push(msg);
+    }
+    kept
+}
+
 /// GET /groups/:id/messages — retrieve cached public messages.
 ///
 /// If `policy.read_access == Public`, any caller with a valid API
@@ -17006,6 +17070,9 @@ pub(in crate::server) async fn get_group_public_messages(
         }
         None => cached,
     };
+    // #1229: re-check the author at delivery. A sender revoked or Blocked
+    // after the row was stored must not come back from history or the cache.
+    let msgs = retain_deliverable_public_messages(&state, msgs).await;
 
     // Validate thread_root query param format before doing any work: 64
     // lowercase hex chars only. Garbage input would otherwise trigger O(N)
