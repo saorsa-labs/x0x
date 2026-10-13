@@ -704,3 +704,132 @@ async fn catchup_apply_does_not_ack_a_removal_a_stale_clone_replaces() {
         );
     }
 }
+
+fn bootstrap_of(group: crate::groups::GroupInfo) -> super::super::PublicGroupBootstrap {
+    super::super::PublicGroupBootstrap {
+        message_type:
+            crate::server::routes::public_group_bootstrap_outbox::PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE
+                .to_string(),
+        group: Box::new(group),
+    }
+}
+
+async fn admit_from(
+    state: &std::sync::Arc<crate::server::AppState>,
+    sender: crate::identity::AgentId,
+    group: crate::groups::GroupInfo,
+) -> Result<crate::dm_inbox::DmTypedPayloadCompletion, String> {
+    crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
+        state,
+        sender,
+        None,
+        bootstrap_of(group),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn installed_admin_consent_catches_up_without_a_known_contact() {
+    let (state, _dir) = super::secure_endpoint_test_state().await.expect("state");
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (behind, ahead) = sealed_step(&authority, &local_hex);
+    let snapshot = signed_public_bootstrap_snapshot(ahead.clone()).expect("snapshot");
+    let group_id = behind.stable_group_id().to_string();
+    let behind_revision = behind.state_revision;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), behind);
+    let trust = state
+        .contacts
+        .read()
+        .await
+        .trust_level(&authority.agent_id());
+    assert_eq!(
+        trust,
+        crate::contacts::TrustLevel::Unknown,
+        "the fixture must not record the committer as a contact"
+    );
+
+    let result = admit_from(&state, authority.agent_id(), snapshot)
+        .await
+        .expect("local admin consent applies the next head");
+    assert!(matches!(
+        result,
+        crate::dm_inbox::DmTypedPayloadCompletion::Inserted
+    ));
+    let installed = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("installed group")
+        .clone();
+    assert_eq!(installed.state_revision, behind_revision.saturating_add(1));
+    assert_eq!(installed.state_hash, ahead.state_hash);
+    assert_eq!(installed.description, "renamed");
+}
+
+#[tokio::test]
+async fn unknown_sender_cannot_install_a_new_public_group() {
+    let (state, _dir) = super::secure_endpoint_test_state().await.expect("state");
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (_behind, ahead) = sealed_step(&authority, &local_hex);
+    let snapshot = signed_public_bootstrap_snapshot(ahead).expect("snapshot");
+    let group_id = snapshot.stable_group_id().to_string();
+
+    let error = admit_from(&state, authority.agent_id(), snapshot)
+        .await
+        .expect_err("a stranger does not seed a group");
+    assert_eq!(
+        error,
+        "public-group bootstrap sender is not a known contact"
+    );
+    assert!(
+        state.named_groups.read().await.get(&group_id).is_none(),
+        "the refused bootstrap must not install the group"
+    );
+}
+
+#[tokio::test]
+async fn installed_member_who_did_not_sign_has_no_catchup_consent() {
+    let (state, _dir) = super::secure_endpoint_test_state().await.expect("state");
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let bystander = crate::identity::AgentKeypair::generate().expect("bystander");
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let bystander_hex = hex::encode(bystander.agent_id().as_bytes());
+    let (mut behind, ahead) = sealed_step(&authority, &local_hex);
+    behind.add_member(
+        bystander_hex,
+        crate::groups::GroupRole::Member,
+        Some(hex::encode(authority.agent_id().as_bytes())),
+        None,
+    );
+    let snapshot = signed_public_bootstrap_snapshot(ahead).expect("snapshot");
+    let group_id = behind.stable_group_id().to_string();
+    let behind_hash = behind.state_hash.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), behind);
+
+    let error = admit_from(&state, bystander.agent_id(), snapshot)
+        .await
+        .expect_err("a non-admin member is not catch-up consent");
+    assert_eq!(
+        error,
+        "public-group bootstrap sender is not a known contact"
+    );
+    let installed = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("installed group")
+        .clone();
+    assert_eq!(installed.state_hash, behind_hash);
+}

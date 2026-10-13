@@ -146,6 +146,8 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
+- **An installed SignedPublic group catches up one revision from a local admin who is not a Known contact (D272, #1105).** For a group this node already has installed, an active admin in the local roster who signed the single retained head counts as consent for that catch-up only. New installs keep the current gate: a Known contact, or a current `GroupInvite` grant on the authenticated machine. Blocked still wins on that gate. The sender is still refused when revoked. The one-revision apply checks are unchanged. The invite-only restart arm obtains N+1.
+
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
