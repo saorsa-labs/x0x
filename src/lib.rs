@@ -19509,13 +19509,7 @@ impl AgentBuilder {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join("peers")
             });
-            // Only a persistent cache may be pruned on disk. With
-            // `disable_peer_cache` ant-quic loads nothing, so an empty
-            // in-memory cache says nothing about the file, and the file
-            // must be kept for a later persistent start.
-            if !self.disable_peer_cache {
-                cache_dir_for_prune = Some(cache_dir.clone());
-            }
+            cache_dir_for_prune = Some(cache_dir.clone());
             Some(
                 ant_quic::BootstrapCacheConfig::builder()
                     .cache_dir(cache_dir)
@@ -19637,43 +19631,26 @@ impl AgentBuilder {
         // 1), so a self-only cache would REAPPEAR from disk after the
         // next restart — when the prune empties the cache, also unlink
         // the persisted file directly (x0x owns the cache dir).
-        //
-        // Since ant-quic 0.27.58 (#269) the cache itself drops the local
-        // node's own entry at load, so `remove()` below usually finds
-        // nothing. The file can still hold that self entry (written by an
-        // older build), and `save()` never rewrites a cache below
-        // `min_peers_to_save`. So unlink the file whenever the loaded cache
-        // is empty, not only when this prune emptied it. A cache file is
-        // never written empty, so an empty load from a persistent cache
-        // means every stored entry was dropped (the self entry, or a file
-        // that failed ant-quic's checksum and was refused whole; it holds
-        // only bootstrap hints). An in-memory cache never gets here:
-        // `cache_dir_for_prune` is set only when the cache persists.
         if let (Some(cache), Some(node)) = (bootstrap_cache.as_ref(), network.as_ref()) {
             let own_peer_id = ant_quic::PeerId(node.peer_id().0);
             let pruned = cache.remove(&own_peer_id).await;
-            let remaining = cache.peer_count().await;
             if pruned.is_some() {
+                let remaining = cache.peer_count().await;
                 tracing::info!(
                     peer = %hex::encode(own_peer_id.0),
                     remaining,
                     "#484: pruned self entry from the bootstrap cache (never self-dial)"
                 );
-            }
-            // Check the EFFECTIVE persistence, not only the builder flag:
-            // when the cache file cannot be read (an I/O error, not a
-            // checksum rejection), ant-quic falls back to an in-memory
-            // cache with `persist = false` and loads nothing. That empty
-            // cache says nothing about the file, so keep the file.
-            if remaining == 0 && cache.config().persist {
-                if let Some(dir) = cache_dir_for_prune.as_deref() {
-                    let file = dir.join("bootstrap_cache.json");
-                    if let Err(e) = tokio::fs::remove_file(&file).await {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(
-                                path = %file.display(),
-                                "#484: failed to remove the emptied bootstrap cache file: {e}"
-                            );
+                if remaining == 0 {
+                    if let Some(dir) = cache_dir_for_prune.as_deref() {
+                        let file = dir.join("bootstrap_cache.json");
+                        if let Err(e) = tokio::fs::remove_file(&file).await {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    path = %file.display(),
+                                    "#484: failed to remove the emptied bootstrap cache file: {e}"
+                                );
+                            }
                         }
                     }
                 }

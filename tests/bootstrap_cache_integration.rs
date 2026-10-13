@@ -204,7 +204,7 @@ async fn test_cache_persists_across_restarts() {
     {
         let agent = agent_with_network_cache(&temp, &cache_dir)
             .await
-            .expect("failed to build second agent")
+            .expect("failed to build a restarted agent")
             .expect("network should still be available for second agent");
         let adapter = agent
             .gossip_cache_adapter()
@@ -379,10 +379,11 @@ fn rewrite_cache_entry_id(cache_file: &Path, from: [u8; 32], to: [u8; 32]) {
 /// must STAY gone across the second shutdown's save cycle.
 ///
 /// Since ant-quic 0.27.58 (#269) the cache refuses to store the node's own
-/// entry, so phase 1 cannot insert it directly any more. It saves a
-/// stand-in peer instead and then rewrites that id in the saved file to our
-/// own id, with the file's checksum recomputed: the shape an older build
-/// left on disk.
+/// entry and drops it at every load, so the never-self-dial property no
+/// longer depends on unlinking the file. Phase 1 cannot insert the self
+/// entry directly any more: it saves a stand-in peer and rewrites that id in
+/// the saved file to our own id, with the checksum recomputed (the shape an
+/// older build left on disk). The later starts must never load it.
 #[tokio::test]
 async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
     let temp = TempDir::new().unwrap();
@@ -431,10 +432,12 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
     );
     rewrite_cache_entry_id(&cache_file, stand_in_bytes, own_bytes);
 
-    // Phase 2: same identity, same cache dir. The #484 startup prune
-    // removes the self entry; with the cache then empty the persisted
-    // file must be unlinked, and the second shutdown must not resurrect it.
-    {
+    // Phase 2 and 3: same identity, same cache dir. ant-quic (#269) drops
+    // the self entry when it loads the file, so the node never holds or
+    // selects itself, on this start or on any later start. The legacy file
+    // may stay on disk (`save()` never rewrites below `min_peers_to_save`);
+    // it is harmless because every load drops the entry again.
+    for start in ["second", "third"] {
         let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
             .await
             .expect("failed to build second agent")
@@ -452,24 +455,16 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
         assert_eq!(
             adapter.peer_count().await,
             0,
-            "the self entry must be pruned from the loaded cache"
-        );
-        assert!(
-            !cache_file.exists(),
-            "an emptied bootstrap cache file must be pruned from disk (#484: never self-dial)"
+            "the {start} start must not load the self entry (#484: never self-dial)"
         );
         agent.shutdown().await;
-        assert!(
-            !cache_file.exists(),
-            "the pruned file must stay gone across the shutdown save cycle"
-        );
     }
 }
 
-/// #1343 review: a start with the peer cache disabled loads nothing, so its
-/// empty in-memory cache says nothing about the file on disk. That start
-/// (and its shutdown) must keep an existing, valid cache file unchanged for
-/// a later persistent start.
+/// A start with the peer cache disabled loads nothing, so its empty
+/// in-memory cache says nothing about the file on disk. That start (and its
+/// shutdown) must keep an existing, valid cache file unchanged for a later
+/// persistent start. No startup prune may delete it.
 #[tokio::test]
 async fn wp_c_491_disabled_peer_cache_keeps_existing_file() {
     let temp = TempDir::new().unwrap();
@@ -526,10 +521,10 @@ async fn wp_c_491_disabled_peer_cache_keeps_existing_file() {
     );
 }
 
-/// #1343 review round 3: when the persisted cache file cannot be READ (an
-/// I/O error such as `PermissionDenied`, not a checksum rejection), ant-quic
-/// falls back to an in-memory cache and loads nothing. The empty cache says
-/// nothing about the file, so the start must not unlink it.
+/// When the persisted cache file cannot be READ (an I/O error such as
+/// `PermissionDenied`, not a checksum rejection), ant-quic falls back to an
+/// in-memory cache and loads nothing. The empty cache says nothing about
+/// the file, so no startup prune may delete it.
 #[cfg(unix)]
 #[tokio::test]
 async fn wp_c_491_unreadable_cache_file_is_kept() {
