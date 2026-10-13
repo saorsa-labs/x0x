@@ -2609,28 +2609,139 @@ async fn remote_group_card_roster_admins(state: &AppState, group_id: &str) -> BT
     group_card_roster_admins(&groups, group_id, &local_agent_hex).unwrap_or_default()
 }
 
-/// #1224: unsigned and unverifiable GroupCards refused before a discovery
-/// cache or an API response. v0.45.0 through v0.47.1 publish only signed
-/// cards (`card.sign` / `to_signed_group_card`).
+/// #1224: unsigned and unverifiable GroupCards refused on discovery, shard,
+/// contact, and metadata ingress. v0.45.0 through v0.47.1 publish only
+/// signed cards (`card.sign` / `to_signed_group_card`).
 static UNSIGNED_GROUP_CARDS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum gap between warn logs for a refused card. Every refusal still
+/// increments [`unsigned_group_cards_refused`].
+const GROUP_CARD_REFUSAL_WARN_INTERVAL_MS: u64 = 60_000;
+static LAST_GROUP_CARD_REFUSAL_WARN_MS: AtomicU64 = AtomicU64::new(0);
 
 fn group_card_signature_accepted(card: &x0x::groups::GroupCard) -> bool {
     match card.verify_signature() {
         Ok(()) => true,
         Err(error) => {
-            UNSIGNED_GROUP_CARDS_REFUSED.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                group_id = %card.group_id,
-                "refused unsigned or unverifiable GroupCard: {error}"
-            );
+            let refused = UNSIGNED_GROUP_CARDS_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = now_millis_u64();
+            let prev = LAST_GROUP_CARD_REFUSAL_WARN_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= GROUP_CARD_REFUSAL_WARN_INTERVAL_MS
+                && LAST_GROUP_CARD_REFUSAL_WARN_MS
+                    .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                tracing::warn!(
+                    group_id = %card.group_id,
+                    refused,
+                    "refused unsigned or unverifiable GroupCard: {error}"
+                );
+            }
             false
         }
     }
 }
 
-#[cfg(test)]
+/// Egress check. Ingress already verified the signature, so a listing must
+/// not run ML-DSA while it holds a cache lock. A card with an empty
+/// signature or authority key never passed that ingress check.
+fn group_card_has_signature_material(card: &x0x::groups::GroupCard) -> bool {
+    !card.signature.is_empty() && !card.authority_public_key.is_empty()
+}
+
+/// Process-local count of GroupCards refused at ingress. `GET /health`
+/// publishes it.
 pub(in crate::server) fn unsigned_group_cards_refused() -> u64 {
     UNSIGNED_GROUP_CARDS_REFUSED.load(Ordering::Relaxed)
+}
+
+/// One payload from the global discovery topic. The listener task calls
+/// this; tests call it directly.
+pub(in crate::server) async fn apply_global_discovery_payload(state: &AppState, payload: &[u8]) {
+    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(payload) else {
+        return;
+    };
+    let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event else {
+        return;
+    };
+    // #1224: refuse an unsigned or unverifiable card before it reaches the
+    // discovery cache. v0.45.0 and later publish only signed cards.
+    if !group_card_signature_accepted(&card) {
+        return;
+    }
+
+    // Phase D.3: withdrawal supersession. A withdrawal card evicts the
+    // cached entry when it is not stale and comes from that entry's own
+    // authority.
+    if card.withdrawn {
+        let roster_admins = remote_group_card_roster_admins(state, &card.group_id).await;
+        let mut cache = state.group_card_cache.write().await;
+        prune_expired_group_cards(&mut cache, now_millis_u64());
+        let existed = cache.contains_key(&card.group_id);
+        if existed
+            && withdraw_remote_group_card(&mut cache, &card, &roster_admins, "discovery")
+                == x0x::groups::directory::CardReplacement::Replace
+        {
+            tracing::info!(
+                group_id = %card.group_id,
+                revision = card.revision,
+                "D.3: withdrawal card superseded prior listing"
+            );
+        }
+        return;
+    }
+
+    let local_group_withdrawn = {
+        let groups = state.named_groups.read().await;
+        has_withdrawn_group_record(&groups, &card.group_id)
+    };
+    if local_group_withdrawn {
+        tracing::debug!(
+            group_id = %card.group_id,
+            "D.3: dropped stale non-withdrawn card for withdrawn group"
+        );
+        return;
+    }
+
+    // Only accept cards that are allowed on a public discovery surface.
+    // Hidden and ListedToContacts must never be cached from the global
+    // discovery topic.
+    if !x0x::groups::may_publish_to_public_shards(card.policy_summary.discoverability) {
+        return;
+    }
+
+    // Phase D.3: higher revision supersedes lower immediately (independent
+    // of TTL). On ties, higher issued_at wins. A cached card is replaced
+    // only by its own authority.
+    let roster_admins = remote_group_card_roster_admins(state, &card.group_id).await;
+    let mut cache = state.group_card_cache.write().await;
+    prune_expired_group_cards(&mut cache, now_millis_u64());
+    match admit_remote_group_card(
+        &mut cache,
+        card.group_id.clone(),
+        card.clone(),
+        &roster_admins,
+        "discovery",
+    ) {
+        x0x::groups::directory::CardReplacement::Replace => {
+            tracing::info!(
+                group_id = %card.group_id,
+                name = %card.name,
+                revision = card.revision,
+                "D.3: caching discovered group card (signed={})",
+                !card.signature.is_empty()
+            );
+            enforce_group_card_cache_cap(&mut cache);
+        }
+        x0x::groups::directory::CardReplacement::Stale => {
+            tracing::debug!(
+                group_id = %card.group_id,
+                revision = card.revision,
+                "D.3: dropped stale card (already have higher rev)"
+            );
+        }
+        x0x::groups::directory::CardReplacement::Refused(_) => {}
+    }
 }
 
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
@@ -2661,97 +2772,7 @@ pub(in crate::server) async fn spawn_global_discovery_listener(
                         "P0-1: received discovery gossip msg ({} bytes)",
                         msg.payload.len()
                     );
-                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
-                    if let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event {
-                        // #1224: refuse an unsigned or unverifiable card before
-                        // it reaches the discovery cache. v0.45.0 and later
-                        // publish only signed cards.
-                        if !group_card_signature_accepted(&card) {
-                            continue;
-                        }
-
-                        // Phase D.3: withdrawal supersession. A withdrawal
-                        // card evicts the cached entry when it is not stale
-                        // and comes from that entry's own authority.
-                        if card.withdrawn {
-                            let roster_admins =
-                                remote_group_card_roster_admins(&state, &card.group_id).await;
-                            let mut cache = state.group_card_cache.write().await;
-                            prune_expired_group_cards(&mut cache, now_millis_u64());
-                            let existed = cache.contains_key(&card.group_id);
-                            if existed
-                                && withdraw_remote_group_card(
-                                    &mut cache,
-                                    &card,
-                                    &roster_admins,
-                                    "discovery",
-                                ) == x0x::groups::directory::CardReplacement::Replace
-                            {
-                                tracing::info!(
-                                    group_id = %card.group_id,
-                                    revision = card.revision,
-                                    "D.3: withdrawal card superseded prior listing"
-                                );
-                            }
-                            continue;
-                        }
-
-                        let local_group_withdrawn = {
-                            let groups = state.named_groups.read().await;
-                            has_withdrawn_group_record(&groups, &card.group_id)
-                        };
-                        if local_group_withdrawn {
-                            tracing::debug!(
-                                group_id = %card.group_id,
-                                "D.3: dropped stale non-withdrawn card for withdrawn group"
-                            );
-                            continue;
-                        }
-
-                        // Only accept cards that are allowed on a public
-                        // discovery surface. Hidden and ListedToContacts must
-                        // never be cached from the global discovery topic.
-                        if !x0x::groups::may_publish_to_public_shards(
-                            card.policy_summary.discoverability,
-                        ) {
-                            continue;
-                        }
-
-                        // Phase D.3: higher revision supersedes lower
-                        // immediately (independent of TTL). On ties, higher
-                        // issued_at wins. A cached card is replaced only by
-                        // its own authority.
-                        let roster_admins =
-                            remote_group_card_roster_admins(&state, &card.group_id).await;
-                        let mut cache = state.group_card_cache.write().await;
-                        prune_expired_group_cards(&mut cache, now_millis_u64());
-                        match admit_remote_group_card(
-                            &mut cache,
-                            card.group_id.clone(),
-                            card.clone(),
-                            &roster_admins,
-                            "discovery",
-                        ) {
-                            x0x::groups::directory::CardReplacement::Replace => {
-                                tracing::info!(
-                                    group_id = %card.group_id,
-                                    name = %card.name,
-                                    revision = card.revision,
-                                    "D.3: caching discovered group card (signed={})",
-                                    !card.signature.is_empty()
-                                );
-                                enforce_group_card_cache_cap(&mut cache);
-                            }
-                            x0x::groups::directory::CardReplacement::Stale => {
-                                tracing::debug!(
-                                    group_id = %card.group_id,
-                                    revision = card.revision,
-                                    "D.3: dropped stale card (already have higher rev)"
-                                );
-                            }
-                            x0x::groups::directory::CardReplacement::Refused(_) => {}
-                        }
-                    }
+                    apply_global_discovery_payload(&state, &msg.payload).await;
                 }
             }
         }
@@ -2943,7 +2964,7 @@ async fn respond_to_pull(
 }
 
 /// Handle one message arriving on a shard topic: Card / Digest / Pull.
-async fn handle_directory_message(
+pub(in crate::server) async fn handle_directory_message(
     state: &AppState,
     kind: x0x::groups::ShardKind,
     shard: u32,
@@ -3102,7 +3123,7 @@ pub(in crate::server) async fn spawn_directory_resubscribe(
 /// direct-message channel. 16 bytes so receivers can do a single
 /// constant-length prefix match. Payload after the prefix is the JSON
 /// encoding of a signed [`x0x::groups::GroupCard`].
-const LTC_CARD_FRAME_PREFIX: &[u8; 16] = b"X0X-LTC-CARD-V1\n";
+pub(in crate::server) const LTC_CARD_FRAME_PREFIX: &[u8; 16] = b"X0X-LTC-CARD-V1\n";
 
 /// Push a signed `ListedToContacts` `GroupCard` to each Trusted/Known
 /// contact via direct-message. Skips contacts we have no record of, any
@@ -3161,6 +3182,88 @@ async fn publish_listed_to_contacts_card(state: &AppState, card: x0x::groups::Gr
     }
 }
 
+/// One ListedToContacts direct-message frame. The listener task calls this;
+/// tests call it directly. A frame that is not an LTC card is ignored.
+pub(in crate::server) async fn apply_listed_to_contacts_frame(
+    state: &AppState,
+    sender_hex: &str,
+    payload: &[u8],
+) {
+    if payload.len() < LTC_CARD_FRAME_PREFIX.len()
+        || &payload[..LTC_CARD_FRAME_PREFIX.len()] != LTC_CARD_FRAME_PREFIX
+    {
+        return;
+    }
+    let json = &payload[LTC_CARD_FRAME_PREFIX.len()..];
+    let card: x0x::groups::GroupCard = match serde_json::from_slice(json) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("C.2/LTC: malformed card JSON: {e}");
+            return;
+        }
+    };
+    // #1224: an unsigned or unverifiable contact card is dropped before the
+    // contact cache.
+    if !group_card_signature_accepted(&card) {
+        return;
+    }
+    // Defensive privacy guard: even via LTC delivery, a card whose
+    // discoverability is not ListedToContacts should not be cached as if it
+    // were. Accept only ListedToContacts cards on this path.
+    if card.policy_summary.discoverability != x0x::groups::GroupDiscoverability::ListedToContacts {
+        tracing::warn!(
+            group_id = %card.group_id,
+            "C.2/LTC: dropped non-LTC card on contact channel"
+        );
+        return;
+    }
+    let roster_admins = remote_group_card_roster_admins(state, &card.group_id).await;
+    if card.withdrawn {
+        let mut cache = state.group_card_cache.write().await;
+        prune_expired_group_cards(&mut cache, now_millis_u64());
+        let existed = cache.contains_key(&card.group_id);
+        if existed
+            && withdraw_remote_group_card(&mut cache, &card, &roster_admins, "contacts")
+                == x0x::groups::directory::CardReplacement::Replace
+        {
+            tracing::info!(
+                group_id = %card.group_id,
+                "C.2/LTC: evicted withdrawn card from contact cache"
+            );
+        }
+        return;
+    }
+    let local_group_withdrawn = {
+        let groups = state.named_groups.read().await;
+        has_withdrawn_group_record(&groups, &card.group_id)
+    };
+    if local_group_withdrawn {
+        tracing::debug!(
+            group_id = %card.group_id,
+            "C.2/LTC: dropped stale non-withdrawn card for withdrawn group"
+        );
+        return;
+    }
+    let mut cache = state.group_card_cache.write().await;
+    prune_expired_group_cards(&mut cache, now_millis_u64());
+    let insert = admit_remote_group_card(
+        &mut cache,
+        card.group_id.clone(),
+        card.clone(),
+        &roster_admins,
+        "contacts",
+    ) == x0x::groups::directory::CardReplacement::Replace;
+    if insert {
+        tracing::info!(
+            group_id = %card.group_id,
+            sender = %sender_hex,
+            revision = card.revision,
+            "C.2/LTC: cached ListedToContacts card from contact"
+        );
+        enforce_group_card_cache_cap(&mut cache);
+    }
+}
+
 /// Background listener that consumes inbound direct messages and, when it
 /// sees an LTC-framed envelope, verifies the card signature and caches it
 /// in `group_card_cache` (never on public shards).
@@ -3175,84 +3278,12 @@ pub(in crate::server) async fn spawn_listed_to_contacts_listener(
                 _ = shutdown_rx.changed() => break,
                 maybe = direct_rx.recv() => {
                     let Some(msg) = maybe else { break; };
-                    if msg.payload.len() < LTC_CARD_FRAME_PREFIX.len() {
-                        continue;
-                    }
-                    if &msg.payload[..LTC_CARD_FRAME_PREFIX.len()] != LTC_CARD_FRAME_PREFIX {
-                        continue;
-                    }
-                    let json = &msg.payload[LTC_CARD_FRAME_PREFIX.len()..];
-                    let card: x0x::groups::GroupCard = match serde_json::from_slice(json) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::debug!("C.2/LTC: malformed card JSON: {e}");
-                            continue;
-                        }
-                    };
-                    // #1224: an unsigned or unverifiable contact card is dropped
-                    // before the contact cache.
-                    if !group_card_signature_accepted(&card) {
-                        continue;
-                    }
-                    // Defensive privacy guard: even via LTC delivery, a
-                    // card whose discoverability is not ListedToContacts
-                    // should not be cached as if it were. Accept only
-                    // ListedToContacts cards on this path.
-                    if card.policy_summary.discoverability
-                        != x0x::groups::GroupDiscoverability::ListedToContacts
-                    {
-                        tracing::warn!(
-                            group_id = %card.group_id,
-                            "C.2/LTC: dropped non-LTC card on contact channel"
-                        );
-                        continue;
-                    }
-                    let roster_admins =
-                        remote_group_card_roster_admins(&state, &card.group_id).await;
-                    if card.withdrawn {
-                        let mut cache = state.group_card_cache.write().await;
-                        prune_expired_group_cards(&mut cache, now_millis_u64());
-                        let existed = cache.contains_key(&card.group_id);
-                        if existed
-                            && withdraw_remote_group_card(&mut cache, &card, &roster_admins, "contacts")
-                                == x0x::groups::directory::CardReplacement::Replace
-                        {
-                            tracing::info!(
-                                group_id = %card.group_id,
-                                "C.2/LTC: evicted withdrawn card from contact cache"
-                            );
-                        }
-                        continue;
-                    }
-                    let local_group_withdrawn = {
-                        let groups = state.named_groups.read().await;
-                        has_withdrawn_group_record(&groups, &card.group_id)
-                    };
-                    if local_group_withdrawn {
-                        tracing::debug!(
-                            group_id = %card.group_id,
-                            "C.2/LTC: dropped stale non-withdrawn card for withdrawn group"
-                        );
-                        continue;
-                    }
-                    let mut cache = state.group_card_cache.write().await;
-                    prune_expired_group_cards(&mut cache, now_millis_u64());
-                    let insert = admit_remote_group_card(
-                        &mut cache,
-                        card.group_id.clone(),
-                        card.clone(),
-                        &roster_admins,
-                        "contacts",
-                    ) == x0x::groups::directory::CardReplacement::Replace;
-                    if insert {
-                        tracing::info!(
-                            group_id = %card.group_id,
-                            sender = %hex::encode(msg.sender.as_bytes()),
-                            revision = card.revision,
-                            "C.2/LTC: cached ListedToContacts card from contact"
-                        );
-                        enforce_group_card_cache_cap(&mut cache);
-                    }
+                    apply_listed_to_contacts_frame(
+                        &state,
+                        &hex::encode(msg.sender.as_bytes()),
+                        &msg.payload,
+                    )
+                    .await;
                 }
             }
         }
@@ -27525,8 +27556,10 @@ pub(in crate::server) async fn discover_groups(
         if card.policy_summary.discoverability == x0x::groups::GroupDiscoverability::Hidden {
             return;
         }
-        // #1224: a cached unsigned or unverifiable card is not a listing entry.
-        if !group_card_signature_accepted(card) {
+        // #1224: ingress already verified. Listing only rejects a card that
+        // has no signature material, and it does that without ML-DSA while
+        // this closure runs under the cache lock.
+        if !group_card_has_signature_material(card) {
             return;
         }
         let entry = cards.entry(card.group_id.clone());
@@ -27737,8 +27770,9 @@ pub(in crate::server) async fn get_group_card(
         let mut cache = state.group_card_cache.write().await;
         prune_and_bound_group_card_cache(&mut cache, now_millis_u64());
         if let Some(card) = cache.get(&id) {
-            // #1224: do not serve an unsigned or unverifiable cached card.
-            if group_card_signature_accepted(card) {
+            // #1224: ingress already verified. Do not run ML-DSA under this
+            // cache lock; a card with no signature material is not served.
+            if group_card_has_signature_material(card) {
                 return Json(serde_json::to_value(card).unwrap_or(serde_json::Value::Null))
                     .into_response();
             }
