@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.48.0] - 2026-10-13
 
-A minor release. It removes one unused public module (breaking for code that imported it), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
+A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
 
 ### Breaking
 
@@ -14,15 +14,21 @@ A minor release. It removes one unused public module (breaking for code that imp
   `BootstrapConfig`; #1178, #1184). Nothing in x0x used it. Bootstrap retry
   and backoff live in `Agent::join_network`, and the seed list is
   `network::DEFAULT_BOOTSTRAP_PEERS`.
+- **`x0x::files` public types changed (#1102, #1323).** `TransferState` has
+  two new public fields, `accept_dispatched` and `chunk_admit_held` (both
+  process-local, `#[serde(default, skip)]`), so a struct literal must set
+  them (use `false`). `FileMessage` has a new variant `ControlAck {
+  transfer_id, op }`, so an exhaustive `match` needs an arm for it. The wire
+  form is unchanged for peers without capability bit 3.
 
 ### Changed
 
-- **Stricter actors on group routes (#1228).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
+- **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
-  seed (#1321).** `join_network` built the JOIN seeds from transport dial
+  seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
   refused it a moment later, and it still became a seed. The JOIN then
   dialled it up to ten times (81.1 s of backoff plus up to 10.128 s of
@@ -75,7 +81,7 @@ A minor release. It removes one unused public module (breaking for code that imp
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
 
-- **ant-quic 0.27.60.** x0x now pins `ant-quic = "=0.27.60"` (0.27.58, 0.27.59 and 0.27.60).
+- **ant-quic 0.27.60 (#1343).** x0x now pins `ant-quic = "=0.27.60"` (0.27.58, 0.27.59 and 0.27.60).
   - Only one end of each peer pair retires a superseded connection: the end
     with the greater PeerId, and only on evidence (ant-quic #313 Part 2,
     #315, ADR-017). Before, the two ends could each close the connection
