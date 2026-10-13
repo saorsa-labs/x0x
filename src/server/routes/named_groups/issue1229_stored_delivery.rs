@@ -90,16 +90,18 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
 
     let blocked_kp = x0x::identity::AgentKeypair::generate()?;
     let revoked_kp = x0x::identity::AgentKeypair::generate()?;
+    let contact_kp = x0x::identity::AgentKeypair::generate()?;
     let kept_kp = x0x::identity::AgentKeypair::generate()?;
     let blocked = signed(&stable, &blocked_kp, "from-cache", 1)?;
     let revoked = signed(&stable, &revoked_kp, "from-history", 2)?;
-    let kept = signed(&stable, &kept_kp, "kept", 3)?;
+    let contact = signed(&stable, &contact_kp, "from-contact", 3)?;
+    let kept = signed(&stable, &kept_kp, "kept", 4)?;
 
     state
         .public_messages
         .write()
         .await
-        .insert(stable.clone(), vec![blocked, kept.clone()]);
+        .insert(stable.clone(), vec![blocked, contact, kept.clone()]);
 
     let store = state.agent.history().context("history")?.store();
     for message in [&revoked, &kept] {
@@ -114,10 +116,11 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
         before,
         BTreeSet::from([
             "from-cache".to_string(),
+            "from-contact".to_string(),
             "from-history".to_string(),
             "kept".to_string()
         ]),
-        "all three authors are served before a refusal"
+        "every author is served before a refusal"
     );
 
     let blocked_id = blocked_kp.agent_id();
@@ -139,12 +142,29 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
         .write()
         .await
         .verify_and_insert(revocation, None)?;
+    state
+        .contacts
+        .write()
+        .await
+        .revoke(&contact_kp.agent_id(), "issue1229");
 
     let after = message_bodies(&app).await?;
     assert_eq!(
         after,
         BTreeSet::from(["kept".to_string()]),
-        "a Blocked cache author and a revoked history author must not be served; the other author stays"
+        "Blocked, revocation-set, and contact-revoked authors must not be served"
+    );
+
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&blocked_id, TrustLevel::Known);
+    let restored = message_bodies(&app).await?;
+    assert_eq!(
+        restored,
+        BTreeSet::from(["from-cache".to_string(), "kept".to_string()]),
+        "clearing Blocked restores that row; a revocation stays hidden"
     );
     Ok(())
 }

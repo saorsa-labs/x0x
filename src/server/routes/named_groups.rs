@@ -16930,44 +16930,10 @@ pub(in crate::server) struct GetMessagesQuery {
     thread_root: Option<String>,
 }
 
-/// #1229: true when live delivery would drop this sender.
-///
-/// The check matches `decode_for_delivery`: the revocation set, then
-/// the contact store's revoked keys, then `Blocked`. An author hex
-/// that does not decode to an agent id returns false.
-pub(in crate::server) async fn stored_sender_delivery_refused(
-    state: &AppState,
-    author_hex: &str,
-) -> bool {
-    let Ok(agent) = parse_agent_id_hex(author_hex) else {
-        return false;
-    };
-    if state
-        .agent
-        .revocation_set()
-        .read()
-        .await
-        .is_agent_revoked(&agent)
-    {
-        tracing::debug!(
-            author = %author_hex,
-            "stored delivery skipped: sender is revoked"
-        );
-        return true;
-    }
-    let contacts = state.contacts.read().await;
-    if contacts.is_revoked(&agent) || contacts.trust_level(&agent) == TrustLevel::Blocked {
-        tracing::debug!(
-            author = %author_hex,
-            "stored delivery skipped: sender is blocked"
-        );
-        return true;
-    }
-    false
-}
-
-/// Drop public messages whose author [`stored_sender_delivery_refused`]
-/// refuses. History rows and the in-memory cache both pass through here.
+/// Drop public messages whose author the delivery gate refuses.
+/// History rows and the in-memory cache both pass through here.
+/// The store limit (500) is applied before this filter, so the response
+/// can be shorter than the stored page.
 async fn retain_deliverable_public_messages(
     state: &AppState,
     msgs: Vec<x0x::groups::GroupPublicMessage>,
@@ -16981,7 +16947,7 @@ async fn retain_deliverable_public_messages(
             continue;
         }
         if !allowed.contains(author) {
-            if stored_sender_delivery_refused(state, author).await {
+            if crate::server::delivery_gate::stored_sender_delivery_refused(state, author).await {
                 denied.insert(msg.author_agent_id.clone());
                 continue;
             }

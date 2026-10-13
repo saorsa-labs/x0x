@@ -890,15 +890,56 @@ async fn abandon_ws_session(
     state.ws_sessions.write().await.remove(session_id);
 }
 
-/// #1229: a backfill row is refused when its author is revoked or Blocked.
-/// A row with no author stays. That row has no sender to check.
+/// #1229: a topic backfill row is refused when its author is revoked or
+/// Blocked. A row with no author stays. That row has no sender to check.
 async fn history_backfill_author_refused(state: &AppState, author: Option<&str>) -> bool {
     match author {
-        Some(author) => {
-            super::routes::named_groups::stored_sender_delivery_refused(state, author).await
-        }
+        Some(author) => super::delivery_gate::stored_sender_delivery_refused(state, author).await,
         None => false,
     }
+}
+
+/// Replay stored direct-message rows onto a session queue.
+///
+/// Refusal is decided on each row as it is fed. A refused row is not hashed,
+/// so a later live frame is not dropped if the sender is allowed again.
+/// The hash set contains only rows that were fed.
+async fn feed_direct_backfill_rows(
+    state: &AppState,
+    rows: &[crate::history::store::StoredRecord],
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    stats: &WsOutboundStats,
+) -> HashSet<[u8; 32]> {
+    let mut hashes = HashSet::new();
+    for row in rows {
+        let record = &row.record;
+        if super::delivery_gate::stored_dm_delivery_refused(
+            state,
+            record.author_agent.as_deref(),
+            record.author_machine.as_deref(),
+        )
+        .await
+        {
+            continue;
+        }
+        hashes.insert(*blake3::hash(&record.payload).as_bytes());
+        let out = WsOutbound::DirectMessage {
+            sender: record.author_agent.clone().unwrap_or_default(),
+            machine_id: record.author_machine.clone().unwrap_or_default(),
+            payload: BASE64.encode(&record.payload),
+            received_at: u64::try_from(record.seen_at_ms).unwrap_or_default(),
+            verified: matches!(
+                record.provenance,
+                crate::history::Provenance::VerifiedEnvelope
+            ),
+            trust_decision: None,
+            observed_origin: None,
+        };
+        if !feed_droppable(outbound_tx, out, stats) {
+            break;
+        }
+    }
+    hashes
 }
 
 /// Core WebSocket connection lifecycle.
@@ -1010,37 +1051,12 @@ async fn handle_ws_connection(
                 {
                     Some(Ok(Ok(mut rows))) => {
                         rows.reverse(); // newest-first → oldest-first replay
-                        let mut hashes = std::collections::HashSet::new();
-                        for row in &rows {
-                            let r = &row.record;
-                            // #1229: same refusal as live delivery. Skip the
-                            // hash too, so a later live frame is not dropped
-                            // if the sender is allowed again.
-                            if history_backfill_author_refused(&state, r.author_agent.as_deref())
-                                .await
-                            {
-                                continue;
-                            }
-                            hashes.insert(*blake3::hash(&r.payload).as_bytes());
-                            let out = WsOutbound::DirectMessage {
-                                sender: r.author_agent.clone().unwrap_or_default(),
-                                machine_id: r.author_machine.clone().unwrap_or_default(),
-                                payload: BASE64.encode(&r.payload),
-                                received_at: u64::try_from(r.seen_at_ms).unwrap_or_default(),
-                                verified: matches!(
-                                    r.provenance,
-                                    crate::history::Provenance::VerifiedEnvelope
-                                ),
-                                trust_decision: None,
-                                observed_origin: None,
-                            };
-                            // Backfill frames are droppable: the store still
-                            // holds them and `/history` can re-serve them.
-                            if !feed_droppable(&outbound_tx, out, &stats) {
-                                break;
-                            }
-                        }
-                        dm_backfill_hashes = Some(hashes);
+                                        // #1229: refuse the agent, a revoked originating
+                                        // machine, and a revoked agent–machine binding.
+                                        // Only fed rows enter the dedupe set.
+                        dm_backfill_hashes = Some(
+                            feed_direct_backfill_rows(&state, &rows, &outbound_tx, &stats).await,
+                        );
                     }
                     Some(Ok(Err(e))) => {
                         tracing::warn!(session_id = %session_id, "direct WS backfill query failed: {e}");
@@ -3239,12 +3255,16 @@ mod tests {
     /// row was stored. A clean author and a row with no author stay.
     #[tokio::test]
     async fn issue1229_topic_backfill_hides_a_blocked_author() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
         let (state, _dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
         let topic = "issue1229.backfill";
         let blocked_kp = crate::identity::AgentKeypair::generate()?;
+        let revoked_kp = crate::identity::AgentKeypair::generate()?;
+        let contact_kp = crate::identity::AgentKeypair::generate()?;
         let kept_kp = crate::identity::AgentKeypair::generate()?;
-        let store = state.agent.history().expect("history").store();
+        let store = state.agent.history().context("history")?.store();
         for (author, body, seen_at_ms) in [
             (
                 Some(hex::encode(blocked_kp.agent_id().as_bytes())),
@@ -3252,11 +3272,21 @@ mod tests {
                 1,
             ),
             (
-                Some(hex::encode(kept_kp.agent_id().as_bytes())),
-                "kept-row",
+                Some(hex::encode(revoked_kp.agent_id().as_bytes())),
+                "revoked-row",
                 2,
             ),
-            (None, "no-author-row", 3),
+            (
+                Some(hex::encode(contact_kp.agent_id().as_bytes())),
+                "contact-row",
+                3,
+            ),
+            (
+                Some(hex::encode(kept_kp.agent_id().as_bytes())),
+                "kept-row",
+                4,
+            ),
+            (None, "no-author-row", 5),
         ] {
             store.insert(&topic_history_row(topic, author, body, seen_at_ms))?;
         }
@@ -3266,10 +3296,12 @@ mod tests {
             before,
             std::collections::BTreeSet::from([
                 "blocked-row".to_string(),
+                "contact-row".to_string(),
                 "kept-row".to_string(),
                 "no-author-row".to_string(),
+                "revoked-row".to_string(),
             ]),
-            "topic backfill serves every stored row before the author is Blocked"
+            "topic backfill serves every stored row before a refusal"
         );
 
         let blocked_id = blocked_kp.agent_id();
@@ -3278,14 +3310,221 @@ mod tests {
             .write()
             .await
             .set_trust(&blocked_id, TrustLevel::Blocked);
+        let revocation = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked_kp.agent_id()),
+            revoked_kp.public_key(),
+            revoked_kp.secret_key(),
+            crate::groups::owner_cert::restore_clock_now(),
+            Some("issue1229".to_string()),
+        )?;
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(revocation, None)?;
+        state
+            .contacts
+            .write()
+            .await
+            .revoke(&contact_kp.agent_id(), "issue1229");
 
         let after = topic_backfill_bodies(&state, topic, "s-after").await;
         assert_eq!(
             after,
             std::collections::BTreeSet::from(["kept-row".to_string(), "no-author-row".to_string()]),
-            "topic backfill must omit the Blocked author and keep the other rows"
+            "topic backfill must omit Blocked, revoked, and contact-revoked authors"
+        );
+
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&blocked_id, TrustLevel::Known);
+        let restored = topic_backfill_bodies(&state, topic, "s-restored").await;
+        assert_eq!(
+            restored,
+            std::collections::BTreeSet::from([
+                "blocked-row".to_string(),
+                "kept-row".to_string(),
+                "no-author-row".to_string(),
+            ]),
+            "clearing Blocked restores that topic row; revocations stay hidden"
         );
         Ok(())
+    }
+
+    /// #1229: direct backfill refuses a revoked agent, a contact-revoked
+    /// agent, a Blocked agent, a revoked machine, and a revoked binding.
+    /// A clean author stays, and clearing Blocked restores only that row.
+    #[tokio::test]
+    async fn issue1229_direct_backfill_hides_refused_senders() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let blocked_kp = crate::identity::AgentKeypair::generate()?;
+        let revoked_kp = crate::identity::AgentKeypair::generate()?;
+        let contact_kp = crate::identity::AgentKeypair::generate()?;
+        let machine_agent = crate::identity::AgentKeypair::generate()?;
+        let binding_agent = crate::identity::AgentKeypair::generate()?;
+        let kept_kp = crate::identity::AgentKeypair::generate()?;
+        let revoked_machine = crate::identity::MachineKeypair::generate()?;
+        let binding_machine = crate::identity::MachineKeypair::generate()?;
+        let clean_machine = crate::identity::MachineKeypair::generate()?;
+        let store = state.agent.history().context("history")?.store();
+        let peer = hex::encode(kept_kp.agent_id().as_bytes());
+        for (author, machine, body, seen_at_ms) in [
+            (&blocked_kp, &clean_machine, "dm-blocked", 1),
+            (&revoked_kp, &clean_machine, "dm-revoked", 2),
+            (&contact_kp, &clean_machine, "dm-contact", 3),
+            (&machine_agent, &revoked_machine, "dm-machine", 4),
+            (&binding_agent, &binding_machine, "dm-binding", 5),
+            (&kept_kp, &clean_machine, "dm-kept", 6),
+        ] {
+            store.insert(&dm_history_row(
+                &peer,
+                hex::encode(author.agent_id().as_bytes()),
+                hex::encode(machine.machine_id().as_bytes()),
+                body,
+                seen_at_ms,
+            ))?;
+        }
+
+        let before = direct_backfill_bodies(&state).await?;
+        assert_eq!(
+            before,
+            std::collections::BTreeSet::from([
+                "dm-binding".to_string(),
+                "dm-blocked".to_string(),
+                "dm-contact".to_string(),
+                "dm-kept".to_string(),
+                "dm-machine".to_string(),
+                "dm-revoked".to_string(),
+            ]),
+            "direct backfill serves every stored row before a refusal"
+        );
+
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&blocked_kp.agent_id(), TrustLevel::Blocked);
+        let agent_revocation = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked_kp.agent_id()),
+            revoked_kp.public_key(),
+            revoked_kp.secret_key(),
+            crate::groups::owner_cert::restore_clock_now(),
+            Some("issue1229".to_string()),
+        )?;
+        let machine_revocation = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(revoked_machine.machine_id()),
+            revoked_machine.public_key(),
+            revoked_machine.secret_key(),
+            crate::groups::owner_cert::restore_clock_now(),
+            Some("issue1229-machine".to_string()),
+        )?;
+        {
+            let set = state.agent.revocation_set();
+            let mut set = set.write().await;
+            set.verify_and_insert(agent_revocation, None)?;
+            set.verify_and_insert(machine_revocation, None)?;
+            set.union_bundle_retired(&[crate::revocation::AgentMachineBinding {
+                agent: binding_agent.agent_id(),
+                machine: binding_machine.machine_id(),
+                move_epoch: 1,
+            }]);
+        }
+        state
+            .contacts
+            .write()
+            .await
+            .revoke(&contact_kp.agent_id(), "issue1229");
+
+        let after = direct_backfill_bodies(&state).await?;
+        assert_eq!(
+            after,
+            std::collections::BTreeSet::from(["dm-kept".to_string()]),
+            "direct backfill must omit revoked agents, Blocked agents, revoked machines, and revoked bindings"
+        );
+
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&blocked_kp.agent_id(), TrustLevel::Known);
+        let restored = direct_backfill_bodies(&state).await?;
+        assert_eq!(
+            restored,
+            std::collections::BTreeSet::from(["dm-blocked".to_string(), "dm-kept".to_string()]),
+            "clearing Blocked restores that direct row; machine and agent revocations stay hidden"
+        );
+        Ok(())
+    }
+
+    fn dm_history_row(
+        peer: &str,
+        author: String,
+        machine: String,
+        body: &str,
+        seen_at_ms: i64,
+    ) -> crate::history::HistoryRecord {
+        let payload = body.as_bytes().to_vec();
+        crate::history::HistoryRecord {
+            msg_id: crate::history::HistoryRecord::compute_msg_id(None, &payload),
+            scope: crate::history::Scope::Dm(peer.to_string()),
+            author_agent: Some(author),
+            author_machine: Some(machine),
+            author_pubkey: None,
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: crate::history::Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: crate::history::Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    async fn direct_backfill_bodies(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        use anyhow::Context as _;
+
+        let store = state.agent.history().context("history")?.store();
+        let query = crate::history::HistoryQuery {
+            scope_kind: Some(crate::history::Scope::Dm(String::new()).kind()),
+            limit: 20,
+            ..Default::default()
+        };
+        let mut rows = store.query(&query)?;
+        rows.reverse();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(16);
+        let stats = WsOutboundStats::default();
+        feed_direct_backfill_rows(state, &rows, &tx, &stats).await;
+        drop(tx);
+        let mut bodies = std::collections::BTreeSet::new();
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                WsOutbound::DirectMessage { payload, .. } => {
+                    let bytes = BASE64
+                        .decode(&payload)
+                        .context("direct backfill payload is base64")?;
+                    bodies.insert(
+                        String::from_utf8(bytes).context("direct backfill payload is utf-8")?,
+                    );
+                }
+                other => anyhow::bail!("unexpected direct backfill frame: {other:?}"),
+            }
+        }
+        Ok(bodies)
     }
 
     fn topic_history_row(

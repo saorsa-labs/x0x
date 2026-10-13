@@ -17,6 +17,7 @@ mod auth;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
+mod delivery_gate;
 mod group_access;
 mod instance_lock;
 mod legacy_store_migration;
@@ -31,6 +32,8 @@ mod ws;
 
 #[cfg(test)]
 mod issue1102;
+#[cfg(test)]
+mod issue1229_delivery;
 #[cfg(test)]
 mod issue1288_ws_shutdown;
 #[cfg(test)]

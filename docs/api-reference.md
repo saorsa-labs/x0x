@@ -2212,11 +2212,11 @@ While this node holds a fork-quarantine marker for a group (see the 409
 `fork_quarantined` section under Error handling), the history surface splits in
 two: **reads always serve, the purge always refuses.**
 
-**Reads are annotated, never refused.** `GET /history`,
+**Fork quarantine annotates reads. It does not refuse the scope.** `GET /history`,
 `GET /history/message/:msg_id`, `GET /history/search`, `GET /history/scopes`,
 `GET /history/stats`, `GET /diagnostics/history` and
-`GET /groups/:id/messages` return the same rows they always did and add two
-envelope fields:
+`GET /groups/:id/messages` still return rows for a fork-quarantined group, and
+they add two envelope fields:
 
 A session bearer outside an active local group seat still receives retained
 history content under the existing history authorization rules, but the
@@ -2227,6 +2227,22 @@ the session's local agent is active appear. Durable operator and rider views
 retain their existing annotation behavior. `GET /groups/:id/messages` likewise
 keeps serving signed public messages under its read policy while omitting the
 quarantine envelope annotation for a session without an active local seat.
+
+Author refusal is a separate check (#1229). `GET /history`,
+`GET /history/message/:msg_id`, `GET /history/search`, and
+`GET /groups/:id/messages` omit a row when that author is revoked or Blocked
+at read time. A direct-message row is also omitted when its originating
+machine is revoked, or when that agent–machine binding is revoked. The store
+keeps the row. A later read serves it again when the author is allowed.
+`GET /history` and `GET /history/search` apply `limit` before this filter, so
+a page can contain fewer records than `limit`. `next_before_id` is still the
+last stored row of that page, including a hidden row, so the next page moves
+forward. `GET /groups/:id/messages` reads at most 500 stored rows and then
+applies the same author filter. `GET /history/scopes`, `GET /history/stats`,
+and `GET /diagnostics/history` do not return message bodies, so this filter
+does not change them. WebSocket topic backfill, WebSocket direct backfill,
+and `GET /direct/events?backfill=N` use the same rules. Direct backfill checks
+each row when that event is emitted.
 
 ```json
 {
