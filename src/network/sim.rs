@@ -296,6 +296,9 @@ struct FabricState {
     labels: BTreeMap<Key, String>,
     by_addr: BTreeMap<SocketAddr, Key>,
     links: BTreeMap<(Key, Key), LinkState>,
+    // Open connections that are no longer Live (`supersede_link`). Each has
+    // a Live link for the same pair.
+    superseded: Vec<((Key, Key), LinkState)>,
     pair_ordinals: BTreeMap<(Key, Key), u64>,
     stream_ordinals: BTreeMap<(Key, Key), u32>,
     open_streams: Vec<(u64, Arc<StreamPair>)>,
@@ -361,6 +364,7 @@ impl SimFabric {
                 labels: BTreeMap::new(),
                 by_addr: BTreeMap::new(),
                 links: BTreeMap::new(),
+                superseded: Vec::new(),
                 pair_ordinals: BTreeMap::new(),
                 stream_ordinals: BTreeMap::new(),
                 open_streams: Vec::new(),
@@ -418,6 +422,84 @@ impl SimFabric {
         if !online {
             Self::close_all_locked(&mut state, node.0, ConnectionCloseReason::PeerShutdown, at);
         }
+    }
+
+    /// Model ant-quic 0.27.58 connection retirement (#313 Part 2, ADR-017):
+    /// open a second connection for the live pair `a`–`b` and make it Live.
+    /// The former Live connection is superseded, not closed: bytes on its
+    /// open streams still move. New streams and pinned sends use the new
+    /// Live connection. No lifecycle event is sent. Returns the new
+    /// generation, or `None` when the pair has no live link.
+    pub(crate) fn supersede_link(&self, a: &PeerId, b: &PeerId) -> Option<u64> {
+        let at = self.now();
+        let mut state = self.lock();
+        let key = pair(a.0, b.0);
+        let former = state.links.remove(&key)?;
+        let generation = state.next_generation;
+        state.next_generation = generation.saturating_add(1);
+        let ordinal = {
+            let next = state.pair_ordinals.entry(key).or_insert(0);
+            let ordinal = *next;
+            *next = next.saturating_add(1);
+            ordinal
+        };
+        state.superseded.push((key, former));
+        state.links.insert(
+            key,
+            LinkState {
+                generation,
+                ordinal,
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        state.trace.push(TraceEvent::Link {
+            a: key.0,
+            b: key.1,
+            ordinal,
+            at,
+            open: true,
+        });
+        Some(generation)
+    }
+
+    /// Make the open superseded connection `generation` Live again, as a
+    /// follower does when it adopts the arbiter's older winner (ADR-017).
+    /// The former Live connection is superseded and stays open. No
+    /// lifecycle event is sent. Returns false when `generation` is not an
+    /// open superseded connection of the pair.
+    pub(crate) fn follow_link(&self, a: &PeerId, b: &PeerId, generation: u64) -> bool {
+        let at = self.now();
+        let mut state = self.lock();
+        let key = pair(a.0, b.0);
+        let Some(index) = state
+            .superseded
+            .iter()
+            .position(|(k, link)| *k == key && link.generation == generation)
+        else {
+            return false;
+        };
+        let (_, target) = state.superseded.remove(index);
+        if let Some(former) = state.links.insert(key, target) {
+            state.superseded.push((key, former));
+        }
+        state.trace.push(TraceEvent::Mark {
+            at,
+            text: format!("follow generation {generation}"),
+        });
+        true
+    }
+
+    /// The Live connection of `key`, or a superseded one that is still open,
+    /// has `generation`.
+    fn generation_open_locked(state: &FabricState, key: (Key, Key), generation: u64) -> bool {
+        state
+            .links
+            .get(&key)
+            .is_some_and(|link| link.generation == generation)
+            || state
+                .superseded
+                .iter()
+                .any(|(k, link)| *k == key && link.generation == generation)
     }
 
     /// Partition `a` from `b` (closing any live link) or heal it.
@@ -879,6 +961,22 @@ impl SimFabric {
         reason: ConnectionCloseReason,
         at: Duration,
     ) {
+        // Superseded connections of the pair close with it.
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.superseded)
+            .into_iter()
+            .partition(|(k, _)| *k == key);
+        state.superseded = kept;
+        for (_, link) in gone {
+            link.closed.store(true, Ordering::SeqCst);
+            state.open_streams.retain(|(generation, stream)| {
+                if *generation == link.generation {
+                    stream.connection_lost();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let Some(link) = state.links.remove(&key) else {
             return;
         };
@@ -1230,10 +1328,7 @@ impl SimFabric {
     fn stream_write(&self, lane: LaneKey, generation: u64, bytes: &[u8]) -> io::Result<()> {
         let at = self.now();
         let mut state = self.lock();
-        let live = state
-            .links
-            .get(&pair(lane.src, lane.dst))
-            .is_some_and(|link| link.generation == generation);
+        let live = Self::generation_open_locked(&state, pair(lane.src, lane.dst), generation);
         let seq = {
             let lane_state = state.lanes.entry(lane).or_default();
             let seq = lane_state.next_seq;
@@ -1464,10 +1559,8 @@ impl SimFabric {
             else {
                 break;
             };
-            let live = state
-                .links
-                .get(&pair(lane.src, lane.dst))
-                .is_some_and(|link| link.generation == queued.generation);
+            let live =
+                Self::generation_open_locked(&state, pair(lane.src, lane.dst), queued.generation);
             let target = state
                 .nodes
                 .get(&lane.dst)
@@ -2160,6 +2253,11 @@ pub struct SimSend {
 }
 
 impl SimSend {
+    /// The connection generation that carries this stream.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Gracefully end this direction (EOF for the reader). As with QUIC
     /// (`ClosedStream`, mapped to `NotConnected`), finishing twice fails.
     pub(crate) fn finish(&mut self) -> io::Result<()> {

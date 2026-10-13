@@ -75,6 +75,15 @@ mod test_halves {
                 Self::Sim(send) => send.finish(),
             }
         }
+
+        /// The simulated connection generation that carries this stream.
+        /// `None` on QUIC: ant-quic does not report it for a stream.
+        pub(crate) fn sim_generation(&self) -> Option<u64> {
+            match self {
+                Self::Quic(_) => None,
+                Self::Sim(send) => Some(send.generation()),
+            }
+        }
     }
 
     impl StreamRecv {

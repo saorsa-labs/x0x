@@ -254,6 +254,24 @@ impl Fixture {
         hello: &Hello,
         denial: Option<Denial>,
     ) -> Outcome {
+        match self.exchange_response(protocol, hello, denial, || {}).await {
+            Err(outcome) => outcome,
+            Ok((_, Ok((ACK | HELLO, _)))) => Outcome::HelloVerified,
+            Ok((_, Err(_))) => Outcome::HelloRefused,
+            Ok((_, other)) => panic!("unexpected Hello response: {other:?}"),
+        }
+    }
+
+    /// The raw reply, with the Sim connection generation of the stream that
+    /// carried the request and its reply. `Err` is an outcome before accept.
+    /// `before_accept` runs after A sends its request, before B takes it.
+    async fn exchange_response(
+        &mut self,
+        protocol: StreamProtocol,
+        hello: &Hello,
+        denial: Option<Denial>,
+        before_accept: impl FnOnce(),
+    ) -> Result<(Option<u64>, io::Result<(u8, Vec<u8>)>), Outcome> {
         let body = codec().serialize(hello).unwrap();
         let (mut send, mut reply) = tokio::time::timeout(
             Duration::from_secs(10),
@@ -265,6 +283,7 @@ impl Fixture {
         .await
         .expect("open timeout")
         .expect("open stream");
+        let carried = send.sim_generation();
         // Raw transport is deliberate: EvidenceV1 does not use the public
         // application opener's outbound trust gate (see Context::exchange).
         send.write_u8(protocol.as_u8()).await.unwrap();
@@ -277,6 +296,7 @@ impl Fixture {
         )
         .await
         .unwrap();
+        before_accept();
         let (peer, send, recv) = tokio::time::timeout(
             Duration::from_secs(10),
             self.responder.network().unwrap().accept_bi(),
@@ -298,7 +318,7 @@ impl Fixture {
         )
         .await
         else {
-            return Outcome::BeforePrefixRefused;
+            return Err(Outcome::BeforePrefixRefused);
         };
         if let Some(denial) = denial {
             self.deny(denial).await;
@@ -323,10 +343,10 @@ impl Fixture {
             "neither selected protocol may leak into the default channel",
         );
         if self.app_acceptor.next().now_or_never().flatten().is_some() {
-            return Outcome::ApplicationDelivered;
+            return Err(Outcome::ApplicationDelivered);
         }
         let Some(stream) = self.evidence_acceptor.next().now_or_never().flatten() else {
-            return Outcome::ProtocolRefused;
+            return Err(Outcome::ProtocolRefused);
         };
         assert!(stream.evidence_lease.is_some(), "bounded admission lease");
         Arc::clone(&self.context).accept(stream).await;
@@ -336,11 +356,7 @@ impl Fixture {
         )
         .await
         .expect("Hello must be answered or reset, not left pending");
-        match response {
-            Ok((ACK | HELLO, _)) => Outcome::HelloVerified,
-            Err(_) => Outcome::HelloRefused,
-            other => panic!("unexpected Hello response: {other:?}"),
-        }
+        Ok((carried, response))
     }
 
     async fn shutdown(&self) {
@@ -1261,6 +1277,12 @@ impl Fixture {
     }
 
     async fn s1b_read_hello(&self, reply: S1bReply) {
+        let _ = self.s1b_read_hello_on(reply).await;
+    }
+
+    /// As `s1b_read_hello`; returns the Sim connection generation that
+    /// carried the Hello.
+    async fn s1b_read_hello_on(&self, reply: S1bReply) -> Option<u64> {
         let (peer, mut send, mut recv) = tokio::time::timeout(
             Duration::from_secs(8),
             self.initiator.network().unwrap().accept_bi(),
@@ -1268,6 +1290,7 @@ impl Fixture {
         .await
         .expect("new connection must receive a Hello")
         .unwrap();
+        let carried = send.sim_generation();
         assert_eq!(peer.0, self.responder.machine_id().0);
         assert_eq!(
             recv.read_u8().await.unwrap(),
@@ -1295,6 +1318,7 @@ impl Fixture {
                     .unwrap();
             }
         }
+        carried
     }
 
     async fn s1b_first_attempt(&self, reply: S1bReply) {
@@ -1759,6 +1783,135 @@ fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
         std::mem::size_of::<Option<u64>>() * (HELLO_ATTEMPT_CAP + 1),
         "inline, fixed size: no heap growth"
     );
+}
+
+// #1346 R2 (Codex P2 on #1349): ant-quic does not say which connection
+// carried an accepted stream. A reply goes back on that stream, so the reply
+// gate must not charge another connection. Sim transport: in-process, no
+// sockets. The Sim models ant-quic 0.27.58 retirement and follow: a
+// superseded connection stays open and its streams still carry bytes.
+#[derive(Clone, Copy, Debug)]
+enum LiveChange {
+    // The follower adopts the arbiter's older winner (the Codex sequence).
+    FollowOlder,
+    // A newer connection becomes Live.
+    SupersedeNewer,
+    // The follow lands after A opened its stream, before B takes the
+    // request. B sees the same Live connection at accept and at reply.
+    FollowBeforeAccept,
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_follow_during_verification_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::FollowOlder).await;
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_supersede_during_verification_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::SupersedeNewer).await;
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_follow_before_accept_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::FollowBeforeAccept).await;
+}
+
+async fn issue1346_r2_live_change_during_verification(change: LiveChange) {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    let fabric = Arc::clone(f._fabric.as_ref().unwrap());
+    let machine = f.initiator.machine_id();
+    let a = ant_quic::PeerId(machine.0);
+    let b = ant_quic::PeerId(f.responder.machine_id().0);
+    let older = f.s1b_generation();
+    // Follow*: generation `used` is Live and `older` stays open.
+    let used = match change {
+        LiveChange::FollowOlder | LiveChange::FollowBeforeAccept => {
+            fabric.supersede_link(&a, &b).unwrap()
+        }
+        LiveChange::SupersedeNewer => older,
+    };
+    assert_eq!(f.s1b_generation(), used);
+    // 1. B sends its Hello on the Live connection `used`.
+    f.publish_ready();
+    let ((), carried) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello_on(S1bReply::Ack),
+    );
+    assert_eq!(carried, Some(used));
+    assert_eq!(f.sent(), 1);
+    // 2. More than 60 s later, A's Hello reaches B on `used`.
+    f.s1b_expire_rate_gate();
+    let pause = Arc::new(HelloOpenPause::default());
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_reply_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    // 3. While B verifies it (or, FollowBeforeAccept, before B takes it),
+    //    the Live connection changes. `used` stays open.
+    let before_accept = || {
+        if matches!(change, LiveChange::FollowBeforeAccept) {
+            assert!(fabric.follow_link(&a, &b, older));
+        }
+    };
+    let live_change = async {
+        tokio::time::timeout(DEADLINE, pause.reached.notified())
+            .await
+            .expect("the inbound Hello must reach the reply gate");
+        let winner = match change {
+            LiveChange::FollowOlder => {
+                assert!(fabric.follow_link(&a, &b, older));
+                older
+            }
+            LiveChange::SupersedeNewer => fabric.supersede_link(&a, &b).unwrap(),
+            LiveChange::FollowBeforeAccept => older,
+        };
+        pause.resume.notify_one();
+        winner
+    };
+    let hello = f.hello();
+    let (response, winner) = tokio::join!(
+        f.exchange_response(StreamProtocol::EvidenceV1, &hello, None, before_accept),
+        live_change,
+    );
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_reply_pause
+        .lock()
+        .unwrap() = None;
+    let (carried, reply) = response.expect("the Hello stream must be accepted");
+    assert_ne!(winner, used);
+    assert_eq!(f.s1b_generation(), winner);
+    // 4–5. The reply goes back on the stream that carried A's Hello, on
+    // `used`. B already sent Hello on `used`: the reply must be ACK only.
+    assert_eq!(carried, Some(used), "{change:?}");
+    let (kind, _) = reply.expect("the reply must arrive");
+    assert_eq!(
+        kind, ACK,
+        "{change:?}: no second Hello on generation {used}"
+    );
+    assert_eq!(f.sent(), 1);
+    // The winner's allowance is not consumed by a reply it did not carry.
+    assert!(
+        !f.context.runtime.wire_limits.state.lock().unwrap().machines[&machine]
+            .hello_attempted(winner),
+        "{change:?}: generation {winner} must stay armed"
+    );
+    // After the gate, B's own Hello goes out once, on the winner.
+    f.s1b_expire_rate_gate();
+    let ((), carried) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello_on(S1bReply::Ack),
+    );
+    assert_eq!(carried, Some(winner), "{change:?}");
+    assert_eq!(f.sent(), 2);
+    f.s1b_expire_rate_gate();
+    Arc::clone(&f.context).connect(machine, None, None).await;
+    f.s1b_no_more_hellos().await;
+    assert_eq!(f.sent(), 2);
+    f.shutdown().await;
 }
 
 #[test]

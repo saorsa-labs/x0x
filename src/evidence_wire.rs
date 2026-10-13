@@ -246,6 +246,9 @@ pub(crate) struct Limits {
     state: Mutex<State>,
     #[cfg(test)]
     hello_open_pause: Mutex<Option<Arc<HelloOpenPause>>>,
+    // #1346: pause an inbound Hello after verification, before the reply gate.
+    #[cfg(test)]
+    hello_reply_pause: Mutex<Option<Arc<HelloOpenPause>>>,
     allocations: Arc<tokio::sync::Semaphore>,
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
@@ -269,6 +272,8 @@ impl Default for Limits {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             hello_open_pause: Mutex::new(None),
+            #[cfg(test)]
+            hello_reply_pause: Mutex::new(None),
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
@@ -1034,6 +1039,10 @@ impl Context {
                             &self.runtime.wire_limits.counters.evidence_hello_refused,
                         );
                     })?;
+                    #[cfg(test)]
+                    if kind == HELLO {
+                        self.pause_hello_reply().await;
+                    }
                     if kind == CERTIFICATE {
                         return write_message(
                             &mut send,
@@ -1129,6 +1138,21 @@ impl Context {
             .unwrap()
             .clone();
         if let Some(pause) = pause.filter(|p| p.after_open == after_open) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_hello_reply(&self) {
+        let pause = self
+            .runtime
+            .wire_limits
+            .hello_reply_pause
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(pause) = pause {
             pause.reached.notify_one();
             pause.resume.notified().await;
         }
