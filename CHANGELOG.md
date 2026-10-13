@@ -60,6 +60,20 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
+- **Stored reads and backfill hide a revoked or Blocked author (#1229).**
+  The row stays in the store and in the cache. A later read serves it again
+  when that author is allowed. There is no wire change and no stored-format
+  change.
+  - `GET /groups/:id/messages`, `GET /history`, `GET /history/message/:msg_id`,
+    `GET /history/search`, WebSocket topic backfill, `/ws/direct?backfill=N`
+    and `GET /direct/events?backfill=N` apply the check.
+  - A direct-message replay also hides a revoked originating machine and a
+    revoked agent–machine binding. Direct SSE checks each row when that
+    event is emitted.
+  - `limit` is applied before the filter, so a history page can contain
+    fewer records than `limit`. `next_before_id` still names the last stored
+    row of that page, including a hidden row.
+
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
