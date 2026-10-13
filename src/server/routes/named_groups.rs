@@ -3925,10 +3925,7 @@ pub(in crate::server) fn owner_axis_catchup_block(
     snapshot: &x0x::groups::GroupInfo,
     is_revoked: impl Fn(&str) -> bool,
 ) -> Option<OwnerAxisCatchupBlock> {
-    local
-        .policy
-        .admission
-        .owner_certified_user_id()?;
+    local.policy.admission.owner_certified_user_id()?;
     let local_active: BTreeSet<&str> = local
         .active_members()
         .map(|member| member.agent_id.as_str())
@@ -40780,8 +40777,8 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
-    mod issue1139_back_to_back_join;
     mod issue1105_public_revision_catchup;
+    mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
     mod issue1256_metadata_listener;
