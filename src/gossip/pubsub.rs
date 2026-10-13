@@ -1140,6 +1140,16 @@ async fn forward_plumtree_payload(
     let revocation = installed.or(from_builder);
     match decode_for_delivery(encoded_payload, env.contacts.get(), revocation).await {
         DeliveryVerdict::Delivered(message) => {
+            // #1116: a carrier snapshot is armed from the set delivery just
+            // read, before the frame is copied to subscribers.
+            if let Some(set) = revocation {
+                crate::revocation::arm_incoming_revocation_snapshot(
+                    set,
+                    &message.topic,
+                    &message.payload,
+                )
+                .await;
+            }
             let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
             deliver_copied_notification(slot, env.stats, env.sub_topic, &notification, &recipients);
         }

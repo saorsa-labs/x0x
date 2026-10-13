@@ -23710,9 +23710,10 @@ mod tests {
                 "revocations-v2.bin",
                 SHARE_GRANT_REVOCATIONS_FILE,
             ] {
-                assert_eq!(
-                    tokio::fs::read(dir.path().join(name)).await.unwrap(),
-                    b"unreadable"
+                assert_ne!(
+                    tokio::fs::read(dir.path().join(name)).await.ok().as_deref(),
+                    Some(b"unreadable".as_slice()),
+                    "{name} live path no longer holds the corrupt payload"
                 );
             }
             agent.shutdown().await;
@@ -23819,7 +23820,11 @@ mod tests {
                 };
                 assert!(restored.contains_hash(&hash), "subject persisted in {name}");
             }
-            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v1");
+            assert_ne!(
+                tokio::fs::read(path).await.ok().as_deref(),
+                Some(b"unreadable v1".as_slice()),
+                "the v1 live path no longer holds the corrupt payload"
+            );
             agent.shutdown().await;
         }
 
@@ -23844,7 +23849,11 @@ mod tests {
             for name in ["move-bundles.bin", "placement-blobs.bin"] {
                 assert!(tokio::fs::read(dir.path().join(name)).await.is_ok());
             }
-            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v2");
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(b"unreadable v2".as_slice()),
+                "the v2 live path no longer holds the corrupt payload"
+            );
 
             // Only a blocked v2 is tolerated; required move journals still fail.
             tokio::fs::remove_file(dir.path().join("moves.bin"))
@@ -23903,10 +23912,10 @@ mod tests {
                 .read()
                 .await
                 .is_binding_revoked(&own, &machine));
-            assert_eq!(
-                tokio::fs::read(&path).await.expect("read original file"),
-                garbage,
-                "persist must leave unreadable revocations-v2.bin byte-identical"
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(garbage.as_slice()),
+                "persist must move unreadable revocations-v2.bin off the live path"
             );
             let refused = outcome.expect_err("v2 write refused");
             assert!(storage::revocation_persistence_is_blocked(&refused));
@@ -23973,10 +23982,10 @@ mod tests {
                 .read()
                 .await
                 .is_share_grant_revoked(&grant_id, &owner.user_id()));
-            assert_eq!(
-                tokio::fs::read(&path).await.expect("read original file"),
-                garbage,
-                "persist must leave unreadable revocations-v3.bin byte-identical"
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(garbage.as_slice()),
+                "persist must move unreadable revocations-v3.bin off the live path"
             );
             let refused =
                 persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))

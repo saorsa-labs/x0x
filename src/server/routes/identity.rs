@@ -2747,7 +2747,11 @@ pub(in crate::server::routes) mod revocation_persistence_tests {
                     "delivery must deny the binding with {blocked} blocked"
                 );
             }
-            assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable");
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(b"unreadable".as_slice()),
+                "the live path no longer holds the corrupt payload"
+            );
             state.agent.shutdown().await;
         }
     }

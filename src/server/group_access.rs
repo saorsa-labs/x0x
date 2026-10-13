@@ -751,6 +751,18 @@ pub(in crate::server) async fn admit_named_group_details_of_state(
     info: &x0x::groups::GroupInfo,
     actor: &ActorContext,
 ) -> (String, Admission) {
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return (
+            String::new(),
+            Err(forbidden(x0x::revocation::REVOCATION_RESYNC_STATUS)),
+        );
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let label = local_join_membership_state(state, info, &local_hex).await;
     let admission = admit_named_group_details(actor, label);
@@ -765,6 +777,15 @@ pub(in crate::server) async fn admit_named_group_members_of_state(
     info: &x0x::groups::GroupInfo,
     actor: &ActorContext,
 ) -> Admission {
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return Err(forbidden(x0x::revocation::REVOCATION_RESYNC_STATUS));
+    }
     match actor {
         ActorContext::Owner { durable: false } => {
             let local_hex = hex::encode(state.agent.agent_id().as_bytes());

@@ -1039,6 +1039,14 @@ impl RevocationStore {
         }
     }
 
+    fn carrier_bit(self) -> u8 {
+        match self {
+            Self::V1 => crate::revocation::REVOCATION_CARRIER_V1,
+            Self::V2 => crate::revocation::REVOCATION_CARRIER_V2,
+            Self::V3 => crate::revocation::REVOCATION_CARRIER_V3,
+        }
+    }
+
     fn at_path(path: &Path) -> Option<Self> {
         match path.file_name()?.to_str()? {
             "revocations.bin" => Some(Self::V1),
@@ -1104,8 +1112,37 @@ async fn read_revocation_store_locked(
     persist_attempt: bool,
 ) -> Result<Option<Vec<u8>>> {
     let result = match fs::read(path).await {
-        Ok(bytes) => store.validate(&bytes).map(|()| Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(bytes) if bytes.is_empty() => {
+            archive_corrupt_revocation_bytes(path, &bytes, persist_attempt).await;
+            Err(IdentityError::Serialization(
+                "revocation store is empty".to_string(),
+            ))
+        }
+        Ok(bytes) => match store.validate(&bytes) {
+            Ok(()) => Ok(Some(bytes)),
+            Err(error) => {
+                archive_corrupt_revocation_bytes(path, &bytes, persist_attempt).await;
+                Err(error)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if quarantine_sibling_exists(path).await {
+                // The bad bytes already live under a quarantine name. Do not
+                // read them again. Membership stays closed until resync.
+                if !persist_attempt {
+                    tracing::error!(
+                        path = %path.display(),
+                        "{}",
+                        crate::revocation::REVOCATION_RESYNC_STATUS
+                    );
+                }
+                Err(IdentityError::Serialization(
+                    "revocation store was quarantined".to_string(),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
         Err(e) => Err(IdentityError::Storage(e)),
     };
     let mut states = revocation_store_states().lock().await;
@@ -1172,10 +1209,12 @@ async fn lock_revocation_path(path: &Path) -> RevocationWriteGuard {
 
 /// Load one revocation file.
 ///
-/// A missing file is `Ok(None)`. A file that exists but cannot be read or
-/// decoded is `Ok(Some)` of an empty set whose gates fail closed (#1116).
-/// Writers keep using [`read_revocation_store_locked`], which still returns
-/// the typed refusal and does not replace the bytes.
+/// A missing file with no quarantine sibling is `Ok(None)`. A file that
+/// exists but cannot be decoded is moved to
+/// `<name>.quarantined-<timestamp>` and returned as `Ok(Some)` of an empty
+/// set whose membership stays closed until that carrier is resynced
+/// (#1116). The next start sees the quarantine name, does not read those
+/// bytes, and stays closed. x0xd keeps running.
 pub(crate) async fn read_revocation_store(
     path: &Path,
     store: RevocationStore,
@@ -1185,18 +1224,142 @@ pub(crate) async fn read_revocation_store(
         let _guard = lock_revocation_path(path).await;
         match read_revocation_store_locked(path, store, persist_attempt).await {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(Some(RevocationSet::unreadable_store())),
+            Err(_) => {
+                return Ok(Some(RevocationSet::quarantined_carrier(
+                    store.carrier_bit(),
+                )));
+            }
         }
     };
-    match bytes.map(|bytes| store.decode(&bytes)).transpose() {
-        Ok(set) => Ok(set),
+    let Some(raw) = bytes else {
+        return Ok(None);
+    };
+    match store.decode(&raw) {
+        Ok(set) => Ok(Some(set)),
         Err(error) => {
             // Structural validation passed and cleared the block. The
-            // authority decoder then rejected the same bytes. Restore the
-            // block so a writer cannot replace the file with an empty set.
+            // authority decoder then rejected the same bytes. Move them
+            // off the live path and restore the block so a writer cannot
+            // replace the store with an empty set.
+            archive_corrupt_revocation_bytes(path, &raw, persist_attempt).await;
             remember_unreadable_store(path, error.to_string()).await;
-            Ok(Some(RevocationSet::unreadable_store()))
+            Ok(Some(RevocationSet::quarantined_carrier(
+                store.carrier_bit(),
+            )))
         }
+    }
+}
+
+/// True when `<name>.quarantined-<timestamp>` is already beside `path`.
+///
+/// This looks at file names only. It does not read the quarantined bytes.
+async fn quarantine_sibling_exists(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!("{name}.quarantined-");
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Move corrupt revocation bytes to `<name>.quarantined-<unix-ms>`.
+///
+/// The live path no longer holds the payload. An existing quarantine file
+/// with the same bytes is kept and the live path is removed. Startup
+/// (`persist_attempt == false`) logs the operator message.
+async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_attempt: bool) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let prefix = format!("{name}.quarantined-");
+    let mut existing = None;
+    if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.starts_with(&prefix) {
+                continue;
+            }
+            if tokio::fs::read(entry.path()).await.ok().as_deref() == Some(bytes) {
+                existing = Some(entry.path());
+                break;
+            }
+        }
+    }
+    let quarantine = if let Some(dest) = existing {
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %error,
+                    "{}",
+                    crate::revocation::REVOCATION_RESYNC_STATUS
+                );
+                return;
+            }
+        }
+        dest
+    } else {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let mut dest = parent.join(format!("{prefix}{millis}"));
+        let mut seq = 0u32;
+        while tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            seq = seq.saturating_add(1);
+            dest = parent.join(format!("{prefix}{millis}-{seq}"));
+        }
+        if let Err(rename_error) = tokio::fs::rename(path, &dest).await {
+            if tokio::fs::write(&dest, bytes).await.is_err() {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %rename_error,
+                    "{}",
+                    crate::revocation::REVOCATION_RESYNC_STATUS
+                );
+                return;
+            }
+            if let Err(error) = tokio::fs::remove_file(path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %error,
+                        "{}",
+                        crate::revocation::REVOCATION_RESYNC_STATUS
+                    );
+                    return;
+                }
+            }
+        }
+        dest
+    };
+    if !persist_attempt {
+        tracing::error!(
+            path = %path.display(),
+            quarantine = %quarantine.display(),
+            "{}",
+            crate::revocation::REVOCATION_RESYNC_STATUS
+        );
     }
 }
 
@@ -1245,12 +1408,13 @@ async fn revocation_write_guard(path: &Path) -> Result<Option<RevocationWriteGua
 
 /// Load the local v1 revocation set from disk.
 ///
-/// A missing file is an empty set: no revocations are known yet. A file
-/// that exists but cannot be read or decoded is an empty set whose gates
-/// fail closed (#1116). The unreadable bytes stay on disk. Repair that
-/// file, or remove it, and restart the daemon. A record that decodes but
-/// fails authority verification is still dropped on its own; that does not
-/// hold the gates.
+/// A missing file with no quarantine sibling is an empty set: no
+/// revocations are known yet. A file that exists but cannot be read or
+/// decoded is moved to a quarantine file. The live path no longer holds
+/// those bytes. Membership stays closed until the group resyncs that
+/// carrier, including on the next start (#1116). x0xd keeps running. A
+/// record that decodes but fails authority verification is still dropped
+/// on its own; that does not close membership.
 pub async fn load_revocation_set(identity_dir: Option<&Path>) -> RevocationSet {
     let Some(path) = revocation_path(identity_dir) else {
         return RevocationSet::new();
@@ -1308,6 +1472,26 @@ mod tests {
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
 
+    async fn quarantine_files(dir: &Path, stem: &str) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await.expect("read dir");
+        let prefix = format!("{stem}.quarantined-");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let stamp = name[prefix.len()..].split('-').next().unwrap_or("");
+            assert!(
+                !stamp.is_empty() && stamp.chars().all(|ch| ch.is_ascii_digit()),
+                "quarantine name has a timestamp: {name}"
+            );
+            found.push(entry.path());
+        }
+        found
+    }
+
     /// #1116 / ADR 0085 rule 4: a fail-closed load must not authorize
     /// overwriting an unreadable v1 file on the next ordinary persist.
     #[tokio::test]
@@ -1322,13 +1506,29 @@ mod tests {
         let mut set = load_revocation_set(Some(dir.path())).await;
         assert!(set.is_empty(), "undecodable bytes contribute no records");
         assert!(
-            set.revocation_store_unreadable(),
-            "a present but undecodable v1 file fails the gates closed"
+            set.revocation_resync_required(),
+            "a present but undecodable v1 file closes membership"
         );
         let stranger = AgentKeypair::generate().expect("stranger");
         assert!(
-            set.is_agent_revoked(&stranger.agent_id()),
+            set.member_treated_as_revoked(&stranger.agent_id()),
             "an unknown agent is refused while revocations.bin is unreadable"
+        );
+        assert!(
+            !set.is_agent_revoked(&stranger.agent_id()),
+            "the hold is not a revocation record"
+        );
+        assert!(
+            quarantine_files(dir.path(), REVOCATION_FILE)
+                .await
+                .iter()
+                .any(|path| std::fs::read(path).ok().as_deref() == Some(garbage.as_slice())),
+            "startup moves the bad v1 bytes to a quarantine file"
+        );
+        assert_ne!(
+            tokio::fs::read(&path).await.ok().as_deref(),
+            Some(garbage.as_slice()),
+            "the live path no longer holds the corrupt payload"
         );
         let issuer = AgentKeypair::generate().expect("issuer key");
         let record = crate::revocation::RevocationRecord::sign(
@@ -1341,18 +1541,24 @@ mod tests {
         .expect("sign self-revocation");
         assert!(set.verify_and_insert(record, None).expect("insert"));
 
-        // Persistence may refuse the unreadable store; the original bytes
-        // and the newly accepted in-memory revocation must survive either way.
+        // Persistence stays refused so an empty rewrite cannot re-admit.
+        // The live path must still not hold the corrupt payload.
         let refused = save_revocation_set(&set, Some(dir.path()))
             .await
             .expect_err("v1 write refused");
         assert!(revocation_persistence_is_blocked(&refused));
         assert!(set.is_agent_revoked(&issuer.agent_id()));
-        assert_eq!(
-            tokio::fs::read(&path).await.expect("read original file"),
-            garbage,
-            "persist must leave unreadable revocations.bin byte-identical"
+        assert_ne!(
+            tokio::fs::read(&path).await.ok().as_deref(),
+            Some(garbage.as_slice()),
+            "persist must not put the corrupt payload back on the live path"
         );
+        let again = load_revocation_set(Some(dir.path())).await;
+        assert!(
+            again.revocation_resync_required(),
+            "the next start stays closed without reading the quarantined payload"
+        );
+        assert!(again.member_treated_as_revoked(&stranger.agent_id()));
         tokio::fs::write(&path, RevocationSet::new().to_bytes().unwrap())
             .await
             .expect("operator repair");
@@ -1362,17 +1568,59 @@ mod tests {
         let repaired = load_revocation_set(Some(dir.path())).await;
         assert!(repaired.is_agent_revoked(&issuer.agent_id()));
         assert!(
-            !repaired.revocation_store_unreadable(),
+            !repaired.revocation_resync_required(),
             "a readable file loads without the hold"
         );
         assert!(
-            !repaired.is_agent_revoked(&stranger.agent_id()),
+            !repaired.member_treated_as_revoked(&stranger.agent_id()),
             "a repaired file does not refuse an unknown agent"
         );
     }
 
+    /// #1116: the next start must not read the quarantined payload, and the
+    /// live path must not hold it. Membership stays closed.
+    #[tokio::test]
+    async fn next_start_leaves_the_live_path_and_does_not_reread_1116() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let garbage = b"corrupt payload must leave the live path";
+        tokio::fs::write(&path, garbage)
+            .await
+            .expect("seed garbage");
+        let stranger = AgentKeypair::generate().expect("stranger");
+        let first = load_revocation_set(Some(dir.path())).await;
+        assert!(first.revocation_resync_required());
+        assert!(first.member_treated_as_revoked(&stranger.agent_id()));
+        assert_ne!(
+            tokio::fs::read(&path).await.ok().as_deref(),
+            Some(garbage.as_slice()),
+            "the original path is no longer the corrupt payload"
+        );
+        let quarantined = quarantine_files(dir.path(), REVOCATION_FILE).await;
+        assert_eq!(quarantined.len(), 1, "one timestamped quarantine file");
+        assert_eq!(std::fs::read(&quarantined[0]).expect("quarantine"), garbage);
+        std::fs::set_permissions(&quarantined[0], std::fs::Permissions::from_mode(0o000))
+            .expect("deny reads of the quarantined payload");
+        let second = load_revocation_set(Some(dir.path())).await;
+        assert!(
+            second.revocation_resync_required(),
+            "the next start stays closed without reading the quarantined bytes"
+        );
+        assert!(second.member_treated_as_revoked(&stranger.agent_id()));
+        assert_ne!(
+            tokio::fs::read(&path).await.ok().as_deref(),
+            Some(garbage.as_slice()),
+            "the next start does not put the corrupt payload back"
+        );
+        std::fs::set_permissions(&quarantined[0], std::fs::Permissions::from_mode(0o600))
+            .expect("restore quarantine permissions for cleanup");
+    }
+
     /// #1116: startup load of a present but undecodable v1, v2 or v3 file
-    /// fails the gates closed. A missing file does not. The bytes stay put.
+    /// fails the gates closed and moves the payload off the live path. A
+    /// missing file does not.
     #[tokio::test]
     async fn corrupt_revocation_files_fail_closed_on_load_1116() {
         use crate::identity::{AgentId, MachineId, UserId};
@@ -1382,20 +1630,26 @@ mod tests {
         let grant = [0x33; 32];
         let owner = UserId([0x44; 32]);
         let assert_closed = |set: &RevocationSet, label: &str| {
-            assert!(set.revocation_store_unreadable(), "{label} holds the gates");
+            assert!(
+                set.revocation_resync_required(),
+                "{label} closes membership"
+            );
             assert!(set.is_empty(), "{label} contributes no records");
-            assert!(set.is_agent_revoked(&agent), "{label} refuses an agent");
             assert!(
-                set.is_machine_revoked(&machine),
-                "{label} refuses a machine"
+                set.member_treated_as_revoked(&agent),
+                "{label} refuses an unverified member"
             );
             assert!(
-                set.is_binding_revoked(&agent, &machine),
-                "{label} refuses a binding"
+                !set.is_agent_revoked(&agent),
+                "{label} writes no revocation record"
             );
             assert!(
-                set.is_share_grant_revoked(&grant, &owner),
-                "{label} refuses a share grant"
+                !set.is_share_grant_revoked(&grant, &owner),
+                "{label} does not mark share grants revoked"
+            );
+            assert!(
+                !set.is_binding_revoked(&agent, &machine),
+                "{label} does not mark bindings revoked"
             );
             assert!(
                 set.max_revoked_binding_epoch(&agent).is_none(),
@@ -1403,8 +1657,11 @@ mod tests {
             );
         };
         let assert_open = |set: &RevocationSet, label: &str| {
-            assert!(!set.revocation_store_unreadable(), "{label} has no hold");
-            assert!(!set.is_agent_revoked(&agent), "{label} accepts an agent");
+            assert!(!set.revocation_resync_required(), "{label} has no hold");
+            assert!(
+                !set.member_treated_as_revoked(&agent),
+                "{label} accepts a member"
+            );
             assert!(
                 !set.is_machine_revoked(&machine),
                 "{label} accepts a machine"
@@ -1459,18 +1716,32 @@ mod tests {
         .expect("v3 file exists");
         set.merge_v3(v3);
         assert_closed(&set, "corrupt v1 v2 and v3");
+        for name in names {
+            assert!(
+                quarantine_files(dir.path(), name)
+                    .await
+                    .iter()
+                    .any(|path| std::fs::read(path).ok().as_deref() == Some(garbage.as_slice())),
+                "{name} is moved to a timestamped quarantine file"
+            );
+            assert_ne!(
+                tokio::fs::read(dir.path().join(name)).await.ok().as_deref(),
+                Some(garbage.as_slice()),
+                "{name} live path no longer holds the corrupt payload"
+            );
+        }
 
         let empty = RevocationSet::new();
         for name in names {
             let path = dir.path().join(name);
-            assert_eq!(tokio::fs::read(&path).await.expect("read"), garbage);
             let refused = save_private_bytes_to(&path, empty.to_bytes().expect("encode"))
                 .await
                 .expect_err("overwrite refused");
             assert!(revocation_persistence_is_blocked(&refused));
-            assert_eq!(
-                tokio::fs::read(&path).await.expect("read after refuse"),
-                garbage
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(garbage.as_slice()),
+                "{name} stays off the live path after a refused write"
             );
         }
 
@@ -1635,7 +1906,11 @@ mod tests {
                     .unwrap_err();
                 assert!(revocation_persistence_is_blocked(&err));
             }
-            assert_eq!(fs::read(&path).await.unwrap(), b"corruption after load");
+            assert_ne!(
+                fs::read(&path).await.ok().as_deref(),
+                Some(b"corruption after load".as_slice()),
+                "{name} live path no longer holds the corrupt payload"
+            );
             fs::write(&path, &bytes).await.unwrap();
             save_private_bytes_to(&path, bytes.clone()).await.unwrap();
             write_private_bytes_durable(&path, bytes.clone())
@@ -1677,8 +1952,8 @@ mod tests {
             assert!(
                 loaded
                     .expect("the path exists")
-                    .revocation_store_unreadable(),
-                "{name} io failure fails the gates closed"
+                    .revocation_resync_required(),
+                "{name} io failure closes membership"
             );
             {
                 let states = revocation_store_states().lock().await;
