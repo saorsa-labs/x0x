@@ -792,14 +792,18 @@ pub struct PubSubManager {
     /// Signing context for authenticating published messages.
     signing: Option<Arc<SigningContext>>,
     /// Contact store for trust-based message filtering.
-    /// Set via `set_contacts()` after construction.
-    contacts: std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>,
+    /// Set via `set_contacts()` after construction. Shared with each
+    /// subscriber task so delivery reads the store when a payload arrives,
+    /// including when subscribe ran first (#1230).
+    contacts: Arc<std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>>,
     /// Authoritative gossiped revocation set (issue #130 / #191). Runtime-
     /// injected via `set_revocation_set()` after construction (mirrors
     /// `contacts`). Delivery consults this BEFORE the operator-local
     /// ContactStore so a gossiped issuer/agent revocation closes the path
-    /// even before the eviction loop sets `trust = Blocked`.
-    revocation_set: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
+    /// even before the eviction loop sets `trust = Blocked`. The task reads
+    /// the lock at delivery time (#1230).
+    revocation_set:
+        Arc<std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>>,
     /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
     stats: Arc<PubSubStats>,
     /// Inbound frames/bytes per (topic class, kind) — `inbound_by_topic` on
@@ -1394,8 +1398,8 @@ impl PubSubManager {
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             next_subscription_generation: AtomicU64::new(1),
             signing,
-            contacts: std::sync::OnceLock::new(),
-            revocation_set: std::sync::OnceLock::new(),
+            contacts: Arc::new(std::sync::OnceLock::new()),
+            revocation_set: Arc::new(std::sync::OnceLock::new()),
             stats: Arc::new(PubSubStats::default()),
             inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
@@ -1753,8 +1757,10 @@ impl PubSubManager {
     /// dropped (and NOT re-broadcast). Messages from other senders are
     /// annotated with their trust level.
     ///
-    /// Call this once after construction, before handling messages.
-    /// Calling more than once is a no-op (first caller wins).
+    /// Call this once after construction. A second call is a no-op (first
+    /// caller wins). Delivery reads the store when it decodes each payload,
+    /// so a subscription opened before this call still drops `Blocked`
+    /// senders (#1230).
     pub fn set_contacts(&self, store: Arc<tokio::sync::RwLock<ContactStore>>) {
         let _ = self.contacts.set(store);
     }
@@ -1763,8 +1769,10 @@ impl PubSubManager {
     /// When set, payloads delivered via the subscribe path whose sender is in
     /// the revocation set are dropped before reaching subscribers — closing
     /// the window between a gossiped revocation arriving and the eviction
-    /// loop setting `trust = Blocked`. Call once after construction; a second
-    /// call is a no-op (first caller wins), matching `set_contacts`.
+    /// loop setting `trust = Blocked`. Call once after construction. A second
+    /// call is a no-op (first caller wins), matching `set_contacts`. Delivery
+    /// reads the set when it decodes each payload, so a subscription opened
+    /// before this call still drops revoked senders (#1230).
     pub fn set_revocation_set(
         &self,
         set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
@@ -1883,8 +1891,10 @@ impl PubSubManager {
         // after which an immediate first publish cannot miss its receiver.
         let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
         let (tx, rx) = mpsc::channel(10_000);
-        let contacts = self.contacts.get().cloned();
-        let revocation_set = self.revocation_set.get().cloned();
+        // #1230: the task holds the locks, not a subscribe-time snapshot.
+        // `OnceLock::get` is empty until `set_contacts` / `set_revocation_set`.
+        let contacts = Arc::clone(&self.contacts);
+        let revocation_set = Arc::clone(&self.revocation_set);
 
         let active_generation = {
             let _name_guard = self
@@ -2005,12 +2015,9 @@ impl PubSubManager {
                     payload_len = encoded_payload.len(),
                     "[4/6 pubsub] received from PlumTree, decoding"
                 );
-                let Some(message) = decode_for_delivery(
-                    encoded_payload,
-                    contacts.as_ref(),
-                    revocation_set.as_ref(),
-                )
-                .await
+                let Some(message) =
+                    decode_for_delivery(encoded_payload, contacts.get(), revocation_set.get())
+                        .await
                 else {
                     stats.incoming_decode_failed.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
@@ -8740,6 +8747,96 @@ mod tests {
         assert!(
             decode_for_delivery(unsigned, None, None).await.is_none(),
             "#1114: unsigned V1 is never deliverable, even with no identity stores"
+        );
+    }
+
+    /// WHY (#1230): the subscriber task used to copy the contact store and
+    /// the revocation set when `subscribe` returned. Both handles are empty
+    /// until the daemon calls `set_contacts` / `set_revocation_set`, so a
+    /// subscription opened first kept `None` for its whole life and delivered
+    /// a later revoked or Blocked sender. Delivery must read the live
+    /// handles. The clean sender is the control: the same subscription still
+    /// delivers a sender who is in neither store.
+    #[tokio::test]
+    async fn issue1230_subscribe_before_stores_drops_revoked_and_blocked() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let topic = "issue1230-late-stores";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.to_string()).await;
+
+        let revoked_kp = AgentKeypair::generate().expect("revoked key");
+        let revoked_ctx = SigningContext::from_keypair(&revoked_kp);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked_ctx.agent_id),
+            revoked_kp.public_key(),
+            revoked_kp.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign revocation");
+        let mut set = crate::revocation::RevocationSet::new();
+        set.verify_and_insert(record, None)
+            .expect("self-revocation verifies without a cert");
+        manager.set_revocation_set(Arc::new(RwLock::new(set)));
+
+        let blocked_ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("blocked"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+        store.set_trust(&blocked_ctx.agent_id, TrustLevel::Blocked);
+        manager.set_contacts(Arc::new(RwLock::new(store)));
+
+        let clean_ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("clean"));
+        let outer_key = outer_signing_key();
+        let from = PeerId::new([0x30; 32]);
+        let closed = [
+            (&revoked_ctx, Bytes::from("from-revoked"), [0x31; 32]),
+            (&blocked_ctx, Bytes::from("from-blocked"), [0x32; 32]),
+        ];
+        for (ctx, payload, msg_id) in closed {
+            let inner = signed_inner_v2(ctx, topic, &payload);
+            manager
+                .handle_incoming(
+                    from,
+                    None,
+                    signed_outer_frame_with_id(&outer_key, topic_id, inner, true, msg_id),
+                )
+                .await;
+        }
+        let clean_payload = Bytes::from("from-clean");
+        manager
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(
+                    &outer_key,
+                    topic_id,
+                    signed_inner_v2(&clean_ctx, topic, &clean_payload),
+                    true,
+                    [0x33; 32],
+                ),
+            )
+            .await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("the clean sender must still be delivered")
+            .expect("subscription open");
+        assert_eq!(
+            delivered.payload, clean_payload,
+            "#1230: a subscription opened before the stores are attached must drop revoked and Blocked senders"
+        );
+        assert_eq!(delivered.sender, Some(clean_ctx.agent_id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "#1230: nothing after the clean sender may be delivered"
         );
     }
 
