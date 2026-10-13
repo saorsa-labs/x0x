@@ -14,7 +14,7 @@ There is **not** a single universal `data` wrapper.
 Examples:
 
 ```json
-{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300}
+{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
 ```
 
 `status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers

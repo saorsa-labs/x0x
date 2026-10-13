@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// The refusal counter is process-wide. These tests read it, so they take
+/// this lock for the whole body. Plain `cargo test` runs them on parallel
+/// threads; without the lock the delta asserts race.
+fn refusal_counter_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn public_card(
     name: &str,
     mls_id: &str,
@@ -36,6 +44,7 @@ fn listed_ids(body: &serde_json::Value) -> Vec<String> {
 /// Listing does not re-verify, so the refusal counter stays put.
 #[tokio::test]
 async fn unsigned_group_card_is_absent_from_discovery_listing() -> Result<()> {
+    let _guard = refusal_counter_lock().lock().await;
     let (state, _dir) = secure_endpoint_test_state().await?;
     let keypair = state.agent.identity().agent_keypair();
     let unsigned = public_card("Unsigned", &"aa".repeat(32), keypair, false);
@@ -161,6 +170,7 @@ fn ltc_frame(card: &x0x::groups::GroupCard) -> Vec<u8> {
 /// signed card is cached.
 #[tokio::test]
 async fn global_discovery_refuses_unsigned_and_damaged_cards() -> Result<()> {
+    let _guard = refusal_counter_lock().lock().await;
     let (state, _dir) = secure_endpoint_test_state().await?;
     let keypair = state.agent.identity().agent_keypair();
     let public = x0x::groups::GroupDiscoverability::PublicDirectory;
@@ -193,6 +203,7 @@ async fn global_discovery_refuses_unsigned_and_damaged_cards() -> Result<()> {
 /// Neither cache is written. A signed card lands in both caches.
 #[tokio::test]
 async fn shard_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
+    let _guard = refusal_counter_lock().lock().await;
     let (state, _dir) = secure_endpoint_test_state().await?;
     let keypair = state.agent.identity().agent_keypair();
     let public = x0x::groups::GroupDiscoverability::PublicDirectory;
@@ -245,6 +256,7 @@ async fn shard_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
 /// and does not enter the public shard cache.
 #[tokio::test]
 async fn contact_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
+    let _guard = refusal_counter_lock().lock().await;
     let (state, _dir) = secure_endpoint_test_state().await?;
     let keypair = state.agent.identity().agent_keypair();
     let contacts = x0x::groups::GroupDiscoverability::ListedToContacts;
@@ -287,6 +299,7 @@ async fn contact_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
 /// cached. The group id on the card matches the local stable id.
 #[tokio::test]
 async fn metadata_apply_refuses_unsigned_and_damaged_cards() -> Result<()> {
+    let _guard = refusal_counter_lock().lock().await;
     let (state, _dir) = secure_endpoint_test_state().await?;
     let keypair = state.agent.identity().agent_keypair();
     let sender = state.agent.agent_id();
