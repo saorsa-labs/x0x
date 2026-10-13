@@ -3328,6 +3328,8 @@ mod tests {
             .write()
             .await
             .revoke(&contact_kp.agent_id(), "issue1229");
+        // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+        let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
 
         let after = topic_backfill_bodies(&state, topic, "s-after").await;
         assert_eq!(
@@ -3440,6 +3442,8 @@ mod tests {
             .write()
             .await
             .revoke(&contact_kp.agent_id(), "issue1229");
+        // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+        let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
 
         let after = direct_backfill_bodies(&state).await?;
         assert_eq!(

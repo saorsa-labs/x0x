@@ -147,6 +147,8 @@ async fn issue1229_cached_and_stored_messages_hide_blocked_or_revoked_authors() 
         .write()
         .await
         .revoke(&contact_kp.agent_id(), "issue1229");
+    // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+    let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
 
     let after = message_bodies(&app).await?;
     assert_eq!(

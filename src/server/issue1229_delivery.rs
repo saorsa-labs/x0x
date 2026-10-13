@@ -266,6 +266,8 @@ async fn issue1229_history_reads_hide_refused_authors() -> Result<()> {
         .write()
         .await
         .revoke(&contact_kp.agent_id(), "issue1229");
+    // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+    let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
     self_revoke_machine(&state, &revoked_machine).await?;
     state
         .agent
@@ -444,6 +446,8 @@ async fn issue1229_direct_sse_backfill_hides_refused_senders() -> Result<()> {
         .write()
         .await
         .revoke(&contact_kp.agent_id(), "issue1229");
+    // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+    let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
     self_revoke_machine(&state, &revoked_machine).await?;
     state
         .agent
