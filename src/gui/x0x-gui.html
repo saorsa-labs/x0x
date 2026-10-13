@@ -5466,23 +5466,35 @@ async function nagRequestAccess(gid){
 async function nagRenderAdmin(gid){
   const host=document.getElementById('nag-admin-'+gid);
   if(!host)return;
-  const [g,stateResp,membersResp,requestsResp,meResp]=await Promise.all([
-    api('/groups/'+gid),
+  // Learn the seat with the session token first. The join-request list
+  // needs the durable token, so it is fetched only for an Admin+ seat.
+  // A render must not prompt: a non-admin never sees the prompt, and an
+  // admin who has not saved a token sees the refusal instead of an empty
+  // list. The prompt is the panel button.
+  const [stateResp,membersResp,meResp]=await Promise.all([
     api('/groups/'+gid+'/state').catch(()=>null),
     api('/groups/'+gid+'/members').catch(()=>null),
-    ownerApi('/groups/'+gid+'/requests').catch(()=>null),
     api('/agent').catch(()=>null),
   ]);
   const members=(membersResp&&membersResp.ok&&membersResp.members)||[];
-  const requests=(requestsResp&&requestsResp.ok&&(requestsResp.requests||[]))||[];
   const myAid=(meResp&&meResp.agent_id)||null;
   const mine=members.find(m=>m.agent_id===myAid);
   const myRole=mine?mine.role:null;
   const isAdminOrAbove=myRole==='owner'||myRole==='admin';
+  let requestsHtml='';
+  if(isAdminOrAbove){
+    const requestsResp=await apiWith(OWNER_TOKEN||SESSION_TOKEN,'/groups/'+gid+'/requests').catch(()=>null);
+    if(durableRequired(requestsResp)){
+      requestsHtml=nagRequestsPanelHtml(gid,[],'durable token needed');
+    }else{
+      const requests=(requestsResp&&requestsResp.ok&&(requestsResp.requests||[]))||[];
+      requestsHtml=nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending'));
+    }
+  }
   host.innerHTML=nagPolicyPanelHtml(gid,isAdminOrAbove)
     +nagStatePanelHtml(gid,stateResp&&stateResp.ok?stateResp:null,isAdminOrAbove)
     +nagRosterPanelHtml(gid,members,myAid,isAdminOrAbove)
-    +(isAdminOrAbove?nagRequestsPanelHtml(gid,requests.filter(r=>r.status==='pending')):'');
+    +requestsHtml;
   nagBindAdminHandlers(gid);
 }
 
@@ -5582,7 +5594,7 @@ function nagRosterPanelHtml(gid,members,myAid,canManage){
   </div>`;
 }
 
-function nagRequestsPanelHtml(gid,pending){
+function nagRequestsPanelHtml(gid,pending,notice){
   const rows=pending.map(req=>{
     const msg=req.message||'(no message)';
     return `<div class="nag-row" data-nag-request="${esc(req.request_id)}">
@@ -5597,11 +5609,23 @@ function nagRequestsPanelHtml(gid,pending){
       </div>
     </div>`;
   }).join('');
+  const body=notice
+    ? `<div class="sub">${esc(notice)}</div><div style="margin-top:8px"><button type="button" data-nag-req-token>Enter durable token</button></div>`
+    : (pending.length?rows:'<div class="sub">No pending requests.</div>');
   return `<div class="nag-panel" data-nag-requests="${esc(gid)}">
-    <h3>Join requests (${pending.length})</h3>
+    <h3>Join requests${notice?'':` (${pending.length})`}</h3>
     <div class="sub">Review pending access requests and approve or reject.</div>
-    ${pending.length?rows:'<div class="sub">No pending requests.</div>'}
+    ${body}
   </div>`;
+}
+
+async function nagEnterDurableToken(gid){
+  // The stored token was refused, or there is none. Clear it so ownerApi
+  // prompts once for this click, then render again without prompting.
+  OWNER_TOKEN='';
+  try{sessionStorage.removeItem('x0x_owner_token')}catch(e){}
+  await ownerApi('/groups/'+gid+'/requests');
+  nagRenderAdmin(gid);
 }
 
 function nagBindAdminHandlers(gid){
@@ -5616,6 +5640,7 @@ function nagBindAdminHandlers(gid){
   host.querySelectorAll('[data-nag-role-agent][data-nag-role]').forEach(btn=>btn.addEventListener('click',()=>nagSetRole(gid,btn.getAttribute('data-nag-role-agent'),btn.getAttribute('data-nag-role'))));
   host.querySelectorAll('[data-nag-ban]').forEach(btn=>btn.addEventListener('click',()=>nagBan(gid,btn.getAttribute('data-nag-ban'))));
   host.querySelectorAll('[data-nag-unban]').forEach(btn=>btn.addEventListener('click',()=>nagUnban(gid,btn.getAttribute('data-nag-unban'))));
+  host.querySelectorAll('[data-nag-req-token]').forEach(btn=>btn.addEventListener('click',()=>nagEnterDurableToken(gid)));
   host.querySelectorAll('[data-nag-req-approve]').forEach(btn=>btn.addEventListener('click',()=>nagApproveRequest(gid,btn.getAttribute('data-nag-req-approve'))));
   host.querySelectorAll('[data-nag-req-reject]').forEach(btn=>btn.addEventListener('click',()=>nagRejectRequest(gid,btn.getAttribute('data-nag-req-reject'))));
 }
