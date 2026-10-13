@@ -89,6 +89,27 @@ async fn agent_with_network_cache(
     }
 }
 
+/// Helper: like `agent_with_network_cache`, but with the peer cache
+/// disabled (in-memory only: nothing loaded, nothing saved).
+async fn agent_with_disabled_network_cache(
+    temp_dir: &TempDir,
+    cache_dir: &Path,
+) -> x0x::error::Result<Option<Agent>> {
+    match Agent::builder()
+        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_agent_key_path(temp_dir.path().join("agent.key"))
+        .with_peer_cache_dir(cache_dir)
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .build()
+        .await
+    {
+        Ok(agent) => Ok(Some(agent)),
+        Err(err) if is_network_bind_permission_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 #[tokio::test]
 async fn test_agent_builds_with_peer_cache_dir() {
     let temp = TempDir::new().unwrap();
@@ -443,4 +464,64 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
             "the pruned file must stay gone across the shutdown save cycle"
         );
     }
+}
+
+/// #1343 review: a start with the peer cache disabled loads nothing, so its
+/// empty in-memory cache says nothing about the file on disk. That start
+/// (and its shutdown) must keep an existing, valid cache file unchanged for
+/// a later persistent start.
+#[tokio::test]
+async fn wp_c_491_disabled_peer_cache_keeps_existing_file() {
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("peers");
+    let cache_file = cache_dir.join("bootstrap_cache.json");
+    let addr: std::net::SocketAddr = "127.0.0.1:54832".parse().unwrap();
+
+    {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build persistent agent")
+        else {
+            return;
+        };
+        let advert = CoordinatorAdvert::new(
+            PeerId::new([0x6b_u8; 32]),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(addr)],
+            NatClass::Unknown,
+            60_000,
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert!(
+            adapter.insert_advert(advert).await,
+            "seeding a peer advert must succeed"
+        );
+        agent.shutdown().await;
+    }
+    assert!(
+        cache_file.exists(),
+        "the persistent start must save the peer"
+    );
+    let before = std::fs::read(&cache_file).expect("read saved cache file");
+
+    {
+        let Some(agent) = agent_with_disabled_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build disabled-cache agent")
+        else {
+            return;
+        };
+        assert!(
+            cache_file.exists(),
+            "a disabled-cache start must not delete the persisted cache file"
+        );
+        agent.shutdown().await;
+    }
+    assert_eq!(
+        std::fs::read(&cache_file).expect("cache file must still exist"),
+        before,
+        "the persisted cache file must be unchanged after a disabled-cache run"
+    );
 }

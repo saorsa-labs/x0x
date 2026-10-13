@@ -19509,7 +19509,13 @@ impl AgentBuilder {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join("peers")
             });
-            cache_dir_for_prune = Some(cache_dir.clone());
+            // Only a persistent cache may be pruned on disk. With
+            // `disable_peer_cache` ant-quic loads nothing, so an empty
+            // in-memory cache says nothing about the file, and the file
+            // must be kept for a later persistent start.
+            if !self.disable_peer_cache {
+                cache_dir_for_prune = Some(cache_dir.clone());
+            }
             Some(
                 ant_quic::BootstrapCacheConfig::builder()
                     .cache_dir(cache_dir)
@@ -19638,8 +19644,11 @@ impl AgentBuilder {
         // older build), and `save()` never rewrites a cache below
         // `min_peers_to_save`. So unlink the file whenever the loaded cache
         // is empty, not only when this prune emptied it. A cache file is
-        // never written empty, so an empty load means every stored entry
-        // was dropped.
+        // never written empty, so an empty load from a persistent cache
+        // means every stored entry was dropped (the self entry, or a file
+        // that failed ant-quic's checksum and was refused whole; it holds
+        // only bootstrap hints). An in-memory cache never gets here:
+        // `cache_dir_for_prune` is set only when the cache persists.
         if let (Some(cache), Some(node)) = (bootstrap_cache.as_ref(), network.as_ref()) {
             let own_peer_id = ant_quic::PeerId(node.peer_id().0);
             let pruned = cache.remove(&own_peer_id).await;
