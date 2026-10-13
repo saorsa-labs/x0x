@@ -8,9 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-David accepted the archive transfer on 10 October 2026. These slots remain
-Proposed; replacement acceptance and clause-level transfer checks are still open.
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must report what happened to a message. A successful send must not imply that an external agent accepted or completed the work.
 
@@ -30,7 +28,7 @@ The delivery model has these distinct states:
 4. Started: the runtime has begun the work.
 5. Completed, refused, failed or expired: the application reports a terminal result.
 
-A successful DM-v2 acknowledgment confirms a verified envelope and a durable local record. Ordinary DMs require local dispatch and an awaited history commit, or an existing matching committed row. A registered durable protocol handler instead confirms its own store. The acknowledgment must not be renamed to imply consumer acceptance.
+The existing DM-v2 acknowledgment retains its current meaning ([ADR 0030](../0030-dm-durable-application-ack-v2.md) §1 and §7; [ADR 0116](../0116-local-history-retention-policy.md) §3). A successful acknowledgment confirms a verified envelope and a durable local record. For an ordinary DM, local dispatch completes, and then the recipient awaits a history commit or matches an existing committed row. A registered durable protocol handler confirms its own store. The acknowledgment must not be renamed to imply consumer acceptance.
 
 ## Durable delivery
 

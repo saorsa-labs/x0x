@@ -8,9 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-David accepted the archive transfer on 10 October 2026. These slots remain
-Proposed; replacement acceptance and clause-level transfer checks are still open.
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x uses separate identities for a human owner, an agent and a machine. This separation lets the owner grant authority to an agent without giving that agent the owner's key.
 
@@ -36,7 +34,7 @@ Authentication must prove the relevant agent and machine binding. A transport si
 
 A key-owning harness keeps its own agent key. An API rider uses a scoped delegation through a daemon, as defined in [A04](A04-r01-agent-attachment-and-inbound-events.md). Both forms retain clear attribution.
 
-Pinned agents remain bound to their approved machine. Existing placement records and denials remain effective. This draft does not activate roaming or the key-move ceremony, which is off by default.
+Pinned agents remain bound to their approved machine. Existing placement records and denials remain effective. This draft does not activate roaming or the key-move ceremony. D27 retired that ceremony. Removal is pending. The code still has an off-by-default switch.
 
 Enrollment and certificate issuance must require owner authority. Discovery provides possible addresses; it does not grant ownership or permission.
 
@@ -66,7 +64,7 @@ Automatic key movement would make placement easier, but would require a complete
 
 ## Current implementation
 
-The three identity types, certificates, enrollment and placement checks exist. The experimental key-move ceremony can be enabled with `[key_move] ceremony_enabled = true`; its endpoints return HTTP 501 by default. The archive map must retain the distinction between this optional ceremony and the always-on enrollment and placement checks.
+The three identity types, certificates, enrollment and placement checks exist. D27 retired the key-move ceremony. Removal is pending. The code still has an off-by-default switch (`[key_move] ceremony_enabled`). While that switch is off, the ceremony endpoints return HTTP 501. The archive map must retain the distinction between this retired ceremony and the always-on enrollment and placement checks.
 
 [A03](A03-r01-trust-permissions-sharing-and-revocation.md) owns revocation effects. [A05](A05-r01-connectivity-discovery-and-names.md) owns name resolution and reachability. [A15](A15-r01-compatibility-validation-and-decision-rules.md) owns format compatibility.
 

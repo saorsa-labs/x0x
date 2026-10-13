@@ -8,9 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-David accepted the archive transfer on 10 October 2026. These slots remain
-Proposed; replacement acceptance and clause-level transfer checks are still open.
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x stores and shares data through authorized peers. It must state who holds the data, how changes merge, and what happens when a peer is offline.
 

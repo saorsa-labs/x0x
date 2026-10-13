@@ -8,9 +8,7 @@
 - **Replacement activation:** Pending the [transfer review](TRANSFER.md) and the Acceptance checks below.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-David accepted the archive transfer on 10 October 2026. These slots remain
-Proposed; replacement acceptance and clause-level transfer checks are still open.
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x will have no more than 15 current ADR slots. The new set must preserve important decisions and evidence while making the current architecture easier to read.
 
@@ -71,10 +69,6 @@ Document upgrade and downgrade limits. Test state produced by a real supported o
 
 Release builds must use the tested dependency graph and lockfile. A source-level test result does not establish that a different published binary passed.
 
-The frozen-layout requirement is not fully implemented. Task snapshots have
-versioned envelopes, but `SnapshotBody` and `SnapshotBodyV2` still decode the
-live `TaskList` type instead of frozen release-specific types.
-
 ## Repository and release governance
 
 ADR 0087 remains in force, including these rules:
@@ -98,6 +92,8 @@ Each architectural guarantee has an owning test or evidence path. Important test
 Keep test traffic isolated from production. Tests that can join the real network must use the approved isolated Linux environment.
 
 Separate design acceptance, code merge, CI results, publication and deployed service evidence. None is a substitute for the others.
+
+The frozen-layout requirement is not fully implemented. Task snapshots have versioned envelopes. `SnapshotBody` and `SnapshotBodyV2` still decode the live `TaskList` type. They do not use frozen release-specific types.
 
 ## Consequences
 
