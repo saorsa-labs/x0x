@@ -9,40 +9,37 @@
 - **Superseded by:** none
 - **Related:** issue #1113; ADR 0014; ADR 0016 decision 6; ADR 0016 decision 7; PR #1337
 
-This record is Proposed. It does not change Accepted ADR bytes. It does not add a wire field.
+This record is Proposed. It does not change Accepted ADR bytes and adds no wire field.
 
 ## Context
 
-ADR 0016 decision 6 names one committer after a TreeKEM self-leave: the lowest active admin, by raw agent id. Other admins hold off. If that admin is gone, another admin removes them and the choice is made again.
+ADR 0016 decision 6 names one committer after a TreeKEM self-leave: the lowest active admin, by raw agent id. Other admins hold off. Removal of that admin makes the choice again.
 
-A daemon that does not run this rekey applies the roster removal and does not seal a TreeKEM commit. If that daemon is the lowest admin, newer admins hold off. The leaver keeps a live leaf.
+A daemon that does not run this rekey does not seal. Newer admins then hold off, and the leaver keeps a live leaf. No message names this rekey. A missing advertisement is not proof the peer is old. Two upgraded admins would both commit.
 
-No message says that an admin runs this rekey. A missing advertisement is not proof that the peer is old. Two admins would then both commit.
+A commit runs only when the leave is the local head and the TreeKEM queue is empty. The sender checks that head again under the membership lock. A truncated catch-up page does not seal. The pass runs after the last page. Replay holds a fence until its batch ends.
 
-ADR 0016 decision 7 says two commits over one parent can fork. A commit is allowed only when the leave is still the local head and the TreeKEM queue is empty. The sender checks that head again under the membership lock before the new epoch is saved. A catch-up page and a replay batch seal once, after the batch. Startup waits one short quiet interval, then skips a group whose queue is not empty.
-
-Two leaves can still be signed against the same parent before either removal commit arrives. This record adds no timeout and no second committer. ADR 0110 is still Proposed and is not used here.
+A node that does not know it is behind can still seal. An in-order backlog is one case. Startup is another: a 250 ms wait runs no catch-up and proves nothing. That seal can fork the group into quarantine. This record adds no timeout and no second committer. ADR 0110 stays Proposed.
 
 ## Decision
 
-Until David accepts a capability bit, election stays ADR 0016 decision 6. Every active admin stays eligible. Absence of an advertisement is not a reason to skip an admin.
+Until a capability bit is accepted, election stays ADR 0016 decision 6. Every active admin stays eligible. That bit must ride an existing signed advertisement. The committer is then the lowest active admin who advertised it. A test may mark an admin silent. That mark is local, not a wire field.
 
-When that bit is accepted, it must ride an existing signed capability advertisement. The committer is then the lowest active admin who advertised the bit. There is still one committer. A test may mark an admin as silent. That mark is local. It is not a wire field.
+One JSON file per group is stored at `data_dir/treekem-self-leave-outbox/<blake3 of the group key>.json`. It lists the roster-only self-leave, unpublished rekeys, and published rekeys. Save the rekey, with `treekem_commit_b64` and `treekem_epoch`, before the epoch is durable. Save the predecessor so restart can serve it on catch-up. After publish, keep the rekey for catch-up and do not send it again. Publish a saved rekey only when the stored chain holds its commit hash. Delete it if persist fails before the epoch is installed. Keep it if the epoch is installed or completion is uncertain. This file is not the TreeKEM journal.
 
-Save the removal event, including `treekem_commit_b64` and `treekem_epoch`, before the new epoch is durable. After a restart, load that event into the catch-up log and send it again. Drop a saved event whose epoch is not in the loaded tree. The pass may then seal a new commit. This store is not the TreeKEM journal.
-
-A pass that hits its batch limit schedules one more pass. It does not start a timer. A demotion, removal, or ban that changes the lowest eligible admin runs the pass again. A missing KeyPackage is a logged deferral, not a finished rekey.
+A full pass schedules one more pass and does not start a timer. A demotion, removal, or ban, including the author's route, runs the pass after the membership guard drops. A missing KeyPackage on a live leaf is a logged deferral. Only the designated admin asks for the bytes.
 
 ## Rejected options
 
-- **Skip a silent admin in this PR.** Two upgraded admins can both commit before a bit arrives.
-- **Use the DM protocol version as the bit.** That version does not name this rekey.
-- **Hand the commit to the next admin on a timer.** That is the Proposed ADR 0110 path.
-- **Publish the roster-only hash, then seal.** A restart can observe the first hash and load the second. The durable hash must be the hash a restart serves.
+- **Skip a silent admin now.** Two upgraded admins can both commit.
+- **Use the DM protocol version as the bit.** It does not name this rekey.
+- **Hand the commit to the next admin on a timer.** That is Proposed ADR 0110.
+- **Seal after the roster-only hash.** Restart must serve the hash peers saw.
+- **Use a longer startup wait.** A wait cannot prove catch-up finished.
 
 ## Consequences
 
-- One committer remains while every active admin is eligible.
-- A mixed group waits until the lowest admin runs this code, or until that admin is removed. That is ADR 0016 until the bit is accepted.
-- Catch-up does not seal a second head between queued events.
-- A crash after the epoch is saved still has the event for catch-up.
+- One committer remains while every active admin is eligible. A mixed group waits until the lowest admin runs this code or is removed.
+- A node that seals while it does not know it is behind can quarantine the group. Accept this record only with that consequence.
+- A crash after the epoch is saved keeps the event. A crash before the epoch does not publish it.
+- The outbox file is a new stored format. Accept this record before merge.

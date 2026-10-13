@@ -663,3 +663,330 @@ async fn remaining_member_converges_on_the_rekey() -> Result<()> {
     );
     Ok(())
 }
+
+fn publish_count(state: &AppState) -> usize {
+    state
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish recorder")
+        .len()
+}
+
+fn log_has_removal(event: &NamedGroupMetadataEvent, with_commit: bool) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            treekem_commit_b64, ..
+        } => treekem_commit_b64.is_some() == with_commit,
+        _ => false,
+    }
+}
+
+/// A truncated catch-up page must not seal. The pass runs after the last page.
+#[tokio::test]
+async fn truncated_catchup_page_does_not_seal() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let leave = signed_self_leave(&fixture).await?;
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    // The leave is authorized only when the catch-up sender is the leaver.
+    // The leaver is still active until this page applies.
+    let truncated = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: fixture.group_id.clone(),
+        events: vec![leave],
+        truncated: true,
+    };
+    handle_treekem_catchup_response(&fixture.state, &fixture.member_id, true, truncated).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a truncated catch-up page must not seal the rekey"
+    );
+    {
+        let groups = fixture.state.named_groups.read().await;
+        let member = groups
+            .get(&fixture.group_id)
+            .and_then(|info| info.members_v2.get(&member_hex))
+            .expect("leaver remains on the roster");
+        assert_eq!(member.state, x0x::groups::GroupMemberState::Removed);
+    }
+    // The last page comes from a member who is still active. The leaver is
+    // no longer eligible to send it.
+    let terminal = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: fixture.group_id.clone(),
+        events: Vec::new(),
+        truncated: false,
+    };
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &fixture.state.agent.agent_id(),
+        true,
+        terminal,
+    )
+    .await;
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "the last catch-up page must let the pass seal"
+    );
+    Ok(())
+}
+
+/// The in-apply path seals one leaf. A second live leaf is sealed by the
+/// pass that runs after the membership guard drops.
+#[tokio::test]
+async fn second_live_leaf_is_sealed_after_the_in_apply_commit() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let extra_id = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let extra_hex = hex::encode(extra_id.as_bytes());
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(extra_id, &[3u8; 32])?;
+    let kp_bytes = prepared.key_package_bytes().to_vec();
+    {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.add_member(extra_id, &kp_bytes)?;
+    }
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.add_member(
+            extra_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(fixture.state.agent.agent_id().as_bytes())),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &extra_hex,
+            base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+        );
+        let member = info.members_v2.get_mut(&extra_hex).expect("extra");
+        member.state = x0x::groups::GroupMemberState::Removed;
+        let epoch = {
+            drop(groups);
+            live_epoch(&fixture.state, &fixture.group_id).await
+        };
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+    }
+    let epoch_before = live_epoch(&fixture.state, &fixture.group_id).await;
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await >= epoch_before.saturating_add(2),
+        "both live removed leaves must be sealed, one in the apply and one after the guard drops"
+    );
+    Ok(())
+}
+
+/// Demotion through the role route, not the receive path, runs the pass.
+#[tokio::test]
+async fn demotion_route_rekeys_when_the_local_admin_becomes_designated() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let lower_hex = {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_lower_admin(info, admin_id)
+    };
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the lower admin is designated, so this daemon must wait"
+    );
+    let response = update_member_role(
+        State(Arc::clone(&fixture.state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((fixture.group_id.clone(), lower_hex)),
+        Json(UpdateMemberRoleRequest {
+            role: "member".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the role route must succeed"
+    );
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "the role route must run the rekey after the guard drops"
+    );
+    Ok(())
+}
+
+/// A successful publish leaves the rekey off the republish list. Resume of a
+/// state loaded from that disk still serves the predecessor and the rekey,
+/// and it does not send the rekey again.
+#[tokio::test]
+async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let data_dir = fixture._dir.path().to_path_buf();
+    let agent = Arc::clone(&fixture.state.agent);
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
+    let file = read_self_leave_rekey_outbox(&path).await;
+    assert!(
+        file.pending.is_empty(),
+        "a successful publish must take the rekey off the republish list"
+    );
+    assert!(
+        !file.served.is_empty(),
+        "catch-up must still have the published rekey"
+    );
+    assert!(
+        !file.predecessors.is_empty(),
+        "catch-up must still have the roster-only self-leave"
+    );
+    let restarted = secure_endpoint_test_state_at(&data_dir, agent).await?;
+    let named = restarted.named_groups.read().await.clone();
+    let restored =
+        restore_treekem_groups(&named, restarted.agent.as_ref(), &restarted.treekem_dir).await;
+    *restarted.treekem_groups.write().await = restored;
+    resume_durable_self_leave_rekeys(&restarted).await;
+    assert_eq!(
+        publish_count(&restarted),
+        0,
+        "restart must not send a rekey that was already published"
+    );
+    let logs = restarted.treekem_event_log.read().await;
+    let events: Vec<_> = logs.values().flat_map(|events| events.iter()).collect();
+    assert!(
+        events.iter().any(|event| log_has_removal(event, false)),
+        "restart must serve the predecessor self-leave"
+    );
+    assert!(
+        events.iter().any(|event| log_has_removal(event, true)),
+        "restart must serve the published rekey"
+    );
+    Ok(())
+}
+
+/// An outbox commit that is not in the stored chain is not published.
+#[tokio::test]
+async fn resume_drops_a_rekey_that_is_not_in_the_stored_chain() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    let mut orphan = published_removal_event(&fixture.state).expect("rekey");
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        revision,
+        treekem_epoch,
+        commit,
+        ..
+    } = &mut orphan
+    {
+        *revision = revision.saturating_add(9);
+        *treekem_epoch = Some(treekem_epoch.unwrap_or(0).saturating_add(9));
+        if let Some(commit) = commit.as_mut() {
+            commit.state_hash = "not-in-the-stored-chain".to_string();
+        }
+    }
+    remember_durable_self_leave_rekey(&fixture.state, &fixture.group_id, &orphan)
+        .await
+        .expect("orphan saved");
+    let before = publish_count(&fixture.state);
+    resume_durable_self_leave_rekeys(&fixture.state).await;
+    assert_eq!(
+        publish_count(&fixture.state),
+        before,
+        "resume must not publish a commit the stored chain does not hold"
+    );
+    let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
+    let file = read_self_leave_rekey_outbox(&path).await;
+    assert!(
+        file.pending.iter().all(|event| {
+            named_group_metadata_event_commit(event)
+                .is_none_or(|commit| commit.state_hash != "not-in-the-stored-chain")
+        }),
+        "the unapplied commit must leave the republish list"
+    );
+    Ok(())
+}
+
+/// Two admins apply the same shape of leave at the same time. Only the
+/// lower agent id commits.
+#[tokio::test]
+async fn two_concurrent_admins_only_the_lower_id_commits() -> Result<()> {
+    let fixture_a = two_member_treekem_group().await?;
+    let fixture_b = two_member_treekem_group().await?;
+    let id_a = fixture_a.state.agent.agent_id();
+    let id_b = fixture_b.state.agent.agent_id();
+    let lower_is_a = id_a.as_bytes() < id_b.as_bytes();
+    {
+        let mut groups = fixture_a.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture_a.group_id).expect("group");
+        add_fixed_admin(info, id_a, hex::encode(id_b.as_bytes()));
+    }
+    {
+        let mut groups = fixture_b.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture_b.group_id).expect("group");
+        add_fixed_admin(info, id_b, hex::encode(id_a.as_bytes()));
+    }
+    let leave_a = signed_self_leave(&fixture_a).await?;
+    let leave_b = signed_self_leave(&fixture_b).await?;
+    let (applied_a, applied_b) = tokio::join!(
+        apply_named_group_metadata_event(
+            &fixture_a.state,
+            leave_a,
+            fixture_a.member_id,
+            true,
+            None
+        ),
+        apply_named_group_metadata_event(
+            &fixture_b.state,
+            leave_b,
+            fixture_b.member_id,
+            true,
+            None
+        ),
+    );
+    assert!(
+        applied_a.accepted,
+        "admin A must apply the leave: {applied_a:?}"
+    );
+    assert!(
+        applied_b.accepted,
+        "admin B must apply the leave: {applied_b:?}"
+    );
+    let epoch_a = live_epoch(&fixture_a.state, &fixture_a.group_id).await;
+    let epoch_b = live_epoch(&fixture_b.state, &fixture_b.group_id).await;
+    if lower_is_a {
+        assert!(
+            epoch_a > fixture_a.epoch_before,
+            "the lower admin must commit"
+        );
+        assert_eq!(
+            epoch_b, fixture_b.epoch_before,
+            "the higher admin must hold off"
+        );
+    } else {
+        assert!(
+            epoch_b > fixture_b.epoch_before,
+            "the lower admin must commit"
+        );
+        assert_eq!(
+            epoch_a, fixture_a.epoch_before,
+            "the higher admin must hold off"
+        );
+    }
+    Ok(())
+}

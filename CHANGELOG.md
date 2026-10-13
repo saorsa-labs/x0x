@@ -138,9 +138,11 @@ A minor release. It removes one unused public module and changes two public file
   The roster removal left the leaf in place, so the leaver could derive later
   epoch keys. The lowest active admin now commits the existing admin
   `MemberRemoved` that carries `treekem_commit_b64` and `treekem_epoch`.
-  That commit runs only when the leave is still the stored head and the
-  TreeKEM queue is empty. The daemon saves the removal event before the new
-  epoch is durable. A missing KeyPackage is a logged deferral, not a finished
+  That commit runs only when the leave is still the stored head, the TreeKEM
+  queue is empty, and catch-up is not waiting on a later page. The daemon
+  saves the roster-only leave and the removal event before the new epoch is
+  durable, and it does not send the removal again after a successful publish.
+  A missing KeyPackage on a live leaf is a logged deferral, not a finished
   rekey. Other admins hold off. This adds no new wire message.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
