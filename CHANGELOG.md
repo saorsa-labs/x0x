@@ -60,7 +60,7 @@ All notable changes to this project will be documented in this file.
   The defect is older than v0.47.0: saorsa-6 showed it at the v0.46.4
   rollout too.
 
-- **ant-quic 0.27.58.** x0x now pins `ant-quic = "=0.27.58"`.
+- **ant-quic 0.27.60.** x0x now pins `ant-quic = "=0.27.60"` (0.27.58, 0.27.59 and 0.27.60).
   - Only one end of each peer pair retires a superseded connection: the end
     with the greater PeerId, and only on evidence (ant-quic #313 Part 2,
     #315, ADR-017). Before, the two ends could each close the connection
@@ -74,6 +74,13 @@ All notable changes to this project will be documented in this file.
   - Happy Eyeballs stops the losing dial attempts (ant-quic #294).
   - The bootstrap cache no longer gives a node its own entry, and it stores
     IPv4-mapped IPv6 addresses as IPv4 (ant-quic #269).
+  - Tighter buffer accounting in the QUIC connection state: stream
+    reassembly, `read_to_end`, the datagram queues and connection-ID
+    retirement. The P2P reader holds its stream budget for the whole read
+    task, so at most 64 uni read tasks run per connection (ant-quic 0.27.59
+    and 0.27.60).
+  - Datagrams after a path change: a datagram equal to the path limit is kept,
+    and a blocked sender is told when it may retry (ant-quic 0.27.60).
 
 ## [v0.47.1] - 2026-10-12
 
