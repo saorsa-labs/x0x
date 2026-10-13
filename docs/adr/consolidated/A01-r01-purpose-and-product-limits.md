@@ -8,8 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x connects people, their machines, and their chosen agents. It supplies identity, permissions, communication, shared data, and work coordination. This decision sets the boundary for the other 14 ADRs.
 
@@ -88,6 +87,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0017 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0017-x0x-as-agent-transport-layer.md) · [ADR 0058 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0058-compile-time-embedded-constitution.md) · [ADR 0072 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0072-scope-freeze-deferred-and-legacy-maintenance.md) · [ADR 0095 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0095-scope-x0x-is-glue.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

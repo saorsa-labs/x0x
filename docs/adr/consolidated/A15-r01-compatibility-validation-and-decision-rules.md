@@ -8,14 +8,13 @@
 - **Replacement activation:** Pending the [transfer review](TRANSFER.md) and the Acceptance checks below.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x will have no more than 15 current ADR slots. The new set must preserve important decisions and evidence while making the current architecture easier to read.
 
 ## Context
 
-There are 100 numbered ADRs in the reviewed snapshot. Many mix decisions with implementation plans, detailed protocols and review history.
+The original snapshot contains 100 numbered ADRs. The transfer map also includes ADR 0115 and ADR 0116, for 102 mapped records. Their bytes are now in `docs/adr-archive/`; their old paths are links. Many mix decisions with implementation plans, detailed protocols and review history.
 
 Current CI protects accepted ADR text and associated frozen evidence. Code, tests and open PRs refer to those records. A file move alone would not create a safe replacement.
 
@@ -94,6 +93,8 @@ Keep test traffic isolated from production. Tests that can join the real network
 
 Separate design acceptance, code merge, CI results, publication and deployed service evidence. None is a substitute for the others.
 
+The frozen-layout requirement is not fully implemented. Task snapshots have versioned envelopes. `SnapshotBody` and `SnapshotBodyV2` still decode the live `TaskList` type. They do not use frozen release-specific types.
+
 ## Consequences
 
 Readers get a small stable set of decisions. Detailed specifications and historical records remain available. The transfer needs careful review before the new set can replace the rules used by current teams.
@@ -108,13 +109,13 @@ Compressing all detail into 15 large records would change the file count without
 
 ## Acceptance
 
-Verify all 100 record mappings and complete the clause-level transfer. Check archived hashes, frozen evidence, links, revision chains and the 15-slot limit.
+Verify all 102 record mappings and complete the clause-level transfer. Check archived hashes, frozen evidence, links, revision chains and the 15-slot limit.
 
 Publish one short current capability guide. Update the repository instructions and documentation mirror when the migration is applied.
 
 ## Matters to settle
 
-The 15-slot direction is confirmed by David (D198) on 5 October 2026. Complete the transfer review and acceptance controls before declaring the old set historical rather than governing.
+The 15-slot direction was confirmed by David (D198) on 5 October 2026. He accepted the archive transfer on 10 October 2026. Archived decisions still govern implementation. Complete the clause-level transfer review and acceptance controls before activating replacements.
 
 ## Existing decision records
 
@@ -125,6 +126,6 @@ These are the primary sources. Their clause-level transfer remains open under Ac
 
 [ADR 0025 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0025-required-gates-prove-observation-completeness.md) · [ADR 0063 Rejected](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) · [ADR 0085 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0085-persisted-binary-formats-are-versioned.md) · [ADR 0087 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0087-repository-and-release-governance.md) · [ADR 0093 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0093-capability-advert-registry.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)
