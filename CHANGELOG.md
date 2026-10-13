@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.48.0] - 2026-10-13
+
+A minor release. It removes one unused public module (breaking for code that imported it), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
+
+### Breaking
+
+- **Removed the unused public module `x0x::bootstrap`** (`BootstrapConnector`,
+  `BootstrapConfig`; #1178, #1184). Nothing in x0x used it. Bootstrap retry
+  and backoff live in `Agent::join_network`, and the seed list is
+  `network::DEFAULT_BOOTSTRAP_PEERS`.
+
 ### Changed
 
 - **Stricter actors on group routes (#1228).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
@@ -85,6 +96,33 @@ All notable changes to this project will be documented in this file.
     and 0.27.60).
   - Datagrams after a path change: a datagram equal to the path limit is kept,
     and a blocked sender is told when it may retry (ant-quic 0.27.60).
+
+- **File offer, accept and reject wait for the receiver's file-control-ack
+  (#1102, #1323).** A missing ack fails the call, so an offer dropped on a
+  live connection no longer reports success. The ack is used only with peers
+  that advertise capability bit 3 `file_control_ack_v1` (transient record
+  T-file-control-ack, slot A10); a v0.47.x peer keeps the old success path.
+- **Revocation carriers can no longer be shed (#1111, #1335).**
+  `x0x.revocation.v1`, `.v2` and `.v3` are Critical by exact name, so a Leaf
+  with `shed_normal` still forwards and delivers them under byte pressure.
+- **A SignedPublic group member one revision behind catches up after a
+  restart (#1105, #1329; transient record T-signed-public-kv-revision-catchup,
+  slot A08).** The catch-up is authenticated, limited to one revision,
+  bounded, and durable before it is acknowledged. Known limit: a member who
+  joined by invite only, with no contact entry and no grant, does not catch
+  up yet (#1105 stays open).
+- **The ADR count check works on a pull request after a force-push (#1332).**
+
+### Tests and tooling
+
+- Regression tests for the TreeKEM journal and ratchet durability fixed in
+  v0.47.1 (#1331), for #1146 (#1339) and for #1162 (#1340).
+
+### Documentation
+
+- `docs/troubleshooting.md` section 7 explains a secure group that refuses
+  to send after a storage error or a downgrade (#1331).
+- Factual corrections in the consolidated ADR slots A01–A15 (#1342).
 
 ## [v0.47.1] - 2026-10-12
 
