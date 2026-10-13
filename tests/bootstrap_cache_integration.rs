@@ -525,3 +525,70 @@ async fn wp_c_491_disabled_peer_cache_keeps_existing_file() {
         "the persisted cache file must be unchanged after a disabled-cache run"
     );
 }
+
+/// #1343 review round 3: when the persisted cache file cannot be READ (an
+/// I/O error such as `PermissionDenied`, not a checksum rejection), ant-quic
+/// falls back to an in-memory cache and loads nothing. The empty cache says
+/// nothing about the file, so the start must not unlink it.
+#[cfg(unix)]
+#[tokio::test]
+async fn wp_c_491_unreadable_cache_file_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("peers");
+    let cache_file = cache_dir.join("bootstrap_cache.json");
+    let addr: std::net::SocketAddr = "127.0.0.1:54833".parse().unwrap();
+
+    {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build persistent agent")
+        else {
+            return;
+        };
+        let advert = CoordinatorAdvert::new(
+            PeerId::new([0x7c_u8; 32]),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(addr)],
+            NatClass::Unknown,
+            60_000,
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert!(
+            adapter.insert_advert(advert).await,
+            "seeding a peer advert must succeed"
+        );
+        agent.shutdown().await;
+    }
+    assert!(
+        cache_file.exists(),
+        "the persistent start must save the peer"
+    );
+    let before = std::fs::read(&cache_file).expect("read saved cache file");
+    std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o000))
+        .expect("make the cache file unreadable");
+    if std::fs::read(&cache_file).is_ok() {
+        // Running as a user that ignores file modes (root): no I/O error.
+        std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).ok();
+        return;
+    }
+
+    let result = agent_with_network_cache(&temp, &cache_dir).await;
+    let still_there = cache_file.exists();
+    std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).ok();
+    let Some(agent) = result.expect("failed to build agent over an unreadable cache") else {
+        return;
+    };
+    assert!(
+        still_there,
+        "an unreadable cache file must not be deleted by the startup prune"
+    );
+    agent.shutdown().await;
+    assert_eq!(
+        std::fs::read(&cache_file).expect("cache file must still exist"),
+        before,
+        "the unreadable cache file must be unchanged"
+    );
+}

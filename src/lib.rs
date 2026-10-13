@@ -19660,7 +19660,12 @@ impl AgentBuilder {
                     "#484: pruned self entry from the bootstrap cache (never self-dial)"
                 );
             }
-            if remaining == 0 {
+            // Check the EFFECTIVE persistence, not only the builder flag:
+            // when the cache file cannot be read (an I/O error, not a
+            // checksum rejection), ant-quic falls back to an in-memory
+            // cache with `persist = false` and loads nothing. That empty
+            // cache says nothing about the file, so keep the file.
+            if remaining == 0 && cache.config().persist {
                 if let Some(dir) = cache_dir_for_prune.as_deref() {
                     let file = dir.join("bootstrap_cache.json");
                     if let Err(e) = tokio::fs::remove_file(&file).await {
