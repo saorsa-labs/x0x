@@ -251,7 +251,161 @@ fn prune_and_bound_group_card_cache(
     enforce_group_card_cache_cap(cache);
 }
 
-fn cache_group_card_if_newer(
+/// Group cards from other nodes that were refused by the card authority
+/// rules (any reason), process-wide.
+static GROUP_CARD_AUTHORITY_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Unix ms of the last refusal debug line (log rate limit).
+static GROUP_CARD_REFUSAL_LOGGED_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// At most one refusal debug line per interval.
+const GROUP_CARD_REFUSAL_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// Count one refused card and write a rate-limited debug line.
+fn note_group_card_refusal(
+    surface: &'static str,
+    card: &x0x::groups::GroupCard,
+    refusal: x0x::groups::directory::CardRefusal,
+) {
+    let total = GROUP_CARD_AUTHORITY_REFUSALS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let now_ms = now_millis_u64();
+    let logged_at = GROUP_CARD_REFUSAL_LOGGED_AT_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(logged_at) >= GROUP_CARD_REFUSAL_LOG_INTERVAL_MS
+        && GROUP_CARD_REFUSAL_LOGGED_AT_MS
+            .compare_exchange(logged_at, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::debug!(
+            surface,
+            group_id = %LogHexId::group(&card.group_id),
+            authority = %LogHexId::agent(&card.authority_agent_id),
+            revision = card.revision,
+            reason = refusal.as_str(),
+            total,
+            "group card not applied: a cached group card is replaced only by its own authority"
+        );
+    }
+}
+
+/// Active admins in this node's own roster for `group_id`, when this node
+/// is an active member of a live local record for the group.
+///
+/// `None` when this node holds no such membership. An import stub is not a
+/// membership: its roster comes from a card, so this node does not trust it.
+fn group_card_roster_admins(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+    local_agent_hex: &str,
+) -> Option<BTreeSet<String>> {
+    groups
+        .get(group_id)
+        .into_iter()
+        .chain(
+            groups
+                .values()
+                .filter(|info| info.stable_group_id() == group_id),
+        )
+        .find_map(|info| group_record_roster_admins(info, local_agent_hex))
+}
+
+/// Active admins in one local record, when this node is an active member of
+/// it and it is not withdrawn.
+fn group_record_roster_admins(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Option<BTreeSet<String>> {
+    if info.withdrawn || !info.has_active_member(local_agent_hex) {
+        return None;
+    }
+    Some(
+        info.members_v2
+            .iter()
+            .filter(|(_, member)| {
+                member.is_active() && member.role.at_least(x0x::groups::GroupRole::Admin)
+            })
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect(),
+    )
+}
+
+/// A card may change a group that this node holds as a member only when the
+/// card's signer is an active admin in this node's own roster. `None` (no
+/// membership) allows the card; the cache rules guard that case.
+fn held_group_card_authority(
+    roster_admins: Option<&BTreeSet<String>>,
+    card: &x0x::groups::GroupCard,
+) -> Result<(), x0x::groups::directory::CardRefusal> {
+    match roster_admins {
+        Some(admins) if !card.is_signed() || !admins.contains(&card.authority_agent_id) => {
+            Err(x0x::groups::directory::CardRefusal::Authority)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`held_group_card_authority`] for an imported card. A card signed with
+/// this node's own key comes from this node's own state, so it is allowed.
+fn imported_card_authority(
+    roster_admins: Option<&BTreeSet<String>>,
+    card: &x0x::groups::GroupCard,
+    local_agent_hex: &str,
+) -> Result<(), x0x::groups::directory::CardRefusal> {
+    if card.is_signed() && card.authority_agent_id == local_agent_hex {
+        return Ok(());
+    }
+    held_group_card_authority(roster_admins, card)
+}
+
+/// Cache a card received from another node. A cached card is replaced only
+/// by its own authority (`GroupCard::replacement_verdict`). The caller
+/// prunes expired cards first and verifies the signature of a signed card.
+fn admit_remote_group_card(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    key: String,
+    card: x0x::groups::GroupCard,
+    roster_admins: &BTreeSet<String>,
+    surface: &'static str,
+) -> x0x::groups::directory::CardReplacement {
+    let verdict = card.replacement_verdict(cache.get(&key), roster_admins);
+    match verdict {
+        x0x::groups::directory::CardReplacement::Replace => {
+            cache.insert(key, card);
+        }
+        x0x::groups::directory::CardReplacement::Stale => {}
+        x0x::groups::directory::CardReplacement::Refused(refusal) => {
+            note_group_card_refusal(surface, &card, refusal);
+        }
+    }
+    verdict
+}
+
+/// Apply a withdrawal card received from another node. A cached card is
+/// withdrawn only by its own authority. On `Replace` the cached card, if
+/// there is one, is removed.
+fn withdraw_remote_group_card(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    card: &x0x::groups::GroupCard,
+    roster_admins: &BTreeSet<String>,
+    surface: &'static str,
+) -> x0x::groups::directory::CardReplacement {
+    let verdict = card.withdrawal_verdict(cache.get(&card.group_id), roster_admins);
+    match verdict {
+        x0x::groups::directory::CardReplacement::Replace => {
+            cache.remove(&card.group_id);
+        }
+        x0x::groups::directory::CardReplacement::Stale => {}
+        x0x::groups::directory::CardReplacement::Refused(refusal) => {
+            note_group_card_refusal(surface, card, refusal);
+        }
+    }
+    verdict
+}
+
+/// Cache this node's own card for a group it holds. The card comes from
+/// local state, so only revision order applies.
+fn cache_local_group_card(
     cache: &mut HashMap<String, x0x::groups::GroupCard>,
     key: String,
     card: x0x::groups::GroupCard,
@@ -266,21 +420,28 @@ fn cache_group_card_if_newer(
     should_insert
 }
 
+/// Remote card admission without roster trust (the non-member case).
+#[cfg(test)]
+fn cache_group_card_if_newer(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    key: String,
+    card: x0x::groups::GroupCard,
+) -> bool {
+    admit_remote_group_card(cache, key, card, &BTreeSet::new(), "test")
+        == x0x::groups::directory::CardReplacement::Replace
+}
+
+/// Remote withdrawal without roster trust (the non-member case). True when
+/// a cached card was removed.
+#[cfg(test)]
 fn remove_group_card_if_not_stale(
     cache: &mut HashMap<String, x0x::groups::GroupCard>,
     card: &x0x::groups::GroupCard,
 ) -> bool {
-    let should_remove = match cache.get(&card.group_id) {
-        Some(existing) => {
-            card.revision > existing.revision
-                || (card.revision == existing.revision && card.issued_at >= existing.issued_at)
-        }
-        None => false,
-    };
-    if should_remove {
-        cache.remove(&card.group_id);
-    }
-    should_remove
+    let existed = cache.contains_key(&card.group_id);
+    existed
+        && withdraw_remote_group_card(cache, card, &BTreeSet::new(), "test")
+            == x0x::groups::directory::CardReplacement::Replace
 }
 
 fn group_card_supersedes_group_info(
@@ -2437,6 +2598,15 @@ async fn publish_group_card_to_discovery_inner(
     commit
 }
 
+/// Roster trust for a card from another node: the active admins in this
+/// node's own roster for the card's group, or an empty set when this node is
+/// not a member.
+async fn remote_group_card_roster_admins(state: &AppState, group_id: &str) -> BTreeSet<String> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    group_card_roster_admins(&groups, group_id, &local_agent_hex).unwrap_or_default()
+}
+
 /// Subscribe to the global discovery topic and insert incoming cards into the cache.
 /// Listener lives for the daemon's lifetime.
 pub(in crate::server) async fn spawn_global_discovery_listener(
@@ -2481,16 +2651,23 @@ pub(in crate::server) async fn spawn_global_discovery_listener(
                             }
                         }
 
-                        // Phase D.3: withdrawal supersession. A signed
-                        // withdrawal card evicts any existing cache entry
-                        // regardless of prior revision (it is, by
-                        // construction, a higher revision than anything
-                        // local since apply_commit enforced that at the
-                        // authority).
+                        // Phase D.3: withdrawal supersession. A withdrawal
+                        // card evicts the cached entry when it is not stale
+                        // and comes from that entry's own authority.
                         if card.withdrawn {
+                            let roster_admins =
+                                remote_group_card_roster_admins(&state, &card.group_id).await;
                             let mut cache = state.group_card_cache.write().await;
                             prune_expired_group_cards(&mut cache, now_millis_u64());
-                            if remove_group_card_if_not_stale(&mut cache, &card) {
+                            let existed = cache.contains_key(&card.group_id);
+                            if existed
+                                && withdraw_remote_group_card(
+                                    &mut cache,
+                                    &card,
+                                    &roster_admins,
+                                    "discovery",
+                                ) == x0x::groups::directory::CardReplacement::Replace
+                            {
                                 tracing::info!(
                                     group_id = %card.group_id,
                                     revision = card.revision,
@@ -2523,29 +2700,37 @@ pub(in crate::server) async fn spawn_global_discovery_listener(
 
                         // Phase D.3: higher revision supersedes lower
                         // immediately (independent of TTL). On ties, higher
-                        // issued_at wins.
+                        // issued_at wins. A cached card is replaced only by
+                        // its own authority.
+                        let roster_admins =
+                            remote_group_card_roster_admins(&state, &card.group_id).await;
                         let mut cache = state.group_card_cache.write().await;
                         prune_expired_group_cards(&mut cache, now_millis_u64());
-                        let should_insert = cache_group_card_if_newer(
+                        match admit_remote_group_card(
                             &mut cache,
                             card.group_id.clone(),
                             card.clone(),
-                        );
-                        if should_insert {
-                            tracing::info!(
-                                group_id = %card.group_id,
-                                name = %card.name,
-                                revision = card.revision,
-                                "D.3: caching discovered group card (signed={})",
-                                !card.signature.is_empty()
-                            );
-                            enforce_group_card_cache_cap(&mut cache);
-                        } else {
-                            tracing::debug!(
-                                group_id = %card.group_id,
-                                revision = card.revision,
-                                "D.3: dropped stale card (already have higher rev)"
-                            );
+                            &roster_admins,
+                            "discovery",
+                        ) {
+                            x0x::groups::directory::CardReplacement::Replace => {
+                                tracing::info!(
+                                    group_id = %card.group_id,
+                                    name = %card.name,
+                                    revision = card.revision,
+                                    "D.3: caching discovered group card (signed={})",
+                                    !card.signature.is_empty()
+                                );
+                                enforce_group_card_cache_cap(&mut cache);
+                            }
+                            x0x::groups::directory::CardReplacement::Stale => {
+                                tracing::debug!(
+                                    group_id = %card.group_id,
+                                    revision = card.revision,
+                                    "D.3: dropped stale card (already have higher rev)"
+                                );
+                            }
+                            x0x::groups::directory::CardReplacement::Refused(_) => {}
                         }
                     }
                 }
@@ -2792,11 +2977,22 @@ async fn handle_directory_message(
                 );
                 return;
             }
-            let accepted = state
-                .directory_cache
-                .write()
-                .await
-                .insert(kind, shard, (*card).clone());
+            // A cached card, in any shard, is replaced or withdrawn only by
+            // its own authority.
+            let roster_admins = remote_group_card_roster_admins(state, &card.group_id).await;
+            let accepted = match state.directory_cache.write().await.insert_checked(
+                kind,
+                shard,
+                (*card).clone(),
+                &roster_admins,
+                now_millis_u64(),
+            ) {
+                Ok(accepted) => accepted,
+                Err(refusal) => {
+                    note_group_card_refusal("shard", &card, refusal);
+                    false
+                }
+            };
             if accepted {
                 // Also update the legacy bridge cache so existing
                 // /groups/discover responses continue to reflect shard
@@ -2804,13 +3000,19 @@ async fn handle_directory_message(
                 if card.withdrawn {
                     let mut cache = state.group_card_cache.write().await;
                     prune_expired_group_cards(&mut cache, now_millis_u64());
-                    remove_group_card_if_not_stale(&mut cache, &card);
+                    withdraw_remote_group_card(&mut cache, &card, &roster_admins, "shard");
                 } else if card.policy_summary.discoverability
                     != x0x::groups::GroupDiscoverability::Hidden
                 {
                     let mut cache = state.group_card_cache.write().await;
                     prune_expired_group_cards(&mut cache, now_millis_u64());
-                    if cache_group_card_if_newer(&mut cache, card.group_id.clone(), (*card).clone())
+                    if admit_remote_group_card(
+                        &mut cache,
+                        card.group_id.clone(),
+                        (*card).clone(),
+                        &roster_admins,
+                        "shard",
+                    ) == x0x::groups::directory::CardReplacement::Replace
                     {
                         enforce_group_card_cache_cap(&mut cache);
                     }
@@ -3004,10 +3206,16 @@ pub(in crate::server) async fn spawn_listed_to_contacts_listener(
                         );
                         continue;
                     }
+                    let roster_admins =
+                        remote_group_card_roster_admins(&state, &card.group_id).await;
                     if card.withdrawn {
                         let mut cache = state.group_card_cache.write().await;
                         prune_expired_group_cards(&mut cache, now_millis_u64());
-                        if remove_group_card_if_not_stale(&mut cache, &card) {
+                        let existed = cache.contains_key(&card.group_id);
+                        if existed
+                            && withdraw_remote_group_card(&mut cache, &card, &roster_admins, "contacts")
+                                == x0x::groups::directory::CardReplacement::Replace
+                        {
                             tracing::info!(
                                 group_id = %card.group_id,
                                 "C.2/LTC: evicted withdrawn card from contact cache"
@@ -3028,8 +3236,13 @@ pub(in crate::server) async fn spawn_listed_to_contacts_listener(
                     }
                     let mut cache = state.group_card_cache.write().await;
                     prune_expired_group_cards(&mut cache, now_millis_u64());
-                    let insert =
-                        cache_group_card_if_newer(&mut cache, card.group_id.clone(), card.clone());
+                    let insert = admit_remote_group_card(
+                        &mut cache,
+                        card.group_id.clone(),
+                        card.clone(),
+                        &roster_admins,
+                        "contacts",
+                    ) == x0x::groups::directory::CardReplacement::Replace;
                     if insert {
                         tracing::info!(
                             group_id = %card.group_id,
@@ -5763,8 +5976,8 @@ pub(in crate::server) async fn refresh_group_card_cache_from_info(
     }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
         Ok(Some(card)) => {
-            cache_group_card_if_newer(&mut cache, key.to_string(), card.clone());
-            cache_group_card_if_newer(&mut cache, stable_key, card);
+            cache_local_group_card(&mut cache, key.to_string(), card.clone());
+            cache_local_group_card(&mut cache, stable_key, card);
             enforce_group_card_cache_cap(&mut cache);
         }
         Ok(None) => {
@@ -13892,11 +14105,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !card.signature.is_empty() && card.verify_signature().is_err() {
                 return ApplyMetadataResult::REJECTED;
             }
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let roster_admins =
+                group_record_roster_admins(&info, &local_agent_hex).unwrap_or_default();
             let mut cache = state.group_card_cache.write().await;
             prune_expired_group_cards(&mut cache, now_millis_u64());
             if card.withdrawn {
-                remove_group_card_if_not_stale(&mut cache, &card);
-            } else if cache_group_card_if_newer(&mut cache, card.group_id.clone(), card) {
+                withdraw_remote_group_card(&mut cache, &card, &roster_admins, "metadata");
+            } else if admit_remote_group_card(
+                &mut cache,
+                card.group_id.clone(),
+                card,
+                &roster_admins,
+                "metadata",
+            ) == x0x::groups::directory::CardReplacement::Replace
+            {
                 enforce_group_card_cache_cap(&mut cache);
             }
             ApplyMetadataResult::ACCEPTED_CONTINUE
@@ -15478,8 +15701,8 @@ pub(in crate::server) async fn create_named_group(
                         let stable_group_id = info.stable_group_id().to_string();
                         let mut cache = state.group_card_cache.write().await;
                         prune_expired_group_cards(&mut cache, now_millis_u64());
-                        cache_group_card_if_newer(&mut cache, group_id_hex.clone(), card.clone());
-                        cache_group_card_if_newer(&mut cache, stable_group_id, card);
+                        cache_local_group_card(&mut cache, group_id_hex.clone(), card.clone());
+                        cache_local_group_card(&mut cache, stable_group_id, card);
                         enforce_group_card_cache_cap(&mut cache);
                         drop(cache);
                         let state_for_card = Arc::clone(&state);
@@ -27501,6 +27724,113 @@ pub(in crate::server) async fn get_group_card(
     not_found("card not found").into_response()
 }
 
+/// Response text when an imported card does not come from an authority of
+/// the group this node already knows.
+const GROUP_CARD_AUTHORITY_CONFLICT: &str =
+    "card is not signed by an authority of the group already known to this node";
+
+/// Create or refresh the local record for an imported card.
+///
+/// A record that this node holds as a member changes only when the card's
+/// signer is an active admin in that record's roster (or is this node).
+/// Otherwise a missing record becomes a stub, and an existing stub is
+/// refreshed from the card.
+fn import_card_into_groups(
+    groups: &mut HashMap<String, x0x::groups::GroupInfo>,
+    card: &x0x::groups::GroupCard,
+    creator: AgentId,
+    policy: &x0x::groups::GroupPolicy,
+    local_agent_hex: &str,
+) -> Result<(), x0x::groups::directory::CardRefusal> {
+    let group_id = card.group_id.clone();
+    imported_card_authority(
+        group_card_roster_admins(groups, &group_id, local_agent_hex).as_ref(),
+        card,
+        local_agent_hex,
+    )?;
+    if !groups.contains_key(&group_id) {
+        let mut stub = x0x::groups::GroupInfo::with_policy(
+            card.name.clone(),
+            card.description.clone(),
+            creator,
+            group_id.clone(),
+            policy.clone(),
+        );
+        if let Some(metadata_topic) = card.metadata_topic.clone() {
+            stub.metadata_topic = metadata_topic;
+        }
+        // Imported stubs must preserve the authority's stable `group_id`
+        // from the card. Recomputing a fresh genesis here would mint a new
+        // local-only stable id, breaking public-topic alignment and any
+        // state-hash / revision metadata copied from the discovered card.
+        stub.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            group_id.clone(),
+            card.owner_agent_id.clone(),
+            card.created_at,
+            String::new(),
+        ));
+        stub.created_at = card.created_at;
+        stub.updated_at = card.updated_at;
+        stub.state_revision = card.revision;
+        if !card.state_hash.is_empty() {
+            stub.state_hash = card.state_hash.clone();
+        }
+        stub.prev_state_hash = card.prev_state_hash.clone();
+        stub.withdrawn = card.withdrawn;
+        // The stub should not treat the caller as an admin — reset members_v2
+        // and store the authority (from card) as the active Admin.
+        stub.members_v2.clear();
+        stub.members_v2.insert(
+            card.owner_agent_id.clone(),
+            x0x::groups::GroupMember::new_admin(card.owner_agent_id.clone(), None, card.created_at),
+        );
+        // Phase D.2: the importer is NOT a member yet. They must not have a
+        // shared secret until a SecureShareDelivered envelope arrives after
+        // approval.
+        stub.shared_secret = None;
+        stub.secret_epoch = 0;
+        groups.insert(group_id.clone(), stub);
+    } else if let Some(existing) = groups.get_mut(&group_id) {
+        existing.name = card.name.clone();
+        existing.description = card.description.clone();
+        existing.policy = policy.clone();
+        existing.created_at = card.created_at;
+        existing.updated_at = card.updated_at;
+        if let Some(metadata_topic) = card.metadata_topic.clone() {
+            existing.metadata_topic = metadata_topic;
+        }
+        existing.state_revision = card.revision;
+        if !card.state_hash.is_empty() {
+            existing.state_hash = card.state_hash.clone();
+        }
+        existing.prev_state_hash = card.prev_state_hash.clone();
+        existing.withdrawn = card.withdrawn;
+        if existing
+            .genesis
+            .as_ref()
+            .is_none_or(|genesis| genesis.group_id != group_id)
+        {
+            existing.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+                group_id.clone(),
+                card.owner_agent_id.clone(),
+                card.created_at,
+                String::new(),
+            ));
+        }
+        existing
+            .members_v2
+            .entry(card.owner_agent_id.clone())
+            .or_insert_with(|| {
+                x0x::groups::GroupMember::new_admin(
+                    card.owner_agent_id.clone(),
+                    None,
+                    card.created_at,
+                )
+            });
+    }
+    Ok(())
+}
+
 /// POST /groups/cards/import — accept a discoverable card into the local cache.
 ///
 /// If no local `GroupInfo` exists for the group_id, creates a minimal "discovered"
@@ -27522,10 +27852,27 @@ pub(in crate::server) async fn import_group_card(
     let membership_lock = group_membership_lock(&state, &group_id).await;
     let _membership_guard = membership_lock.lock().await;
 
+    // A group this node holds as a member changes only through the admins
+    // of its own roster. A cached card is replaced only by its own authority.
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let roster_admins = {
+        let groups = state.named_groups.read().await;
+        group_card_roster_admins(&groups, &group_id, &local_agent_hex)
+    };
+    if let Err(refusal) = imported_card_authority(roster_admins.as_ref(), &card, &local_agent_hex) {
+        note_group_card_refusal("import", &card, refusal);
+        return api_error(StatusCode::CONFLICT, GROUP_CARD_AUTHORITY_CONFLICT);
+    }
+    let roster_admins = roster_admins.unwrap_or_default();
+
     if card.withdrawn {
         let mut cache = state.group_card_cache.write().await;
         prune_expired_group_cards(&mut cache, now_millis_u64());
-        remove_group_card_if_not_stale(&mut cache, &card);
+        if let x0x::groups::directory::CardReplacement::Refused(_) =
+            withdraw_remote_group_card(&mut cache, &card, &roster_admins, "import")
+        {
+            return api_error(StatusCode::CONFLICT, GROUP_CARD_AUTHORITY_CONFLICT);
+        }
         drop(cache);
 
         let local = {
@@ -27609,8 +27956,20 @@ pub(in crate::server) async fn import_group_card(
     {
         let mut cache = state.group_card_cache.write().await;
         prune_expired_group_cards(&mut cache, now_millis_u64());
-        if cache_group_card_if_newer(&mut cache, group_id.clone(), card.clone()) {
-            enforce_group_card_cache_cap(&mut cache);
+        match admit_remote_group_card(
+            &mut cache,
+            group_id.clone(),
+            card.clone(),
+            &roster_admins,
+            "import",
+        ) {
+            x0x::groups::directory::CardReplacement::Replace => {
+                enforce_group_card_cache_cap(&mut cache);
+            }
+            x0x::groups::directory::CardReplacement::Stale => {}
+            x0x::groups::directory::CardReplacement::Refused(_) => {
+                return api_error(StatusCode::CONFLICT, GROUP_CARD_AUTHORITY_CONFLICT);
+            }
         }
     }
 
@@ -27645,94 +28004,21 @@ pub(in crate::server) async fn import_group_card(
     // Create or refresh a local stub GroupInfo keyed by the authority's
     // stable group id from the card under the same global roster transaction
     // as every other production writer.
+    let mut import_refusal = None;
     let persist_outcome = persist_named_groups_mutation(&state, |groups| {
-        if !groups.contains_key(&group_id) {
-            let mut stub = x0x::groups::GroupInfo::with_policy(
-                card.name.clone(),
-                card.description.clone(),
-                creator,
-                group_id.clone(),
-                policy.clone(),
-            );
-            if let Some(metadata_topic) = card.metadata_topic.clone() {
-                stub.metadata_topic = metadata_topic;
+        match import_card_into_groups(groups, &card, creator, &policy, &local_agent_hex) {
+            Ok(()) => true,
+            Err(refusal) => {
+                import_refusal = Some(refusal);
+                false
             }
-            // Imported stubs must preserve the authority's stable `group_id`
-            // from the card. Recomputing a fresh genesis here would mint a new
-            // local-only stable id, breaking public-topic alignment and any
-            // state-hash / revision metadata copied from the discovered card.
-            stub.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
-                group_id.clone(),
-                card.owner_agent_id.clone(),
-                card.created_at,
-                String::new(),
-            ));
-            stub.created_at = card.created_at;
-            stub.updated_at = card.updated_at;
-            stub.state_revision = card.revision;
-            if !card.state_hash.is_empty() {
-                stub.state_hash = card.state_hash.clone();
-            }
-            stub.prev_state_hash = card.prev_state_hash.clone();
-            stub.withdrawn = card.withdrawn;
-            // The stub should not treat the caller as an admin — reset members_v2
-            // and store the authority (from card) as the active Admin.
-            stub.members_v2.clear();
-            stub.members_v2.insert(
-                card.owner_agent_id.clone(),
-                x0x::groups::GroupMember::new_admin(
-                    card.owner_agent_id.clone(),
-                    None,
-                    card.created_at,
-                ),
-            );
-            // Phase D.2: the importer is NOT a member yet. They must not have a
-            // shared secret until a SecureShareDelivered envelope arrives after
-            // approval.
-            stub.shared_secret = None;
-            stub.secret_epoch = 0;
-            groups.insert(group_id.clone(), stub);
-        } else if let Some(existing) = groups.get_mut(&group_id) {
-            existing.name = card.name.clone();
-            existing.description = card.description.clone();
-            existing.policy = policy.clone();
-            existing.created_at = card.created_at;
-            existing.updated_at = card.updated_at;
-            if let Some(metadata_topic) = card.metadata_topic.clone() {
-                existing.metadata_topic = metadata_topic;
-            }
-            existing.state_revision = card.revision;
-            if !card.state_hash.is_empty() {
-                existing.state_hash = card.state_hash.clone();
-            }
-            existing.prev_state_hash = card.prev_state_hash.clone();
-            existing.withdrawn = card.withdrawn;
-            if existing
-                .genesis
-                .as_ref()
-                .is_none_or(|genesis| genesis.group_id != group_id)
-            {
-                existing.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
-                    group_id.clone(),
-                    card.owner_agent_id.clone(),
-                    card.created_at,
-                    String::new(),
-                ));
-            }
-            existing
-                .members_v2
-                .entry(card.owner_agent_id.clone())
-                .or_insert_with(|| {
-                    x0x::groups::GroupMember::new_admin(
-                        card.owner_agent_id.clone(),
-                        None,
-                        card.created_at,
-                    )
-                });
         }
-        true
     })
     .await;
+    if let Some(refusal) = import_refusal {
+        note_group_card_refusal("import", &card, refusal);
+        return api_error(StatusCode::CONFLICT, GROUP_CARD_AUTHORITY_CONFLICT);
+    }
     if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -4967,10 +4967,13 @@ async fn issue732_valid_card_import_cannot_clear_a_quarantined_alias() -> Result
             .insert(alias_key.clone(), quarantined);
     }
 
-    // A genuinely valid, non-withdrawn, discoverable signed card.
+    // A genuinely valid, non-withdrawn, discoverable signed card. This node
+    // holds the group (it is the creator), so the card must come from an
+    // admin of that roster: a held group takes card fields only from its
+    // own roster's admins.
     let creator = AgentKeypair::generate()?;
     let mut card = super::sample_group_card(&stable, 2, now_millis_u64());
-    card.sign(&creator)?;
+    card.sign(state.agent.identity().agent_keypair())?;
     let response = super::super::import_group_card(State(Arc::clone(&state)), Json(card))
         .await
         .into_response();
