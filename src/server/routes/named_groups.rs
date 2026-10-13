@@ -22550,9 +22550,7 @@ fn removed_member_missing_key_package(info: &x0x::groups::GroupInfo) -> Option<S
         if member.state != x0x::groups::GroupMemberState::Removed {
             return None;
         }
-        if member.treekem_key_package_hash.is_none() {
-            return None;
-        }
+        member.treekem_key_package_hash.as_ref()?;
         current_member_treekem_key_package(member)
             .is_none()
             .then(|| member.agent_id.clone())
