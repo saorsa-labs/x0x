@@ -506,6 +506,8 @@ jobs:
           --expect w3h_1105_red_baseline_restarted_replica_stays_at_n=RED
           --require w3h_1105_restarted_replica_obtains_n_plus_one_snapshot
           --expect w3h_1105_restarted_replica_obtains_n_plus_one_snapshot=GREEN
+          --require w3h_1191_attempt_exit
+          --expect w3h_1191_attempt_exit=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
