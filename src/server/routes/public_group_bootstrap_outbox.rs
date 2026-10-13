@@ -43,9 +43,10 @@ use crate::server::state::AppState;
 use x0x::identity::AgentId;
 
 use super::named_groups::{
-    confirm_named_groups_durability, ensure_named_group_listeners, group_membership_lock,
-    named_group_direct_delivery_config, now_millis_u64, persist_named_group_info,
-    persist_named_groups_mutation, signed_public_bootstrap_snapshot,
+    apply_signed_public_revision_catchup, confirm_named_groups_durability,
+    ensure_named_group_listeners, group_membership_lock, named_group_direct_delivery_config,
+    now_millis_u64, persist_named_group_info, persist_named_groups_mutation,
+    refresh_group_card_cache_from_info, signed_public_bootstrap_snapshot,
     validate_public_group_bootstrap, write_named_groups_json_atomic, AtomicWriteOutcome,
     PublicGroupBootstrap, MAX_BOOTSTRAP_INSTALLED_GROUPS,
 };
@@ -156,7 +157,7 @@ fn public_group_bootstrap_request_id(
 
 /// Message-type tag carried inside the JSON body, shared with the legacy
 /// unprefixed wire form so one decoder serves both.
-const PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE: &str = "public_group_bootstrap";
+pub(in crate::server) const PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE: &str = "public_group_bootstrap";
 
 fn encode_public_group_bootstrap_typed_payload(
     group: x0x::groups::GroupInfo,
@@ -265,6 +266,17 @@ fn public_group_bootstrap_delivery_config(
     Ok(config)
 }
 
+/// Catch-up holds the per-group membership lock across this send. The
+/// ordinary attempt waits up to eight seconds for an ACK a refused peer
+/// never sends. One second is enough for a live peer and releases the lock
+/// when the peer withholds the ACK.
+const SIGNED_PUBLIC_CATCHUP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// An installed group's admission waits this long for the membership lock.
+/// A busy lock withholds the ACK so the serial DM inbox can move. The
+/// sender retries.
+const INSTALLED_BOOTSTRAP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn public_group_bootstrap_legacy_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_durable_app_ack = false;
@@ -316,9 +328,55 @@ async fn public_group_bootstrap_wire_version(
     }
 }
 
+/// One best-effort send of a SignedPublic head to a member who is one
+/// revision behind. This does not write an outbox obligation.
+///
+/// `membership_guard` is the per-group membership lock. The caller takes it
+/// before it selects the snapshot, checks quarantine under it, and holds it
+/// across this await. Delivery then cannot race a marker install.
+pub(in crate::server) async fn push_signed_public_catchup_snapshot(
+    state: &AppState,
+    recipient: AgentId,
+    snapshot: x0x::groups::GroupInfo,
+    membership_guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> bool {
+    let obligation = match prepare_public_group_bootstrap_obligation(recipient, snapshot) {
+        Ok(obligation) => obligation,
+        Err(error) => {
+            tracing::warn!("signed-public catch-up snapshot was not encoded: {error}");
+            return false;
+        }
+    };
+    // Keep the caller's membership guard borrowed across delivery. The lock
+    // stays taken until this function returns. The attempt itself is short,
+    // so a withheld ACK cannot hold the lock for the ordinary eight seconds.
+    let _held_across_delivery = membership_guard;
+    match deliver_public_group_bootstrap_bounded(
+        state,
+        &obligation,
+        Some(SIGNED_PUBLIC_CATCHUP_SEND_TIMEOUT),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::debug!("signed-public catch-up snapshot was not delivered: {error}");
+            false
+        }
+    }
+}
+
 async fn deliver_public_group_bootstrap(
     state: &AppState,
     obligation: &PublicGroupBootstrapObligation,
+) -> Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    deliver_public_group_bootstrap_bounded(state, obligation, None).await
+}
+
+async fn deliver_public_group_bootstrap_bounded(
+    state: &AppState,
+    obligation: &PublicGroupBootstrapObligation,
+    attempt_timeout: Option<std::time::Duration>,
 ) -> Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
     // #1288: tests park here, still holding the membership lock and the
     // AppState, the way a v2 application ACK that never arrives does.
@@ -337,19 +395,24 @@ async fn deliver_public_group_bootstrap(
         == PublicGroupBootstrapWireVersion::LegacyV1
     {
         let payload = public_group_bootstrap_legacy_payload(obligation)?;
+        let mut config = public_group_bootstrap_legacy_delivery_config();
+        if let Some(timeout) = attempt_timeout {
+            config.timeout_per_attempt = timeout;
+            config.raw_quic_receive_ack_timeout = Some(timeout);
+        }
         return state
             .agent
-            .send_direct_with_config(
-                &recipient,
-                payload,
-                public_group_bootstrap_legacy_delivery_config(),
-            )
+            .send_direct_with_config(&recipient, payload, config)
             .await
             .map(PublicGroupBootstrapDelivery::LegacyV1Sent);
     }
 
-    let config = public_group_bootstrap_delivery_config(obligation)
+    let mut config = public_group_bootstrap_delivery_config(obligation)
         .map_err(x0x::dm::DmError::EnvelopeConstruction)?;
+    if let Some(timeout) = attempt_timeout {
+        config.timeout_per_attempt = timeout;
+        config.raw_quic_receive_ack_timeout = Some(timeout);
+    }
     state
         .agent
         .send_direct_with_config(&recipient, obligation.payload.clone(), config)
@@ -690,7 +753,10 @@ async fn quarantined_markers(
 /// that nobody remembers to bootstrap is the failure this outbox exists to
 /// prevent) and delivery resumes on its own after `POST
 /// /groups/:id/quarantine/clear`.
-async fn withhold_bootstrap_publication(state: &Arc<AppState>, group_id: &str) -> bool {
+pub(in crate::server) async fn withhold_bootstrap_publication(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> bool {
     let Some(marker) = crate::server::delegations::fork_quarantine_marker(state, group_id).await
     else {
         return false;
@@ -1226,12 +1292,52 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
+    let revoked_snapshot_members = {
+        let set = state.agent.revocation_set();
+        let revoked = set.read().await;
+        group
+            .members_v2
+            .values()
+            .filter(|member| member.is_active())
+            .filter_map(|member| {
+                parse_agent_id_hex(&member.agent_id)
+                    .ok()
+                    .filter(|agent| revoked.is_agent_revoked(agent))
+                    .map(|_| member.agent_id.clone())
+            })
+            .collect::<Vec<String>>()
+    };
     if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
         tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
         return Err("public-group bootstrap failed signed frontier validation".to_string());
     }
     let group_id = group.stable_group_id().to_string();
     let frontier = (group.state_revision, group.state_hash.clone());
+
+    // Both bootstrap listeners enter here. A local metadata update holds this
+    // same lock from the moment it clones the installed frontier until
+    // `persist_named_group_info` returns. Take it before the read, and hold
+    // it through apply and persistence, so that clone cannot replace a
+    // removal this admission has already acknowledged.
+    let membership_lock = group_membership_lock(state, &group_id).await;
+    let membership_guard =
+        match tokio::time::timeout(INSTALLED_BOOTSTRAP_LOCK_WAIT, membership_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_elapsed) => {
+                let installed = {
+                    let groups = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&groups, &group_id).is_some()
+                };
+                if installed {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        "withholding public-group bootstrap ACK: membership lock is busy"
+                    );
+                    return Err("public-group bootstrap membership lock is busy".to_string());
+                }
+                membership_lock.lock().await
+            }
+        };
 
     let installed_frontier_matches = {
         let groups = state.named_groups.read().await;
@@ -1264,6 +1370,55 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         // obligation survives until it catches up through the ordinary
         // metadata-commit path.
         if !frontier_matches {
+            // A new install still refuses a foreign frontier. An installed
+            // member who is exactly one signed commit behind may take this
+            // head when the sender is the admin who signed it.
+            let caught_up = persist_named_groups_mutation(state, |groups| {
+                let Some((key, info)) =
+                    crate::server::resolve_group_entry_locked(groups, &group_id)
+                        .map(|(key, info)| (key.to_string(), info.clone()))
+                else {
+                    return false;
+                };
+                let Some(next) = apply_signed_public_revision_catchup(
+                    &info,
+                    &group,
+                    &sender_hex,
+                    &local_agent_hex,
+                    |agent| {
+                        revoked_snapshot_members
+                            .iter()
+                            .any(|revoked| revoked == agent)
+                    },
+                ) else {
+                    return false;
+                };
+                super::named_groups::store_named_group_info_locked(groups, &key, next)
+            })
+            .await;
+            if matches!(caught_up, Ok(AtomicWriteOutcome::Durable)) {
+                if let Some((key, info)) = {
+                    let groups = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&groups, &group_id)
+                        .map(|(key, info)| (key.to_string(), info.clone()))
+                } {
+                    refresh_group_card_cache_from_info(state, &key, &info).await;
+                }
+                tracing::info!(
+                    group_id = %LogHexId::group(&group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    "applied signed-public revision catch-up"
+                );
+                // The membership guard is still held, so a stale clone cannot
+                // persist until this acknowledgement is about to return.
+                #[cfg(test)]
+                catchup_apply_test_seam::park(&group_id).await;
+                drop(membership_guard);
+                return Ok(DmTypedPayloadCompletion::Inserted);
+            }
+            if matches!(caught_up, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
+                return Err("public-group bootstrap catch-up was not directory-durable".to_string());
+            }
             return Err("public-group bootstrap frontier is not the installed one".to_string());
         }
         // `Duplicate` certifies that a durable record already exists, so it may
@@ -1292,6 +1447,7 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         true
     })
     .await;
+    drop(membership_guard);
     // Only `Durable` — rename plus parent-directory fsync — earns `Inserted`.
     // `ReplacedNotDurable` is visible but not yet proven to survive a crash, so
     // it withholds the ACK and the sender retries.
@@ -1339,6 +1495,81 @@ pub(in crate::server) async fn handle_public_group_bootstrap_typed_payload(
     };
     if let Some(completion) = completion {
         let _ = completion.send(result);
+    }
+}
+
+/// Parks a durable catch-up acknowledgement so a test can persist a stale
+/// clone before `Inserted` returns. One-shot, keyed by group id.
+#[cfg(test)]
+pub(in crate::server) mod catchup_apply_test_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct Pause {
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    pub(in crate::server) struct Armed {
+        key: String,
+        pause: Arc<Pause>,
+    }
+
+    impl Armed {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.pause.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.pause.released.store(true, Ordering::SeqCst);
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(armed) = armed.as_mut() {
+                if armed
+                    .get(&self.key)
+                    .is_some_and(|pause| Arc::ptr_eq(pause, &self.pause))
+                {
+                    armed.remove(&self.key);
+                }
+            }
+        }
+    }
+
+    static ARMED: Mutex<Option<HashMap<String, Arc<Pause>>>> = Mutex::new(None);
+
+    pub(in crate::server) fn arm(group_id: &str) -> Armed {
+        let pause = Arc::new(Pause {
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(group_id.to_string(), Arc::clone(&pause));
+        Armed {
+            key: group_id.to_string(),
+            pause,
+        }
+    }
+
+    pub(in crate::server) async fn park(group_id: &str) {
+        let pause = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|armed| armed.remove(group_id));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.store(true, Ordering::SeqCst);
+        while !pause.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }
 

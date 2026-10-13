@@ -53,7 +53,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -3765,6 +3765,373 @@ pub(in crate::server) fn validate_public_group_bootstrap(
 /// bounds attacker-driven state growth and listener-task spawn.
 pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
+/// How often one ahead member offers the same SignedPublic commit to one peer.
+const SIGNED_PUBLIC_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
+
+/// After a catch-up send fails, the same peer is not offered again until
+/// this elapses. A refused or unreachable recipient otherwise retries as
+/// soon as the five-second throttle ends, and each try holds the membership
+/// lock for the send.
+const SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Live send-throttle entries. A full cache refuses a new peer. It does not
+/// evict a peer whose five seconds are still running.
+const SIGNED_PUBLIC_CATCHUP_SEND_LIMIT: usize = 64;
+
+/// In-flight catch-up tasks for one daemon hook. A full queue refuses more
+/// work. It does not start another task for a key that is already pending.
+pub(in crate::server) const SIGNED_PUBLIC_CATCHUP_QUEUE_CAP: usize = 32;
+
+fn with_signed_public_catchup_cache<T>(
+    body: impl FnOnce(&mut Vec<(String, std::time::Instant)>) -> T,
+) -> T {
+    use std::sync::Mutex;
+    static LAST: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
+    let mut guard = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    body(&mut guard)
+}
+
+fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision: u64) -> bool {
+    let key = format!("{group_id}:{author_hex}:{from_revision}");
+    with_signed_public_catchup_cache(|guard| {
+        signed_public_catchup_decide(guard, &key, std::time::Instant::now())
+    })
+}
+
+fn signed_public_catchup_note_failure(group_id: &str, author_hex: &str, from_revision: u64) {
+    let key = format!("{group_id}:{author_hex}:{from_revision}");
+    with_signed_public_catchup_cache(|guard| {
+        signed_public_catchup_extend_failure(guard, &key, std::time::Instant::now());
+    });
+}
+
+fn signed_public_catchup_decide(
+    guard: &mut Vec<(String, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    guard.retain(|(_, until)| *until > now);
+    if guard.iter().any(|(existing, _)| existing == key) {
+        return false;
+    }
+    if guard.len() >= SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
+        return false;
+    }
+    guard.push((key.to_string(), now + SIGNED_PUBLIC_CATCHUP_THROTTLE));
+    true
+}
+
+/// Stretch an existing offer, or record one, so a failed send is not retried
+/// for [`SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF`]. A full cache does not evict
+/// a live entry to remember the failure.
+pub(in crate::server) fn signed_public_catchup_extend_failure(
+    guard: &mut Vec<(String, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) {
+    let until = now + SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF;
+    if let Some((_, existing)) = guard.iter_mut().find(|(existing, _)| existing == key) {
+        if *existing < until {
+            *existing = until;
+        }
+        return;
+    }
+    if guard.len() < SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
+        guard.push((key.to_string(), until));
+    }
+}
+
+pub(in crate::server) fn reserve_signed_public_catchup_queue(
+    pending: &mut Vec<(String, u64, AgentId)>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) -> bool {
+    if pending.iter().any(|(group, revision, pending_author)| {
+        group == group_key && *revision == signed_revision && *pending_author == author
+    }) {
+        return false;
+    }
+    if pending.len() >= SIGNED_PUBLIC_CATCHUP_QUEUE_CAP {
+        return false;
+    }
+    pending.push((group_key.to_string(), signed_revision, author));
+    true
+}
+
+pub(in crate::server) fn release_signed_public_catchup_queue(
+    pending: &mut Vec<(String, u64, AgentId)>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) {
+    if let Some(index) = pending
+        .iter()
+        .position(|(group, revision, pending_author)| {
+            group == group_key && *revision == signed_revision && *pending_author == author
+        })
+    {
+        pending.remove(index);
+    }
+}
+
+fn restore_local_member_key_material(
+    next: &mut x0x::groups::GroupInfo,
+    local: &x0x::groups::GroupInfo,
+) {
+    for (id, member) in next.members_v2.iter_mut() {
+        // These fields are local. They are not in the roster root or the
+        // state hash, so a signed next commit can carry a different
+        // non-empty value and still verify. Drop the remote value first.
+        // Retained members then take the local value back, including None.
+        member.kem_public_key_b64 = None;
+        member.treekem_key_package_b64 = None;
+        member.treekem_key_package_hash = None;
+        member.certificate_missing_since_ms = None;
+        let Some(previous) = local.members_v2.get(id) else {
+            continue;
+        };
+        member
+            .kem_public_key_b64
+            .clone_from(&previous.kem_public_key_b64);
+        member
+            .treekem_key_package_b64
+            .clone_from(&previous.treekem_key_package_b64);
+        member
+            .treekem_key_package_hash
+            .clone_from(&previous.treekem_key_package_hash);
+        member.certificate_missing_since_ms = previous.certificate_missing_since_ms;
+    }
+}
+
+/// Why an owner-axis catch-up refused a head the ordinary apply would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum OwnerAxisCatchupBlock {
+    /// An active snapshot member who is not active locally is in the local
+    /// revocation set (ADR-0038 B1).
+    RevokedNewcomer,
+    /// The active roster changed. Roster commits stay on the ordinary path,
+    /// which is the one that carries the owner mandate (ADR-0064 §1b).
+    RosterChange,
+}
+
+/// Owner-axis catch-up may install a metadata-only head. It refuses a head
+/// that adds a locally revoked member, and any head that changes the active
+/// roster. A non-owner-axis group is not blocked here.
+pub(in crate::server) fn owner_axis_catchup_block(
+    local: &x0x::groups::GroupInfo,
+    snapshot: &x0x::groups::GroupInfo,
+    is_revoked: impl Fn(&str) -> bool,
+) -> Option<OwnerAxisCatchupBlock> {
+    local.policy.admission.owner_certified_user_id()?;
+    let local_active: BTreeSet<&str> = local
+        .active_members()
+        .map(|member| member.agent_id.as_str())
+        .collect();
+    if snapshot.active_members().any(|member| {
+        !local_active.contains(member.agent_id.as_str()) && is_revoked(member.agent_id.as_str())
+    }) {
+        return Some(OwnerAxisCatchupBlock::RevokedNewcomer);
+    }
+    let snapshot_active: BTreeSet<&str> = snapshot
+        .active_members()
+        .map(|member| member.agent_id.as_str())
+        .collect();
+    if local_active != snapshot_active {
+        return Some(OwnerAxisCatchupBlock::RosterChange);
+    }
+    let role_changed = snapshot.active_members().any(|member| {
+        local
+            .members_v2
+            .get(member.agent_id.as_str())
+            .is_none_or(|installed| installed.role != member.role)
+    });
+    if role_changed {
+        return Some(OwnerAxisCatchupBlock::RosterChange);
+    }
+    None
+}
+
+/// Apply one newer SignedPublic bootstrap onto an installed group.
+///
+/// The snapshot must be the sanitized head from
+/// [`signed_public_bootstrap_snapshot`]. The sender must be the admin who
+/// signed that head, and the head must be the next link after `local`.
+/// Local invite, lineage, quarantine and mandate state stay on `local`.
+/// A snapshot that does not chain returns `None` and leaves `local` unused.
+///
+/// `is_revoked` is the local ADR-0018 set. On an owner-axis group it refuses
+/// a newcomer who is revoked, and any active-roster change is refused so
+/// that change stays on the ordinary mandate path.
+pub(in crate::server) fn apply_signed_public_revision_catchup(
+    local: &x0x::groups::GroupInfo,
+    snapshot: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+    local_agent_hex: &str,
+    is_revoked: impl Fn(&str) -> bool,
+) -> Option<x0x::groups::GroupInfo> {
+    if local.withdrawn
+        || local.fork_quarantine.is_some()
+        || snapshot.withdrawn
+        || snapshot.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || local.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || snapshot.shared_secret.is_some()
+        || snapshot.security_binding.is_some()
+        || snapshot.invite_lineage.is_some()
+        || snapshot.fork_quarantine.is_some()
+        || !snapshot.mandate_capability.is_empty()
+        || snapshot.stable_group_id() != local.stable_group_id()
+        || snapshot.state_revision != local.state_revision.saturating_add(1)
+        || snapshot.prev_state_hash.as_deref() != Some(local.state_hash.as_str())
+        || !snapshot.has_active_member(local_agent_hex)
+        || !snapshot.has_active_member(sender_hex)
+    {
+        return None;
+    }
+    let retained = snapshot.commit_log.last()?;
+    if snapshot.commit_log.len() != 1 || !retained.roster_root_consistent() {
+        return None;
+    }
+    let commit = &retained.commit;
+    if commit.verify_structure().is_err()
+        || commit.committed_by != sender_hex
+        || !local
+            .caller_role(sender_hex)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        || commit.group_id != snapshot.stable_group_id()
+        || commit.revision != snapshot.state_revision
+        || commit.state_hash != snapshot.state_hash
+        || commit.prev_state_hash != snapshot.prev_state_hash
+        || commit.withdrawn != snapshot.withdrawn
+        || commit.security_binding != snapshot.security_binding
+        || commit.roster_root != x0x::groups::compute_roster_root(&snapshot.members_v2)
+        || commit.policy_hash != x0x::groups::compute_policy_hash(&snapshot.policy)
+        || commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&snapshot.public_meta())
+    {
+        return None;
+    }
+    if x0x::groups::enforce_last_admin_invariant(&snapshot.members_v2, snapshot.withdrawn).is_err()
+    {
+        return None;
+    }
+    // Ordinary PolicyUpdated rejects a commit that changes or removes an
+    // installed OwnerCertified owner. Catch-up uses the same rule. The
+    // incoming snapshot is checked only against its own policy, so an
+    // OpenJoin head would otherwise drop the axis.
+    if let Some(current_owner) = local.policy.admission.owner_certified_user_id() {
+        if snapshot.policy.admission.owner_certified_user_id() != Some(current_owner) {
+            return None;
+        }
+    }
+    if owner_axis_catchup_block(local, snapshot, is_revoked).is_some() {
+        return None;
+    }
+    let mut next = local.clone();
+    next.name.clone_from(&snapshot.name);
+    next.description.clone_from(&snapshot.description);
+    next.tags.clone_from(&snapshot.tags);
+    next.avatar_url.clone_from(&snapshot.avatar_url);
+    next.banner_url.clone_from(&snapshot.banner_url);
+    next.home.clone_from(&snapshot.home);
+    next.policy = snapshot.policy.clone();
+    next.members_v2.clone_from(&snapshot.members_v2);
+    next.state_revision = snapshot.state_revision;
+    next.prev_state_hash.clone_from(&snapshot.prev_state_hash);
+    next.withdrawn = snapshot.withdrawn;
+    next.security_binding.clone_from(&snapshot.security_binding);
+    next.updated_at = snapshot.updated_at;
+    // Ordinary metadata apply adopts the roster clock with a +1 clamp and a
+    // policy head adopts its clock the same way. Neither field is in the
+    // state hash.
+    next.roster_revision = adopt_roster_revision(local.roster_revision, snapshot.roster_revision);
+    next.policy_revision = adopt_roster_revision(local.policy_revision, snapshot.policy_revision);
+    restore_local_member_key_material(&mut next, local);
+    next.recompute_state_hash();
+    if next.state_hash != snapshot.state_hash {
+        return None;
+    }
+    if next
+        .commit_log
+        .last()
+        .is_none_or(|link| link.commit.revision != commit.revision)
+    {
+        next.commit_log
+            .push(x0x::groups::state_commit::RetainedCommit::capture(
+                commit.clone(),
+                &next.members_v2,
+                next.public_meta(),
+            ));
+        if next.commit_log.len() > x0x::groups::COMMIT_LOG_CAP {
+            let overflow = next.commit_log.len() - x0x::groups::COMMIT_LOG_CAP;
+            next.commit_log.drain(0..overflow);
+        }
+    }
+    Some(next)
+}
+
+/// The ahead committer offers its current SignedPublic head to a member whose
+/// KV binding is exactly one revision behind. The record itself stays rejected.
+pub(in crate::server) async fn offer_signed_public_kv_catchup(
+    state: &Arc<AppState>,
+    group_key: &str,
+    signed_revision: u64,
+    author: AgentId,
+) {
+    let author_hex = hex::encode(author.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // The bootstrap worker holds this lock from the quarantine check through
+    // delivery. Take it before selecting the snapshot, and hold the guard
+    // across the send below. A marker install uses the same lock, so it
+    // either lands before this check or after the send.
+    let membership_lock = group_membership_lock(state, group_key).await;
+    let membership_guard = membership_lock.lock().await;
+    if super::public_group_bootstrap_outbox::withhold_bootstrap_publication(state, group_key).await
+    {
+        return;
+    }
+    let Some(snapshot) = ({
+        let groups = state.named_groups.read().await;
+        // #732: the map key and the stable id are different spellings. The
+        // shared resolver hits the key first, then scans by stable id, so a
+        // quarantine check below cannot miss an alias-keyed record.
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
+            return;
+        };
+        let committed_by = match info.commit_log.last() {
+            Some(link) => link.commit.committed_by.as_str(),
+            None => return,
+        };
+        if info.withdrawn
+            || info.fork_quarantine.is_some()
+            || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+            || info.state_revision != signed_revision.saturating_add(1)
+            || !info.has_active_member(&author_hex)
+            || committed_by != local_hex
+        {
+            return;
+        }
+        signed_public_bootstrap_snapshot(info.clone())
+    }) else {
+        return;
+    };
+    let group_id = snapshot.stable_group_id().to_string();
+    if !signed_public_catchup_allowed(&group_id, &author_hex, signed_revision) {
+        return;
+    }
+    let delivered = super::public_group_bootstrap_outbox::push_signed_public_catchup_snapshot(
+        state,
+        author,
+        snapshot,
+        &membership_guard,
+    )
+    .await;
+    if !delivered {
+        signed_public_catchup_note_failure(&group_id, &author_hex, signed_revision);
+    }
+}
+
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     let reg = state.group_metadata_tasks.write().await.remove(group_id);
     if let Some(reg) = reg {
@@ -5376,7 +5743,7 @@ where
     Ok(next)
 }
 
-async fn refresh_group_card_cache_from_info(
+pub(in crate::server) async fn refresh_group_card_cache_from_info(
     state: &AppState,
     key: &str,
     info: &x0x::groups::GroupInfo,
@@ -5412,7 +5779,7 @@ async fn refresh_group_card_cache_from_info(
     }
 }
 
-fn store_named_group_info_locked(
+pub(in crate::server) fn store_named_group_info_locked(
     groups: &mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
     info: x0x::groups::GroupInfo,
@@ -40425,6 +40792,8 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    #[path = "issue1105_public_revision_catchup.rs"]
+    mod public_revision_catchup_1105;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;

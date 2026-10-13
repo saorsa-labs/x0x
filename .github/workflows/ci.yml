@@ -460,6 +460,9 @@ jobs:
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed
       # (`W3H-TRACES`) and do not fail the job.
+      # D30 restart-cold row for #1105: w3h_1105_red_baseline_restarted_replica_stays_at_n
+      # (RED) and w3h_1105_restarted_replica_obtains_n_plus_one_snapshot (GREEN).
+      # This is the existing 20-rerun gate, not a separate workflow.
       - name: W3-H gate (verdict-stable reruns, D196)
         run: >-
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
@@ -499,6 +502,10 @@ jobs:
           --expect w3h_811_control_web_request_dropped_is_infra=INFRA
           --require w3h_811_control_web_history_withheld_is_red
           --expect w3h_811_control_web_history_withheld_is_red=RED
+          --require w3h_1105_red_baseline_restarted_replica_stays_at_n
+          --expect w3h_1105_red_baseline_restarted_replica_stays_at_n=RED
+          --require w3h_1105_restarted_replica_obtains_n_plus_one_snapshot
+          --expect w3h_1105_restarted_replica_obtains_n_plus_one_snapshot=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

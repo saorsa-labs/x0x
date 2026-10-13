@@ -10,8 +10,8 @@ use crate::identity::AgentId;
 use crate::kv::encrypted::{bind_public_payload, sign_mutation_with_snapshot};
 use crate::kv::encrypted::{
     open_mutation, open_public_payload, open_signed_mutation, open_signed_mutation_bound,
-    AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, PublicAuthorizationVersion,
-    SharedKvSecureContext, SignedKvMutation,
+    public_control_revision_skew, AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind,
+    PublicAuthorizationVersion, SharedKvSecureContext, SignedKvMutation,
 };
 use crate::kv::retained_paging::{
     decode_page, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
@@ -2416,6 +2416,12 @@ impl KvStoreSync {
         }
         let (_, record) =
             decode_delta::<SignedKvMutation>(payload).map_err(|_| ControlOpenFailure::Verify)?;
+        if let Some((signed_revision, author)) =
+            public_control_revision_skew(ctx.as_ref(), store_id, &record)
+        {
+            ctx.note_public_revision_skew(signed_revision, &author);
+            return Err(ControlOpenFailure::Verify);
+        }
         let mutation = open_signed_mutation_bound(ctx.as_ref(), store_id, record)
             .map_err(|_| ControlOpenFailure::Verify)?;
         if mutation.kind != KvMutationKind::Control {
@@ -7496,6 +7502,270 @@ mod tests {
         assert!(holder_sync.state_sync_snapshot().requests_answered > 0);
         creator_sync.stop().await.expect("stop creator");
         holder_sync.stop().await.expect("stop holder");
+    }
+
+    /// #1105: a one-revision SignedPublic skew rejects every state request.
+    /// Applying that commit on the lagging context is what lets both sides
+    /// receive requests and merge. The public authorization watch already
+    /// restarts the requester after `update_from_group`.
+    #[tokio::test]
+    async fn public_revision_skew_rejects_until_the_lagging_commit() {
+        let node = make_node().await;
+        let owner_keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
+        let reader_keypair = crate::identity::AgentKeypair::generate().expect("reader keypair");
+        let owner = owner_keypair.agent_id();
+        let reader = reader_keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let mut behind = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "ce".repeat(16),
+        );
+        behind.migrate_from_v1();
+        behind.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        behind.policy.read_access = crate::groups::GroupReadAccess::Public;
+        behind.add_member(
+            hex::encode(reader.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let mut ahead = behind.clone();
+        ahead.state_revision = behind.state_revision.saturating_add(1);
+        let seen = Arc::new(std::sync::Mutex::new(behind.clone()));
+        let holder_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&ahead).expect("holder context"),
+        );
+        let reader_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&behind).expect("reader context"),
+        );
+        let reader_refresh: SecureRefreshFn = {
+            let seen = Arc::clone(&seen);
+            let reader_ctx = Arc::clone(&reader_ctx);
+            Arc::new(move || {
+                let seen = Arc::clone(&seen);
+                let reader_ctx = Arc::clone(&reader_ctx);
+                Box::pin(async move {
+                    let info = seen.lock().expect("group view").clone();
+                    reader_ctx.update_from_group(&info);
+                })
+            })
+        };
+        let id = store_id(5);
+        let group_bytes = behind.stable_group_id().as_bytes().to_vec();
+        let mut holder_store = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_bytes.clone(),
+            holder_ctx.clone(),
+        )
+        .expect("holder store");
+        holder_store
+            .put(
+                "barrier".to_string(),
+                b"caught-up".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("holder put");
+        let reader_store = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_bytes,
+            reader_ctx.clone(),
+        )
+        .expect("reader store");
+        let mut holder_sync = KvStoreSync::new(
+            holder_store,
+            Arc::clone(&pubsub),
+            "group/public/skew".to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("holder sync");
+        holder_sync.set_secure_context(holder_ctx, None);
+        holder_sync
+            .set_author_signing(AuthorSigning::from_keypair(&owner_keypair).expect("owner sign"));
+        let mut reader_sync = KvStoreSync::new(
+            reader_store,
+            pubsub,
+            "group/public/skew".to_string(),
+            peer(2),
+            Some(reader),
+        )
+        .expect("reader sync");
+        reader_sync.set_secure_context(reader_ctx.clone(), Some(reader_refresh));
+        reader_sync
+            .set_author_signing(AuthorSigning::from_keypair(&reader_keypair).expect("reader sign"));
+        holder_sync.start().await.expect("start holder");
+        reader_sync.start().await.expect("start reader");
+
+        let skewed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let holder = holder_sync.state_sync_snapshot();
+                let reader = reader_sync.state_sync_snapshot();
+                if holder.rejected_verify > 0 && reader.rejected_verify > 0 {
+                    break (holder, reader);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both sides reject the other revision");
+        let (holder, reader) = skewed;
+        assert_eq!(holder.requests_received, 0);
+        assert_eq!(reader.requests_received, 0);
+
+        {
+            let mut guard = seen.lock().expect("group view");
+            *guard = ahead.clone();
+        }
+        reader_ctx.update_from_group(&ahead);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let merged = reader_sync.read().await.get("barrier").is_some();
+                let holder = holder_sync.state_sync_snapshot();
+                let reader = reader_sync.state_sync_snapshot();
+                if merged && holder.requests_received > 0 && reader.requests_received > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("applying the lagging commit converges state sync");
+        holder_sync.stop().await.expect("stop holder");
+        reader_sync.stop().await.expect("stop reader");
+    }
+
+    /// #1105: the ahead context reports the skew. The hook applies the missing
+    /// commit, which is what the daemon's group catch-up does, and both sides
+    /// then receive requests.
+    #[tokio::test]
+    async fn public_revision_skew_hook_applies_the_lagging_commit() {
+        let node = make_node().await;
+        let owner_keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
+        let reader_keypair = crate::identity::AgentKeypair::generate().expect("reader keypair");
+        let owner = owner_keypair.agent_id();
+        let reader = reader_keypair.agent_id();
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let mut behind = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "cf".repeat(16),
+        );
+        behind.migrate_from_v1();
+        behind.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        behind.policy.read_access = crate::groups::GroupReadAccess::Public;
+        behind.add_member(
+            hex::encode(reader.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let mut ahead = behind.clone();
+        ahead.state_revision = behind.state_revision.saturating_add(1);
+        let seen = Arc::new(std::sync::Mutex::new(behind.clone()));
+        let holder_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&ahead).expect("holder context"),
+        );
+        let reader_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&behind).expect("reader context"),
+        );
+        holder_ctx.set_revision_skew_hook({
+            let seen = Arc::clone(&seen);
+            let reader_ctx = Arc::clone(&reader_ctx);
+            let ahead = ahead.clone();
+            Arc::new(move |skew| {
+                if skew.signed_revision.saturating_add(1) != skew.local_revision {
+                    return;
+                }
+                *seen.lock().expect("group view") = ahead.clone();
+                reader_ctx.update_from_group(&ahead);
+            })
+        });
+        let reader_refresh: SecureRefreshFn = {
+            let seen = Arc::clone(&seen);
+            let reader_ctx = Arc::clone(&reader_ctx);
+            Arc::new(move || {
+                let seen = Arc::clone(&seen);
+                let reader_ctx = Arc::clone(&reader_ctx);
+                Box::pin(async move {
+                    let info = seen.lock().expect("group view").clone();
+                    reader_ctx.update_from_group(&info);
+                })
+            })
+        };
+        let id = store_id(6);
+        let group_bytes = behind.stable_group_id().as_bytes().to_vec();
+        let mut holder_store = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_bytes.clone(),
+            holder_ctx.clone(),
+        )
+        .expect("holder store");
+        holder_store
+            .put(
+                "barrier".to_string(),
+                b"caught-up".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("holder put");
+        let reader_store = KvStore::new_group_signed(
+            id,
+            "Wiki".to_string(),
+            owner,
+            group_bytes,
+            reader_ctx.clone(),
+        )
+        .expect("reader store");
+        let mut holder_sync = KvStoreSync::new(
+            holder_store,
+            Arc::clone(&pubsub),
+            "group/public/skew-hook".to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("holder sync");
+        holder_sync.set_secure_context(holder_ctx, None);
+        holder_sync
+            .set_author_signing(AuthorSigning::from_keypair(&owner_keypair).expect("owner sign"));
+        let mut reader_sync = KvStoreSync::new(
+            reader_store,
+            pubsub,
+            "group/public/skew-hook".to_string(),
+            peer(2),
+            Some(reader),
+        )
+        .expect("reader sync");
+        reader_sync.set_secure_context(reader_ctx, Some(reader_refresh));
+        reader_sync
+            .set_author_signing(AuthorSigning::from_keypair(&reader_keypair).expect("reader sign"));
+        holder_sync.start().await.expect("start holder");
+        reader_sync.start().await.expect("start reader");
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let merged = reader_sync.read().await.get("barrier").is_some();
+                let holder = holder_sync.state_sync_snapshot();
+                let reader = reader_sync.state_sync_snapshot();
+                if merged && holder.requests_received > 0 && reader.requests_received > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the skew hook applies the lagging commit and state sync converges");
+        holder_sync.stop().await.expect("stop holder");
+        reader_sync.stop().await.expect("stop reader");
     }
 
     #[tokio::test]

@@ -176,11 +176,63 @@ impl PublicState {
     }
 }
 
+/// One signed-public control record whose group and store match, and whose
+/// signed revision does not. The record stays rejected. The hook may ask the
+/// group layer for the missing commit.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicRevisionSkew {
+    pub signed_revision: u64,
+    pub local_revision: u64,
+    pub author: AgentId,
+}
+
+/// Called when a public control record is one binding revision away from this
+/// context. It must not block and must not admit the record.
+pub type PublicRevisionSkewHook = Arc<dyn Fn(PublicRevisionSkew) + Send + Sync>;
+
+struct SkewNotice {
+    signed_revision: u64,
+    author: AgentId,
+    at: std::time::Instant,
+}
+
+/// Live skew notices. A full cache refuses a new author. It does not evict
+/// a notice that is still inside the two-second window.
+const SKEW_NOTICE_LIMIT: usize = 32;
+const SKEW_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Current-policy authorization for a plaintext group-signed store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PublicGroupKvContext {
     state: Arc<std::sync::RwLock<PublicState>>,
     changes: tokio::sync::watch::Sender<PublicAuthorizationVersion>,
+    skew_hook: Arc<std::sync::Mutex<Option<PublicRevisionSkewHook>>>,
+    skew_notices: Arc<std::sync::Mutex<Vec<SkewNotice>>>,
+}
+
+/// Test probe for the roster snapshot. `alive` is false once every owner,
+/// including a skew hook, has dropped it.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PublicAuthorizationWeak(std::sync::Weak<std::sync::RwLock<PublicState>>);
+
+#[cfg(test)]
+impl PublicAuthorizationWeak {
+    pub(crate) fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    pub(crate) fn alive(&self) -> bool {
+        self.strong_count() > 0
+    }
+}
+
+impl std::fmt::Debug for PublicGroupKvContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicGroupKvContext")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PublicGroupKvContext {
@@ -198,8 +250,29 @@ impl PublicGroupKvContext {
             Self {
                 state: Arc::new(std::sync::RwLock::new(state)),
                 changes,
+                skew_hook: Arc::new(std::sync::Mutex::new(None)),
+                skew_notices: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         })
+    }
+
+    /// Install the daemon hook that offers a missing SignedPublic commit.
+    /// A later call replaces the previous hook.
+    ///
+    /// The hook must not own this context. Clones share `skew_hook`, so that
+    /// capture would keep the roster snapshot alive after the last owner drops.
+    pub fn set_revision_skew_hook(&self, hook: PublicRevisionSkewHook) {
+        *self
+            .skew_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Weak handle on the roster snapshot. A hook that captures this context
+    /// keeps the snapshot alive after the last owner drops.
+    #[cfg(test)]
+    pub(crate) fn authorization_weak(&self) -> PublicAuthorizationWeak {
+        PublicAuthorizationWeak(std::sync::Arc::downgrade(&self.state))
     }
 
     pub fn update_from_group(&self, info: &GroupInfo) {
@@ -266,6 +339,62 @@ impl KvSecureContext for PublicGroupKvContext {
         &self,
     ) -> Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>> {
         Some(self.changes.subscribe())
+    }
+
+    fn note_public_revision_skew(&self, signed_revision: u64, author: &AgentId) {
+        let local_revision = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if signed_revision == state.state_revision {
+                return;
+            }
+            // Catch-up is only the next revision, and only for an active
+            // member of a valid SignedPublic context. Any other verified
+            // skew stays rejected and does not enter the notice cache.
+            if !state.valid
+                || signed_revision.saturating_add(1) != state.state_revision
+                || !state.writers.contains_key(author)
+            {
+                return;
+            }
+            state.state_revision
+        };
+        let now = std::time::Instant::now();
+        {
+            let mut notices = self
+                .skew_notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            notices.retain(|notice| now.duration_since(notice.at) < SKEW_NOTICE_TTL);
+            if notices
+                .iter()
+                .any(|notice| notice.signed_revision == signed_revision && notice.author == *author)
+            {
+                return;
+            }
+            if notices.len() >= SKEW_NOTICE_LIMIT {
+                return;
+            }
+            notices.push(SkewNotice {
+                signed_revision,
+                author: *author,
+                at: now,
+            });
+        }
+        let hook = self
+            .skew_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(PublicRevisionSkew {
+                signed_revision,
+                local_revision,
+                author: *author,
+            });
+        }
     }
 
     fn seal(&self, _: &KvStoreId, _: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
@@ -1311,6 +1440,61 @@ mod tests {
         assert!(
             ctx.seal(&store_id, b"after-clear").is_ok(),
             "and sealing must work again once the marker is gone"
+        );
+    }
+
+    #[test]
+    fn skew_notice_cache_keeps_live_entries_when_full() {
+        let owner = AgentId([9; 32]);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "skew-notice".to_string(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        let mut authors = Vec::new();
+        for index in 1..=super::SKEW_NOTICE_LIMIT + 1 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = u8::try_from(index).expect("author index");
+            let author = AgentId(bytes);
+            info.add_member(
+                hex::encode(author.as_bytes()),
+                GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+            authors.push(author);
+        }
+        info.state_revision = 5;
+        let ctx = PublicGroupKvContext::from_group(&info).expect("public context");
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_hook = std::sync::Arc::clone(&hits);
+        ctx.set_revision_skew_hook(std::sync::Arc::new(move |_| {
+            hits_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let stranger = AgentId([255; 32]);
+        ctx.note_public_revision_skew(1, &authors[0]);
+        ctx.note_public_revision_skew(4, &stranger);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a far revision or a non-member must not spawn catch-up work"
+        );
+        for author in authors.iter().take(super::SKEW_NOTICE_LIMIT) {
+            ctx.note_public_revision_skew(4, author);
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            super::SKEW_NOTICE_LIMIT
+        );
+        ctx.note_public_revision_skew(4, authors.last().expect("overflow author"));
+        ctx.note_public_revision_skew(4, &authors[0]);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            super::SKEW_NOTICE_LIMIT,
+            "a full notice cache refuses a new author and keeps the first live notice"
         );
     }
 }
