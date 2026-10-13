@@ -51,6 +51,21 @@ All notable changes to this project will be documented in this file.
 - **Post-merge vision review (#1405).** The README marks audio and video Parked. The `/calls` routes are experimental and carry no media. Release builds lack `voice`. A01 records that same limit. A05 names the bearer paths as ant-quic paths. x0x has no `src/transport` directory. The partition row cites local snapshot loads (`load_snapshot`, `TaskListStorage::load_task_list`). Held data is not synced data (#1105). Accepted records stay unchanged. No fold and no version bump.
 - **Product vision, 13 Oct 2026.** The README introduces x0x as people, their agents and their machines collaborating. It marks each vision point shipped, target or parked. Each shipped row names a file or symbol checked at commit `86a1d395`. A01 records public and private groups as policy already in the tree. A01 records partition behaviour as peers keeping the data they hold. Liveness and repair stay incomplete. A01 adds projects as a target. A01 adds agent rental as a target. David accepted that rental amendment (D275, 14 Oct 2026). The billing exclusion no longer rules rental out. Rental is still not shipped. Voice and video stay a vision target. The optional `voice` feature delivers a two-party audio library, and call routes cover lifecycle only. A08 records public and discoverable groups beside private ones. David accepted these A01 and A08 amendments (D275). He also accepted, and did not fold, `T-projects-and-agent-rental` (slot A01) and `T-alternate-bearers` (slot A05). ant-quic 0.27.60 already has BLE, serial and LoRa scaffolding. x0x does not call it. No version section and no version bump.
 
+### Fixed
+
+- **A finished join attempt is removed, including when a seat or an
+  existing outcome wins (#1191).** A timed-out join with no carry can
+  redeem a later invite whose base already seats the joiner. The poll
+  then reaches its deadline while that seat still wins. That exit left
+  the attempt registered. Owner removal deleted the membership row and
+  did not clear the attempt. A re-invite on the same process returned
+  `409 join_already_pending` until restart.
+  - The finalizer retires matching attempt bookkeeping when the
+    requested outcome does not apply. A newer attempt id stays in
+    place. A superseded or already-finalized poll uses the same
+    bookkeeping-only cleanup, so a newer attempt and its inviter pin
+    stay. Those exits do not count a timeout.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
