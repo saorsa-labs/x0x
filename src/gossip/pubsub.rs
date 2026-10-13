@@ -3085,6 +3085,18 @@ const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
     "x0x/caps/v1/response/targeted-v2",
 ];
 
+/// Revocation carriers are exact topic names (#1111).
+///
+/// They must not live in [`CRITICAL_TOPIC_PREFIXES`]. That list matches with
+/// `starts_with`, so `x0x.revocation.v1` would also classify
+/// `x0x.revocation.v10`, `x0x.revocation.v1.extra`, and a name with trailing
+/// junk as Critical. A neighbouring name stays Normal.
+const CRITICAL_EXACT_TOPICS: &[&str] = &[
+    crate::REVOCATION_TOPIC,
+    crate::REVOCATION_V2_TOPIC,
+    crate::REVOCATION_V3_TOPIC,
+];
+
 const BULK_TOPIC_PREFIXES: &[&str] = &[
     "x0x.identity.shard.v2.",  // Identity anti-entropy shards
     "x0x.machine.shard.v2.",   // Machine anti-entropy shards
@@ -3104,13 +3116,17 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
 
 /// Returns the X0X-0074 admission priority for an x0x topic name.
 ///
-/// Matching is prefix-based against the priority lists above. Critical is
-/// checked before Bulk so e.g. `x0x.test.discover.v1` lands on Critical
-/// even though `x0x.test.` is a substring of other bulk topics. Anything
-/// unmatched (presence, named-group fanout, public messages, custom app
-/// topics) falls through to `TopicPriority::Normal`.
+/// The three revocation carriers match by exact name. Every other Critical
+/// or Bulk name matches a prefix. Critical prefixes are checked before Bulk
+/// so e.g. `x0x.test.discover.v1` lands on Critical even though `x0x.test.`
+/// is a substring of other bulk topics. Anything unmatched (presence,
+/// named-group fanout, public messages, custom app topics) falls through to
+/// `TopicPriority::Normal`.
 #[must_use]
 pub fn classify_x0x_topic(topic_name: &str) -> TopicPriority {
+    if CRITICAL_EXACT_TOPICS.contains(&topic_name) {
+        return TopicPriority::Critical;
+    }
     if CRITICAL_TOPIC_PREFIXES
         .iter()
         .any(|prefix| topic_name.starts_with(prefix))
@@ -3163,6 +3179,19 @@ fn register_x0x_topic_priorities(
         TopicId::from_entity("x0x/caps/v1/response/targeted-v2".as_bytes()),
         TopicPriority::Critical,
     );
+    // #1111: seed the revocation carriers so the receive-pump resolver
+    // (which reads this registry, not the classifier) exempts them before
+    // the first local subscribe.
+    for topic in [
+        crate::REVOCATION_TOPIC,
+        crate::REVOCATION_V2_TOPIC,
+        crate::REVOCATION_V3_TOPIC,
+    ] {
+        registry.register(
+            TopicId::from_entity(topic.as_bytes()),
+            TopicPriority::Critical,
+        );
+    }
     // Per-recipient DM inbox topics (`x0x/dm/v1/inbox/<hash>`) are
     // dynamic — they're registered through `register_dynamic_topic_priority`
     // when the runtime subscribes to its own inbox. The prefix
@@ -3838,6 +3867,259 @@ mod tests {
         assert_eq!(
             classify_x0x_topic("my.custom.app.topic"),
             TopicPriority::Normal
+        );
+    }
+
+    /// D23 / #1111: the three carriers are Critical by exact name. A suffix
+    /// or a version neighbour stays Normal. Prefix matching would promote
+    /// those neighbours (`v1` also matches `v10` and `v1.extra`).
+    #[test]
+    fn classify_x0x_topic_routes_revocation_carriers_to_critical() {
+        for topic in [
+            crate::REVOCATION_TOPIC,
+            crate::REVOCATION_V2_TOPIC,
+            crate::REVOCATION_V3_TOPIC,
+        ] {
+            assert_eq!(
+                classify_x0x_topic(topic),
+                TopicPriority::Critical,
+                "{topic} must be Critical"
+            );
+            for neighbour in [
+                format!("{topic}.extra"),
+                format!("{topic}0"),
+                format!("{topic}/attacker"),
+                format!("{topic}\0junk"),
+            ] {
+                assert_eq!(
+                    classify_x0x_topic(&neighbour),
+                    TopicPriority::Normal,
+                    "{neighbour:?} is not a revocation carrier"
+                );
+            }
+        }
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.other"),
+            TopicPriority::Normal,
+            "only the three revocation carriers move to Critical"
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.v10"),
+            TopicPriority::Normal
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.v1.extra"),
+            TopicPriority::Normal
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.v2/attacker"),
+            TopicPriority::Normal
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.revocation.v3\0junk"),
+            TopicPriority::Normal
+        );
+    }
+
+    /// #1111: the receive pump reads this registry, not the classifier.
+    /// The carriers have to already be Critical, or the first frames stay
+    /// sheddable until something subscribes and re-registers them.
+    #[test]
+    fn revocation_carriers_are_seeded_critical_for_shed_normal() {
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::default();
+        register_x0x_topic_priorities(&registry);
+        for topic in [
+            crate::REVOCATION_TOPIC,
+            crate::REVOCATION_V2_TOPIC,
+            crate::REVOCATION_V3_TOPIC,
+        ] {
+            assert_eq!(
+                registry.priority_for(&TopicId::from_entity(topic.as_bytes())),
+                TopicPriority::Critical,
+                "{topic} must be seeded Critical so shed_normal cannot drop it"
+            );
+        }
+    }
+
+    /// #1111: a `shed_normal` Leaf that has already spent its burst must
+    /// still forward the three revocation carriers. The same budget sheds a
+    /// forwarded Normal frame. A later local publish of that Normal topic
+    /// still leaves: local-origin sends are exempt, so only a forwarded
+    /// frame proves the carrier class.
+    #[tokio::test]
+    async fn shed_normal_leaf_forwards_revocation_carriers_under_byte_pressure() {
+        let mut manager = PubSubManager::new(test_node().await, test_signing()).expect("manager");
+        manager
+            .configure_egress(&GossipConfig {
+                byte_policy: LeafBytePolicy::ShedNormal,
+                leaf_egress_soft_bytes_per_sec: 0,
+                leaf_egress_hard_bytes_per_sec: 1,
+                leaf_max_eager_degree: 2,
+                ..GossipConfig::default()
+            })
+            .await
+            .expect("opted-in Leaf sheds forwarded Normal");
+        assert_eq!(manager.effective_byte_policy, LeafBytePolicy::ShedNormal);
+
+        let forward_to = PeerId::new([0x22; 32]);
+        let inbound_from = PeerId::new([0x11; 32]);
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![forward_to, inbound_from],
+            sends: Vec::new(),
+        });
+
+        let normal = "x0x.pressure.normal.v1";
+        let carriers = [
+            crate::REVOCATION_TOPIC,
+            crate::REVOCATION_V2_TOPIC,
+            crate::REVOCATION_V3_TOPIC,
+        ];
+        let mesh = vec![forward_to, inbound_from];
+        // Spend the burst before subscribing. A subscriber opened now would
+        // queue every drain payload, and the later `recv` would not be the
+        // forwarded control.
+        manager
+            .set_topic_peers_for_test(TopicId::from_entity(normal.as_bytes()), mesh.clone())
+            .await;
+
+        let mut exhausted = false;
+        for n in 0..32 {
+            let (_fanout, observed) = manager
+                .publish_with_observed_fanout(
+                    normal.to_string(),
+                    Bytes::from(vec![0x5a; 256 * 1024]),
+                )
+                .await
+                .expect("local drain publish");
+            let observed = observed.expect("local publish reports fan-out");
+            assert_eq!(
+                observed.byte_rejected, 0,
+                "draining the burst uses local-origin publishes, which shed_normal must not drop"
+            );
+            if n == 0 {
+                assert!(
+                    observed.attempted >= 1,
+                    "the drain needs a live eager peer; an empty mesh cannot exhaust the burst"
+                );
+            }
+            if manager.plumtree.leaf_egress_snapshot().shed_suppressed >= 1 {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(
+            exhausted,
+            "the Leaf burst must be spent before the forward checks"
+        );
+
+        let mut normal_sub = manager.subscribe(normal.to_string()).await;
+        let mut carrier_subs = Vec::new();
+        for topic in carriers {
+            carrier_subs.push(manager.subscribe(topic.to_string()).await);
+            manager
+                .set_topic_peers_for_test(TopicId::from_entity(topic.as_bytes()), mesh.clone())
+                .await;
+        }
+        manager
+            .set_topic_peers_for_test(TopicId::from_entity(normal.as_bytes()), mesh)
+            .await;
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .sends
+            .clear();
+
+        let normal_id = [0x41; 32];
+        let deferred_before = manager.plumtree.leaf_egress_snapshot().data_deferred;
+        let eager_before = eager_outbound_attempt_msgs(&manager);
+        let normal_payload = Bytes::from("forwarded-normal");
+        manager
+            .handle_incoming(
+                inbound_from,
+                None,
+                slice1_signed_frame(
+                    MessageKind::Eager,
+                    TopicId::from_entity(normal.as_bytes()),
+                    remote_signed_inner(normal, normal_payload.clone()),
+                    normal_id,
+                ),
+            )
+            .await;
+        assert_eq!(
+            eager_outbound_attempt_msgs(&manager),
+            eager_before,
+            "a forwarded Normal frame must be shed once the Leaf burst is spent"
+        );
+        assert!(
+            manager.plumtree.leaf_egress_snapshot().data_deferred > deferred_before,
+            "the Normal miss must be a byte-budget shed, not an empty forward set"
+        );
+        assert_eq!(count_eager_for_msg(&manager, normal_id), 0);
+        let delivered_normal = tokio::time::timeout(Duration::from_secs(2), normal_sub.recv())
+            .await
+            .expect("the shed frame is still delivered locally")
+            .expect("subscription open");
+        assert_eq!(delivered_normal.payload, normal_payload);
+
+        for (index, topic) in carriers.into_iter().enumerate() {
+            let msg_id = [0x51 + index as u8; 32];
+            let payload = Bytes::from(format!("revocation-{index}"));
+            let eager_before = eager_outbound_attempt_msgs(&manager);
+            manager
+                .handle_incoming(
+                    inbound_from,
+                    None,
+                    slice1_signed_frame(
+                        MessageKind::Eager,
+                        TopicId::from_entity(topic.as_bytes()),
+                        remote_signed_inner(topic, payload.clone()),
+                        msg_id,
+                    ),
+                )
+                .await;
+            let attempted = (eager_outbound_attempt_msgs(&manager) - eager_before) as usize;
+            assert!(
+                attempted >= 1,
+                "{topic} must still be forwarded under an exhausted shed_normal budget"
+            );
+            let sends = await_eager_settled_for_msg(&manager, msg_id, attempted).await;
+            assert!(
+                sends.iter().any(|(peer, _)| *peer == forward_to),
+                "{topic} must reach the eager peer"
+            );
+            let delivered =
+                tokio::time::timeout(Duration::from_secs(2), carrier_subs[index].recv())
+                    .await
+                    .expect("revocation carrier delivered locally")
+                    .expect("subscription open");
+            assert_eq!(delivered.payload, payload, "{topic}");
+        }
+
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .sends
+            .clear();
+        let (_fanout, observed) = manager
+            .publish_with_observed_fanout(normal.to_string(), Bytes::from("local-origin-normal"))
+            .await
+            .expect("local-origin publish");
+        let observed = observed.expect("local publish reports fan-out");
+        assert_eq!(
+            observed.byte_rejected, 0,
+            "a local-origin Normal publish stays exempt after the burst is spent"
+        );
+        assert!(
+            observed.attempted >= 1,
+            "the exempt local publish must still be handed to the transport"
         );
     }
 
