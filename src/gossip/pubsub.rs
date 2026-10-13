@@ -3116,18 +3116,15 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
 
 /// Returns the X0X-0074 admission priority for an x0x topic name.
 ///
-/// Exact names in [`CRITICAL_EXACT_TOPICS`] match with `==`. Every other
-/// Critical or Bulk name matches a prefix. Critical prefixes are checked
-/// before Bulk so e.g. `x0x.test.discover.v1` lands on Critical even though
-/// `x0x.test.` is a substring of other bulk topics. Anything unmatched
-/// (presence, named-group fanout, public messages, custom app topics) falls
-/// through to `TopicPriority::Normal`.
+/// The three revocation carriers match by exact name. Every other Critical
+/// or Bulk name matches a prefix. Critical prefixes are checked before Bulk
+/// so e.g. `x0x.test.discover.v1` lands on Critical even though `x0x.test.`
+/// is a substring of other bulk topics. Anything unmatched (presence,
+/// named-group fanout, public messages, custom app topics) falls through to
+/// `TopicPriority::Normal`.
 #[must_use]
 pub fn classify_x0x_topic(topic_name: &str) -> TopicPriority {
-    if CRITICAL_EXACT_TOPICS
-        .iter()
-        .any(|topic| topic_name == *topic)
-    {
+    if CRITICAL_EXACT_TOPICS.contains(&topic_name) {
         return TopicPriority::Critical;
     }
     if CRITICAL_TOPIC_PREFIXES
