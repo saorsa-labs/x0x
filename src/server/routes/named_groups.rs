@@ -40411,6 +40411,7 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
+    mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
