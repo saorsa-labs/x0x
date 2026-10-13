@@ -8,8 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 Agents can share work through groups, messages, task lists and limited delegation. Coordination state must not be mistaken for exclusive authority to perform an external action.
 
@@ -73,9 +72,9 @@ Putting all task semantics in x0xd would make every workflow a core protocol con
 ## Current implementation
 
 Task CRDTs, signed provenance, structured mentions and bounded delegation
-exist in the source snapshot. Complete `owner_agent` and signed-transfer
-implementation is not established by this review; its release evidence
-remains to be checked. This does not defer or change ADR 0040's decision.
+exist. `TaskItem` has an `assignee` field, but no `owner_agent` field or
+signed ownership-transfer operation. ADR 0040's ownership decision is not
+implemented. This does not defer or change that decision.
 Exclusive execution is not a general shipped guarantee.
 
 ## Validation
@@ -100,6 +99,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0040 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0040-agent-delegation-in-spaces.md) · [ADR 0048 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0048-crdt-task-list-coordination.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

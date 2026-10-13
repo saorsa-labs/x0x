@@ -8,8 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x will use its identities, permissions and connectivity for voice and video between people and agents. Media delivery has different timing needs from durable work messages.
 
@@ -63,7 +62,7 @@ Reliable streams can simplify delivery but can delay fresh media behind lost dat
 
 ## Current implementation
 
-Some two-party voice work exists behind the voice feature. The call API is experimental. Multi-party media and browser integration remain future work under the current park.
+Some two-party voice work exists behind the `voice` feature. The experimental call lifecycle routes are registered without that feature, but have no media path. Multi-party media and browser integration remain future work under the current park.
 
 A fresh ADR must not turn those targets into a release claim.
 
@@ -86,6 +85,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0042 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0042-voice-media-over-tailnet-streams.md) · [ADR 0056 Superseded](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0056-voice-link-transport-and-signaling.md) · [ADR 0073 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0073-audio-and-video-calling.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

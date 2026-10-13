@@ -8,8 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must remain recoverable when an update fails. Agents can help maintain a node, but update safety must also work when no agent is available.
 
@@ -69,7 +68,7 @@ Treating a signed manifest as the only release gate protects authenticity but do
 
 ## Current implementation
 
-Signed updates and diagnostics exist. M2 safe apply and stronger health reporting are active work. The complete owner-governed maintenance system is not yet shipped.
+Signed updates, diagnostics and an unsupervised restart helper exist. Supervised updates request a restart but do not arm automatic rollback. The apply lock is local to one daemon process, not host-wide. M2 safe apply and the complete owner-governed maintenance system remain incomplete.
 
 ## Validation
 
@@ -96,6 +95,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0026 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0026-managed-x0xd-deployment.md) · [ADR 0045 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0045-decentralized-self-update.md) · [ADR 0053 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0053-api-unserved-watchdog.md) · [ADR 0061 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0061-supervised-upgrade-restart-ownership.md) · [ADR 0094 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0094-m2-safe-apply.md) · [ADR 0096 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0096-r12-x0x-is-maintained-by-its-own-agents.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)

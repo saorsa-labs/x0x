@@ -8,8 +8,7 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These drafts remain Proposed until David accepts the transfer (D198, D199).
-Use the [index and transition rules](README.md) to interpret their status.
+These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 The local API and human interface expose the same x0x capabilities and permission rules. A successful interface action must reflect the actual result of the operation.
 
@@ -67,7 +66,7 @@ A remote public control service would simplify browser-only access but would cre
 
 ## Current implementation
 
-The local API, embedded GUI, CLI registry and application integration exist. The agent-opened-view design has its own implementation hold. Scoped rider subscriptions require new work under [A04](A04-r01-agent-attachment-and-inbound-events.md).
+The local API, embedded GUI, CLI registry and application integration exist. The agent-opened-view design remains on hold and has no route implementation. Scoped rider subscriptions require new work under [A04](A04-r01-agent-attachment-and-inbound-events.md).
 
 ## Validation
 
@@ -88,6 +87,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 [ADR 0044 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0044-daemon-local-rest-ws-sse-control-plane.md) · [ADR 0052 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0052-embedded-gui-in-daemon-binary.md) · [ADR 0057 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0057-embedded-serve-library-local-apps.md) · [ADR 0083 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0083-agent-initiated-gui-show.md)
 
-Source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Current implementation statements refer to that snapshot.
+Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
 [All 15 ADRs](README.md)
