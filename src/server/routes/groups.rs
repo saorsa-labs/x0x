@@ -8,7 +8,7 @@ use super::super::{api_error, bad_request, decode_base64_payload, not_found, par
 use super::named_groups::secure_group_effect_response_after_terminality_recheck;
 use crate as x0x;
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -54,11 +54,29 @@ pub(in crate::server) struct CreateWelcomeRequest {
     pub(in crate::server) agent_id: String,
 }
 
+/// #1228: legacy MLS control is an owner-admin act. A session token is refused.
+fn mls_requires_durable_owner(
+    actor: &crate::server::rider_auth::ActorContext,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if actor.is_durable_owner() {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "MLS group control requires the durable API token (not a session token)",
+        ))
+    }
+}
+
 /// POST /mls/groups — create a new MLS group.
 pub(in crate::server) async fn create_mls_group(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<CreateMlsGroupRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let group_id_bytes = match req.group_id {
         Some(hex_str) => match hex::decode(&hex_str) {
             Ok(bytes) => bytes,
@@ -113,7 +131,11 @@ pub(in crate::server) async fn create_mls_group(
 /// GET /mls/groups — list all MLS groups.
 pub(in crate::server) async fn list_mls_groups(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let groups = state.mls_groups.read().await;
     let entries: Vec<serde_json::Value> = groups
         .iter()
@@ -135,8 +157,12 @@ pub(in crate::server) async fn list_mls_groups(
 /// GET /mls/groups/:id — get details of a specific MLS group.
 pub(in crate::server) async fn get_mls_group(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let groups = state.mls_groups.read().await;
     let Some(group) = groups.get(&id) else {
         return not_found("group not found");
@@ -162,9 +188,13 @@ pub(in crate::server) async fn get_mls_group(
 /// POST /mls/groups/:id/members — add a member to a group.
 pub(in crate::server) async fn add_mls_member(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<AddMlsMemberRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -206,8 +236,12 @@ pub(in crate::server) async fn add_mls_member(
 /// DELETE /mls/groups/:id/members/:agent_id — remove a member from a group.
 pub(in crate::server) async fn remove_mls_member(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let agent_id = match parse_agent_id_hex(&agent_id_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -248,9 +282,13 @@ pub(in crate::server) async fn remove_mls_member(
 /// POST /mls/groups/:id/encrypt — encrypt data with group key.
 pub(in crate::server) async fn mls_encrypt(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<MlsEncryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let plaintext = match decode_base64_payload(&req.payload) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -291,9 +329,13 @@ pub(in crate::server) async fn mls_encrypt(
 /// POST /mls/groups/:id/decrypt — decrypt data with group key.
 pub(in crate::server) async fn mls_decrypt(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<MlsDecryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let ciphertext = match decode_base64_payload(&req.ciphertext) {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -337,9 +379,13 @@ pub(in crate::server) async fn mls_decrypt(
 /// POST /mls/groups/:id/welcome — generate a welcome message for a new member.
 pub(in crate::server) async fn create_mls_welcome(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<CreateWelcomeRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = mls_requires_durable_owner(&actor) {
+        return response;
+    }
     let invitee = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
         Err(e) => {

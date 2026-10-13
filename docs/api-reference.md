@@ -65,10 +65,13 @@ Auth-class labels used throughout this reference:
   `POST /shutdown`, `POST /upgrade/apply` (binary swap + restart =
   lifecycle act), `POST /sync/devices/enroll`,
   `POST /groups/:id/delegate` (signed capability with caller-chosen
-  expiry), `POST /home/rename`, and `PATCH /groups/:id` /
+  expiry), `POST /home/rename`, `PATCH /groups/:id` /
   `PATCH /groups/:id/policy` **when the target carries Home metadata**
   (metadata presence is the marker — never the current policy axes, so
-  the Home cannot be policy-flipped around the rename gate).
+  the Home cannot be policy-flipped around the rename gate), and
+  (#1228) `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`,
+  and every `/mls/groups*` route. Approving or rejecting a join request
+  stays an admin-seat route and still accepts a session token.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -1170,7 +1173,8 @@ Operational invariant (maintainer follow-up): legacy/raw `/mls/groups` helpers
 must not expose usable key material or reactivate a withdrawn named group. A
 named-group tombstone/terminality marker remains authoritative for group
 terminality; this is a documented maintainer invariant, not a new low-level MLS
-helper API.
+helper API. Every `/mls/groups*` route requires the durable API
+token. A session token is refused before the body is read.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
@@ -1214,22 +1218,22 @@ helper API.
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
-| PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set display name in group. Body `{"name":"<display name>"}` |
+| PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set the local agent's own display name. Body `{"name":"<display name>"}`. Requires an active seat in the group, any role, on any token class. The label is local, so there is no Home durable fence. The name is not part of the signed roster |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
-| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests (admin-only) |
+| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires the durable API token and a local admin seat |
 | POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored) |
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored) |
-| DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request |
+| DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request. An owner credential (session or durable) is enough; the request must belong to this daemon |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id) — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
+| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id). Requires the durable API token. On a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
 | POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
 | POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit). **ADR-0066 §3b**: 409 `fork_quarantined` while the group is fork-quarantined — refused before anything is signed, committed or published |
 | GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history. **ADR-0066 §3b**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
