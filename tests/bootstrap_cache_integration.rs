@@ -298,6 +298,53 @@ async fn test_default_cache_dir_when_not_specified() {
     }
 }
 
+/// Rewrite one peer id in a saved ant-quic bootstrap cache file and
+/// recompute the file checksum the way `CacheData::calculate_checksum`
+/// does (`DefaultHasher` over the version, the entry count and the sorted
+/// 32-byte ids). Test-only: it builds the file shape an older build wrote.
+fn rewrite_cache_entry_id(cache_file: &Path, from: [u8; 32], to: [u8; 32]) {
+    use std::hash::{Hash, Hasher};
+    let raw = std::fs::read_to_string(cache_file).expect("read cache file");
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("cache file is JSON");
+    let from_hex = hex::encode(from);
+    let to_hex = hex::encode(to);
+    let peers = doc
+        .get_mut("peers")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("cache file has a peers map");
+    let mut entry = peers.remove(&from_hex).expect("stand-in entry present");
+    if let Some(id) = entry.get_mut("peer_id") {
+        *id = serde_json::Value::String(to_hex.clone());
+    }
+    peers.insert(to_hex, entry);
+    let mut ids: Vec<[u8; 32]> = peers
+        .keys()
+        .map(|k| {
+            let bytes = hex::decode(k).expect("hex peer key");
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&bytes);
+            id
+        })
+        .collect();
+    ids.sort();
+    let version = doc
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .expect("cache file has a version") as u32;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    version.hash(&mut hasher);
+    ids.len().hash(&mut hasher);
+    for id in &ids {
+        id.hash(&mut hasher);
+    }
+    doc["checksum"] = serde_json::Value::from(hasher.finish());
+    std::fs::write(
+        cache_file,
+        serde_json::to_string_pretty(&doc).expect("serialize cache file"),
+    )
+    .expect("write cache file");
+}
+
 /// #491 (from #484): prune-on-empty — when the startup self-entry prune
 /// leaves the persistent bootstrap cache with ZERO entries, the cache
 /// FILE must be unlinked too. WHY: ant-quic's `remove()` is memory-only
@@ -309,6 +356,12 @@ async fn test_default_cache_dir_when_not_specified() {
 /// restarts the SAME identity (same machine.key → same peer id), so the
 /// prune empties the cache and must have removed the file — and the file
 /// must STAY gone across the second shutdown's save cycle.
+///
+/// Since ant-quic 0.27.58 (#269) the cache refuses to store the node's own
+/// entry, so phase 1 cannot insert it directly any more. It saves a
+/// stand-in peer instead and then rewrites that id in the saved file to our
+/// own id, with the file's checksum recomputed: the shape an older build
+/// left on disk.
 #[tokio::test]
 async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
     let temp = TempDir::new().unwrap();
@@ -325,9 +378,14 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
         else {
             return;
         };
-        let own = PeerId::new(agent.machine_id().0);
+        let own_bytes = agent.machine_id().0;
+        let stand_in_bytes = [0x5a_u8; 32];
+        assert_ne!(
+            own_bytes, stand_in_bytes,
+            "stand-in must differ from our id"
+        );
         let advert = CoordinatorAdvert::new(
-            own,
+            PeerId::new(stand_in_bytes),
             CoordinatorRoles::default(),
             vec![AddrHint::new(addr)],
             NatClass::Unknown,
@@ -338,16 +396,19 @@ async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
             .expect("network agent should expose cache adapter");
         assert!(
             adapter.insert_advert(advert).await,
-            "seeding the self-keyed advert must succeed"
+            "seeding the stand-in advert must succeed"
         );
         assert_eq!(adapter.peer_count().await, 1);
         agent.shutdown().await;
-        own
+        (own_bytes, stand_in_bytes)
     };
+    let (own_bytes, stand_in_bytes) = own_peer_id;
+    let own_peer_id = PeerId::new(own_bytes);
     assert!(
         cache_file.exists(),
-        "shutdown must persist the single self-keyed entry (min_peers_to_save=1)"
+        "shutdown must persist the single stand-in entry (min_peers_to_save=1)"
     );
+    rewrite_cache_entry_id(&cache_file, stand_in_bytes, own_bytes);
 
     // Phase 2: same identity, same cache dir. The #484 startup prune
     // removes the self entry; with the cache then empty the persisted
