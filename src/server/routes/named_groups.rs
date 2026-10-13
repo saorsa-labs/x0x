@@ -40777,7 +40777,6 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
-    mod issue1105_public_revision_catchup;
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
@@ -40793,6 +40792,8 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    #[path = "issue1105_public_revision_catchup.rs"]
+    mod public_revision_catchup_1105;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
