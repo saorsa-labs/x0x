@@ -2108,11 +2108,19 @@ pub async fn serve_with_options(
 
     // ADR 0014 / ADR 0016: a self-leave that landed while this daemon was
     // offline still has the leaver's ratchet leaf. The lowest active admin
-    // commits that removal on this online pass.
+    // commits that removal after a short quiet window, so the first catch-up
+    // round can fill the TreeKEM queue before a new commit. The pass persists,
+    // so it runs shielded (#1269): shutdown must not abort it between the
+    // journal commit and the publish.
     {
         let rekey_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
-            routes::named_groups::rekey_outstanding_treekem_self_leaves(&rekey_state).await;
+            let shielded = Arc::clone(&rekey_state);
+            let _ = rekey_state
+                .run_shielded(async move {
+                    routes::named_groups::startup_self_leave_rekey(&shielded).await;
+                })
+                .await;
         }));
     }
 
