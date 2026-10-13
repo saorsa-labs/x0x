@@ -233,6 +233,15 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
+- **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
+  The roster removal left the leaf in place, so the leaver could derive later
+  epoch keys. The lowest active admin now commits the existing admin
+  `MemberRemoved` that carries `treekem_commit_b64` and `treekem_epoch`.
+  That commit runs only when the leave is still the stored head and the
+  TreeKEM queue is empty. The daemon saves the removal event before the new
+  epoch is durable. A missing KeyPackage is a logged deferral, not a finished
+  rekey. Other admins hold off. This adds no new wire message.
+
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
