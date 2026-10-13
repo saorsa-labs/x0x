@@ -12,14 +12,17 @@
 //! the snapshot send, and `admit_public_group_bootstrap` (apply and
 //! directory-durable persistence under the membership lock).
 //!
-//! Two arms, the same scenario:
+//! Three arms, the same scenario:
 //! - baseline: every DM toward M is dropped during the catch-up bound, so
 //!   the snapshot cannot arrive. M stays at N. The committer rejects M's
 //!   state requests (`requests_received` does not move, `rejected_verify`
 //!   does). RED.
-//! - candidate: DMs are delivered. M obtains N+1 and both stores then
-//!   report `requests_received` greater than the post-restart baseline.
-//!   GREEN.
+//! - candidate: M records O as a Known contact, and DMs are delivered. M
+//!   obtains N+1 and both stores then report `requests_received` greater
+//!   than the post-restart baseline. GREEN.
+//! - invite-only: M joined by invite and the test sets no contact and no
+//!   share grant. The consent gate is unchanged. The receipt records
+//!   whether that member obtains N+1.
 //!
 //! Disconnecting `install_public_kv_revision_catchup` from public-store
 //! open leaves the candidate with no snapshot to deliver, so its request
@@ -62,8 +65,10 @@ const FINAL: &str = "restarted_replica_holds_n_plus_one_and_both_receive_request
 enum Arm {
     /// DMs toward M are dropped for the catch-up bound.
     SnapshotDropped,
-    /// The production snapshot path is left in place.
+    /// The production snapshot path is left in place. M records O as Known.
     ProductionPath,
+    /// M joined by invite. The test sets no contact and no share grant.
+    InviteOnly,
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -250,18 +255,38 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         listed && active && o_rev.is_some() && o_rev == m_rev
     })
     .await?;
-    let (status, contact) = sim
-        .api(
-            "M",
-            Method::POST,
-            "/contacts",
-            Some(json!({"agent_id": o_hex, "trust_level": "known"})),
-        )
-        .await?;
-    ensure!(
-        status.is_success(),
-        "M did not record O as a known contact: {status} {contact}"
-    );
+    if arm == Arm::InviteOnly {
+        let agent =
+            super::super::parse_agent_id_hex(&o_hex).map_err(|error| anyhow::anyhow!(error))?;
+        let trust = {
+            let state = sim.state("M")?;
+            let contacts = state.contacts.read().await;
+            contacts.trust_level(&agent)
+        };
+        ensure!(
+            trust == crate::contacts::TrustLevel::Unknown,
+            "INFRA: the invite join recorded O as {trust}"
+        );
+        receipt.evidence(
+            "invite_join_sets_no_known_contact_and_no_grant",
+            true,
+            "M's trust in O is unknown; the test set no contact and no share grant".to_string(),
+            at(sim),
+        );
+    } else {
+        let (status, contact) = sim
+            .api(
+                "M",
+                Method::POST,
+                "/contacts",
+                Some(json!({"agent_id": o_hex, "trust_level": "known"})),
+            )
+            .await?;
+        ensure!(
+            status.is_success(),
+            "M did not record O as a known contact: {status} {contact}"
+        );
+    }
 
     let topic = metadata_topic(sim, "O", &group).await?;
     let metadata = TopicBlock::install(sim, "M", &topic)?;
@@ -382,6 +407,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             if arm == Arm::ProductionPath {
                 return caught_up;
             }
+            if arm == Arm::InviteOnly && caught_up {
+                return true;
+            }
             // Skew observed and still not caught up: the rest of the bound
             // is held below, so a late snapshot would still be visible.
             let Some(o_rejected) = seen
@@ -399,7 +427,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("catch-up bound")?;
-    if arm == Arm::SnapshotDropped {
+    if arm != Arm::ProductionPath {
         let rest = CATCHUP.saturating_sub(sim.fabric().now().saturating_sub(bound_start));
         if !rest.is_zero() {
             sim.within(
@@ -434,13 +462,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     );
     let passed = m_rev == o_rev && o_rev == n + 1 && o_delta > 0 && m_delta > 0;
     let request_ok = match arm {
-        Arm::ProductionPath => dm_delivered > 0 || plaintext_snapshots > 0,
+        Arm::ProductionPath | Arm::InviteOnly => dm_delivered > 0 || plaintext_snapshots > 0,
         Arm::SnapshotDropped => o_rejected > base_o_rejected && dm_delivered == 0,
     };
     receipt.request_delivered(
         match arm {
             Arm::ProductionPath => "committer_snapshot_reached_the_restarted_replica",
             Arm::SnapshotDropped => "skewed_state_request_reached_the_committer",
+            Arm::InviteOnly => "snapshot_reached_the_invite_only_member",
         },
         request_ok,
         format!(
@@ -535,6 +564,21 @@ async fn w3h_1105_restarted_replica_obtains_n_plus_one_snapshot() -> Result<()> 
         0x1105_0002,
         Arm::ProductionPath,
         Verdict::Green,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1105_invite_only_restart_has_no_catchup_consent() -> Result<()> {
+    expect(
+        "w3h_1105_invite_only_restart_has_no_catchup_consent",
+        0x1105_0003,
+        Arm::InviteOnly,
+        Verdict::Red,
     )
     .await
 }

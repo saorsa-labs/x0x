@@ -3,8 +3,19 @@
 //! chain is refused.
 
 use super::super::{
-    apply_signed_public_revision_catchup, now_millis_u64, signed_public_bootstrap_snapshot,
+    apply_signed_public_revision_catchup, now_millis_u64, owner_axis_catchup_block,
+    signed_public_bootstrap_snapshot, signed_public_catchup_decide,
+    signed_public_catchup_extend_failure, OwnerAxisCatchupBlock,
 };
+
+fn apply_catchup(
+    local: &crate::groups::GroupInfo,
+    snapshot: &crate::groups::GroupInfo,
+    sender: &str,
+    member: &str,
+) -> Option<crate::groups::GroupInfo> {
+    apply_signed_public_revision_catchup(local, snapshot, sender, member, |_| false)
+}
 
 fn sealed_step(
     authority: &crate::identity::AgentKeypair,
@@ -46,18 +57,15 @@ fn one_revision_bootstrap_advances_the_installed_group() {
         .insert("local-invite".to_string());
     let snapshot = signed_public_bootstrap_snapshot(ahead.clone()).expect("snapshot");
     let sender = hex::encode(authority.agent_id().as_bytes());
-    let updated = apply_signed_public_revision_catchup(&behind, &snapshot, &sender, &member_hex)
-        .expect("chained head applies");
+    let updated =
+        apply_catchup(&behind, &snapshot, &sender, &member_hex).expect("chained head applies");
     assert_eq!(updated.state_revision, ahead.state_revision);
     assert_eq!(updated.state_hash, ahead.state_hash);
     assert_eq!(updated.description, "renamed");
     assert!(updated.issued_invite_secrets.contains("local-invite"));
+    assert!(apply_catchup(&ahead, &snapshot, &sender, &member_hex).is_none());
     assert!(
-        apply_signed_public_revision_catchup(&ahead, &snapshot, &sender, &member_hex).is_none()
-    );
-    assert!(
-        apply_signed_public_revision_catchup(&behind, &snapshot, &member_hex, &member_hex)
-            .is_none(),
+        apply_catchup(&behind, &snapshot, &member_hex, &member_hex).is_none(),
         "a member who did not sign the head cannot install it"
     );
 }
@@ -74,9 +82,7 @@ fn a_two_revision_gap_is_not_a_catchup() {
         .expect("third seal");
     let snapshot = signed_public_bootstrap_snapshot(ahead).expect("snapshot");
     let sender = hex::encode(authority.agent_id().as_bytes());
-    assert!(
-        apply_signed_public_revision_catchup(&behind, &snapshot, &sender, &member_hex).is_none()
-    );
+    assert!(apply_catchup(&behind, &snapshot, &sender, &member_hex).is_none());
 }
 
 fn owner_certified_policy(owner: crate::identity::UserId) -> crate::groups::GroupPolicy {
@@ -125,7 +131,7 @@ fn catchup_keeps_an_installed_owner_certified_axis() {
     let snapshot = signed_public_bootstrap_snapshot(group).expect("snapshot");
     let sender = hex::encode(authority.agent_id().as_bytes());
     assert!(
-        apply_signed_public_revision_catchup(&behind, &snapshot, &sender, &member_hex).is_none(),
+        apply_catchup(&behind, &snapshot, &sender, &member_hex).is_none(),
         "a signed next head must not replace OwnerCertified with OpenJoin"
     );
 
@@ -137,8 +143,8 @@ fn catchup_keeps_an_installed_owner_certified_axis() {
         now_millis_u64().saturating_add(2),
     );
     let kept = signed_public_bootstrap_snapshot(same_owner).expect("same-owner snapshot");
-    let updated = apply_signed_public_revision_catchup(&behind, &kept, &sender, &member_hex)
-        .expect("the same owner still chains");
+    let updated =
+        apply_catchup(&behind, &kept, &sender, &member_hex).expect("the same owner still chains");
     assert_eq!(
         updated.policy.admission.owner_certified_user_id(),
         Some(&owner)
@@ -155,8 +161,143 @@ fn catchup_keeps_an_installed_owner_certified_axis() {
     );
     let swapped = signed_public_bootstrap_snapshot(replaced).expect("other-owner snapshot");
     assert!(
-        apply_signed_public_revision_catchup(&behind, &swapped, &sender, &member_hex).is_none(),
+        apply_catchup(&behind, &swapped, &sender, &member_hex).is_none(),
         "a signed next head must not replace the installed owner"
+    );
+}
+
+fn owner_axis_pair(
+    authority: &crate::identity::AgentKeypair,
+    member_hex: &str,
+) -> crate::groups::GroupInfo {
+    let owner = crate::identity::UserId([7; 32]);
+    let mut group = crate::groups::GroupInfo::with_policy(
+        "Catch-up".to_string(),
+        String::new(),
+        authority.agent_id(),
+        "ab".repeat(32),
+        owner_certified_policy(owner),
+    );
+    group.add_member(
+        member_hex.to_string(),
+        crate::groups::GroupRole::Member,
+        Some(hex::encode(authority.agent_id().as_bytes())),
+        None,
+    );
+    seal_owner_certified(&mut group, authority, now_millis_u64());
+    group
+}
+
+#[test]
+fn catchup_refuses_a_revoked_newcomer_on_an_owner_axis() {
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let member = crate::identity::AgentKeypair::generate().expect("member");
+    let newcomer = crate::identity::AgentKeypair::generate().expect("newcomer");
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let newcomer_hex = hex::encode(newcomer.agent_id().as_bytes());
+    let sender = hex::encode(authority.agent_id().as_bytes());
+    let behind = owner_axis_pair(&authority, &member_hex);
+    let mut ahead = behind.clone();
+    ahead.add_member(
+        newcomer_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(sender.clone()),
+        None,
+    );
+    seal_owner_certified(&mut ahead, &authority, now_millis_u64().saturating_add(1));
+    let snapshot = signed_public_bootstrap_snapshot(ahead).expect("snapshot");
+    assert_eq!(
+        owner_axis_catchup_block(&behind, &snapshot, |agent| agent == newcomer_hex),
+        Some(OwnerAxisCatchupBlock::RevokedNewcomer),
+        "ADR-0038 B1: a newcomer in the local revocation set is not a catch-up head"
+    );
+    assert!(
+        apply_signed_public_revision_catchup(&behind, &snapshot, &sender, &member_hex, |agent| {
+            agent == newcomer_hex
+        })
+        .is_none(),
+        "catch-up must not install the revoked newcomer"
+    );
+    assert_eq!(
+        owner_axis_catchup_block(&behind, &snapshot, |_| false),
+        Some(OwnerAxisCatchupBlock::RosterChange),
+        "the same head is also an active-roster change"
+    );
+}
+
+#[test]
+fn catchup_refuses_a_roster_change_from_a_mandate_required_committer() {
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let member = crate::identity::AgentKeypair::generate().expect("member");
+    let newcomer = crate::identity::AgentKeypair::generate().expect("newcomer");
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let sender = hex::encode(authority.agent_id().as_bytes());
+    let mut behind = owner_axis_pair(&authority, &member_hex);
+    let capability = crate::groups::MandateCapabilityState {
+        first_seen_ms: 1,
+        refusals: 0,
+        refusal_transition_counted: false,
+    };
+    assert!(
+        capability.refusal_due(60, now_millis_u64()),
+        "the committer is past the owner-mandate grace window"
+    );
+    behind.mandate_capability.insert(sender.clone(), capability);
+    let mut roster_head = behind.clone();
+    roster_head.add_member(
+        hex::encode(newcomer.agent_id().as_bytes()),
+        crate::groups::GroupRole::Member,
+        Some(sender.clone()),
+        None,
+    );
+    seal_owner_certified(
+        &mut roster_head,
+        &authority,
+        now_millis_u64().saturating_add(1),
+    );
+    let roster_snapshot = signed_public_bootstrap_snapshot(roster_head).expect("roster snapshot");
+    assert!(
+        roster_snapshot.mandate_capability.is_empty(),
+        "a bootstrap snapshot does not carry the owner mandate"
+    );
+    assert_eq!(
+        owner_axis_catchup_block(&behind, &roster_snapshot, |_| false),
+        Some(OwnerAxisCatchupBlock::RosterChange),
+        "ADR-0064 §1b: a roster change from a mandate-required committer stays on the ordinary path"
+    );
+    assert!(
+        apply_catchup(&behind, &roster_snapshot, &sender, &member_hex).is_none(),
+        "catch-up must not install the roster head"
+    );
+
+    let mut metadata = behind.clone();
+    metadata.description = "renamed".to_string();
+    metadata.roster_revision = 100;
+    metadata.policy_revision = 50;
+    seal_owner_certified(
+        &mut metadata,
+        &authority,
+        now_millis_u64().saturating_add(2),
+    );
+    metadata.roster_revision = 100;
+    metadata.policy_revision = 50;
+    let mut lagging = behind.clone();
+    lagging.roster_revision = 4;
+    lagging.policy_revision = 2;
+    let metadata_snapshot = signed_public_bootstrap_snapshot(metadata).expect("metadata snapshot");
+    assert_eq!(
+        owner_axis_catchup_block(&lagging, &metadata_snapshot, |_| false),
+        None,
+        "a rename is not an active-roster change"
+    );
+    let updated = apply_catchup(&lagging, &metadata_snapshot, &sender, &member_hex)
+        .expect("a metadata-only head still catches up");
+    assert_eq!(updated.description, "renamed");
+    assert_eq!(updated.roster_revision, 5, "roster clock adopts at most +1");
+    assert_eq!(updated.policy_revision, 3, "policy clock adopts at most +1");
+    assert!(
+        updated.mandate_capability.contains_key(&sender),
+        "local mandate observation stays on the installed group"
     );
 }
 
@@ -346,9 +487,8 @@ fn catchup_keeps_conflicting_local_key_material() {
         remote.treekem_key_package_hash = Some(hash.to_string());
         remote.certificate_missing_since_ms = Some(timer);
     }
-    let updated =
-        apply_signed_public_revision_catchup(&behind, &snapshot, &authority_hex, &member_hex)
-            .expect("a signed next head still applies when its local-only fields differ");
+    let updated = apply_catchup(&behind, &snapshot, &authority_hex, &member_hex)
+        .expect("a signed next head still applies when its local-only fields differ");
     let kept = updated
         .members_v2
         .get(&member_hex)
@@ -394,10 +534,27 @@ fn catchup_send_cache_keeps_live_entries_when_full() {
         "a full cache must refuse a new peer instead of evicting a live one"
     );
     assert!(
-        !super::super::signed_public_catchup_decide(&mut guard, "group:0", now),
+        !signed_public_catchup_decide(&mut guard, "group:0", now),
         "the first peer is still inside the five-second throttle"
     );
     assert_eq!(guard.len(), super::super::SIGNED_PUBLIC_CATCHUP_SEND_LIMIT);
+    signed_public_catchup_extend_failure(&mut guard, "group:0", now);
+    assert!(
+        !signed_public_catchup_decide(
+            &mut guard,
+            "group:0",
+            now + std::time::Duration::from_secs(6),
+        ),
+        "a failed offer is not retried when the five-second throttle has elapsed"
+    );
+    assert!(
+        signed_public_catchup_decide(
+            &mut guard,
+            "group:0",
+            now + std::time::Duration::from_secs(31),
+        ),
+        "the failure backoff ends and the peer can be offered again"
+    );
 }
 
 #[test]
@@ -511,7 +668,7 @@ async fn catchup_apply_does_not_ack_a_removal_a_stale_clone_replaces() {
         .await
     });
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !pause.reached() && tokio::time::Instant::now() < deadline {
+    while !pause.reached() && !admit.is_finished() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     super::super::persist_named_group_info(&state, &group_id, metadata.clone())

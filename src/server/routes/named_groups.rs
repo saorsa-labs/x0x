@@ -53,7 +53,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -3768,6 +3768,12 @@ pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 /// How often one ahead member offers the same SignedPublic commit to one peer.
 const SIGNED_PUBLIC_CATCHUP_THROTTLE: Duration = Duration::from_secs(5);
 
+/// After a catch-up send fails, the same peer is not offered again until
+/// this elapses. A refused or unreachable recipient otherwise retries as
+/// soon as the five-second throttle ends, and each try holds the membership
+/// lock for the send.
+const SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Live send-throttle entries. A full cache refuses a new peer. It does not
 /// evict a peer whose five seconds are still running.
 const SIGNED_PUBLIC_CATCHUP_SEND_LIMIT: usize = 64;
@@ -3776,14 +3782,29 @@ const SIGNED_PUBLIC_CATCHUP_SEND_LIMIT: usize = 64;
 /// work. It does not start another task for a key that is already pending.
 pub(in crate::server) const SIGNED_PUBLIC_CATCHUP_QUEUE_CAP: usize = 32;
 
-fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision: u64) -> bool {
+fn with_signed_public_catchup_cache<T>(
+    body: impl FnOnce(&mut Vec<(String, std::time::Instant)>) -> T,
+) -> T {
     use std::sync::Mutex;
     static LAST: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
-    let key = format!("{group_id}:{author_hex}:{from_revision}");
     let mut guard = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    signed_public_catchup_decide(&mut guard, &key, std::time::Instant::now())
+    body(&mut guard)
+}
+
+fn signed_public_catchup_allowed(group_id: &str, author_hex: &str, from_revision: u64) -> bool {
+    let key = format!("{group_id}:{author_hex}:{from_revision}");
+    with_signed_public_catchup_cache(|guard| {
+        signed_public_catchup_decide(guard, &key, std::time::Instant::now())
+    })
+}
+
+fn signed_public_catchup_note_failure(group_id: &str, author_hex: &str, from_revision: u64) {
+    let key = format!("{group_id}:{author_hex}:{from_revision}");
+    with_signed_public_catchup_cache(|guard| {
+        signed_public_catchup_extend_failure(guard, &key, std::time::Instant::now());
+    });
 }
 
 fn signed_public_catchup_decide(
@@ -3791,15 +3812,35 @@ fn signed_public_catchup_decide(
     key: &str,
     now: std::time::Instant,
 ) -> bool {
-    guard.retain(|(_, at)| now.saturating_duration_since(*at) < SIGNED_PUBLIC_CATCHUP_THROTTLE);
+    guard.retain(|(_, until)| *until > now);
     if guard.iter().any(|(existing, _)| existing == key) {
         return false;
     }
     if guard.len() >= SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
         return false;
     }
-    guard.push((key.to_string(), now));
+    guard.push((key.to_string(), now + SIGNED_PUBLIC_CATCHUP_THROTTLE));
     true
+}
+
+/// Stretch an existing offer, or record one, so a failed send is not retried
+/// for [`SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF`]. A full cache does not evict
+/// a live entry to remember the failure.
+pub(in crate::server) fn signed_public_catchup_extend_failure(
+    guard: &mut Vec<(String, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) {
+    let until = now + SIGNED_PUBLIC_CATCHUP_FAILURE_BACKOFF;
+    if let Some((_, existing)) = guard.iter_mut().find(|(existing, _)| existing == key) {
+        if *existing < until {
+            *existing = until;
+        }
+        return;
+    }
+    if guard.len() < SIGNED_PUBLIC_CATCHUP_SEND_LIMIT {
+        guard.push((key.to_string(), until));
+    }
 }
 
 pub(in crate::server) fn reserve_signed_public_catchup_queue(
@@ -3865,6 +3906,57 @@ fn restore_local_member_key_material(
     }
 }
 
+/// Why an owner-axis catch-up refused a head the ordinary apply would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum OwnerAxisCatchupBlock {
+    /// An active snapshot member who is not active locally is in the local
+    /// revocation set (ADR-0038 B1).
+    RevokedNewcomer,
+    /// The active roster changed. Roster commits stay on the ordinary path,
+    /// which is the one that carries the owner mandate (ADR-0064 §1b).
+    RosterChange,
+}
+
+/// Owner-axis catch-up may install a metadata-only head. It refuses a head
+/// that adds a locally revoked member, and any head that changes the active
+/// roster. A non-owner-axis group is not blocked here.
+pub(in crate::server) fn owner_axis_catchup_block(
+    local: &x0x::groups::GroupInfo,
+    snapshot: &x0x::groups::GroupInfo,
+    is_revoked: impl Fn(&str) -> bool,
+) -> Option<OwnerAxisCatchupBlock> {
+    local
+        .policy
+        .admission
+        .owner_certified_user_id()?;
+    let local_active: BTreeSet<&str> = local
+        .active_members()
+        .map(|member| member.agent_id.as_str())
+        .collect();
+    if snapshot.active_members().any(|member| {
+        !local_active.contains(member.agent_id.as_str()) && is_revoked(member.agent_id.as_str())
+    }) {
+        return Some(OwnerAxisCatchupBlock::RevokedNewcomer);
+    }
+    let snapshot_active: BTreeSet<&str> = snapshot
+        .active_members()
+        .map(|member| member.agent_id.as_str())
+        .collect();
+    if local_active != snapshot_active {
+        return Some(OwnerAxisCatchupBlock::RosterChange);
+    }
+    let role_changed = snapshot.active_members().any(|member| {
+        local
+            .members_v2
+            .get(member.agent_id.as_str())
+            .is_none_or(|installed| installed.role != member.role)
+    });
+    if role_changed {
+        return Some(OwnerAxisCatchupBlock::RosterChange);
+    }
+    None
+}
+
 /// Apply one newer SignedPublic bootstrap onto an installed group.
 ///
 /// The snapshot must be the sanitized head from
@@ -3872,11 +3964,16 @@ fn restore_local_member_key_material(
 /// signed that head, and the head must be the next link after `local`.
 /// Local invite, lineage, quarantine and mandate state stay on `local`.
 /// A snapshot that does not chain returns `None` and leaves `local` unused.
+///
+/// `is_revoked` is the local ADR-0018 set. On an owner-axis group it refuses
+/// a newcomer who is revoked, and any active-roster change is refused so
+/// that change stays on the ordinary mandate path.
 pub(in crate::server) fn apply_signed_public_revision_catchup(
     local: &x0x::groups::GroupInfo,
     snapshot: &x0x::groups::GroupInfo,
     sender_hex: &str,
     local_agent_hex: &str,
+    is_revoked: impl Fn(&str) -> bool,
 ) -> Option<x0x::groups::GroupInfo> {
     if local.withdrawn
         || local.fork_quarantine.is_some()
@@ -3931,6 +4028,9 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
             return None;
         }
     }
+    if owner_axis_catchup_block(local, snapshot, is_revoked).is_some() {
+        return None;
+    }
     let mut next = local.clone();
     next.name.clone_from(&snapshot.name);
     next.description.clone_from(&snapshot.description);
@@ -3945,6 +4045,11 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
     next.withdrawn = snapshot.withdrawn;
     next.security_binding.clone_from(&snapshot.security_binding);
     next.updated_at = snapshot.updated_at;
+    // Ordinary metadata apply adopts the roster clock with a +1 clamp and a
+    // policy head adopts its clock the same way. Neither field is in the
+    // state hash.
+    next.roster_revision = adopt_roster_revision(local.roster_revision, snapshot.roster_revision);
+    next.policy_revision = adopt_roster_revision(local.policy_revision, snapshot.policy_revision);
     restore_local_member_key_material(&mut next, local);
     next.recompute_state_hash();
     if next.state_hash != snapshot.state_hash {
@@ -4014,16 +4119,20 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
     }) else {
         return;
     };
-    if !signed_public_catchup_allowed(snapshot.stable_group_id(), &author_hex, signed_revision) {
+    let group_id = snapshot.stable_group_id().to_string();
+    if !signed_public_catchup_allowed(&group_id, &author_hex, signed_revision) {
         return;
     }
-    super::public_group_bootstrap_outbox::push_signed_public_catchup_snapshot(
+    let delivered = super::public_group_bootstrap_outbox::push_signed_public_catchup_snapshot(
         state,
         author,
         snapshot,
         &membership_guard,
     )
     .await;
+    if !delivered {
+        signed_public_catchup_note_failure(&group_id, &author_hex, signed_revision);
+    }
 }
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
@@ -5637,7 +5746,7 @@ where
     Ok(next)
 }
 
-async fn refresh_group_card_cache_from_info(
+pub(in crate::server) async fn refresh_group_card_cache_from_info(
     state: &AppState,
     key: &str,
     info: &x0x::groups::GroupInfo,
@@ -40671,8 +40780,8 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
-    mod issue1105_public_revision_catchup;
     mod issue1139_back_to_back_join;
+    mod issue1105_public_revision_catchup;
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
     mod issue1256_metadata_listener;

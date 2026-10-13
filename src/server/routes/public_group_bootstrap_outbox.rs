@@ -46,9 +46,9 @@ use super::named_groups::{
     apply_signed_public_revision_catchup, confirm_named_groups_durability,
     ensure_named_group_listeners, group_membership_lock, named_group_direct_delivery_config,
     now_millis_u64, persist_named_group_info, persist_named_groups_mutation,
-    signed_public_bootstrap_snapshot, validate_public_group_bootstrap,
-    write_named_groups_json_atomic, AtomicWriteOutcome, PublicGroupBootstrap,
-    MAX_BOOTSTRAP_INSTALLED_GROUPS,
+    refresh_group_card_cache_from_info, signed_public_bootstrap_snapshot,
+    validate_public_group_bootstrap, write_named_groups_json_atomic, AtomicWriteOutcome,
+    PublicGroupBootstrap, MAX_BOOTSTRAP_INSTALLED_GROUPS,
 };
 
 /// Strict typed-DM framing for a signed-public group bootstrap. The legacy
@@ -266,6 +266,17 @@ fn public_group_bootstrap_delivery_config(
     Ok(config)
 }
 
+/// Catch-up holds the per-group membership lock across this send. The
+/// ordinary attempt waits up to eight seconds for an ACK a refused peer
+/// never sends. One second is enough for a live peer and releases the lock
+/// when the peer withholds the ACK.
+const SIGNED_PUBLIC_CATCHUP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// An installed group's admission waits this long for the membership lock.
+/// A busy lock withholds the ACK so the serial DM inbox can move. The
+/// sender retries.
+const INSTALLED_BOOTSTRAP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn public_group_bootstrap_legacy_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_durable_app_ack = false;
@@ -328,25 +339,44 @@ pub(in crate::server) async fn push_signed_public_catchup_snapshot(
     recipient: AgentId,
     snapshot: x0x::groups::GroupInfo,
     membership_guard: &tokio::sync::MutexGuard<'_, ()>,
-) {
+) -> bool {
     let obligation = match prepare_public_group_bootstrap_obligation(recipient, snapshot) {
         Ok(obligation) => obligation,
         Err(error) => {
             tracing::warn!("signed-public catch-up snapshot was not encoded: {error}");
-            return;
+            return false;
         }
     };
     // Keep the caller's membership guard borrowed across delivery. The lock
-    // stays taken until this function returns.
+    // stays taken until this function returns. The attempt itself is short,
+    // so a withheld ACK cannot hold the lock for the ordinary eight seconds.
     let _held_across_delivery = membership_guard;
-    if let Err(error) = deliver_public_group_bootstrap(state, &obligation).await {
-        tracing::debug!("signed-public catch-up snapshot was not delivered: {error}");
+    match deliver_public_group_bootstrap_bounded(
+        state,
+        &obligation,
+        Some(SIGNED_PUBLIC_CATCHUP_SEND_TIMEOUT),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::debug!("signed-public catch-up snapshot was not delivered: {error}");
+            false
+        }
     }
 }
 
 async fn deliver_public_group_bootstrap(
     state: &AppState,
     obligation: &PublicGroupBootstrapObligation,
+) -> Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    deliver_public_group_bootstrap_bounded(state, obligation, None).await
+}
+
+async fn deliver_public_group_bootstrap_bounded(
+    state: &AppState,
+    obligation: &PublicGroupBootstrapObligation,
+    attempt_timeout: Option<std::time::Duration>,
 ) -> Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
     // #1288: tests park here, still holding the membership lock and the
     // AppState, the way a v2 application ACK that never arrives does.
@@ -365,19 +395,24 @@ async fn deliver_public_group_bootstrap(
         == PublicGroupBootstrapWireVersion::LegacyV1
     {
         let payload = public_group_bootstrap_legacy_payload(obligation)?;
+        let mut config = public_group_bootstrap_legacy_delivery_config();
+        if let Some(timeout) = attempt_timeout {
+            config.timeout_per_attempt = timeout;
+            config.raw_quic_receive_ack_timeout = Some(timeout);
+        }
         return state
             .agent
-            .send_direct_with_config(
-                &recipient,
-                payload,
-                public_group_bootstrap_legacy_delivery_config(),
-            )
+            .send_direct_with_config(&recipient, payload, config)
             .await
             .map(PublicGroupBootstrapDelivery::LegacyV1Sent);
     }
 
-    let config = public_group_bootstrap_delivery_config(obligation)
+    let mut config = public_group_bootstrap_delivery_config(obligation)
         .map_err(x0x::dm::DmError::EnvelopeConstruction)?;
+    if let Some(timeout) = attempt_timeout {
+        config.timeout_per_attempt = timeout;
+        config.raw_quic_receive_ack_timeout = Some(timeout);
+    }
     state
         .agent
         .send_direct_with_config(&recipient, obligation.payload.clone(), config)
@@ -1257,6 +1292,21 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
+    let revoked_snapshot_members = {
+        let set = state.agent.revocation_set();
+        let revoked = set.read().await;
+        group
+            .members_v2
+            .values()
+            .filter(|member| member.is_active())
+            .filter_map(|member| {
+                parse_agent_id_hex(&member.agent_id)
+                    .ok()
+                    .filter(|agent| revoked.is_agent_revoked(agent))
+                    .map(|_| member.agent_id.clone())
+            })
+            .collect::<Vec<String>>()
+    };
     if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
         tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
         return Err("public-group bootstrap failed signed frontier validation".to_string());
@@ -1270,7 +1320,24 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     // it through apply and persistence, so that clone cannot replace a
     // removal this admission has already acknowledged.
     let membership_lock = group_membership_lock(state, &group_id).await;
-    let membership_guard = membership_lock.lock().await;
+    let membership_guard =
+        match tokio::time::timeout(INSTALLED_BOOTSTRAP_LOCK_WAIT, membership_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_elapsed) => {
+                let installed = {
+                    let groups = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&groups, &group_id).is_some()
+                };
+                if installed {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        "withholding public-group bootstrap ACK: membership lock is busy"
+                    );
+                    return Err("public-group bootstrap membership lock is busy".to_string());
+                }
+                membership_lock.lock().await
+            }
+        };
 
     let installed_frontier_matches = {
         let groups = state.named_groups.read().await;
@@ -1318,6 +1385,11 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
                     &group,
                     &sender_hex,
                     &local_agent_hex,
+                    |agent| {
+                        revoked_snapshot_members
+                            .iter()
+                            .any(|revoked| revoked == agent)
+                    },
                 ) else {
                     return false;
                 };
@@ -1325,6 +1397,13 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
             })
             .await;
             if matches!(caught_up, Ok(AtomicWriteOutcome::Durable)) {
+                if let Some((key, info)) = {
+                    let groups = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&groups, &group_id)
+                        .map(|(key, info)| (key.to_string(), info.clone()))
+                } {
+                    refresh_group_card_cache_from_info(state, &key, &info).await;
+                }
                 tracing::info!(
                     group_id = %LogHexId::group(&group_id),
                     sender = %LogHexId::agent(&sender_hex),
