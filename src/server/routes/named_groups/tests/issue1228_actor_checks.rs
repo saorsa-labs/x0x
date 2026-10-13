@@ -1,6 +1,6 @@
 //! #1228: session tokens must not clear fork quarantine, list join
-//! requests, or drive legacy MLS routes. Display-name requires an admin
-//! seat. Cancelling a join request is limited to an owner.
+//! requests, or drive legacy MLS routes. Display-name requires an active
+//! seat of any role. Cancelling a join request is limited to an owner.
 
 use super::super::super::groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
@@ -248,31 +248,37 @@ async fn rider_cannot_cancel_a_join_request() -> Result<()> {
     Ok(())
 }
 
-/// A member seat cannot set a display name. An admin seat can.
+/// A caller with no seat cannot set a display name. A member seat can.
 #[tokio::test]
-async fn display_name_requires_admin_seat() -> Result<()> {
+async fn display_name_requires_an_active_seat() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
-    let member_id = "11".repeat(32);
-    let admin_id = "22".repeat(32);
+    let outsider_id = "11".repeat(32);
+    let member_id = "22".repeat(32);
     let local = hex::encode(state.agent.agent_id().as_bytes());
+    let other = x0x::identity::AgentKeypair::generate().expect("keypair");
     {
         let mut groups = state.named_groups.write().await;
         groups.insert(
-            member_id.clone(),
-            group_with_local_role(&state, &member_id, x0x::groups::GroupRole::Member),
+            outsider_id.clone(),
+            x0x::groups::GroupInfo::new(
+                "outsider".to_string(),
+                "desc".to_string(),
+                other.agent_id(),
+                outsider_id.clone(),
+            ),
         );
         groups.insert(
-            admin_id.clone(),
-            group_with_local_role(&state, &admin_id, x0x::groups::GroupRole::Admin),
+            member_id.clone(),
+            group_with_local_role(&state, &member_id, x0x::groups::GroupRole::Member),
         );
     }
 
     let (status, body) = json_response(
         set_group_display_name(
             State(Arc::clone(&state)),
-            Path(member_id.clone()),
+            Path(outsider_id.clone()),
             Json(SetDisplayNameRequest {
-                name: "Member".to_string(),
+                name: "Outsider".to_string(),
             }),
         )
         .await
@@ -281,19 +287,25 @@ async fn display_name_requires_admin_seat() -> Result<()> {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("active seat")),
+        "{body}"
+    );
+    assert!(
         state
             .named_groups
             .read()
             .await
-            .get(&member_id)
-            .is_some_and(|info| info.display_name(&local) != "Member"),
-        "a member seat must not store the name"
+            .get(&outsider_id)
+            .is_some_and(|info| info.display_name(&local) != "Outsider"),
+        "a non-member must not store the name"
     );
 
     let (status, body) = json_response(
         set_group_display_name(
             State(Arc::clone(&state)),
-            Path(admin_id.clone()),
+            Path(member_id.clone()),
             Json(SetDisplayNameRequest {
                 name: "Ada".to_string(),
             }),
@@ -308,7 +320,7 @@ async fn display_name_requires_admin_seat() -> Result<()> {
             .named_groups
             .read()
             .await
-            .get(&admin_id)
+            .get(&member_id)
             .map(|info| info.display_name(&local)),
         Some("Ada".to_string())
     );
@@ -465,5 +477,187 @@ async fn durable_owner_can_create_and_list_an_mls_group() -> Result<()> {
         .iter()
         .any(|group| group["group_id"] == id);
     assert!(listed, "durable list missing {id}: {body}");
+
+    let (status, body) = json_response(
+        get_mls_group(
+            State(Arc::clone(&state)),
+            Extension(durable()),
+            Path(id.clone()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["group_id"], id);
+
+    let member = "66".repeat(32);
+    let (status, body) = json_response(
+        add_mls_member(
+            State(Arc::clone(&state)),
+            Extension(durable()),
+            Path(id.clone()),
+            Json(AddMlsMemberRequest {
+                agent_id: member.clone(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = json_response(
+        create_mls_welcome(
+            State(Arc::clone(&state)),
+            Extension(durable()),
+            Path(id.clone()),
+            Json(CreateWelcomeRequest {
+                agent_id: member.clone(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = json_response(
+        remove_mls_member(
+            State(Arc::clone(&state)),
+            Extension(durable()),
+            Path((id, member)),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+/// A session owner can cancel the daemon's own pending join request.
+#[tokio::test]
+async fn session_owner_can_cancel_its_own_join_request() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "77".repeat(32);
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    // The creator stays an active admin. A member-only roster cannot seal:
+    // a live group must keep one active admin.
+    let mut info = x0x::groups::GroupInfo::new(
+        group_id.clone(),
+        "desc".to_string(),
+        state.agent.agent_id(),
+        group_id.clone(),
+    );
+    let request = x0x::groups::JoinRequest::new(group_id.clone(), local, None, 1);
+    let request_id = request.request_id.clone();
+    info.join_requests.insert(request_id.clone(), request);
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let (status, body) = json_response(
+        cancel_join_request(
+            State(Arc::clone(&state)),
+            Extension(session()),
+            Path((group_id.clone(), request_id.clone())),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .and_then(|info| info.join_requests.get(&request_id))
+            .is_some_and(|request| request.status == x0x::groups::JoinRequestStatus::Cancelled),
+        "the session owner cancel must mark the request cancelled: {body}"
+    );
+    Ok(())
+}
+
+/// A minted session token is refused by auth middleware before a malformed
+/// body is parsed. The durable token can list join requests.
+#[tokio::test]
+async fn minted_session_token_is_refused_before_the_body() -> Result<()> {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "88".repeat(32);
+    state.named_groups.write().await.insert(
+        group_id.clone(),
+        group_with_local_role(&state, &group_id, x0x::groups::GroupRole::Admin),
+    );
+    let session = state.sessions.issue(std::time::Instant::now());
+    let durable_token = state.api_token.clone();
+    let app = axum::Router::new()
+        .route(
+            "/groups/:id/quarantine/clear",
+            axum::routing::post(clear_group_quarantine),
+        )
+        .route(
+            "/groups/:id/requests",
+            axum::routing::get(list_join_requests),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::server::auth::auth_middleware,
+        ))
+        .with_state(Arc::clone(&state));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/groups/{group_id}/quarantine/clear"))
+                .header("authorization", format!("Bearer {session}"))
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("durable")),
+        "a malformed body must still be the durable 403: {body}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/groups/{group_id}/requests"))
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::empty())
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/groups/{group_id}/requests"))
+                .header("authorization", format!("Bearer {durable_token}"))
+                .body(Body::empty())
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["requests"].as_array().map(Vec::len), Some(0), "{body}");
     Ok(())
 }

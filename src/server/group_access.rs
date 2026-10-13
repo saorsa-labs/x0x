@@ -190,9 +190,9 @@ pub(in crate::server) enum AccessLevel {
     /// No actor-based gate on a write surface; remaining gates are local
     /// policy or data checks, not principal identity — the write-side
     /// member of the no-actor class (S2's `open-envelope`, S3's request
-    /// create). #1228 moved display-name to [`AccessLevel::Admin`],
-    /// request cancel to [`AccessLevel::SessionBearer`], and
-    /// `quarantine/clear` plus `/mls/groups*` to [`AccessLevel::OwnerDurable`].
+    /// create). #1228 labels request cancel [`AccessLevel::SessionBearer`]
+    /// and `quarantine/clear` plus `/mls/groups*` [`AccessLevel::OwnerDurable`].
+    /// Display-name is [`AccessLevel::JoinSelf`] (C-1228-1).
     PublicWrite,
 }
 
@@ -312,7 +312,8 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // handlers keep at entry. The requests LISTING carries the same
     // seat gate but NO withdrawn check (today's shape — a withdrawn
     // shell's requests stay listable) and, since #1228, also requires
-    // the durable owner. display-name is the local admin seat (#1228).
+    // the durable owner. display-name is an active local seat of any role
+    // (C-1228-1).
     // Request create stays PublicWrite. Request cancel is the owner
     // who filed it (SessionBearer plus the handler's requester check).
     // Leave is the daemon's own active seat (JoinSelf).
@@ -359,7 +360,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::PUT,
         path: "/groups/:id/display-name",
-        level: AccessLevel::Admin,
+        level: AccessLevel::JoinSelf,
     },
     RouteAccess {
         method: Method::POST,
@@ -1105,7 +1106,7 @@ pub(in crate::server) fn admit_self_leave<'a>(
 }
 
 /// Shared entry for display-name, request create and request cancel:
-/// raw-id lookup 404 → withdrawn 409. #1228's admin seat (display-name)
+/// raw-id lookup 404 → withdrawn 409. #1228's active seat (display-name)
 /// and owner-requester (cancel) gates run in the handlers after this.
 pub(in crate::server) fn admit_live_group_route<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
@@ -1910,7 +1911,11 @@ mod tests {
             ),
             (Method::PATCH, "/groups/:id", AccessLevel::Admin),
             (Method::PATCH, "/groups/:id/policy", AccessLevel::Admin),
-            (Method::PUT, "/groups/:id/display-name", AccessLevel::Admin),
+            (
+                Method::PUT,
+                "/groups/:id/display-name",
+                AccessLevel::JoinSelf,
+            ),
             (Method::POST, "/groups/:id/state/seal", AccessLevel::Admin),
             (
                 Method::POST,

@@ -738,8 +738,9 @@ function maybeRefreshSession(){
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
 // /sync/devices*, /announce with user identity, /home/rename,
-// /upgrade/apply, PATCH on the Home group, and /direct/send with
-// reserved exec payloads) require the DURABLE API token — a session
+// /upgrade/apply, PATCH on the Home group, /direct/send with
+// reserved exec payloads, GET /groups/:id/requests, and /mls/groups*)
+// require the DURABLE API token — a session
 // bearer gets a typed 403 naming it. ownerApi() prefers a remembered
 // owner token, and on the durable-required 403 prompts once, keeps it
 // in sessionStorage ONLY (never localStorage, never a URL), and
@@ -4240,7 +4241,7 @@ function renderMls(){
 function mountMls(){ pollMlsGroups(); }
 
 async function pollMlsGroups(){
-  const r=await api('/mls/groups');
+  const r=await ownerApi('/mls/groups');
   const list=document.getElementById('mls-list');
   if(!list)return;
   const groups=(r&&r.groups)||[];
@@ -4270,7 +4271,7 @@ async function selectMlsGroup(id){
 async function refreshMlsDetail(id){
   const el=document.getElementById('mls-detail');
   if(!el)return;
-  const r=await api('/mls/groups/'+encodeURIComponent(id));
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(id));
   if(!r||!r.ok){el.innerHTML='<span style="color:var(--rd)">Failed to load group.</span>';return}
   const members=r.members||[];
   el.innerHTML=`<div><span class="k">Group</span>: <span class="aid-short">${esc(id)}</span></div>
@@ -4290,7 +4291,7 @@ async function createMlsGroup(){
   const body={};
   const id=(idInput.value||'').trim();
   if(id)body.group_id=id;
-  const r=await api('/mls/groups',{method:'POST',body:JSON.stringify(body)});
+  const r=await ownerApi('/mls/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.group_id){
     toast('MLS group created: '+short(r.group_id,12),'success');
     idInput.value='';
@@ -4305,14 +4306,14 @@ async function mlsAddMember(gid){
   const input=document.getElementById('mls-add-id');
   const aid=(input.value||'').trim();
   if(!aid){toast('Enter an agent ID','warn');return}
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/members',{method:'POST',body:JSON.stringify({agent_id:aid})});
   if(r&&r.ok){toast('Member added','success');input.value='';refreshMlsDetail(gid)}
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
 
 async function mlsRemoveMember(gid,aid){
   if(!confirm('Remove '+short(aid,12)+' from the group?'))return;
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/members/'+encodeURIComponent(aid),{method:'DELETE'});
   if(r&&r.ok){toast('Member removed','success');refreshMlsDetail(gid)}
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
@@ -4320,7 +4321,7 @@ async function mlsRemoveMember(gid,aid){
 async function mlsSendWelcome(gid){
   const aid=(document.getElementById('mls-add-id').value||'').trim();
   if(!aid){toast('Enter the agent ID to welcome','warn');return}
-  const r=await api('/mls/groups/'+encodeURIComponent(gid)+'/welcome',{method:'POST',body:JSON.stringify({agent_id:aid})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(gid)+'/welcome',{method:'POST',body:JSON.stringify({agent_id:aid})});
   if(r&&r.ok)toast('Welcome sent','success');
   else toast('Failed: '+((r&&r.error)||'unknown'),'error');
 }
@@ -4328,7 +4329,7 @@ async function mlsSendWelcome(gid){
 async function mlsEncryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const plaintext=document.getElementById('mls-plain').value||'';
-  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.ciphertext){
     document.getElementById('mls-cipher').value=r.ciphertext;
@@ -4343,7 +4344,7 @@ async function mlsDecryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const ciphertext=document.getElementById('mls-cipher').value||'';
   const epoch=parseInt(document.getElementById('mls-epoch').value||'0',10);
-  const r=await api('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.plaintext){
     document.getElementById('mls-plain').value=r.plaintext;
@@ -5469,7 +5470,7 @@ async function nagRenderAdmin(gid){
     api('/groups/'+gid),
     api('/groups/'+gid+'/state').catch(()=>null),
     api('/groups/'+gid+'/members').catch(()=>null),
-    api('/groups/'+gid+'/requests').catch(()=>null),
+    ownerApi('/groups/'+gid+'/requests').catch(()=>null),
     api('/agent').catch(()=>null),
   ]);
   const members=(membersResp&&membersResp.ok&&membersResp.members)||[];

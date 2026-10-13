@@ -20339,8 +20339,9 @@ pub(in crate::server) async fn join_group_via_invite(
 
 /// PUT /groups/:id/display-name — set your display name in a group.
 ///
-/// #1228: the local seat must be admin or higher. A member seat is refused.
-/// A session token of an admin seat may still set the name.
+/// #1228 (C-1228-1): the caller must hold an active seat in this group,
+/// any role. The label is local and is not in the signed roster. A
+/// session token of that seat may still set the name.
 pub(in crate::server) async fn set_group_display_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -20357,11 +20358,10 @@ pub(in crate::server) async fn set_group_display_name(
             Ok(info) => info,
             Err(resp) => return resp,
         };
-        if !info
-            .caller_role(&agent_hex)
-            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
-        {
-            return forbidden("setting a display name requires admin");
+        // C-1228-1: any active seat. `caller_role` is `None` for a missing,
+        // pending, removed, or banned seat.
+        if info.caller_role(&agent_hex).is_none() {
+            return forbidden("setting a display name requires an active seat in the group");
         }
         let mut next = info.clone();
         next.set_display_name(&agent_hex, req.name.clone());
