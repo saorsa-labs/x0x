@@ -1436,17 +1436,32 @@ pub(crate) const PLANE_HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Per-peer gossip-plane state, tracked only when plane isolation is
 /// configured (`NetworkConfig::network_id` is `Some`).
-#[derive(Debug, Clone, Copy)]
+///
+/// Issue #1403: the legacy grace belongs to one connection generation.
+/// [`Self::Pending`] and [`Self::LegacyCleared`] name the ant-quic
+/// generation that they are for. Time while the peer is disconnected, or on
+/// an earlier generation, never counts toward the grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanePeerState {
     /// Connected; awaiting the peer's plane hello. Gossip to and from this
     /// peer is held until the peer is cleared.
     Pending {
-        /// When the connection was registered (drives legacy grace).
+        /// When the gate first saw `generation` pending (drives legacy
+        /// grace).
         since: Instant,
+        /// The live connection generation that this clock belongs to.
+        generation: u64,
     },
-    /// Plane verified: the peer's hello matched our plane, or the peer was
-    /// admitted as legacy after [`PLANE_LEGACY_GRACE`].
+    /// Plane verified: the peer's hello matched our plane. This holds for
+    /// the peer, not for one generation (see [`PLANE_REVERIFY_TTL`]).
     Cleared,
+    /// Admitted as legacy: `generation` stayed the transport winner, with
+    /// no plane hello, for [`PLANE_LEGACY_GRACE`]. A new generation is
+    /// gated again.
+    LegacyCleared {
+        /// The connection generation that served the grace.
+        generation: u64,
+    },
 }
 
 /// Validate a gossip-plane identifier (issue #206).
@@ -2074,9 +2089,10 @@ pub struct NetworkNode {
     /// Gossip-plane bookkeeping per connected peer (issue #206). Populated
     /// only when `config.network_id` is `Some`: peers start
     /// [`PlanePeerState::Pending`] and are promoted to
-    /// [`PlanePeerState::Cleared`] by a matching plane hello or by legacy
-    /// grace expiry. Mismatched peers are tombstoned + disconnected and
-    /// removed here.
+    /// [`PlanePeerState::Cleared`] by a matching plane hello, or to
+    /// [`PlanePeerState::LegacyCleared`] when one connection generation
+    /// serves the whole legacy grace (#1403). Mismatched peers are
+    /// tombstoned + disconnected and removed here.
     plane_peers: Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
     /// Last successful plane verification per peer (issue #206). Unlike
     /// [`Self::plane_peers`] this survives disconnects and connection
@@ -3999,39 +4015,30 @@ impl NetworkNode {
     /// Returns `true` when gossip traffic with `peer` is plane-allowed:
     /// always when isolation is off (`network_id` unset); only for
     /// plane-cleared peers when on. Pending peers are promoted to
-    /// legacy-cleared once [`PLANE_LEGACY_GRACE`] elapses — peers running
-    /// pre-#206 code never send a hello, and refusing them forever would
-    /// partition a mixed-version fleet.
+    /// legacy-cleared once one connection generation has served the whole
+    /// [`PLANE_LEGACY_GRACE`] — peers running pre-#206 code never send a
+    /// hello, and refusing them forever would partition a mixed-version
+    /// fleet. See [`plane_gate_step`] for the rules (#1403).
     fn plane_gate_allows(&self, peer: &AntPeerId) -> bool {
         if self.config.network_id.is_none() {
             return true;
         }
+        // Issue #1403: the legacy grace counts per connection generation.
+        // Read the live generation without blocking. A busy node lock (only
+        // teardown takes the write lock) or no live connection reads as
+        // `None`: no clock starts, and the grace admits nothing.
+        let current = self.try_connection_generation(peer).ok().flatten();
         let mut map = match self.plane_peers.lock() {
             Ok(m) => m,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let now = Instant::now();
-        // A peer with no recorded connect event (e.g. the gatekeeper task has
-        // not dequeued it yet) enters as pending-from-now — unless its plane
-        // was verified within [`PLANE_REVERIFY_TTL`], in which case it stays
-        // cleared across the connection generation (issue #206 churn fix).
-        let seed = if plane_recently_cleared(&self.plane_cleared_at, peer) {
-            PlanePeerState::Cleared
-        } else {
-            PlanePeerState::Pending { since: now }
-        };
-        let entry = map.entry(*peer).or_insert(seed);
-        match entry {
-            PlanePeerState::Cleared => true,
-            PlanePeerState::Pending { since } => {
-                if now.duration_since(*since) >= PLANE_LEGACY_GRACE {
-                    *entry = PlanePeerState::Cleared;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
+        plane_gate_step(
+            &mut map,
+            *peer,
+            current,
+            || plane_recently_cleared(&self.plane_cleared_at, peer),
+            Instant::now(),
+        )
     }
 
     /// Peers for which ant-quic still has a routable transport winner.
@@ -4276,16 +4283,18 @@ impl NetworkNode {
                     }
                     GatekeeperEvent::Network(NetworkEvent::PeerDisconnected {
                         peer_id, ..
-                    })
-                    | GatekeeperEvent::Lifecycle(
+                    }) => {
+                        plane_note_closed(&plane_peers, ant_quic::PeerId(peer_id), None);
+                    }
+                    GatekeeperEvent::Lifecycle(
                         ant_quic::PeerId(peer_id),
-                        ant_quic::PeerLifecycleEvent::Closed { .. },
+                        ant_quic::PeerLifecycleEvent::Closed { generation, .. },
                     ) => {
-                        let mut map = match plane_peers.lock() {
-                            Ok(m) => m,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        map.remove(&ant_quic::PeerId(peer_id));
+                        plane_note_closed(
+                            &plane_peers,
+                            ant_quic::PeerId(peer_id),
+                            Some(generation),
+                        );
                     }
                     _ => {}
                 }
@@ -6136,28 +6145,59 @@ async fn plane_note_connected(
     reset: bool,
 ) {
     let peer = ant_quic::PeerId(peer_id);
-    // A peer whose plane was verified within PLANE_REVERIFY_TTL keeps its
-    // clearance across connection generations: churn (supersedes, proactive
-    // reconnects) must not re-gate it and black-hole its gossip frames. The
-    // hello is still (re)sent below, so a genuine plane change is refused by
-    // the mismatch path, which also purges the clearance.
-    let seed = if plane_recently_cleared(plane_cleared_at, &peer) {
-        PlanePeerState::Cleared
-    } else {
-        PlanePeerState::Pending {
-            since: Instant::now(),
-        }
-    };
-    {
+    // Issue #1403: a clock belongs to the live connection generation. x0x
+    // emits `PeerConnected` after the dial returns, so the gatekeeper can
+    // apply it after the `Closed` of that connection. Such a late event
+    // finds no live generation and starts no clock.
+    let current = node
+        .read()
+        .await
+        .as_ref()
+        .and_then(|link| link.current_connection_generation(&peer))
+        .filter(|generation| *generation != STALE_GENERATION_SENTINEL);
+    if let Some(generation) = current {
+        // A peer whose plane was verified within PLANE_REVERIFY_TTL keeps its
+        // clearance across connection generations: churn (supersedes,
+        // proactive reconnects) must not re-gate it and black-hole its gossip
+        // frames. The hello is still (re)sent below, so a genuine plane
+        // change is refused by the mismatch path, which also purges the
+        // clearance.
+        let seed = if plane_recently_cleared(plane_cleared_at, &peer) {
+            PlanePeerState::Cleared
+        } else {
+            PlanePeerState::Pending {
+                since: Instant::now(),
+                generation,
+            }
+        };
         let mut map = match plane_peers.lock() {
             Ok(m) => m,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if reset {
+        // Without `reset`, keep a hello match and keep the entry of this
+        // generation (its clock is already running). An entry for another
+        // generation is replaced: its time does not count here.
+        let keep = !reset
+            && match map.get(&peer) {
+                Some(PlanePeerState::Cleared) => true,
+                Some(
+                    PlanePeerState::Pending {
+                        generation: entry, ..
+                    }
+                    | PlanePeerState::LegacyCleared { generation: entry },
+                ) => *entry == generation,
+                None => false,
+            };
+        if !keep {
             map.insert(peer, seed);
-        } else {
-            map.entry(peer).or_insert(seed);
         }
+    } else if reset {
+        // The replacing generation is already gone: drop the old clock.
+        let mut map = match plane_peers.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.remove(&peer);
     }
     let frame = build_plane_hello_frame(plane_id);
     let node = Arc::clone(node);
@@ -6174,6 +6214,107 @@ async fn plane_note_connected(
             }
         }
     });
+}
+
+/// One plane-gate decision for `peer` (issue #206), with the #1403 rule:
+/// legacy-grace admission happens only after one connection generation
+/// stays the transport winner, with no hello, for [`PLANE_LEGACY_GRACE`].
+///
+/// `current` is the peer's live, non-sentinel connection generation, or
+/// `None` when the peer has no live connection or the read failed.
+/// `recently_cleared` reports a hello match within [`PLANE_REVERIFY_TTL`];
+/// it is called only when the decision needs it. Returns whether gossip
+/// with `peer` is plane-allowed, and writes the next state into `map`.
+///
+/// - A hello match ([`PlanePeerState::Cleared`]) is allowed.
+/// - With no live generation, no clock starts or runs and nothing is
+///   inserted. Only a recent hello match is allowed.
+/// - An entry for another generation restarts the clock on `current` (or
+///   becomes `Cleared` after a recent hello match).
+/// - A `Pending` entry for `current` is promoted to
+///   [`PlanePeerState::LegacyCleared`] when the whole grace has passed.
+fn plane_gate_step(
+    map: &mut HashMap<AntPeerId, PlanePeerState>,
+    peer: AntPeerId,
+    current: Option<u64>,
+    recently_cleared: impl FnOnce() -> bool,
+    now: Instant,
+) -> bool {
+    let entry = map.get(&peer).copied();
+    if entry == Some(PlanePeerState::Cleared) {
+        return true;
+    }
+    let Some(generation) = current else {
+        return recently_cleared();
+    };
+    match entry {
+        Some(PlanePeerState::LegacyCleared {
+            generation: cleared,
+        }) if cleared == generation => true,
+        Some(PlanePeerState::Pending {
+            since,
+            generation: pending,
+        }) if pending == generation => {
+            if now.duration_since(since) >= PLANE_LEGACY_GRACE {
+                map.insert(peer, PlanePeerState::LegacyCleared { generation });
+                true
+            } else {
+                false
+            }
+        }
+        // No entry, or an entry for another generation: `current` starts
+        // its own clock. A peer whose hello matched within the TTL stays
+        // cleared across the generation (issue #206 churn fix).
+        _ => {
+            if recently_cleared() {
+                map.insert(peer, PlanePeerState::Cleared);
+                true
+            } else {
+                map.insert(
+                    peer,
+                    PlanePeerState::Pending {
+                        since: now,
+                        generation,
+                    },
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Drop the plane bookkeeping of a closed connection (issue #206).
+///
+/// Issue #1403: a lifecycle `Closed { generation }` (`closed = Some(..)`)
+/// removes a `Pending` or `LegacyCleared` entry only when the entry names
+/// that generation. So a late `Closed` for an older connection keeps the
+/// clock of the live one. A network `PeerDisconnected` has no generation
+/// (`closed = None`) and removes the entry. Any close removes a hello match
+/// (`Cleared`); the next connection seeds it again from
+/// [`PLANE_REVERIFY_TTL`]. Removal is the safe direction: the next gate
+/// read starts a new clock.
+fn plane_note_closed(
+    plane_peers: &Mutex<HashMap<AntPeerId, PlanePeerState>>,
+    peer: AntPeerId,
+    closed: Option<u64>,
+) {
+    let mut map = match plane_peers.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let other_generation = match (map.get(&peer), closed) {
+        (
+            Some(
+                PlanePeerState::Pending { generation, .. }
+                | PlanePeerState::LegacyCleared { generation },
+            ),
+            Some(closed),
+        ) => *generation != closed,
+        _ => false,
+    };
+    if !other_generation {
+        map.remove(&peer);
+    }
 }
 
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
@@ -7438,6 +7579,125 @@ mod tests {
 
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403: the pure gate decision. A clock runs only for the generation
+    /// it names, and no clock starts without a live generation.
+    #[test]
+    fn issue1403_plane_gate_step_counts_the_grace_per_generation() {
+        let peer = test_ant_peer(7);
+        let now = Instant::now();
+        let old = now
+            .checked_sub(PLANE_LEGACY_GRACE + Duration::from_secs(1))
+            .expect("std Instant moves back 11 s");
+        let never = || -> bool { panic!("the hello cache is not needed here") };
+        let mut map = HashMap::new();
+
+        // No live generation: not allowed, nothing inserted.
+        assert!(!plane_gate_step(&mut map, peer, None, || false, now));
+        assert!(map.is_empty());
+        // ... unless the peer's hello matched within the TTL.
+        assert!(plane_gate_step(&mut map, peer, None, || true, now));
+        assert!(map.is_empty());
+
+        // A first read on generation 1 starts its clock.
+        assert!(!plane_gate_step(&mut map, peer, Some(1), || false, now));
+        assert_eq!(
+            map.get(&peer),
+            Some(&PlanePeerState::Pending {
+                since: now,
+                generation: 1
+            })
+        );
+
+        // An old clock for generation 1 does not admit generation 2: the
+        // clock restarts on generation 2.
+        map.insert(
+            peer,
+            PlanePeerState::Pending {
+                since: old,
+                generation: 1,
+            },
+        );
+        assert!(!plane_gate_step(&mut map, peer, Some(2), || false, now));
+        assert_eq!(
+            map.get(&peer),
+            Some(&PlanePeerState::Pending {
+                since: now,
+                generation: 2
+            })
+        );
+
+        // The same generation for the whole grace is admitted as legacy.
+        map.insert(
+            peer,
+            PlanePeerState::Pending {
+                since: old,
+                generation: 2,
+            },
+        );
+        assert!(plane_gate_step(&mut map, peer, Some(2), never, now));
+        assert_eq!(
+            map.get(&peer),
+            Some(&PlanePeerState::LegacyCleared { generation: 2 })
+        );
+        assert!(plane_gate_step(&mut map, peer, Some(2), never, now));
+
+        // A legacy admission does not carry over to generation 3, and it
+        // does not hold while the peer is disconnected.
+        assert!(!plane_gate_step(&mut map, peer, None, || false, now));
+        assert!(!plane_gate_step(&mut map, peer, Some(3), || false, now));
+        assert_eq!(
+            map.get(&peer),
+            Some(&PlanePeerState::Pending {
+                since: now,
+                generation: 3
+            })
+        );
+
+        // A recent hello match clears a new generation at once, and a hello
+        // match holds for the peer, with or without a live generation.
+        assert!(plane_gate_step(&mut map, peer, Some(4), || true, now));
+        assert_eq!(map.get(&peer), Some(&PlanePeerState::Cleared));
+        assert!(plane_gate_step(&mut map, peer, Some(5), never, now));
+        assert!(plane_gate_step(&mut map, peer, None, never, now));
+    }
+
+    /// #1403: a lifecycle `Closed` removes a generation-bound entry only for
+    /// its own generation.
+    #[test]
+    fn issue1403_plane_note_closed_keeps_the_live_generation() {
+        let peer = test_ant_peer(8);
+        let now = Instant::now();
+        let map = Mutex::new(HashMap::new());
+        let set = |state: PlanePeerState| {
+            map.lock().unwrap().insert(peer, state);
+        };
+        let get = || map.lock().unwrap().get(&peer).copied();
+
+        let pending = PlanePeerState::Pending {
+            since: now,
+            generation: 2,
+        };
+        set(pending);
+        plane_note_closed(&map, peer, Some(1));
+        assert_eq!(get(), Some(pending), "a late Closed(1) keeps generation 2");
+        plane_note_closed(&map, peer, Some(2));
+        assert_eq!(get(), None, "Closed(2) removes generation 2");
+
+        set(PlanePeerState::LegacyCleared { generation: 2 });
+        plane_note_closed(&map, peer, Some(1));
+        assert_eq!(get(), Some(PlanePeerState::LegacyCleared { generation: 2 }));
+        plane_note_closed(&map, peer, Some(2));
+        assert_eq!(get(), None);
+
+        set(pending);
+        plane_note_closed(&map, peer, None);
+        assert_eq!(get(), None, "PeerDisconnected has no generation");
+
+        set(PlanePeerState::Cleared);
+        plane_note_closed(&map, peer, Some(1));
+        assert_eq!(get(), None, "any close removes a hello match");
     }
 
     /// Boundary regression for ant-quic's transport-aware connected snapshot.

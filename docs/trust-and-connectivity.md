@@ -268,7 +268,10 @@ peers, who drop it harmlessly):
 - **No hello** (pre-#206 code, open-plane embedders) → the peer is held
   out of gossip sets for a 10 s legacy grace window, then admitted. This
   keeps rolling upgrades from partitioning the fleet; full isolation
-  requires both sides on the new code.
+  requires both sides on the new code. The window counts per connection
+  generation (#1403): one connection must stay the transport winner, with
+  no hello, for the full 10 s. A new connection starts a new window, and
+  time while the peer is disconnected never counts.
 
 Until cleared, a peer is excluded from eager sets, membership keepalives,
 and CRDT sync targets, and its inbound gossip frames are dropped — the
