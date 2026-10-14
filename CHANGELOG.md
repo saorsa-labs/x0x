@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A subscription opened before the revocation stores are attached drops a
+  revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
+  store and the revocation set when it decodes each payload. A store
+  attached after subscribe still filters that subscription.
+  - `AgentBuilder::build` attaches the agent's contact store with
+    `set_contacts` when a gossip runtime exists. It also passes the agent's
+    revocation set to `set_group_identity_context`. Delivery uses that set
+    when `set_revocation_set` has not run. A bare agent drops an author
+    revoked after subscribe, and a sender marked `Blocked` on
+    `agent.contacts()`, with no later `set_contacts` call. A clean author
+    is still delivered.
+  - A later `set_contacts` with a different store has no effect. Once
+    `set_revocation_set` has run, delivery uses that set. A second call has
+    no effect. x0xd passes the same contact store and the same revocation
+    `Arc`.
+  - A revoked or Blocked drop increments `incoming_sender_refused` on
+    `GET /diagnostics/gossip` (`stats`). The log is debug, once per 30
+    seconds. The decode-failure counter stays unchanged.
+
 ### Security
 
 - **rustls 0.23.46 in Cargo.lock.** The lockfile moves rustls from 0.23.45 to 0.23.46. This closes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349. ant-quic stays 0.27.60. No Cargo.toml change and no version bump.
@@ -34,25 +55,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **A subscription opened before the revocation stores are attached drops a
-  revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
-  store and the revocation set when it decodes each payload. A store
-  attached after subscribe still filters that subscription.
-  - `AgentBuilder::build` attaches the agent's contact store with
-    `set_contacts` when a gossip runtime exists. It also passes the agent's
-    revocation set to `set_group_identity_context`. Delivery uses that set
-    when `set_revocation_set` has not run. A bare agent drops an author
-    revoked after subscribe, and a sender marked `Blocked` on
-    `agent.contacts()`, with no later `set_contacts` call. A clean author
-    is still delivered.
-  - A later `set_contacts` with a different store has no effect. Once
-    `set_revocation_set` has run, delivery uses that set. A second call has
-    no effect. x0xd passes the same contact store and the same revocation
-    `Arc`.
-  - A revoked or Blocked drop increments `incoming_sender_refused` on
-    `GET /diagnostics/gossip` (`stats`). The log is debug, once per 30
-    seconds. The decode-failure counter stays unchanged.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
