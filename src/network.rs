@@ -1464,6 +1464,9 @@ enum PlanePeerState {
     },
 }
 
+/// The plane gate's receiver on the peer-lifecycle stream (#1403 R2).
+type PlaneLifecycleReceiver = broadcast::Receiver<(AntPeerId, ant_quic::PeerLifecycleEvent)>;
+
 /// Validate a gossip-plane identifier (issue #206).
 ///
 /// Plane ids ride the plane-hello frame length-prefixed with a `u8`, so they
@@ -2101,6 +2104,11 @@ pub struct NetworkNode {
     /// connection churn cannot black-hole its gossip frames. Purged on a
     /// mismatched hello.
     plane_cleared_at: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
+    /// The plane gate's own receiver on the ant-quic peer-lifecycle stream
+    /// (#1403 R2). `Some` only when `config.network_id` is `Some`. Each gate
+    /// read applies the queued events first ([`drain_plane_lifecycle`]), so
+    /// a winner change cannot wait for the gatekeeper task.
+    plane_lifecycle: Arc<Mutex<Option<PlaneLifecycleReceiver>>>,
     /// Handles to the background tasks spawned at construction (receiver, accept
     /// loop, connection-pool eviction).
     ///
@@ -2452,6 +2460,14 @@ impl NetworkNode {
         let authenticated_sessions = Arc::new(Mutex::new(AuthenticatedSessions::new(
             shutdown_state.teardown.clone(),
         )));
+        // #1403 R2: subscribe before the node is shared, so the plane gate
+        // sees every lifecycle event from the start.
+        let plane_lifecycle = Arc::new(Mutex::new(
+            config
+                .network_id
+                .as_ref()
+                .map(|_| node.subscribe_all_peer_events()),
+        ));
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -2483,6 +2499,7 @@ impl NetworkNode {
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
+            plane_lifecycle,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             shutdown_state,
             #[cfg(test)]
@@ -4024,14 +4041,21 @@ impl NetworkNode {
             return true;
         }
         // Issue #1403: the legacy grace counts per connection generation.
-        // Read the live generation without blocking. A busy node lock (only
-        // teardown takes the write lock) or no live connection reads as
-        // `None`: no clock starts, and the grace admits nothing.
+        // Read the live generation with no async wait: `try_read` on the
+        // node slot, then a short synchronous lookup under the ant-quic
+        // lifecycle read lock (or the Sim fabric lock). A busy node slot
+        // (only teardown takes its write lock) or no live connection reads
+        // as `None`: no clock starts, and the grace admits nothing.
         let current = self.try_connection_generation(peer).ok().flatten();
         let mut map = match self.plane_peers.lock() {
             Ok(m) => m,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // #1403 R2: apply the queued lifecycle events before the decision.
+        // A winner change (`Replaced`) voids a running clock and a legacy
+        // admission, also when ant-quic restores a superseded connection
+        // with its old generation number.
+        drain_plane_lifecycle(&self.plane_lifecycle, &mut map);
         plane_gate_step(
             &mut map,
             *peer,
@@ -6302,6 +6326,15 @@ fn plane_note_closed(
         Ok(m) => m,
         Err(poisoned) => poisoned.into_inner(),
     };
+    plane_note_closed_in(&mut map, peer, closed);
+}
+
+/// [`plane_note_closed`] on a map that the caller has locked.
+fn plane_note_closed_in(
+    map: &mut HashMap<AntPeerId, PlanePeerState>,
+    peer: AntPeerId,
+    closed: Option<u64>,
+) {
     let other_generation = match (map.get(&peer), closed) {
         (
             Some(
@@ -6314,6 +6347,69 @@ fn plane_note_closed(
     };
     if !other_generation {
         map.remove(&peer);
+    }
+}
+
+/// Apply every lifecycle event queued for the plane gate (#1403 R2). The
+/// caller holds the `plane_peers` lock and passes its map.
+///
+/// The gatekeeper task applies the same events, but asynchronously, so a
+/// gate read can come first. ant-quic can also restore a superseded
+/// connection with its old generation number (`WinnerUnavailableFallback`),
+/// so a generation match alone does not prove that the connection stayed
+/// the winner for the whole grace. ant-quic sends `Replaced` (with
+/// `Closing` and `Closed` for the old generation) when a new winner
+/// registers, so the drain sees a supersede before the restore.
+///
+/// - `Replaced` is a winner change. It drops the peer's
+///   generation-bound entry (`Pending` or `LegacyCleared`), and the next
+///   decision starts a new clock. A hello match (`Cleared`) stays: it is
+///   per peer, and the gatekeeper re-gates it on `Replaced` as before.
+/// - `Closed { generation }` applies [`plane_note_closed_in`].
+/// - A lagged receiver lost events, so every generation-bound entry is
+///   dropped.
+///
+/// The drain only removes entries. It can delay a legacy admission, but it
+/// can never admit a peer.
+fn drain_plane_lifecycle(
+    receiver: &Mutex<Option<PlaneLifecycleReceiver>>,
+    map: &mut HashMap<AntPeerId, PlanePeerState>,
+) {
+    let mut guard = match receiver.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(events) = guard.as_mut() else {
+        return;
+    };
+    let mut stream_closed = false;
+    loop {
+        match events.try_recv() {
+            Ok((peer, ant_quic::PeerLifecycleEvent::Replaced { .. })) => {
+                if matches!(
+                    map.get(&peer),
+                    Some(PlanePeerState::Pending { .. } | PlanePeerState::LegacyCleared { .. })
+                ) {
+                    map.remove(&peer);
+                }
+            }
+            Ok((peer, ant_quic::PeerLifecycleEvent::Closed { generation, .. })) => {
+                plane_note_closed_in(map, peer, Some(generation));
+            }
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                map.retain(|_, state| *state == PlanePeerState::Cleared);
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => {
+                stream_closed = true;
+                break;
+            }
+        }
+    }
+    if stream_closed {
+        // The node is gone (shutdown). Nothing more can arrive.
+        *guard = None;
     }
 }
 
@@ -7755,6 +7851,78 @@ mod tests {
         assert_eq!(map.get(&peer), Some(&PlanePeerState::Cleared));
         assert!(plane_gate_step(&mut map, peer, Some(5), never, now));
         assert!(plane_gate_step(&mut map, peer, None, never, now));
+    }
+
+    /// #1403 R2: the gate's drain of the lifecycle stream only removes
+    /// entries. A winner change voids generation-bound state, and a lagged
+    /// receiver voids all of it. A hello match stays.
+    #[test]
+    fn issue1403_drain_plane_lifecycle_voids_state_on_a_winner_change() {
+        let now = Instant::now();
+        let (p1, p2, p3) = (test_ant_peer(1), test_ant_peer(2), test_ant_peer(3));
+        let (tx, rx) = broadcast::channel(4);
+        let receiver = Mutex::new(Some(rx));
+        let mut map = HashMap::from([
+            (
+                p1,
+                PlanePeerState::Pending {
+                    since: now,
+                    generation: 5,
+                },
+            ),
+            (p2, PlanePeerState::LegacyCleared { generation: 5 }),
+            (p3, PlanePeerState::Cleared),
+        ]);
+
+        // A supersede (or a restore) of every peer.
+        for peer in [p1, p2, p3] {
+            tx.send((
+                peer,
+                ant_quic::PeerLifecycleEvent::Replaced {
+                    old_generation: 5,
+                    new_generation: 6,
+                },
+            ))
+            .unwrap();
+        }
+        drain_plane_lifecycle(&receiver, &mut map);
+        assert_eq!(map.len(), 1, "Replaced voids Pending and LegacyCleared");
+        assert_eq!(map.get(&p3), Some(&PlanePeerState::Cleared));
+
+        // A late Closed for the old generation keeps the live clock.
+        let live = PlanePeerState::Pending {
+            since: now,
+            generation: 6,
+        };
+        map.insert(p1, live);
+        tx.send((
+            p1,
+            ant_quic::PeerLifecycleEvent::Closed {
+                generation: 5,
+                reason: ant_quic::ConnectionCloseReason::Superseded,
+            },
+        ))
+        .unwrap();
+        drain_plane_lifecycle(&receiver, &mut map);
+        assert_eq!(map.get(&p1), Some(&live));
+
+        // A lag lost events: every generation-bound entry goes.
+        map.insert(p2, PlanePeerState::LegacyCleared { generation: 6 });
+        for _ in 0..6 {
+            tx.send((
+                p3,
+                ant_quic::PeerLifecycleEvent::Established { generation: 7 },
+            ))
+            .unwrap();
+        }
+        drain_plane_lifecycle(&receiver, &mut map);
+        assert_eq!(map.len(), 1, "a lagged drain keeps only hello matches");
+        assert_eq!(map.get(&p3), Some(&PlanePeerState::Cleared));
+
+        // The stream ends with the node.
+        drop(tx);
+        drain_plane_lifecycle(&receiver, &mut map);
+        assert!(receiver.lock().unwrap().is_none());
     }
 
     /// #1403: a lifecycle `Closed` removes a generation-bound entry only for
