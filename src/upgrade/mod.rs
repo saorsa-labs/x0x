@@ -292,14 +292,50 @@ impl InstallRecord {
         dir.join(format!(".{name}.installed.json"))
     }
 
-    /// Read the record for `target`. `None` when missing or not readable.
-    pub fn read(_target: &Path) -> Option<Self> {
-        None
+    /// Read the record for `target`. `None` when missing, unparseable or of
+    /// another format: then it is no evidence, and the swap fails closed.
+    pub fn read(target: &Path) -> Option<Self> {
+        let bytes = std::fs::read(Self::path_for(target)).ok()?;
+        serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|r| r.format == INSTALL_RECORD_FORMAT && r.version == INSTALL_RECORD_VERSION)
     }
 
-    /// Write the record for `target` with a record barrier.
-    pub fn write(_target: &Path, _release: &Version, _sha256: &[u8; 32]) -> std::io::Result<()> {
-        Ok(())
+    /// The installed release this record proves for bytes with `sha256`.
+    pub fn release_for(&self, sha256: &[u8; 32]) -> Option<Version> {
+        if self.sha256 != hex::encode(sha256) {
+            return None;
+        }
+        Version::parse(&self.release).ok()
+    }
+
+    /// Write the record for `target` with a record barrier (temp file,
+    /// fsync, rename, directory fsync).
+    pub fn write(target: &Path, release: &Version, sha256: &[u8; 32]) -> std::io::Result<()> {
+        use std::io::Write;
+        let record = Self {
+            format: INSTALL_RECORD_FORMAT.to_string(),
+            version: INSTALL_RECORD_VERSION,
+            release: release.to_string(),
+            sha256: hex::encode(sha256),
+        };
+        let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+        let path = Self::path_for(target);
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(tmp_name);
+        let written = std::fs::File::create(&tmp).and_then(|mut file| {
+            file.write_all(&json)?;
+            file.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        sync_parent_dir(&path)
     }
 }
 
@@ -438,16 +474,17 @@ impl Upgrader {
     }
 
     /// The versioned backup name for the bytes now at the target:
-    /// `<binary>.backup-<running version>-<first 8 hex of their SHA-256>`.
-    pub fn versioned_backup_path(&self, previous_sha256: &[u8; 32]) -> PathBuf {
+    /// `<binary>.backup-<their release>-<first 8 hex of their SHA-256>`.
+    /// The release is the installed release from verified evidence, not
+    /// the running version (#1106 F1).
+    pub fn versioned_backup_path(&self, release: &Version, previous_sha256: &[u8; 32]) -> PathBuf {
         let name = self
             .target_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "x0xd".to_string());
         self.target_path.with_file_name(format!(
-            "{name}.backup-{}-{}",
-            self.current_version,
+            "{name}.backup-{release}-{}",
             hex::encode(&previous_sha256[..4])
         ))
     }
@@ -460,10 +497,11 @@ impl Upgrader {
     /// overwritten (ADR 0094 §3): the apply is refused before any swap.
     fn create_versioned_backup(
         &self,
+        release: &Version,
         previous_sha256: &[u8; 32],
         staging_dir: &Path,
     ) -> Result<PathBuf, UpgradeError> {
-        let backup_path = self.versioned_backup_path(previous_sha256);
+        let backup_path = self.versioned_backup_path(release, previous_sha256);
         let backup_failed = |source: std::io::Error| UpgradeError::BackupFailed {
             path: backup_path.clone(),
             source,
@@ -503,7 +541,28 @@ impl Upgrader {
     /// is copied or replaced. Otherwise the previous bytes go to a versioned
     /// backup that no later writer overwrites, and then the new bytes replace
     /// the target. `staging_dir` must be on the target's filesystem.
+    /// The installed release for bytes with `installed_sha256`, from
+    /// verified evidence only: this process's own bytes, a matching install
+    /// record, or the caller's hint (the companion follows its daemon).
+    fn installed_release(&self, installed_sha256: &[u8; 32]) -> Option<Version> {
+        if self.running_sha256.as_ref() == Some(installed_sha256) {
+            return Some(self.current_version.clone());
+        }
+        if let Some(release) =
+            InstallRecord::read(&self.target_path).and_then(|r| r.release_for(installed_sha256))
+        {
+            return Some(release);
+        }
+        self.installed_release_hint.clone()
+    }
+
     /// Decide the swap under the lock, before any binary changes (#1106 F1).
+    ///
+    /// The installed bytes and their release are checked under the lock.
+    /// Equal bytes need no swap. Otherwise the installed release must be
+    /// known from verified evidence and older than the target; a newer or
+    /// equal installed release (another writer on this host installed it)
+    /// and unknown bytes are refused.
     pub fn plan_locked_swap(
         &self,
         _lock: &HostUpgradeLock,
@@ -516,34 +575,63 @@ impl Upgrader {
         if new_sha256 == installed_sha256 {
             return Ok(LockedSwapPlan::AlreadyInstalled);
         }
+        let installed_release = self.installed_release(&installed_sha256).ok_or_else(|| {
+            UpgradeError::InstalledReleaseUnknown {
+                path: self.target_path.clone(),
+            }
+        })?;
+        if &installed_release >= target_version {
+            warn!(
+                target = %self.target_path.display(),
+                installed = %installed_release,
+                requested = %target_version,
+                "Refusing to replace an installed release that is not older than the target"
+            );
+            return Err(UpgradeError::InstalledReleaseNotOlder {
+                installed: installed_release.to_string(),
+                target: target_version.to_string(),
+            });
+        }
         Ok(LockedSwapPlan::Replace {
-            installed_release: self.current_version.clone(),
+            installed_release,
             installed_sha256,
         })
     }
 
     pub fn perform_locked_upgrade(
         &self,
-        _lock: &HostUpgradeLock,
+        lock: &HostUpgradeLock,
         new_binary_path: &Path,
         target_version: &Version,
         staging_dir: &Path,
     ) -> Result<SwapOutcome, UpgradeError> {
-        self.validate_upgrade(target_version)?;
-
+        let (installed_release, installed_sha256) =
+            match self.plan_locked_swap(lock, new_binary_path, target_version)? {
+                LockedSwapPlan::AlreadyInstalled => {
+                    info!(
+                        target = %self.target_path.display(),
+                        version = %target_version,
+                        "Installed binary already matches the verified release; another \
+                         writer on this host swapped it, so this writer skips the swap"
+                    );
+                    if let Err(e) = InstallRecord::write(
+                        &self.target_path,
+                        target_version,
+                        &sha256_file(new_binary_path)?,
+                    ) {
+                        debug!(error = %e, "Failed to refresh the install record");
+                    }
+                    return Ok(SwapOutcome::AlreadyInstalled);
+                }
+                LockedSwapPlan::Replace {
+                    installed_release,
+                    installed_sha256,
+                } => (installed_release, installed_sha256),
+            };
         let new_sha256 = sha256_file(new_binary_path)?;
-        let installed_sha256 = sha256_file(&self.target_path)?;
-        if new_sha256 == installed_sha256 {
-            info!(
-                target = %self.target_path.display(),
-                version = %target_version,
-                "Installed binary already matches the verified release; another \
-                 writer on this host swapped it, so this writer skips the swap"
-            );
-            return Ok(SwapOutcome::AlreadyInstalled);
-        }
 
-        let backup_path = self.create_versioned_backup(&installed_sha256, staging_dir)?;
+        let backup_path =
+            self.create_versioned_backup(&installed_release, &installed_sha256, staging_dir)?;
         info!(backup_path = %backup_path.display(), "Previous binary kept as a versioned backup");
 
         info!("Replacing binary...");
@@ -551,6 +639,12 @@ impl Upgrader {
             Ok(()) => {
                 if let Err(e) = sync_parent_dir(&self.target_path) {
                     debug!(error = %e, "Directory fsync after the binary swap failed");
+                }
+                // Evidence for the next writer on this host: these bytes are
+                // this release (#1106 F1).
+                if let Err(e) = InstallRecord::write(&self.target_path, target_version, &new_sha256)
+                {
+                    warn!(error = %e, "Failed to write the install record after the swap");
                 }
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
                 prune_versioned_backups(
