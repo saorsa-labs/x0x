@@ -311,6 +311,18 @@ impl RolloutState {
         Ok(())
     }
 
+    /// The newest staged release above `current_version`: the active
+    /// release. Any older staged release is superseded by it, also after a
+    /// restart (review F5).
+    pub fn newest_release(&self, current_version: &str) -> Option<&StagedRelease> {
+        self.releases
+            .iter()
+            .filter(|r| super::manifest::is_newer(&r.version, current_version))
+            .filter_map(|r| semver::Version::parse(&r.version).ok().map(|v| (v, r)))
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(_, r)| r)
+    }
+
     /// The staged entry for `version`, if any.
     pub fn entry(&self, version: &str) -> Option<&StagedRelease> {
         self.releases.iter().find(|r| r.version == version)

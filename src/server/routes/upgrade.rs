@@ -520,6 +520,16 @@ impl RolloutScheduler {
                 };
             }
         }
+        // The stored active release supersedes older ones across restarts
+        // (review F5): an older manifest that arrives first after a restart
+        // must not start or resume its own wait.
+        if let Some(active) = inner.state.newest_release(x0x::VERSION) {
+            if is_newer(&active.version, version) {
+                return RolloutOffer::Superseded {
+                    by: active.version.clone(),
+                };
+            }
+        }
         if trigger != RolloutTrigger::Manual {
             inner
                 .failed
