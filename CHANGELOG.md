@@ -249,6 +249,18 @@ All notable changes to this project will be documented in this file.
   `treekem:epoch=<n>:commit=<blake3>`. A v0.48 receiver rebuilds
   `treekem:epoch=<n>`, gets `StateHashMismatch`, and leaves a group that
   contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
+- **The designated admin finishes TreeKEM catch-up before a startup self-leave rekey.**
+  Startup no longer waits 250 ms and then seals. When a removed member still
+  has a live leaf and another active member remains, the lowest active admin
+  asks those members for catch-up and seals only after each asked peer reports
+  the same saved membership head. An empty page, a truncated page, and a
+  KeyPackage reply do not clear that wait. Failed sends retry within three
+  attempts, including one attempt after the network join. The wait does not
+  expire into a seal. While it is open, new TreeKEM ciphertext is withheld.
+  When no other active member remains, startup seals. Historical Removed rows
+  with no live leaf do not start the wait. A 30 second backoff uses any
+  send that is still inside the bound. `T-self-leave-catchup-before-seal`
+  (Proposed, slot A09).
 
 ## [v0.48.0] - 2026-10-13
 

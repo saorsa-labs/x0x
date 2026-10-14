@@ -423,6 +423,7 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         group_id: s.stable_group_id.clone(),
         events: vec![s.add_j1.event.clone(), s.add_j2.event.clone()],
         truncated: false,
+        responder_state_hash: None,
     }
 }
 
@@ -640,6 +641,7 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         group_id: page.group_id.clone(),
         events: vec![logged],
         truncated: false,
+        responder_state_hash: None,
     })?
     .len();
     assert!(

@@ -1478,6 +1478,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// returns an error. Tests that want the success arm set this. Production
     /// leaves it false and uses the transport result.
     pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
+    /// #1113 startup catch-up: tests that want a page send to count as
+    /// delivered set this. Production builds omit the recorders.
+    pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// Pages `handle_treekem_catchup_request` built, including a cold log.
+    pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
