@@ -46,10 +46,12 @@ All notable changes to this project will be documented in this file.
   null, when that metadata is missing. Recovery omits the id. A cancelled
   producer omits the id. A frame that fails verification omits the id. A
   receiver change omits the id and still delivers the payload. A cached or
-  forged frame does not stamp another call's payload. History backfill omits
-  the field. x0x does not derive the id from the payload. The field is not
-  `HistoryRecord.msg_id` and not the ADR 0029 application id (`msg_id` on
-  `mention` frames). David exempted the field from an ADR (D243).
+  forged frame does not stamp another call's payload. A payload replay does
+  not label another delivery. History backfill omits the field. A key-cache
+  v3 frame omits the id. Peers on 0.47 and 0.48 use that frame, so the key
+  is usually absent. x0x does not derive the id from the payload. The field
+  is not `HistoryRecord.msg_id` and not the ADR 0029 application id (`msg_id`
+  on `mention` frames). David exempted the field from an ADR (D243).
 
 ### Security
 

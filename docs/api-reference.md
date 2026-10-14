@@ -2427,7 +2427,7 @@ Server → client (complete outbound frame set):
 | `type` | Fields | Emitted when |
 |---|---|---|
 | `connected` | `session_id`, `agent_id` | Session registered (`/ws` and `/ws/direct`) |
-| `message` | `topic`, `payload` (base64), `origin?`, `transport_msg_id?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself. `transport_msg_id` is the validated gossip `MessageHeader.msg_id` (64 lowercase hex) when that metadata is present. The key is absent when the metadata is absent. It is not `HistoryRecord.msg_id` and not the ADR 0029 application `msg_id` |
+| `message` | `topic`, `payload` (base64), `origin?`, `transport_msg_id?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself. `transport_msg_id` is the validated legacy v2 gossip `MessageHeader.msg_id` (64 lowercase hex) when x0x bound that id to this delivery. The key is absent when the metadata is absent. A key-cache v3 frame does not supply it: x0x cannot check that header, so a live frame between 0.47.x or 0.48.0 peers usually omits the key. It is not `HistoryRecord.msg_id` and not the ADR 0029 application `msg_id` |
 | `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` requests best-effort history rows first) |
 | `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | A requested best-effort backfill attempt has transitioned to live frames (ADR-0023); this does not confirm that history existed, its query succeeded, or every replay row reached the client |
 | `subscribed` / `unsubscribed` | `topics[]` | After the corresponding client command |
@@ -2440,10 +2440,13 @@ subscribe-time anti-entropy can re-serve messages from the sender's roughly
 60-second cache, so applications should expect duplicate frames. Under
 backpressure, `feed_droppable` may also drop topic frames from the bounded
 outbound queue (`ws_outbound_dropped`). A live frame carries
-`transport_msg_id` when the inbound gossip frame had a validated
-`MessageHeader.msg_id`. x0x copies that id. It does not derive one from the
-payload bytes. When that metadata is absent, or two validated ids match the
-same delivery, the frame omits `transport_msg_id` (the key is absent, not
+`transport_msg_id` when the inbound frame is a validated legacy v2 eager
+message and x0x bound that `MessageHeader.msg_id` to this delivery. x0x
+copies that id. It does not derive one from the payload bytes. Current
+peers send key-cache v3 frames. x0x does not treat a v3 header id as
+authenticated, so a live frame on the 0.47.x or 0.48.0 fleet usually omits
+`transport_msg_id`. When that metadata is absent, or the id cannot be bound
+to this delivery, the frame omits `transport_msg_id` (the key is absent, not
 null). That id is not the local `HistoryRecord.msg_id` and not the ADR 0029
 application id (`msg_id` on a decoded signed-group message, and on `mention`
 frames). History backfill frames omit `transport_msg_id`. The event promises
