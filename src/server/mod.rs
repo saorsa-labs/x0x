@@ -50,10 +50,11 @@ use routes::{
     ack_diagnostics, acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add,
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
     add_named_group_member, add_task, agent_info, agent_reachability, agent_sign,
-    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
-    apply_direct_kv_store_delta, apply_named_group_metadata_event_inner_serialized, apply_upgrade,
-    approve_join_request, ban_group_member, bootstrap_cache_stats, broadcast_current_manifest,
-    cancel_join_request, causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
+    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_completed_upgrade,
+    announce_identity, apply_direct_kv_store_delta,
+    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
+    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
+    causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
     connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
@@ -480,6 +481,9 @@ pub async fn serve_with_options(
         pid = std::process::id(),
         "x0xd started"
     );
+    // #1106: report a self-update that the previous process applied, once,
+    // at WARN level ("x0xd upgraded from X to Y").
+    announce_completed_upgrade(&config.data_dir);
 
     // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
     // by the binary (see `run_update_check_and_report`) before it ever calls

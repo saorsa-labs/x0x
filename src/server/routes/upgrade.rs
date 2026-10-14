@@ -724,7 +724,54 @@ pub(in crate::server) fn rollout_scheduler_for(state: &AppState) -> Arc<RolloutS
 /// At start, report a completed self-update once at WARN level:
 /// "x0xd upgraded from X to Y" (#1106). The previous version comes from the
 /// handoff record that the old process wrote before it exited.
-pub(in crate::server) fn announce_completed_upgrade(_data_dir: &std::path::Path) {}
+///
+/// The line is written once per handoff transaction: the reported
+/// transaction is kept in `upgrade-rollout.json`, so a later restart of the
+/// same binary (for example a crash loop) does not repeat it. A stale
+/// handoff record from an older upgrade says nothing.
+pub(in crate::server) fn announce_completed_upgrade(data_dir: &std::path::Path) {
+    let handoff_path = data_dir.join(x0x::upgrade::restart::HANDOFF_FILE_NAME);
+    let Ok(handoff) = x0x::upgrade::restart::UpgradeHandoff::read(&handoff_path) else {
+        return;
+    };
+    if handoff.to_version != x0x::VERSION {
+        return;
+    }
+    let state_path = RolloutState::path_in(data_dir);
+    let (mut state, problem) = RolloutState::load(&state_path);
+    if let Some(problem) = problem {
+        tracing::warn!(
+            path = %state_path.display(),
+            aside = ?problem.aside,
+            reason = %problem.reason,
+            "Staged-rollout state is unreadable; every release starts a fresh wait"
+        );
+    }
+    let Some(notice) = state.take_upgrade_notice(
+        &handoff.from_version,
+        &handoff.to_version,
+        handoff.started_at,
+        x0x::VERSION,
+    ) else {
+        return;
+    };
+    tracing::warn!(
+        from_version = %notice.from_version,
+        to_version = %notice.to_version,
+        mode = ?handoff.mode,
+        handoff_started_at = notice.started_at,
+        "x0xd upgraded from {} to {}",
+        notice.from_version,
+        notice.to_version
+    );
+    if let Err(e) = state.save(&state_path) {
+        tracing::debug!(
+            path = %state_path.display(),
+            error = %e,
+            "Failed to record the reported upgrade; a restart may report it again"
+        );
+    }
+}
 
 /// Offer a verified release to the staged rollout, and apply it when this
 /// node's wait is served (#1106, ADR 0094 §1). Returns the applied version

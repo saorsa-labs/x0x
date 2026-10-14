@@ -82,6 +82,10 @@ pub(crate) struct AppliedSummaryLine<'a> {
     pub exit: &'a str,
 }
 
+/// Bounded pause before a supervised exit so the non-blocking log writer can
+/// write the WARN summary line (#1106).
+const SUPERVISED_EXIT_LOG_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How the process leaves after an applied upgrade, for the summary line.
 /// `restart_now` is false when the HTTP handler restarts after its response.
 pub(crate) fn exit_description(
@@ -103,8 +107,11 @@ pub(crate) fn exit_description(
 }
 
 /// Emit the one summary line per applied upgrade (#1106).
+///
+/// WARN level on purpose: fleet units run `RUST_LOG=warn`, and before this
+/// line no upgrade step was visible at that level (self-update audit Q4).
 pub(crate) fn log_applied_summary(line: &AppliedSummaryLine<'_>) {
-    info!(
+    warn!(
         trigger = line.trigger,
         from_version = line.from,
         to_version = line.to,
@@ -434,20 +441,24 @@ impl AutoApplyUpgrader {
             &target_version,
             &temp_dir,
         )?;
-        let (result, backup_path) = match swap {
+        let (result, backup_path, swap_label) = match swap {
             SwapOutcome::Swapped { backup_path } => (
                 UpgradeResult::Success {
                     version: target_version.to_string(),
                 },
                 Some(backup_path),
+                "performed",
             ),
             SwapOutcome::AlreadyInstalled => (
                 UpgradeResult::Success {
                     version: target_version.to_string(),
                 },
                 super::latest_versioned_backup(&target_path, current_version_str),
+                "already_installed",
             ),
-            SwapOutcome::RolledBack { reason } => (UpgradeResult::RolledBack { reason }, None),
+            SwapOutcome::RolledBack { reason } => {
+                (UpgradeResult::RolledBack { reason }, None, "rolled_back")
+            }
         };
 
         // Clean up temp dir
@@ -470,6 +481,31 @@ impl AutoApplyUpgrader {
                  replacement readiness has not been observed yet",
                 target_version
             );
+            // #1106: the one WARN summary line of this applied upgrade,
+            // written before the restart so the fleet log keeps it.
+            let backup_display = backup_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let exit = exit_description(
+                restart_plan.mode,
+                restart_plan.supervised_exit_code,
+                self.restart_on_success,
+            );
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: self
+                    .apply_summary
+                    .trigger
+                    .map(RolloutTrigger::as_str)
+                    .unwrap_or("unknown"),
+                from: current_version_str,
+                to: &target_version.to_string(),
+                sender: self.apply_summary.sender.as_deref().unwrap_or("unknown"),
+                delay_secs: self.apply_summary.delay_secs,
+                swap: swap_label,
+                backup: &backup_display,
+                exit: &exit,
+            });
             if self.restart_on_success {
                 if let Err(e) = self.trigger_restart(
                     &restart_plan,
@@ -553,6 +589,10 @@ impl AutoApplyUpgrader {
                      replacement readiness is observed by the supervisor, not by x0xd",
                     exit_code
                 );
+                // The daemon's stdout log writer is non-blocking (#600), and
+                // `process::exit` runs no destructors. Give the writer thread
+                // a short, bounded moment to write the summary line (#1106).
+                std::thread::sleep(SUPERVISED_EXIT_LOG_DRAIN);
                 std::process::exit(exit_code);
             }
             restart::RestartMode::TransactionalHandoff => restart::begin_transactional_handoff(
