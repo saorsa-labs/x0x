@@ -1460,6 +1460,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_host_lock_works_on_a_read_only_lock_file() {
+        // Codex R1: a second service account may only read a lock file the
+        // first account created; flock needs no write access.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        drop(HostUpgradeLock::try_acquire(&target).unwrap().unwrap());
+        let lock_path = HostUpgradeLock::lock_path_for(&target);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let held = HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("a read-only lock file still locks");
+        assert!(HostUpgradeLock::try_acquire(&target).unwrap().is_none());
+        drop(held);
+    }
+
     #[test]
     fn two_writers_on_one_install_swap_once_and_keep_a_versioned_backup() {
         // x0xd and x0xd-443 share /opt/x0x/x0xd and apply the same release

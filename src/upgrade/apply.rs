@@ -79,6 +79,9 @@ pub struct ApplySummary {
 pub struct SharedInstallGate {
     /// This daemon's participant record key.
     pub own_key: String,
+    /// D185 `now=true`: other participants' remaining waits do not stop
+    /// the swap; their holds and every record check still do.
+    pub skip_waits: bool,
 }
 
 /// A swapped install whose restart still has to run (#1106 review F3).
@@ -453,6 +456,7 @@ impl AutoApplyUpgrader {
                 &gate.own_key,
                 &target_version,
                 now_unix,
+                gate.skip_waits,
             ) {
                 Ok(ParticipantGate::AllDue { stale }) => {
                     for record in stale {

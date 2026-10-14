@@ -1732,10 +1732,8 @@ pub async fn serve_with_options(
         bg_tasks.push(heartbeat);
     } else if configured_for_self_update {
         if let Ok(exe) = x0x::upgrade::apply::current_binary_path() {
-            let key = x0x::upgrade::participants::participant_key(&config.data_dir);
-            if let Err(e) = x0x::upgrade::participants::remove_own(&exe, &key) {
-                tracing::debug!(error = %e, "Failed to remove this daemon's participant record");
-            }
+            let node_id = *state.agent.machine_id().as_bytes();
+            routes::register_updates_off_participant(&exe, &node_id, &config.data_dir).await;
         }
     }
 

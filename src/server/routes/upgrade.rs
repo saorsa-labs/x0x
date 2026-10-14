@@ -465,7 +465,7 @@ fn publish_participant_record(env: &RolloutEnv, inner: &RolloutInner) {
         inner.state.blocked.clone(),
     );
     let key = x0x::upgrade::participants::participant_key(&env.data_dir);
-    if let Err(e) = x0x::upgrade::participants::write_own(target, &key, &record) {
+    if let Err(e) = x0x::upgrade::participants::write_own_unlocked(target, &key, &record) {
         tracing::debug!(
             error = %e,
             "Failed to write the shared-install participant record; a swap will be refused"
@@ -919,6 +919,7 @@ fn rollout_env_for(state: &AppState) -> RolloutEnv {
             ),
             shared_install_gate: Some(x0x::upgrade::apply::SharedInstallGate {
                 own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+                skip_waits: false,
             }),
         }),
         install_target: x0x::upgrade::apply::current_binary_path().ok(),
@@ -1633,6 +1634,32 @@ async fn store_upgrade_response(
     upgrade_response(status, body)
 }
 
+/// Keep this daemon in the shared-install participant set while it runs with
+/// self-update off (review R1).
+pub(in crate::server) async fn register_updates_off_participant(
+    target: &std::path::Path,
+    _node_id: &[u8; 32],
+    data_dir: &std::path::Path,
+) {
+    let key = x0x::upgrade::participants::participant_key(data_dir);
+    if let Ok(Some(lock)) = x0x::upgrade::HostUpgradeLock::try_acquire(target) {
+        if let Err(e) = x0x::upgrade::participants::remove_own(&lock, target, &key) {
+            tracing::debug!(error = %e, "Failed to remove this daemon's participant record");
+        }
+    }
+}
+
+/// The shared-install gate of an HTTP apply. `bypass` is D185 `now=true`.
+pub(in crate::server) fn http_install_gate(
+    data_dir: &std::path::Path,
+    bypass: bool,
+) -> Option<x0x::upgrade::apply::SharedInstallGate> {
+    (!bypass).then(|| x0x::upgrade::apply::SharedInstallGate {
+        own_key: x0x::upgrade::participants::participant_key(data_dir),
+        skip_waits: false,
+    })
+}
+
 /// Query of `POST /upgrade/apply`.
 #[derive(Debug, Default, serde::Deserialize)]
 pub(in crate::server) struct ApplyUpgradeQuery {
@@ -1832,14 +1859,7 @@ pub(in crate::server) async fn apply_upgrade(
             delay_secs: staged.delay_secs,
             bypass: staged.bypass.is_some(),
         })
-        // D185: now=true moves every instance on this install early, so it
-        // skips the participant gate too; the host lock and every swap
-        // check stay.
-        .with_shared_install_gate(staged.bypass.is_none().then(|| {
-            x0x::upgrade::apply::SharedInstallGate {
-                own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
-            }
-        }));
+        .with_shared_install_gate(http_install_gate(&state.data_dir, staged.bypass.is_some()));
 
     match upgrader.apply_upgrade_prepared(&release.manifest).await {
         Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
@@ -2188,6 +2208,8 @@ mod tests {
         let read = || -> x0x::upgrade::participants::ParticipantRecord {
             serde_json::from_slice(&std::fs::read(&path).expect("record written")).unwrap()
         };
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        assert!(wait_until(|| path.exists(), Duration::from_secs(10)).await);
         assert_eq!(read().staged, None, "registered at start, nothing staged");
         assert_eq!(read().machine_id, hex::encode(id));
 
@@ -2201,6 +2223,7 @@ mod tests {
         else {
             panic!("a 60-minute window stages the release");
         };
+        assert!(wait_until(|| read().staged.is_some(), Duration::from_secs(10)).await);
         let stage = read().staged.expect("the staged release is published");
         assert_eq!(stage.release, version);
         assert!(!stage.due);
@@ -2213,7 +2236,14 @@ mod tests {
             )
             .await
         );
-        assert!(read().staged.expect("still staged").due, "published as due");
+        assert!(
+            wait_until(
+                || read().staged.is_some_and(|s| s.due),
+                Duration::from_secs(10)
+            )
+            .await,
+            "published as due"
+        );
     }
 
     /// A node whose 60-minute-window delay for `version` is in `range`.
@@ -2522,6 +2552,68 @@ mod tests {
             .offer_now(&manifest_with_version(&version_newer_than_current()), "api")
             .await;
         assert!(matches!(offer, RolloutOffer::Blocked { .. }), "{offer:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn participant_records_change_only_under_the_host_lock() {
+        // Codex R1: registration, refresh and removal must take the host
+        // lock, so a writer that holds it sees a frozen participant set.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        // Another writer holds the host transaction lock.
+        let held = x0x::upgrade::HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the test takes the host lock");
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [8; 32], 60, applier, Some(target.clone()));
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !path.exists(),
+            "no participant record may appear while another writer holds the lock"
+        );
+        drop(held);
+        assert!(
+            wait_until(|| path.exists(), Duration::from_secs(30)).await,
+            "the record is written once the lock is free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_with_updates_off_keeps_its_participant_record() {
+        // Codex R1: removing a running daemon's record when its updates are
+        // off hid it from the other writers on the install.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        register_updates_off_participant(&target, &[9; 32], dir.path()).await;
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        let record: x0x::upgrade::participants::ParticipantRecord =
+            serde_json::from_slice(&std::fs::read(&path).expect("the record stays")).unwrap();
+        assert!(!record.updates_enabled);
+        assert_eq!(record.machine_id, hex::encode([9u8; 32]));
+    }
+
+    #[test]
+    fn a_now_request_keeps_the_participant_holds() {
+        // Codex R5 / D185: now=true skips the other participants' WAITS
+        // only; their holds and record checks still run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let gate = http_install_gate(dir.path(), true).expect("the gate stays on now=true");
+        assert!(gate.skip_waits);
+        let normal = http_install_gate(dir.path(), false).expect("the ordinary gate");
+        assert!(!normal.skip_waits);
     }
 
     #[test]

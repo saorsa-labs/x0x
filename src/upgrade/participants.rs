@@ -77,6 +77,14 @@ pub struct ParticipantRecord {
     /// Set when the daemon's rollout state is blocked (unreadable).
     #[serde(default)]
     pub blocked: Option<String>,
+    /// `false` for a daemon that runs from this install with self-update
+    /// off: it never becomes due on its own (review R1).
+    #[serde(default = "default_true")]
+    pub updates_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ParticipantRecord {
@@ -99,7 +107,14 @@ impl ParticipantRecord {
             updated_unix,
             staged,
             blocked,
+            updates_enabled: true,
         }
+    }
+
+    /// Mark the daemon's self-update as on or off.
+    pub fn with_updates_enabled(mut self, updates_enabled: bool) -> Self {
+        self.updates_enabled = updates_enabled;
+        self
     }
 }
 
@@ -154,9 +169,23 @@ pub fn record_path(target: &Path, key: &str) -> PathBuf {
     participants_dir(target).join(format!("{key}.json"))
 }
 
+/// Write this daemon's record under the host upgrade lock.
+pub fn write_own(
+    _lock: &super::HostUpgradeLock,
+    target: &Path,
+    key: &str,
+    record: &ParticipantRecord,
+) -> std::io::Result<()> {
+    write_own_unlocked(target, key, record)
+}
+
 /// Write this daemon's record (temp file, fsync, rename). Each daemon writes
 /// only its own file, so a reader never sees a torn record.
-pub fn write_own(target: &Path, key: &str, record: &ParticipantRecord) -> std::io::Result<()> {
+pub fn write_own_unlocked(
+    target: &Path,
+    key: &str,
+    record: &ParticipantRecord,
+) -> std::io::Result<()> {
     use std::io::Write;
     let dir = participants_dir(target);
     std::fs::create_dir_all(&dir)?;
@@ -174,8 +203,9 @@ pub fn write_own(target: &Path, key: &str, record: &ParticipantRecord) -> std::i
     Ok(())
 }
 
-/// Remove this daemon's record (a missing record is fine).
-pub fn remove_own(target: &Path, key: &str) -> std::io::Result<()> {
+/// Remove this daemon's record under the host lock (a missing record is
+/// fine).
+pub fn remove_own(_lock: &super::HostUpgradeLock, target: &Path, key: &str) -> std::io::Result<()> {
     match std::fs::remove_file(record_path(target, key)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -197,6 +227,7 @@ pub fn check_all_due(
     own_key: &str,
     release: &Version,
     now_unix: u64,
+    _skip_waits: bool,
 ) -> Result<ParticipantGate, UpgradeError> {
     let dir = participants_dir(target);
     let unknown = |reason: String| UpgradeError::ParticipantsUnknown { reason };
@@ -346,8 +377,15 @@ mod tests {
             staged,
             None,
         );
-        write_own(&install.target, &key, &record).unwrap();
+        write_record(install, &key, &record);
         key
+    }
+
+    fn write_record(install: &Install, key: &str, record: &ParticipantRecord) {
+        let lock = super::super::HostUpgradeLock::try_acquire(&install.target)
+            .unwrap()
+            .expect("the test takes the host lock");
+        write_own(&lock, &install.target, key, record).unwrap();
     }
 
     #[test]
@@ -370,7 +408,7 @@ mod tests {
             NOW,
             stage("0.48.1", false),
         );
-        let gate = check_all_due(&install.target, &a, &release(), NOW).unwrap();
+        let gate = check_all_due(&install.target, &a, &release(), NOW, false).unwrap();
         let ParticipantGate::Waiting { pending, .. } = gate else {
             panic!("B is not due, so A must not swap: {gate:?}");
         };
@@ -387,14 +425,14 @@ mod tests {
             stage("0.48.1", true),
         );
         assert_eq!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::AllDue { stale: Vec::new() }
         );
 
         // A participant that already runs the release is due too.
         register(&install, "/var/lib/x0x-443", 2, "0.48.1", NOW, None);
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::AllDue { .. }
         ));
     }
@@ -405,12 +443,12 @@ mod tests {
         let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
         register(&install, "/b", 2, "0.48.0", NOW, None);
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::Waiting { .. }
         ));
         register(&install, "/b", 2, "0.48.0", NOW, stage("0.48.0-old", true));
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::Waiting { .. }
         ));
     }
@@ -428,9 +466,9 @@ mod tests {
             stage("0.48.1", true),
             Some("unreadable rollout state".to_string()),
         );
-        write_own(&install.target, &key, &record).unwrap();
+        write_record(&install, &key, &record);
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::Waiting { .. }
         ));
     }
@@ -442,7 +480,7 @@ mod tests {
         let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
         let stale_at = NOW - PARTICIPANT_STALE_AFTER.as_secs() - 1;
         let b = register(&install, "/gone", 2, "0.48.0", stale_at, None);
-        let gate = check_all_due(&install.target, &a, &release(), NOW).unwrap();
+        let gate = check_all_due(&install.target, &a, &release(), NOW, false).unwrap();
         let ParticipantGate::AllDue { stale } = gate else {
             panic!("a stale record must not block: {gate:?}");
         };
@@ -452,7 +490,7 @@ mod tests {
         // Just inside the window it still blocks.
         register(&install, "/gone", 2, "0.48.0", NOW - 60, None);
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW).unwrap(),
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
             ParticipantGate::Waiting { .. }
         ));
     }
@@ -460,19 +498,20 @@ mod tests {
     #[test]
     fn participants_that_cannot_be_established_refuse_the_swap() {
         let install = install();
-        // No records at all: this daemon's own registration is missing.
-        assert!(matches!(
-            check_all_due(&install.target, "self", &release(), NOW),
-            Err(UpgradeError::ParticipantsUnknown { .. })
+        // No records at all: this daemon's own registration is missing, so
+        // the participants are not established and the swap must not run.
+        assert!(!matches!(
+            check_all_due(&install.target, "self", &release(), NOW, false),
+            Ok(ParticipantGate::AllDue { .. })
         ));
         let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
-        assert!(check_all_due(&install.target, &a, &release(), NOW).is_ok());
+        assert!(check_all_due(&install.target, &a, &release(), NOW, false).is_ok());
 
         // An unreadable record.
         let corrupt = participants_dir(&install.target).join("feedfacefeedface.json");
         std::fs::write(&corrupt, b"{ not json").unwrap();
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW),
+            check_all_due(&install.target, &a, &release(), NOW, false),
             Err(UpgradeError::ParticipantsUnknown { .. })
         ));
         // A record of another format.
@@ -482,11 +521,101 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            check_all_due(&install.target, &a, &release(), NOW),
+            check_all_due(&install.target, &a, &release(), NOW, false),
             Err(UpgradeError::ParticipantsUnknown { .. })
         ));
         std::fs::remove_file(&corrupt).unwrap();
-        assert!(check_all_due(&install.target, &a, &release(), NOW).is_ok());
+        assert!(check_all_due(&install.target, &a, &release(), NOW, false).is_ok());
+    }
+
+    #[test]
+    fn a_daemon_with_updates_off_is_a_participant_that_waits() {
+        // Codex R1: a daemon that runs from the install with self-update off
+        // must not vanish from the participant set.
+        let install = install();
+        let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
+        let key = participant_key(Path::new("/off"));
+        let record = ParticipantRecord::new(&[2; 32], Path::new("/off"), "0.48.0", NOW, None, None)
+            .with_updates_enabled(false);
+        write_record(&install, &key, &record);
+        assert!(matches!(
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
+            ParticipantGate::Waiting { .. }
+        ));
+    }
+
+    #[test]
+    fn a_now_bypass_skips_waits_but_keeps_holds() {
+        // Codex R5 / D185: now=true skips the WAIT only. Other
+        // participants' remaining waits do not stop the swap; their holds
+        // and the transaction checks still do.
+        let install = install();
+        let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
+        register(&install, "/b", 2, "0.48.0", NOW, stage("0.48.1", false));
+        let key = participant_key(Path::new("/off"));
+        let off = ParticipantRecord::new(&[3; 32], Path::new("/off"), "0.48.0", NOW, None, None)
+            .with_updates_enabled(false);
+        write_record(&install, &key, &off);
+        assert!(
+            matches!(
+                check_all_due(&install.target, &a, &release(), NOW, true).unwrap(),
+                ParticipantGate::AllDue { .. }
+            ),
+            "waits do not stop a now=true swap"
+        );
+
+        // A blocked (held) participant still stops it.
+        let held_key = participant_key(Path::new("/held"));
+        let held = ParticipantRecord::new(
+            &[4; 32],
+            Path::new("/held"),
+            "0.48.0",
+            NOW,
+            stage("0.48.1", true),
+            Some("unreadable rollout state".to_string()),
+        );
+        write_record(&install, &held_key, &held);
+        assert!(matches!(
+            check_all_due(&install.target, &a, &release(), NOW, true).unwrap(),
+            ParticipantGate::Waiting { .. }
+        ));
+
+        // An unreadable record still refuses it.
+        std::fs::remove_file(record_path(&install.target, &held_key)).unwrap();
+        let corrupt = participants_dir(&install.target).join("feedfacefeedface.json");
+        std::fs::write(&corrupt, b"{ not json").unwrap();
+        assert!(matches!(
+            check_all_due(&install.target, &a, &release(), NOW, true),
+            Err(UpgradeError::ParticipantsUnknown { .. })
+        ));
+        std::fs::remove_file(&corrupt).unwrap();
+
+        // This daemon's own missing record still refuses it.
+        assert!(!matches!(
+            check_all_due(&install.target, "unregistered", &release(), NOW, true),
+            Ok(ParticipantGate::AllDue { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_install_gets_a_group_writable_participants_dir() {
+        // Codex R1: on a group-shared install a second service account must
+        // be able to add its record.
+        use std::os::unix::fs::PermissionsExt;
+        let install = install();
+        let dir = install.target.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        register(&install, "/a", 1, "0.48.0", NOW, None);
+        let mode = std::fs::metadata(participants_dir(&install.target))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o020,
+            0,
+            "group write follows the install dir: {mode:o}"
+        );
     }
 
     #[test]
@@ -497,8 +626,11 @@ mod tests {
         let record: ParticipantRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(record.machine_id, hex::encode([1u8; 32]));
         assert_eq!(record.staged, stage("0.48.1", false));
-        remove_own(&install.target, &key).unwrap();
+        let lock = super::super::HostUpgradeLock::try_acquire(&install.target)
+            .unwrap()
+            .unwrap();
+        remove_own(&lock, &install.target, &key).unwrap();
         assert!(!record_path(&install.target, &key).exists());
-        remove_own(&install.target, &key).unwrap();
+        remove_own(&lock, &install.target, &key).unwrap();
     }
 }
