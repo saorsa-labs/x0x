@@ -498,6 +498,32 @@ async fn write_participant_record_locked(
     }
 }
 
+/// Why a queued apply attempt for `version` must not run (review R6).
+fn attempt_must_not_apply(inner: &RolloutInner, version: &str) -> Option<&'static str> {
+    if inner
+        .applied
+        .as_deref()
+        .is_some_and(|applied| !is_newer(version, applied))
+    {
+        return Some("already applied");
+    }
+    if inner.state.blocked.is_some() {
+        return Some("staged-rollout state is blocked");
+    }
+    if inner
+        .state
+        .newest_release(x0x::VERSION)
+        .is_some_and(|active| is_newer(&active.version, version))
+    {
+        return Some("superseded by a newer staged release");
+    }
+    match inner.state.entry(version) {
+        Some(entry) if entry.is_due() || entry.bypass.is_some() => None,
+        Some(_) => Some("its staged-rollout wait is not served"),
+        None => Some("no longer staged"),
+    }
+}
+
 fn is_participant_wait(
     result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
 ) -> bool {
@@ -802,14 +828,20 @@ impl RolloutScheduler {
         let attempt = || {
             let summary = summary.clone();
             async move {
-                let already = {
+                // Review R6: this attempt holds the apply lock now, and it
+                // may have queued on it (or on the #1196 retry window).
+                // Recheck under the lock, before any download or swap.
+                let skip = {
                     let inner = self.inner.lock().await;
-                    inner
-                        .applied
-                        .as_deref()
-                        .is_some_and(|applied| !is_newer(&manifest.version, applied))
+                    attempt_must_not_apply(&inner, &manifest.version)
                 };
-                if already {
+                if let Some(reason) = skip {
+                    tracing::info!(
+                        version = %manifest.version,
+                        reason,
+                        "Staged apply of v{} cancelled before download",
+                        manifest.version
+                    );
                     return Ok(x0x::upgrade::UpgradeResult::NoUpgrade);
                 }
                 self.env.applier.apply(manifest, summary).await
