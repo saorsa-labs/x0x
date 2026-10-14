@@ -2187,12 +2187,30 @@ mod tests {
         applier: Arc<dyn RolloutApplier>,
         install_target: Option<PathBuf>,
     ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
+        test_scheduler_locked(
+            data_dir,
+            node_id,
+            window_minutes,
+            applier,
+            install_target,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    fn test_scheduler_locked(
+        data_dir: &std::path::Path,
+        node_id: [u8; 32],
+        window_minutes: u64,
+        applier: Arc<dyn RolloutApplier>,
+        install_target: Option<PathBuf>,
+        upgrade_apply_lock: Arc<Mutex<()>>,
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
         let (shutdown_tx, shutdown_watch) = watch::channel(false);
         let scheduler = RolloutScheduler::new(RolloutEnv {
             node_id,
             window_minutes,
             data_dir: data_dir.to_path_buf(),
-            upgrade_apply_lock: Arc::new(Mutex::new(())),
+            upgrade_apply_lock,
             shutdown_watch,
             applier,
             install_target,
@@ -2685,6 +2703,55 @@ mod tests {
         assert!(gate.skip_waits);
         let normal = http_install_gate(dir.path(), false).expect("the ordinary gate");
         assert!(!normal.skip_waits);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_older_attempt_does_not_apply_after_a_newer_release_is_staged() {
+        // Codex R6: the older waiter is due but waits for the in-process
+        // apply lock (an HTTP apply holds it). Meanwhile a newer release is
+        // staged. When the lock frees, the older attempt must not apply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let older = version_newer_than_current();
+        let newer = {
+            let mut v = semver::Version::parse(&older).unwrap();
+            v.patch += 1;
+            v.to_string()
+        };
+        let id = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let r = x0x::upgrade::rollout::StagedRollout::new(id, 60);
+                r.calculate_delay_for_version(&older).as_secs() < 300
+                    && r.calculate_delay_for_version(&newer).as_secs() > 900
+            })
+            .expect("a node that is due soon for the older release only");
+        let lock = Arc::new(Mutex::new(()));
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_locked(dir.path(), id, 60, applier.clone(), None, Arc::clone(&lock));
+        let held = lock.lock().await;
+        let RolloutOffer::Waiting(first) = scheduler
+            .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+            .await
+        else {
+            panic!("the older release waits");
+        };
+        // The older wait is served; its attempt queues on the apply lock.
+        tokio::time::sleep(first.delay() + Duration::from_secs(5)).await;
+        assert_eq!(applier.attempts(), 0);
+        assert!(matches!(
+            scheduler
+                .offer(&manifest_with_version(&newer), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Waiting(_)
+        ));
+        drop(held);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            applier.attempts(),
+            0,
+            "a superseded attempt must not reach the download or swap"
+        );
     }
 
     #[test]
