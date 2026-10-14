@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
+
 - **Stored reads and backfill hide a revoked or Blocked author (#1229).**
   The row stays in the store and in the cache. A later read serves it again
   when that author is allowed. There is no wire change and no stored-format
@@ -73,8 +75,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
