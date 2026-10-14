@@ -11,7 +11,7 @@
 
 ## Context
 
-#1329 (`ec9fb505`) partly fixes #1105. The invite-only W3-H arm stays RED. #1105 stays open. The consent gate is unchanged.
+#1329 (`ec9fb505`) partly fixes #1105. Before D272, the invite-only W3-H arm was RED.
 
 Consent requires no local revocation, then a Known contact or a current `GroupInvite` grant on the authenticated machine. Blocked still wins. The bootstrap roster is not consent. The same gate covers catch-up. The Accepted record requires the signing admin and one linked revision. Its bytes stay unchanged (D258).
 
@@ -29,7 +29,7 @@ Consent requires no local revocation, then a Known contact or a current `GroupIn
 
 ## Decision
 
-Use option 2. Not implemented. Each check must hold.
+Use option 2. Each check must hold.
 
 1. `is_agent_revoked` runs first. Error: `public-group bootstrap sender is revoked`.
 2. The shared resolver, alias included, finds an installed group. Otherwise today's gate applies. Error: `public-group bootstrap sender is not a known contact`.
@@ -54,7 +54,7 @@ Do not offer an owner-axis roster head that every receiver at this version refus
 
 ### Negative / Trade-offs
 
-- Until acceptance and implementation, invite-only stays RED and #1105 stays open.
+- The file is not folded.
 
 ### Neutral / Operational
 
@@ -62,8 +62,8 @@ Do not offer an owner-axis roster head that every receiver at this version refus
 
 ## Validation
 
-`w3h_1105_invite_only_restart_has_no_catchup_consent` stays RED. A later change must still refuse an unknown install, a non-admin, a non-committer, a larger gap, a roster change, and a revoked newcomer.
+`w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin` is the invite-only arm. A later change must still refuse an unknown install, a non-admin, a non-committer, a larger gap, a roster change, and a revoked newcomer.
 
 ## Notes for AI-assisted work
 
-Must not mark this Accepted. Fold only when David asks (D258).
+Fold only when David asks (D258).
