@@ -65,6 +65,12 @@ All notable changes to this project will be documented in this file.
     place. A superseded or already-finalized poll uses the same
     bookkeeping-only cleanup, so a newer attempt and its inviter pin
     stay. Those exits do not count a timeout.
+  - The finalizer clears that attempt's inviter pin while it still
+    holds the attempt registry mutex. A new join can record the same
+    key as soon as the mutex drops, and that new pin stays.
+  - Self-removal retires the matching attempt before the apply
+    returns. A re-invite on that process does not wait for the join
+    poll's next tick.
 
 ## [v0.48.0] - 2026-10-13
 

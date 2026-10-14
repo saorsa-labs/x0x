@@ -2374,6 +2374,20 @@ async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -
     }
     let after_removal = wa_owner_removes_j2(&s, true).await?;
     assert_eq!(after_removal.after, "no_row");
+    assert!(
+        !s.j2
+            .pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .contains_key(&key),
+        "#1191: self-removal retires the matching attempt before the poll's next tick \
+         (timeout_before_removal={timeout_before_removal})"
+    );
+    assert!(
+        super::super::expected_join_result_inviter(&s.j2, &key).is_none(),
+        "#1191: self-removal clears the matching inviter pin \
+         (timeout_before_removal={timeout_before_removal})"
+    );
     super::super::poll_join_result_until_membership_confirmed(
         Arc::clone(&s.j2),
         s.group_key.clone(),

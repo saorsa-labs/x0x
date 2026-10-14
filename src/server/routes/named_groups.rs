@@ -13119,6 +13119,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 ) {
                     return ApplyMetadataResult::REJECTED;
                 }
+                // #1191: the join poll retires a superseded attempt on its
+                // next tick (up to `JOIN_RESULT_POLL_INTERVAL`, plus a fetch
+                // that can block for the ack timeout). A re-invite in that
+                // gap is `409 join_already_pending`. Retire the matching
+                // attempt here, while this apply still holds the membership
+                // lock, so the gap closes when the removal becomes durable.
+                retire_join_attempts_after_self_removal(
+                    state,
+                    &resolved_group_key,
+                    info.stable_group_id(),
+                    &info.mls_group_id,
+                    &local_agent_hex,
+                )
+                .await;
                 // #876 r3 (review finding 3): the group is gone — its
                 // parked role updates die with it.
                 for alias in &cache_aliases {
@@ -36507,6 +36521,10 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
     // (a registered attempt with no stored volley).
     let mut fetch_only = false;
+    // The legacy TimedOut owner has no registry entry. It still clears its
+    // pin after this lock drops. An owned entry clears its pin inside the
+    // lock (#1191).
+    let mut clear_pin_after_release = false;
     let (mut polls, mut tasks, listener_token) = {
         let mut attempts = state
             .pending_join_attempts
@@ -36519,6 +36537,10 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             let Some(mut entry) = attempts.remove(&expected_key) else {
                 return JoinFinalizeDisposition::NotApplicable;
             };
+            // #1191: clear this attempt's pin before the registry mutex
+            // drops. The superseded exit holds no membership lock, so a new
+            // join can record the same key in any gap after this remove.
+            clear_expected_join_result_inviter(state, &expected_key);
             fetch_only = entry.stored_resend.is_none();
             (
                 std::mem::take(&mut entry.polls),
@@ -36554,6 +36576,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                         if !stub_pending {
                             return JoinFinalizeDisposition::NotApplicable;
                         }
+                        clear_pin_after_release = true;
                         (Vec::new(), Vec::new(), None)
                     }
                 },
@@ -36563,7 +36586,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     state
         .control_blobs
         .cancel_attempt(event_group_id, member_agent_id, attempt_id);
-    clear_expected_join_result_inviter(state, &expected_key);
+    if clear_pin_after_release {
+        clear_expected_join_result_inviter(state, &expected_key);
+    }
     // #477 (r7 item 3): abort every owned poll/task EXCEPT the finalizer's
     // own task — the timeout owner IS a registered poll whose handle sits
     // in `polls`; aborting itself here would cancel the cleanup below at
@@ -36646,6 +36671,54 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         }
     }
     JoinFinalizeDisposition::Finalized
+}
+
+/// #1191: self-removal drops the local group before the join poll's next
+/// tick. Retire every matching attempt now. The caller holds the group's
+/// membership lock (`JoinFinalizeGuard::HeldByCaller`).
+async fn retire_join_attempts_after_self_removal(
+    state: &AppState,
+    resolved_group_key: &str,
+    stable_group_id: &str,
+    mls_group_id: &str,
+    member_agent_id: &str,
+) {
+    let aliases = [resolved_group_key, stable_group_id, mls_group_id];
+    let targets: Vec<(String, String, String)> = {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts
+            .iter()
+            .filter(|(key, entry)| {
+                *key == &join_result_key(&entry.invite_group_id, member_agent_id)
+                    && aliases.iter().any(|alias| {
+                        entry.local_group_key.eq_ignore_ascii_case(alias)
+                            || entry.invite_group_id.eq_ignore_ascii_case(alias)
+                    })
+            })
+            .map(|(_, entry)| {
+                (
+                    entry.local_group_key.clone(),
+                    entry.invite_group_id.clone(),
+                    entry.attempt_id.clone(),
+                )
+            })
+            .collect()
+    };
+    for (local_group_key, event_group_id, attempt_id) in targets {
+        finalize_join_attempt(
+            state,
+            &local_group_key,
+            &event_group_id,
+            member_agent_id,
+            &attempt_id,
+            JoinAttemptOutcome::Seated,
+            JoinFinalizeGuard::HeldByCaller,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -39844,6 +39917,8 @@ async fn poll_join_result_until_membership_confirmed(
         // #1191: a removed group or an existing outcome can leave this
         // attempt registered. Use bookkeeping-only finalization. Its
         // attempt-id comparison preserves a newer attempt and its pin.
+        // Self-removal also retires the matching attempt inside the apply,
+        // so a re-invite does not wait for this tick.
         finalize_join_attempt(
             state.as_ref(),
             &group_id,

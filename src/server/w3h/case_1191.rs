@@ -6,16 +6,17 @@
 //!    plane hello is dropped, so J's first join times out with no carry and
 //!    no local row. A's roster still seats J.
 //! 2. J redeems a fresh invite whose base already seats J. J reports
-//!    `active` and installs no TreeKEM group. The poll then runs to its
-//!    120 s deadline while that seat still wins.
-//! 3. The drop lifts. A removes J and the removal is delivered. A mints
+//!    `active` and installs no TreeKEM group.
+//! 3. Two arms then remove J. The timeout arm waits out the 130 s keyless
+//!    poll. The superseded arm removes J about 30 s after the redeem, so
+//!    the poll exits before its deadline.
+//! 4. The drop lifts. A removes J and the removal is delivered. A mints
 //!    another invite and J posts `POST /groups/join` on the same process.
-//! 4. A few seconds later, the case checks that a newly started attempt is
-//!    still the current one (a late finalizer of the ended attempt must
-//!    not erase it).
+//! 5. A few seconds later, J must hold a TreeKEM group, report `active`,
+//!    and be listed by A. A `join_state` string alone does not pass.
 //!
-//! Baseline on main: the re-invite is 409 `join_already_pending`.
-//! Fixed: the POST is accepted and the new attempt survives that tick.
+//! Baseline on main: the re-invite is 409 `join_already_pending` on both
+//! arms. Fixed: both POSTs are accepted and J completes the secure join.
 
 #![cfg(test)]
 
@@ -37,7 +38,38 @@ const FINAL: &str = "reinvite_starts_a_new_attempt";
 /// `JOIN_RESULT_POLL_TIMEOUT` plus margin for the poll that started inside
 /// the redeem barrier.
 const POLL_DEADLINE: Duration = Duration::from_secs(130);
+/// Long enough for the poll to be running, and short of its deadline.
+const SUPERSEDED_WAIT: Duration = Duration::from_secs(30);
 const LATER_TICK: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy)]
+enum ExitLeg {
+    /// Remove J after the keyless poll deadline.
+    TimeoutFirst,
+    /// Remove J about 30 s after the redeem, before the deadline.
+    Superseded,
+}
+
+impl ExitLeg {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TimeoutFirst => "timeout",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    fn wait(self) -> Duration {
+        match self {
+            Self::TimeoutFirst => POLL_DEADLINE,
+            Self::Superseded => SUPERSEDED_WAIT,
+        }
+    }
+}
+
+struct LegOutcome {
+    pending: bool,
+    secured: bool,
+}
 
 fn at(sim: &Sim) -> u128 {
     sim.fabric().now().as_micros()
@@ -142,7 +174,7 @@ async fn listed(sim: &Sim, label: &str, group: &str, agent: &str) -> Result<bool
         .any(|id| id == agent))
 }
 
-async fn scenario(sim: &Sim, receipt: &mut Receipt) -> Result<()> {
+async fn scenario(sim: &Sim, receipt: &mut Receipt, leg: ExitLeg) -> Result<LegOutcome> {
     mesh(sim, &["A", "J"]).await?;
     let group = create_group(sim, "A").await?;
     let block = AwayFromJ::install(sim)?;
@@ -211,24 +243,43 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
 
-    sim.within("keyless poll deadline", POLL_DEADLINE + secs(10), async {
-        tokio::time::sleep(POLL_DEADLINE).await;
+    let wait = leg.wait();
+    let (wait_name, evidence_name) = match leg {
+        ExitLeg::TimeoutFirst => (
+            "keyless poll deadline",
+            "after the keyless poll deadline J is still active and still has no TreeKEM group",
+        ),
+        ExitLeg::Superseded => (
+            "superseded-leg pause before the poll deadline",
+            "30s after the base-seated redeem J is still active, still keyless, and the attempt is still registered",
+        ),
+    };
+    sim.within(wait_name, wait + secs(10), async {
+        tokio::time::sleep(wait).await;
     })
     .await?;
     let still_active = membership(sim, "J", &group).await?;
     let still_keyless = !has_treekem(sim, &group).await?;
-    let after_deadline = attempt_ids(sim, &group)?;
+    let after_wait = attempt_ids(sim, &group)?;
+    let wait_ok = match leg {
+        ExitLeg::TimeoutFirst => still_active.as_deref() == Some("active") && still_keyless,
+        ExitLeg::Superseded => {
+            still_active.as_deref() == Some("active") && still_keyless && !after_wait.is_empty()
+        }
+    };
     receipt.evidence(
-        "after the keyless poll deadline J is still active and still has no TreeKEM group",
-        still_active.as_deref() == Some("active") && still_keyless,
+        evidence_name,
+        wait_ok,
         format!(
-            "membership={still_active:?} treekem={} attempts={after_deadline:?}",
+            "leg={} membership={still_active:?} treekem={} attempts={after_wait:?}",
+            leg.name(),
             !still_keyless
         ),
         at(sim),
     );
     receipt.note(format!(
-        "attempts after the keyless deadline (main keeps them): {after_deadline:?}"
+        "{} attempts before removal (main keeps them): {after_wait:?}",
+        leg.name()
     ));
 
     block.set(false);
@@ -242,21 +293,26 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt) -> Result<()> {
         .await?;
     ensure!(
         remove_status.is_success(),
-        "remove-member: {remove_status} {remove_body}"
+        "{} remove-member: {remove_status} {remove_body}",
+        leg.name()
     );
-    sim.until("J applies A's removal", secs(60), async |s| {
-        let gone_on_j = membership(s, "J", &group)
-            .await
-            .ok()
-            .is_some_and(|state| state.as_deref() != Some("active"));
-        let gone_on_a = listed(s, "A", &group, &j).await.ok() == Some(false);
-        gone_on_j && gone_on_a
-    })
+    sim.until(
+        &format!("{}: J applies A's removal", leg.name()),
+        secs(60),
+        async |s| {
+            let gone_on_j = membership(s, "J", &group)
+                .await
+                .ok()
+                .is_some_and(|state| state.as_deref() != Some("active"));
+            let gone_on_a = listed(s, "A", &group, &j).await.ok() == Some(false);
+            gone_on_j && gone_on_a
+        },
+    )
     .await?;
     let j_after = membership(sim, "J", &group).await?;
     let a_still = listed(sim, "A", &group, &j).await?;
     receipt.request_delivered(
-        "J applied A's MemberRemoved",
+        &format!("{}: J applied A's MemberRemoved", leg.name()),
         j_after.as_deref() != Some("active") && !a_still,
         format!("j_membership={j_after:?} a_lists_j={a_still}"),
         at(sim),
@@ -276,53 +332,76 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt) -> Result<()> {
     if pending {
         receipt.cause(
             "POST /groups/join returns 409 join_already_pending",
-            Some(format!("{status} {body}")),
+            Some(format!("{} {status} {body}", leg.name())),
             true,
             at(sim),
         );
     }
     let accepted = status.is_success() && body["ok"] != false && !pending;
     let started = attempt_ids(sim, &group)?;
-    let mut erased = false;
+    let mut secured = false;
     if accepted {
-        sim.within("later finalizer tick", LATER_TICK + secs(5), async {
-            tokio::time::sleep(LATER_TICK).await;
-        })
+        sim.within(
+            &format!("{}: later finalizer tick", leg.name()),
+            LATER_TICK + secs(5),
+            async {
+                tokio::time::sleep(LATER_TICK).await;
+            },
+        )
         .await?;
         let later = attempt_ids(sim, &group)?;
         let keyed = has_treekem(sim, &group).await?;
         let member = membership(sim, "J", &group).await?;
         let reseated = listed(sim, "A", &group, &j).await?;
-        erased = !started.is_empty()
-            && later.is_empty()
-            && !keyed
-            && member.as_deref() != Some("active")
-            && !reseated;
+        secured = keyed && member.as_deref() == Some("active") && reseated;
         receipt.note(format!(
-            "new attempt ids at accept={started:?} after {later:?} keyed={keyed} \
-             membership={member:?} a_lists_j={reseated} erased={erased}"
+            "{}: attempt ids at accept={started:?} after {later:?} keyed={keyed} \
+             membership={member:?} a_lists_j={reseated} secured={secured}",
+            leg.name()
         ));
     }
-    receipt.note(format!("reinvite status={status} body={body}"));
-    let passed = accepted && !erased && (!started.is_empty() || body["join_state"].is_string());
-    receipt.finish(FINAL, passed, at(sim));
-    Ok(())
+    receipt.note(format!(
+        "{}: reinvite status={status} body={body}",
+        leg.name()
+    ));
+    Ok(LegOutcome { pending, secured })
 }
 
 async fn run() -> Receipt {
     let mut receipt = Receipt::new(CASE, SEED);
-    match Sim::start(CASE, SEED, &["A", "J"]).await {
-        Ok(sim) => {
-            if let Err(error) = scenario(&sim, &mut receipt).await {
-                receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
+    let mut all_secured = true;
+    for (index, leg) in [ExitLeg::TimeoutFirst, ExitLeg::Superseded]
+        .into_iter()
+        .enumerate()
+    {
+        let seed = SEED + index as u64;
+        match Sim::start(CASE, seed, &["A", "J"]).await {
+            Ok(sim) => {
+                match scenario(&sim, &mut receipt, leg).await {
+                    Ok(outcome) => all_secured &= outcome.secured && !outcome.pending,
+                    Err(error) => {
+                        all_secured = false;
+                        receipt.infra(
+                            format!("{}: {error:#}", leg.name()),
+                            sim.fabric().now().as_micros(),
+                        );
+                    }
+                }
+                if let Err(error) = sim.finish().await {
+                    all_secured = false;
+                    receipt.infra(format!("{} finish: {error:#}", leg.name()), 0);
+                }
             }
-            if let Err(error) = sim.finish().await {
-                receipt.infra(format!("finish: {error:#}"), 0);
+            Err(error) => {
+                all_secured = false;
+                receipt.infra(format!("{} sim: {error:#}", leg.name()), 0);
             }
         }
-        Err(error) => receipt.infra(format!("sim: {error:#}"), 0),
     }
-    if receipt.verdict().is_none() || receipt.has_infra() {
+    if receipt.verdict().is_none() {
+        receipt.finish(FINAL, all_secured && !receipt.has_infra(), 0);
+    }
+    if receipt.has_infra() {
         receipt.reclassify(FINAL);
     }
     receipt.emit();
