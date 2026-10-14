@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The panic scanner reports a production panic after a closed test item
+  (#1254).** It used to treat every line after a file's first `#[cfg(test)]`
+  as test code. A span is now test-only when a test attribute is identified
+  and that item's closing delimiter is matched. An unclosed or uncertain
+  span stays production, so a later `unwrap`, `expect`, or `panic!` is
+  reported.
 - **Corrected the revoke documentation (#1108).** The single-id form of
   `POST /identity/revoke` supports the daemon's own agent, not its machine or
   an owner-authorized third-party revocation. The API reference and CLI/handler
@@ -140,12 +146,6 @@ A minor release. It removes one unused public module and changes two public file
 
 ### Fixed
 
-- **The panic scanner reports a production panic after a closed test item
-  (#1254).** It used to treat every line after a file's first `#[cfg(test)]`
-  as test code. A span is now test-only when a test attribute is identified
-  and that item's closing delimiter is matched. An unclosed or uncertain
-  span stays production, so a later `unwrap`, `expect`, or `panic!` is
-  reported.
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
   results. A cached cross-plane peer passed the dial, the plane gate (#206)
