@@ -34,8 +34,8 @@ Core capabilities in this tree are:
 
 Target capabilities are:
 
-- Projects. A project is one group, the shared data that group may use, and the agents shared into that work. The proposed record is [T-projects-and-agent-rental](../transient/T-projects-and-agent-rental.md).
-- Agent rental. Rental is time-bounded use of a shared agent through ShareGrant expiry and revocation. This Proposed text would leave rental in scope and would stop the billing exclusion from ruling it out. It adds no price, invoice or marketplace. David has not accepted it.
+- Projects. A project is one group, the shared data that group may use, and the agents shared into that work. David accepted the record (D275, 14 Oct 2026) and did not fold it: [T-projects-and-agent-rental](../transient/T-projects-and-agent-rental.md). No project type is shipped.
+- Agent rental. Rental is time-bounded use of a shared agent through ShareGrant expiry and revocation. David accepted this amendment (D275, 14 Oct 2026). The billing exclusion no longer rules rental out. Rental adds no price, invoice or marketplace. It is not shipped.
 - Scoped scratchpads.
 - The complete resource envelope for network traffic, CPU, memory, disk and idle cost. [A06](A06-r01-gossip-relay-roles-and-resource-limits.md) keeps that envelope incomplete.
 
@@ -49,7 +49,7 @@ Peers that can still reach each other keep their messages and the authorized sha
 
 Machine connectivity does not mean unrestricted access to the machine. A peer still needs permission for each protected service.
 
-x0x does not host a model, settle payments, or define the meaning of an agent task. Agent rental is a target in the list above. This Proposed text would leave rental in scope. David has not accepted it. Rental would be time-bounded access through an expiring, revocable ShareGrant. It would add no price, invoice or marketplace to x0xd.
+x0x does not host a model, settle payments, or define the meaning of an agent task. Agent rental is a target in the list above. David accepted that amendment (D275, 14 Oct 2026). Rental is time-bounded access through an expiring, revocable ShareGrant. It adds no price, invoice or marketplace to x0xd. It is not shipped.
 
 Voice and video are a vision target for people and their agents. Checked at commit `86a1d395`, the optional `voice` feature (`src/voice/mod.rs`) is a two-party audio library (`X0xSignaling`, `X0xLinkTransport`). Call routes (`src/server/routes/calls.rs`) cover lifecycle only. Video remains future work. Implementation stays sequenced. The current parked priority remains in force, so this text starts no new media slice. Rich collaborative text remains parked. Existing code continues to receive required security and bug fixes.
 
@@ -59,7 +59,7 @@ New core requirements do not automatically lift a parked work item or an impleme
 
 A transport-only product would leave identity sharing, durable agent delivery and group recovery to each application. This would duplicate important security work.
 
-A complete hosted agent platform would expand x0x into model operation, payment settlement and application task semantics. We will keep model hosting, payment settlement and task meaning outside x0xd. Under this Proposed text, that limit would leave agent rental in scope. Rental stays a ShareGrant target. David has not accepted this text.
+A complete hosted agent platform would expand x0x into model operation, payment settlement and application task semantics. We will keep model hosting, payment settlement and task meaning outside x0xd. David accepted the amendment that leaves agent rental in scope (D275, 14 Oct 2026). Rental stays a ShareGrant target. It is not shipped.
 
 ## Consequences
 
@@ -98,6 +98,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
-Shipped claims in the 13 October 2026 vision text were checked on 14 October 2026 at commit `86a1d395` on `origin/main`. Grant caps are `ShareCap` in `src/share_grant.rs` (`Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`). Presets are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). The agent card route is `get_a2a_agent_card` in `src/server/routes/identity.rs`. Voice is `X0xSignaling` and `X0xLinkTransport` in `src/voice/mod.rs`, behind feature `voice`. Call routes in `src/server/routes/calls.rs` cover lifecycle only. Projects, rental and scratchpads stay targets.
+Shipped claims in the 13 October 2026 vision text were checked on 14 October 2026 at commit `86a1d395` on `origin/main`. Grant caps are `ShareCap` in `src/share_grant.rs` (`Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`). Presets are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). The agent card route is `get_a2a_agent_card` in `src/server/routes/identity.rs`. Voice is `X0xSignaling` and `X0xLinkTransport` in `src/voice/mod.rs`, behind feature `voice`. Call routes in `src/server/routes/calls.rs` cover lifecycle only. Projects, rental and scratchpads stay targets. David accepted these amendments (D275, 14 Oct 2026). This slot stays Proposed. This note does not fold them into a new revision.
 
 [All 15 ADRs](README.md)

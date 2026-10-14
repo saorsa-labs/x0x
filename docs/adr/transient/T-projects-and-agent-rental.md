@@ -1,6 +1,6 @@
 # T-projects-and-agent-rental: a project is a group, shared data and shared agents
 
-- **Status:** Proposed
+- **Status:** Accepted (David, D275, 14 Oct 2026, slot A01, PR #1405)
 - **Target slot:** A01
 - **Date:** 2026-10-13
 - **Decision owners:** David Irvine (direction, 13 Oct 2026)
