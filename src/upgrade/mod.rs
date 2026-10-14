@@ -26,10 +26,6 @@ pub const MAX_BINARY_SIZE_BYTES: u64 = 200 * 1024 * 1024;
 /// The holder releases the lock when its apply returns or its process exits.
 pub const HOST_UPGRADE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// A versioned backup younger than this is never pruned: an in-flight
-/// transactional handoff may still need it.
-pub const BACKUP_PRUNE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
-
 /// Outcome of a host-locked binary swap (#1106).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwapOutcome {
@@ -165,66 +161,6 @@ pub fn latest_versioned_backup(target: &Path, from_version: &str) -> Option<Path
         })
         .max()
         .map(|(_, path)| path)
-}
-
-/// Remove versioned backups of `target` that are older than the last
-/// known-good release (D194, review F6).
-///
-/// `known_good` is the release this process runs: it started and served, so
-/// its bytes are the last known-good copy. A backup is removed only when its
-/// name parses as `<binary>.backup-<release>-<sha8>`, `<release>` is older
-/// than `known_good`, it is not in `keep`, and it is older than `min_age`.
-/// So the known-good copy and every newer, not yet proven copy stay until a
-/// later release proves itself. The legacy `<binary>.backup`, unparseable
-/// names, other binaries' backups and operator copies are never touched.
-/// Best-effort.
-pub fn prune_versioned_backups(
-    target: &Path,
-    keep: &[&Path],
-    known_good: &Version,
-    min_age: std::time::Duration,
-) -> usize {
-    let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-        return 0;
-    };
-    let Some(dir) = target.parent() else {
-        return 0;
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let prefix = format!("{name}.backup-");
-    let now = std::time::SystemTime::now();
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if keep.contains(&path.as_path()) {
-            continue;
-        }
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = file_name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let older_than_known_good = rest
-            .rsplit_once('-')
-            .and_then(|(release, _sha8)| Version::parse(release).ok())
-            .is_some_and(|release| &release < known_good);
-        if !older_than_known_good {
-            continue;
-        }
-        let aged = entry
-            .metadata()
-            .ok()
-            .filter(std::fs::Metadata::is_file)
-            .and_then(|m| m.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= min_age);
-        if aged && std::fs::remove_file(&path).is_ok() {
-            info!(path = %path.display(), "Removed a versioned upgrade backup older than the known-good release");
-            removed += 1;
-        }
-    }
-    removed
 }
 
 /// fsync the directory that holds `path`, so a rename in it is durable.
@@ -731,12 +667,10 @@ impl Upgrader {
                     warn!(error = %e, "Failed to write the install record after the swap");
                 }
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
-                prune_versioned_backups(
-                    &self.target_path,
-                    &[backup_path.as_path()],
-                    &self.current_version,
-                    BACKUP_PRUNE_MIN_AGE,
-                );
+                // No automatic pruning (review R4): before ADR 0094 M2 there
+                // is no host-commit evidence for the last known-good pair
+                // (D194), so every versioned backup stays until an operator
+                // removes it.
                 Ok(SwapOutcome::Swapped { backup_path })
             }
             Err(replace_err) => {
@@ -1409,9 +1343,11 @@ mod tests {
             "the running release's backup is the last known-good copy"
         );
         assert_eq!(fs::read(&known_good).unwrap(), OLD_BYTES);
+        // Review R4: without host-commit evidence nothing is pruned, so the
+        // older copy stays too.
         assert!(
-            !ancient.exists(),
-            "a release older than the known-good one goes"
+            ancient.exists(),
+            "no backup is deleted without commit evidence"
         );
     }
 
