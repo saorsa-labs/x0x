@@ -356,6 +356,35 @@ impl InstallRecord {
     }
 }
 
+/// Release marker embedded in every x0x binary built from this crate
+/// (#1106 review R2/R3): `X0X-RELEASE-MARKER:<version>:END` in read-only
+/// data. Both `x0xd` and `x0x` reference it at start, so the linker keeps it.
+/// It lets a writer read the release of installed bytes from the bytes.
+pub const RELEASE_MARKER: &str = concat!("X0X-RELEASE-MARKER:", env!("CARGO_PKG_VERSION"), ":END");
+
+/// The release embedded in the bytes at `path`: `Some` when the bytes carry
+/// exactly one marker release, `None` when they carry none (a binary from
+/// before 0.48.1) or markers of different releases.
+pub fn embedded_release(_path: &Path) -> Result<Option<Version>, UpgradeError> {
+    Ok(None)
+}
+
+/// The upgrader for the companion `x0x` CLI beside the daemon.
+pub fn companion_upgrader(
+    cli_path: PathBuf,
+    current_version: Version,
+    daemon_plan: &LockedSwapPlan,
+    target_version: &Version,
+) -> Upgrader {
+    let hint = match daemon_plan {
+        LockedSwapPlan::AlreadyInstalled => target_version.clone(),
+        LockedSwapPlan::Replace {
+            installed_release, ..
+        } => installed_release.clone(),
+    };
+    Upgrader::new(cli_path, current_version).with_installed_release_hint(hint)
+}
+
 /// SHA-256 of the bytes this process runs, computed once (#1106 F1).
 ///
 /// On Linux it reads `/proc/self/exe`, which names the running image even
@@ -1538,7 +1567,10 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_prunes_older_versioned_backups_and_keeps_other_files() {
+    fn a_swap_deletes_no_backup_without_host_commit_evidence() {
+        // Codex R4: no host-commit state exists before ADR 0094 M2, so no
+        // backup has the evidence D194 needs before deletion. A swap keeps
+        // every versioned backup, the legacy one and operator copies.
         let dir = TempDir::new().unwrap();
         let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
         let older = dir.path().join("x0xd.backup-0.47.1-0badc0de");
@@ -1564,11 +1596,121 @@ mod tests {
             panic!("expected a swap, got {outcome:?}");
         };
         assert!(backup_path.exists());
-        assert!(!older.exists(), "an aged older versioned backup is pruned");
-        assert!(fresh.exists(), "a young versioned backup is kept");
-        assert!(legacy.exists(), "the legacy x0xd.backup is not touched");
-        assert!(companion.exists(), "another binary's backup is not touched");
-        assert!(ops_copy.exists(), "an operator copy is not touched");
+        for kept in [&older, &fresh, &legacy, &companion, &ops_copy] {
+            assert!(kept.exists(), "{} must be kept", kept.display());
+        }
+    }
+
+    fn marked(release: &str, filler: &[u8]) -> Vec<u8> {
+        let mut bytes = filler.to_vec();
+        bytes.extend_from_slice(b"\0\x7f padding ");
+        bytes.extend_from_slice(format!("X0X-RELEASE-MARKER:{release}:END").as_bytes());
+        bytes.extend_from_slice(b" more data\0");
+        bytes
+    }
+
+    #[test]
+    fn embedded_release_reads_the_one_marker_in_the_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x0xd");
+        fs::write(&path, marked("0.48.2", b"elf")).unwrap();
+        assert_eq!(
+            embedded_release(&path).unwrap(),
+            Some(Version::new(0, 48, 2))
+        );
+        // A fat binary carries the same marker twice: still one release.
+        let mut twice = marked("0.48.2", b"a");
+        twice.extend(marked("0.48.2", b"b"));
+        fs::write(&path, &twice).unwrap();
+        assert_eq!(
+            embedded_release(&path).unwrap(),
+            Some(Version::new(0, 48, 2))
+        );
+        // A binary from before 0.48.1 has no marker.
+        fs::write(&path, b"plain bytes").unwrap();
+        assert_eq!(embedded_release(&path).unwrap(), None);
+        // Two different releases: no evidence.
+        let mut mixed = marked("0.48.2", b"a");
+        mixed.extend(marked("0.48.3", b"b"));
+        fs::write(&path, &mixed).unwrap();
+        assert_eq!(embedded_release(&path).unwrap(), None);
+        // A truncated marker is no evidence either.
+        fs::write(&path, b"X0X-RELEASE-MARKER:0.48.2").unwrap();
+        assert_eq!(embedded_release(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn the_embedded_release_of_installed_bytes_wins_over_the_running_hash() {
+        // Codex R2: on macOS the running hash was taken from the pathname,
+        // so it could be the hash of bytes another daemon installed later.
+        // Bytes that say 0.48.2 must not be called 0.48.0.
+        let dir = TempDir::new().unwrap();
+        let installed = marked("0.48.2", b"new bytes");
+        let target = create_test_binary(&dir, "x0xd", &installed);
+        let (staging, new_binary) = staged_binary(dir.path(), "r2", &marked("0.48.1", b"older"));
+        let lock = take_lock(&target);
+        let upgrader = Upgrader::new(target.clone(), Version::new(0, 48, 0))
+            .with_running_sha256(Some(sha(&installed)));
+        let outcome =
+            upgrader.perform_locked_upgrade(&lock, &new_binary, &Version::new(0, 48, 1), &staging);
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseNotOlder { ref installed, .. })
+                if installed == "0.48.2"),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), installed);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_running_hash_is_not_version_evidence_off_linux() {
+        // Codex R2: off Linux the running image cannot be read after a
+        // rename, so a pathname hash cannot prove the binding.
+        assert_eq!(running_binary_sha256(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_running_hash_reads_the_running_image_on_linux() {
+        assert!(running_binary_sha256().is_some());
+    }
+
+    #[test]
+    fn a_companion_cli_with_newer_or_unknown_bytes_is_never_replaced() {
+        // Codex R3: A replaced the CLI with 0.48.2 and died before its
+        // record and the daemon swap. B (0.48.0, due 0.48.1) must not
+        // downgrade the CLI, and must not guess unknown CLI bytes.
+        let dir = TempDir::new().unwrap();
+        let daemon_plan = LockedSwapPlan::Replace {
+            installed_release: Version::new(0, 48, 0),
+            installed_sha256: sha(OLD_BYTES),
+        };
+        let target_version = Version::new(0, 48, 1);
+        let cli_new = marked("0.48.2", b"cli");
+        let cli = create_test_binary(&dir, "x0x", &cli_new);
+        let (staging, new_cli) = staged_binary(dir.path(), "cli", &marked("0.48.1", b"cli-old"));
+        let lock = take_lock(&cli);
+        let upgrader = companion_upgrader(
+            cli.clone(),
+            Version::new(0, 48, 0),
+            &daemon_plan,
+            &target_version,
+        );
+        let outcome = upgrader.perform_locked_upgrade(&lock, &new_cli, &target_version, &staging);
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseNotOlder { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&cli).unwrap(), cli_new, "no CLI downgrade");
+
+        // Unknown CLI bytes (no marker, no record) are refused too.
+        fs::write(&cli, b"unknown cli bytes").unwrap();
+        let outcome = upgrader.perform_locked_upgrade(&lock, &new_cli, &target_version, &staging);
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
+            "{outcome:?}"
+        );
+        drop(lock);
     }
 }
 

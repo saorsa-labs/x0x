@@ -13,8 +13,7 @@ use super::restart;
 use super::rollout::RolloutTrigger;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use super::{
-    HostUpgradeLock, LockedSwapPlan, SwapOutcome, UpgradeError, UpgradeResult, Upgrader,
-    HOST_UPGRADE_LOCK_WAIT,
+    HostUpgradeLock, SwapOutcome, UpgradeError, UpgradeResult, Upgrader, HOST_UPGRADE_LOCK_WAIT,
 };
 
 /// Removes an upgrade temp dir when dropped, so it is never leaked on an
@@ -549,12 +548,6 @@ impl AutoApplyUpgrader {
         // installed bytes, refuse the whole apply here.
         let daemon_plan =
             upgrader.plan_locked_swap(&host_lock, &extracted_path, &target_version)?;
-        let companion_release_hint = match &daemon_plan {
-            LockedSwapPlan::AlreadyInstalled => target_version.clone(),
-            LockedSwapPlan::Replace {
-                installed_release, ..
-            } => installed_release.clone(),
-        };
 
         // If we are upgrading x0xd, also check for companion x0x binary and upgrade it too.
         if self.binary_name == "x0xd" {
@@ -577,8 +570,12 @@ impl AutoApplyUpgrader {
                     // The CLI ships in the same archive as the daemon: with
                     // no install record of its own, it follows the daemon's
                     // installed release.
-                    let x0x_upgrader = Upgrader::new(x0x_path.clone(), current_version.clone())
-                        .with_installed_release_hint(companion_release_hint.clone());
+                    let x0x_upgrader = super::companion_upgrader(
+                        x0x_path.clone(),
+                        current_version.clone(),
+                        &daemon_plan,
+                        &target_version,
+                    );
                     match x0x_upgrader.perform_locked_upgrade(
                         &host_lock,
                         &extracted_x0x,
