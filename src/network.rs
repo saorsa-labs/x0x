@@ -4052,9 +4052,11 @@ impl NetworkNode {
             Err(poisoned) => poisoned.into_inner(),
         };
         // #1403 R2: apply the queued lifecycle events before the decision.
-        // A winner change (`Replaced`) voids a running clock and a legacy
-        // admission, also when ant-quic restores a superseded connection
-        // with its old generation number.
+        // A published winner change (`Replaced`) voids a running clock and
+        // a legacy admission, also when ant-quic later restores the
+        // superseded connection with its old generation number. A change
+        // that ant-quic has not published yet is not fenced: see the
+        // residual at `drain_plane_lifecycle` (D281, ant-quic#330).
         drain_plane_lifecycle(&self.plane_lifecycle, &mut map);
         plane_gate_step(
             &mut map,
@@ -6358,8 +6360,9 @@ fn plane_note_closed_in(
 /// connection with its old generation number (`WinnerUnavailableFallback`),
 /// so a generation match alone does not prove that the connection stayed
 /// the winner for the whole grace. ant-quic sends `Replaced` (with
-/// `Closing` and `Closed` for the old generation) when a new winner
-/// registers, so the drain sees a supersede before the restore.
+/// `Closing` and `Closed` for the old generation) when a new winner's outer
+/// registration runs. When that event is queued before the restore, the
+/// drain sees the supersede.
 ///
 /// - `Replaced` is a winner change. It drops the peer's
 ///   generation-bound entry (`Pending` or `LegacyCleared`), and the next
@@ -6371,6 +6374,21 @@ fn plane_note_closed_in(
 ///
 /// The drain only removes entries. It can delay a legacy admission, but it
 /// can never admit a peer.
+///
+/// Residual (partial fix, David D281; finish in 0.49 with ant-quic#330):
+/// the drain fences a winner change only after ant-quic has queued its
+/// `Replaced`. In ant-quic 0.27.60, B can supersede A (A stays open as a
+/// fallback), then B can close and ant-quic can restore A with the same
+/// generation, all before B's outer registration publishes `Replaced`.
+/// That registration waits for reader setup and for the connected-peer and
+/// stats write locks, and nothing bounds that wait. A gate read in this
+/// window has no event to drain, so it admits A from A's earlier Live
+/// period (an expired `Pending` clock or `LegacyCleared { A }`). If the
+/// delayed registration then reads A as the live snapshot again, and A is
+/// the last published generation, ant-quic sends no `Replaced` at all, so
+/// the A→B→A history is lost. A full fix binds the grace to ant-quic's
+/// Live-period epoch, which ant-quic#330 asks it to expose. The ignored
+/// tests `issue1403_unpublished_restore_*` model this case.
 fn drain_plane_lifecycle(
     receiver: &Mutex<Option<PlaneLifecycleReceiver>>,
     map: &mut HashMap<AntPeerId, PlanePeerState>,
@@ -7692,14 +7710,16 @@ mod tests {
     /// #1403 R2: ant-quic supersedes generation A with B and then restores
     /// A with the same generation number (`WinnerUnavailableFallback`).
     /// Model it in the fabric and return when A reads as the winner again.
+    /// `publish` says whether B's `Replaced` was queued before the restore.
     fn issue1403_supersede_then_restore(
         fabric: &sim::SimFabric,
         a: &NetworkNode,
         peer_b: &AntPeerId,
         generation: u64,
+        publish: bool,
     ) {
         let (old, new) = fabric
-            .supersede_link_for_test(&a.peer_id(), peer_b)
+            .supersede_link_for_test(&a.peer_id(), peer_b, publish)
             .expect("the pair has a link");
         assert_eq!(old, generation);
         assert_eq!(a.try_connection_generation(peer_b), Ok(Some(new)));
@@ -7732,7 +7752,7 @@ mod tests {
         );
         issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
 
-        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation);
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation, true);
         assert!(
             !a.plane_gate_allows(&peer_b),
             "a restored generation starts a new grace: its earlier Live period does not count"
@@ -7761,10 +7781,59 @@ mod tests {
             "generation A served the whole grace: legacy admission"
         );
 
-        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation);
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation, true);
         assert!(
             !a.plane_gate_allows(&peer_b),
             "a legacy admission does not survive supersede-then-restore"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403 residual (Codex re-review of 8dacc99; David D281: partial fix
+    /// now, finish in 0.49). Ignored until ant-quic#330 exposes the
+    /// Live-period epoch: this case FAILS with the current fix.
+    ///
+    /// A→B→restore A, but B's outer registration has not published
+    /// `Replaced` when the gate reads (ant-quic 0.27.60 does not bound that
+    /// wait). The gate has no event to drain, so a clock from A's earlier
+    /// Live period admits the restored A. To enable: bind the grace to the
+    /// ant-quic Live-period epoch, then remove `#[ignore]`.
+    #[ignore = "known #1403 residual; needs ant-quic#330 (Live-period accessor), D281"]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_unpublished_restore_restarts_a_running_clock() {
+        let plane = "issue1403-unpublished-restore-clock";
+        let (fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14035).await;
+        let (peer_b, generation) = issue1403_connect_generation(&a, b_addr).await;
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation, false);
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a restored generation starts a new grace, also before ant-quic publishes the supersede"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403 residual, `LegacyCleared` case. Ignored until ant-quic#330
+    /// (D281); see `issue1403_unpublished_restore_restarts_a_running_clock`.
+    #[ignore = "known #1403 residual; needs ant-quic#330 (Live-period accessor), D281"]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_unpublished_restore_does_not_keep_a_legacy_admission() {
+        let plane = "issue1403-unpublished-restore-legacy";
+        let (fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14036).await;
+        let (peer_b, generation) = issue1403_connect_generation(&a, b_addr).await;
+        assert!(!a.plane_gate_allows(&peer_b));
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+        assert!(a.plane_gate_allows(&peer_b), "legacy admission on A");
+
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation, false);
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a legacy admission does not survive an unpublished supersede-then-restore"
         );
 
         a.try_shutdown().await.unwrap();

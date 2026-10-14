@@ -434,12 +434,19 @@ impl SimFabric {
     }
 
     /// #1403 test hook: model an ant-quic supersede of the `a`–`b` link.
-    /// The pair's live generation moves to a new one, and both nodes get
-    /// the events that ant-quic's `register_connected_peer` sends for it:
-    /// `Replaced`, then `Closing` and `Closed` (reason `Superseded`) for the
-    /// old generation. Returns `(old, new)`, or `None` when the pair has no
+    /// The pair's live generation moves to a new one. With `publish`, both
+    /// nodes get the events that ant-quic's `register_connected_peer` sends
+    /// for it: `Replaced`, then `Closing` and `Closed` (reason `Superseded`)
+    /// for the old generation. Without `publish`, no event is sent: this
+    /// models an outer registration that has not run yet (#1403 residual,
+    /// ant-quic#330). Returns `(old, new)`, or `None` when the pair has no
     /// link.
-    pub(crate) fn supersede_link_for_test(&self, a: &PeerId, b: &PeerId) -> Option<(u64, u64)> {
+    pub(crate) fn supersede_link_for_test(
+        &self,
+        a: &PeerId,
+        b: &PeerId,
+        publish: bool,
+    ) -> Option<(u64, u64)> {
         let key = pair(a.0, b.0);
         let mut state = self.lock();
         let old = state.links.get(&key)?.generation;
@@ -447,6 +454,9 @@ impl SimFabric {
         state.next_generation = new.saturating_add(1);
         if let Some(link) = state.links.get_mut(&key) {
             link.generation = new;
+        }
+        if !publish {
+            return Some((old, new));
         }
         for (me, other) in [(a.0, b.0), (b.0, a.0)] {
             if let Some(slot) = state.nodes.get(&me) {
