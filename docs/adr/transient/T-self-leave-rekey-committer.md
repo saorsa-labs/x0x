@@ -1,6 +1,6 @@
 # T-self-leave-rekey-committer: who commits a TreeKEM self-leave
 
-- **Status:** Proposed
+- **Status:** Accepted (David, D274, 14 Oct 2026, slot A09, PR #1337). Acceptance includes the fork-quarantine consequence.
 - **Date:** 2026-10-13
 - **Target slot:** A09
 - **Decision owners:** David Irvine
