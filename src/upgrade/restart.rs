@@ -2344,8 +2344,8 @@ pub fn resolve_restart_plan(
         }
     }
 
-    // The swap writes `<executable>.backup` beside the target and the helper
-    // respawns from that directory. An install dir we cannot see is an
+    // The swap writes a versioned `<executable>.backup-<ver>-<sha8>` beside
+    // the target (#1106) and the helper respawns from that directory. An install dir we cannot see is an
     // unresolved contract, not something to discover mid-swap.
     let install_dir = executable
         .parent()
@@ -2414,7 +2414,9 @@ pub struct UpgradeHandoff {
     pub to_version: String,
     /// Path the new bytes were swapped into (the daemon's install path).
     pub target_path: PathBuf,
-    /// Path holding the previous binary (`x0xd.backup`).
+    /// Path holding the previous binary: the versioned
+    /// `x0xd.backup-<from_version>-<sha8>` (#1106), or the legacy
+    /// `x0xd.backup` when no versioned backup exists.
     pub backup_path: PathBuf,
     /// Full argv of the old process, including `argv[0]`. `argv[0]` is recorded
     /// for diagnosis only — the respawn always uses `target_path`.
@@ -2498,7 +2500,9 @@ impl UpgradeHandoff {
         serde_json::from_str(&std::fs::read_to_string(path)?).map_err(io_other)
     }
 
-    /// Backup path the swap created for this target (`x0xd.backup`).
+    /// The legacy single-slot backup name (`x0xd.backup`). The daemon swap
+    /// now writes a versioned backup (#1106) and the apply path records that
+    /// path instead; this name is the fallback when none exists.
     pub fn backup_path_for(target_path: &Path) -> PathBuf {
         target_path.with_extension("backup")
     }

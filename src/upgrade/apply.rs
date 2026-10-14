@@ -11,7 +11,9 @@ use super::manifest::{current_platform_target, ReleaseManifest};
 use super::restart;
 use super::rollout::RolloutTrigger;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
-use super::{UpgradeError, UpgradeResult, Upgrader};
+use super::{
+    HostUpgradeLock, SwapOutcome, UpgradeError, UpgradeResult, Upgrader, HOST_UPGRADE_LOCK_WAIT,
+};
 
 /// Removes an upgrade temp dir when dropped, so it is never leaked on an
 /// early-return error path (e.g. a failed binary replace on Windows, which
@@ -187,7 +189,7 @@ impl AutoApplyUpgrader {
     pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
         let target_path = current_binary_path()?;
         let plan = self.resolve_restart_plan(&target_path).await?;
-        self.trigger_restart(&plan, target_version)
+        self.trigger_restart(&plan, target_version, None)
     }
 
     /// Classify the restart mode for the current environment (I0).
@@ -317,6 +319,14 @@ impl AutoApplyUpgrader {
             return Ok(result);
         }
 
+        // #1106: one binary writer per host. Two daemons that share this
+        // executable (x0xd and x0xd-443) take the same OS lock, so only one
+        // downloads, backs up and swaps at a time. The lock is held through
+        // the restart below: a supervised exit or handoff releases it when
+        // this process exits; any other return drops it here.
+        let host_lock = HostUpgradeLock::acquire(&target_path, HOST_UPGRADE_LOCK_WAIT).await?;
+        debug!(lock = %host_lock.path().display(), "Host upgrade lock held");
+
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
@@ -394,16 +404,51 @@ impl AutoApplyUpgrader {
                     warn!("Failed to extract companion x0x binary: {e}");
                 } else {
                     let x0x_upgrader = Upgrader::new(x0x_path.clone(), current_version.clone());
-                    match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
-                        Ok(_) => info!("x0x companion upgraded successfully"),
+                    match x0x_upgrader.perform_locked_upgrade(
+                        &host_lock,
+                        &extracted_x0x,
+                        &target_version,
+                        &temp_dir,
+                    ) {
+                        Ok(SwapOutcome::Swapped { backup_path }) => info!(
+                            backup = %backup_path.display(),
+                            "x0x companion upgraded successfully"
+                        ),
+                        Ok(SwapOutcome::AlreadyInstalled) => {
+                            info!("x0x companion already upgraded by another writer on this host")
+                        }
+                        Ok(SwapOutcome::RolledBack { reason }) => {
+                            warn!("Failed to upgrade x0x companion: {reason}")
+                        }
                         Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
                     }
                 }
             }
         }
 
-        // Replace binary (with backup + rollback)
-        let result = upgrader.perform_upgrade(&extracted_path, &target_version)?;
+        // Replace binary (versioned backup + rollback), or skip the swap when
+        // another writer on this host already installed these bytes.
+        let swap = upgrader.perform_locked_upgrade(
+            &host_lock,
+            &extracted_path,
+            &target_version,
+            &temp_dir,
+        )?;
+        let (result, backup_path) = match swap {
+            SwapOutcome::Swapped { backup_path } => (
+                UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
+                Some(backup_path),
+            ),
+            SwapOutcome::AlreadyInstalled => (
+                UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
+                super::latest_versioned_backup(&target_path, current_version_str),
+            ),
+            SwapOutcome::RolledBack { reason } => (UpgradeResult::RolledBack { reason }, None),
+        };
 
         // Clean up temp dir
         if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
@@ -426,7 +471,11 @@ impl AutoApplyUpgrader {
                 target_version
             );
             if self.restart_on_success {
-                if let Err(e) = self.trigger_restart(&restart_plan, &target_version.to_string()) {
+                if let Err(e) = self.trigger_restart(
+                    &restart_plan,
+                    &target_version.to_string(),
+                    backup_path.as_deref(),
+                ) {
                     warn!(
                         error = %e,
                         installed_bytes = true,
@@ -454,12 +503,24 @@ impl AutoApplyUpgrader {
     /// - `TransactionalHandoff` (genuinely unsupervised, including the default
     ///   `stop_on_upgrade = true` terminal launch) runs the helper, which
     ///   proves `/health` on the new binary or restores the backup.
+    ///
+    /// `backup_path` is this transaction's versioned backup (#1106). When it
+    /// is `None` (another writer swapped, or the HTTP path restarts later),
+    /// the newest versioned backup of the running version is used, and the
+    /// legacy `<exe>.backup` name only when none exists.
     fn trigger_restart(
         &self,
         plan: &restart::RestartPlan,
         target_version: &str,
+        backup_path: Option<&Path>,
     ) -> Result<(), UpgradeError> {
-        let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        let mut handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        if let Some(backup) = backup_path
+            .map(Path::to_path_buf)
+            .or_else(|| super::latest_versioned_backup(&plan.executable, crate::VERSION))
+        {
+            handoff.backup_path = backup;
+        }
         let handoff_path = plan.handoff_path();
 
         match plan.mode {

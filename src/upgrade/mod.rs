@@ -86,7 +86,13 @@ impl HostUpgradeLock {
                 path: path.clone(),
                 source,
             })?;
-        Ok(Some(Self { _file: file, path }))
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file, path })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => {
+                Err(UpgradeError::HostLock { path, source })
+            }
+        }
     }
 
     /// Take the lock, waiting at most `timeout` for another writer.
@@ -136,8 +142,76 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], UpgradeError> {
 }
 
 /// The newest versioned backup of `target` that `from_version` made, if any.
-pub fn latest_versioned_backup(_target: &Path, _from_version: &str) -> Option<PathBuf> {
-    None
+///
+/// The transactional handoff and the supervised-exit intent record name this
+/// path as `backup_path`. When this process did not swap (another writer on
+/// the host did), the other writer's backup of the same running version is
+/// the previous bytes.
+pub fn latest_versioned_backup(target: &Path, from_version: &str) -> Option<PathBuf> {
+    let name = target.file_name()?.to_string_lossy().into_owned();
+    let prefix = format!("{name}.backup-{from_version}-");
+    let dir = target.parent()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix)
+                && entry.file_type().is_ok_and(|t| t.is_file())
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, entry.path()))
+        })
+        .max()
+        .map(|(_, path)| path)
+}
+
+/// Remove older versioned backups of `target` and keep `keep` (D194: keep the
+/// previous binary, delete older ones). Only `<binary>.backup-*` files older
+/// than `min_age` are removed; the legacy `<binary>.backup`, other binaries'
+/// backups and operator copies are never touched. Best-effort.
+pub fn prune_versioned_backups(target: &Path, keep: &Path, min_age: std::time::Duration) -> usize {
+    let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return 0;
+    };
+    let Some(dir) = target.parent() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let prefix = format!("{name}.backup-");
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let aged = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if aged && std::fs::remove_file(&path).is_ok() {
+            info!(path = %path.display(), "Removed an older versioned upgrade backup");
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// fsync the directory that holds `path`, so a rename in it is durable.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Result of an upgrade attempt.
@@ -256,8 +330,60 @@ impl Upgrader {
 
     /// The versioned backup name for the bytes now at the target:
     /// `<binary>.backup-<running version>-<first 8 hex of their SHA-256>`.
-    pub fn versioned_backup_path(&self, _previous_sha256: &[u8; 32]) -> PathBuf {
-        self.target_path.with_extension("backup")
+    pub fn versioned_backup_path(&self, previous_sha256: &[u8; 32]) -> PathBuf {
+        let name = self
+            .target_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "x0xd".to_string());
+        self.target_path.with_file_name(format!(
+            "{name}.backup-{}-{}",
+            self.current_version,
+            hex::encode(&previous_sha256[..4])
+        ))
+    }
+
+    /// Copy the bytes now at the target to their versioned backup name.
+    ///
+    /// The copy is staged in `staging_dir`, fsynced, renamed into place and
+    /// the directory fsynced. An existing backup with the same name and
+    /// the same bytes is reused. A different file under that name is never
+    /// overwritten (ADR 0094 §3): the apply is refused before any swap.
+    fn create_versioned_backup(
+        &self,
+        previous_sha256: &[u8; 32],
+        staging_dir: &Path,
+    ) -> Result<PathBuf, UpgradeError> {
+        let backup_path = self.versioned_backup_path(previous_sha256);
+        let backup_failed = |source: std::io::Error| UpgradeError::BackupFailed {
+            path: backup_path.clone(),
+            source,
+        };
+        if backup_path.exists() {
+            if sha256_file(&backup_path)? == *previous_sha256 {
+                debug!(backup_path = %backup_path.display(), "Versioned backup already holds these bytes");
+                return Ok(backup_path);
+            }
+            return Err(backup_failed(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a different file already holds this versioned backup name; \
+                 refusing to overwrite a rollback copy",
+            )));
+        }
+        let staged = staging_dir.join("previous-binary");
+        std::fs::copy(&self.target_path, &staged).map_err(backup_failed)?;
+        std::fs::File::open(&staged)
+            .and_then(|f| f.sync_all())
+            .map_err(backup_failed)?;
+        if sha256_file(&staged)? != *previous_sha256 {
+            let _ = std::fs::remove_file(&staged);
+            return Err(backup_failed(std::io::Error::other(
+                "the installed binary changed while it was copied",
+            )));
+        }
+        std::fs::rename(&staged, &backup_path).map_err(backup_failed)?;
+        sync_parent_dir(&backup_path).map_err(backup_failed)?;
+        Ok(backup_path)
     }
 
     /// Host-locked swap (#1106): one writer per install.
@@ -273,12 +399,74 @@ impl Upgrader {
         _lock: &HostUpgradeLock,
         new_binary_path: &Path,
         target_version: &Version,
-        _staging_dir: &Path,
+        staging_dir: &Path,
     ) -> Result<SwapOutcome, UpgradeError> {
-        let backup_path = self.target_path.with_extension("backup");
-        match self.perform_upgrade(new_binary_path, target_version)? {
-            UpgradeResult::RolledBack { reason } => Ok(SwapOutcome::RolledBack { reason }),
-            _ => Ok(SwapOutcome::Swapped { backup_path }),
+        self.validate_upgrade(target_version)?;
+
+        let new_sha256 = sha256_file(new_binary_path)?;
+        let installed_sha256 = sha256_file(&self.target_path)?;
+        if new_sha256 == installed_sha256 {
+            info!(
+                target = %self.target_path.display(),
+                version = %target_version,
+                "Installed binary already matches the verified release; another \
+                 writer on this host swapped it, so this writer skips the swap"
+            );
+            return Ok(SwapOutcome::AlreadyInstalled);
+        }
+
+        let backup_path = self.create_versioned_backup(&installed_sha256, staging_dir)?;
+        info!(backup_path = %backup_path.display(), "Previous binary kept as a versioned backup");
+
+        info!("Replacing binary...");
+        match self.atomic_replace(new_binary_path) {
+            Ok(()) => {
+                if let Err(e) = sync_parent_dir(&self.target_path) {
+                    debug!(error = %e, "Directory fsync after the binary swap failed");
+                }
+                info!(version = %target_version, "Successfully upgraded to version {}", target_version);
+                prune_versioned_backups(&self.target_path, &backup_path, BACKUP_PRUNE_MIN_AGE);
+                Ok(SwapOutcome::Swapped { backup_path })
+            }
+            Err(replace_err) => {
+                warn!(error = %replace_err, "Binary replacement failed: {}", replace_err);
+                // A failed rename leaves the target as it was. Put the
+                // previous bytes back only if the target changed anyway.
+                if sha256_file(&self.target_path).ok() == Some(installed_sha256) {
+                    return Ok(SwapOutcome::RolledBack {
+                        reason: format!("Replacement failed: {replace_err}"),
+                    });
+                }
+                // Copy, then rename over the target: a rename is valid even
+                // when the target is a running executable, and the backup
+                // stays in place for the next attempt.
+                let restoring = staging_dir.join("restore-binary");
+                let restore = std::fs::copy(&backup_path, &restoring)
+                    .and_then(|_| std::fs::rename(&restoring, &self.target_path))
+                    .map_err(|source| UpgradeError::RestoreFailed {
+                        backup_path: backup_path.clone(),
+                        target_path: self.target_path.clone(),
+                        source,
+                    });
+                match restore {
+                    Ok(()) => Ok(SwapOutcome::RolledBack {
+                        reason: format!("Replacement failed: {replace_err}"),
+                    }),
+                    Err(restore_err) => {
+                        tracing::error!(
+                            error = %replace_err,
+                            rollback_error = %restore_err,
+                            "CRITICAL: Replacement failed ({}) AND rollback failed ({})",
+                            replace_err,
+                            restore_err
+                        );
+                        Err(UpgradeError::CriticalFailure {
+                            replace_error: replace_err.to_string(),
+                            rollback_error: restore_err.to_string(),
+                        })
+                    }
+                }
+            }
         }
     }
 
