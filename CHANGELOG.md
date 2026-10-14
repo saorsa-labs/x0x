@@ -152,6 +152,14 @@ All notable changes to this project will be documented in this file.
   send is reserved before the request is awaited. When no other active member
   remains, startup seals. Historical Removed rows with no live leaf do not
   start the wait. `T-self-leave-catchup-before-seal` (Proposed, slot A07).
+- **A self-leave fork uses the existing local quarantine clear.**
+  A stale self-leave rekey can sign a second child of the same parent and
+  set the ADR 0064 / ADR 0066 marker. The clear is local to this node. It
+  re-arms the evidence gate, so the next conflicting commit quarantines the
+  group again. An ordinary group (`no_anchor`) needs `force` and a reason
+  on `POST /groups/:id/quarantine/clear`, and the durable API token. The
+  clear does not roll the sealed TreeKEM epoch back.
+  `T-self-leave-fork-quarantine-recovery` (Proposed, slot A14).
 
 ## [v0.48.0] - 2026-10-13
 

@@ -3146,3 +3146,205 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
     );
     Ok(())
 }
+
+async fn deliver_conflicting_description(
+    fixture: &LeaveFixture,
+    parent: &x0x::groups::GroupInfo,
+    actor_hex: &str,
+    description: &str,
+) -> Result<bool> {
+    let mut sibling_meta = parent.public_meta();
+    sibling_meta.description = description.to_string();
+    let sibling = x0x::groups::GroupStateCommit::sign(
+        parent.stable_group_id().to_string(),
+        parent.state_revision.saturating_add(1),
+        Some(parent.state_hash.clone()),
+        x0x::groups::compute_roster_root(&parent.members_v2),
+        x0x::groups::compute_policy_hash(&parent.policy),
+        x0x::groups::compute_public_meta_hash(&sibling_meta),
+        parent.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        fixture.state.agent.identity().agent_keypair(),
+    )?;
+    let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: fixture.group_id.clone(),
+        revision: parent.state_revision.saturating_add(1),
+        actor: actor_hex.to_string(),
+        name: None,
+        description: Some(description.to_string()),
+        commit: Some(sibling),
+    };
+    let applied = apply_named_group_metadata_event(
+        &fixture.state,
+        event,
+        fixture.state.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    Ok(applied.accepted)
+}
+
+/// A conflicting description commit arrives on the metadata receive path.
+/// The existing clear lifts the local marker and re-arms the evidence gate.
+/// The next conflicting commit quarantines the group again. The sealed
+/// epoch stays.
+#[tokio::test]
+async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Result<()> {
+    let fixture = two_member_treekem_group_with_id("cf".repeat(16)).await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let lower_hex = {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_lower_admin(info, admin_id)
+    };
+
+    let event = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, event, fixture.member_id, true, None)
+            .await;
+    assert!(
+        applied.accepted,
+        "roster self-leave must apply before the fork: {applied:?}"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the higher admin must not seal the rekey"
+    );
+    let parent = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.remove_member(&lower_hex, Some(lower_hex.clone()));
+    }
+    startup_self_leave_rekey(&fixture.state).await;
+    let sealed_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        sealed_epoch > fixture.epoch_before,
+        "startup must seal once no other active member remains; before {}, after {sealed_epoch}",
+        fixture.epoch_before
+    );
+
+    let accepted = deliver_conflicting_description(
+        &fixture,
+        &parent,
+        &admin_hex,
+        "sibling-of-the-self-leave-rekey",
+    )
+    .await?;
+    assert!(
+        !accepted,
+        "the receive path must not adopt the conflicting description"
+    );
+    let quarantined = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    let marker = quarantined
+        .fork_quarantine
+        .as_ref()
+        .expect("the receive-path conflict must set the existing fork quarantine");
+    assert!(
+        marker.no_anchor,
+        "an ordinary TreeKEM group has no owner axis"
+    );
+    assert_eq!(marker.committed_by, admin_hex);
+    assert!(
+        reject_fork_quarantined(&fixture.state, &fixture.group_id, &quarantined).is_some(),
+        "a quarantined group must be refused"
+    );
+
+    let session = clear_group_quarantine(
+        State(Arc::clone(&fixture.state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: false }),
+        Path(fixture.group_id.clone()),
+        Json(ClearQuarantineRequest {
+            force: true,
+            reason: "a session token must not clear".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        session.status(),
+        StatusCode::FORBIDDEN,
+        "a session token must not clear fork quarantine"
+    );
+    {
+        let groups = fixture.state.named_groups.read().await;
+        assert!(
+            groups
+                .get(&fixture.group_id)
+                .expect("group")
+                .is_fork_quarantined(),
+            "a refused session clear must leave the marker"
+        );
+    }
+
+    let response = clear_group_quarantine(
+        State(Arc::clone(&fixture.state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(fixture.group_id.clone()),
+        Json(ClearQuarantineRequest {
+            force: true,
+            reason: "operator verified the canonical head before this local clear".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the durable force clear must lift the local marker: {body}"
+    );
+    let cleared = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    assert!(
+        !cleared.is_fork_quarantined(),
+        "the clear must remove the marker"
+    );
+    assert!(
+        reject_fork_quarantined(&fixture.state, &fixture.group_id, &cleared).is_none(),
+        "the local refusal must lift"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        sealed_epoch,
+        "the clear must leave the sealed epoch in place"
+    );
+
+    let accepted_again = deliver_conflicting_description(
+        &fixture,
+        &parent,
+        &admin_hex,
+        "second-conflict-after-the-clear",
+    )
+    .await?;
+    assert!(
+        !accepted_again,
+        "the later conflict must not replace the head"
+    );
+    let again = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    assert!(
+        again.is_fork_quarantined(),
+        "the clear re-arms the evidence gate, so the next conflict quarantines again"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        sealed_epoch,
+        "the later conflict must also leave the sealed epoch in place"
+    );
+    Ok(())
+}
