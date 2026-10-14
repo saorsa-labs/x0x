@@ -941,6 +941,7 @@ impl Drop for ForwarderDone {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_delivery_forwarder(
     slot: Arc<TopicDelivery>,
     deliveries: Arc<TopicDeliveryMap>,
