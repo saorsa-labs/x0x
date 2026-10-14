@@ -7263,6 +7263,183 @@ mod tests {
         b.try_shutdown().await.unwrap();
     }
 
+    /// #1403 fixture: two nodes on one plane of the W3-H simulation fabric
+    /// (no socket). A fault rule drops every plane hello, so each node sees
+    /// the other as a legacy peer: only the legacy grace can admit it.
+    async fn issue1403_legacy_pair(
+        plane: &str,
+        seed: u64,
+    ) -> (Arc<sim::SimFabric>, NetworkNode, NetworkNode, SocketAddr) {
+        let fabric = sim::SimFabric::new(seed);
+        fabric.add_rule(|write| {
+            if write.lane.class == sim::LaneClass::PlaneHello {
+                sim::Fault::Drop
+            } else {
+                sim::Fault::Pass
+            }
+        });
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        (fabric, a, b, SocketAddr::from(([198, 18, 0, 2], 5483)))
+    }
+
+    /// Let the background tasks (the plane gatekeeper) apply the events
+    /// that are already queued. Virtual time; the fabric is in memory.
+    async fn issue1403_settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fn issue1403_plane_entry(node: &NetworkNode, peer: &AntPeerId) -> Option<PlanePeerState> {
+        node.plane_peers.lock().unwrap().get(peer).copied()
+    }
+
+    /// Move the start of a pending legacy-grace clock back by `by`. The gate
+    /// uses `std::time::Instant`, which paused tokio time does not move.
+    fn issue1403_backdate_clock(node: &NetworkNode, peer: &AntPeerId, by: Duration) {
+        let mut map = node.plane_peers.lock().unwrap();
+        if let Some(PlanePeerState::Pending { since, .. }) = map.get_mut(peer) {
+            *since = since.checked_sub(by).expect("std Instant moves back 11 s");
+        }
+    }
+
+    /// #1403 (RED on main): the legacy-grace clock belongs to one connection
+    /// generation. x0x emits `PeerConnected` after the dial returns, so the
+    /// gatekeeper can apply it after the `Closed` of that connection. That
+    /// late event must not start a clock that the next generation inherits.
+    ///
+    /// Before the fix, the late event put `Pending { since: now }` with no
+    /// live connection, and generation 2 read `Admitted` at once: no hello
+    /// and no 10 s on generation 2.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_late_peer_connected_clock_does_not_admit_the_next_generation() {
+        let plane = "issue1403-late-peer-connected";
+        let (_fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 1403).await;
+
+        // Generation 1: connect, let the gatekeeper see it, then close it.
+        let peer_b = a.connect_addr(b_addr).await.unwrap();
+        assert_eq!(peer_b, b.peer_id());
+        issue1403_settle().await;
+        let first = a
+            .try_connection_generation(&peer_b)
+            .unwrap()
+            .expect("generation 1 is live");
+        a.disconnect(&peer_b).await.unwrap();
+        issue1403_settle().await;
+        assert_eq!(
+            a.try_connection_generation(&peer_b),
+            Ok(None),
+            "generation 1 is closed"
+        );
+        assert!(
+            issue1403_plane_entry(&a, &peer_b).is_none(),
+            "the gatekeeper applied Closed for generation 1"
+        );
+
+        // The late PeerConnected for generation 1, then more than the grace
+        // passes on any clock that it started.
+        plane_note_connected(
+            plane,
+            &a.plane_peers,
+            &a.plane_cleared_at,
+            &a.node,
+            peer_b.0,
+            false,
+        )
+        .await;
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+
+        // Generation 2: a fresh connection, read at once.
+        assert_eq!(a.connect_addr(b_addr).await.unwrap(), peer_b);
+        let second = a
+            .try_connection_generation(&peer_b)
+            .unwrap()
+            .expect("generation 2 is live");
+        assert_ne!(first, second, "the redial is a new connection generation");
+        assert_eq!(
+            a.peer_admission(&peer_b).await,
+            PeerAdmission::PlanePending,
+            "generation 2 has had no hello and no {PLANE_LEGACY_GRACE:?} of its own"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403 (RED on main): a gate read for a peer with no live connection
+    /// starts no clock. Time while the peer is disconnected never counts
+    /// toward the legacy grace.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_gate_read_on_a_disconnected_peer_starts_no_clock() {
+        let plane = "issue1403-disconnected-gate-read";
+        let (_fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14031).await;
+        let peer_b = b.peer_id();
+
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a disconnected legacy peer is not plane-allowed"
+        );
+        assert!(
+            issue1403_plane_entry(&a, &peer_b).is_none(),
+            "a gate read on a disconnected peer inserts nothing"
+        );
+
+        // Even if a clock had started, the next connection must not use it.
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+        assert_eq!(a.connect_addr(b_addr).await.unwrap(), peer_b);
+        assert_eq!(
+            a.peer_admission(&peer_b).await,
+            PeerAdmission::PlanePending,
+            "time while disconnected does not count toward the legacy grace"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403 guard (green before and after the fix): a legacy peer that
+    /// stays on one connection generation for the grace is still admitted,
+    /// and its next generation is gated again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_one_generation_still_gets_the_legacy_grace() {
+        let plane = "issue1403-legacy-grace-kept";
+        let (_fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14032).await;
+
+        let peer_b = a.connect_addr(b_addr).await.unwrap();
+        issue1403_settle().await;
+        assert_eq!(
+            a.peer_admission(&peer_b).await,
+            PeerAdmission::PlanePending,
+            "a new legacy connection waits for the grace"
+        );
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+        assert_eq!(
+            a.peer_admission(&peer_b).await,
+            PeerAdmission::Admitted,
+            "one generation that stayed the winner for the grace is admitted as legacy"
+        );
+
+        a.disconnect(&peer_b).await.unwrap();
+        issue1403_settle().await;
+        assert_eq!(a.connect_addr(b_addr).await.unwrap(), peer_b);
+        assert_eq!(
+            a.peer_admission(&peer_b).await,
+            PeerAdmission::PlanePending,
+            "the next generation of a legacy peer is gated again"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
     /// Boundary regression for ant-quic's transport-aware connected snapshot.
     ///
     /// The dependency's `constrained_peer_connectivity_surfaces_match_send_routing`
