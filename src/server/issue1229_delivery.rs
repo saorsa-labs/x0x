@@ -1,8 +1,9 @@
 //! #1229: history reads and direct SSE backfill re-check the sender.
 //!
-//! `/history`, point lookup, and search hide a refused author. Direct SSE
-//! backfill also hides a revoked originating machine and a revoked binding,
-//! and it checks each row when that event is emitted.
+//! `/history`, point lookup, and search hide a refused author, including
+//! `GET /history?scope=group:<id>` and the canonical group-message lookup.
+//! Direct SSE backfill also hides a revoked originating machine and a revoked
+//! binding, and it checks each row when that event is emitted.
 
 #![cfg(test)]
 
@@ -78,6 +79,63 @@ fn text_row(
         ingress_sender_agent: None,
         logical_request_id: None,
     }
+}
+
+/// A signed group-public row. `canonical_id` is the ADR-0029 message id.
+/// It is not the store dedupe id, so point lookup needs `?scope=group:`.
+fn signed_group_row(
+    group_id: &str,
+    author: &AgentKeypair,
+    body: &str,
+    seen_at_ms: i64,
+) -> Result<(HistoryRecord, String)> {
+    let message = crate::groups::GroupPublicMessage::sign(
+        group_id.to_string(),
+        "issue1229-state".to_string(),
+        1,
+        author,
+        None,
+        crate::groups::GroupPublicMessageKind::Chat,
+        body.to_string(),
+        u64::try_from(seen_at_ms).unwrap_or(0),
+        None,
+        None,
+        None,
+    )
+    .context("sign group public message")?;
+    let canonical_id = message.msg_id();
+    let artifact = serde_json::to_vec(&message).context("serialize group artifact")?;
+    let payload = message.body.as_bytes().to_vec();
+    let store_id = hex::encode(HistoryRecord::compute_msg_id(Some(&artifact), &payload));
+    if canonical_id == store_id {
+        anyhow::bail!("canonical group id collided with the store dedupe id");
+    }
+    let signature = hex::decode(&message.signature).context("group signature hex")?;
+    let author_pubkey = hex::decode(&message.author_public_key).context("author pubkey hex")?;
+    Ok((
+        HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id),
+            author_agent: Some(message.author_agent_id),
+            author_machine: None,
+            author_pubkey: Some(author_pubkey),
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: crate::history::Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact),
+            signature: Some(signature),
+            sig_context: Some("x0x.group.public-message.v1".to_string()),
+            provenance: crate::history::Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        },
+        canonical_id,
+    ))
 }
 
 async fn get_json(app: &axum::Router, path: &str) -> Result<(StatusCode, serde_json::Value)> {
@@ -349,6 +407,160 @@ fn payload_is(encoded: &str, body: &str) -> bool {
         .decode(encoded)
         .ok()
         .is_some_and(|bytes| bytes == body.as_bytes())
+}
+
+fn msg_id_for_body(json: &serde_json::Value, body: &str) -> Result<String> {
+    json["records"]
+        .as_array()
+        .context("history records array missing")?
+        .iter()
+        .find(|row| {
+            row["payload"]
+                .as_str()
+                .is_some_and(|payload| payload_is(payload, body))
+        })
+        .and_then(|row| row["msg_id"].as_str())
+        .map(str::to_string)
+        .with_context(|| format!("msg_id for {body}"))
+}
+
+/// Group history hides a refused author on the list, on canonical point
+/// lookup (`?scope=group:`), and on search.
+///
+/// A `Scope::Group` exemption in `history_record_delivery_refused` must fail
+/// this test. The topic and direct-message tests do not insert a group row,
+/// so they stay green if that exemption lands.
+#[tokio::test]
+async fn issue1229_group_history_reads_hide_refused_authors() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let blocked_kp = AgentKeypair::generate()?;
+    let revoked_kp = AgentKeypair::generate()?;
+    let contact_kp = AgentKeypair::generate()?;
+    let kept_kp = AgentKeypair::generate()?;
+    const GROUP: &str = "issue1229-group";
+    let store = state.agent.history().context("history")?.store();
+    let (blocked_row, blocked_id) =
+        signed_group_row(GROUP, &blocked_kp, "group blocked needle", 1)?;
+    let (revoked_row, revoked_id) =
+        signed_group_row(GROUP, &revoked_kp, "group revoked needle", 2)?;
+    let (contact_row, contact_id) =
+        signed_group_row(GROUP, &contact_kp, "group contact needle", 3)?;
+    let (kept_row, kept_id) = signed_group_row(GROUP, &kept_kp, "group kept needle", 4)?;
+    store.insert(&blocked_row)?;
+    store.insert(&revoked_row)?;
+    store.insert(&contact_row)?;
+    store.insert(&kept_row)?;
+
+    let app = history_router(Arc::clone(&state));
+    let list_path = format!("/history?scope=group:{GROUP}&limit=20");
+    let (status, before) = get_json(&app, &list_path).await?;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(
+        record_bodies(&before)?,
+        BTreeSet::from([
+            "group blocked needle".to_string(),
+            "group contact needle".to_string(),
+            "group kept needle".to_string(),
+            "group revoked needle".to_string(),
+        ]),
+        "group history lists every author before a refusal"
+    );
+    assert_eq!(
+        msg_id_for_body(&before, "group kept needle")?,
+        kept_id,
+        "the list must expose the canonical group id, not the store dedupe id"
+    );
+    assert_eq!(
+        msg_id_for_body(&before, "group blocked needle")?,
+        blocked_id
+    );
+    assert_eq!(
+        msg_id_for_body(&before, "group revoked needle")?,
+        revoked_id
+    );
+    assert_eq!(
+        msg_id_for_body(&before, "group contact needle")?,
+        contact_id
+    );
+
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&blocked_kp.agent_id(), TrustLevel::Blocked);
+    self_revoke_agent(&state, &revoked_kp).await?;
+    state
+        .contacts
+        .write()
+        .await
+        .revoke(&contact_kp.agent_id(), "issue1229");
+    // Drop the contact so trust reads Unknown. Only `is_revoked` hides this row.
+    let _ = state.contacts.write().await.remove(&contact_kp.agent_id());
+
+    let (status, listed) = get_json(&app, &list_path).await?;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        record_bodies(&listed)?,
+        BTreeSet::from(["group kept needle".to_string()]),
+        "GET /history?scope=group hides Blocked, revoked, and contact-revoked authors"
+    );
+
+    let point = |id: &str| format!("/history/message/{id}?scope=group:{GROUP}");
+    for (id, label) in [
+        (blocked_id.as_str(), "blocked"),
+        (revoked_id.as_str(), "revoked"),
+        (contact_id.as_str(), "contact-revoked"),
+    ] {
+        let (status, body) = get_json(&app, &point(id)).await?;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "canonical group lookup must hide the {label} author: {body}"
+        );
+    }
+    let (bare_status, bare) = get_json(&app, &format!("/history/message/{kept_id}")).await?;
+    assert_eq!(
+        bare_status,
+        StatusCode::NOT_FOUND,
+        "a canonical group id without ?scope=group must miss the row: {bare}"
+    );
+    let (kept_status, kept_message) = get_json(&app, &point(&kept_id)).await?;
+    assert_eq!(kept_status, StatusCode::OK, "{kept_message}");
+    let kept_payload = kept_message["record"]["payload"]
+        .as_str()
+        .context("point-lookup payload")?;
+    assert!(
+        payload_is(kept_payload, "group kept needle"),
+        "canonical group lookup must return the clean author"
+    );
+
+    let search_path = format!("/history/search?scope=group:{GROUP}&q=needle&limit=20");
+    let (search_status, search) = get_json(&app, &search_path).await?;
+    assert_eq!(search_status, StatusCode::OK, "{search}");
+    assert_eq!(
+        record_bodies(&search)?,
+        BTreeSet::from(["group kept needle".to_string()]),
+        "group-history search hides the same refused authors"
+    );
+
+    state
+        .contacts
+        .write()
+        .await
+        .set_trust(&blocked_kp.agent_id(), TrustLevel::Known);
+    let (status, restored) = get_json(&app, &list_path).await?;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(
+        record_bodies(&restored)?,
+        BTreeSet::from([
+            "group blocked needle".to_string(),
+            "group kept needle".to_string(),
+        ]),
+        "clearing Blocked restores the group history row"
+    );
+    let (restored_status, restored_message) = get_json(&app, &point(&blocked_id)).await?;
+    assert_eq!(restored_status, StatusCode::OK, "{restored_message}");
+    Ok(())
 }
 
 fn sse_router(state: Arc<AppState>) -> axum::Router {
