@@ -120,7 +120,10 @@ All notable changes to this project will be documented in this file.
   saves the roster-only leave and the removal event before the new epoch is
   durable, and it does not send the removal again after a successful publish.
   A missing KeyPackage on a live leaf is a logged deferral, not a finished
-  rekey. Other admins hold off. This adds no new wire message.
+  rekey. Catch-up applies a removal only after the commit signature verifies,
+  and one peer's truncated page stays open until that peer's last page. A
+  failed or timed-out publish leaves the removal pending. Other admins hold
+  off. This adds no new wire message.
 
 ## [v0.48.0] - 2026-10-13
 

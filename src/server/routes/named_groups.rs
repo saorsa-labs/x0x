@@ -3447,11 +3447,25 @@ fn sign_member_joined_kem_binding(
     }
 }
 
+enum MetadataPublishOutcome {
+    Published,
+    Failed,
+    TimedOut,
+}
+
 async fn publish_named_group_metadata_event(
     state: &AppState,
     metadata_topic: &str,
     event: &NamedGroupMetadataEvent,
 ) {
+    let _ = publish_named_group_metadata_event_outcome(state, metadata_topic, event).await;
+}
+
+async fn publish_named_group_metadata_event_outcome(
+    state: &AppState,
+    metadata_topic: &str,
+    event: &NamedGroupMetadataEvent,
+) -> MetadataPublishOutcome {
     #[cfg(test)]
     if let Ok(mut attempts) = state.named_group_test_recorders.publish_attempts.lock() {
         attempts.push((
@@ -3459,6 +3473,33 @@ async fn publish_named_group_metadata_event(
             named_group_metadata_event_group_id(event).to_string(),
             named_group_metadata_event_recipient(event).map(str::to_string),
         ));
+    }
+    #[cfg(test)]
+    if let Ok(fault) = state
+        .named_group_test_recorders
+        .metadata_publish_fault
+        .lock()
+    {
+        if let Some(kind) = fault.as_deref() {
+            return if kind == "timeout" {
+                MetadataPublishOutcome::TimedOut
+            } else {
+                MetadataPublishOutcome::Failed
+            };
+        }
+    }
+    #[cfg(test)]
+    if state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            if let Ok(mut published) = state.named_group_test_recorders.publish_bytes.lock() {
+                published.push((metadata_topic.to_string(), bytes));
+            }
+        }
+        return MetadataPublishOutcome::Published;
     }
 
     match serde_json::to_vec(event) {
@@ -3476,9 +3517,10 @@ async fn publish_named_group_metadata_event(
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => MetadataPublishOutcome::Published,
                 Ok(Err(e)) => {
                     tracing::warn!(topic = %LogHexId::topic(&metadata_topic), "failed to publish named-group metadata event: {e}");
+                    MetadataPublishOutcome::Failed
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -3486,10 +3528,14 @@ async fn publish_named_group_metadata_event(
                         timeout_ms = NAMED_GROUP_METADATA_PUBLISH_TIMEOUT.as_millis() as u64,
                         "timed out publishing named-group metadata event"
                     );
+                    MetadataPublishOutcome::TimedOut
                 }
             }
         }
-        Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
+        Err(e) => {
+            tracing::warn!("failed to serialize named-group metadata event: {e}");
+            MetadataPublishOutcome::Failed
+        }
     }
 }
 
@@ -11308,6 +11354,10 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
+    let key_package_shaped = !events.is_empty()
+        && events
+            .iter()
+            .all(|event| matches!(event, NamedGroupMetadataEvent::MemberJoined { .. }));
 
     // #846: while the durable owner-anchored gap record is ARMED (the
     // owner attested a stale-base gap and the current state has not yet
@@ -11336,16 +11386,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             return;
         }
     }
-    // #1113: a catch-up page is one batch. A truncated page means a later
-    // page still exists. Do not seal until the last page. The fence stops
-    // the startup pass from sealing between those pages.
+    // #1113: a catch-up page is one batch. A truncated page from this peer
+    // means that peer still owes a later page. Another peer's last page,
+    // and a member-keyed KeyPackage reply, do not close this peer's stream.
     let fence_ids = [
         response.group_id.clone(),
         response_info.mls_group_id.clone(),
         response_info.stable_group_id().to_string(),
     ];
     if was_truncated {
-        self_leave_rekey_fence_catchup(&fence_ids, true);
+        self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, true);
     }
     SELF_LEAVE_REKEY_BATCH
         .scope((), async {
@@ -11355,7 +11405,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
                     });
-                apply_named_group_metadata_event(state, event, *sender, true, None).await;
+                // A survivor may relay a signed removal. The transport sender
+                // is that survivor. The author is the verified commit signer.
+                // T-self-leave-catchup-author. The actor field is not authority.
+                let apply_sender =
+                    verified_catchup_member_removed_author(&event).unwrap_or(*sender);
+                apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
                 if let Some(ev) = recovery_event {
                     apply_recovered_member_key_package(state, &ev).await;
                 }
@@ -11416,16 +11471,79 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             sender = %hex::encode(sender.as_bytes()),
             "TreeKEM catch-up response was truncated; requesting next page"
         );
-        request_treekem_catchup_page(state, &response.group_id, sender).await;
-    } else {
-        // Last page. Close the fence before the pass, or the pass refuses
-        // the group it is now allowed to seal.
-        self_leave_rekey_fence_catchup(&fence_ids, false);
+        let mut sent = false;
+        for _ in 0..SELF_LEAVE_CATCHUP_PAGE_SENDS {
+            if request_treekem_catchup_page(state, &response.group_id, sender).await {
+                sent = true;
+                break;
+            }
+        }
+        if !sent {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                sender = %LogHexId::agent(&sender_hex),
+                sends = SELF_LEAVE_CATCHUP_PAGE_SENDS,
+                "TreeKEM catch-up next page was not sent; this peer's page fence stays open"
+            );
+        }
+    } else if self_leave_key_package_reply(&fence_ids, &sender_hex, key_package_shaped) {
+        // A KeyPackage reply carries no proof that a membership page stream
+        // reached its head. Leave every open page stream fenced.
+    } else if self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex) {
+        // This peer's last page. Close only this peer. Another open stream
+        // still refuses the seal.
+        self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, false);
+        schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
+    } else if !self_leave_rekey_fence_any_open(&fence_ids) {
+        // No known page is outstanding. A node that does not know it is
+        // behind may still seal. That consequence is Accepted in
+        // T-self-leave-rekey-committer.
         schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
     }
 }
 
-async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
+/// How many times one truncated page asks the same peer for the next page.
+///
+/// The send stays inside this bound. A failed send does not seal. The page
+/// fence stays open until that peer's terminal page arrives.
+const SELF_LEAVE_CATCHUP_PAGE_SENDS: u32 = 3;
+
+fn verified_catchup_member_removed_author(
+    event: &NamedGroupMetadataEvent,
+) -> Option<x0x::identity::AgentId> {
+    let NamedGroupMetadataEvent::MemberRemoved { actor, commit, .. } = event else {
+        return None;
+    };
+    let commit = commit.as_ref()?;
+    if actor != &commit.committed_by {
+        return None;
+    }
+    commit.verify_structure().ok()?;
+    parse_agent_id_hex(&commit.committed_by).ok()
+}
+
+fn self_leave_key_package_reply(
+    group_ids: &[String],
+    peer: &str,
+    key_package_shaped: bool,
+) -> bool {
+    if key_package_shaped {
+        self_leave_rekey_take_key_package_wait(group_ids, peer);
+        return true;
+    }
+    // An empty reply is this peer's membership terminal page when a page
+    // stream is open. It retires a key-package wait only when no page is open.
+    if self_leave_rekey_fence_peer_open(group_ids, peer) {
+        return false;
+    }
+    self_leave_rekey_take_key_package_wait(group_ids, peer)
+}
+
+async fn request_treekem_catchup_page(
+    state: &Arc<AppState>,
+    group_id: &str,
+    peer: &AgentId,
+) -> bool {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (from_revision, from_epoch, current_state_hash) = {
         let groups = state.named_groups.read().await;
@@ -11434,7 +11552,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
                 .values()
                 .find(|info| info.stable_group_id() == group_id)
         }) else {
-            return;
+            return false;
         };
         (
             info.state_revision,
@@ -11457,7 +11575,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         Ok(payload) => payload,
         Err(e) => {
             tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize paged TreeKEM catch-up request: {e}");
-            return;
+            return false;
         }
     };
     if let Err(e) = state
@@ -11466,7 +11584,9 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         .await
     {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
+        return false;
     }
+    true
 }
 
 /// Issue #205: ask peers that witnessed a member's join for that member's
@@ -11481,7 +11601,7 @@ async fn request_member_key_package_catchup(
     member_agent_id: &str,
 ) {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let (from_revision, from_epoch, current_state_hash, candidates) = {
+    let (from_revision, from_epoch, current_state_hash, candidates, fence_ids) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id).or_else(|| {
             groups
@@ -11515,6 +11635,11 @@ async fn request_member_key_package_catchup(
             info.secret_epoch,
             info.state_hash.clone(),
             candidate_hexes,
+            vec![
+                group_id.to_string(),
+                info.mls_group_id.clone(),
+                info.stable_group_id().to_string(),
+            ],
         )
     };
     for candidate_hex in candidates {
@@ -11553,6 +11678,7 @@ async fn request_member_key_package_catchup(
                 continue;
             }
         };
+        self_leave_rekey_note_key_package_wait(&fence_ids, &candidate_hex);
         #[cfg(test)]
         detached_send_test_seam::park(&detached_send_test_seam::key_package_catchup_key(
             group_id,
@@ -13217,6 +13343,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // Save the roster-only leave before any epoch commit. A failed
+            // save is a failure before that commit: the leave is not stored
+            // and the rekey does not run.
+            let keep_predecessor = roster_only_removal
+                && self_leave_auth
+                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                && agent_id != local_agent_hex;
+            if keep_predecessor {
+                if let Err(error) = remember_durable_self_leave_predecessor(
+                    state,
+                    &resolved_group_key,
+                    &event_for_log,
+                )
+                .await
+                {
+                    tracing::error!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        leaver = %LogHexId::agent(&agent_id),
+                        "self-leave predecessor was not saved; the epoch was not committed: {error}"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let removed_self = agent_id == local_agent_hex;
             if treekem_payload.is_none() {
@@ -13373,7 +13522,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 } else if !self_leave_rekey_batch_held()
                     && self_leave_rekey_log_once(&format!(
-                        "apply-queue:{resolved_group_key}:{agent_id}"
+                        "apply-queue:{resolved_group_key}:{agent_id}:{}",
+                        next.state_hash
                     ))
                 {
                     tracing::info!(
@@ -13397,27 +13547,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
             // Keep the leaver's join package until the rekey MemberRemoved
-            // blanks the leaf. Pruning it here leaves a hash-only admin
-            // with no peer that can still serve the bytes.
-            let keep_leaver_package = roster_only_removal
-                && self_leave_auth
-                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
-                && !removed_self;
-            if keep_leaver_package {
-                if let Err(error) = remember_durable_self_leave_predecessor(
-                    state,
-                    &resolved_group_key,
-                    &event_for_log,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(&resolved_group_key),
-                        leaver = %LogHexId::agent(&agent_id),
-                        "self-leave predecessor was not saved for catch-up: {error}"
-                    );
-                }
-            } else {
+            // blanks the leaf. The predecessor itself was saved before the
+            // epoch commit. Pruning a hash-only admin here leaves no peer
+            // that can still serve the bytes.
+            if !keep_predecessor {
                 let _ = prune_treekem_cache_member(
                     state,
                     &resolved_group_key,
@@ -13425,6 +13558,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     "member_removed",
                 )
                 .await;
+            }
+            if !roster_only_removal {
+                self_leave_rekey_log_clear_group(&resolved_group_key);
+                self_leave_rekey_log_clear_group(next.stable_group_id());
             }
             ApplyMetadataResult::ACCEPTED_EXIT
         }
@@ -22586,7 +22723,14 @@ fn self_leave_rekey_log_clear_group(group_key: &str) {
 
 struct SelfLeaveFence {
     replay: u32,
-    catchup: bool,
+    /// Peers that still owe a membership catch-up page.
+    catchup_peers: HashSet<String>,
+    /// Peers with an outstanding member-keyed KeyPackage request.
+    key_package_peers: HashSet<String>,
+}
+
+fn self_leave_fence_idle(fence: &SelfLeaveFence) -> bool {
+    fence.replay == 0 && fence.catchup_peers.is_empty() && fence.key_package_peers.is_empty()
 }
 
 fn self_leave_rekey_fences() -> &'static std::sync::Mutex<HashMap<String, SelfLeaveFence>> {
@@ -22601,7 +22745,7 @@ fn self_leave_rekey_fence_open(group_id: &str) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
         .get(group_id)
-        .is_some_and(|fence| fence.replay > 0 || fence.catchup)
+        .is_some_and(|fence| fence.replay > 0 || !fence.catchup_peers.is_empty())
 }
 
 fn self_leave_rekey_fence_replay(group_id: &str, enter: bool) {
@@ -22610,32 +22754,93 @@ fn self_leave_rekey_fence_replay(group_id: &str, enter: bool) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fence = guard.entry(group_id.to_string()).or_insert(SelfLeaveFence {
         replay: 0,
-        catchup: false,
+        catchup_peers: HashSet::new(),
+        key_package_peers: HashSet::new(),
     });
     if enter {
         fence.replay = fence.replay.saturating_add(1);
     } else {
         fence.replay = fence.replay.saturating_sub(1);
     }
-    if fence.replay == 0 && !fence.catchup {
+    if self_leave_fence_idle(fence) {
         guard.remove(group_id);
     }
 }
 
-fn self_leave_rekey_fence_catchup(group_ids: &[String], open: bool) {
+fn self_leave_rekey_fence_catchup_peer(group_ids: &[String], peer: &str, open: bool) {
     let mut guard = self_leave_rekey_fences()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for group_id in group_ids {
         let fence = guard.entry(group_id.clone()).or_insert(SelfLeaveFence {
             replay: 0,
-            catchup: false,
+            catchup_peers: HashSet::new(),
+            key_package_peers: HashSet::new(),
         });
-        fence.catchup = open;
-        if fence.replay == 0 && !fence.catchup {
+        if open {
+            fence.catchup_peers.insert(peer.to_string());
+        } else {
+            fence.catchup_peers.remove(peer);
+        }
+        if self_leave_fence_idle(fence) {
             guard.remove(group_id);
         }
     }
+}
+
+fn self_leave_rekey_fence_peer_open(group_ids: &[String], peer: &str) -> bool {
+    let guard = self_leave_rekey_fences()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    group_ids.iter().any(|group_id| {
+        guard
+            .get(group_id)
+            .is_some_and(|fence| fence.catchup_peers.contains(peer))
+    })
+}
+
+fn self_leave_rekey_fence_any_open(group_ids: &[String]) -> bool {
+    let guard = self_leave_rekey_fences()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    group_ids.iter().any(|group_id| {
+        guard
+            .get(group_id)
+            .is_some_and(|fence| fence.replay > 0 || !fence.catchup_peers.is_empty())
+    })
+}
+
+fn self_leave_rekey_note_key_package_wait(group_ids: &[String], peer: &str) {
+    let mut guard = self_leave_rekey_fences()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        let fence = guard.entry(group_id.clone()).or_insert(SelfLeaveFence {
+            replay: 0,
+            catchup_peers: HashSet::new(),
+            key_package_peers: HashSet::new(),
+        });
+        fence.key_package_peers.insert(peer.to_string());
+    }
+}
+
+fn self_leave_rekey_take_key_package_wait(group_ids: &[String], peer: &str) -> bool {
+    let mut guard = self_leave_rekey_fences()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut found = false;
+    for group_id in group_ids {
+        let Some(fence) = guard.get_mut(group_id) else {
+            continue;
+        };
+        if fence.key_package_peers.remove(peer) {
+            found = true;
+        }
+        if self_leave_fence_idle(fence) {
+            guard.remove(group_id);
+        }
+    }
+    found
 }
 
 struct SelfLeaveReplayFence {
@@ -22708,8 +22913,9 @@ async fn self_leave_candidate_extends_stored_head(
 /// Whether this admin can author the responsive rekey.
 ///
 /// This binary can. A remote admin stays eligible: no wire field yet says
-/// that a peer is too old. `T-self-leave-rekey-committer` (Proposed, A09)
-/// records that rule. Tests mark an admin incapable to cover both orders.
+/// that a peer is too old. `T-self-leave-rekey-committer` (Accepted, David,
+/// D274, slot A09) records that rule. Tests mark an admin incapable to
+/// cover both orders.
 fn admin_eligible_for_self_leave_rekey(
     state: &AppState,
     agent_id: &x0x::identity::AgentId,
@@ -22741,16 +22947,229 @@ pub(in crate::server) async fn schedule_self_leave_rekey_if_idle(
     rekey_treekem_self_leaves(state, group_id).await;
 }
 
-fn removed_member_missing_key_package(info: &x0x::groups::GroupInfo) -> Option<String> {
-    info.members_v2.values().find_map(|member| {
+fn hash_only_removed_members(
+    info: &x0x::groups::GroupInfo,
+    group: Option<&x0x::mls::TreeKemMlsGroup>,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    for member in info.members_v2.values() {
         if member.state != x0x::groups::GroupMemberState::Removed {
-            return None;
+            continue;
         }
-        member.treekem_key_package_hash.as_ref()?;
-        current_member_treekem_key_package(member)
-            .is_none()
-            .then(|| member.agent_id.clone())
+        if member.treekem_key_package_hash.is_none() {
+            continue;
+        }
+        if current_member_treekem_key_package(member).is_some() {
+            continue;
+        }
+        if let Some(group) = group {
+            let Ok(agent_id) = parse_agent_id_hex(&member.agent_id) else {
+                continue;
+            };
+            if !group.tracks_member(&agent_id) {
+                continue;
+            }
+        }
+        rows.push(member.agent_id.clone());
+    }
+    rows
+}
+
+async fn pending_self_leave_rekey_for_head(
+    state: &AppState,
+    group_key: &str,
+    leaver_hex: &str,
+    head_hash: &str,
+) -> Option<NamedGroupMetadataEvent> {
+    let path = self_leave_rekey_outbox_path(state, group_key);
+    let file = {
+        let _guard = self_leave_outbox_lock().lock().await;
+        read_self_leave_rekey_outbox(&path).await
+    };
+    file.pending.into_iter().find(|event| match event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            agent_id,
+            treekem_commit_b64,
+            commit,
+            ..
+        } => {
+            agent_id == leaver_hex
+                && treekem_commit_b64.is_some()
+                && commit
+                    .as_ref()
+                    .is_some_and(|commit| commit.prev_state_hash.as_deref() == Some(head_hash))
+        }
+        _ => false,
     })
+}
+
+async fn install_saved_self_leave_rekey(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    guard: &mut x0x::mls::TreeKemMlsGroup,
+    event: NamedGroupMetadataEvent,
+) -> SelfLeaveRekeyStep {
+    let NamedGroupMetadataEvent::MemberRemoved {
+        agent_id: leaver_hex,
+        revision,
+        treekem_commit_b64: Some(_),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(saved_commit),
+        ..
+    } = &event
+    else {
+        return SelfLeaveRekeyStep::Deferred;
+    };
+    let Some(event_key) = self_leave_outbox_event_key(&event) else {
+        return SelfLeaveRekeyStep::Deferred;
+    };
+    // The committer already applied this commit inside `remove_member`.
+    // saorsa-mls rejects `process_commit` of that same UpdatePath. The
+    // saved snapshot is that post-commit tree. Restoring it installs the
+    // same keys. A new `remove_member` would be a second payload.
+    let Some(saved_tree) = self_leave_committer_snapshot(state, group_key, &event_key).await else {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            leaver = %LogHexId::agent(leaver_hex),
+            "saved self-leave rekey has no committer snapshot; a new commit was not created"
+        );
+        return SelfLeaveRekeyStep::Deferred;
+    };
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "saved self-leave rekey deferred: snapshot failed: {error}"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+    };
+    match restore_local_treekem_group_from_snapshot(state, info, &saved_tree) {
+        Ok(restored) => *guard = restored,
+        Err(error) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                leaver = %LogHexId::agent(leaver_hex),
+                "saved self-leave rekey snapshot did not restore; a new commit was not created: {error}"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+    }
+    if guard.epoch() != *treekem_epoch {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_key,
+            info,
+            &rollback_snapshot,
+            guard,
+            "saved_self_leave_rekey_epoch",
+        );
+        return SelfLeaveRekeyStep::Deferred;
+    }
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut next = info.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    if next.roster_revision != *revision {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_key,
+            info,
+            &rollback_snapshot,
+            guard,
+            "saved_self_leave_rekey_revision",
+        );
+        return SelfLeaveRekeyStep::Deferred;
+    }
+    next.remove_member(leaver_hex, Some(local_agent_hex));
+    next.secret_epoch = *treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    // `seal_commit` advances `state_revision` before it hashes. The saved
+    // commit's hash includes that revision. A bare roster recompute does not.
+    let previous_hash = next.state_hash.clone();
+    next.state_revision = next.state_revision.saturating_add(1);
+    next.prev_state_hash = Some(previous_hash);
+    next.recompute_state_hash();
+    if next.state_hash != saved_commit.state_hash {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_key,
+            info,
+            &rollback_snapshot,
+            guard,
+            "saved_self_leave_rekey_hash",
+        );
+        tracing::error!(
+            group_id = %LogHexId::group(group_key),
+            leaver = %LogHexId::agent(leaver_hex),
+            "saved self-leave rekey does not match this roster transition; a new commit was not created"
+        );
+        return SelfLeaveRekeyStep::Deferred;
+    }
+    if self_leave_rekey_batch_held()
+        || self_leave_rekey_fence_open(group_key)
+        || self_leave_rekey_fence_open(info.stable_group_id())
+        || !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await
+        || !self_leave_candidate_extends_stored_head(state, group_key, info).await
+    {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_key,
+            info,
+            &rollback_snapshot,
+            guard,
+            "saved_self_leave_rekey_head_moved",
+        );
+        return SelfLeaveRekeyStep::Deferred;
+    }
+    let persisted =
+        persist_treekem_and_named_groups_atomic_with_info(state, group_key, next.clone(), guard)
+            .await;
+    purge_join_artifacts_if_ineligible(state, group_key, leaver_hex).await;
+    if let Err(error) = persisted {
+        if self_leave_persist_left_epoch_installed(&error) {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "saved self-leave rekey persist reported an error after the epoch was installed: {error}"
+            );
+            let mut groups = state.named_groups.write().await;
+            if groups
+                .get(group_key)
+                .map(|stored| stored.state_hash.as_str())
+                != Some(next.state_hash.as_str())
+            {
+                groups.insert(group_key.to_string(), next.clone());
+            }
+        } else {
+            rollback_treekem_group_after_failed_install(
+                state,
+                group_key,
+                &next,
+                &rollback_snapshot,
+                guard,
+                "saved_self_leave_rekey_persist_failed",
+            );
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "saved self-leave rekey deferred: persist failed before the epoch was installed: {error}"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+    }
+    save_mls_groups(state).await;
+    let _ = prune_treekem_cache_member(state, group_key, leaver_hex, "self_leave_rekey").await;
+    remember_treekem_membership_event(state, &event).await;
+    finish_published_self_leave_rekey(
+        state,
+        group_key,
+        &info.metadata_topic,
+        &next,
+        &event,
+        leaver_hex,
+        *treekem_epoch,
+    )
+    .await
 }
 
 /// Copy a cached KeyPackage onto a Removed member when its committed hash
@@ -22833,6 +23252,7 @@ fn self_leave_outbox_event_key(event: &NamedGroupMetadataEvent) -> Option<String
             group_id,
             revision,
             agent_id,
+            treekem_commit_b64,
             treekem_epoch,
             commit,
             ..
@@ -22841,9 +23261,12 @@ fn self_leave_outbox_event_key(event: &NamedGroupMetadataEvent) -> Option<String
                 .as_ref()
                 .map(|commit| commit.state_hash.clone())
                 .unwrap_or_default();
+            // The roster hash does not cover the TreeKEM commit bytes. Two
+            // commits for one logical removal must stay two outbound records.
+            let commit_bytes = treekem_commit_b64.as_deref().unwrap_or("");
+            let commit_id = blake3::hash(commit_bytes.as_bytes()).to_hex();
             Some(format!(
-                "{group_id}:{revision}:{agent_id}:{:?}:{hash}",
-                treekem_epoch
+                "{group_id}:{revision}:{agent_id}:{treekem_epoch:?}:{hash}:{commit_id}"
             ))
         }
         _ => None,
@@ -22854,6 +23277,14 @@ fn self_leave_outbox_lock() -> &'static Mutex<()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct SelfLeaveCommitterSnapshot {
+    event_key: String,
+    /// Post-commit tree bytes. The committer cannot `process_commit` its
+    /// own UpdatePath. A retry restores this snapshot instead.
+    snapshot_b64: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -22868,6 +23299,9 @@ struct SelfLeaveOutboxFile {
     /// not send them again.
     #[serde(default)]
     served: Vec<NamedGroupMetadataEvent>,
+    /// Local post-commit trees for pending rekeys. Not a wire field.
+    #[serde(default)]
+    committer_snapshots: Vec<SelfLeaveCommitterSnapshot>,
 }
 
 fn self_leave_outbox_is_empty(file: &SelfLeaveOutboxFile) -> bool {
@@ -22907,8 +23341,29 @@ async fn read_self_leave_rekey_outbox(path: &std::path::Path) -> SelfLeaveOutbox
             predecessors: Vec::new(),
             pending,
             served: Vec::new(),
+            committer_snapshots: Vec::new(),
         })
         .unwrap_or_default()
+}
+
+fn self_leave_outbox_drop_snapshot(file: &mut SelfLeaveOutboxFile, key: &str) {
+    file.committer_snapshots.retain(|row| row.event_key != key);
+}
+
+fn self_leave_outbox_store_snapshot(
+    file: &mut SelfLeaveOutboxFile,
+    event_key: String,
+    snapshot: &[u8],
+) {
+    file.committer_snapshots
+        .retain(|row| row.event_key != event_key);
+    file.committer_snapshots.push(SelfLeaveCommitterSnapshot {
+        event_key,
+        snapshot_b64: base64::engine::general_purpose::STANDARD.encode(snapshot),
+    });
+    while file.committer_snapshots.len() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
+        file.committer_snapshots.remove(0);
+    }
 }
 
 async fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -22946,7 +23401,57 @@ async fn write_self_leave_rekey_outbox(
         return sync_parent_dir_for_path(path);
     }
     let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
-    write_atomic_bytes(path, &bytes).await
+    write_atomic_bytes(path, &bytes).await?;
+    #[cfg(test)]
+    if self_leave_outbox_write_should_fail() {
+        // The rename already landed. The caller sees a failure and must not
+        // persist a different TreeKEM commit under this record.
+        return Err(std::io::Error::other(
+            "self-leave outbox parent directory fsync failed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn self_leave_outbox_write_index() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    static INDEX: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+    INDEX.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+}
+
+#[cfg(test)]
+fn self_leave_outbox_fail_write() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    static FAIL: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+    FAIL.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+}
+
+/// Fail the Nth self-leave outbox write in this process (1-based). `0` disables it.
+#[cfg(test)]
+pub(in crate::server) fn fail_self_leave_outbox_write_number(n: usize) {
+    self_leave_outbox_write_index().store(0, std::sync::atomic::Ordering::SeqCst);
+    self_leave_outbox_fail_write().store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn self_leave_outbox_write_should_fail() -> bool {
+    let n = self_leave_outbox_write_index().fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let fail_on = self_leave_outbox_fail_write().load(std::sync::atomic::Ordering::SeqCst);
+    fail_on != 0 && n == fail_on
+}
+
+#[cfg(test)]
+fn skip_self_leave_rekey_ack_flag() -> &'static std::sync::atomic::AtomicBool {
+    use std::sync::OnceLock;
+    static SKIP: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    SKIP.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+/// Leave a persisted rekey in `pending` so a test can resume before the ack.
+#[cfg(test)]
+pub(in crate::server) fn skip_self_leave_rekey_ack(skip: bool) {
+    skip_self_leave_rekey_ack_flag().store(skip, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn mutate_self_leave_outbox<F>(
@@ -22977,15 +23482,44 @@ async fn remember_durable_self_leave_predecessor(
     .await
 }
 
+async fn self_leave_committer_snapshot(
+    state: &AppState,
+    group_key: &str,
+    event_key: &str,
+) -> Option<Vec<u8>> {
+    let path = self_leave_rekey_outbox_path(state, group_key);
+    let file = {
+        let _guard = self_leave_outbox_lock().lock().await;
+        read_self_leave_rekey_outbox(&path).await
+    };
+    let encoded = file
+        .committer_snapshots
+        .iter()
+        .find(|row| row.event_key == event_key)?
+        .snapshot_b64
+        .clone();
+    BASE64.decode(encoded).ok()
+}
+
 /// Save the exact removal event before the new epoch is durable.
+///
+/// `committer_snapshot` is the tree after `remove_member`. saorsa-mls
+/// refuses `process_commit` of that member's own UpdatePath, so a later
+/// retry restores these bytes instead of creating a second commit.
 async fn remember_durable_self_leave_rekey(
     state: &AppState,
     group_key: &str,
     event: &NamedGroupMetadataEvent,
+    committer_snapshot: Option<&[u8]>,
 ) -> std::io::Result<()> {
     let event = event.clone();
+    let event_key = self_leave_outbox_event_key(&event);
+    let snapshot = committer_snapshot.map(<[u8]>::to_vec);
     mutate_self_leave_outbox(state, group_key, move |file| {
         self_leave_outbox_push_capped(&mut file.pending, event);
+        if let (Some(event_key), Some(snapshot)) = (event_key, snapshot) {
+            self_leave_outbox_store_snapshot(file, event_key, &snapshot);
+        }
     })
     .await
 }
@@ -23002,6 +23536,7 @@ async fn forget_durable_self_leave_rekey(
         file.pending.retain(|existing| {
             self_leave_outbox_event_key(existing).as_deref() != Some(key.as_str())
         });
+        self_leave_outbox_drop_snapshot(file, &key);
     })
     .await;
 }
@@ -23021,6 +23556,7 @@ async fn acknowledge_published_self_leave_rekey(
         file.pending.retain(|existing| {
             self_leave_outbox_event_key(existing).as_deref() != Some(key.as_str())
         });
+        self_leave_outbox_drop_snapshot(file, &key);
         self_leave_outbox_push_capped(&mut file.served, event);
     })
     .await;
@@ -23069,7 +23605,10 @@ async fn self_leave_resume_disposition(
     }
 }
 
-async fn publish_saved_self_leave_rekey(state: &Arc<AppState>, event: &NamedGroupMetadataEvent) {
+async fn publish_saved_self_leave_rekey(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
     let group_id = named_group_metadata_event_group_id(event);
     let topic = {
         let groups = state.named_groups.read().await;
@@ -23083,28 +23622,60 @@ async fn publish_saved_self_leave_rekey(state: &Arc<AppState>, event: &NamedGrou
             .map(|info| (info.metadata_topic.clone(), info.clone()))
     };
     let Some((topic, info)) = topic else {
-        return;
+        return false;
     };
     let leaver = match event {
         NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } => agent_id.clone(),
         _ => String::new(),
     };
+    deliver_self_leave_rekey(state, &topic, &info, event, &leaver).await
+}
+
+/// Gossip publish is the success condition for moving a rekey to `served`.
+/// A transport error or a timeout leaves the event pending so restart sends
+/// it again. Direct delivery and redelivery are extra copies. They do not
+/// confirm that the publish succeeded.
+async fn deliver_self_leave_rekey(
+    state: &Arc<AppState>,
+    topic: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    leaver: &str,
+) -> bool {
+    let published = if drop_initial_volley(event) {
+        true
+    } else {
+        matches!(
+            publish_named_group_metadata_event_outcome(state, topic, event).await,
+            MetadataPublishOutcome::Published
+        )
+    };
+    let leaver_owned = leaver.to_string();
     if !drop_initial_volley(event) {
-        publish_named_group_metadata_event(state, &topic, event).await;
         spawn_named_group_event_delivery_to_active_members(
             state,
-            &info,
+            info,
             event,
-            std::slice::from_ref(&leaver),
+            std::slice::from_ref(&leaver_owned),
         );
     }
     spawn_group_control_event_redelivery(
         state,
-        &topic,
-        &info,
+        topic,
+        info,
         event,
-        std::slice::from_ref(&leaver),
+        std::slice::from_ref(&leaver_owned),
     );
+    published
+}
+
+fn self_leave_rekey_ack_withheld() -> bool {
+    #[cfg(test)]
+    {
+        return skip_self_leave_rekey_ack_flag().load(std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(test))]
+    false
 }
 
 /// After restart, load saved leaves into the catch-up log. Publish a rekey
@@ -23128,43 +23699,63 @@ pub(in crate::server) async fn resume_durable_self_leave_rekeys(state: &Arc<AppS
         for event in snapshot.predecessors.iter().chain(snapshot.served.iter()) {
             remember_treekem_membership_event(state, event).await;
         }
-        let mut published_keys = Vec::new();
-        let mut dropped_keys = Vec::new();
-        for event in &snapshot.pending {
-            let Some(key) = self_leave_outbox_event_key(event) else {
+        for event in snapshot.pending {
+            let Some(key) = self_leave_outbox_event_key(&event) else {
                 continue;
             };
-            match self_leave_resume_disposition(state, event).await {
+            // The same membership lock the live commit holds. The hash check
+            // and the outbox delete stay inside it, so a commit that has
+            // saved its event and not yet installed it cannot be discarded.
+            let group_id = named_group_metadata_event_group_id(&event).to_string();
+            let membership = group_membership_lock(state, &group_id).await;
+            let _membership_guard = membership.lock().await;
+            match self_leave_resume_disposition(state, &event).await {
                 SelfLeaveResumeDisposition::Publish => {
-                    remember_treekem_membership_event(state, event).await;
-                    publish_saved_self_leave_rekey(state, event).await;
-                    published_keys.push(key);
+                    remember_treekem_membership_event(state, &event).await;
+                    let published = publish_saved_self_leave_rekey(state, &event).await;
+                    if published && !self_leave_rekey_ack_withheld() {
+                        let _ = update_self_leave_outbox_file(&path, |file| {
+                            let mut moved = None;
+                            file.pending.retain(|existing| {
+                                if self_leave_outbox_event_key(existing).as_deref()
+                                    == Some(key.as_str())
+                                {
+                                    moved = Some(existing.clone());
+                                    return false;
+                                }
+                                true
+                            });
+                            self_leave_outbox_drop_snapshot(file, &key);
+                            if let Some(moved) = moved {
+                                self_leave_outbox_push_capped(&mut file.served, moved);
+                            }
+                        })
+                        .await;
+                    }
                 }
-                SelfLeaveResumeDisposition::Drop => dropped_keys.push(key),
+                SelfLeaveResumeDisposition::Drop => {
+                    let _ = update_self_leave_outbox_file(&path, |file| {
+                        file.pending.retain(|existing| {
+                            self_leave_outbox_event_key(existing).as_deref() != Some(key.as_str())
+                        });
+                        self_leave_outbox_drop_snapshot(file, &key);
+                    })
+                    .await;
+                }
                 SelfLeaveResumeDisposition::Keep => {}
             }
         }
-        if published_keys.is_empty() && dropped_keys.is_empty() {
-            continue;
-        }
-        let _guard = self_leave_outbox_lock().lock().await;
-        let mut fresh = read_self_leave_rekey_outbox(&path).await;
-        let mut moved = Vec::new();
-        fresh.pending.retain(|event| {
-            let Some(key) = self_leave_outbox_event_key(event) else {
-                return true;
-            };
-            if published_keys.iter().any(|published| published == &key) {
-                moved.push(event.clone());
-                return false;
-            }
-            !dropped_keys.iter().any(|dropped| dropped == &key)
-        });
-        for event in moved {
-            self_leave_outbox_push_capped(&mut fresh.served, event);
-        }
-        let _ = write_self_leave_rekey_outbox(&path, &fresh).await;
     }
+}
+
+async fn update_self_leave_outbox_file(
+    path: &std::path::Path,
+    mutate: impl FnOnce(&mut SelfLeaveOutboxFile),
+) -> std::io::Result<()> {
+    let _guard = self_leave_outbox_lock().lock().await;
+    let mut file = read_self_leave_rekey_outbox(path).await;
+    mutate(&mut file);
+    write_self_leave_rekey_outbox(path, &file).await
 }
 
 /// Startup pass. Wait once so the first catch-up round can queue events,
@@ -23234,10 +23825,9 @@ fn tree_has_leaf_outside_active_roster(
 /// fails after the rename are that case. Those errors must keep the saved
 /// event. A failure before the commit point may drop it.
 fn self_leave_persist_left_epoch_installed(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
-    message.contains("not directory-durable")
-        || message.contains("TreeKEM journal cleanup")
-        || message.contains("named groups write:")
+    error
+        .chain()
+        .any(|cause| cause.is::<EpochInstalledPersistError>())
 }
 
 fn outstanding_removed_treekem_leaf(
@@ -23304,7 +23894,7 @@ async fn commit_treekem_self_leave_rekey_from(
     install_cached_key_packages_for_removed_members(state, &mut info).await;
     if !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await {
         let leaver = removed_member_log_id(&info);
-        if self_leave_rekey_log_once(&format!("queue:{group_key}:{leaver}")) {
+        if self_leave_rekey_log_once(&format!("queue:{group_key}:{}", info.state_hash)) {
             tracing::info!(
                 group_id = %LogHexId::group(group_key),
                 leaver = %LogHexId::agent(&leaver),
@@ -23326,7 +23916,7 @@ async fn commit_treekem_self_leave_rekey_from(
     // daemon holds hashes for members it did not invite.
     let Some(designated) = lowest_active_admin_id(state, &info) else {
         let leaver = removed_member_log_id(&info);
-        if self_leave_rekey_log_once(&format!("no-admin:{group_key}:{leaver}")) {
+        if self_leave_rekey_log_once(&format!("no-admin:{group_key}:{}", info.state_hash)) {
             tracing::warn!(
                 group_id = %LogHexId::group(group_key),
                 leaver = %LogHexId::agent(&leaver),
@@ -23338,7 +23928,10 @@ async fn commit_treekem_self_leave_rekey_from(
     if designated != state.agent.agent_id() {
         let designated_hex = hex::encode(designated.as_bytes());
         let leaver = removed_member_log_id(&info);
-        if self_leave_rekey_log_once(&format!("wait:{group_key}:{designated_hex}:{leaver}")) {
+        if self_leave_rekey_log_once(&format!(
+            "wait:{group_key}:{designated_hex}:{}",
+            info.state_hash
+        )) {
             tracing::info!(
                 group_id = %LogHexId::group(group_key),
                 leaver = %LogHexId::agent(&leaver),
@@ -23373,29 +23966,52 @@ async fn commit_treekem_self_leave_rekey_from(
     };
     let mut guard = group.lock().await;
     let Some((leaver_hex, kp_bytes)) = outstanding_removed_treekem_leaf(&info, &guard) else {
-        if let Some(missing) = removed_member_missing_key_package(&info) {
-            // A hash with no bytes is a live leaf only when the tree still
-            // has more members than the active roster. A historical Removed
-            // seat whose leaf is already blank does not warn and does not ask.
-            if tree_has_leaf_outside_active_roster(&info, &guard) {
-                if self_leave_rekey_log_once(&format!("package:{group_key}:{missing}")) {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(group_key),
-                        leaver = %LogHexId::agent(&missing),
-                        "self-leave TreeKEM rekey deferred: roster holds the KeyPackage hash and not the bytes"
-                    );
-                }
-                let bg_state = Arc::clone(state);
-                let bg_group = group_key.to_string();
-                let bg_member = missing;
-                let _ = state.spawn_detached(async move {
-                    request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
-                });
-                return SelfLeaveRekeyStep::Deferred;
+        let tracked = hash_only_removed_members(&info, Some(&*guard));
+        let ask = if !tracked.is_empty() {
+            tracked
+        } else if tree_has_leaf_outside_active_roster(&info, &guard) {
+            // The leaf count does not name the seat. Ask the bounded set so
+            // one historical hash cannot block a later leaver.
+            if self_leave_rekey_log_once(&format!("unidentified-leaf:{group_key}")) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    "self-leave TreeKEM rekey deferred: a live leaf is not tied to one removed member"
+                );
             }
+            hash_only_removed_members(&info, None)
+        } else {
+            Vec::new()
+        };
+        if ask.is_empty() {
+            if self_leave_rekey_log_once(&format!("no-live-leaf:{group_key}:{}", info.state_hash)) {
+                tracing::info!(
+                    group_id = %LogHexId::group(group_key),
+                    "self-leave TreeKEM rekey found no removed member with a live leaf"
+                );
+            }
+            return SelfLeaveRekeyStep::Done;
         }
-        return SelfLeaveRekeyStep::Done;
+        for missing in ask.into_iter().take(SELF_LEAVE_REKEY_PASS_LIMIT) {
+            if self_leave_rekey_log_once(&format!("package:{group_key}:{missing}")) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    leaver = %LogHexId::agent(&missing),
+                    "self-leave TreeKEM rekey deferred: roster holds the KeyPackage hash and not the bytes"
+                );
+            }
+            let bg_state = Arc::clone(state);
+            let bg_group = group_key.to_string();
+            let _ = state.spawn_detached(async move {
+                request_member_key_package_catchup(&bg_state, &bg_group, &missing).await;
+            });
+        }
+        return SelfLeaveRekeyStep::Deferred;
     };
+    if let Some(saved) =
+        pending_self_leave_rekey_for_head(state, group_key, &leaver_hex, &info.state_hash).await
+    {
+        return install_saved_self_leave_rekey(state, group_key, &info, &mut guard, saved).await;
+    }
     let Ok(target_agent) = parse_agent_id_hex(&leaver_hex) else {
         tracing::warn!(
             group_id = %LogHexId::group(group_key),
@@ -23501,7 +24117,27 @@ async fn commit_treekem_self_leave_rekey_from(
         secret_epoch: None,
         commit: Some(commit),
     };
-    if let Err(error) = remember_durable_self_leave_rekey(state, group_key, &event).await {
+    let committer_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            rollback_treekem_group_after_failed_install(
+                state,
+                group_key,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "self_leave_rekey_committer_snapshot",
+            );
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "self-leave TreeKEM rekey deferred: the post-commit tree was not snapshotted: {error}"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+    };
+    if let Err(error) =
+        remember_durable_self_leave_rekey(state, group_key, &event, Some(&committer_snapshot)).await
+    {
         rollback_treekem_group_after_failed_install(
             state,
             group_key,
@@ -23557,34 +24193,48 @@ async fn commit_treekem_self_leave_rekey_from(
 
     save_mls_groups(state).await;
     let _ = prune_treekem_cache_member(state, group_key, &leaver_hex, "self_leave_rekey").await;
-    if !drop_initial_volley(&event) {
-        publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-    }
     remember_treekem_membership_event(state, &event).await;
-    if !drop_initial_volley(&event) {
-        spawn_named_group_event_delivery_to_active_members(
-            state,
-            &next,
-            &event,
-            std::slice::from_ref(&leaver_hex),
-        );
-    }
-    spawn_group_control_event_redelivery(
+    finish_published_self_leave_rekey(
         state,
+        group_key,
         &metadata_topic,
         &next,
         &event,
-        std::slice::from_ref(&leaver_hex),
-    );
+        &leaver_hex,
+        treekem_epoch,
+    )
+    .await
+}
+
+async fn finish_published_self_leave_rekey(
+    state: &Arc<AppState>,
+    group_key: &str,
+    metadata_topic: &str,
+    next: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    leaver_hex: &str,
+    treekem_epoch: u64,
+) -> SelfLeaveRekeyStep {
+    let published = deliver_self_leave_rekey(state, metadata_topic, next, event, leaver_hex).await;
     maybe_publish_group_card_after_state_change(state, group_key).await;
-    acknowledge_published_self_leave_rekey(state, group_key, &event).await;
-    self_leave_rekey_log_clear_group(group_key);
-    tracing::info!(
-        group_id = %LogHexId::group(group_key),
-        leaver = %LogHexId::agent(&leaver_hex),
-        epoch = treekem_epoch,
-        "self-leave TreeKEM rekey committed"
-    );
+    if published && !self_leave_rekey_ack_withheld() {
+        acknowledge_published_self_leave_rekey(state, group_key, event).await;
+        self_leave_rekey_log_clear_group(group_key);
+        tracing::info!(
+            group_id = %LogHexId::group(group_key),
+            leaver = %LogHexId::agent(leaver_hex),
+            epoch = treekem_epoch,
+            "self-leave TreeKEM rekey committed"
+        );
+    } else {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            leaver = %LogHexId::agent(leaver_hex),
+            epoch = treekem_epoch,
+            published,
+            "self-leave TreeKEM rekey stayed pending: publish did not succeed or the ack was withheld"
+        );
+    }
     SelfLeaveRekeyStep::Committed
 }
 
@@ -30797,6 +31447,21 @@ async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
 /// Persist a supplied named-group state and matching TreeKEM snapshot with a
 /// replay journal. The matching live map entry is installed before the journal
 /// is removed and while the persistence mutex is still held.
+/// The atomic persist returned after the new epoch was already installed.
+///
+/// Callers must not roll the tree back and must not drop the only outbound
+/// copy of that commit. The marker is the signal. The error text is not.
+#[derive(Debug)]
+struct EpochInstalledPersistError;
+
+impl std::fmt::Display for EpochInstalledPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("treekem epoch already installed")
+    }
+}
+
+impl std::error::Error for EpochInstalledPersistError {}
+
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
@@ -31043,7 +31708,12 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
-        .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+        .map_err(|e| {
+            // The legacy journal is already the commit point. A restart
+            // replays this epoch, so the caller must keep the outbound event.
+            anyhow::Error::new(EpochInstalledPersistError)
+                .context(format!("named groups write: {e}"))
+        })?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -31066,7 +31736,8 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             state
                 .named_groups_requires_durability_confirmation
                 .store(true, Ordering::Release);
-            anyhow::bail!("named groups replacement was not directory-durable");
+            return Err(anyhow::Error::new(EpochInstalledPersistError)
+                .context("named groups replacement was not directory-durable"));
         }
         AtomicWriteOutcome::NotReplaced => {
             // #1187: the named half did not land, so the journal must not
@@ -31085,7 +31756,8 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     }
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
+            return Err(anyhow::Error::new(EpochInstalledPersistError)
+                .context(format!("TreeKEM journal cleanup: {e}")));
         }
     }
     // #458 r3: this group's state is now durable (journal replayed or both
@@ -43256,12 +43928,18 @@ pub(in crate::server) mod tests {
 
     pub(in crate::server) async fn secure_endpoint_test_state(
     ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        secure_endpoint_test_state_with_key(x0x::identity::AgentKeypair::generate()?).await
+    }
+
+    pub(in crate::server) async fn secure_endpoint_test_state_with_key(
+        agent_key: x0x::identity::AgentKeypair,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path();
         let agent = Arc::new(
             Agent::builder()
                 .with_machine_key(data_dir.join("machine.key"))
-                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_key(agent_key)
                 .with_agent_cert_path(data_dir.join("agent.cert"))
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))

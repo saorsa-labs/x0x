@@ -454,6 +454,16 @@ impl TreeKemMlsGroup {
         self.inner.member_count()
     }
 
+    /// Whether this instance still tracks `member` in its leaf map.
+    ///
+    /// The map records members this instance added and its own leaf. A
+    /// removal this instance applied drops the entry. A leaf count cannot
+    /// name which roster row owns a remaining leaf.
+    #[must_use]
+    pub fn tracks_member(&self, member: &AgentId) -> bool {
+        self.agent_to_leaf.contains_key(member)
+    }
+
     /// Serialize the full group state for persistence. **Contains private key
     /// material** — the caller MUST protect it at rest (Phase 4 persists it with
     /// the same `0600` model x0x uses for other key files; see ADR-0012).
