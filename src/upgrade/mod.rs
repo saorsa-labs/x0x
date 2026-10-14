@@ -26,6 +26,24 @@ pub const MAX_BINARY_SIZE_BYTES: u64 = 200 * 1024 * 1024;
 /// The holder releases the lock when its apply returns or its process exits.
 pub const HOST_UPGRADE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// Free space that staging must leave on the install filesystem (D194:
+/// 1 GiB).
+pub const DISK_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Versioned backups kept per binary besides the known-good pair (review S3).
+pub const NEWEST_BACKUPS_KEPT: usize = 3;
+
+/// Refuse staging when `available` minus the peak space an apply needs
+/// would leave less than [`DISK_RESERVE_BYTES`] (D194, review S3).
+pub fn check_disk_reserve(_available: u64, _needed: u64) -> Result<(), UpgradeError> {
+    Ok(())
+}
+
+/// Free bytes available to this process on the filesystem holding `path`.
+pub fn free_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Outcome of a host-locked binary swap (#1106).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwapOutcome {
@@ -203,6 +221,9 @@ pub struct Upgrader {
     /// SHA-256 of the bytes this process runs, when the target is this
     /// process's own executable (#1106 F1 version evidence).
     running_sha256: Option<[u8; 32]>,
+    /// The release this daemon ran before the current one (its last
+    /// known-good predecessor), kept by retention (D194, review S3).
+    previous_release: Option<Version>,
 }
 
 /// What a host-locked swap does, decided under the lock before any binary
@@ -398,6 +419,7 @@ impl Upgrader {
             target_path,
             current_version,
             running_sha256: None,
+            previous_release: None,
         }
     }
 
@@ -406,6 +428,13 @@ impl Upgrader {
     /// version.
     pub fn with_running_sha256(mut self, running_sha256: Option<[u8; 32]>) -> Self {
         self.running_sha256 = running_sha256;
+        self
+    }
+
+    /// The release this daemon ran before the current one (D194, review S3):
+    /// retention never deletes its backup.
+    pub fn with_previous_release(mut self, previous_release: Option<Version>) -> Self {
+        self.previous_release = previous_release;
         self
     }
 
@@ -958,6 +987,15 @@ pub enum UpgradeError {
     /// review F2). The swap is refused.
     #[error("shared install: participants cannot be established: {reason}")]
     ParticipantsUnknown { reason: String },
+
+    /// Staging would leave less than the 1 GiB disk reserve (D194, review
+    /// S3). Nothing was downloaded; this is not counted as a failure.
+    #[error("insufficient_disk: {available} bytes free, an apply needs {needed} plus a {reserve}-byte reserve")]
+    InsufficientDisk {
+        available: u64,
+        needed: u64,
+        reserve: u64,
+    },
 
     /// Another writer on this host held the upgrade lock for the whole wait
     /// (#1106). Nothing was replaced.
@@ -1602,6 +1640,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_marker_alone_is_not_version_evidence() {
+        // Codex S2: a hand copy or partial file can keep a whole marker. With
+        // no hash-bound evidence the bytes are unknown.
+        let dir = TempDir::new().unwrap();
+        let installed = marked("0.48.0", b"hand copy, maybe partial");
+        let target = create_test_binary(&dir, "x0xd", &installed);
+        let (staging, new_binary) = staged_binary(dir.path(), "s2a", &marked("0.48.1", b"new"));
+        let lock = take_lock(&target);
+        let outcome = Upgrader::new(target.clone(), Version::new(0, 48, 0)).perform_locked_upgrade(
+            &lock,
+            &new_binary,
+            &Version::new(0, 48, 1),
+            &staging,
+        );
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), installed);
+    }
+
+    #[test]
+    fn a_marker_that_disagrees_with_hash_bound_evidence_is_unknown() {
+        // Codex S2: a false low marker must not defeat the version guard.
+        let dir = TempDir::new().unwrap();
+        let installed = marked("0.48.0", b"bytes the updater recorded as 0.48.2");
+        let target = create_test_binary(&dir, "x0xd", &installed);
+        InstallRecord::write(&target, &Version::new(0, 48, 2), &sha(&installed)).unwrap();
+        let (staging, new_binary) = staged_binary(dir.path(), "s2b", &marked("0.48.1", b"new"));
+        let lock = take_lock(&target);
+        let outcome = Upgrader::new(target.clone(), Version::new(0, 48, 0)).perform_locked_upgrade(
+            &lock,
+            &new_binary,
+            &Version::new(0, 48, 1),
+            &staging,
+        );
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), installed);
+    }
+
+    #[test]
+    fn a_marker_that_agrees_with_the_install_record_counts() {
+        let dir = TempDir::new().unwrap();
+        let installed = marked("0.48.2", b"recorded bytes");
+        let target = create_test_binary(&dir, "x0xd", &installed);
+        InstallRecord::write(&target, &Version::new(0, 48, 2), &sha(&installed)).unwrap();
+        let (staging, new_binary) = staged_binary(dir.path(), "s2c", &marked("0.48.1", b"new"));
+        let lock = take_lock(&target);
+        let outcome = Upgrader::new(target.clone(), Version::new(0, 48, 0)).perform_locked_upgrade(
+            &lock,
+            &new_binary,
+            &Version::new(0, 48, 1),
+            &staging,
+        );
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseNotOlder { ref installed, .. })
+                if installed == "0.48.2"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn retention_keeps_the_known_good_pair_and_the_newest_three() {
+        // Codex S3 / D194 (controller ruling): never delete the backup of
+        // the release this daemon runs or of the one it ran before; keep the
+        // newest three versioned backups; delete only older ones.
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let backup = |release: &str| dir.path().join(format!("x0xd.backup-{release}-0badc0de"));
+        for release in ["0.46.0", "0.47.0", "0.47.1", "0.47.2", "0.47.3"] {
+            fs::write(backup(release), release.as_bytes()).unwrap();
+        }
+        let companion = dir.path().join("x0x.backup-0.46.0-0badc0de");
+        fs::write(&companion, b"cli").unwrap();
+        let (staging, new_binary) = staged_binary(dir.path(), "s3", NEW_BYTES);
+        let lock = take_lock(&target);
+        let outcome = Upgrader::new(target.clone(), Version::new(0, 48, 0))
+            .with_running_sha256(Some(sha(OLD_BYTES)))
+            .with_previous_release(Some(Version::new(0, 47, 1)))
+            .perform_locked_upgrade(&lock, &new_binary, &Version::new(0, 48, 1), &staging)
+            .unwrap();
+        let SwapOutcome::Swapped { backup_path } = outcome else {
+            panic!("expected a swap");
+        };
+        assert!(
+            backup_path.exists(),
+            "the backup of the running release stays"
+        );
+        assert!(
+            backup("0.47.1").exists(),
+            "the previous known-good release stays"
+        );
+        assert!(
+            backup("0.47.3").exists() && backup("0.47.2").exists(),
+            "newest three stay"
+        );
+        assert!(!backup("0.47.0").exists(), "older backups go");
+        assert!(!backup("0.46.0").exists(), "older backups go");
+        assert!(
+            companion.exists(),
+            "another binary's backups are not touched"
+        );
+    }
+
+    #[test]
+    fn the_disk_reserve_refuses_staging_below_one_gib() {
+        // D194 (review S3): refuse staging when it would leave less than
+        // 1 GiB free; report insufficient_disk.
+        let gib = DISK_RESERVE_BYTES;
+        assert!(check_disk_reserve(10 * gib, gib).is_ok());
+        let refused = check_disk_reserve(gib + 100, 200).unwrap_err();
+        assert!(matches!(refused, UpgradeError::InsufficientDisk { .. }));
+        assert!(
+            refused.to_string().starts_with("insufficient_disk"),
+            "{refused}"
+        );
+        assert!(check_disk_reserve(100, 200).is_err());
+        assert!(free_space_bytes(std::env::temp_dir().as_path()).is_some_and(|b| b > 0));
+    }
+
     fn marked(release: &str, filler: &[u8]) -> Vec<u8> {
         let mut bytes = filler.to_vec();
         bytes.extend_from_slice(b"\0\x7f padding ");
@@ -1654,9 +1816,10 @@ mod tests {
             .with_running_sha256(Some(sha(&installed)));
         let outcome =
             upgrader.perform_locked_upgrade(&lock, &new_binary, &Version::new(0, 48, 1), &staging);
+        // Review S2: the marker disagrees with the hash-bound evidence (the
+        // running hash says 0.48.0): the bytes are unknown and refused.
         assert!(
-            matches!(outcome, Err(UpgradeError::InstalledReleaseNotOlder { ref installed, .. })
-                if installed == "0.48.2"),
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
             "{outcome:?}"
         );
         assert_eq!(fs::read(&target).unwrap(), installed);
@@ -1698,8 +1861,9 @@ mod tests {
             &target_version,
         );
         let outcome = upgrader.perform_locked_upgrade(&lock, &new_cli, &target_version, &staging);
+        // Review S2: a marker with no hash-bound evidence is no evidence.
         assert!(
-            matches!(outcome, Err(UpgradeError::InstalledReleaseNotOlder { .. })),
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
             "{outcome:?}"
         );
         assert_eq!(fs::read(&cli).unwrap(), cli_new, "no CLI downgrade");
