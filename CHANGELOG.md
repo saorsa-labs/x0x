@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **rustls 0.23.46 in Cargo.lock.** The lockfile moves rustls from 0.23.45 to 0.23.46. This closes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349. ant-quic stays 0.27.60. No Cargo.toml change and no version bump.
+
 ### Fixed
 
 - **Self-update is staged per node (#1106, ADR 0094 §1, D183/D184).** `[update] rollout_window_minutes` was parsed and never read, and `StagedRollout` had no production caller, so every node applied a release in the same seconds (self-update audit, 14 Oct 2026). Now the startup check, the gossip listener, the fallback poll and `POST /upgrade/apply` verify a release and then wait `SHA-256(MachineId ‖ version)` × window, in `[0, window)`, from this node's first receipt. Nodes apply at different times and the order changes per release. The compiled default window is now **60 minutes** (was 0). `0` still applies on first receipt (private rehearsal hosts, D184). The served wait is kept per release in the new `<data_dir>/upgrade-rollout.json` (versioned JSON), so a duplicate receipt or a restart does not reset or re-roll it. A stored newer release supersedes older ones, also after a restart. An unreadable or newer-format `upgrade-rollout.json` blocks every apply and is kept as it is (ADR 0094 §6). Repair: move the file away. `POST /upgrade/apply` answers `applied: false, staged: true` with `delay_secs` and `remaining_secs` while the node waits. The manifest wire format is unchanged.
