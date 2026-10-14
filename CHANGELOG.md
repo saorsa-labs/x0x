@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Product vision, 13 Oct 2026.** The README introduces x0x as people, their agents and their machines collaborating. It marks each vision point shipped, target or parked. Each shipped row names a file or symbol checked at commit `86a1d395`. A01 records public and private groups as policy already in the tree. A01 records partition behaviour as peers keeping the data they hold. Liveness and repair stay incomplete. A01 adds projects as a target. A01 adds agent rental as a target. David accepted that rental amendment (D275, 14 Oct 2026). The billing exclusion no longer rules rental out. Rental is still not shipped. Voice and video stay a vision target. The optional `voice` feature delivers a two-party audio library, and call routes cover lifecycle only. A08 records public and discoverable groups beside private ones. David accepted these A01 and A08 amendments (D275). He also accepted, and did not fold, `T-projects-and-agent-rental` (slot A01) and `T-alternate-bearers` (slot A05). ant-quic 0.27.60 already has BLE, serial and LoRa scaffolding. x0x does not call it. No version section and no version bump.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.

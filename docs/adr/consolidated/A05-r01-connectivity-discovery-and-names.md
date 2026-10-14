@@ -66,6 +66,8 @@ A full IP overlay can support more applications, but it expands routing, operati
 
 QUIC transport, discovery, streams and loopback forwarding exist. Friendly names, persistent forwards and SOCKS are a separate Phase 2 design. They must not be described as a complete shipped tailnet.
 
+ant-quic 0.27.60 already has bearer scaffolding. `TransportAddr` in `src/transport/addr.rs` names `Ble`, `LoRa` and `Serial`. `TransportCapabilities` in `src/transport/capabilities.rs` names `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. David accepted that record (D275, 14 Oct 2026) in [T-alternate-bearers](../transient/T-alternate-bearers.md). This note does not fold it into A05. Wiring those bearers into x0x stays a target.
+
 [A06](A06-r01-gossip-relay-roles-and-resource-limits.md) owns relay duties and resource limits. [A03](A03-r01-trust-permissions-sharing-and-revocation.md) owns service authority.
 
 ## Validation
@@ -88,5 +90,7 @@ These records are the primary sources for this draft. This mapping does not comp
 [ADR 0001 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0001-bootstrap-peers-are-seed-hints-only.md) · [ADR 0002 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0002-application-level-keepalive-for-direct-connections.md) · [ADR 0003 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0003-auto-connect-to-discovered-agents.md) · [ADR 0005 Superseded](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0005-mdns-local-network-discovery.md) · [ADR 0011 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0011-bootstrap-dual-listen-udp-443.md) · [ADR 0020 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0020-tailnet-phase-1-byte-streams-and-forwarding.md) · [ADR 0022 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0022-tailnet-stream-api.md) · [ADR 0032 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0032-x0xd-443-own-identity.md) · [ADR 0049 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0049-presence-foaf-discovery.md) · [ADR 0074 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0074-tailnet-phase-2-names-persistent-forwards-socks5.md) · [ADR 0086 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0086-gossip-send-targets-bounded-by-transport-connectivity.md)
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
+
+David accepted the bearer amendment above (D275, 14 Oct 2026). This slot stays Proposed. This note does not fold [T-alternate-bearers](../transient/T-alternate-bearers.md) into a new revision.
 
 [All 15 ADRs](README.md)
