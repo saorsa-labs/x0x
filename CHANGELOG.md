@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 
-- **Product vision, 13 Oct 2026.** The README introduces x0x as people, their agents and their machines collaborating, and marks each vision point shipped, target or parked against commit `86a1d395`. A01 adds projects, public and private groups, partition-first operation, and agent rental as a target. The billing exclusion no longer rules rental out. Voice and video are a vision target; implementation stays sequenced. A08 records public and discoverable groups beside private ones. Proposed transients, not folded and not Accepted: `T-projects-and-agent-rental` (slot A01) and `T-alternate-bearers` (slot A05). No version section and no version bump.
+- **Product vision, 13 Oct 2026.** The README introduces x0x as people, their agents and their machines collaborating. It marks each vision point shipped, target or parked. Each shipped row names a file or symbol checked at commit `86a1d395`. A01 records public and private groups as policy already in the tree. A01 records partition behaviour as peers keeping the data they hold. Liveness and repair stay incomplete. A01 adds projects as a target. A01 adds agent rental as a target. The Proposed A01 text would stop the billing exclusion from ruling rental out. That change stays Proposed until David accepts it. Voice and video stay a vision target. The optional `voice` feature delivers a two-party audio library, and call routes cover lifecycle only. A08 records public and discoverable groups beside private ones. Proposed transients, not folded and not Accepted: `T-projects-and-agent-rental` (slot A01) and `T-alternate-bearers` (slot A05). No version section and no version bump.
 
 ## [v0.48.0] - 2026-10-13
 

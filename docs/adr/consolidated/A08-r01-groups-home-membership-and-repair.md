@@ -121,6 +121,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
-The public and discoverable group text was added on 13 October 2026 against commit `86a1d395`. It records policy that is already in the tree. It does not mark liveness or repair complete.
+The public and discoverable group text was checked on 14 October 2026 at commit `86a1d395`. Preset names are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). `SignedPublic` is `GroupConfidentiality`, a mode, not a preset name. The check records policy that is already in the tree. It does not mark liveness or repair complete.
 
 [All 15 ADRs](README.md)
