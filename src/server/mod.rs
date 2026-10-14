@@ -1721,10 +1721,10 @@ pub async fn serve_with_options(
             "Staged rollout active: releases apply 0-{window} min after first receipt"
         );
     }
-    // #1106 review F2: a daemon that may self-update keeps a fresh
-    // participant record beside the shared executable; one that may not
-    // (`--skip-update-check`, `[update] enabled = false`) removes its record,
-    // so it does not hold back the other daemons on the install.
+    // #1106 review F2/R1: every daemon that runs from the install keeps a
+    // fresh participant record beside the shared executable, written under
+    // the host lock. One with self-update off (`--skip-update-check`,
+    // `[update] enabled = false`) registers as such and never becomes due.
     if let Some(heartbeat) = rollout
         .as_ref()
         .and_then(|r| r.spawn_participant_heartbeat())
@@ -1732,8 +1732,12 @@ pub async fn serve_with_options(
         bg_tasks.push(heartbeat);
     } else if configured_for_self_update {
         if let Ok(exe) = x0x::upgrade::apply::current_binary_path() {
-            let node_id = *state.agent.machine_id().as_bytes();
-            routes::register_updates_off_participant(&exe, &node_id, &config.data_dir).await;
+            bg_tasks.push(routes::spawn_updates_off_participant(
+                exe,
+                *state.agent.machine_id().as_bytes(),
+                config.data_dir.clone(),
+                state.shutdown_notify.subscribe(),
+            ));
         }
     }
 

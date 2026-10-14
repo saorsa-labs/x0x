@@ -73,16 +73,25 @@ impl HostUpgradeLock {
     /// Take the lock without waiting. `Ok(None)` means another writer holds it.
     pub fn try_acquire(target: &Path) -> Result<Option<Self>, UpgradeError> {
         let path = Self::lock_path_for(target);
-        let file = std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
-            .map_err(|source| UpgradeError::HostLock {
-                path: path.clone(),
-                source,
-            })?;
+            .open(&path);
+        // Review R1: another service account on a shared install may only
+        // read a lock file the first account created. flock needs no write
+        // access, so a read-only descriptor locks the same file.
+        let opened = match opened {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::OpenOptions::new().read(true).open(&path)
+            }
+            other => other,
+        };
+        let file = opened.map_err(|source| UpgradeError::HostLock {
+            path: path.clone(),
+            source,
+        })?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file, path })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),

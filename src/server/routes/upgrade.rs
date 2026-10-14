@@ -398,6 +398,9 @@ struct RolloutInner {
     waiter: Option<RolloutWaiter>,
     failed: HashMap<String, Instant>,
     applied: Option<String>,
+    /// The latest participant record; the heartbeat writes it under the
+    /// host lock (review R1).
+    participant_tx: watch::Sender<Option<x0x::upgrade::participants::ParticipantRecord>>,
 }
 
 impl RolloutInner {
@@ -442,12 +445,13 @@ fn log_apply_result(
 
 /// Write this daemon's shared-install participant record (#1106 review F2)
 /// from the scheduler state: the active staged release, its wait, and any
-/// blocked state. Best-effort: when the record cannot be written, the gate
-/// cannot establish the participants and refuses the swap.
+/// blocked state. The record goes to the heartbeat task, which writes it
+/// under the host lock (review R1). Until it is written, this daemon's own
+/// swap waits (its participants are not established).
 fn publish_participant_record(env: &RolloutEnv, inner: &RolloutInner) {
-    let Some(target) = env.install_target.as_deref() else {
+    if env.install_target.is_none() {
         return;
-    };
+    }
     let staged = inner.state.newest_release(x0x::VERSION).map(|entry| {
         x0x::upgrade::participants::ParticipantStage {
             release: entry.version.clone(),
@@ -464,11 +468,32 @@ fn publish_participant_record(env: &RolloutEnv, inner: &RolloutInner) {
         staged,
         inner.state.blocked.clone(),
     );
-    let key = x0x::upgrade::participants::participant_key(&env.data_dir);
-    if let Err(e) = x0x::upgrade::participants::write_own_unlocked(target, &key, &record) {
-        tracing::debug!(
+    inner.participant_tx.send_replace(Some(record));
+}
+
+/// Write a participant record under the host upgrade lock (review R1). The
+/// wait for the lock is bounded; a failure is a WARN, because the shared
+/// install then cannot count this daemon.
+async fn write_participant_record_locked(
+    target: &std::path::Path,
+    key: &str,
+    record: &x0x::upgrade::participants::ParticipantRecord,
+) {
+    let written =
+        match x0x::upgrade::HostUpgradeLock::acquire(target, x0x::upgrade::HOST_UPGRADE_LOCK_WAIT)
+            .await
+        {
+            Ok(lock) => x0x::upgrade::participants::write_own(&lock, target, key, record)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+    if let Err(e) = written {
+        tracing::warn!(
             error = %e,
-            "Failed to write the shared-install participant record; a swap will be refused"
+            install = %target.display(),
+            "Failed to write this daemon's shared-install participant record; this daemon \
+             cannot swap the shared binary, and the other daemons on the install cannot count \
+             it until the record is written"
         );
     }
 }
@@ -500,6 +525,7 @@ impl RolloutScheduler {
             waiter: None,
             failed: HashMap::new(),
             applied: None,
+            participant_tx: watch::channel(None).0,
         };
         // Register as a shared-install participant (#1106 review F2).
         publish_participant_record(&env, &inner);
@@ -516,17 +542,25 @@ impl RolloutScheduler {
     pub(in crate::server) fn spawn_participant_heartbeat(
         self: &Arc<Self>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        self.env.install_target.as_ref()?;
+        let target = self.env.install_target.clone()?;
         let this = Arc::clone(self);
         Some(tokio::spawn(async move {
+            let key = x0x::upgrade::participants::participant_key(&this.env.data_dir);
+            let mut records = this.inner.lock().await.participant_tx.subscribe();
             let mut shutdown = this.env.shutdown_watch.clone();
             loop {
-                {
-                    let inner = this.inner.lock().await;
-                    publish_participant_record(&this.env, &inner);
+                let latest = records.borrow_and_update().clone();
+                if let Some(mut record) = latest {
+                    record.updated_unix = unix_now_secs();
+                    write_participant_record_locked(&target, &key, &record).await;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_REFRESH) => {}
+                    changed = records.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             return;
@@ -1636,17 +1670,50 @@ async fn store_upgrade_response(
 
 /// Keep this daemon in the shared-install participant set while it runs with
 /// self-update off (review R1).
+///
+/// It writes a record with `updates_enabled = false` under the host lock.
+/// Such a daemon never becomes due, so the other daemons on the install do
+/// not swap the shared binary while it runs (only D185 `now=true` skips
+/// that wait). Before round 3 its record was removed, which hid it.
 pub(in crate::server) async fn register_updates_off_participant(
     target: &std::path::Path,
-    _node_id: &[u8; 32],
+    node_id: &[u8; 32],
     data_dir: &std::path::Path,
 ) {
     let key = x0x::upgrade::participants::participant_key(data_dir);
-    if let Ok(Some(lock)) = x0x::upgrade::HostUpgradeLock::try_acquire(target) {
-        if let Err(e) = x0x::upgrade::participants::remove_own(&lock, target, &key) {
-            tracing::debug!(error = %e, "Failed to remove this daemon's participant record");
+    let record = x0x::upgrade::participants::ParticipantRecord::new(
+        node_id,
+        data_dir,
+        x0x::VERSION,
+        unix_now_secs(),
+        None,
+        None,
+    )
+    .with_updates_enabled(false);
+    write_participant_record_locked(target, &key, &record).await;
+}
+
+/// Refresh [`register_updates_off_participant`] every
+/// [`x0x::upgrade::participants::PARTICIPANT_REFRESH`] until shutdown.
+pub(in crate::server) fn spawn_updates_off_participant(
+    target: PathBuf,
+    node_id: [u8; 32],
+    data_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            register_updates_off_participant(&target, &node_id, &data_dir).await;
+            tokio::select! {
+                _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_REFRESH) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
         }
-    }
+    })
 }
 
 /// The shared-install gate of an HTTP apply. `bypass` is D185 `now=true`.

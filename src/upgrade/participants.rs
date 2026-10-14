@@ -169,26 +169,27 @@ pub fn record_path(target: &Path, key: &str) -> PathBuf {
     participants_dir(target).join(format!("{key}.json"))
 }
 
-/// Write this daemon's record under the host upgrade lock.
+/// Write this daemon's record under the host upgrade lock (review R1): a
+/// writer that holds the lock sees a participant set that cannot change.
+///
+/// Each daemon writes only its own file: temp file, fsync, rename, then a
+/// directory fsync. The participants directory is created on first use with
+/// the install directory's group-write bit (setgid on a group-writable
+/// install), so a second service account on a group-shared install can add
+/// its record.
 pub fn write_own(
     _lock: &super::HostUpgradeLock,
     target: &Path,
     key: &str,
     record: &ParticipantRecord,
 ) -> std::io::Result<()> {
-    write_own_unlocked(target, key, record)
-}
-
-/// Write this daemon's record (temp file, fsync, rename). Each daemon writes
-/// only its own file, so a reader never sees a torn record.
-pub fn write_own_unlocked(
-    target: &Path,
-    key: &str,
-    record: &ParticipantRecord,
-) -> std::io::Result<()> {
     use std::io::Write;
     let dir = participants_dir(target);
-    std::fs::create_dir_all(&dir)?;
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir)?;
+        share_like_install_dir(&dir, target)?;
+        sync_dir_of(&dir)?;
+    }
     let path = record_path(target, key);
     let tmp = dir.join(format!("{key}.json.tmp-{}", std::process::id()));
     let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
@@ -200,17 +201,53 @@ pub fn write_own_unlocked(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(())
+    sync_dir_of(&path)
 }
 
 /// Remove this daemon's record under the host lock (a missing record is
 /// fine).
 pub fn remove_own(_lock: &super::HostUpgradeLock, target: &Path, key: &str) -> std::io::Result<()> {
-    match std::fs::remove_file(record_path(target, key)) {
-        Ok(()) => Ok(()),
+    let path = record_path(target, key);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_dir_of(&path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Give the new participants directory the install directory's group
+/// write bit (plus setgid), so every account that can write the install
+/// can register.
+#[cfg(unix)]
+fn share_like_install_dir(dir: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let install_mode = target
+        .parent()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o755);
+    let mode = if install_mode & 0o020 != 0 {
+        0o2775
+    } else {
+        0o755
+    };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn share_like_install_dir(_dir: &Path, _target: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// fsync the directory that holds `path`.
+fn sync_dir_of(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Check, under the host lock, that every live participant of the install
@@ -219,9 +256,12 @@ pub fn remove_own(_lock: &super::HostUpgradeLock, target: &Path, key: &str) -> s
 /// A live participant is due when it already runs `release` or newer, or
 /// when it has staged `release` or newer and its wait is served. A record
 /// older than [`PARTICIPANT_STALE_AFTER`] is stale: it is ignored and
-/// reported. The participants cannot be established, and the swap is
-/// refused, when the directory cannot be read, this daemon's own record is
-/// missing, or any record is unreadable or of another format.
+/// reported. A daemon with self-update off never becomes due. With
+/// `skip_waits` (D185 `now=true`), other participants' waits are skipped,
+/// but their holds (a blocked rollout state) still stop the swap. In every
+/// mode the swap is refused when the participants cannot be established:
+/// this daemon's own record is missing (pending), or the directory cannot
+/// be read or a record is unreadable or of another format (error).
 pub fn check_all_due(
     target: &Path,
     own_key: &str,
@@ -231,8 +271,17 @@ pub fn check_all_due(
 ) -> Result<ParticipantGate, UpgradeError> {
     let dir = participants_dir(target);
     let unknown = |reason: String| UpgradeError::ParticipantsUnknown { reason };
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| unknown(format!("cannot read {}: {e}", dir.display())))?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // Nothing registered yet, this daemon included: not established.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ParticipantGate::Waiting {
+                pending: vec![own_record_missing(own_key, &dir)],
+                stale: Vec::new(),
+            });
+        }
+        Err(e) => return Err(unknown(format!("cannot read {}: {e}", dir.display()))),
+    };
     let mut own_seen = false;
     let mut pending = Vec::new();
     let mut stale = Vec::new();
@@ -275,19 +324,19 @@ pub fn check_all_due(
             ));
             continue;
         }
-        if let Some(reason) = participant_not_due(&record, release) {
-            pending.push(PendingParticipant {
+        match participant_not_due(&record, release) {
+            None => {}
+            Some(NotDue::Wait(reason) | NotDue::Hold(reason)) => pending.push(PendingParticipant {
                 key: key.to_string(),
                 machine_id: record.machine_id.clone(),
                 reason,
-            });
+            }),
         }
     }
     if !own_seen {
-        return Err(unknown(format!(
-            "this daemon's own record {own_key}.json is missing from {}",
-            dir.display()
-        )));
+        // Registration is pending or failed (logged by that daemon at
+        // WARN). The set is not established: no swap, in any mode.
+        pending.push(own_record_missing(own_key, &dir));
     }
     if pending.is_empty() {
         Ok(ParticipantGate::AllDue { stale })
@@ -296,33 +345,57 @@ pub fn check_all_due(
     }
 }
 
+fn own_record_missing(own_key: &str, dir: &Path) -> PendingParticipant {
+    PendingParticipant {
+        key: own_key.to_string(),
+        machine_id: String::new(),
+        reason: format!(
+            "this daemon's own record {own_key}.json is missing from {} (registration pending \
+             or failed)",
+            dir.display()
+        ),
+    }
+}
+
+/// Why a live participant is not due: a wait (time or configuration; D185
+/// `now=true` may skip it) or a hold (it never ends by waiting).
+enum NotDue {
+    Wait(String),
+    Hold(String),
+}
+
 /// `None` when the live participant is due for `release`, else why not.
-fn participant_not_due(record: &ParticipantRecord, release: &Version) -> Option<String> {
+fn participant_not_due(record: &ParticipantRecord, release: &Version) -> Option<NotDue> {
     let label = format!(
         "machine {} ({})",
         short(&record.machine_id),
         record.data_dir
     );
     if let Some(reason) = &record.blocked {
-        return Some(format!("{label}: rollout state blocked: {reason}"));
+        return Some(NotDue::Hold(format!(
+            "{label}: rollout state blocked: {reason}"
+        )));
     }
     if Version::parse(&record.running_version).is_ok_and(|running| &running >= release) {
         return None;
     }
-    match &record.staged {
-        None => Some(format!("{label}: has not staged v{release}")),
+    if !record.updates_enabled {
+        return Some(NotDue::Wait(format!(
+            "{label}: self-update is off for this daemon"
+        )));
+    }
+    let reason = match &record.staged {
+        None => format!("{label}: has not staged v{release}"),
         Some(stage) => match Version::parse(&stage.release) {
-            Ok(staged) if &staged >= release && stage.due => None,
-            Ok(staged) if &staged >= release => Some(format!(
+            Ok(staged) if &staged >= release && stage.due => return None,
+            Ok(staged) if &staged >= release => format!(
                 "{label}: due for v{} in {}s",
                 stage.release, stage.remaining_secs
-            )),
-            _ => Some(format!(
-                "{label}: waits for v{}, not v{release}",
-                stage.release
-            )),
+            ),
+            _ => format!("{label}: waits for v{}, not v{release}", stage.release),
         },
-    }
+    };
+    Some(NotDue::Wait(reason))
 }
 
 fn short(machine_id: &str) -> &str {

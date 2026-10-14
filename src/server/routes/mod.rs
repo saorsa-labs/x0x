@@ -150,7 +150,7 @@ pub(super) use tasks::{
 pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{
     announce_completed_upgrade, apply_upgrade, broadcast_current_manifest, check_upgrade,
-    register_updates_off_participant, report_available_update, rollout_scheduler_for,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    report_available_update, rollout_scheduler_for, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, spawn_updates_off_participant,
     SelfPublishedReleaseManifests,
 };
