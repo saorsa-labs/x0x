@@ -1637,7 +1637,11 @@ mod tests {
         assert!(held.is_share_grant_revoked(&grant_id, &owner_keys.user_id()));
         let peer_a = AgentId([0xA1; 32]);
         let peer_b = AgentId([0xB2; 32]);
-        held.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V3, &peer_a, &[grant.clone()]);
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_a,
+            std::slice::from_ref(&grant),
+        );
         assert!(
             held.revocation_resync_required(),
             "one peer does not open the carrier"
