@@ -433,6 +433,64 @@ impl SimFabric {
         }
     }
 
+    /// #1403 test hook: model an ant-quic supersede of the `a`–`b` link.
+    /// The pair's live generation moves to a new one, and both nodes get
+    /// the events that ant-quic's `register_connected_peer` sends for it:
+    /// `Replaced`, then `Closing` and `Closed` (reason `Superseded`) for the
+    /// old generation. Returns `(old, new)`, or `None` when the pair has no
+    /// link.
+    pub(crate) fn supersede_link_for_test(&self, a: &PeerId, b: &PeerId) -> Option<(u64, u64)> {
+        let key = pair(a.0, b.0);
+        let mut state = self.lock();
+        let old = state.links.get(&key)?.generation;
+        let new = state.next_generation;
+        state.next_generation = new.saturating_add(1);
+        if let Some(link) = state.links.get_mut(&key) {
+            link.generation = new;
+        }
+        for (me, other) in [(a.0, b.0), (b.0, a.0)] {
+            if let Some(slot) = state.nodes.get(&me) {
+                for event in [
+                    PeerLifecycleEvent::Replaced {
+                        old_generation: old,
+                        new_generation: new,
+                    },
+                    PeerLifecycleEvent::Closing {
+                        generation: old,
+                        reason: ConnectionCloseReason::Superseded,
+                    },
+                    PeerLifecycleEvent::Closed {
+                        generation: old,
+                        reason: ConnectionCloseReason::Superseded,
+                    },
+                ] {
+                    let _ = slot.lifecycle.send((PeerId(other), event));
+                }
+            }
+        }
+        Some((old, new))
+    }
+
+    /// #1403 test hook: model an ant-quic restore of a superseded
+    /// connection (`WinnerUnavailableFallback`). The `a`–`b` link's live
+    /// generation goes back to `generation` at once, as
+    /// `current_connection_generation` reads it. No event is sent here:
+    /// ant-quic sends its `Replaced` later, from an asynchronous task.
+    pub(crate) fn restore_link_generation_for_test(
+        &self,
+        a: &PeerId,
+        b: &PeerId,
+        generation: u64,
+    ) -> bool {
+        match self.lock().links.get_mut(&pair(a.0, b.0)) {
+            Some(link) => {
+                link.generation = generation;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Record a harness event (barrier, receipt, fault step) in the trace.
     pub(crate) fn mark(&self, text: impl Into<String>) {
         let at = self.now();

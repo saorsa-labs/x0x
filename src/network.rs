@@ -7581,6 +7581,100 @@ mod tests {
         b.try_shutdown().await.unwrap();
     }
 
+    /// #1403 R2 fixture: connect A to B on generation `A`, let the
+    /// gatekeeper see it, and return the generation.
+    async fn issue1403_connect_generation(a: &NetworkNode, b_addr: SocketAddr) -> (AntPeerId, u64) {
+        let peer_b = a.connect_addr(b_addr).await.unwrap();
+        issue1403_settle().await;
+        let generation = a
+            .try_connection_generation(&peer_b)
+            .unwrap()
+            .expect("generation A is live");
+        (peer_b, generation)
+    }
+
+    /// #1403 R2: ant-quic supersedes generation A with B and then restores
+    /// A with the same generation number (`WinnerUnavailableFallback`).
+    /// Model it in the fabric and return when A reads as the winner again.
+    fn issue1403_supersede_then_restore(
+        fabric: &sim::SimFabric,
+        a: &NetworkNode,
+        peer_b: &AntPeerId,
+        generation: u64,
+    ) {
+        let (old, new) = fabric
+            .supersede_link_for_test(&a.peer_id(), peer_b)
+            .expect("the pair has a link");
+        assert_eq!(old, generation);
+        assert_eq!(a.try_connection_generation(peer_b), Ok(Some(new)));
+        assert!(fabric.restore_link_generation_for_test(&a.peer_id(), peer_b, generation));
+        assert_eq!(
+            a.try_connection_generation(peer_b),
+            Ok(Some(generation)),
+            "A is the winner again, with its old generation number"
+        );
+    }
+
+    /// #1403 R2 (RED at 70dea07): A→B→restore A. A ran a clock for more
+    /// than the grace before B superseded it. The restored A has only just
+    /// become the winner again, so that clock must not count.
+    ///
+    /// The gate read runs before the gatekeeper task handles the queued
+    /// lifecycle events: there is no await between the transitions and the
+    /// synchronous read.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_restored_generation_restarts_a_running_clock() {
+        let plane = "issue1403-restore-running-clock";
+        let (fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14033).await;
+        let (peer_b, generation) = issue1403_connect_generation(&a, b_addr).await;
+        assert!(
+            matches!(
+                issue1403_plane_entry(&a, &peer_b),
+                Some(PlanePeerState::Pending { .. })
+            ),
+            "generation A has a running clock"
+        );
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation);
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a restored generation starts a new grace: its earlier Live period does not count"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
+    /// #1403 R2 (RED at 70dea07): A→B→restore A after A was admitted as
+    /// legacy. The legacy admission belongs to A's earlier Live period and
+    /// must not survive the supersede. Same ordering as above: the gate
+    /// read comes before the gatekeeper handles the events.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1403_restored_generation_does_not_keep_a_legacy_admission() {
+        let plane = "issue1403-restore-legacy-admission";
+        let (fabric, a, b, b_addr) = issue1403_legacy_pair(plane, 14034).await;
+        let (peer_b, generation) = issue1403_connect_generation(&a, b_addr).await;
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a new legacy connection waits"
+        );
+        issue1403_backdate_clock(&a, &peer_b, PLANE_LEGACY_GRACE + Duration::from_secs(1));
+        assert!(
+            a.plane_gate_allows(&peer_b),
+            "generation A served the whole grace: legacy admission"
+        );
+
+        issue1403_supersede_then_restore(&fabric, &a, &peer_b, generation);
+        assert!(
+            !a.plane_gate_allows(&peer_b),
+            "a legacy admission does not survive supersede-then-restore"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
     /// #1403: the pure gate decision. A clock runs only for the generation
     /// it names, and no clock starts without a live generation.
     #[test]
