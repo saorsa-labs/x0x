@@ -311,6 +311,8 @@ pub(in crate::server) struct DaemonApplier {
     pub stop_on_upgrade: bool,
     /// Restart planner context (data dir, API address, shutdown hook).
     pub restart_context: RestartContext,
+    /// This daemon's shared-install participant gate (#1106 review F2).
+    pub shared_install_gate: Option<x0x::upgrade::apply::SharedInstallGate>,
 }
 
 impl RolloutApplier for DaemonApplier {
@@ -324,6 +326,7 @@ impl RolloutApplier for DaemonApplier {
                 .with_stop_on_upgrade(self.stop_on_upgrade)
                 .with_restart_context(self.restart_context.clone())
                 .with_apply_summary(summary)
+                .with_shared_install_gate(self.shared_install_gate.clone())
                 .apply_upgrade_from_manifest(manifest)
                 .await
         })
@@ -344,6 +347,9 @@ pub(in crate::server) struct RolloutEnv {
     pub shutdown_watch: watch::Receiver<bool>,
     /// The destructive half of a due apply.
     pub applier: Arc<dyn RolloutApplier>,
+    /// The installed executable this daemon runs from. When set, the daemon
+    /// keeps its shared-install participant record beside it (#1106 F2).
+    pub install_target: Option<PathBuf>,
 }
 
 /// What the scheduler decided for one offered release.
@@ -731,7 +737,11 @@ fn rollout_env_for(state: &AppState) -> RolloutEnv {
                 state.api_address,
                 daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
             ),
+            shared_install_gate: Some(x0x::upgrade::apply::SharedInstallGate {
+                own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+            }),
         }),
+        install_target: x0x::upgrade::apply::current_binary_path().ok(),
     }
 }
 
@@ -1826,6 +1836,16 @@ mod tests {
         window_minutes: u64,
         applier: Arc<CountingApplier>,
     ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
+        test_scheduler_with(data_dir, node_id, window_minutes, applier, None)
+    }
+
+    fn test_scheduler_with(
+        data_dir: &std::path::Path,
+        node_id: [u8; 32],
+        window_minutes: u64,
+        applier: Arc<dyn RolloutApplier>,
+        install_target: Option<PathBuf>,
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
         let (shutdown_tx, shutdown_watch) = watch::channel(false);
         let scheduler = RolloutScheduler::new(RolloutEnv {
             node_id,
@@ -1834,8 +1854,116 @@ mod tests {
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             shutdown_watch,
             applier,
+            install_target,
         });
         (scheduler, shutdown_tx)
+    }
+
+    /// Answers "participants not yet due" for the first `not_due` attempts,
+    /// then applies (Codex F2).
+    struct ParticipantWaitApplier {
+        attempts: AtomicU64,
+        not_due: u64,
+    }
+
+    impl RolloutApplier for ParticipantWaitApplier {
+        fn apply<'a>(
+            &'a self,
+            manifest: &'a ReleaseManifest,
+            _summary: ApplySummary,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n < self.not_due {
+                    return Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
+                        release: manifest.version.clone(),
+                        pending: vec!["x0xd-443 (due in 600s)".to_string()],
+                    });
+                }
+                Ok(x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_wait_is_retried_without_a_failure_backoff() {
+        // Codex F2: a due daemon on a shared install waits for the other
+        // participant. That is a wait, not a failed apply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let applier = Arc::new(ParticipantWaitApplier {
+            attempts: AtomicU64::new(0),
+            not_due: 2,
+        });
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [3; 32], 0, applier.clone(), None);
+        let manifest = manifest_with_version(&version_newer_than_current());
+        let applied =
+            stage_and_apply_if_due(&scheduler, &manifest, RolloutTrigger::Gossip, None).await;
+        assert_eq!(applied, None, "the first attempt waits for the participant");
+        assert!(
+            !scheduler.backoff_active(&manifest.version).await,
+            "a participant wait is not a failure"
+        );
+        assert!(
+            wait_until(
+                || applier.attempts.load(Ordering::SeqCst) == 3,
+                Duration::from_secs(300)
+            )
+            .await,
+            "the daemon re-checks the participants until they are due"
+        );
+        assert_eq!(
+            scheduler
+                .offer(&manifest, RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::AlreadyApplied
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_scheduler_publishes_its_participant_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), id, 60, applier.clone(), Some(target.clone()));
+        let key = x0x::upgrade::participants::participant_key(dir.path());
+        let path = x0x::upgrade::participants::record_path(&target, &key);
+        let read = || -> x0x::upgrade::participants::ParticipantRecord {
+            serde_json::from_slice(&std::fs::read(&path).expect("record written")).unwrap()
+        };
+        assert_eq!(read().staged, None, "registered at start, nothing staged");
+        assert_eq!(read().machine_id, hex::encode(id));
+
+        let RolloutOffer::Waiting(staged) = scheduler
+            .offer(
+                &manifest_with_version(&version),
+                RolloutTrigger::Gossip,
+                None,
+            )
+            .await
+        else {
+            panic!("a 60-minute window stages the release");
+        };
+        let stage = read().staged.expect("the staged release is published");
+        assert_eq!(stage.release, version);
+        assert!(!stage.due);
+        assert_eq!(stage.delay_secs, staged.delay_secs);
+
+        assert!(
+            wait_until(
+                || applier.attempts() == 1,
+                staged.delay() + Duration::from_secs(10)
+            )
+            .await
+        );
+        assert!(read().staged.expect("still staged").due, "published as due");
     }
 
     /// A node whose 60-minute-window delay for `version` is in `range`.
@@ -2340,7 +2468,9 @@ mod tests {
                     SocketAddr::from(([127, 0, 0, 1], 12700)),
                     Arc::new(|| {}),
                 ),
+                shared_install_gate: None,
             }),
+            install_target: None,
         });
         (rollout, shutdown_tx)
     }

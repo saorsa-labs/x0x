@@ -8,6 +8,7 @@
 pub mod apply;
 pub mod manifest;
 pub mod monitor;
+pub mod participants;
 pub mod restart;
 pub mod rollout;
 pub mod signature;
@@ -933,6 +934,20 @@ pub enum UpgradeError {
     /// not this process's bytes and no install record matches them.
     #[error("the release installed at {path} is unknown (not this process's bytes, no matching install record); refusing to replace it")]
     InstalledReleaseUnknown { path: PathBuf },
+
+    /// A shared install still has participants whose wait is not served
+    /// (#1106 review F2, ADR 0094 §1). Nothing was replaced; this is a wait,
+    /// not a failure.
+    #[error("shared install: participants are not yet due for {release}: {}", pending.join("; "))]
+    ParticipantsNotDue {
+        release: String,
+        pending: Vec<String>,
+    },
+
+    /// The participants of a shared install cannot be established (#1106
+    /// review F2). The swap is refused.
+    #[error("shared install: participants cannot be established: {reason}")]
+    ParticipantsUnknown { reason: String },
 
     /// Another writer on this host held the upgrade lock for the whole wait
     /// (#1106). Nothing was replaced.

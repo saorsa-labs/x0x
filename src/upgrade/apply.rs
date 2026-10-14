@@ -70,6 +70,15 @@ pub struct ApplySummary {
     pub delay_secs: u64,
 }
 
+/// The shared-install gate of a daemon apply (#1106 review F2): this
+/// daemon's participant record key. Under the host lock the apply swaps the
+/// shared binary only when every live participant is due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedInstallGate {
+    /// This daemon's participant record key.
+    pub own_key: String,
+}
+
 /// The fields of one applied-upgrade summary line.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AppliedSummaryLine<'a> {
@@ -145,6 +154,8 @@ pub struct AutoApplyUpgrader {
     restart_context: RestartContext,
     /// Trigger, sender and served delay for the WARN summary line.
     apply_summary: ApplySummary,
+    /// The shared-install participant gate (#1106 review F2).
+    shared_install_gate: Option<SharedInstallGate>,
 }
 
 impl AutoApplyUpgrader {
@@ -155,7 +166,16 @@ impl AutoApplyUpgrader {
             restart_on_success: true,
             restart_context: RestartContext::default(),
             apply_summary: ApplySummary::default(),
+            shared_install_gate: None,
         }
+    }
+
+    /// Gate the shared swap on every participant being due (#1106 review
+    /// F2). `None` skips the gate (the D185 `now=true` bypass, and callers
+    /// outside the daemon).
+    pub fn with_shared_install_gate(mut self, gate: Option<SharedInstallGate>) -> Self {
+        self.shared_install_gate = gate;
+        self
     }
 
     /// Supply the trigger, sender and served rollout delay that the WARN
