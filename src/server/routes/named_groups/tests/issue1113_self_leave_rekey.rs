@@ -15,9 +15,12 @@ struct LeaveFixture {
 }
 
 async fn two_member_treekem_group() -> Result<LeaveFixture> {
+    two_member_treekem_group_with_id("cd".repeat(16)).await
+}
+
+async fn two_member_treekem_group_with_id(group_id: String) -> Result<LeaveFixture> {
     let (state, dir) = secure_endpoint_test_state().await?;
     let admin_id = state.agent.agent_id();
-    let group_id = "cd".repeat(16);
     let group_id_bytes = hex::decode(&group_id)?;
     let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
     let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
@@ -695,6 +698,7 @@ fn empty_catchup(group_id: &str, truncated: bool) -> TreeKemCatchupResponse {
         group_id: group_id.to_string(),
         events: Vec::new(),
         truncated,
+        responder_state_hash: None,
     }
 }
 
@@ -716,6 +720,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
         group_id: fixture.group_id.clone(),
         events: vec![leave],
         truncated: true,
+        responder_state_hash: None,
     };
     // The transport sender is an active peer, not the leaver. The commit
     // signature is the author.
@@ -1659,6 +1664,7 @@ async fn deliver_catchup(
             group_id: group_id.to_string(),
             events: vec![event],
             truncated: false,
+            responder_state_hash: None,
         },
     )
     .await;
@@ -1846,6 +1852,455 @@ async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
             .decrypt_message(&ciphertext)
             .is_err(),
         "the leaver must not read the relayed epoch"
+    );
+    Ok(())
+}
+
+async fn mark_leaver_removed(fixture: &LeaveFixture) {
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    let mut groups = fixture.state.named_groups.write().await;
+    let info = groups.get_mut(&fixture.group_id).expect("group");
+    info.remove_member(&member_hex, Some(member_hex.clone()));
+}
+
+fn catchup_page(
+    group_id: &str,
+    truncated: bool,
+    responder_state_hash: Option<String>,
+) -> TreeKemCatchupResponse {
+    TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.to_string(),
+        events: Vec::new(),
+        truncated,
+        responder_state_hash,
+    }
+}
+
+async fn saved_head(state: &AppState, group_id: &str) -> String {
+    let groups = state.named_groups.read().await;
+    groups.get(group_id).expect("group").state_hash.clone()
+}
+
+async fn encrypt_status(state: &AppState, group_id: &str) -> StatusCode {
+    let payload = base64::engine::general_purpose::STANDARD.encode(b"secret");
+    let (status, _) =
+        super::super::treekem_group_encrypt(state, group_id, None, &payload, None).await;
+    status
+}
+
+fn key_package_reply(
+    group_id: &str,
+    responder_state_hash: Option<String>,
+) -> TreeKemCatchupResponse {
+    TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.to_string(),
+        events: vec![NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.to_string(),
+            stable_group_id: None,
+            member_agent_id: "not-a-member".to_string(),
+            member_public_key_b64: String::new(),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: String::new(),
+            invite_secret: String::new(),
+            ts_ms: 0,
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            certificate_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: String::new(),
+        }],
+        truncated: false,
+        responder_state_hash,
+    }
+}
+
+async fn startup_with_witness(group_id: &str) -> Result<(LeaveFixture, x0x::identity::AgentId)> {
+    let fixture = two_member_treekem_group_with_id(group_id.to_string()).await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let witness = x0x::identity::AgentId([0xff; 32]);
+    let witness_hex = fixed_admin_hex([0xff; 32], &admin_id, false);
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_fixed_admin(info, admin_id, witness_hex);
+    }
+    mark_leaver_removed(&fixture).await;
+    Ok((fixture, witness))
+}
+
+/// Startup must not seal on a timer, an empty page, or a hash that is not
+/// the local saved head. The matching head is the signal that permits the seal.
+#[tokio::test]
+async fn startup_seals_only_after_the_peer_reports_the_saved_head() -> Result<()> {
+    // A distinct id: the catch-up gate is process-wide, and the other
+    // tests in this module share "cd" * 16.
+    let (fixture, witness) = startup_with_witness(&"ce".repeat(16)).await?;
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "startup must not seal before the saved head is verified"
+    );
+    let head = saved_head(&fixture.state, &fixture.group_id).await;
+    for page in [
+        catchup_page(&fixture.group_id, false, None),
+        catchup_page(
+            &fixture.group_id,
+            false,
+            Some("newer-saved-head".to_string()),
+        ),
+        key_package_reply(&fixture.group_id, Some(head.clone())),
+    ] {
+        handle_treekem_catchup_response(&fixture.state, &witness, true, page).await;
+        assert_eq!(
+            live_epoch(&fixture.state, &fixture.group_id).await,
+            fixture.epoch_before,
+            "a page without the local saved head must not seal"
+        );
+    }
+    let head = saved_head(&fixture.state, &fixture.group_id).await;
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &witness,
+        true,
+        catchup_page(&fixture.group_id, false, Some(head)),
+    )
+    .await;
+    let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        epoch_after > fixture.epoch_before,
+        "the matching saved head must let the designated admin seal; \
+         before {}, after {epoch_after}",
+        fixture.epoch_before
+    );
+    Ok(())
+}
+
+/// With no other active member, no peer can hold a later head. Startup seals
+/// without a catch-up response and without a wait.
+#[tokio::test]
+async fn startup_seals_when_no_other_active_member_can_be_ahead() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    mark_leaver_removed(&fixture).await;
+    startup_self_leave_rekey(&fixture.state).await;
+    let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        epoch_after > fixture.epoch_before,
+        "startup must seal when no other active member remains; before {}, after {epoch_after}",
+        fixture.epoch_before
+    );
+    Ok(())
+}
+
+/// A restarted responder with an empty event log still reports its saved
+/// head. That newer head must not let the committer seal.
+#[tokio::test]
+async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<()> {
+    let (responder, requester) = startup_with_witness(&"c1".repeat(16)).await?;
+    {
+        let mut groups = responder.state.named_groups.write().await;
+        let info = groups.get_mut(&responder.group_id).expect("group");
+        info.state_hash = "newer-saved-head".to_string();
+    }
+    handle_treekem_catchup_request(
+        &responder.state,
+        &requester,
+        true,
+        TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: responder.group_id.clone(),
+            requester_agent_id: hex::encode(requester.as_bytes()),
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: "older-head".to_string(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: 8,
+        },
+    )
+    .await;
+    let recorded = responder
+        .state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("cold responder built a page");
+    let page: TreeKemCatchupResponse = serde_json::from_slice(&recorded)?;
+    assert!(page.events.is_empty(), "a cold log has no membership page");
+    assert!(!page.truncated, "an empty cold log is a terminal page");
+    assert_eq!(
+        page.responder_state_hash.as_deref(),
+        Some("newer-saved-head"),
+        "the cold responder must report its saved head"
+    );
+
+    let (committer, witness) = startup_with_witness(&"c2".repeat(16)).await?;
+    startup_self_leave_rekey(&committer.state).await;
+    let mut foreign = page;
+    foreign.group_id = committer.group_id.clone();
+    handle_treekem_catchup_response(&committer.state, &witness, true, foreign).await;
+    assert_eq!(
+        live_epoch(&committer.state, &committer.group_id).await,
+        committer.epoch_before,
+        "a newer saved head must not clear the startup gate"
+    );
+    Ok(())
+}
+
+/// The last other active member can leave before answering. The roster fact
+/// retires the obligation under the membership lock, and the epoch advances.
+#[tokio::test]
+async fn startup_seals_when_the_last_other_member_leaves_during_the_wait() -> Result<()> {
+    let (fixture, witness) = startup_with_witness(&"c3".repeat(16)).await?;
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the wait must hold while the other member is still active"
+    );
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.remove_member(
+            &hex::encode(witness.as_bytes()),
+            Some(hex::encode(fixture.state.agent.agent_id().as_bytes())),
+        );
+    }
+    schedule_self_leave_rekey_if_idle(&fixture.state, &fixture.group_id).await;
+    let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        epoch_after > fixture.epoch_before,
+        "the last other member leaving must retire the wait and seal; \
+         before {}, after {epoch_after}",
+        fixture.epoch_before
+    );
+    Ok(())
+}
+
+/// A Removed row whose leaf is already gone must not arm the startup wait,
+/// even when another active member remains.
+#[tokio::test]
+async fn historical_removed_row_does_not_open_the_startup_wait() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"c4".repeat(16)).await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let group_id_bytes = hex::decode(&fixture.group_id)?;
+    let seed = super::super::agent_treekem_seed(fixture.state.agent.as_ref(), &group_id_bytes);
+    let solo = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    fixture.state.treekem_groups.write().await.insert(
+        fixture.group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(solo)),
+    );
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        0,
+        "a historical Removed row must not send startup catch-up"
+    );
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::OK,
+        "a historical Removed row must not withhold ciphertext"
+    );
+    Ok(())
+}
+
+/// A failed startup send stays pending. Reconnect may retry inside the bound.
+/// Past the bound the leaf stays, and new ciphertext stays withheld.
+#[tokio::test]
+async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"c5".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a failed send must not seal"
+    );
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "new ciphertext must be withheld while the live leaf remains"
+    );
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        3,
+        "the send bound must stop further catch-up requests"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "spending the send bound must not seal"
+    );
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "ciphertext stays withheld after the send bound"
+    );
+    Ok(())
+}
+
+/// A request that leaves this process is not a completed catch-up. The gate
+/// stays open until the saved head comes back.
+#[tokio::test]
+async fn sent_startup_request_without_a_response_keeps_the_gate() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"c6".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    let recorded = fixture
+        .state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .clone();
+    assert_eq!(
+        recorded.last().map(Vec::as_slice),
+        Some(fixture.group_id.as_bytes()),
+        "the startup pass must send the catch-up request"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a lost response must not seal"
+    );
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "a lost response must withhold ciphertext"
+    );
+    Ok(())
+}
+
+async fn add_removed_leaf_group(state: &Arc<AppState>, group_id: &str) -> Result<u64> {
+    let admin_id = state.agent.agent_id();
+    let group_id_bytes = hex::decode(group_id)?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    let member_kp = x0x::identity::AgentKeypair::generate()?;
+    let member_id = member_kp.agent_id();
+    let member_hex = hex::encode(member_id.as_bytes());
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_id, &[9u8; 32])?;
+    let kp_bytes = prepared.key_package_bytes().to_vec();
+    let added = admin_group.add_member(member_id, &kp_bytes)?;
+    let _leaver = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+    let epoch_before = admin_group.epoch();
+    let mut info = x0x::groups::GroupInfo::new(
+        "leave-rekey".to_string(),
+        String::new(),
+        admin_id,
+        group_id.to_string(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.add_member(
+        member_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    info.set_member_treekem_key_package(
+        &member_hex,
+        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+    );
+    info.remove_member(&member_hex, Some(member_hex.clone()));
+    let witness_hex = fixed_admin_hex([0xff; 32], &admin_id, false);
+    add_fixed_admin(&mut info, admin_id, witness_hex);
+    info.secret_epoch = epoch_before;
+    info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.to_string(),
+        Arc::new(tokio::sync::Mutex::new(admin_group)),
+    );
+    Ok(epoch_before)
+}
+
+/// Both groups are gated before either send, so a live schedule cannot seal
+/// the later group while the earlier group's request is in flight.
+#[tokio::test]
+async fn startup_gates_every_group_before_either_send() -> Result<()> {
+    let (first, witness) = startup_with_witness(&"c8".repeat(16)).await?;
+    let second_id = "c9".repeat(16);
+    let second_epoch = add_removed_leaf_group(&first.state, &second_id).await?;
+    self_leave_startup_hold_for_gate_install();
+    schedule_self_leave_rekey_if_idle(&first.state, &second_id).await;
+    assert_eq!(
+        live_epoch(&first.state, &second_id).await,
+        second_epoch,
+        "a live rekey must not seal before startup installs the gates"
+    );
+    first
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&first.state).await;
+    assert_eq!(
+        live_epoch(&first.state, &first.group_id).await,
+        first.epoch_before
+    );
+    assert_eq!(live_epoch(&first.state, &second_id).await, second_epoch);
+    assert_eq!(self_leave_startup_send_count(&first.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&second_id), 1);
+    let recorded = first
+        .state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .clone();
+    let sent: Vec<String> = recorded
+        .iter()
+        .filter_map(|bytes| String::from_utf8(bytes.clone()).ok())
+        .filter(|id| id == &first.group_id || id == &second_id)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![first.group_id.clone(), second_id.clone()],
+        "startup must send in sorted group-key order after both gates exist"
+    );
+    let head = saved_head(&first.state, &first.group_id).await;
+    handle_treekem_catchup_response(
+        &first.state,
+        &witness,
+        true,
+        catchup_page(&first.group_id, false, Some(head)),
+    )
+    .await;
+    assert!(live_epoch(&first.state, &first.group_id).await > first.epoch_before);
+    assert_eq!(
+        live_epoch(&first.state, &second_id).await,
+        second_epoch,
+        "clearing one group must not seal the other"
     );
     Ok(())
 }
