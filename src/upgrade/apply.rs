@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::manifest::{current_platform_target, ReleaseManifest};
 use super::restart;
+use super::rollout::RolloutTrigger;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use super::{UpgradeError, UpgradeResult, Upgrader};
 
@@ -54,6 +55,74 @@ pub struct RestartContext {
     pub shutdown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// What the WARN summary line of an applied upgrade reports (#1106).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplySummary {
+    /// The apply path. `None` for a caller outside the daemon's rollout.
+    pub trigger: Option<RolloutTrigger>,
+    /// Who offered the release: the gossip sender's AgentId (hex) or the
+    /// local API caller. `None` when unknown.
+    pub sender: Option<String>,
+    /// The staged-rollout delay this node served before the apply.
+    pub delay_secs: u64,
+}
+
+/// The fields of one applied-upgrade summary line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AppliedSummaryLine<'a> {
+    pub trigger: &'a str,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub sender: &'a str,
+    pub delay_secs: u64,
+    pub swap: &'a str,
+    pub backup: &'a str,
+    pub exit: &'a str,
+}
+
+/// How the process leaves after an applied upgrade, for the summary line.
+/// `restart_now` is false when the HTTP handler restarts after its response.
+pub(crate) fn exit_description(
+    mode: restart::RestartMode,
+    exit_code: Option<i32>,
+    restart_now: bool,
+) -> String {
+    let base = match mode {
+        restart::RestartMode::SupervisedExit => {
+            format!("supervised_exit(code={})", exit_code.unwrap_or(0))
+        }
+        restart::RestartMode::TransactionalHandoff => "transactional_handoff".to_string(),
+    };
+    if restart_now {
+        base
+    } else {
+        format!("deferred_restart({base})")
+    }
+}
+
+/// Emit the one summary line per applied upgrade (#1106).
+pub(crate) fn log_applied_summary(line: &AppliedSummaryLine<'_>) {
+    info!(
+        trigger = line.trigger,
+        from_version = line.from,
+        to_version = line.to,
+        sender = line.sender,
+        delay_secs = line.delay_secs,
+        swap = line.swap,
+        backup = line.backup,
+        exit = line.exit,
+        "x0xd self-update applied: {} -> {} via {} (sender {}, staged delay {}s, swap {}, backup {}, exit {})",
+        line.from,
+        line.to,
+        line.trigger,
+        line.sender,
+        line.delay_secs,
+        line.swap,
+        line.backup,
+        line.exit
+    );
+}
+
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
     /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
@@ -64,6 +133,8 @@ pub struct AutoApplyUpgrader {
     restart_on_success: bool,
     /// Data directory / API address / shutdown hook for the restart planner.
     restart_context: RestartContext,
+    /// Trigger, sender and served delay for the WARN summary line.
+    apply_summary: ApplySummary,
 }
 
 impl AutoApplyUpgrader {
@@ -73,7 +144,15 @@ impl AutoApplyUpgrader {
             stop_on_upgrade: false,
             restart_on_success: true,
             restart_context: RestartContext::default(),
+            apply_summary: ApplySummary::default(),
         }
+    }
+
+    /// Supply the trigger, sender and served rollout delay that the WARN
+    /// summary line of a successful apply reports (#1106).
+    pub fn with_apply_summary(mut self, summary: ApplySummary) -> Self {
+        self.apply_summary = summary;
+        self
     }
 
     pub fn with_stop_on_upgrade(mut self, stop: bool) -> Self {
@@ -803,6 +882,54 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_applied_upgrade_summary_is_one_warn_line() {
+        // #1106: the fleet runs RUST_LOG=warn, so the success path must be
+        // visible at WARN: path, versions, sender, served delay and exit.
+        let (logged, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: "gossip",
+                from: "0.48.0",
+                to: "0.48.1",
+                sender: "ab12cd34",
+                delay_secs: 1234,
+                swap: "performed",
+                backup: "/opt/x0x/x0xd.backup-0.48.0-0011aabb",
+                exit: "supervised_exit(code=0)",
+            })
+        });
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 1, "one summary line, got: {logged:?}");
+        let line = lines[0];
+        assert!(line.contains("WARN"), "summary must be WARN level: {line}");
+        for needle in [
+            "x0xd self-update applied: 0.48.0 -> 0.48.1 via gossip",
+            "sender ab12cd34",
+            "staged delay 1234s",
+            "swap performed",
+            "backup /opt/x0x/x0xd.backup-0.48.0-0011aabb",
+            "exit supervised_exit(code=0)",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line}");
+        }
+    }
+
+    #[test]
+    fn exit_description_names_the_restart_owner() {
+        assert_eq!(
+            exit_description(restart::RestartMode::SupervisedExit, Some(0), true),
+            "supervised_exit(code=0)"
+        );
+        assert_eq!(
+            exit_description(restart::RestartMode::TransactionalHandoff, None, true),
+            "transactional_handoff"
+        );
+        assert_eq!(
+            exit_description(restart::RestartMode::SupervisedExit, Some(0), false),
+            "deferred_restart(supervised_exit(code=0))"
+        );
+    }
 
     /// Magic prefix of a native executable on the host platform, so archive
     /// contents built by these tests pass the post-extraction magic check.

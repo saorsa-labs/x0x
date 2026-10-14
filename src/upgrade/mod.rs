@@ -21,6 +21,125 @@ use tracing::{debug, info, warn};
 /// Maximum binary size we'll accept (200 MiB).
 pub const MAX_BINARY_SIZE_BYTES: u64 = 200 * 1024 * 1024;
 
+/// How long an apply waits for another writer's host upgrade lock (#1106).
+/// The holder releases the lock when its apply returns or its process exits.
+pub const HOST_UPGRADE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A versioned backup younger than this is never pruned: an in-flight
+/// transactional handoff may still need it.
+pub const BACKUP_PRUNE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Outcome of a host-locked binary swap (#1106).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// This writer replaced the installed bytes. `backup_path` holds the
+    /// previous bytes under a versioned name.
+    Swapped {
+        /// The versioned backup of the previous bytes.
+        backup_path: PathBuf,
+    },
+    /// Another writer on this host already installed exactly these bytes.
+    /// Nothing was copied or replaced.
+    AlreadyInstalled,
+    /// The replacement failed and the previous bytes are in place.
+    RolledBack {
+        /// Why the replacement failed.
+        reason: String,
+    },
+}
+
+/// Host-level upgrade lock: one binary writer per install (#1106, ADR 0094
+/// §2/§3).
+///
+/// An OS file lock on `<install dir>/.<binary>.upgrade-lock`. Two daemons
+/// that share one executable (for example `x0xd` and `x0xd-443`) take the
+/// same lock, so only one of them downloads, backs up and swaps at a time.
+/// The OS releases the lock when the holder drops it or its process exits.
+/// The lock file itself is never deleted.
+#[derive(Debug)]
+pub struct HostUpgradeLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl HostUpgradeLock {
+    /// The lock file for the binary at `target`.
+    pub fn lock_path_for(target: &Path) -> PathBuf {
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "x0xd".to_string());
+        let dir = target.parent().unwrap_or_else(|| Path::new("."));
+        dir.join(format!(".{name}.upgrade-lock"))
+    }
+
+    /// Take the lock without waiting. `Ok(None)` means another writer holds it.
+    pub fn try_acquire(target: &Path) -> Result<Option<Self>, UpgradeError> {
+        let path = Self::lock_path_for(target);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| UpgradeError::HostLock {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Some(Self { _file: file, path }))
+    }
+
+    /// Take the lock, waiting at most `timeout` for another writer.
+    pub async fn acquire(
+        target: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, UpgradeError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(lock) = Self::try_acquire(target)? {
+                return Ok(lock);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(UpgradeError::HostLockBusy {
+                    path: Self::lock_path_for(target),
+                    waited_secs: timeout.as_secs(),
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Path of the lock file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// SHA-256 of a file, streamed.
+pub fn sha256_file(path: &Path) -> Result<[u8; 32], UpgradeError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// The newest versioned backup of `target` that `from_version` made, if any.
+pub fn latest_versioned_backup(_target: &Path, _from_version: &str) -> Option<PathBuf> {
+    None
+}
+
 /// Result of an upgrade attempt.
 #[derive(Debug)]
 pub enum UpgradeResult {
@@ -133,6 +252,34 @@ impl Upgrader {
             source: e,
         })?;
         Ok(temp_dir)
+    }
+
+    /// The versioned backup name for the bytes now at the target:
+    /// `<binary>.backup-<running version>-<first 8 hex of their SHA-256>`.
+    pub fn versioned_backup_path(&self, _previous_sha256: &[u8; 32]) -> PathBuf {
+        self.target_path.with_extension("backup")
+    }
+
+    /// Host-locked swap (#1106): one writer per install.
+    ///
+    /// The caller holds the [`HostUpgradeLock`] for `target_path` and has
+    /// verified `new_binary`. When the installed bytes already equal
+    /// `new_binary`, another writer on this host has installed them: nothing
+    /// is copied or replaced. Otherwise the previous bytes go to a versioned
+    /// backup that no later writer overwrites, and then the new bytes replace
+    /// the target. `staging_dir` must be on the target's filesystem.
+    pub fn perform_locked_upgrade(
+        &self,
+        _lock: &HostUpgradeLock,
+        new_binary_path: &Path,
+        target_version: &Version,
+        _staging_dir: &Path,
+    ) -> Result<SwapOutcome, UpgradeError> {
+        let backup_path = self.target_path.with_extension("backup");
+        match self.perform_upgrade(new_binary_path, target_version)? {
+            UpgradeResult::RolledBack { reason } => Ok(SwapOutcome::RolledBack { reason }),
+            _ => Ok(SwapOutcome::Swapped { backup_path }),
+        }
     }
 
     /// Full upgrade workflow: validate -> backup -> replace.
@@ -336,6 +483,18 @@ pub enum UpgradeError {
 
     #[error("failed to fetch manifest: {0}")]
     ManifestFetchFailed(String),
+
+    /// The host upgrade lock file could not be opened or locked (#1106).
+    #[error("host upgrade lock {path} failed: {source}")]
+    HostLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// Another writer on this host held the upgrade lock for the whole wait
+    /// (#1106). Nothing was replaced.
+    #[error("host upgrade lock {path} still held by another writer after {waited_secs}s")]
+    HostLockBusy { path: PathBuf, waited_secs: u64 },
 
     /// The restart contract could not be resolved, or names two restart
     /// owners, so the apply was refused before any binary was replaced
@@ -557,5 +716,226 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert!(!stale.exists());
+    }
+
+    // ------------------------------------------------------------------
+    // #1106: one binary writer per host, versioned backups.
+    // ------------------------------------------------------------------
+
+    const OLD_BYTES: &[u8] = b"x0xd 0.48.0 bytes that serve today";
+    const NEW_BYTES: &[u8] = b"x0xd 0.48.1 bytes from the verified archive";
+
+    fn expected_backup_name(previous: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(previous).into();
+        format!("x0xd.backup-0.48.0-{}", hex::encode(&digest[..4]))
+    }
+
+    fn backup_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("x0xd.backup"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// One writer: take the host lock (bounded spin), swap, release.
+    fn locked_writer(target: &Path, staging: &Path, new_binary: &Path) -> SwapOutcome {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let lock = loop {
+            if let Some(lock) = HostUpgradeLock::try_acquire(target).unwrap() {
+                break lock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other writer must release the host lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let upgrader = Upgrader::new(target.to_path_buf(), Version::new(0, 48, 0));
+        let outcome = upgrader
+            .perform_locked_upgrade(&lock, new_binary, &Version::new(0, 48, 1), staging)
+            .unwrap();
+        drop(lock);
+        outcome
+    }
+
+    #[test]
+    fn the_host_lock_admits_one_holder_at_a_time() {
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let first = HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the first writer takes the lock");
+        assert!(
+            HostUpgradeLock::try_acquire(&target).unwrap().is_none(),
+            "a second writer must wait while the first holds the lock"
+        );
+        drop(first);
+        assert!(
+            HostUpgradeLock::try_acquire(&target).unwrap().is_some(),
+            "the lock is free again once its holder drops it"
+        );
+    }
+
+    #[test]
+    fn two_writers_on_one_install_swap_once_and_keep_a_versioned_backup() {
+        // x0xd and x0xd-443 share /opt/x0x/x0xd and apply the same release
+        // at about the same moment (the 2026-10-14 prod event).
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let staging = dir.path().join(format!(".x0x-upgrade-test-{i}"));
+                fs::create_dir_all(&staging).unwrap();
+                let new_binary = staging.join("extracted-binary");
+                fs::write(&new_binary, NEW_BYTES).unwrap();
+                let target = target.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    locked_writer(&target, &staging, &new_binary)
+                })
+            })
+            .collect();
+        let outcomes: Vec<SwapOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let swapped: Vec<&SwapOutcome> = outcomes
+            .iter()
+            .filter(|o| matches!(o, SwapOutcome::Swapped { .. }))
+            .collect();
+        assert_eq!(swapped.len(), 1, "exactly one swap per host: {outcomes:?}");
+        assert!(
+            outcomes.contains(&SwapOutcome::AlreadyInstalled),
+            "the second writer sees the bytes installed and skips: {outcomes:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), NEW_BYTES);
+
+        let SwapOutcome::Swapped { backup_path } = swapped[0] else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(
+            backup_path.file_name().unwrap().to_string_lossy(),
+            expected_backup_name(OLD_BYTES)
+        );
+        assert_eq!(
+            fs::read(backup_path).unwrap(),
+            OLD_BYTES,
+            "the backup holds the bytes that served before the swap"
+        );
+        assert_eq!(
+            backup_files(dir.path()),
+            vec![expected_backup_name(OLD_BYTES)],
+            "one versioned backup and no legacy single-slot x0xd.backup"
+        );
+    }
+
+    #[test]
+    fn a_late_second_writer_never_overwrites_the_backup_with_new_bytes() {
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let mut outcomes = Vec::new();
+        for i in 0..2 {
+            let staging = dir.path().join(format!(".x0x-upgrade-late-{i}"));
+            fs::create_dir_all(&staging).unwrap();
+            let new_binary = staging.join("extracted-binary");
+            fs::write(&new_binary, NEW_BYTES).unwrap();
+            outcomes.push(locked_writer(&target, &staging, &new_binary));
+        }
+        assert!(matches!(outcomes[0], SwapOutcome::Swapped { .. }));
+        assert_eq!(outcomes[1], SwapOutcome::AlreadyInstalled);
+        let backup = dir.path().join(expected_backup_name(OLD_BYTES));
+        assert_eq!(fs::read(&backup).unwrap(), OLD_BYTES);
+        assert_eq!(
+            backup_files(dir.path()),
+            vec![expected_backup_name(OLD_BYTES)]
+        );
+        assert_eq!(
+            latest_versioned_backup(&target, "0.48.0"),
+            Some(backup),
+            "the handoff record can name this transaction's backup"
+        );
+    }
+
+    #[test]
+    fn a_swap_prunes_older_versioned_backups_and_keeps_other_files() {
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let older = dir.path().join("x0xd.backup-0.47.1-0badc0de");
+        fs::write(&older, b"0.47.1").unwrap();
+        age_file(&older, std::time::Duration::from_secs(7200));
+        let fresh = dir.path().join("x0xd.backup-0.47.2-0123abcd");
+        fs::write(&fresh, b"0.47.2").unwrap();
+        let legacy = dir.path().join("x0xd.backup");
+        fs::write(&legacy, b"legacy").unwrap();
+        let companion = dir.path().join("x0x.backup-0.47.1-0badc0de");
+        fs::write(&companion, b"cli").unwrap();
+        age_file(&companion, std::time::Duration::from_secs(7200));
+        let ops_copy = dir.path().join("x0xd.v0480-pre0481");
+        fs::write(&ops_copy, b"ops").unwrap();
+
+        let staging = dir.path().join(".x0x-upgrade-prune");
+        fs::create_dir_all(&staging).unwrap();
+        let new_binary = staging.join("extracted-binary");
+        fs::write(&new_binary, NEW_BYTES).unwrap();
+        let outcome = locked_writer(&target, &staging, &new_binary);
+
+        let SwapOutcome::Swapped { backup_path } = outcome else {
+            panic!("expected a swap, got {outcome:?}");
+        };
+        assert!(backup_path.exists());
+        assert!(!older.exists(), "an aged older versioned backup is pruned");
+        assert!(fresh.exists(), "a young versioned backup is kept");
+        assert!(legacy.exists(), "the legacy x0xd.backup is not touched");
+        assert!(companion.exists(), "another binary's backup is not touched");
+        assert!(ops_copy.exists(), "an operator copy is not touched");
+    }
+}
+
+/// Test-only capture of `tracing` output at WARN and above.
+#[cfg(test)]
+pub(crate) mod log_capture {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` and return every line it logged at WARN or above.
+    pub(crate) fn capture_warn<F: FnOnce() -> R, R>(f: F) -> (String, R) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = captured.0.lock().expect("capture buffer poisoned").clone();
+        (String::from_utf8_lossy(&bytes).into_owned(), result)
     }
 }

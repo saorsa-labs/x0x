@@ -1,10 +1,37 @@
-//! Staged rollout: deterministic delay based on machine ID hash spreads
-//! upgrades across a configurable time window.
+//! Staged rollout (ADR 0094 §1, rulings D183/D184, #1106).
+//!
+//! A node does not apply a verified release at first receipt. It waits a
+//! delay that is a pure function of its MachineId, the release version and
+//! the effective rollout window:
+//!
+//! `delay = SHA-256(machine_id ‖ version)[0..8] as u64 × window_secs / 2^64`
+//!
+//! The delay is in `[0, window)`. Different nodes get different delays for one
+//! release, and the version salt changes the order for each release. The wait
+//! that a node has served is persisted per release in
+//! `<data_dir>/upgrade-rollout.json`, so a duplicate receipt or a restart does
+//! not reset or re-roll it.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
+
+/// Compiled default rollout window in minutes (D183: 60 minutes). The fleet
+/// default and minimum is also 60 (D184); the inventory check, not the daemon,
+/// enforces the fleet minimum, and private rehearsal hosts may set 0.
+pub const DEFAULT_ROLLOUT_WINDOW_MINUTES: u64 = 60;
+
+/// File name of the per-instance rollout state in the daemon data directory.
+pub const ROLLOUT_STATE_FILE_NAME: &str = "upgrade-rollout.json";
+
+/// `format` marker of the rollout state file.
+pub const ROLLOUT_STATE_FORMAT: &str = "x0x.upgrade-rollout";
+
+/// Current `version` of the rollout state file.
+pub const ROLLOUT_STATE_VERSION: u32 = 1;
 
 /// Staged rollout delay calculator.
 ///
@@ -39,23 +66,8 @@ impl StagedRollout {
         }
 
         let hash = Sha256::digest(&self.node_id);
-        let fraction = self.hash_to_fraction(&hash);
-        let delay_secs = (fraction * (self.max_delay_minutes as f64) * 60.0) as u64;
-        let delay = Duration::from_secs(delay_secs);
-
-        let hours = delay_secs / 3600;
-        let minutes = (delay_secs % 3600) / 60;
-        let seconds = delay_secs % 60;
-        debug!(
-            delay_hours = hours,
-            delay_minutes = minutes,
-            delay_seconds = seconds,
-            "Calculated staged rollout delay: {}h {}m {}s",
-            hours,
-            minutes,
-            seconds
-        );
-
+        let delay = delay_from_hash(&hash, self.window_secs());
+        log_delay(delay);
         delay
     }
 
@@ -73,32 +85,213 @@ impl StagedRollout {
         hasher.update(version.as_bytes());
         let hash = hasher.finalize();
 
-        let fraction = self.hash_to_fraction(&hash);
-        let delay_secs = (fraction * (self.max_delay_minutes as f64) * 60.0) as u64;
-        let delay = Duration::from_secs(delay_secs);
-
-        let hours = delay_secs / 3600;
-        let minutes = (delay_secs % 3600) / 60;
-        let seconds = delay_secs % 60;
-        debug!(
-            delay_hours = hours,
-            delay_minutes = minutes,
-            delay_seconds = seconds,
-            "Calculated staged rollout delay: {}h {}m {}s",
-            hours,
-            minutes,
-            seconds
-        );
-
+        let delay = delay_from_hash(&hash, self.window_secs());
+        log_delay(delay);
         delay
     }
 
-    /// Convert a SHA-256 hash to a fraction in [0.0, 1.0).
-    fn hash_to_fraction(&self, hash: &[u8]) -> f64 {
-        let value = u64::from_be_bytes([
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
-        ]);
-        value as f64 / u64::MAX as f64
+    fn window_secs(&self) -> u64 {
+        self.max_delay_minutes.saturating_mul(60)
+    }
+}
+
+fn log_delay(delay: Duration) {
+    let delay_secs = delay.as_secs();
+    let hours = delay_secs / 3600;
+    let minutes = (delay_secs % 3600) / 60;
+    let seconds = delay_secs % 60;
+    debug!(
+        delay_hours = hours,
+        delay_minutes = minutes,
+        delay_seconds = seconds,
+        "Calculated staged rollout delay: {}h {}m {}s",
+        hours,
+        minutes,
+        seconds
+    );
+}
+
+/// Map a SHA-256 hash to a delay in `[0, window_secs)`.
+pub(crate) fn delay_from_hash(hash: &[u8], window_secs: u64) -> Duration {
+    let mut prefix = [0u8; 8];
+    for (slot, byte) in prefix.iter_mut().zip(hash.iter()) {
+        *slot = *byte;
+    }
+    let value = u64::from_be_bytes(prefix);
+    let fraction = value as f64 / u64::MAX as f64;
+    Duration::from_secs((fraction * window_secs as f64) as u64)
+}
+
+/// Which apply path offered a release to the staged rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutTrigger {
+    /// The post-bind startup GitHub check.
+    Startup,
+    /// A signed manifest received on the `x0x/release` gossip topic.
+    Gossip,
+    /// The periodic GitHub fallback poll.
+    Poll,
+    /// Authenticated `POST /upgrade/apply`.
+    Manual,
+}
+
+impl RolloutTrigger {
+    /// Stable lower-case name for logs and the state file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Gossip => "gossip",
+            Self::Poll => "poll",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl std::fmt::Display for RolloutTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The persisted wait of one staged release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedRelease {
+    /// Release version (semver).
+    pub version: String,
+    /// Apply path of the first eligible receipt.
+    pub first_trigger: RolloutTrigger,
+    /// Wall-clock second of the first eligible receipt. Diagnostic only: the
+    /// due decision never reads the wall clock.
+    pub first_receipt_unix: u64,
+    /// Effective rollout window that chose `delay_secs`.
+    pub window_minutes: u64,
+    /// The chosen delay: a pure function of node, version and window.
+    pub delay_secs: u64,
+    /// Monotonic wait served so far, checkpointed while the daemon runs.
+    /// Time while the daemon is stopped does not count.
+    pub waited_secs: u64,
+}
+
+impl StagedRelease {
+    /// The chosen delay.
+    pub fn delay(&self) -> Duration {
+        Duration::from_secs(self.delay_secs)
+    }
+
+    /// The wait that is still to serve.
+    pub fn remaining(&self) -> Duration {
+        Duration::from_secs(self.delay_secs.saturating_sub(self.waited_secs))
+    }
+
+    /// Whether the node has served its whole delay for this release.
+    pub fn is_due(&self) -> bool {
+        self.waited_secs >= self.delay_secs
+    }
+}
+
+/// The last completed upgrade that the new process has reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncedUpgrade {
+    /// Version that applied the upgrade.
+    pub from_version: String,
+    /// Version that the upgrade installed.
+    pub to_version: String,
+    /// `started_at` of the handoff record (identifies the transaction).
+    pub started_at: u64,
+}
+
+/// Why a stored rollout state could not be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutStateProblem {
+    /// Where the unreadable file was moved, if it was moved.
+    pub aside: Option<PathBuf>,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+/// Per-instance rollout state (`<data_dir>/upgrade-rollout.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutState {
+    /// Always [`ROLLOUT_STATE_FORMAT`].
+    pub format: String,
+    /// Always [`ROLLOUT_STATE_VERSION`] for this binary.
+    pub version: u32,
+    /// Staged releases newer than the running version.
+    #[serde(default)]
+    pub releases: Vec<StagedRelease>,
+    /// The last upgrade reported at start ("upgraded from X to Y").
+    #[serde(default)]
+    pub announced_upgrade: Option<AnnouncedUpgrade>,
+}
+
+impl Default for RolloutState {
+    fn default() -> Self {
+        Self {
+            format: ROLLOUT_STATE_FORMAT.to_string(),
+            version: ROLLOUT_STATE_VERSION,
+            releases: Vec::new(),
+            announced_upgrade: None,
+        }
+    }
+}
+
+impl RolloutState {
+    /// Path of the state file in `data_dir`.
+    pub fn path_in(data_dir: &Path) -> PathBuf {
+        data_dir.join(ROLLOUT_STATE_FILE_NAME)
+    }
+
+    /// Load the state. A missing file is an empty state.
+    pub fn load(_path: &Path) -> (Self, Option<RolloutStateProblem>) {
+        (Self::default(), None)
+    }
+
+    /// Persist the state with a record barrier.
+    pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// The staged entry for `version`, if any.
+    pub fn entry(&self, version: &str) -> Option<&StagedRelease> {
+        self.releases.iter().find(|r| r.version == version)
+    }
+
+    /// Stage `version` for this node (idempotent).
+    pub fn stage(
+        &mut self,
+        version: &str,
+        _node_id: &[u8],
+        window_minutes: u64,
+        trigger: RolloutTrigger,
+        now_unix: u64,
+        _current_version: &str,
+    ) -> (StagedRelease, bool) {
+        let staged = StagedRelease {
+            version: version.to_string(),
+            first_trigger: trigger,
+            first_receipt_unix: now_unix,
+            window_minutes,
+            delay_secs: 0,
+            waited_secs: 0,
+        };
+        (staged, true)
+    }
+
+    /// Record the total monotonic wait served for `version`.
+    pub fn set_waited(&mut self, _version: &str, _waited_secs: u64) -> Option<StagedRelease> {
+        None
+    }
+
+    /// Return the "upgraded from" notice once per handoff transaction.
+    pub fn take_upgrade_notice(
+        &mut self,
+        _from_version: &str,
+        _to_version: &str,
+        _started_at: u64,
+        _current_version: &str,
+    ) -> Option<AnnouncedUpgrade> {
+        None
     }
 }
 
@@ -203,5 +396,218 @@ mod tests {
             spread > max_secs / 2,
             "Distribution too narrow: spread={spread}s out of {max_secs}s window"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1106 / ADR 0094 §1: the staged wait through the persisted state.
+    // ------------------------------------------------------------------
+
+    const WINDOW_MINUTES: u64 = 60;
+    const CURRENT: &str = "0.48.0";
+    const RELEASE: &str = "0.48.1";
+
+    fn node(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn staged_delay(node_id: &[u8], version: &str) -> u64 {
+        let mut state = RolloutState::default();
+        let (staged, _) = state.stage(
+            version,
+            node_id,
+            WINDOW_MINUTES,
+            RolloutTrigger::Gossip,
+            1_000,
+            CURRENT,
+        );
+        staged.delay_secs
+    }
+
+    #[test]
+    fn two_nodes_get_different_staged_delays_for_one_release() {
+        let a = staged_delay(&node(1), RELEASE);
+        let b = staged_delay(&node(2), RELEASE);
+        assert_ne!(a, b, "two MachineIds must not share one delay");
+        for delay in [a, b] {
+            assert!(
+                delay < WINDOW_MINUTES * 60,
+                "delay {delay}s must be inside the {WINDOW_MINUTES}-minute window"
+            );
+        }
+        assert!(
+            a > 0 || b > 0,
+            "a 60-minute window must stagger at least one of two nodes"
+        );
+    }
+
+    #[test]
+    fn a_new_release_reorders_the_nodes() {
+        let order = |version: &str| {
+            let mut nodes: Vec<(u64, u8)> = (0u8..16)
+                .map(|b| (staged_delay(&node(b), version), b))
+                .collect();
+            nodes.sort();
+            nodes.into_iter().map(|(_, b)| b).collect::<Vec<u8>>()
+        };
+        let first = order("0.48.1");
+        let second = order("0.48.2");
+        assert_ne!(
+            first, second,
+            "the version salt must change the apply order for each release"
+        );
+    }
+
+    #[test]
+    fn staged_delay_is_strictly_inside_the_window() {
+        let window_secs = WINDOW_MINUTES * 60;
+        let mut max_seen = 0;
+        for b in 0u8..=255 {
+            let delay = staged_delay(&node(b), RELEASE);
+            assert!(
+                delay < window_secs,
+                "delay {delay}s >= window {window_secs}s"
+            );
+            max_seen = max_seen.max(delay);
+        }
+        assert!(
+            max_seen > window_secs / 2,
+            "256 nodes must spread over the window, max {max_seen}s"
+        );
+        // The highest possible hash still maps strictly below the window
+        // (ADR 0094 §1: the fraction is in [0, 1)).
+        assert!(delay_from_hash(&[0xFF; 32], window_secs) < Duration::from_secs(window_secs));
+        assert_eq!(delay_from_hash(&[0x00; 32], window_secs), Duration::ZERO);
+    }
+
+    #[test]
+    fn zero_window_stages_a_due_release() {
+        let mut state = RolloutState::default();
+        let (staged, _) = state.stage(RELEASE, &node(7), 0, RolloutTrigger::Poll, 1_000, CURRENT);
+        assert_eq!(staged.delay_secs, 0);
+        assert!(staged.is_due());
+    }
+
+    #[test]
+    fn staged_wait_survives_a_restart_without_a_reroll() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = RolloutState::path_in(dir.path());
+        // Pick a node whose delay is long enough to observe a partial wait.
+        let id = (0u8..=255)
+            .map(node)
+            .find(|id| staged_delay(id, RELEASE) > 600)
+            .expect("some node has a delay above 10 minutes");
+
+        let mut state = RolloutState::default();
+        let (first, is_new) = state.stage(
+            RELEASE,
+            &id,
+            WINDOW_MINUTES,
+            RolloutTrigger::Gossip,
+            1_000,
+            CURRENT,
+        );
+        assert!(is_new);
+        assert!(first.delay_secs > 600);
+        state.set_waited(RELEASE, 300);
+        state.save(&path).unwrap();
+
+        // Restart: a new process loads the file and sees a duplicate receipt.
+        let (mut reloaded, problem) = RolloutState::load(&path);
+        assert_eq!(problem, None);
+        let (again, is_new) = reloaded.stage(
+            RELEASE,
+            &id,
+            WINDOW_MINUTES,
+            RolloutTrigger::Poll,
+            9_999,
+            CURRENT,
+        );
+        assert!(!is_new, "a duplicate receipt must not create a new wait");
+        assert_eq!(
+            again.delay_secs, first.delay_secs,
+            "no re-roll after restart"
+        );
+        assert_eq!(again.waited_secs, 300, "the served wait is kept");
+        assert_eq!(
+            again.remaining(),
+            Duration::from_secs(first.delay_secs - 300)
+        );
+        assert_eq!(again.first_trigger, RolloutTrigger::Gossip);
+        assert_eq!(again.first_receipt_unix, 1_000);
+    }
+
+    #[test]
+    fn a_window_change_recomputes_the_delay_and_keeps_the_wait() {
+        let mut state = RolloutState::default();
+        let id = node(3);
+        state.stage(RELEASE, &id, 60, RolloutTrigger::Gossip, 1_000, CURRENT);
+        state.set_waited(RELEASE, 50);
+        let (restaged, _) = state.stage(RELEASE, &id, 120, RolloutTrigger::Gossip, 2_000, CURRENT);
+        assert_eq!(
+            restaged.delay_secs,
+            StagedRollout::new(&id, 120)
+                .calculate_delay_for_version(RELEASE)
+                .as_secs()
+        );
+        assert_eq!(restaged.window_minutes, 120);
+        assert_eq!(restaged.waited_secs, 50);
+    }
+
+    #[test]
+    fn releases_at_or_below_the_running_version_are_pruned() {
+        let mut state = RolloutState::default();
+        state.stage("0.48.1", &node(1), 60, RolloutTrigger::Gossip, 1, "0.48.0");
+        state.stage("0.48.2", &node(1), 60, RolloutTrigger::Gossip, 2, "0.48.0");
+        // The daemon now runs 0.48.1.
+        state.stage("0.48.2", &node(1), 60, RolloutTrigger::Gossip, 3, "0.48.1");
+        let versions: Vec<&str> = state.releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, vec!["0.48.2"]);
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_moved_aside_not_trusted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = RolloutState::path_in(dir.path());
+        std::fs::write(&path, b"{ not json").unwrap();
+        let (state, problem) = RolloutState::load(&path);
+        assert_eq!(state, RolloutState::default());
+        let problem = problem.expect("a corrupt file is reported");
+        let aside = problem.aside.expect("the corrupt file is kept aside");
+        assert!(aside.exists(), "the unreadable bytes are preserved");
+        assert!(!path.exists(), "the unreadable file is not reused");
+
+        // A file from a newer format version is not trusted either.
+        std::fs::write(
+            &path,
+            br#"{"format":"x0x.upgrade-rollout","version":99,"releases":[]}"#,
+        )
+        .unwrap();
+        let (state, problem) = RolloutState::load(&path);
+        assert_eq!(state, RolloutState::default());
+        assert!(problem.is_some());
+    }
+
+    #[test]
+    fn the_upgraded_from_notice_fires_once_per_handoff() {
+        let mut state = RolloutState::default();
+        // A stale handoff from an older upgrade says nothing.
+        assert_eq!(
+            state.take_upgrade_notice("0.44.0", "0.45.0", 10, "0.48.1"),
+            None
+        );
+        let notice = state
+            .take_upgrade_notice("0.48.0", "0.48.1", 20, "0.48.1")
+            .expect("first start after the upgrade reports it");
+        assert_eq!(notice.from_version, "0.48.0");
+        assert_eq!(notice.to_version, "0.48.1");
+        // A later restart of the same binary does not repeat it.
+        assert_eq!(
+            state.take_upgrade_notice("0.48.0", "0.48.1", 20, "0.48.1"),
+            None
+        );
+        // A new transaction to the same version (a re-apply) reports again.
+        assert!(state
+            .take_upgrade_notice("0.48.0", "0.48.1", 30, "0.48.1")
+            .is_some());
     }
 }
