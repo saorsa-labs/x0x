@@ -4490,6 +4490,62 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 /// record's owner-key authority, insert, and persist `revocations-v3.bin`
 /// when anything was new. Records of any other subject are ignored here —
 /// they have their own carriers.
+/// After a verified carrier quorum, write that carrier's live file (#1116).
+///
+/// The quarantine sibling is left in place. A hold that is still open is
+/// not written, so a restart cannot treat a partial set as a rebuild.
+async fn persist_completed_revocation_rebuild(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) {
+    let pending = revocation_set.write().await.take_rebuild_pending();
+    if pending == 0 {
+        return;
+    }
+    let Some(dir) = identity_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(storage::x0x_home_dir)
+    else {
+        return;
+    };
+    let (v1, v2, v3) = {
+        let set = revocation_set.read().await;
+        (
+            (pending & revocation::REVOCATION_CARRIER_V1 != 0)
+                .then(|| set.to_bytes().ok())
+                .flatten(),
+            (pending & revocation::REVOCATION_CARRIER_V2 != 0)
+                .then(|| set.to_bytes_v2().ok())
+                .flatten(),
+            (pending & revocation::REVOCATION_CARRIER_V3 != 0)
+                .then(|| set.to_bytes_v3().ok())
+                .flatten(),
+        )
+    };
+    if let Some(bytes) = v1 {
+        if let Err(error) =
+            storage::save_rebuilt_revocation_file(&dir.join("revocations.bin"), bytes).await
+        {
+            tracing::warn!("revocations.bin rebuild failed: {error}");
+        }
+    }
+    if let Some(bytes) = v2 {
+        if let Err(error) =
+            storage::save_rebuilt_revocation_file(&dir.join("revocations-v2.bin"), bytes).await
+        {
+            tracing::warn!("revocations-v2.bin rebuild failed: {error}");
+        }
+    }
+    if let Some(bytes) = v3 {
+        if let Err(error) =
+            storage::save_rebuilt_revocation_file(&dir.join(SHARE_GRANT_REVOCATIONS_FILE), bytes)
+                .await
+        {
+            tracing::warn!("revocations-v3.bin rebuild failed: {error}");
+        }
+    }
+}
+
 pub(crate) async fn ingest_share_grant_revocations(
     owner_trust: &owner_trust::OwnerTrust,
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
@@ -4526,6 +4582,7 @@ pub(crate) async fn ingest_share_grant_revocations(
     if inserted {
         persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
     }
+    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
     inserted
 }
 
@@ -11756,6 +11813,11 @@ impl Agent {
                                 }
                             }
                         }
+                        persist_completed_revocation_rebuild(
+                            &revocation_set,
+                            identity_dir_for_listener.as_deref(),
+                        )
+                        .await;
                         continue;
                     }
                     // ADR-0043 §2.1: V3 machine announce — verify both
@@ -11902,6 +11964,11 @@ impl Agent {
                                 }
                             });
                         }
+                        persist_completed_revocation_rebuild(
+                            &revocation_set,
+                            identity_dir_for_listener.as_deref(),
+                        )
+                        .await;
                         continue;
                     }
                     // ADR-0070: share-grant revocations on the v3 carrier.
@@ -14151,6 +14218,8 @@ impl Agent {
                 )));
             }
         }
+        persist_completed_revocation_rebuild(&self.revocation_set, self.identity_dir.as_deref())
+            .await;
 
         // 2. Return only the subject's own store result. V1 does not
         //    change for binding/share-grant subjects; its unreadability
@@ -16972,13 +17041,25 @@ impl Agent {
                 .await
                 .decision,
         );
-        let (revoked_agent, revoked_machine) = {
+        let (revoked_agent, revoked_machine, resync_required) = {
             let revoked = self.revocation_set.read().await;
             (
                 revoked.is_agent_revoked(agent_id),
                 revoked.is_machine_revoked(&machine_id),
+                revoked.revocation_resync_required(),
             )
         };
+        if resync_required {
+            tracing::info!(
+                target: "x0x::streams",
+                agent = %hex::encode(agent_id.as_bytes()),
+                outcome = "withhold_revocation_resync",
+                "outbound stream withheld until revocation resync"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
         streams::stream_gate(
             agent_id,
             trust_decision,
@@ -17199,13 +17280,26 @@ impl Agent {
                 pair.decision
                     .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
             );
-            let (revoked_agent, revoked_machine) = {
+            let (revoked_agent, revoked_machine, resync_required) = {
                 let revoked = revocation_set.read().await;
                 (
                     revoked.is_agent_revoked(agent_id),
                     revoked.is_machine_revoked(machine_id),
+                    revoked.revocation_resync_required(),
                 )
             };
+            if resync_required && !evidence_only {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "withhold_revocation_resync",
+                    "inbound stream withheld until revocation resync"
+                );
+                return Err(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                });
+            }
             if let Err(e) = streams::stream_gate(
                 agent_id,
                 trust_decision,

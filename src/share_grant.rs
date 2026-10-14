@@ -1098,7 +1098,8 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     }
     let live: Vec<ShareGrant> = {
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(requester_agent)
+        if revoked.revocation_resync_required()
+            || revoked.is_agent_revoked(requester_agent)
             || revoked.is_machine_revoked(requester_machine)
             || revoked.is_binding_revoked(requester_agent, requester_machine)
         {

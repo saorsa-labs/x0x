@@ -480,6 +480,27 @@ pub async fn write_private_bytes_durable_typed(
 
 /// V3's read/merge already validated the file and holds its write guard.
 /// Consume that guard through fsync rather than reading the file twice.
+/// Write a carrier that a verified group resync just rebuilt (#1116).
+///
+/// The quarantine sibling stays in place as evidence. This does not run
+/// the missing-file refusal, so a hold can become a readable live file
+/// only after the caller has finished that resync.
+pub(crate) async fn save_rebuilt_revocation_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let guard = lock_revocation_path(path).await;
+    let result = write_private_bytes_durable_guarded(path, bytes, Some(guard))
+        .await
+        .map_err(durable_write_identity_error);
+    if result.is_ok() {
+        let mut states = revocation_store_states().lock().await;
+        if let Some(state) = states.get_mut(path) {
+            state.unreadable = None;
+            state.last_persist_warning = None;
+            state.archive_failed = false;
+        }
+    }
+    result
+}
+
 pub(crate) async fn write_revocation_bytes_durable(
     bytes: Vec<u8>,
     guard: RevocationWriteGuard,
@@ -1093,6 +1114,7 @@ struct RevocationStoreState {
     write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     unreadable: Option<String>,
     last_persist_warning: Option<std::time::Instant>,
+    archive_failed: bool,
 }
 
 type RevocationStoreStates = std::collections::HashMap<std::path::PathBuf, RevocationStoreState>;
@@ -1225,8 +1247,9 @@ pub(crate) async fn read_revocation_store(
         match read_revocation_store_locked(path, store, persist_attempt).await {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Ok(Some(RevocationSet::quarantined_carrier(
+                return Ok(Some(quarantined_load(
                     store.carrier_bit(),
+                    archive_failed(path).await,
                 )));
             }
         }
@@ -1243,8 +1266,9 @@ pub(crate) async fn read_revocation_store(
             // replace the store with an empty set.
             archive_corrupt_revocation_bytes(path, &raw, persist_attempt).await;
             remember_unreadable_store(path, error.to_string()).await;
-            Ok(Some(RevocationSet::quarantined_carrier(
+            Ok(Some(quarantined_load(
                 store.carrier_bit(),
+                archive_failed(path).await,
             )))
         }
     }
@@ -1276,17 +1300,78 @@ async fn quarantine_sibling_exists(path: &Path) -> bool {
     false
 }
 
+#[cfg(test)]
+fn fails_revocation_archive_for_testing(path: &Path) -> bool {
+    FAIL_REVOCATION_ARCHIVE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|armed| armed == path)
+}
+
+#[cfg(test)]
+static FAIL_REVOCATION_ARCHIVE_FOR_TESTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm archive failure for `path` until the guard drops.
+#[cfg(test)]
+pub(crate) struct FailRevocationArchiveGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_fail_revocation_archive_for_testing(path: &Path) -> FailRevocationArchiveGuard {
+    FAIL_REVOCATION_ARCHIVE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+    FailRevocationArchiveGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailRevocationArchiveGuard {
+    fn drop(&mut self) {
+        let mut armed = FAIL_REVOCATION_ARCHIVE_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|candidate| *candidate == self.path) {
+            armed.swap_remove(idx);
+        }
+    }
+}
+
 /// Move corrupt revocation bytes to `<name>.quarantined-<unix-ms>`.
 ///
-/// The live path no longer holds the payload. An existing quarantine file
-/// with the same bytes is kept and the live path is removed. Startup
-/// (`persist_attempt == false`) logs the operator message.
-async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_attempt: bool) {
+/// Returns whether the live path no longer holds the payload. An existing
+/// quarantine file with the same bytes is kept and the live path is removed.
+/// Startup (`persist_attempt == false`) logs the operator message. A failed
+/// archive logs that the bytes are still on the live path.
+async fn archive_corrupt_revocation_bytes(
+    path: &Path,
+    bytes: &[u8],
+    persist_attempt: bool,
+) -> bool {
+    #[cfg(test)]
+    if fails_revocation_archive_for_testing(path) {
+        note_archive_failed(path).await;
+        if !persist_attempt {
+            tracing::error!(
+                path = %path.display(),
+                "{}",
+                crate::revocation::REVOCATION_ARCHIVE_FAILED
+            );
+        }
+        return false;
+    }
     let Some(parent) = path.parent() else {
-        return;
+        note_archive_failed(path).await;
+        return false;
     };
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return;
+        note_archive_failed(path).await;
+        return false;
     };
     let prefix = format!("{name}.quarantined-");
     let mut existing = None;
@@ -1312,9 +1397,10 @@ async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_att
                     path = %path.display(),
                     error = %error,
                     "{}",
-                    crate::revocation::REVOCATION_RESYNC_STATUS
+                    crate::revocation::REVOCATION_ARCHIVE_FAILED
                 );
-                return;
+                note_archive_failed(path).await;
+                return false;
             }
         }
         dest
@@ -1335,9 +1421,10 @@ async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_att
                     path = %path.display(),
                     error = %rename_error,
                     "{}",
-                    crate::revocation::REVOCATION_RESYNC_STATUS
+                    crate::revocation::REVOCATION_ARCHIVE_FAILED
                 );
-                return;
+                note_archive_failed(path).await;
+                return false;
             }
             if let Err(error) = tokio::fs::remove_file(path).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -1345,14 +1432,16 @@ async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_att
                         path = %path.display(),
                         error = %error,
                         "{}",
-                        crate::revocation::REVOCATION_RESYNC_STATUS
+                        crate::revocation::REVOCATION_ARCHIVE_FAILED
                     );
-                    return;
+                    note_archive_failed(path).await;
+                    return false;
                 }
             }
         }
         dest
     };
+    clear_archive_failed(path).await;
     if !persist_attempt {
         tracing::error!(
             path = %path.display(),
@@ -1361,6 +1450,35 @@ async fn archive_corrupt_revocation_bytes(path: &Path, bytes: &[u8], persist_att
             crate::revocation::REVOCATION_RESYNC_STATUS
         );
     }
+    true
+}
+
+async fn note_archive_failed(path: &Path) {
+    let mut states = revocation_store_states().lock().await;
+    states.entry(path.to_path_buf()).or_default().archive_failed = true;
+}
+
+async fn clear_archive_failed(path: &Path) {
+    let mut states = revocation_store_states().lock().await;
+    if let Some(state) = states.get_mut(path) {
+        state.archive_failed = false;
+    }
+}
+
+fn quarantined_load(carrier: u8, archive_failed: bool) -> RevocationSet {
+    let mut set = RevocationSet::quarantined_carrier(carrier);
+    if archive_failed {
+        set.note_archive_failed();
+    }
+    set
+}
+
+async fn archive_failed(path: &Path) -> bool {
+    revocation_store_states()
+        .lock()
+        .await
+        .get(path)
+        .is_some_and(|state| state.archive_failed)
 }
 
 /// Record a decode failure after structural validation cleared the block.
@@ -1821,16 +1939,23 @@ mod tests {
 
     /// #1116: a present 0-byte file and a truncated valid file are corrupt.
     /// Each is moved off the live path and membership stays closed.
+    /// The v2 truncation is a shortened v2 encoding, not a v1 header.
     #[tokio::test]
     async fn zero_byte_and_truncated_revocation_files_fail_closed_1116() {
-        let valid = RevocationSet::new().to_bytes().expect("empty store");
-        assert!(valid.len() > 1, "a revocation file has a header");
-        let truncated = &valid[..valid.len() - 1];
-        for (name, bytes) in [
-            ("revocations.bin", &[][..]),
-            ("revocations-v2.bin", truncated),
-            ("revocations-v3.bin", &[][..]),
-        ] {
+        let empty = RevocationSet::new();
+        let v1 = empty.to_bytes().expect("v1");
+        let v2 = empty.to_bytes_v2().expect("v2");
+        let v3 = empty.to_bytes_v3().expect("v3");
+        assert!(v1.len() > 1 && v2.len() > 1 && v3.len() > 1);
+        let cases: [(&str, &[u8]); 6] = [
+            ("revocations.bin", &[]),
+            ("revocations.bin", &v1[..v1.len() - 1]),
+            ("revocations-v2.bin", &[]),
+            ("revocations-v2.bin", &v2[..v2.len() - 1]),
+            ("revocations-v3.bin", &[]),
+            ("revocations-v3.bin", &v3[..v3.len() - 1]),
+        ];
+        for (name, bytes) in cases {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(name);
             tokio::fs::write(&path, bytes).await.expect("seed");
@@ -1861,6 +1986,32 @@ mod tests {
                 "{name} quarantine holds the bad payload"
             );
         }
+    }
+
+    /// #1116: a failed archive must not claim the bytes were moved.
+    #[tokio::test]
+    async fn archive_failure_keeps_the_bad_bytes_and_says_so_1116() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let garbage = b"cannot-archive";
+        tokio::fs::write(&path, garbage).await.expect("seed");
+        let _guard = arm_fail_revocation_archive_for_testing(&path);
+        let loaded = read_revocation_store(&path, RevocationStore::V1, false)
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(loaded.revocation_resync_required());
+        assert_eq!(
+            loaded.revocation_status_sentence(),
+            crate::revocation::REVOCATION_ARCHIVE_FAILED
+        );
+        assert_eq!(tokio::fs::read(&path).await.expect("live bytes"), garbage);
+        assert!(
+            quarantine_files(dir.path(), REVOCATION_FILE)
+                .await
+                .is_empty(),
+            "a failed archive leaves no quarantine sibling"
+        );
     }
 
     /// Missing stores are healthy, independent, and may be created by every

@@ -1642,3 +1642,39 @@ async fn reconnect_nudge_includes_already_due_entries() {
     assert!(!outbox.nudge(&[AgentId([0x42; 32])], later));
     assert!(outbox.notified().now_or_never().is_none());
 }
+
+/// WHY (#1116): a revocation-store hold must not send a queued grant and
+/// must not delete it. Delivery resumes after the hold clears.
+#[tokio::test]
+async fn revocation_resync_hold_keeps_queued_grant_delivery() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(0x44, 3_600);
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
+    *world.revocations.write().await = crate::revocation::RevocationSet::quarantined_carrier(
+        crate::revocation::REVOCATION_CARRIER_V3,
+    );
+    let due = world.now + retry_delay_secs(0);
+    let held = outbox
+        .step(due, &world.revocations, |recipient, payload, request_id| {
+            receiver.send(recipient, payload, request_id)
+        })
+        .await;
+    assert_eq!(held.dropped, 0, "the hold is not a revocation");
+    assert_eq!(held.delivered, 0, "the hold does not send");
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(outbox.len(), 1, "the queued grant stays");
+    *world.revocations.write().await = crate::revocation::RevocationSet::new();
+    let resumed = outbox
+        .step(due, &world.revocations, |recipient, payload, request_id| {
+            receiver.send(recipient, payload, request_id)
+        })
+        .await;
+    assert_eq!(resumed.delivered, 1, "{resumed:?}");
+    assert!(outbox.is_empty());
+}

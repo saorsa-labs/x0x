@@ -228,6 +228,34 @@ All notable changes to this project will be documented in this file.
   - Self-removal retires the matching attempt before the apply
     returns. A re-invite on that process does not wait for the join
     poll's next tick.
+- **A corrupt revocation store is quarantined and x0xd keeps running (#1116).**
+  A present revocation file that cannot be decoded is moved to
+  `<file>.quarantined-<unix-ms>` (a taken name gets `-<seq>`). The live path
+  no longer holds those bytes. x0xd starts and keeps running. The next start
+  sees the quarantine name, does not read that payload, and stays closed.
+  Startup writes one error log line. `GET /status` and `x0x status` set
+  `revocation_resync_required` and include the same sentence in `warnings`.
+  The first status read also sends one `status` event on `/events`. If the
+  archive fails, the sentence says the live path still holds the bad bytes.
+  Until the group resyncs that carrier, membership fails closed. A member
+  whose non-revocation is not verified is treated as revoked. The hold is
+  not a revocation record, so admission, invite accept, join approval,
+  join-artifact and key delivery, streams, and grant sends are withheld.
+  They are not purged. Identity, machine, and user announcements still
+  arrive, so a certificate can verify an issuer revocation or a binding
+  tombstone. Other pubsub, DM, and direct messages stay withheld.
+  One peer does not open a carrier. The node's own publish does not open
+  it. An empty snapshot does not open it. A snapshot that omits a
+  revocation this node has already verified does not open it. A carrier
+  opens when two other peers have published the same snapshot and every
+  record in it has verified. x0xd then writes that carrier to the live
+  path and leaves the quarantine file in place. The next start loads the
+  live file. Placing a readable file on the live path is a rebuild for the
+  next start. It does not change the set of a process that is already
+  running. Do not delete the quarantine file. Do not replace it with a
+  zero-byte file. v1 and v2 revocation writes fsync the file and its
+  directory. Accepted transient record:
+  `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not folded).
 
 - **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
   The roster removal left the leaf in place, so the leaver could derive later
@@ -307,27 +335,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **A corrupt revocation store is quarantined and x0xd keeps running (#1116).**
-  A present revocation file that cannot be decoded is moved to
-  `<file>.quarantined-<unix-ms>` (a taken name gets `-<seq>`). The live path
-  no longer holds those bytes. x0xd starts and keeps running. The next start
-  sees the quarantine name, does not read that payload, and stays closed.
-  Startup writes one error log line. `GET /status` and `x0x status` set
-  `revocation_resync_required` and include the same sentence in `warnings`.
-  The first status read also sends one `status` event on `/events`. Until
-  the group resyncs revocations, or an operator places a readable file on
-  the live path, membership fails closed. A member whose non-revocation
-  cannot be verified is treated as revoked. An empty snapshot does not open
-  membership. Group admission, invite accept, join-artifact and key
-  delivery are withheld, as are non-revocation pubsub, DM and direct
-  messages. The hold is not a revocation record, so those paths do not
-  purge. A carrier opens only when every record in a snapshot from
-  another peer belongs to that carrier and verifies. The node's own
-  publish does not open it, and a partial snapshot does not open it.
-  v1 and v2 revocation writes fsync the file and its directory. Accepted
-  transient record: `docs/adr/transient/T-revocation-store-corrupt.md`
-  (slot A03, not folded).
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial

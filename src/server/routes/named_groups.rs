@@ -29306,6 +29306,16 @@ pub(in crate::server) async fn approve_join_request(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #1116: approving a join admits a member. Withhold it, do not purge it.
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return forbidden(x0x::revocation::REVOCATION_RESYNC_STATUS);
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
@@ -30003,6 +30013,17 @@ async fn approve_treekem_join_request(
     caller_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
+
+    // #1116: the TreeKEM approve path admits a member. Withhold, do not purge.
+    if state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .revocation_resync_required()
+    {
+        return forbidden(x0x::revocation::REVOCATION_RESYNC_STATUS);
+    }
 
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();

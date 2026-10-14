@@ -179,6 +179,9 @@ pub struct PubSubStats {
     pub incoming_sender_refused: AtomicU64,
     /// Millis since the unix epoch of the last sender-refusal debug log.
     sender_refusal_logged_at_ms: AtomicU64,
+    /// Messages withheld until a revocation resync (#1116). Not a decode
+    /// failure: the frame was valid and will be delivered after the hold.
+    pub incoming_withheld: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
     /// Subscriber channel was full and got dropped to isolate the dispatcher
@@ -216,6 +219,8 @@ pub struct PubSubStatsSnapshot {
     pub incoming_decode_failed: u64,
     /// Verified payloads dropped because the sender is revoked or Blocked.
     pub incoming_sender_refused: u64,
+    /// Messages withheld until a revocation resync (#1116).
+    pub incoming_withheld: u64,
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
@@ -225,9 +230,9 @@ pub struct PubSubStatsSnapshot {
     /// Local publishes whose eager-peer fan-out was zero.
     pub publish_zero_fanout: u64,
     /// `incoming_total - incoming_decoded - incoming_decode_failed -
-    /// incoming_sender_refused` — messages that entered the pipeline but did
-    /// not reach a decision yet (usually 0, non-zero means a worker panicked
-    /// or the decode task is blocked).
+    /// incoming_sender_refused - incoming_withheld` — messages that entered
+    /// the pipeline but did not reach a decision yet (usually 0, non-zero
+    /// means a worker panicked or the decode task is blocked).
     pub in_flight_decode: i64,
     /// `incoming_decoded - delivered_to_subscriber - subscriber_channel_closed`
     /// — messages decoded but never handed off (drop signal).
@@ -247,6 +252,7 @@ impl PubSubStats {
         let incoming_decoded = self.incoming_decoded.load(Ordering::Relaxed);
         let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
         let incoming_sender_refused = self.incoming_sender_refused.load(Ordering::Relaxed);
+        let incoming_withheld = self.incoming_withheld.load(Ordering::Relaxed);
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
@@ -255,7 +261,8 @@ impl PubSubStats {
         let in_flight_decode = incoming_total as i64
             - incoming_decoded as i64
             - incoming_decode_failed as i64
-            - incoming_sender_refused as i64;
+            - incoming_sender_refused as i64
+            - incoming_withheld as i64;
         let decode_to_delivery_drops = incoming_decoded as i64
             - delivered_to_subscriber as i64
             - subscriber_channel_closed as i64;
@@ -266,6 +273,7 @@ impl PubSubStats {
             incoming_decoded,
             incoming_decode_failed,
             incoming_sender_refused,
+            incoming_withheld,
             delivered_to_subscriber,
             slow_subscriber_dropped,
             subscriber_channel_closed,
@@ -1169,7 +1177,27 @@ async fn forward_plumtree_payload(
         DeliveryVerdict::Refused(sender) => {
             count_refused_deliveries(env.stats, env.sub_topic, &sender, recipients.len() as u64);
         }
+        DeliveryVerdict::Withheld => {
+            // #1116: a valid frame stays off the subscriber channel until
+            // resync. Count it with the other per-recipient decisions so
+            // the in-flight balance still closes.
+            count_withheld_deliveries(env.stats, env.sub_topic, recipients.len() as u64);
+        }
     }
+}
+
+fn count_withheld_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64) {
+    if waiting == 0 {
+        return;
+    }
+    stats.incoming_total.fetch_add(waiting, Ordering::Relaxed);
+    stats
+        .incoming_withheld
+        .fetch_add(waiting, Ordering::Relaxed);
+    tracing::debug!(
+        topic = %sub_topic,
+        "[4/6 pubsub] payload withheld until revocation resync"
+    );
 }
 
 fn count_refused_deliveries(stats: &PubSubStats, sub_topic: &str, sender: &AgentId, waiting: u64) {
@@ -4114,6 +4142,9 @@ enum DeliveryVerdict {
     Rejected,
     /// Revoked or Blocked. Counted as `incoming_sender_refused`.
     Refused(AgentId),
+    /// Valid frame held back until revocation resync (#1116).
+    /// Counted as `incoming_withheld`.
+    Withheld,
 }
 
 impl DeliveryVerdict {
@@ -4121,7 +4152,7 @@ impl DeliveryVerdict {
     fn into_message(self) -> Option<PubSubMessage> {
         match self {
             Self::Delivered(message) => Some(message),
-            Self::Rejected | Self::Refused(_) => None,
+            Self::Rejected | Self::Refused(_) | Self::Withheld => None,
         }
     }
 }
@@ -4192,18 +4223,18 @@ async fn decode_for_delivery(
         if set.is_agent_revoked(&sender) {
             return DeliveryVerdict::Refused(sender);
         }
-        // #1116: while a revocation carrier is unverified, withhold every
-        // other topic. The revocation carriers themselves still flow so a
-        // group snapshot can arrive. This is not a stored revocation.
+        // #1116: while a revocation carrier is unverified, withhold ordinary
+        // topics. Revocation carriers and certificate announcements still
+        // flow. This is not a stored revocation and is not a decode failure.
         if set.revocation_resync_required()
-            && !crate::revocation::is_revocation_carrier_topic(&message.topic)
+            && !crate::revocation::is_revocation_recovery_topic(&message.topic)
         {
             tracing::debug!(
                 "Withholding payload from {} until revocation resync ({})",
                 sender,
                 message.topic
             );
-            return DeliveryVerdict::Rejected;
+            return DeliveryVerdict::Withheld;
         }
     }
 

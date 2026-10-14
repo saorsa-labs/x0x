@@ -263,3 +263,29 @@ Two cases can keep a group in this state:
 - **A power loss reverted a change that had not reached disk.** If a group change was in place but not yet durable, and the next change's journal replaced the earlier journal, the restart cannot repair that group. The group then stays unavailable. Share the group again from a member that still has it.
 
 Do not delete `<gid>.journal` or `<gid>.snap` files by hand. Check the daemon log for the storage error (a failed fsync, a full disk, or an I/O error) and fix the disk first.
+
+## 8) Membership stays closed after a bad revocation file [working]
+
+x0xd stores revocations in three files under the identity directory:
+
+- `revocations.bin` (agents and machines)
+- `revocations-v2.bin` (binding tombstones)
+- `revocations-v3.bin` (share-grant revocations)
+
+A missing file means no revocations are known yet. Membership stays open. A file that is present but cannot be decoded is different. That includes a zero-byte file and a truncated file. x0xd moves those bytes to `<file>.quarantined-<unix-ms>`. A taken name gets `-<seq>`. x0xd keeps running.
+
+`GET /status` and `x0x status` then set `revocation_resync_required` to true. `warnings` contains one sentence. The first status read also sends one `status` event on `/events`. Startup writes the same sentence as an error log line. If x0xd cannot move the bad bytes, the sentence says the live path still holds them. Membership still stays closed.
+
+While the flag is true, x0xd withholds group admission, invite accept, join approval, key delivery, ordinary pubsub, direct messages, DMs, streams, and share-grant sends. It does not delete those items. Revocation topics still flow. Identity, machine, and user announcements still flow, so a later revocation can be checked against a certificate.
+
+The flag clears for one file only when two other peers have published the same snapshot for that file and every record in the snapshot has verified. One peer is not enough. A snapshot that leaves out a revocation this node already holds does not clear the flag. After that resync, x0xd writes the rebuilt file to the live path. The quarantine file stays. Restart x0xd and read `/status` again. `revocation_resync_required` must be false, and the revoked subjects must still be revoked.
+
+You can also rebuild a carrier by hand:
+
+1. Copy a readable revocation file from another machine that already has the revoked subjects you need.
+2. Check that the copy decodes before you install it. A zero-byte file is quarantined again.
+3. Put that file on the live path, beside the quarantine file. Do not delete the quarantine file. Do not rename it onto the live path unless you have confirmed the bytes decode.
+4. Restart x0xd. The running process does not reload the file until restart.
+5. Read `GET /status`. `revocation_resync_required` is false only when every corrupt carrier has a readable live file or a verified resync.
+
+Do not delete a quarantine file to clear the flag. Deleting it drops the only local copy of the bad bytes and can admit a member whose revocation was in that file.

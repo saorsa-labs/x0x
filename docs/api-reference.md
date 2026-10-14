@@ -274,6 +274,8 @@ most 10 s old. The reason is appended to `warnings`. A quiet peer, with both
 directions idle, is not degraded. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
+`revocation_resync_required` is false on a healthy node. It is true when a revocation file was present but could not be decoded. `warnings` then contains the same sentence as the startup error log. The first `GET /status` after that also sends one `status` event on `/events`. While the flag is true, group admission and key delivery are withheld. See `docs/troubleshooting.md` section 8 for the states and the recovery steps. Do not delete the quarantine file. A zero-byte file is not a repair.
+
 ## Identity
 
 | Method | Endpoint | CLI | Purpose |

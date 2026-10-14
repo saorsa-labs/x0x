@@ -714,6 +714,9 @@ impl GrantRedeliveryOutbox {
         //    each one against the revocation set right before sending
         //    (#983 post-merge P1; the gate keeps local and gossiped
         //    revocations out for the rest of this pass).
+        if revocations.read().await.revocation_resync_required() {
+            return report;
+        }
         let mut due: Vec<PendingGrantDelivery> = live
             .into_iter()
             .filter(|e| e.next_attempt_at <= now_unix)

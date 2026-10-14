@@ -422,8 +422,11 @@ impl OwnerTrust {
         let Some(devices) = self.device_store() else {
             return false;
         };
-        if revocation_set.read().await.is_machine_revoked(machine_id) {
-            return false;
+        {
+            let revoked = revocation_set.read().await;
+            if revoked.revocation_resync_required() || revoked.is_machine_revoked(machine_id) {
+                return false;
+            }
         }
         devices.is_enrolled(machine_id, &owner).await
     }

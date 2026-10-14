@@ -215,6 +215,21 @@ async fn corrupt_revocation_store_quarantines_starts_and_reports_1116() {
         "adding a member stays closed: {added_body}"
     );
 
+    let approved = daemon
+        .client
+        .post(daemon.url(&format!(
+            "/groups/{group_id}/requests/missing-request/approve"
+        )))
+        .send()
+        .await
+        .expect("POST approve");
+    assert_eq!(approved.status(), reqwest::StatusCode::FORBIDDEN);
+    let approved_body: serde_json::Value = approved.json().await.expect("approve json");
+    assert_eq!(
+        approved_body["error"], REVOCATION_RESYNC_STATUS,
+        "approving a join stays closed: {approved_body}"
+    );
+
     let quarantine_path = quarantined.path();
     daemon.stop().await;
     let readable = x0x::revocation::RevocationSet::new()

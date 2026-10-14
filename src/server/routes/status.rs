@@ -339,7 +339,7 @@ pub(in crate::server) async fn status(
         }
     }
 
-    let revocation_resync_required = {
+    let (revocation_resync_required, revocation_warning) = {
         let revocations = state.agent.revocation_set();
         let mut revocations = revocations.write().await;
         if let Some(message) = revocations.take_revocation_status_event() {
@@ -351,10 +351,12 @@ pub(in crate::server) async fn status(
                 }),
             });
         }
-        revocations.revocation_resync_required()
+        let required = revocations.revocation_resync_required();
+        let sentence = revocations.revocation_status_sentence().to_string();
+        (required, sentence)
     };
     if revocation_resync_required {
-        warnings.push(x0x::revocation::REVOCATION_RESYNC_STATUS.to_string());
+        warnings.push(revocation_warning);
     }
 
     let one_sided_peers = state.health_snapshot.load().2;
