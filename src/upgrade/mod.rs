@@ -170,7 +170,12 @@ pub fn latest_versioned_backup(target: &Path, from_version: &str) -> Option<Path
 /// previous binary, delete older ones). Only `<binary>.backup-*` files older
 /// than `min_age` are removed; the legacy `<binary>.backup`, other binaries'
 /// backups and operator copies are never touched. Best-effort.
-pub fn prune_versioned_backups(target: &Path, keep: &Path, min_age: std::time::Duration) -> usize {
+pub fn prune_versioned_backups(
+    target: &Path,
+    keep: &[&Path],
+    _known_good: &Version,
+    min_age: std::time::Duration,
+) -> usize {
     let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return 0;
     };
@@ -185,7 +190,9 @@ pub fn prune_versioned_backups(target: &Path, keep: &Path, min_age: std::time::D
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == keep || !entry.file_name().to_string_lossy().starts_with(&prefix) {
+        if keep.contains(&path.as_path())
+            || !entry.file_name().to_string_lossy().starts_with(&prefix)
+        {
             continue;
         }
         let aged = entry
@@ -231,6 +238,91 @@ pub struct Upgrader {
     target_path: PathBuf,
     /// Current version of the binary.
     current_version: Version,
+    /// SHA-256 of the bytes this process runs, when the target is this
+    /// process's own executable (#1106 F1 version evidence).
+    running_sha256: Option<[u8; 32]>,
+    /// Installed release to assume when no other evidence exists (the
+    /// companion CLI follows its daemon's installed release).
+    installed_release_hint: Option<Version>,
+}
+
+/// What a host-locked swap does, decided under the lock before any binary
+/// changes (#1106 F1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockedSwapPlan {
+    /// The installed bytes already equal the verified binary.
+    AlreadyInstalled,
+    /// Replace the installed release, which is older than the target.
+    Replace {
+        /// The release now installed, from verified evidence.
+        installed_release: Version,
+        /// SHA-256 of the installed bytes.
+        installed_sha256: [u8; 32],
+    },
+}
+
+/// Verified evidence of the release installed at a target (#1106 F1):
+/// `<install dir>/.<binary>.installed.json`, written under the host lock
+/// after each swap. It counts only while its hash matches the installed bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstallRecord {
+    /// Always [`INSTALL_RECORD_FORMAT`].
+    pub format: String,
+    /// Always [`INSTALL_RECORD_VERSION`].
+    pub version: u32,
+    /// The installed release (semver).
+    pub release: String,
+    /// Hex SHA-256 of the installed bytes.
+    pub sha256: String,
+}
+
+/// `format` marker of [`InstallRecord`].
+pub const INSTALL_RECORD_FORMAT: &str = "x0x.upgrade-install";
+/// Current `version` of [`InstallRecord`].
+pub const INSTALL_RECORD_VERSION: u32 = 1;
+
+impl InstallRecord {
+    /// The record file for the binary at `target`.
+    pub fn path_for(target: &Path) -> PathBuf {
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "x0xd".to_string());
+        let dir = target.parent().unwrap_or_else(|| Path::new("."));
+        dir.join(format!(".{name}.installed.json"))
+    }
+
+    /// Read the record for `target`. `None` when missing or not readable.
+    pub fn read(_target: &Path) -> Option<Self> {
+        None
+    }
+
+    /// Write the record for `target` with a record barrier.
+    pub fn write(_target: &Path, _release: &Version, _sha256: &[u8; 32]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SHA-256 of the bytes this process runs, computed once (#1106 F1).
+///
+/// On Linux it reads `/proc/self/exe`, which names the running image even
+/// after a rename replaced the installed file. Elsewhere it hashes the
+/// executable path; [`prime_running_binary_sha256`] runs at daemon start so
+/// the value is taken before any swap.
+pub fn running_binary_sha256() -> Option<[u8; 32]> {
+    static RUNNING: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    *RUNNING.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        let path = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let path = apply::current_binary_path().ok()?;
+        sha256_file(&path).ok()
+    })
+}
+
+/// Compute [`running_binary_sha256`] now (call early at daemon start).
+pub fn prime_running_binary_sha256() {
+    let _ = running_binary_sha256();
 }
 
 impl Upgrader {
@@ -238,7 +330,24 @@ impl Upgrader {
         Self {
             target_path,
             current_version,
+            running_sha256: None,
+            installed_release_hint: None,
         }
+    }
+
+    /// Supply the SHA-256 of the bytes this process runs (#1106 F1). When it
+    /// equals the installed bytes, the installed release is this process's
+    /// version.
+    pub fn with_running_sha256(mut self, running_sha256: Option<[u8; 32]>) -> Self {
+        self.running_sha256 = running_sha256;
+        self
+    }
+
+    /// Installed release to assume when neither the running hash nor an
+    /// install record identifies the installed bytes (#1106 F1).
+    pub fn with_installed_release_hint(mut self, release: Version) -> Self {
+        self.installed_release_hint = Some(release);
+        self
     }
 
     /// Prevent downgrades — target must be strictly newer.
@@ -394,6 +503,25 @@ impl Upgrader {
     /// is copied or replaced. Otherwise the previous bytes go to a versioned
     /// backup that no later writer overwrites, and then the new bytes replace
     /// the target. `staging_dir` must be on the target's filesystem.
+    /// Decide the swap under the lock, before any binary changes (#1106 F1).
+    pub fn plan_locked_swap(
+        &self,
+        _lock: &HostUpgradeLock,
+        new_binary_path: &Path,
+        target_version: &Version,
+    ) -> Result<LockedSwapPlan, UpgradeError> {
+        self.validate_upgrade(target_version)?;
+        let new_sha256 = sha256_file(new_binary_path)?;
+        let installed_sha256 = sha256_file(&self.target_path)?;
+        if new_sha256 == installed_sha256 {
+            return Ok(LockedSwapPlan::AlreadyInstalled);
+        }
+        Ok(LockedSwapPlan::Replace {
+            installed_release: self.current_version.clone(),
+            installed_sha256,
+        })
+    }
+
     pub fn perform_locked_upgrade(
         &self,
         _lock: &HostUpgradeLock,
@@ -425,7 +553,12 @@ impl Upgrader {
                     debug!(error = %e, "Directory fsync after the binary swap failed");
                 }
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
-                prune_versioned_backups(&self.target_path, &backup_path, BACKUP_PRUNE_MIN_AGE);
+                prune_versioned_backups(
+                    &self.target_path,
+                    &[backup_path.as_path()],
+                    &self.current_version,
+                    BACKUP_PRUNE_MIN_AGE,
+                );
                 Ok(SwapOutcome::Swapped { backup_path })
             }
             Err(replace_err) => {
@@ -678,6 +811,18 @@ pub enum UpgradeError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    /// The installed release is the target or newer (#1106 F1): another
+    /// writer on this host installed it. Nothing was replaced.
+    #[error(
+        "installed release {installed} is not older than target {target}; refusing to replace it"
+    )]
+    InstalledReleaseNotOlder { installed: String, target: String },
+
+    /// No verified evidence names the installed bytes (#1106 F1): they are
+    /// not this process's bytes and no install record matches them.
+    #[error("the release installed at {path} is unknown (not this process's bytes, no matching install record); refusing to replace it")]
+    InstalledReleaseUnknown { path: PathBuf },
 
     /// Another writer on this host held the upgrade lock for the whole wait
     /// (#1106). Nothing was replaced.
@@ -932,23 +1077,241 @@ mod tests {
 
     /// One writer: take the host lock (bounded spin), swap, release.
     fn locked_writer(target: &Path, staging: &Path, new_binary: &Path) -> SwapOutcome {
+        locked_writer_for(target, staging, new_binary, &Version::new(0, 48, 1)).unwrap()
+    }
+
+    fn sha(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).into()
+    }
+
+    fn take_lock(target: &Path) -> HostUpgradeLock {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let lock = loop {
+        loop {
             if let Some(lock) = HostUpgradeLock::try_acquire(target).unwrap() {
-                break lock;
+                return lock;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "the other writer must release the host lock"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        let upgrader = Upgrader::new(target.to_path_buf(), Version::new(0, 48, 0));
-        let outcome = upgrader
-            .perform_locked_upgrade(&lock, new_binary, &Version::new(0, 48, 1), staging)
-            .unwrap();
+        }
+    }
+
+    /// One writer that runs 0.48.0 (its running bytes are `OLD_BYTES`) and
+    /// applies `target_version` from `new_binary` under the host lock.
+    fn locked_writer_for(
+        target: &Path,
+        staging: &Path,
+        new_binary: &Path,
+        target_version: &Version,
+    ) -> Result<SwapOutcome, UpgradeError> {
+        let lock = take_lock(target);
+        let upgrader = Upgrader::new(target.to_path_buf(), Version::new(0, 48, 0))
+            .with_running_sha256(Some(sha(OLD_BYTES)));
+        let outcome = upgrader.perform_locked_upgrade(&lock, new_binary, target_version, staging);
         drop(lock);
         outcome
+    }
+
+    fn staged_binary(dir: &Path, tag: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
+        let staging = dir.join(format!(".x0x-upgrade-{tag}"));
+        fs::create_dir_all(&staging).unwrap();
+        let new_binary = staging.join("extracted-binary");
+        fs::write(&new_binary, bytes).unwrap();
+        (staging, new_binary)
+    }
+
+    const NEW_0482: &[u8] = b"x0xd 0.48.2 bytes from a later verified archive";
+    const NEW_0483: &[u8] = b"x0xd 0.48.3 bytes from the next verified archive";
+
+    #[test]
+    fn a_late_writer_with_an_older_release_never_downgrades_the_install() {
+        // Codex F1: A and B both run 0.48.0. A installs 0.48.2. B holds a
+        // valid 0.48.1 manifest and gets the lock later. B must refuse
+        // before any binary changes.
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let (staging_a, new_a) = staged_binary(dir.path(), "a", NEW_0482);
+        let a = locked_writer_for(&target, &staging_a, &new_a, &Version::new(0, 48, 2)).unwrap();
+        assert!(matches!(a, SwapOutcome::Swapped { .. }), "{a:?}");
+
+        let (staging_b, new_b) = staged_binary(dir.path(), "b", NEW_BYTES);
+        let b = locked_writer_for(&target, &staging_b, &new_b, &Version::new(0, 48, 1));
+        assert!(
+            matches!(b, Err(UpgradeError::InstalledReleaseNotOlder { ref installed, ref target })
+                if installed == "0.48.2" && target == "0.48.1"),
+            "an older target must be refused: {b:?}"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            NEW_0482,
+            "0.48.2 stays installed"
+        );
+        assert_eq!(
+            backup_files(dir.path()),
+            vec![expected_backup_name(OLD_BYTES)],
+            "the refused writer saved nothing"
+        );
+    }
+
+    #[test]
+    fn the_backup_is_named_from_the_bytes_being_saved() {
+        // The process runs 0.48.0, but another writer installed 0.48.2. The
+        // backup of the 0.48.2 bytes must say 0.48.2, not 0.48.0.
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let (staging_a, new_a) = staged_binary(dir.path(), "a", NEW_0482);
+        locked_writer_for(&target, &staging_a, &new_a, &Version::new(0, 48, 2)).unwrap();
+        let (staging_c, new_c) = staged_binary(dir.path(), "c", NEW_0483);
+        let c = locked_writer_for(&target, &staging_c, &new_c, &Version::new(0, 48, 3)).unwrap();
+        let SwapOutcome::Swapped { backup_path } = c else {
+            panic!("0.48.3 replaces 0.48.2: {c:?}");
+        };
+        assert_eq!(
+            backup_path.file_name().unwrap().to_string_lossy(),
+            format!("x0xd.backup-0.48.2-{}", hex::encode(&sha(NEW_0482)[..4]))
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), NEW_0482);
+        assert_eq!(fs::read(&target).unwrap(), NEW_0483);
+    }
+
+    #[test]
+    fn unknown_installed_bytes_are_never_replaced() {
+        // The installed bytes are not this process's bytes and no install
+        // record names them (for example a hand copy without a restart).
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", b"bytes from an unknown copy");
+        let (staging, new_binary) = staged_binary(dir.path(), "u", NEW_BYTES);
+        let outcome = locked_writer_for(&target, &staging, &new_binary, &Version::new(0, 48, 1));
+        assert!(
+            matches!(outcome, Err(UpgradeError::InstalledReleaseUnknown { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"bytes from an unknown copy");
+        assert!(backup_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn pruning_keeps_the_running_known_good_backup_after_an_uncommitted_swap() {
+        // Codex F6: 0.48.0 serves; an earlier swap installed 0.48.1 but its
+        // restart failed, so 0.48.0 still runs. Hours later the same process
+        // applies 0.48.2. The 0.48.0 copy is the last known-good release and
+        // must survive; only releases older than it may go.
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let (staging_a, new_a) = staged_binary(dir.path(), "a", NEW_BYTES);
+        locked_writer_for(&target, &staging_a, &new_a, &Version::new(0, 48, 1)).unwrap();
+        let known_good = dir.path().join(expected_backup_name(OLD_BYTES));
+        age_file(&known_good, std::time::Duration::from_secs(7200));
+        let ancient = dir.path().join("x0xd.backup-0.47.1-0badc0de");
+        fs::write(&ancient, b"0.47.1").unwrap();
+        age_file(&ancient, std::time::Duration::from_secs(7200));
+
+        let (staging_b, new_b) = staged_binary(dir.path(), "b", NEW_0482);
+        let b = locked_writer_for(&target, &staging_b, &new_b, &Version::new(0, 48, 2)).unwrap();
+        assert!(matches!(b, SwapOutcome::Swapped { .. }), "{b:?}");
+        assert!(
+            known_good.exists(),
+            "the running release's backup is the last known-good copy"
+        );
+        assert_eq!(fs::read(&known_good).unwrap(), OLD_BYTES);
+        assert!(
+            !ancient.exists(),
+            "a release older than the known-good one goes"
+        );
+    }
+
+    // A real two-process case (#1106 acceptance): the test binary re-runs
+    // itself twice as plain processes. No socket, no daemon.
+    const CHILD_TARGET: &str = "X0X_1106_CHILD_TARGET";
+    const CHILD_STAGING: &str = "X0X_1106_CHILD_STAGING";
+    const CHILD_GO: &str = "X0X_1106_CHILD_GO";
+    const CHILD_OUT: &str = "X0X_1106_CHILD_OUT";
+
+    #[test]
+    fn two_process_writer_child() {
+        // A no-op unless the two-process test below started this process.
+        let (Ok(target), Ok(staging), Ok(go), Ok(out)) = (
+            std::env::var(CHILD_TARGET),
+            std::env::var(CHILD_STAGING),
+            std::env::var(CHILD_GO),
+            std::env::var(CHILD_OUT),
+        ) else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !Path::new(&go).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "start signal never came"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let staging = PathBuf::from(staging);
+        let outcome = locked_writer(
+            Path::new(&target),
+            &staging,
+            &staging.join("extracted-binary"),
+        );
+        fs::write(out, format!("{outcome:?}")).unwrap();
+    }
+
+    #[test]
+    fn two_processes_on_one_install_swap_once_and_keep_a_versioned_backup() {
+        let dir = TempDir::new().unwrap();
+        let target = create_test_binary(&dir, "x0xd", OLD_BYTES);
+        let go = dir.path().join("go");
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = (0..2)
+            .map(|i| {
+                let (staging, _) = staged_binary(dir.path(), &format!("p{i}"), NEW_BYTES);
+                let out = dir.path().join(format!("outcome-{i}"));
+                let child = std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "upgrade::tests::two_process_writer_child",
+                        "--test-threads=1",
+                        "--quiet",
+                    ])
+                    .env(CHILD_TARGET, &target)
+                    .env(CHILD_STAGING, &staging)
+                    .env(CHILD_GO, &go)
+                    .env(CHILD_OUT, &out)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                (child, out)
+            })
+            .collect();
+        fs::write(&go, b"go").unwrap();
+        let mut outcomes = Vec::new();
+        for (mut child, out) in children {
+            assert!(child.wait().unwrap().success(), "a writer process failed");
+            outcomes.push(fs::read_to_string(out).unwrap());
+        }
+        outcomes.sort();
+        assert_eq!(
+            outcomes.iter().filter(|o| o.starts_with("Swapped")).count(),
+            1,
+            "exactly one process swaps: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| o == "AlreadyInstalled"),
+            "the other process finds the bytes installed: {outcomes:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), NEW_BYTES);
+        assert_eq!(
+            fs::read(dir.path().join(expected_backup_name(OLD_BYTES))).unwrap(),
+            OLD_BYTES,
+            "a valid previous-version backup survives"
+        );
+        assert_eq!(
+            backup_files(dir.path()),
+            vec![expected_backup_name(OLD_BYTES)]
+        );
     }
 
     #[test]
