@@ -112,14 +112,18 @@ fn log_delay(delay: Duration) {
 }
 
 /// Map a SHA-256 hash to a delay in `[0, window_secs)`.
+///
+/// The first 8 hash bytes are a fraction `value / 2^64` in `[0, 1)` (ADR 0094
+/// §1). Integer arithmetic keeps the result exact and the same on every
+/// platform.
 pub(crate) fn delay_from_hash(hash: &[u8], window_secs: u64) -> Duration {
     let mut prefix = [0u8; 8];
     for (slot, byte) in prefix.iter_mut().zip(hash.iter()) {
         *slot = *byte;
     }
-    let value = u64::from_be_bytes(prefix);
-    let fraction = value as f64 / u64::MAX as f64;
-    Duration::from_secs((fraction * window_secs as f64) as u64)
+    let value = u128::from(u64::from_be_bytes(prefix));
+    let delay_secs = (value * u128::from(window_secs)) >> 64;
+    Duration::from_secs(u64::try_from(delay_secs).unwrap_or(u64::MAX))
 }
 
 /// Which apply path offered a release to the staged rollout.
@@ -243,12 +247,71 @@ impl RolloutState {
     }
 
     /// Load the state. A missing file is an empty state.
-    pub fn load(_path: &Path) -> (Self, Option<RolloutStateProblem>) {
-        (Self::default(), None)
+    ///
+    /// A file that cannot be parsed, or that has another format or a newer
+    /// version, is not trusted: it is moved aside to
+    /// `<file>.unreadable-<unix ms>` (the bytes are kept for diagnosis) and
+    /// the state starts empty. An empty state can only make a wait longer,
+    /// never shorter.
+    pub fn load(path: &Path) -> (Self, Option<RolloutStateProblem>) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
+            Err(e) => {
+                return (
+                    Self::default(),
+                    Some(RolloutStateProblem {
+                        aside: None,
+                        reason: format!("cannot read {}: {e}", path.display()),
+                    }),
+                )
+            }
+        };
+        let reason = match serde_json::from_slice::<Self>(&bytes) {
+            Ok(state)
+                if state.format == ROLLOUT_STATE_FORMAT
+                    && state.version == ROLLOUT_STATE_VERSION =>
+            {
+                return (state, None);
+            }
+            Ok(state) => format!(
+                "unsupported format {:?} version {} (this binary reads {:?} version {})",
+                state.format, state.version, ROLLOUT_STATE_FORMAT, ROLLOUT_STATE_VERSION
+            ),
+            Err(e) => format!("unparseable: {e}"),
+        };
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut aside_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        aside_name.push(format!(".unreadable-{unix_ms}"));
+        let aside = path.with_file_name(aside_name);
+        let aside = std::fs::rename(path, &aside).ok().map(|()| aside);
+        (Self::default(), Some(RolloutStateProblem { aside, reason }))
     }
 
-    /// Persist the state with a record barrier.
-    pub fn save(&self, _path: &Path) -> std::io::Result<()> {
+    /// Persist the state with a record barrier: write a temp file, fsync
+    /// it, rename it over the state file, then fsync the directory.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(tmp_name);
+        if let Err(e) = write_synced_then_rename(&tmp, &json, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -257,42 +320,106 @@ impl RolloutState {
         self.releases.iter().find(|r| r.version == version)
     }
 
-    /// Stage `version` for this node (idempotent).
+    /// Stage `version` for this node (idempotent). Returns the entry and
+    /// whether this receipt created it.
+    ///
+    /// The delay is recomputed on every receipt, but it is a pure function
+    /// of node, version and window, so a duplicate receipt or a restart gets
+    /// the same delay (no re-roll). A changed window gives the delay for the
+    /// new window; the served wait is kept. Releases at or below
+    /// `current_version` are dropped, and at most
+    /// [`MAX_STAGED_RELEASES`] newer ones are kept.
     pub fn stage(
         &mut self,
         version: &str,
-        _node_id: &[u8],
+        node_id: &[u8],
         window_minutes: u64,
         trigger: RolloutTrigger,
         now_unix: u64,
-        _current_version: &str,
+        current_version: &str,
     ) -> (StagedRelease, bool) {
+        self.releases
+            .retain(|r| super::manifest::is_newer(&r.version, current_version));
+        let delay_secs = StagedRollout::new(node_id, window_minutes)
+            .calculate_delay_for_version(version)
+            .as_secs();
+        if let Some(entry) = self.releases.iter_mut().find(|r| r.version == version) {
+            entry.window_minutes = window_minutes;
+            entry.delay_secs = delay_secs;
+            return (entry.clone(), false);
+        }
         let staged = StagedRelease {
             version: version.to_string(),
             first_trigger: trigger,
             first_receipt_unix: now_unix,
             window_minutes,
-            delay_secs: 0,
+            delay_secs,
             waited_secs: 0,
         };
+        self.releases.push(staged.clone());
+        if self.releases.len() > MAX_STAGED_RELEASES {
+            // Keep the newest releases; drop the oldest by semver.
+            self.releases.sort_by(|a, b| {
+                match (
+                    semver::Version::parse(&a.version),
+                    semver::Version::parse(&b.version),
+                ) {
+                    (Ok(a), Ok(b)) => a.cmp(&b),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+            let excess = self.releases.len() - MAX_STAGED_RELEASES;
+            self.releases.drain(..excess);
+        }
         (staged, true)
     }
 
-    /// Record the total monotonic wait served for `version`.
-    pub fn set_waited(&mut self, _version: &str, _waited_secs: u64) -> Option<StagedRelease> {
-        None
+    /// Record the total monotonic wait served for `version`. The value only
+    /// grows and is capped at the delay.
+    pub fn set_waited(&mut self, version: &str, waited_secs: u64) -> Option<StagedRelease> {
+        let entry = self.releases.iter_mut().find(|r| r.version == version)?;
+        entry.waited_secs = entry.waited_secs.max(waited_secs).min(entry.delay_secs);
+        Some(entry.clone())
     }
 
     /// Return the "upgraded from" notice once per handoff transaction.
+    ///
+    /// The handoff record (`upgrade-handoff.json`) names the version that
+    /// applied the upgrade and the version it installed. When this binary is
+    /// the installed version and the transaction was not reported yet, the
+    /// notice is returned and recorded; a later restart returns `None`.
     pub fn take_upgrade_notice(
         &mut self,
-        _from_version: &str,
-        _to_version: &str,
-        _started_at: u64,
-        _current_version: &str,
+        from_version: &str,
+        to_version: &str,
+        started_at: u64,
+        current_version: &str,
     ) -> Option<AnnouncedUpgrade> {
-        None
+        if to_version != current_version || from_version == to_version {
+            return None;
+        }
+        let notice = AnnouncedUpgrade {
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            started_at,
+        };
+        if self.announced_upgrade.as_ref() == Some(&notice) {
+            return None;
+        }
+        self.announced_upgrade = Some(notice.clone());
+        Some(notice)
     }
+}
+
+/// At most this many staged releases are kept in the state file.
+pub const MAX_STAGED_RELEASES: usize = 4;
+
+fn write_synced_then_rename(tmp: &Path, bytes: &[u8], path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(tmp, path)
 }
 
 #[cfg(test)]

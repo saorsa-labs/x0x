@@ -10,7 +10,7 @@
 //! x0xd                                  # default config
 //! x0xd --config /path/to/config.toml    # custom config
 //! x0xd --check                          # validate config and exit
-//! x0xd --check-updates                  # check/apply updates and exit
+//! x0xd --check-updates                  # report available updates and exit (installs nothing)
 //! x0xd --skip-update-check              # run daemon with self-update disabled
 //! x0xd --name alice                     # run a named instance (separate identity)
 //! x0xd --list                           # list running instances
@@ -110,7 +110,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --connect-acl <PATH>            Override default connect ACL path");
         println!("    --check                         Check configuration and exit");
-        println!("    --check-updates       Check for updates and exit");
+        println!("    --check-updates       Report available updates and exit (installs nothing)");
         println!("    --skip-update-check   Disable self-update for this process");
         println!("    --doctor              Run diagnostics");
         println!("    --version, -V         Print version and exit");
@@ -376,8 +376,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // `--check-updates` is a print-and-exit mode: run the update check, report,
-    // and return without serving (matches pre-extraction behaviour).
+    // `--check-updates` is a print-and-exit mode: check for a newer verified
+    // release, report it, and return without serving. Report only (ADR 0094
+    // §1, #1106): the running daemon applies releases after its staged wait.
     if check_updates_only {
         return x0x::server::run_update_check_and_report(&config, skip_update_check).await;
     }
