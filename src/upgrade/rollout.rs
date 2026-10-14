@@ -227,6 +227,11 @@ pub struct RolloutState {
     /// The last upgrade reported at start ("upgraded from X to Y").
     #[serde(default)]
     pub announced_upgrade: Option<AnnouncedUpgrade>,
+    /// Why the stored state cannot be trusted (unreadable, unparseable, or
+    /// another format or version). While set, nothing may apply and the file
+    /// is never overwritten (ADR 0094 §6 fail closed). Not stored.
+    #[serde(skip)]
+    pub blocked: Option<String>,
 }
 
 impl Default for RolloutState {
@@ -236,6 +241,7 @@ impl Default for RolloutState {
             version: ROLLOUT_STATE_VERSION,
             releases: Vec::new(),
             announced_upgrade: None,
+            blocked: None,
         }
     }
 }
@@ -692,26 +698,34 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_state_file_is_moved_aside_not_trusted() {
+    fn an_unreadable_state_file_blocks_apply_and_is_preserved() {
+        // Codex F4 / ADR 0094 §6: fail closed means no apply, the record
+        // kept in place, and a degraded report; not a fresh timer.
         let dir = tempfile::TempDir::new().unwrap();
         let path = RolloutState::path_in(dir.path());
-        std::fs::write(&path, b"{ not json").unwrap();
-        let (state, problem) = RolloutState::load(&path);
-        assert_eq!(state, RolloutState::default());
-        let problem = problem.expect("a corrupt file is reported");
-        let aside = problem.aside.expect("the corrupt file is kept aside");
-        assert!(aside.exists(), "the unreadable bytes are preserved");
-        assert!(!path.exists(), "the unreadable file is not reused");
-
-        // A file from a newer format version is not trusted either.
-        std::fs::write(
-            &path,
-            br#"{"format":"x0x.upgrade-rollout","version":99,"releases":[]}"#,
-        )
-        .unwrap();
-        let (state, problem) = RolloutState::load(&path);
-        assert_eq!(state, RolloutState::default());
-        assert!(problem.is_some());
+        let cases: [&[u8]; 2] = [
+            b"{ not json",
+            br#"{"format":"x0x.upgrade-rollout","version":2,"releases":[],"wait":"new"}"#,
+        ];
+        for bytes in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let (state, problem) = RolloutState::load(&path);
+            assert!(problem.is_some(), "the unreadable file is reported");
+            assert!(
+                state.blocked.is_some(),
+                "an unreadable record blocks every apply"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "the active record stays in place, byte for byte"
+            );
+            assert!(
+                state.save(&path).is_err(),
+                "a blocked state never overwrites the record"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

@@ -365,6 +365,13 @@ pub(in crate::server) enum RolloutOffer {
     /// The wait is served. The caller applies now with
     /// [`RolloutScheduler::apply_due`].
     Due(StagedRelease),
+    /// The stored rollout state cannot be trusted (ADR 0094 §6 fail
+    /// closed): nothing applies until a supported binary or an explicit
+    /// repair resolves it.
+    Blocked {
+        /// Why the state is blocked.
+        reason: String,
+    },
 }
 
 /// Per-instance staged-rollout scheduler.
@@ -827,6 +834,16 @@ async fn stage_and_apply_if_due(
                 version = %manifest.version,
                 superseded_by = %by,
                 "Release v{} is superseded by staged v{by}",
+                manifest.version
+            );
+            None
+        }
+        RolloutOffer::Blocked { reason } => {
+            tracing::warn!(
+                version = %manifest.version,
+                %trigger,
+                %reason,
+                "Release v{} not applied: the staged-rollout state is unreadable (apply blocked until repair)",
                 manifest.version
             );
             None
@@ -1539,6 +1556,20 @@ pub(in crate::server) async fn apply_upgrade(
                 })),
             );
         }
+        RolloutOffer::Blocked { reason } => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "blocked": true,
+                    "reason": format!(
+                        "staged-rollout state is unreadable; apply blocked until repair: {reason}"
+                    ),
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
         RolloutOffer::NotNewer | RolloutOffer::BackoffActive => {
             return (
                 StatusCode::OK,
@@ -1992,6 +2023,72 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(3600)).await;
         assert_eq!(applier.attempts(), 1, "only the newer release applies");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_rollout_state_blocks_every_apply() {
+        // Codex F4: an unreadable or newer-format record must not restart
+        // the wait or apply; it stays in place until repair.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = RolloutState::path_in(dir.path());
+        let bytes = br#"{"format":"x0x.upgrade-rollout","version":2,"releases":[]}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), [5; 32], 0, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version_newer_than_current());
+        for trigger in [RolloutTrigger::Gossip, RolloutTrigger::Manual] {
+            let offer = scheduler.offer(&manifest, trigger, None).await;
+            assert!(
+                matches!(offer, RolloutOffer::Blocked { .. }),
+                "{trigger}: {offer:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(applier.attempts(), 0, "nothing applies while blocked");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the record is kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_keeps_a_newer_staged_release_ahead_of_an_older_receipt() {
+        // Codex F5: 0.x.2 supersedes a waiting 0.x.1; after a restart the
+        // older manifest arrives first and must still be superseded.
+        let dir = tempfile::TempDir::new().unwrap();
+        let older = version_newer_than_current();
+        let newer = {
+            let mut v = semver::Version::parse(&older).unwrap();
+            v.patch += 1;
+            v.to_string()
+        };
+        let id = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let r = x0x::upgrade::rollout::StagedRollout::new(id, 60);
+                r.calculate_delay_for_version(&older).as_secs() > 600
+                    && r.calculate_delay_for_version(&newer).as_secs() > 600
+            })
+            .expect("a node that waits for both releases");
+        let applier = Arc::new(CountingApplier::default());
+        let (first, shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        first
+            .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+            .await;
+        first
+            .offer(&manifest_with_version(&newer), RolloutTrigger::Gossip, None)
+            .await;
+        shutdown.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(first);
+
+        let (second, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        assert_eq!(
+            second
+                .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Superseded { by: newer.clone() },
+            "the stored newer release still supersedes the older one"
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(applier.attempts(), 0, "the older release never applies");
     }
 
     #[test]
