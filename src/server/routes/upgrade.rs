@@ -431,10 +431,55 @@ fn log_apply_result(
             tracing::warn!(%reason, %trigger, "Upgrade rolled back");
         }
         Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => {}
+        Err(e @ x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }) => {
+            tracing::info!(%trigger, "Upgrade waits: {e}");
+        }
         Err(e) => {
             tracing::error!(error = %e, %trigger, "Upgrade failed: {e}");
         }
     }
+}
+
+/// Write this daemon's shared-install participant record (#1106 review F2)
+/// from the scheduler state: the active staged release, its wait, and any
+/// blocked state. Best-effort: when the record cannot be written, the gate
+/// cannot establish the participants and refuses the swap.
+fn publish_participant_record(env: &RolloutEnv, inner: &RolloutInner) {
+    let Some(target) = env.install_target.as_deref() else {
+        return;
+    };
+    let staged = inner.state.newest_release(x0x::VERSION).map(|entry| {
+        x0x::upgrade::participants::ParticipantStage {
+            release: entry.version.clone(),
+            delay_secs: entry.delay_secs,
+            remaining_secs: entry.remaining().as_secs(),
+            due: entry.is_due(),
+        }
+    });
+    let record = x0x::upgrade::participants::ParticipantRecord::new(
+        &env.node_id,
+        &env.data_dir,
+        x0x::VERSION,
+        unix_now_secs(),
+        staged,
+        inner.state.blocked.clone(),
+    );
+    let key = x0x::upgrade::participants::participant_key(&env.data_dir);
+    if let Err(e) = x0x::upgrade::participants::write_own(target, &key, &record) {
+        tracing::debug!(
+            error = %e,
+            "Failed to write the shared-install participant record; a swap will be refused"
+        );
+    }
+}
+
+fn is_participant_wait(
+    result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) -> bool {
+    matches!(
+        result,
+        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. })
+    )
 }
 
 impl RolloutScheduler {
@@ -450,16 +495,73 @@ impl RolloutScheduler {
                  supported binary or an operator repair resolves it (the record is kept)"
             );
         }
+        let inner = RolloutInner {
+            state,
+            waiter: None,
+            failed: HashMap::new(),
+            applied: None,
+        };
+        // Register as a shared-install participant (#1106 review F2).
+        publish_participant_record(&env, &inner);
         Arc::new(Self {
             env,
             state_path,
-            inner: Mutex::new(RolloutInner {
-                state,
-                waiter: None,
-                failed: HashMap::new(),
-                applied: None,
-            }),
+            inner: Mutex::new(inner),
         })
+    }
+
+    /// Refresh this daemon's participant record every
+    /// [`x0x::upgrade::participants::PARTICIPANT_REFRESH`] until shutdown,
+    /// so other daemons on the install do not see it as stale.
+    pub(in crate::server) fn spawn_participant_heartbeat(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.env.install_target.as_ref()?;
+        let this = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            let mut shutdown = this.env.shutdown_watch.clone();
+            loop {
+                {
+                    let inner = this.inner.lock().await;
+                    publish_participant_record(&this.env, &inner);
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_REFRESH) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Start a waiter for `manifest` if none runs for it (a due release that
+    /// waits for the other shared-install participants).
+    pub(in crate::server) async fn ensure_waiter(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        let running = inner
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.version == manifest.version && !w.task.is_finished());
+        if running {
+            return;
+        }
+        let this = Arc::clone(self);
+        let waiter_manifest = manifest.clone();
+        let task = tokio::spawn(async move {
+            this.run_waiter(waiter_manifest, trigger, sender).await;
+        });
+        inner.waiter = Some(RolloutWaiter {
+            version: manifest.version.clone(),
+            task,
+        });
     }
 
     /// The effective rollout window in minutes.
@@ -557,6 +659,7 @@ impl RolloutScheduler {
         // A duplicate receipt changes nothing; do not rewrite the file.
         if inner.state != before {
             self.persist(&inner.state);
+            publish_participant_record(&self.env, &inner);
         }
         if is_new {
             tracing::info!(
@@ -636,6 +739,9 @@ impl RolloutScheduler {
             Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
                 inner.applied = Some(version.clone());
             }
+            // A shared install that waits for another participant is a
+            // wait, not a failed apply (#1106 review F2).
+            Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }) => {}
             Ok(x0x::upgrade::UpgradeResult::RolledBack { .. }) | Err(_) => {
                 inner
                     .failed
@@ -652,6 +758,7 @@ impl RolloutScheduler {
         let mut inner = self.inner.lock().await;
         inner.state.set_waited(version, waited_secs);
         self.persist(&inner.state);
+        publish_participant_record(&self.env, &inner);
         inner.is_current_waiter(version)
     }
 
@@ -690,24 +797,47 @@ impl RolloutScheduler {
             }
         }
 
-        let staged = {
-            let inner = self.inner.lock().await;
-            if !inner.is_current_waiter(&version) {
+        loop {
+            let staged = {
+                let inner = self.inner.lock().await;
+                if !inner.is_current_waiter(&version) {
+                    return;
+                }
+                inner.state.entry(&version).cloned()
+            };
+            let Some(staged) = staged else {
+                return;
+            };
+            tracing::info!(
+                %version,
+                %trigger,
+                delay_secs = staged.delay_secs,
+                "Staged-rollout wait served; applying v{version}"
+            );
+            let result = self
+                .apply_due(&manifest, trigger, sender.clone(), &staged)
+                .await;
+            log_apply_result(trigger, &result);
+            if !is_participant_wait(&result) {
+                break;
+            }
+            // #1106 review F2: another participant of the shared install is
+            // not due yet. Refresh this daemon's record and check again.
+            {
+                let inner = self.inner.lock().await;
+                if !inner.is_current_waiter(&version) {
+                    return;
+                }
+                publish_participant_record(&self.env, &inner);
+            }
+            let stopped = tokio::select! {
+                _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_RECHECK) => false,
+                changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+            };
+            if stopped {
                 return;
             }
-            inner.state.entry(&version).cloned()
-        };
-        let Some(staged) = staged else {
-            return;
-        };
-        tracing::info!(
-            %version,
-            %trigger,
-            delay_secs = staged.delay_secs,
-            "Staged-rollout wait served; applying v{version}"
-        );
-        let result = self.apply_due(&manifest, trigger, sender, &staged).await;
-        log_apply_result(trigger, &result);
+        }
         let mut inner = self.inner.lock().await;
         if inner.is_current_waiter(&version) {
             inner.waiter = None;
@@ -829,8 +959,15 @@ async fn stage_and_apply_if_due(
                 "Staged-rollout wait served; applying v{}",
                 manifest.version
             );
-            let result = rollout.apply_due(manifest, trigger, sender, &staged).await;
+            let result = rollout
+                .apply_due(manifest, trigger, sender.clone(), &staged)
+                .await;
             log_apply_result(trigger, &result);
+            if is_participant_wait(&result) {
+                // #1106 review F2: the shared install waits for another
+                // participant; a waiter checks again until all are due.
+                rollout.ensure_waiter(manifest, trigger, sender).await;
+            }
             match result {
                 Ok(x0x::upgrade::UpgradeResult::Success { version }) => Some(version),
                 _ => None,
@@ -1624,14 +1761,43 @@ pub(in crate::server) async fn apply_upgrade(
         .with_restart_context(restart_context.clone())
         .with_apply_summary(ApplySummary {
             trigger: Some(RolloutTrigger::Manual),
-            sender,
+            sender: sender.clone(),
             delay_secs: staged.delay_secs,
-        });
+        })
+        .with_shared_install_gate(Some(x0x::upgrade::apply::SharedInstallGate {
+            own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+        }));
 
     match upgrader
         .apply_upgrade_from_manifest(&release.manifest)
         .await
     {
+        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
+            release: due_release,
+            pending,
+        }) => {
+            // #1106 review F2: this node is due, another participant of the
+            // shared install is not. A waiter applies when all are due.
+            rollout
+                .ensure_waiter(&release.manifest, RolloutTrigger::Manual, sender)
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "reason": format!(
+                        "staged rollout: v{due_release} waits for the other daemons on this \
+                         install to be due (ADR 0094 §1): {}",
+                        pending.join("; ")
+                    ),
+                    "version": due_release,
+                    "pending_participants": pending,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            )
+        }
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
             rollout.mark_applied(&version).await;
             schedule_restart_after_response(stop_on_upgrade, restart_context, version.clone());

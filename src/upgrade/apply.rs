@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{current_platform_target, ReleaseManifest};
+use super::participants::{self, ParticipantGate};
 use super::restart;
 use super::rollout::RolloutTrigger;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
@@ -354,6 +355,48 @@ impl AutoApplyUpgrader {
         // this process exits; any other return drops it here.
         let host_lock = HostUpgradeLock::acquire(&target_path, HOST_UPGRADE_LOCK_WAIT).await?;
         debug!(lock = %host_lock.path().display(), "Host upgrade lock held");
+
+        // #1106 review F2 (ADR 0094 §1): a shared install swaps only when
+        // every live participant is due. Checked under the lock, before any
+        // download. `None` is the D185 `now=true` bypass.
+        if let Some(gate) = &self.shared_install_gate {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match participants::check_all_due(
+                &target_path,
+                &gate.own_key,
+                &target_version,
+                now_unix,
+            ) {
+                Ok(ParticipantGate::AllDue { stale }) => {
+                    for record in stale {
+                        warn!(
+                            %record,
+                            "Ignoring a stale shared-install participant record (a removed or \
+                             stopped daemon); delete it if that daemon is gone"
+                        );
+                    }
+                }
+                Ok(ParticipantGate::Waiting { pending, .. }) => {
+                    let pending: Vec<String> = pending.into_iter().map(|p| p.reason).collect();
+                    info!(
+                        version = %target_version,
+                        pending = ?pending,
+                        "Shared install: waiting for every participant to be due before the swap"
+                    );
+                    return Err(UpgradeError::ParticipantsNotDue {
+                        release: target_version.to_string(),
+                        pending,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "Refusing the shared-install swap: {e}");
+                    return Err(e);
+                }
+            }
+        }
 
         // #1106 F1: the running bytes are version evidence for the install.
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone())

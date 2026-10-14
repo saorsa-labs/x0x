@@ -457,6 +457,8 @@ pub async fn serve_with_options(
     // for startup checks, background gossip/poll workers, and `/upgrade/apply`.
     // The config itself stays unchanged, so a later ordinary launch still
     // participates in the normal release train.
+    // The daemon binary is configured for self-update; embedders are not.
+    let configured_for_self_update = self_update_enabled;
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
     // Ensure data directory exists early so self-update has a working directory.
     tokio::fs::create_dir_all(&config.data_dir)
@@ -1723,6 +1725,23 @@ pub async fn serve_with_options(
             rollout_window_minutes = window,
             "Staged rollout active: releases apply 0-{window} min after first receipt"
         );
+    }
+    // #1106 review F2: a daemon that may self-update keeps a fresh
+    // participant record beside the shared executable; one that may not
+    // (`--skip-update-check`, `[update] enabled = false`) removes its record,
+    // so it does not hold back the other daemons on the install.
+    if let Some(heartbeat) = rollout
+        .as_ref()
+        .and_then(|r| r.spawn_participant_heartbeat())
+    {
+        bg_tasks.push(heartbeat);
+    } else if configured_for_self_update {
+        if let Ok(exe) = x0x::upgrade::apply::current_binary_path() {
+            let key = x0x::upgrade::participants::participant_key(&config.data_dir);
+            if let Err(e) = x0x::upgrade::participants::remove_own(&exe, &key) {
+                tracing::debug!(error = %e, "Failed to remove this daemon's participant record");
+            }
+        }
     }
 
     if let Some(rollout) = rollout.as_ref() {

@@ -154,8 +154,23 @@ pub fn record_path(target: &Path, key: &str) -> PathBuf {
     participants_dir(target).join(format!("{key}.json"))
 }
 
-/// Write this daemon's record (temp file, fsync, rename).
-pub fn write_own(_target: &Path, _key: &str, _record: &ParticipantRecord) -> std::io::Result<()> {
+/// Write this daemon's record (temp file, fsync, rename). Each daemon writes
+/// only its own file, so a reader never sees a torn record.
+pub fn write_own(target: &Path, key: &str, record: &ParticipantRecord) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = participants_dir(target);
+    std::fs::create_dir_all(&dir)?;
+    let path = record_path(target, key);
+    let tmp = dir.join(format!("{key}.json.tmp-{}", std::process::id()));
+    let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(&json)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -170,13 +185,117 @@ pub fn remove_own(target: &Path, key: &str) -> std::io::Result<()> {
 
 /// Check, under the host lock, that every live participant of the install
 /// at `target` is due for `release`.
+///
+/// A live participant is due when it already runs `release` or newer, or
+/// when it has staged `release` or newer and its wait is served. A record
+/// older than [`PARTICIPANT_STALE_AFTER`] is stale: it is ignored and
+/// reported. The participants cannot be established, and the swap is
+/// refused, when the directory cannot be read, this daemon's own record is
+/// missing, or any record is unreadable or of another format.
 pub fn check_all_due(
-    _target: &Path,
-    _own_key: &str,
-    _release: &Version,
-    _now_unix: u64,
+    target: &Path,
+    own_key: &str,
+    release: &Version,
+    now_unix: u64,
 ) -> Result<ParticipantGate, UpgradeError> {
-    Ok(ParticipantGate::AllDue { stale: Vec::new() })
+    let dir = participants_dir(target);
+    let unknown = |reason: String| UpgradeError::ParticipantsUnknown { reason };
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| unknown(format!("cannot read {}: {e}", dir.display())))?;
+    let mut own_seen = false;
+    let mut pending = Vec::new();
+    let mut stale = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| unknown(format!("cannot list {}: {e}", dir.display())))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(key) = name.strip_suffix(".json") else {
+            continue; // temp files and anything else
+        };
+        let path = entry.path();
+        let record: ParticipantRecord = std::fs::read(&path)
+            .map_err(|e| unknown(format!("cannot read {}: {e}", path.display())))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| unknown(format!("unreadable record {}: {e}", path.display())))
+            })?;
+        if record.format != PARTICIPANT_FORMAT || record.version != PARTICIPANT_VERSION {
+            return Err(unknown(format!(
+                "record {} has format {:?} version {}",
+                path.display(),
+                record.format,
+                record.version
+            )));
+        }
+        if key == own_key {
+            own_seen = true;
+            continue;
+        }
+        if record
+            .updated_unix
+            .saturating_add(PARTICIPANT_STALE_AFTER.as_secs())
+            < now_unix
+        {
+            stale.push(format!(
+                "{} (machine {}, data dir {}, last refreshed {}s ago)",
+                path.display(),
+                short(&record.machine_id),
+                record.data_dir,
+                now_unix.saturating_sub(record.updated_unix)
+            ));
+            continue;
+        }
+        if let Some(reason) = participant_not_due(&record, release) {
+            pending.push(PendingParticipant {
+                key: key.to_string(),
+                machine_id: record.machine_id.clone(),
+                reason,
+            });
+        }
+    }
+    if !own_seen {
+        return Err(unknown(format!(
+            "this daemon's own record {own_key}.json is missing from {}",
+            dir.display()
+        )));
+    }
+    if pending.is_empty() {
+        Ok(ParticipantGate::AllDue { stale })
+    } else {
+        Ok(ParticipantGate::Waiting { pending, stale })
+    }
+}
+
+/// `None` when the live participant is due for `release`, else why not.
+fn participant_not_due(record: &ParticipantRecord, release: &Version) -> Option<String> {
+    let label = format!(
+        "machine {} ({})",
+        short(&record.machine_id),
+        record.data_dir
+    );
+    if let Some(reason) = &record.blocked {
+        return Some(format!("{label}: rollout state blocked: {reason}"));
+    }
+    if Version::parse(&record.running_version).is_ok_and(|running| &running >= release) {
+        return None;
+    }
+    match &record.staged {
+        None => Some(format!("{label}: has not staged v{release}")),
+        Some(stage) => match Version::parse(&stage.release) {
+            Ok(staged) if &staged >= release && stage.due => None,
+            Ok(staged) if &staged >= release => Some(format!(
+                "{label}: due for v{} in {}s",
+                stage.release, stage.remaining_secs
+            )),
+            _ => Some(format!(
+                "{label}: waits for v{}, not v{release}",
+                stage.release
+            )),
+        },
+    }
+}
+
+fn short(machine_id: &str) -> &str {
+    machine_id.get(..16).unwrap_or(machine_id)
 }
 
 #[cfg(test)]
