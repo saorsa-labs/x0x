@@ -80,6 +80,60 @@ pub struct SharedInstallGate {
     pub own_key: String,
 }
 
+/// A swapped install whose restart still has to run (#1106 review F3).
+///
+/// The HTTP apply restarts after its response. This value carries the host
+/// upgrade lock, the restart plan resolved before the swap and this
+/// transaction's backup into that deferred restart, so the restart uses
+/// exactly them and no other writer on the host can swap in between. The
+/// lock is released when the value is dropped (after a completed refusal or
+/// restore) or when the process exits.
+pub struct PreparedRestart {
+    host_lock: Option<HostUpgradeLock>,
+    plan: restart::RestartPlan,
+    backup_path: Option<PathBuf>,
+    target_version: String,
+}
+
+impl PreparedRestart {
+    /// The restart plan resolved before the swap.
+    pub fn plan(&self) -> &restart::RestartPlan {
+        &self.plan
+    }
+
+    /// This transaction's versioned backup, if this writer made one.
+    pub fn backup_path(&self) -> Option<&Path> {
+        self.backup_path.as_deref()
+    }
+
+    /// The installed release.
+    pub fn target_version(&self) -> &str {
+        &self.target_version
+    }
+
+    /// Whether this value still holds the host upgrade lock.
+    pub fn holds_host_lock(&self) -> bool {
+        self.host_lock.is_some()
+    }
+}
+
+/// Carry the host lock, plan and backup of a completed swap into its
+/// deferred restart.
+pub(crate) fn prepare_restart(
+    host_lock: HostUpgradeLock,
+    plan: restart::RestartPlan,
+    backup_path: Option<PathBuf>,
+    target_version: &str,
+) -> PreparedRestart {
+    drop(host_lock);
+    PreparedRestart {
+        host_lock: None,
+        plan,
+        backup_path,
+        target_version: target_version.to_string(),
+    }
+}
+
 /// The fields of one applied-upgrade summary line.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AppliedSummaryLine<'a> {
@@ -1097,6 +1151,43 @@ mod tests {
         ] {
             assert!(line.contains(needle), "missing {needle:?} in {line}");
         }
+    }
+
+    #[test]
+    fn a_prepared_restart_carries_the_host_lock_plan_and_backup() {
+        // Codex F3: the deferred HTTP restart must hold the host lock and
+        // use the plan and backup of its own swap, not a fresh plan.
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let lock = HostUpgradeLock::try_acquire(&target).unwrap().unwrap();
+        let plan = restart::RestartPlan {
+            mode: restart::RestartMode::SupervisedExit,
+            supervised_exit_code: Some(0),
+            supervision_signal: Some("INVOCATION_ID".to_string()),
+            executable: target.clone(),
+            argv: vec![target.display().to_string()],
+            cwd: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
+            api_addr: "127.0.0.1:12600".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        let backup = dir.path().join("x0xd.backup-0.48.0-00112233");
+        let prepared = prepare_restart(lock, plan.clone(), Some(backup.clone()), "0.48.1");
+
+        assert!(prepared.holds_host_lock());
+        assert!(
+            HostUpgradeLock::try_acquire(&target).unwrap().is_none(),
+            "no other writer can swap during the response window"
+        );
+        assert_eq!(prepared.plan(), &plan, "the plan from before the swap");
+        assert_eq!(prepared.backup_path(), Some(backup.as_path()));
+        assert_eq!(prepared.target_version(), "0.48.1");
+
+        // A completed refusal or restore drops it: the lock is free again.
+        drop(prepared);
+        assert!(HostUpgradeLock::try_acquire(&target).unwrap().is_some());
     }
 
     #[test]
