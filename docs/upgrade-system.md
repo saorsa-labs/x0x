@@ -10,7 +10,7 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback. Extraction accepts only a regular file whose final path component is exactly the binary name, refuses archives holding more than one such entry, and requires the extracted file to carry the platform's native executable magic (ELF/Mach-O/MZ) (#1144). A `TempDirGuard` (RAII) removes the per-attempt `.x0x-upgrade-*` temp dir on every exit path, including early-return errors, so a failed apply never leaks the downloaded archive.
 
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
-- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+- **`rollout.rs`**: Staged rollout (ADR 0094 §1, #1106): the per-node delay `SHA-256(MachineId ‖ version)` × window, and the persisted wait per release (`<data_dir>/upgrade-rollout.json`). See [Staged rollout](#staged-rollout-1106-adr-0094-1).
 
 ### Binary replacement (`mod.rs`)
 
@@ -18,6 +18,35 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 
 - **Unix**: `fs::rename(new, target)` — atomic on the same filesystem, valid even when `target` is the running executable.
 - **Windows / non-Unix**: a running executable is locked and cannot be renamed over in place. `replace_via_sideline` moves the live binary aside to `<name>.x0xold-<nanos>` (allowed even while locked), moves the new binary into place, and rolls the sideline back if the second move fails. The sidelined file stays locked until the old process exits and is reclaimed on the next launch.
+
+### One binary writer per host (#1106)
+
+Two daemons can share one executable. Every fleet host runs `x0xd` and
+`x0xd-443` from `/opt/x0x/x0xd`. Before 0.48.1 both applied the same release
+independently, and the second one copied the already-new bytes over the single
+`x0xd.backup`, so no copy of the old release was left.
+
+- **Host lock.** The apply takes an OS file lock on
+  `<install dir>/.<binary>.upgrade-lock` (for example `/opt/x0x/.x0xd.upgrade-lock`)
+  after the restart plan resolves and before the download. It holds the lock
+  through the swap and the restart; the OS releases it when the process exits.
+  A second writer waits at most 10 minutes and then fails before any change.
+  The lock file is never deleted.
+- **Skip when installed.** Under the lock, when the installed bytes already
+  equal the verified binary, the writer does not swap. Another writer on the host
+  installed them, so this daemon only restarts onto them.
+- **Versioned backup.** The previous bytes are copied to
+  `<binary>.backup-<running version>-<first 8 hex of their SHA-256>`, for example
+  `/opt/x0x/x0xd.backup-0.48.0-f9149f65`. The copy is fsynced and renamed into
+  place. A different file under that name is never overwritten. The companion
+  `x0x` CLI uses the same rule (`x0x.backup-<version>-<sha8>`).
+- **Retention.** After a swap, older `<binary>.backup-*` files older than one
+  hour are removed, so the previous release stays (D194). The legacy
+  `<binary>.backup`, other binaries' backups and operator copies such as
+  `x0xd.v0480-pre0481` are not touched.
+- The handoff/intent record `upgrade-handoff.json` names the versioned backup in
+  `backup_path`. The daemon no longer writes `<binary>.backup`. A file with that
+  name is left from an older release and may be very old: do not restore it.
 
 `sweep_stale_upgrade_artifacts(dir, min_age)` runs once at `x0xd` startup. It removes leftover `.x0x-upgrade-*` temp dirs older than `min_age` (1h — never disturbs an in-flight apply) and `*.x0xold-*` sidelined binaries that clear the same age gate (issue #261: a handoff still in flight must not lose its rollback bytes). This reclaims debris from previously-interrupted attempts.
 
@@ -91,8 +120,10 @@ The scenario: a migrated/supervised job took the supervised exit, the
 replacement failed to start, and the daemon is now down. Two artifacts
 survive the attempt and are all you need:
 
-- `<target>.backup` — the exact bytes that were serving before the swap,
-  written beside the installed binary (`<target>`).
+- `<target>.backup-<from_version>-<sha8>` — the exact bytes that were
+  serving before the swap, written beside the installed binary (`<target>`).
+  The intent file's `backup_path` names it. (Releases before 0.48.1 wrote a
+  single `<target>.backup`; see "One binary writer per host" above.)
 - `<data_dir>/upgrade-handoff.json` — the intent record: from/to versions,
   `target_path`, `backup_path`, argv, cwd, old pid, API address. On the
   supervised path it also carries `launchd_verified` — the launchd label and
@@ -172,9 +203,11 @@ sudo cat /var/lib/x0x-443/data/upgrade-handoff.json         # 443 instance
 `Restart=no`/`on-failure` on a unit that exits 0 for upgrades is the same
 dead-job state as the missing-`KeepAlive` case above: fix the unit
 (`Restart=always`, `sudo systemctl daemon-reload`) before restoring
-service. Fleet caveat (ADR-0011): the self-updater restarts only
-`x0xd.service` — after any upgrade, restored or successful, restart
-`x0xd-443` too or it keeps serving the old image.
+service. Fleet caveat (ADR-0011): each listener restarts itself at its own
+staged-rollout due time (#1106). The first one swaps the shared binary; the
+second one finds the bytes installed and only restarts. Until its due time,
+`x0xd-443` keeps serving the old image. After a manual restore, restart both
+listeners (step 3).
 
 #### 2. Restore the known-good binary
 
@@ -182,9 +215,13 @@ Only needed when the replacement will not start. On Unix a rename over the
 installed path is safe even if a copy is still running:
 
 ```bash
-# <target> is the intent file's target_path (the job's program/ExecStart)
-mv <target>.backup <target>
+# <target> is the intent file's target_path (the job's program/ExecStart);
+# <backup> is its backup_path, for example /opt/x0x/x0xd.backup-0.48.0-f9149f65
+cp -p <backup> <target>.restore && mv <target>.restore <target>
 ```
+
+Copy, then rename: the backup stays for a second attempt, and a rename over
+the target is safe while a copy is still running.
 
 There is no intent file and no backup to restore (the daemon died before
 writing them)? The installed bytes are the replacement — reinstall the
@@ -213,7 +250,7 @@ launchctl load "$HOME/Library/LaunchAgents/$label.plist"
 # Linux (systemd) — desktop user unit:
 systemctl --user restart x0xd
 # Fleet hosts: restart BOTH listeners after restoring the binary —
-# x0xd-443 is not in the updater's restart set (ADR-0011):
+# each listener otherwise restarts only at its own staged-rollout due time:
 sudo systemctl restart x0xd x0xd-443
 ```
 
@@ -296,11 +333,74 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
-2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
-3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
+1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and stage it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
+2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, stage if newer
+3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip, stage
+4. **`POST /upgrade/apply`**: authenticated manual request; it stages the release like the other paths
 
-Both apply paths back off versions that fail to apply: a failed version is recorded and skipped for 30 minutes before retrying (a newer release supersedes the skip immediately). This prevents a release that can never apply in a given environment from re-downloading and re-extracting on every gossip receipt.
+Every path verifies a release first and then offers it to the staged rollout below. A release applies only when this node's wait is served.
+
+Every automatic path backs off versions that fail to apply: a failed version is recorded and skipped for 30 minutes before retrying (a newer release supersedes the skip immediately). This prevents a release that can never apply in a given environment from re-downloading and re-extracting on every gossip receipt.
+
+`x0xd --check-updates` is report-only (ADR 0094 §1): it prints whether a newer verified release exists and installs nothing (no binary, no SKILL.md).
+
+## Staged rollout (#1106, ADR 0094 §1)
+
+A node does not apply a verified release at first receipt. It waits:
+
+```text
+delay = SHA-256(MachineId ‖ version)[0..8] as u64 × window_secs / 2^64     (in [0, window))
+```
+
+- `window` is `[update] rollout_window_minutes`. The compiled default is **60**
+  (D183). The fleet default and minimum are 60 (D184); the fleet inventory check
+  enforces that minimum, not the daemon. Private rehearsal hosts may set `0`,
+  which applies on first receipt.
+- Different nodes get different delays for one release, and the version salt
+  changes the order for each release. A permanent early ring is M4 work.
+- The wait starts at this node's first eligible receipt, so discovery lag adds to
+  the window (#1169).
+- `<data_dir>/upgrade-rollout.json` keeps, per release: the first trigger and
+  receipt time (diagnostic), the window, the chosen delay and the served wait.
+  The file is versioned JSON (`"format": "x0x.upgrade-rollout"`, `"version": 1`)
+  and is written with a record barrier (temp file, fsync, rename, directory
+  fsync). A duplicate receipt or a restart keeps the delay and the served wait.
+  The delay is a pure function, so it cannot re-roll. The wait is counted on the
+  monotonic clock while the daemon runs and checkpointed every 30 s; time while
+  the daemon is stopped does not count, and the wall clock never decides the due
+  time. A changed window gives the delay for the new window and keeps the served
+  wait. An unreadable or newer-format file is moved aside to
+  `upgrade-rollout.json.unreadable-<unix ms>` and the wait starts again, which
+  can only make it longer.
+- While a node waits it downloads and replaces nothing. A waiter task applies
+  the release when the wait is served. A newer release supersedes a waiting one.
+- `POST /upgrade/apply` also waits. While the node waits it answers
+  `{"ok": true, "applied": false, "staged": true, "reason": …, "version": …,
+  "delay_secs": …, "remaining_secs": …, "window_minutes": …}`, and the daemon
+  applies the release when the wait is served. There is no bypass yet: ADR 0094
+  left the HTTP bypass as an open question.
+- A due apply keeps the #1196 behaviour on every trigger: when the only refusal
+  is an unaged systemd start-rate window, it waits that window out and retries
+  once.
+- Shared installs: each daemon on a host waits its own delay. The first one due
+  swaps the shared binary under the host lock; the next one finds the bytes
+  installed and only restarts. ADR 0094 §1 asks that a shared install wait for
+  every participant; that needs the participant inventory of ADR 0094 §2 (M2
+  slice S2) and is not done yet.
+
+### Upgrade log lines
+
+Fleet units run `RUST_LOG=warn`. Two WARN lines record a self-update:
+
+- Before the restart: `x0xd self-update applied: <from> -> <to> via
+  <startup|gossip|poll|manual> (sender <agent hex | local API | unknown>, staged
+  delay <n>s, swap <performed|already_installed>, backup <path>, exit
+  <supervised_exit(code=0)|transactional_handoff|deferred_restart(…)>)`.
+- At the next start: `x0xd upgraded from <from> to <to>`, from the existing
+  `upgrade-handoff.json`. It is written once per handoff transaction (the reported
+  transaction is kept in `upgrade-rollout.json`), so a crash loop does not repeat it.
+
+Every other upgrade step stays at INFO or DEBUG.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,

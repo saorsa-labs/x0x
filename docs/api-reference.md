@@ -2334,6 +2334,14 @@ authenticated daemon endpoint `POST /upgrade/apply` (or let the daemon's
 self-update apply it), over REST or the GUI. See
 [docs/upgrade-system.md](upgrade-system.md).
 
+**Staged rollout (#1106).** `POST /upgrade/apply` waits for this node's
+staged-rollout delay like every other apply path. While the node waits it
+answers `200` with `{"ok": true, "applied": false, "staged": true, "reason":
+"staged rollout: …", "version", "delay_secs", "remaining_secs",
+"window_minutes", "current_version"}`, and the daemon applies the release
+when the wait is served. When the wait is served the answer is the usual
+`{"applied": true, "version", "previous_version", "restart_scheduled": true}`.
+
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
 binary cannot read the `owner_certified` policy variant and crash-loops; the
 upgrade helper auto-respawns the previous binary on a failed health check.
