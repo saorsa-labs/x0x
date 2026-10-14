@@ -515,6 +515,7 @@ impl RolloutScheduler {
             }
         }
 
+        let before = inner.state.clone();
         let (staged, is_new) = inner.state.stage(
             version,
             &self.env.node_id,
@@ -523,7 +524,10 @@ impl RolloutScheduler {
             unix_now_secs(),
             x0x::VERSION,
         );
-        self.persist(&inner.state);
+        // A duplicate receipt changes nothing; do not rewrite the file.
+        if inner.state != before {
+            self.persist(&inner.state);
+        }
         if is_new {
             tracing::info!(
                 version = %staged.version,
