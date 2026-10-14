@@ -66,7 +66,7 @@ A full IP overlay can support more applications, but it expands routing, operati
 
 QUIC transport, discovery, streams and loopback forwarding exist. Friendly names, persistent forwards and SOCKS are a separate Phase 2 design. They must not be described as a complete shipped tailnet.
 
-ant-quic 0.27.60 already has bearer scaffolding. `TransportAddr` in `src/transport/addr.rs` names `Ble`, `LoRa` and `Serial`. `TransportCapabilities` in `src/transport/capabilities.rs` names `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. David accepted that record (D275, 14 Oct 2026) in [T-alternate-bearers](../transient/T-alternate-bearers.md). This note does not fold it into A05. Wiring those bearers into x0x stays a target.
+ant-quic 0.27.60 already has bearer scaffolding. The paths in this note are in the ant-quic crate. x0x has no `src/transport` directory. `TransportAddr` in ant-quic `src/transport/addr.rs` names `Ble`, `LoRa` and `Serial`. `TransportCapabilities` in ant-quic `src/transport/capabilities.rs` names `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. David accepted that record (D275, 14 Oct 2026) in [T-alternate-bearers](../transient/T-alternate-bearers.md). This note does not fold it into A05. Wiring those bearers into x0x stays a target.
 
 [A06](A06-r01-gossip-relay-roles-and-resource-limits.md) owns relay duties and resource limits. [A03](A03-r01-trust-permissions-sharing-and-revocation.md) owns service authority.
 
