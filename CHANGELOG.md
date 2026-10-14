@@ -82,6 +82,36 @@ All notable changes to this project will be documented in this file.
   transport remains unknown without message identity correlation; verdicts
   and the outstanding determinism work are unchanged.
 
+- **The GUI uses the JSON fields these routes read and return (#1399).**
+  The MLS encrypt pane sent `plaintext`. `POST /mls/groups/:id/encrypt`
+  reads `payload` and base64-decodes it, so the call returned 422. The pane
+  now sends `payload` as standard base64 of the UTF-8 text. Decrypt read
+  `plaintext`. The route returns `payload`. The pane now reads `payload`
+  and decodes it.
+  `setSpaceDisplayName` sent `display_name`. `PUT /groups/:id/display-name`
+  reads `name`. The call now sends `name`.
+  Secure encrypt sent `plaintext`. `POST /groups/:id/secure/encrypt` reads
+  `payload_b64`. The call now sends `payload_b64` as standard base64. The
+  cipher box stores `ciphertext_b64`, `nonce_b64`, and `secret_epoch`.
+  Decrypt read `plaintext`. The route returns `payload_b64`. The pane now
+  reads `payload_b64` and decodes it.
+  Secure reseal sent `plaintext`. `POST /groups/:id/secure/reseal` reads
+  `recipient`. The call now sends `recipient`.
+  Sign payload omitted `context`. `POST /agent/sign` requires `context` and
+  `payload_b64`. The call now sends both.
+  The GUI parity test checks every call that sends a JSON body or reads a
+  response field. A wrong field name fails that test.
+  Presence find read `agent_id`, `reachable`, `addresses`, and `via`.
+  `GET /presence/find/:id` returns `agent`. The pane now reads `agent`.
+  Presence status read `reachable`, `last_beacon_secs`, and `trust_level`.
+  `GET /presence/status/:id` returns `online` and `agent`. The pane now
+  reads those.
+  Connectivity read `is_relay`, `is_coordinator`, `lan_discovery_enabled`,
+  `upnp_enabled`, and `notes`. `GET /diagnostics/connectivity` returns
+  `relay`, `coordinator`, `mdns`, `port_mapping`, and
+  `transport_environment`. The pane now reads those.
+  Bootstrap cache read `cached_peers`. `GET /network/bootstrap-cache`
+  returns `connected_peers`. The pane now reads `connected_peers`.
 - **A subscription opened before the revocation stores are attached drops a
   revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
   store and the revocation set when it decodes each payload. A store
@@ -177,14 +207,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **The GUI sends the JSON field each of these two routes reads (#1399).**
-  The MLS encrypt pane sent `plaintext`. `POST /mls/groups/:id/encrypt`
-  reads `payload` and base64-decodes it, so the call returned 422. The pane
-  now sends `payload` as standard base64 of the UTF-8 text.
-  `setSpaceDisplayName` sent `display_name`. `PUT /groups/:id/display-name`
-  reads `name`. The call now sends `name`. The GUI parity test checks both
-  bodies against the endpoint registry. A wrong field name fails that test.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
