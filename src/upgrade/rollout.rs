@@ -208,8 +208,6 @@ pub struct AnnouncedUpgrade {
 /// Why a stored rollout state could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutStateProblem {
-    /// Where the unreadable file was moved, if it was moved.
-    pub aside: Option<PathBuf>,
     /// Human-readable reason.
     pub reason: String,
 }
@@ -254,55 +252,47 @@ impl RolloutState {
 
     /// Load the state. A missing file is an empty state.
     ///
-    /// A file that cannot be parsed, or that has another format or a newer
-    /// version, is not trusted: it is moved aside to
-    /// `<file>.unreadable-<unix ms>` (the bytes are kept for diagnosis) and
-    /// the state starts empty. An empty state can only make a wait longer,
-    /// never shorter.
+    /// ADR 0094 §6 fail closed (review F4): a file that cannot be read or
+    /// parsed, or that has another format or a newer version, is not trusted
+    /// and is not moved. The returned state is blocked: nothing may apply,
+    /// and [`RolloutState::save`] refuses to overwrite the record. A
+    /// supported binary or an explicit repair (an operator moves the file
+    /// away) resolves it.
     pub fn load(path: &Path) -> (Self, Option<RolloutStateProblem>) {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+        let reason = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
+                Ok(state)
+                    if state.format == ROLLOUT_STATE_FORMAT
+                        && state.version == ROLLOUT_STATE_VERSION =>
+                {
+                    return (state, None);
+                }
+                Ok(state) => format!(
+                    "unsupported format {:?} version {} (this binary reads {:?} version {})",
+                    state.format, state.version, ROLLOUT_STATE_FORMAT, ROLLOUT_STATE_VERSION
+                ),
+                Err(e) => format!("unparseable: {e}"),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
-            Err(e) => {
-                return (
-                    Self::default(),
-                    Some(RolloutStateProblem {
-                        aside: None,
-                        reason: format!("cannot read {}: {e}", path.display()),
-                    }),
-                )
-            }
+            Err(e) => format!("cannot read {}: {e}", path.display()),
         };
-        let reason = match serde_json::from_slice::<Self>(&bytes) {
-            Ok(state)
-                if state.format == ROLLOUT_STATE_FORMAT
-                    && state.version == ROLLOUT_STATE_VERSION =>
-            {
-                return (state, None);
-            }
-            Ok(state) => format!(
-                "unsupported format {:?} version {} (this binary reads {:?} version {})",
-                state.format, state.version, ROLLOUT_STATE_FORMAT, ROLLOUT_STATE_VERSION
-            ),
-            Err(e) => format!("unparseable: {e}"),
+        let state = Self {
+            blocked: Some(reason.clone()),
+            ..Self::default()
         };
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut aside_name = path
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_default();
-        aside_name.push(format!(".unreadable-{unix_ms}"));
-        let aside = path.with_file_name(aside_name);
-        let aside = std::fs::rename(path, &aside).ok().map(|()| aside);
-        (Self::default(), Some(RolloutStateProblem { aside, reason }))
+        (state, Some(RolloutStateProblem { reason }))
     }
 
     /// Persist the state with a record barrier: write a temp file, fsync
     /// it, rename it over the state file, then fsync the directory.
+    ///
+    /// A blocked state never writes: the unreadable record stays as it is.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(reason) = &self.blocked {
+            return Err(std::io::Error::other(format!(
+                "staged-rollout state is blocked ({reason}); the record is not overwritten"
+            )));
+        }
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         let mut tmp_name = path
             .file_name()

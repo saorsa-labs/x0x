@@ -439,9 +439,9 @@ impl RolloutScheduler {
         if let Some(problem) = problem {
             tracing::warn!(
                 path = %state_path.display(),
-                aside = ?problem.aside,
                 reason = %problem.reason,
-                "Staged-rollout state is unreadable; every release starts a fresh wait"
+                "Staged-rollout state is unreadable; self-update apply is BLOCKED until a \
+                 supported binary or an operator repair resolves it (the record is kept)"
             );
         }
         Arc::new(Self {
@@ -501,6 +501,13 @@ impl RolloutScheduler {
             return RolloutOffer::NotNewer;
         }
         let mut inner = self.inner.lock().await;
+        // ADR 0094 §6 fail closed (review F4): an untrusted stored state
+        // blocks every trigger, the manual one included.
+        if let Some(reason) = &inner.state.blocked {
+            return RolloutOffer::Blocked {
+                reason: reason.clone(),
+            };
+        }
         if let Some(applied) = &inner.applied {
             if !is_newer(version, applied) {
                 return RolloutOffer::AlreadyApplied;
@@ -751,11 +758,10 @@ pub(in crate::server) fn announce_completed_upgrade(data_dir: &std::path::Path) 
     let state_path = RolloutState::path_in(data_dir);
     let (mut state, problem) = RolloutState::load(&state_path);
     if let Some(problem) = problem {
-        tracing::warn!(
+        tracing::debug!(
             path = %state_path.display(),
-            aside = ?problem.aside,
             reason = %problem.reason,
-            "Staged-rollout state is unreadable; every release starts a fresh wait"
+            "Staged-rollout state is unreadable; the reported upgrade is not recorded"
         );
     }
     let Some(notice) = state.take_upgrade_notice(
