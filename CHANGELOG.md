@@ -210,6 +210,17 @@ All notable changes to this project will be documented in this file.
     returns. A re-invite on that process does not wait for the join
     poll's next tick.
 
+- **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
+  The roster removal left the leaf in place, so the leaver could derive later
+  epoch keys. The lowest active admin now commits the existing admin
+  `MemberRemoved` that carries `treekem_commit_b64` and `treekem_epoch`.
+  That commit runs only when the leave is still the stored head, the TreeKEM
+  queue is empty, and catch-up is not waiting on a later page. The daemon
+  saves the roster-only leave and the removal event before the new epoch is
+  durable, and it does not send the removal again after a successful publish.
+  A missing KeyPackage on a live leaf is a logged deferral, not a finished
+  rekey. Other admins hold off. This adds no new wire message.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
@@ -232,17 +243,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
-  The roster removal left the leaf in place, so the leaver could derive later
-  epoch keys. The lowest active admin now commits the existing admin
-  `MemberRemoved` that carries `treekem_commit_b64` and `treekem_epoch`.
-  That commit runs only when the leave is still the stored head, the TreeKEM
-  queue is empty, and catch-up is not waiting on a later page. The daemon
-  saves the roster-only leave and the removal event before the new epoch is
-  durable, and it does not send the removal again after a successful publish.
-  A missing KeyPackage on a live leaf is a logged deferral, not a finished
-  rekey. Other admins hold off. This adds no new wire message.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial
