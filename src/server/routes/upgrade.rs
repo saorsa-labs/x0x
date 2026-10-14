@@ -1768,10 +1768,7 @@ pub(in crate::server) async fn apply_upgrade(
             own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
         }));
 
-    match upgrader
-        .apply_upgrade_from_manifest(&release.manifest)
-        .await
-    {
+    match upgrader.apply_upgrade_prepared(&release.manifest).await {
         Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
             release: due_release,
             pending,
@@ -1798,9 +1795,14 @@ pub(in crate::server) async fn apply_upgrade(
                 })),
             )
         }
-        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+        Ok((x0x::upgrade::UpgradeResult::Success { version }, prepared)) => {
             rollout.mark_applied(&version).await;
-            schedule_restart_after_response(stop_on_upgrade, restart_context, version.clone());
+            schedule_restart_after_response(
+                stop_on_upgrade,
+                restart_context,
+                version.clone(),
+                prepared,
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1812,7 +1814,7 @@ pub(in crate::server) async fn apply_upgrade(
                 })),
             )
         }
-        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => (
+        Ok((x0x::upgrade::UpgradeResult::RolledBack { reason }, _)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "ok": false,
@@ -1821,7 +1823,7 @@ pub(in crate::server) async fn apply_upgrade(
                 "reason": reason
             })),
         ),
-        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => (
+        Ok((x0x::upgrade::UpgradeResult::NoUpgrade, _)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
@@ -1847,13 +1849,22 @@ fn schedule_restart_after_response(
     stop_on_upgrade: bool,
     restart_context: RestartContext,
     target_version: String,
+    prepared: Option<x0x::upgrade::apply::PreparedRestart>,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(750)).await;
         // Same planner as every other apply path (#261): unsupervised daemons
         // get the transactional handoff here too — never a bare exit(0).
         let upgrader = deferred_restart_upgrader(stop_on_upgrade, restart_context);
-        if let Err(e) = upgrader.restart_current_binary(&target_version).await {
+        // #1106 review F3: restart with the host lock, the plan from before
+        // the swap and this transaction's backup. No other writer on the
+        // host can swap during the response window, and no fresh plan is
+        // resolved after the swap.
+        let result = match prepared {
+            Some(prepared) => upgrader.restart_prepared(prepared),
+            None => upgrader.restart_current_binary(&target_version).await,
+        };
+        if let Err(e) = result {
             tracing::error!(error = %e, "failed to restart after manual upgrade apply");
         }
     });

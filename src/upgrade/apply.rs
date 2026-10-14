@@ -125,9 +125,8 @@ pub(crate) fn prepare_restart(
     backup_path: Option<PathBuf>,
     target_version: &str,
 ) -> PreparedRestart {
-    drop(host_lock);
     PreparedRestart {
-        host_lock: None,
+        host_lock: Some(host_lock),
         plan,
         backup_path,
         target_version: target_version.to_string(),
@@ -346,6 +345,33 @@ impl AutoApplyUpgrader {
         &self,
         manifest: &ReleaseManifest,
     ) -> Result<UpgradeResult, UpgradeError> {
+        let (result, prepared) = self.apply_upgrade_prepared(manifest).await?;
+        if let Some(prepared) = prepared.filter(|_| self.restart_on_success) {
+            if let Err(e) = self.restart_prepared(prepared) {
+                warn!(
+                    error = %e,
+                    installed_bytes = true,
+                    restart = "not_started",
+                    readiness_observed = false,
+                    "Restart after successful upgrade did not start: {e}; \
+                     old process keeps serving"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// Apply a manifest up to the restart (#1106 review F3).
+    ///
+    /// The same steps as [`Self::apply_upgrade_from_manifest`], but a
+    /// successful swap returns a [`PreparedRestart`] instead of restarting.
+    /// It holds the host lock and carries the restart plan resolved before
+    /// the swap and this transaction's backup. The HTTP handler passes it to
+    /// its deferred restart; dropping it releases the lock.
+    pub async fn apply_upgrade_prepared(
+        &self,
+        manifest: &ReleaseManifest,
+    ) -> Result<(UpgradeResult, Option<PreparedRestart>), UpgradeError> {
         let current_version_str = crate::VERSION;
         let target_version = semver::Version::parse(&manifest.version)
             .map_err(|e| UpgradeError::Other(format!("invalid version: {e}")))?;
@@ -399,7 +425,7 @@ impl AutoApplyUpgrader {
         // non-test builds; an uninstalled hook changes nothing.
         #[cfg(test)]
         if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
-            return Ok(result);
+            return Ok((result, None));
         }
 
         // #1106: one binary writer per host. Two daemons that share this
@@ -643,25 +669,35 @@ impl AutoApplyUpgrader {
                 backup: &backup_display,
                 exit: &exit,
             });
-            if self.restart_on_success {
-                if let Err(e) = self.trigger_restart(
-                    &restart_plan,
-                    &target_version.to_string(),
-                    backup_path.as_deref(),
-                ) {
-                    warn!(
-                        error = %e,
-                        installed_bytes = true,
-                        restart = "not_started",
-                        readiness_observed = false,
-                        "Restart after successful upgrade did not start: {e}; \
-                         old process keeps serving"
-                    );
-                }
-            }
+            // The host lock, the plan from before the swap and this backup
+            // go to the restart together (#1106 review F3).
+            let prepared = prepare_restart(
+                host_lock,
+                restart_plan,
+                backup_path,
+                &target_version.to_string(),
+            );
+            return Ok((result, Some(prepared)));
         }
 
-        Ok(result)
+        Ok((result, None))
+    }
+
+    /// Run the restart of a [`PreparedRestart`] with its own plan and backup
+    /// (#1106 review F3). On success it does not return (supervised exit or
+    /// transactional handoff); the OS releases the host lock at exit. On a
+    /// refusal or a completed restore it returns the error, and the lock is
+    /// released then.
+    pub fn restart_prepared(&self, prepared: PreparedRestart) -> Result<(), UpgradeError> {
+        let PreparedRestart {
+            host_lock,
+            plan,
+            backup_path,
+            target_version,
+        } = prepared;
+        let result = self.trigger_restart(&plan, &target_version, backup_path.as_deref());
+        drop(host_lock);
+        result
     }
 
     /// Execute an already-resolved restart plan (#261, ADR-0061 §1).
