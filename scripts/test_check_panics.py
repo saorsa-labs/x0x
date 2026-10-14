@@ -169,84 +169,94 @@ class PanicScanner(unittest.TestCase):
                 self.assertIn(inside, result.stdout)
                 self.assertIn(self._found(kind), result.stdout)
 
-    def test_never_type_is_production(self):
+    def test_never_type_closes_at_the_function_body(self):
+        # -> ! is a never type. The body stays test-only and the next function
+        # stays production.
         for kind in ("expect", "unwrap", "panic"):
             with self.subTest(kind=kind):
-                inside = self._call(kind, "inside")
-                after = self._call(kind, "after")
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
                 source = (
                     "#[cfg(test)]\n"
                     "fn helper() -> ! {\n"
-                    f"    {inside};\n"
+                    f"    {hidden};\n"
                     "}\n"
-                    f"fn prod() {{ {after}; }}\n"
+                    f"fn prod() {{ {visible}; }}\n"
                 )
                 result = self.scan("src/never.rs", source)
-                self._assert_both_production(result, kind)
+                self._assert_rejected(result, kind)
 
-    def test_expr_macro_is_production(self):
+    def test_expr_macro_stays_inside_the_attributed_statement(self):
+        # matches! / vec! are part of the statement. They do not end it.
         for kind in ("expect", "unwrap", "panic"):
-            inside = self._call(kind, "inside")
-            after = self._call(kind, "after")
+            hidden = self._call(kind, "hidden")
+            visible = self._call(kind, "visible")
             shapes = {
                 "if": (
                     "fn prod() {\n"
                     "    #[cfg(test)]\n"
-                    f"    if matches!(Some(1), Some(_)) {{ {inside}; }}\n"
-                    f"    {after};\n"
+                    f"    if matches!(Some(1), Some(_)) {{ {hidden}; }}\n"
+                    f"    {visible};\n"
                     "}\n"
                 ),
                 "let": (
                     "fn prod() {\n"
                     "    #[cfg(test)]\n"
-                    f"    let _ = vec![{inside}];\n"
-                    f"    {after};\n"
+                    f"    let _ = vec![{hidden}];\n"
+                    f"    {visible};\n"
                     "}\n"
                 ),
                 "array": (
                     "fn prod() {\n"
                     "    let _ = [\n"
                     "        #[cfg(test)]\n"
-                    f"        vec![{inside}],\n"
-                    f"        {after},\n"
+                    f"        vec![{hidden}],\n"
+                    f"        {visible},\n"
                     "    ];\n"
+                    "}\n"
+                ),
+                "not": (
+                    "fn prod() {\n"
+                    "    #[cfg(test)]\n"
+                    f"    if !false {{ {hidden}; }}\n"
+                    f"    {visible};\n"
                     "}\n"
                 ),
             }
             for name, source in shapes.items():
                 with self.subTest(kind=kind, shape=name):
                     result = self.scan("src/expr_macro.rs", source)
-                    self._assert_both_production(result, kind)
+                    self._assert_rejected(result, kind)
 
-    def test_return_type_brace_macro_is_production(self):
+    def test_return_type_brace_macro_is_not_the_function_body(self):
         for kind in ("expect", "unwrap", "panic"):
             with self.subTest(kind=kind):
-                inside = self._call(kind, "inside")
-                after = self._call(kind, "after")
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
                 source = (
                     "#[cfg(test)]\n"
                     "fn helper() -> unit!{} {\n"
-                    f"    {inside};\n"
+                    f"    {hidden};\n"
                     "}\n"
-                    f"fn prod() {{ {after}; }}\n"
+                    f"fn prod() {{ {visible}; }}\n"
                 )
                 result = self.scan("src/ret_brace.rs", source)
-                self._assert_both_production(result, kind)
+                self._assert_rejected(result, kind)
 
-    def test_signature_macro_is_production(self):
+    def test_signature_paren_macro_is_not_the_function_body(self):
         for kind in ("expect", "unwrap", "panic"):
             with self.subTest(kind=kind):
-                inside = self._call(kind, "inside")
-                after = self._call(kind, "after")
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
                 source = (
                     "#[cfg(test)]\n"
                     "fn helper() -> unit!() {\n"
-                    f"    {inside};\n"
+                    f"    {hidden};\n"
                     "}\n"
-                    f"fn prod() {{ {after}; }}\n"
+                    f"fn prod() {{ {visible}; }}\n"
                 )
                 result = self.scan("src/ret_paren.rs", source)
-                self._assert_both_production(result, kind)
+                self._assert_rejected(result, kind)
 
     def test_comment_before_generic_is_production(self):
         for kind in ("expect", "unwrap", "panic"):
@@ -355,6 +365,143 @@ class PanicScanner(unittest.TestCase):
                 )
                 result = self.scan("src/string_brace.rs", source)
                 self._assert_rejected(result, kind)
+
+    def test_array_closer_does_not_hide_later_call(self):
+        # A ']' that ends the enclosing array also ends the attributed element.
+        # A later array at the same depth is production.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "fn prod() {\n"
+                    "    let _ = [\n"
+                    "        #[cfg(test)]\n"
+                    f"        {hidden}\n"
+                    "    ];\n"
+                    "    let _ = [\n"
+                    "        {\n"
+                    f"            {visible};\n"
+                    "        }\n"
+                    "    ];\n"
+                    "}\n"
+                )
+                result = self.scan("src/array_closer.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_tuple_closer_does_not_hide_later_call(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "fn prod() {\n"
+                    "    let _ = (\n"
+                    "        #[cfg(test)]\n"
+                    f"        {hidden}\n"
+                    "    );\n"
+                    f"    {visible};\n"
+                    "}\n"
+                )
+                result = self.scan("src/tuple_closer.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_inner_cfg_in_macro_args_does_not_exempt_the_file(self):
+        # Brace depth zero is not crate scope. A macro can swallow the attribute.
+        for kind in ("expect", "unwrap", "panic"):
+            inside = self._call(kind, "inside")
+            after = self._call(kind, "after")
+            shapes = {
+                "paren": (
+                    "macro_rules! eat { ($($t:tt)*) => {} }\n"
+                    "eat!(\n"
+                    "    #![cfg(test)]\n"
+                    f"    fn helper() {{ {inside}; }}\n"
+                    ");\n"
+                    f"fn prod() {{ {after}; }}\n"
+                ),
+                "bracket": (
+                    "macro_rules! eat { ($($t:tt)*) => {} }\n"
+                    "eat![\n"
+                    "    #![cfg(test)]\n"
+                    f"    fn helper() {{ {inside}; }}\n"
+                    "];\n"
+                    f"fn prod() {{ {after}; }}\n"
+                ),
+            }
+            for name, source in shapes.items():
+                with self.subTest(kind=kind, shape=name):
+                    result = self.scan("src/macro_cfg.rs", source)
+                    self._assert_both_production(result, kind)
+
+    def test_nested_inner_cfg_closes_with_the_module(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "mod support {\n"
+                    "    #![cfg(test)]\n"
+                    f"    fn helper() {{ {hidden}; }}\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/nested_cfg.rs", source)
+                self._assert_rejected(result, kind)
+
+    def test_macro_item_closes_before_the_next_function(self):
+        for kind in ("expect", "unwrap", "panic"):
+            hidden = self._call(kind, "hidden")
+            visible = self._call(kind, "visible")
+            shapes = {
+                "brace": (
+                    "#[cfg(test)]\n"
+                    "make! {\n"
+                    f"    {hidden};\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                ),
+                "paren": (
+                    "#[cfg(test)]\n"
+                    f"make!({hidden});\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                ),
+                "macro_rules": (
+                    "#[cfg(test)]\n"
+                    "macro_rules! make {\n"
+                    f"    () => {{ {hidden}; }};\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                ),
+            }
+            for name, source in shapes.items():
+                with self.subTest(kind=kind, shape=name):
+                    result = self.scan("src/macro_item.rs", source)
+                    self._assert_rejected(result, kind)
+
+    def test_slash_slash_inside_a_string_does_not_hide_a_call(self):
+        result = self.scan(
+            "src/production.rs",
+            'fn prod() { let _ = "http://".expect("visible"); }\n',
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('.expect("visible")', result.stdout)
+        self.assertIn("FOUND: .expect() calls in production code", result.stdout)
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                visible = self._call(kind, "visible")
+                source = f'fn prod() {{ let _ = "http://"; {visible}; }}\n'
+                result = self.scan("src/production.rs", source)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(visible, result.stdout)
+                self.assertIn(self._found(kind), result.stdout)
+
+    def test_block_comment_and_doc_comment_calls_are_accepted(self):
+        self.assert_clean(self.scan("src/production.rs", '/* value.expect("comment"); */\n'))
+        self.assert_clean(self.scan("src/production.rs", "/* value.unwrap() */\n"))
+        self.assert_clean(self.scan("src/production.rs", '/* panic!("comment") */\n'))
+        self.assert_clean(self.scan("src/production.rs", '/// value.expect("comment");\n'))
+        self.assert_clean(self.scan("src/production.rs", '//! value.expect("comment");\n'))
 
 
 if __name__ == "__main__":

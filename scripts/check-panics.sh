@@ -15,25 +15,40 @@ NC='\033[0m' # No Color
 
 FOUND_ISSUES=0
 
-# Lines that belong to a proved test-only item, keyed as "path:line".
-# Populated once by load_test_regions.
-declare -A IN_TEST=()
+# Proved test spans and comment spans, keyed as "path:line". Bash 4 keeps
+# them in memory. Bash 3.2 (macOS /bin/bash) has no associative arrays, so
+# lookup reads REGIONS_FILE instead. `declare -A` runs only on Bash 4+.
+USE_ASSOC=0
+REGIONS_FILE=""
+if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && [ -z "${X0X_PANIC_SCAN_FILE_REGIONS:-}" ]; then
+    USE_ASSOC=1
+    declare -A IN_TEST=()
+    declare -A IN_COMMENT=()
+fi
+cleanup_regions() {
+    if [ -n "${REGIONS_FILE:-}" ]; then
+        rm -f "$REGIONS_FILE"
+    fi
+}
+trap cleanup_regions EXIT
 
-# A span is test-only only when two things are proved: a test attribute and
-# that item's closing delimiter. Attributes are the exact forms in this tree:
+# A span is test-only only when a test attribute and that item's closing
+# delimiter are both proved. Attributes are the exact forms in this tree:
 # #[cfg(test)], #![cfg(test)], #[cfg(all(test, unix))], #[test], #[tokio::test],
-# and #[tokio::test(...)]. A body item closes at the matching '}'. An item
-# with no body closes at ';' or ','. A crate-level #![cfg(test)] runs to EOF.
-# Anything else stays production. That includes a header whose extent is
-# uncertain because of '!' (never type, macro, signature macro) and any
-# attribute this list does not name. Strings and comments are skipped so a
-# brace inside them cannot extend a region. An unclosed string, comment, or
-# item is not committed. Line numbers follow grep: newlines are preserved and
-# split on LF only. Bytes after the closing delimiter on the same line stay
-# production.
+# and #[tokio::test(...)]. A body closes at the matching '}'. An item with no
+# body closes at ';' or ','. A crate-level #![cfg(test)] (no open brace, paren,
+# or bracket) runs to EOF. A nested #![cfg(test)] closes with its module. One
+# inside a macro argument does not mark the file. '-> !' is a never type, not
+# a macro. A macro token tree in a signature or expression is not the body. A
+# macro item closes at its '}' or at ';' / ',' after ')' or ']'. An attributed
+# element also ends when its enclosing array or tuple closes. An unclosed
+# string, comment, or item is not committed. Line numbers follow grep. Bytes
+# after the closing delimiter on the same line stay production. A comment does
+# not hide a panic, and '//' inside a string is not a comment.
 load_test_regions() {
     local tmp
     tmp=$(mktemp)
+    REGIONS_FILE=$tmp
     if ! python3 - "$tmp" << 'PY'
 from __future__ import annotations
 
@@ -49,11 +64,19 @@ FILE_ATTR = "#![cfg(test)]"
 TOKIO_ATTR = "#[tokio::test"
 
 
-def test_lines(text: str) -> dict[int, str]:
-    """Return 1-based lines to a proved test-span spec.
+INTRODUCERS = frozenset({
+    "fn", "struct", "enum", "mod", "trait", "impl", "type", "const", "static",
+    "use", "union", "async", "unsafe", "extern", "where",
+    "if", "while", "loop", "match", "let", "for", "return", "else", "move",
+})
+_CLOSERS = {"{": "}", "(": ")", "[": "]"}
 
-    ``*`` means the whole line is test-only. Otherwise the spec is a
-    comma-separated list of half-open byte ranges.
+
+def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Return proved test spans and comment spans, keyed by 1-based line.
+
+    ``*`` means the whole line. Otherwise the spec is a comma-separated list
+    of half-open byte ranges.
     """
     lines = text.split("\n")
     if lines and lines[-1] == "":
@@ -67,6 +90,7 @@ def test_lines(text: str) -> dict[int, str]:
         byte_ofs.append(ofs)
 
     regions: dict[int, list[list[int]]] = {}
+    comments: dict[int, list[list[int]]] = {}
     depth = 0
     paren = 0
     bracket = 0
@@ -76,6 +100,8 @@ def test_lines(text: str) -> dict[int, str]:
     raw_hashes = 0
     # (line, byte just after the brace) for each unmatched '{'.
     opens: list[tuple[int, int]] = []
+    # (closer, is_item) for a macro token tree in a header.
+    macro_frames: list[tuple[str, bool]] = []
 
     active = False
     body = False
@@ -84,43 +110,99 @@ def test_lines(text: str) -> dict[int, str]:
     bracket_floor = 0
     origin: tuple[int, int] | None = None
     file_test = False
+    ident = ""
+    prev_token = ""
+    saw_introducer = False
+    pending = False
+    pending_item = False
+    comment_origin: tuple[int, int] | None = None
 
-    def add_span(line_no: int, start: int, end: int) -> None:
+    def add_span(store: dict[int, list[list[int]]], line_no: int, start: int, end: int) -> None:
         if end <= start:
             return
-        regions.setdefault(line_no, []).append([start, end])
+        store.setdefault(line_no, []).append([start, end])
+
+    def add_range(store: dict[int, list[list[int]]], start_line: int, start_byte: int, end_line: int, end_byte: int) -> None:
+        if end_line <= start_line:
+            add_span(store, start_line, start_byte, end_byte)
+            return
+        add_span(store, start_line, start_byte, line_bytes[start_line - 1])
+        for mid in range(start_line + 1, end_line):
+            add_span(store, mid, 0, line_bytes[mid - 1])
+        add_span(store, end_line, 0, end_byte)
+
+    def _clear_header() -> None:
+        nonlocal active, body, origin, ident, prev_token, saw_introducer, pending, pending_item
+        active = False
+        body = False
+        origin = None
+        ident = ""
+        prev_token = ""
+        saw_introducer = False
+        pending = False
+        pending_item = False
+        macro_frames.clear()
 
     def commit(end_line: int, end_byte: int) -> None:
-        nonlocal active, body, origin
-        if origin is None:
-            active = False
-            body = False
-            return
-        start_line, start_byte = origin
-        if end_line <= start_line:
-            add_span(start_line, start_byte, end_byte)
-        else:
-            add_span(start_line, start_byte, line_bytes[start_line - 1])
-            for mid in range(start_line + 1, end_line):
-                add_span(mid, 0, line_bytes[mid - 1])
-            add_span(end_line, 0, end_byte)
-        active = False
-        body = False
-        origin = None
+        if origin is not None:
+            add_range(regions, origin[0], origin[1], end_line, end_byte)
+        _clear_header()
 
     def discard() -> None:
-        nonlocal active, body, origin
-        active = False
-        body = False
-        origin = None
+        _clear_header()
 
     def at_item_level() -> bool:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
 
+    def _finish_ident() -> None:
+        nonlocal ident, prev_token, saw_introducer
+        if not ident:
+            return
+        prev_token = ident
+        if (
+            active
+            and not body
+            and not macro_frames
+            and not pending
+            and at_item_level()
+            and ident in INTRODUCERS
+        ):
+            saw_introducer = True
+        ident = ""
+
+    def _open_frame(ch: str, is_item: bool, i: int) -> int:
+        nonlocal depth, paren, bracket
+        macro_frames.append((_CLOSERS[ch], is_item))
+        i += 1
+        if ch == "{":
+            depth += 1
+            opens.append((line_no, byte_ofs[idx][i]))
+        elif ch == "(":
+            paren += 1
+        else:
+            bracket += 1
+        return i
+
+    def _close_frame(i: int) -> tuple[int, bool, str]:
+        nonlocal depth, paren, bracket
+        closer, is_item = macro_frames.pop()
+        i += 1
+        if closer == "}":
+            if depth > 0:
+                depth -= 1
+            if opens:
+                opens.pop()
+        elif closer == ")":
+            if paren > 0:
+                paren -= 1
+        elif bracket > 0:
+            bracket -= 1
+        return i, is_item, closer
+
     for idx, line in enumerate(lines):
         line_no = idx + 1
         if file_test:
-            add_span(line_no, 0, line_bytes[idx])
+            add_span(regions, line_no, 0, line_bytes[idx])
             continue
 
         n = len(line)
@@ -156,14 +238,26 @@ def test_lines(text: str) -> dict[int, str]:
                 if ch == "*" and nxt == "/":
                     block -= 1
                     i += 2
+                    if block == 0 and comment_origin is not None:
+                        add_range(comments, comment_origin[0], comment_origin[1], line_no, byte_ofs[idx][i])
+                        comment_origin = None
                     continue
                 i += 1
                 continue
 
+            if ident and not (ch.isalnum() or ch == "_"):
+                _finish_ident()
+
+            if ch.isspace():
+                i += 1
+                continue
+
             if ch == "/" and nxt == "/":
+                add_span(comments, line_no, byte_ofs[idx][i], line_bytes[idx])
                 break
             if ch == "/" and nxt == "*":
                 block = 1
+                comment_origin = (line_no, byte_ofs[idx][i])
                 i += 2
                 continue
 
@@ -180,13 +274,39 @@ def test_lines(text: str) -> dict[int, str]:
 
             if ch == "'":
                 i = _skip_tick(line, i)
+                prev_token = "'"
                 continue
+
+            if macro_frames:
+                if ch in "({[":
+                    i = _open_frame(ch, False, i)
+                    continue
+                if ch == macro_frames[-1][0]:
+                    i, is_item, closer = _close_frame(i)
+                    if not macro_frames and is_item and closer == "}":
+                        commit(line_no, byte_ofs[idx][i])
+                    continue
+                i += 1
+                continue
+
+            if pending:
+                if ch in "({[":
+                    is_item = pending_item
+                    pending = False
+                    i = _open_frame(ch, is_item, i)
+                    continue
+                if ch.isalnum() or ch == "_":
+                    while i < n and (line[i].isalnum() or line[i] == "_"):
+                        i += 1
+                    continue
+                pending = False
+                discard()
 
             if line[:i].strip() == "":
                 kind, length = _attr_kind(line[i:])
-                if kind == "file" and depth == 0:
+                if kind == "file" and depth == 0 and paren == 0 and bracket == 0:
                     file_test = True
-                    add_span(line_no, byte_ofs[idx][i], line_bytes[idx])
+                    add_span(regions, line_no, byte_ofs[idx][i], line_bytes[idx])
                     break
                 if kind == "file" and depth > 0 and not active:
                     active = True
@@ -195,11 +315,13 @@ def test_lines(text: str) -> dict[int, str]:
                     paren_floor = paren
                     bracket_floor = bracket
                     origin = opens[-1] if opens else (line_no, byte_ofs[idx][i])
+                    saw_introducer = False
+                    i += length
+                    continue
+                if kind == "file":
                     i += length
                     continue
                 if kind == "item":
-                    # A header that never reached ';' / ',' / '{' was not
-                    # proved. Drop it and let this attribute start clean.
                     if active and not body:
                         discard()
                     if not active:
@@ -209,20 +331,31 @@ def test_lines(text: str) -> dict[int, str]:
                         paren_floor = paren
                         bracket_floor = bracket
                         origin = (line_no, byte_ofs[idx][i])
+                        saw_introducer = False
                         i += length
                         continue
 
-            # '!' before the body is a macro or a never type. The closing
-            # delimiter is not proved, so the candidate stays production.
-            if (
-                active
-                and not body
-                and ch == "!"
-                and nxt != "="
-                and at_item_level()
-            ):
-                discard()
+            if active and not body and (ch.isalnum() or ch == "_"):
+                ident += ch
                 i += 1
+                continue
+
+            if (
+                ch == "!"
+                and nxt != "="
+                and active
+                and not body
+                and _is_macro_name(prev_token)
+            ):
+                pending = True
+                pending_item = (not saw_introducer) and at_item_level()
+                prev_token = "!"
+                i += 1
+                continue
+
+            if ch == "-" and nxt == ">":
+                prev_token = "->"
+                i += 2
                 continue
 
             if ch == "{":
@@ -233,7 +366,6 @@ def test_lines(text: str) -> dict[int, str]:
                 opens.append((line_no, byte_ofs[idx][i]))
                 continue
             if ch == "}":
-                # A header with no body of its own ends when its parent closes.
                 if (
                     active
                     and not body
@@ -259,6 +391,16 @@ def test_lines(text: str) -> dict[int, str]:
             if ch == ")":
                 if paren > 0:
                     paren -= 1
+                if (
+                    active
+                    and not body
+                    and paren < paren_floor
+                    and depth == floor
+                    and bracket == bracket_floor
+                ):
+                    i += 1
+                    commit(line_no, byte_ofs[idx][i])
+                    continue
                 i += 1
                 continue
             if ch == "[":
@@ -268,32 +410,53 @@ def test_lines(text: str) -> dict[int, str]:
             if ch == "]":
                 if bracket > 0:
                     bracket -= 1
+                if (
+                    active
+                    and not body
+                    and bracket < bracket_floor
+                    and depth == floor
+                    and paren == paren_floor
+                ):
+                    i += 1
+                    commit(line_no, byte_ofs[idx][i])
+                    continue
                 i += 1
                 continue
             if ch == ";" and active and not body and at_item_level():
                 i += 1
                 commit(line_no, byte_ofs[idx][i])
                 continue
-            # Variant, field, parameter, or match arm. A comma before the
-            # body also ends the header; the bytes after it stay production.
             if ch == "," and active and not body and at_item_level():
                 i += 1
                 commit(line_no, byte_ofs[idx][i])
                 continue
+            prev_token = ch
             i += 1
 
-    if active and (in_string or in_raw or block or not body):
-        discard()
-    elif active:
-        # Body never closed. Do not commit an open region.
+        if ident:
+            _finish_ident()
+
+    # An unclosed comment is not proved, so those bytes stay production.
+    if active:
         discard()
 
+    return _specs(regions, line_bytes), _specs(comments, line_bytes)
+
+
+def _is_macro_name(token: str) -> bool:
+    if not token or token[0].isdigit() or token in INTRODUCERS:
+        return False
+    return all(ch.isalnum() or ch == "_" for ch in token)
+
+
+def _specs(spans_by_line: dict[int, list[list[int]]], line_bytes: list[int]) -> dict[int, str]:
     specs: dict[int, str] = {}
-    for number, spans in regions.items():
+    for number, spans in spans_by_line.items():
         spec = _span_spec(spans, line_bytes[number - 1])
         if spec:
             specs[number] = spec
     return specs
+
 
 
 def _attr_kind(rest: str) -> tuple[str, int]:
@@ -420,8 +583,12 @@ def _emit(root, out):
             rel = os.path.relpath(path, ".").replace(os.sep, "/")
             with open(path, encoding="utf-8", errors="replace", newline="") as handle:
                 text = handle.read()
-            for number, spec in test_lines(text).items():
-                out.write(f"{rel}\t{number}\t{spec}\n")
+            tests, comment_spans = test_lines(text)
+            numbers = set(tests) | set(comment_spans)
+            for number in sorted(numbers):
+                out.write(
+                    f"{rel}\t{number}\t{tests.get(number, '')}\t{comment_spans.get(number, '')}\n"
+                )
 
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     _emit("src", handle)
@@ -429,14 +596,23 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
     then
         rm -f "$tmp"
+        REGIONS_FILE=""
         echo "panic scanner could not classify #[cfg(test)] regions" >&2
         exit 1
     fi
-    while IFS=$'\t' read -r file num spec; do
-        [[ -n "$file" && -n "$num" && -n "$spec" ]] || continue
-        IN_TEST["${file}:${num}"]="$spec"
-    done < "$tmp"
-    rm -f "$tmp"
+    if [ "$USE_ASSOC" -eq 1 ]; then
+        while IFS=$'\t' read -r file num test_spec comment_spec; do
+            [[ -n "$file" && -n "$num" ]] || continue
+            if [[ -n "$test_spec" ]]; then
+                IN_TEST["${file}:${num}"]="$test_spec"
+            fi
+            if [[ -n "$comment_spec" ]]; then
+                IN_COMMENT["${file}:${num}"]="$comment_spec"
+            fi
+        done < "$tmp"
+        rm -f "$tmp"
+        REGIONS_FILE=""
+    fi
 }
 
 # spec is "*" or comma-separated half-open byte ranges, for example "0-12,40-55".
@@ -444,6 +620,7 @@ _offset_in_spans() {
     local offset="$1"
     local spec="$2"
     local part start end
+    [[ -n "$spec" ]] || return 1
     local IFS=','
     for part in $spec; do
         start=${part%%-*}
@@ -455,20 +632,36 @@ _offset_in_spans() {
     return 1
 }
 
-# Return 0 when every occurrence of pattern on this line is inside a test span.
+# Return 0 when every match sits in a proved test span or a comment span.
 is_in_test_code() {
     local file="$1"
     local line_num="$2"
     local content="$3"
     local pattern="$4"
-    local spec="${IN_TEST["$file:$line_num"]-}"
-    local offset found=0
-    [[ -n "$spec" ]] || return 1
-    [[ "$spec" == "*" ]] && return 0
+    local test_spec="" comment_spec="" row offset found=0
+    if [ "$USE_ASSOC" -eq 1 ]; then
+        test_spec="${IN_TEST["$file:$line_num"]-}"
+        comment_spec="${IN_COMMENT["$file:$line_num"]-}"
+    else
+        row=$(awk -F '\t' -v f="$file" -v n="$line_num" '
+            $1 == f && $2 == n { printf "%s\t%s", $3, $4; exit }
+        ' "$REGIONS_FILE") || row=""
+        if [[ "$row" == *$'\t'* ]]; then
+            test_spec=${row%%$'\t'*}
+            comment_spec=${row#*$'\t'}
+        else
+            test_spec=$row
+            comment_spec=""
+        fi
+    fi
+    [[ -n "$test_spec" || -n "$comment_spec" ]] || return 1
+    if [[ "$test_spec" == "*" || "$comment_spec" == "*" ]]; then
+        return 0
+    fi
     while IFS=: read -r offset _; do
         [[ -n "$offset" ]] || continue
         found=1
-        if ! _offset_in_spans "$offset" "$spec"; then
+        if ! _offset_in_spans "$offset" "$test_spec" && ! _offset_in_spans "$offset" "$comment_spec"; then
             return 1
         fi
     done < <(printf '%s\n' "$content" | grep -aboE -- "$pattern" || true)
@@ -486,10 +679,10 @@ scan_pattern() {
 
     # Scan for pattern
     while IFS= read -r match; do
-        # Skip if in tests/ directory, a file named tests.rs (file-level test
-        # submodules declared via `#[cfg(test)] mod tests;` in the parent, e.g.
-        # src/connect/acl/tests.rs), or .bak files.
-        if echo "$match" | grep -qE "(tests/|/tests\.rs:|\.bak:|\.rs:.*//.*$pattern)"; then
+        # Skip tests/ paths, a file named tests.rs (a `#[cfg(test)] mod tests`
+        # submodule, for example src/connect/acl/tests.rs), and .bak files.
+        # Comment matches are spans, so '//' inside a string does not skip the line.
+        if echo "$match" | grep -qE "(tests/|/tests\.rs:|\.bak:)"; then
             continue
         fi
 
