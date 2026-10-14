@@ -604,6 +604,16 @@ impl RolloutScheduler {
         trigger: RolloutTrigger,
         sender: Option<String>,
     ) -> RolloutOffer {
+        self.offer_inner(manifest, trigger, sender, None).await
+    }
+
+    async fn offer_inner(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+        bypass_by: Option<&str>,
+    ) -> RolloutOffer {
         let version = manifest.version.as_str();
         if !is_newer(version, x0x::VERSION) {
             return RolloutOffer::NotNewer;
@@ -675,6 +685,29 @@ impl RolloutScheduler {
             );
         }
 
+        // D185: `now=true` skips the wait for this host only, after every
+        // check above (blocked hold, already applied, superseded). The
+        // bypass and who asked are kept in the rollout state.
+        if let Some(requested_by) = bypass_by {
+            let staged = inner
+                .state
+                .record_bypass(version, requested_by, unix_now_secs())
+                .unwrap_or(staged);
+            self.persist(&inner.state);
+            publish_participant_record(&self.env, &inner);
+            tracing::info!(
+                version = %staged.version,
+                requested_by,
+                delay_secs = staged.delay_secs,
+                remaining_secs = staged.remaining().as_secs(),
+                "now=true: skipping the staged-rollout wait for this host (D185)"
+            );
+            // A waiter for this release stops at its next checkpoint; the
+            // caller applies now.
+            inner.waiter = None;
+            return RolloutOffer::Due(staged);
+        }
+
         let same_waiter = inner
             .waiter
             .as_ref()
@@ -707,10 +740,11 @@ impl RolloutScheduler {
         manifest: &ReleaseManifest,
         requested_by: &str,
     ) -> RolloutOffer {
-        self.offer(
+        self.offer_inner(
             manifest,
             RolloutTrigger::Manual,
             Some(requested_by.to_string()),
+            Some(requested_by),
         )
         .await
     }
@@ -1615,9 +1649,11 @@ pub(in crate::server) struct ApplyUpgradeQuery {
 /// manifest is offered to the staged rollout (#1106) like every other
 /// trigger. While this node still waits, the handler reports `applied:
 /// false, staged: true` with the delay and the remaining wait, and the
-/// daemon applies the release when the wait is served. ADR 0094 leaves an
-/// explicit HTTP bypass of the wait open, so this route has none. When the
-/// wait is served, this handler serializes the destructive apply with the
+/// daemon applies the release when the wait is served. `?now=true` (D185)
+/// skips the wait and the shared-install participant gate for this host
+/// only; eligibility, holds and every transaction check stay, and the
+/// rollout state and the WARN summary line record the bypass and who asked.
+/// When the wait is served, this handler serializes the destructive apply with the
 /// background update workers, performs the verified binary swap, returns a
 /// JSON result, then schedules restart/exec after the response has a chance
 /// to flush.
@@ -1625,7 +1661,6 @@ pub(in crate::server) async fn apply_upgrade(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ApplyUpgradeQuery>,
 ) -> impl IntoResponse {
-    let _ = params.now;
     if !state.self_update_enabled {
         // Embed path: never replace/restart the host process via the API.
         return (
@@ -1693,11 +1728,16 @@ pub(in crate::server) async fn apply_upgrade(
     };
 
     let rollout = rollout_scheduler_for(&state);
-    let sender = Some("local API (durable token)".to_string());
-    let staged = match rollout
-        .offer(&release.manifest, RolloutTrigger::Manual, sender.clone())
-        .await
-    {
+    let requested_by = "local API (durable token)";
+    let sender = Some(requested_by.to_string());
+    let offer = if params.now {
+        rollout.offer_now(&release.manifest, requested_by).await
+    } else {
+        rollout
+            .offer(&release.manifest, RolloutTrigger::Manual, sender.clone())
+            .await
+    };
+    let staged = match offer {
         RolloutOffer::Due(staged) => staged,
         RolloutOffer::Waiting(staged) => {
             return (
@@ -1790,10 +1830,15 @@ pub(in crate::server) async fn apply_upgrade(
             trigger: Some(RolloutTrigger::Manual),
             sender: sender.clone(),
             delay_secs: staged.delay_secs,
-            bypass: false,
+            bypass: staged.bypass.is_some(),
         })
-        .with_shared_install_gate(Some(x0x::upgrade::apply::SharedInstallGate {
-            own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+        // D185: now=true moves every instance on this install early, so it
+        // skips the participant gate too; the host lock and every swap
+        // check stay.
+        .with_shared_install_gate(staged.bypass.is_none().then(|| {
+            x0x::upgrade::apply::SharedInstallGate {
+                own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+            }
         }));
 
     match upgrader.apply_upgrade_prepared(&release.manifest).await {

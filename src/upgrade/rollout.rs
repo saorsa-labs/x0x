@@ -398,11 +398,16 @@ impl RolloutState {
     /// Record that `requested_by` skipped the wait for `version` (D185).
     pub fn record_bypass(
         &mut self,
-        _version: &str,
-        _requested_by: &str,
-        _at_unix: u64,
+        version: &str,
+        requested_by: &str,
+        at_unix: u64,
     ) -> Option<StagedRelease> {
-        None
+        let entry = self.releases.iter_mut().find(|r| r.version == version)?;
+        entry.bypass = Some(RolloutBypass {
+            requested_by: requested_by.to_string(),
+            at_unix,
+        });
+        Some(entry.clone())
     }
 
     /// Record the total monotonic wait served for `version`. The value only
