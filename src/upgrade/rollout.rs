@@ -175,6 +175,18 @@ pub struct StagedRelease {
     /// Monotonic wait served so far, checkpointed while the daemon runs.
     /// Time while the daemon is stopped does not count.
     pub waited_secs: u64,
+    /// Set when an authenticated `now=true` request skipped the wait (D185).
+    #[serde(default)]
+    pub bypass: Option<RolloutBypass>,
+}
+
+/// A recorded `now=true` bypass of the staged wait (D185).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutBypass {
+    /// Who asked (for example the local API durable-token holder).
+    pub requested_by: String,
+    /// Wall-clock second of the request (diagnostic).
+    pub at_unix: u64,
 }
 
 impl StagedRelease {
@@ -363,6 +375,7 @@ impl RolloutState {
             window_minutes,
             delay_secs,
             waited_secs: 0,
+            bypass: None,
         };
         self.releases.push(staged.clone());
         if self.releases.len() > MAX_STAGED_RELEASES {
@@ -380,6 +393,16 @@ impl RolloutState {
             self.releases.drain(..excess);
         }
         (staged, true)
+    }
+
+    /// Record that `requested_by` skipped the wait for `version` (D185).
+    pub fn record_bypass(
+        &mut self,
+        _version: &str,
+        _requested_by: &str,
+        _at_unix: u64,
+    ) -> Option<StagedRelease> {
+        None
     }
 
     /// Record the total monotonic wait served for `version`. The value only
@@ -728,6 +751,35 @@ mod tests {
             );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn a_now_bypass_is_recorded_with_who_asked() {
+        // D185: M1 and the journal record the bypass and who asked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = RolloutState::path_in(dir.path());
+        let mut state = RolloutState::default();
+        state.stage(
+            RELEASE,
+            &node(4),
+            60,
+            RolloutTrigger::Manual,
+            1_000,
+            CURRENT,
+        );
+        let entry = state
+            .record_bypass(RELEASE, "local API (durable token)", 2_000)
+            .expect("the staged release records the bypass");
+        assert_eq!(
+            entry.bypass,
+            Some(RolloutBypass {
+                requested_by: "local API (durable token)".to_string(),
+                at_unix: 2_000,
+            })
+        );
+        state.save(&path).unwrap();
+        let (reloaded, _) = RolloutState::load(&path);
+        assert_eq!(reloaded.entry(RELEASE).unwrap().bypass, entry.bypass);
     }
 
     #[test]

@@ -700,6 +700,21 @@ impl RolloutScheduler {
         RolloutOffer::Waiting(staged)
     }
 
+    /// D185: an authenticated `now=true` request. It stages the release
+    /// like any receipt and then skips the wait for this host only.
+    pub(in crate::server) async fn offer_now(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        requested_by: &str,
+    ) -> RolloutOffer {
+        self.offer(
+            manifest,
+            RolloutTrigger::Manual,
+            Some(requested_by.to_string()),
+        )
+        .await
+    }
+
     /// Apply a due release now, under the in-process apply lock, with the
     /// #1196 single retry after an unaged systemd start-rate window.
     pub(in crate::server) async fn apply_due(
@@ -713,6 +728,7 @@ impl RolloutScheduler {
             trigger: Some(trigger),
             sender,
             delay_secs: staged.delay_secs,
+            bypass: false,
         };
         let mut shutdown = self.env.shutdown_watch.clone();
         let attempt = || {
@@ -1583,6 +1599,15 @@ async fn store_upgrade_response(
     upgrade_response(status, body)
 }
 
+/// Query of `POST /upgrade/apply`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(in crate::server) struct ApplyUpgradeQuery {
+    /// D185: skip the staged-rollout wait for this host only. Eligibility,
+    /// holds and every transaction check stay.
+    #[serde(default)]
+    now: bool,
+}
+
 /// POST /upgrade/apply — fetch the latest signed manifest and apply it.
 ///
 /// On a same-version run the monitor returns `None` and the handler reports
@@ -1598,7 +1623,9 @@ async fn store_upgrade_response(
 /// to flush.
 pub(in crate::server) async fn apply_upgrade(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ApplyUpgradeQuery>,
 ) -> impl IntoResponse {
+    let _ = params.now;
     if !state.self_update_enabled {
         // Embed path: never replace/restart the host process via the API.
         return (
@@ -1763,6 +1790,7 @@ pub(in crate::server) async fn apply_upgrade(
             trigger: Some(RolloutTrigger::Manual),
             sender: sender.clone(),
             delay_secs: staged.delay_secs,
+            bypass: false,
         })
         .with_shared_install_gate(Some(x0x::upgrade::apply::SharedInstallGate {
             own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
@@ -2208,6 +2236,7 @@ mod tests {
                 trigger: Some(RolloutTrigger::Gossip),
                 sender: Some("ab".into()),
                 delay_secs: staged.delay_secs,
+                bypass: false,
             }]
         );
     }
@@ -2410,6 +2439,44 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(3600)).await;
         assert_eq!(applier.attempts(), 0, "the older release never applies");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_now_request_skips_the_wait_and_records_who_asked() {
+        // D185: now=true skips the wait for this host only, and the
+        // rollout state records the bypass and who asked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version);
+        let offer = scheduler
+            .offer_now(&manifest, "local API (durable token)")
+            .await;
+        let RolloutOffer::Due(staged) = offer else {
+            panic!("now=true must not wait, got {offer:?}");
+        };
+        assert!(staged.delay_secs >= 600, "the delay is still recorded");
+        assert_eq!(
+            staged.bypass.as_ref().map(|b| b.requested_by.as_str()),
+            Some("local API (durable token)")
+        );
+        let (stored, _) = RolloutState::load(&RolloutState::path_in(dir.path()));
+        assert_eq!(stored.entry(&version).unwrap().bypass, staged.bypass);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_now_request_keeps_the_blocked_hold() {
+        // D185: the bypass keeps holds. An unreadable state stays blocked.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(RolloutState::path_in(dir.path()), b"{ not json").unwrap();
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), [6; 32], 60, applier);
+        let offer = scheduler
+            .offer_now(&manifest_with_version(&version_newer_than_current()), "api")
+            .await;
+        assert!(matches!(offer, RolloutOffer::Blocked { .. }), "{offer:?}");
     }
 
     #[test]

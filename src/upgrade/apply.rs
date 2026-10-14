@@ -69,6 +69,8 @@ pub struct ApplySummary {
     pub sender: Option<String>,
     /// The staged-rollout delay this node served before the apply.
     pub delay_secs: u64,
+    /// An authenticated `now=true` request skipped the wait (D185).
+    pub bypass: bool,
 }
 
 /// The shared-install gate of a daemon apply (#1106 review F2): this
@@ -141,6 +143,7 @@ pub(crate) struct AppliedSummaryLine<'a> {
     pub to: &'a str,
     pub sender: &'a str,
     pub delay_secs: u64,
+    pub rollout: &'a str,
     pub swap: &'a str,
     pub backup: &'a str,
     pub exit: &'a str,
@@ -665,6 +668,11 @@ impl AutoApplyUpgrader {
                 to: &target_version.to_string(),
                 sender: self.apply_summary.sender.as_deref().unwrap_or("unknown"),
                 delay_secs: self.apply_summary.delay_secs,
+                rollout: if self.apply_summary.bypass {
+                    "bypassed by now=true"
+                } else {
+                    "served"
+                },
                 swap: swap_label,
                 backup: &backup_display,
                 exit: &exit,
@@ -1168,6 +1176,7 @@ mod tests {
                 to: "0.48.1",
                 sender: "ab12cd34",
                 delay_secs: 1234,
+                rollout: "served",
                 swap: "performed",
                 backup: "/opt/x0x/x0xd.backup-0.48.0-0011aabb",
                 exit: "supervised_exit(code=0)",
@@ -1180,7 +1189,7 @@ mod tests {
         for needle in [
             "x0xd self-update applied: 0.48.0 -> 0.48.1 via gossip",
             "sender ab12cd34",
-            "staged delay 1234s",
+            "staged delay 1234s served",
             "swap performed",
             "backup /opt/x0x/x0xd.backup-0.48.0-0011aabb",
             "exit supervised_exit(code=0)",
@@ -1224,6 +1233,33 @@ mod tests {
         // A completed refusal or restore drops it: the lock is free again.
         drop(prepared);
         assert!(HostUpgradeLock::try_acquire(&target).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_summary_line_records_a_now_bypass() {
+        // D185: the bypass and who asked are on the WARN line.
+        let (logged, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: "manual",
+                from: "0.48.0",
+                to: "0.48.1",
+                sender: "local API (durable token)",
+                delay_secs: 1234,
+                rollout: "bypassed by now=true",
+                swap: "performed",
+                backup: "/opt/x0x/x0xd.backup-0.48.0-0011aabb",
+                exit: "deferred_restart(supervised_exit(code=0))",
+            })
+        });
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(
+            logged.contains("staged delay 1234s bypassed by now=true"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("sender local API (durable token)"),
+            "{logged}"
+        );
     }
 
     #[test]
