@@ -259,19 +259,42 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     if arm == Arm::InviteOnly {
         let agent =
             super::super::parse_agent_id_hex(&o_hex).map_err(|error| anyhow::anyhow!(error))?;
-        let trust = {
+        let machine = sim.ids("O")?.1;
+        let (trust, grant_access_empty, stored_group_invite) = {
             let state = sim.state("M")?;
-            let contacts = state.contacts.read().await;
-            contacts.trust_level(&agent)
+            let trust = {
+                let contacts = state.contacts.read().await;
+                contacts.trust_level(&agent)
+            };
+            let access = state.agent.share_grant_access(&agent, &machine).await;
+            let stored_group_invite = state.agent.share_grant_store().is_some_and(|store| {
+                [
+                    crate::share_grant::GrantRole::Issued,
+                    crate::share_grant::GrantRole::Received,
+                ]
+                .into_iter()
+                .any(|role| {
+                    store.grants(role).into_iter().any(|grant| {
+                        grant
+                            .caps
+                            .contains(&crate::share_grant::ShareCap::GroupInvite)
+                    })
+                })
+            });
+            (trust, access.is_empty(), stored_group_invite)
         };
+        let no_known_contact = trust == crate::contacts::TrustLevel::Unknown;
+        let no_grant = grant_access_empty && !stored_group_invite;
         ensure!(
-            trust == crate::contacts::TrustLevel::Unknown,
-            "INFRA: the invite join recorded O as {trust}"
+            no_known_contact && no_grant,
+            "INFRA: invite-only arm recorded O as {trust}, grant_access_empty={grant_access_empty}, stored_group_invite={stored_group_invite}"
         );
         receipt.evidence(
             "invite_join_sets_no_known_contact_and_no_grant",
-            true,
-            "M's trust in O is unknown; the test set no contact and no share grant".to_string(),
+            no_known_contact && no_grant,
+            format!(
+                "trust={trust}; grant_access_empty={grant_access_empty}; stored_group_invite={stored_group_invite}"
+            ),
             at(sim),
         );
     } else {

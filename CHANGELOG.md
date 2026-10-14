@@ -14,12 +14,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **An installed SignedPublic group catches up one revision from a local admin who is not a Known contact (D272, #1105).** For a group this node already has installed, an active admin in the local roster who signed the single retained head counts as consent for that catch-up only. New installs keep the current gate: a Known contact, or a current `GroupInvite` grant on the authenticated machine. Blocked still wins, including before that catch-up branch. The sender is still refused when revoked. The one-revision apply checks are unchanged. The invite-only restart arm obtains N+1.
+
 - **The panic scanner reports a production panic after a closed test item
   (#1254).** It used to treat every line after a file's first `#[cfg(test)]`
   as test code. A span is now test-only when a test attribute is identified
   and that item's closing delimiter is matched. An unclosed or uncertain
   span stays production, so a later `unwrap`, `expect`, or `panic!` is
   reported.
+
 - **Corrected the revoke documentation (#1108).** The single-id form of
   `POST /identity/revoke` supports the daemon's own agent, not its machine or
   an owner-authorized third-party revocation. The API reference and CLI/handler
@@ -145,8 +148,6 @@ A minor release. It removes one unused public module and changes two public file
 - **Stricter actors on group routes (#1228, #1334).** `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`, and every `/mls/groups*` route require the durable API token. The check runs in `requires_durable_owner` before the body is read; the handlers repeat it. `PUT /groups/:id/display-name` requires an active seat in the group, any role. Approving or rejecting a join request still accepts a session token. Cancelling a join request stays limited to the owner who filed it.
 
 ### Fixed
-
-- **An installed SignedPublic group catches up one revision from a local admin who is not a Known contact (D272, #1105).** For a group this node already has installed, an active admin in the local roster who signed the single retained head counts as consent for that catch-up only. New installs keep the current gate: a Known contact, or a current `GroupInvite` grant on the authenticated machine. Blocked still wins on that gate. The sender is still refused when revoked. The one-revision apply checks are unchanged. The invite-only restart arm obtains N+1.
 
 - **A cached peer on another gossip plane no longer becomes a HyParView JOIN
   seed (#1321, #1330).** `join_network` built the JOIN seeds from transport dial

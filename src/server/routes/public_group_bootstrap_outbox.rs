@@ -1285,17 +1285,24 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     //
     // ADR-0070 §2: a current `GroupInvite` ShareGrant for this agent is the
     // one other consent — the owner said this grantee may add the shared
-    // agent to groups. Blocked still wins (the grant evaluation refuses a
-    // Blocked sender), and the grant pairs only on the authenticated
-    // binding of the transport machine. It never touches Home admission
+    // agent to groups. The grant pairs only on the authenticated binding
+    // of the transport machine. It never touches Home admission
     // (`GroupAdmission::OwnerCertified`).
+    //
+    // Blocked still wins. Grant evaluation refuses a Blocked sender, and
+    // the check below refuses one before the D272 consent branch. The
+    // listener can queue a frame after ingress, so the block may land
+    // while that frame waits.
     //
     // D272: an already installed group may take the catch-up branch from an
     // active local admin who signed the single retained head. That consent
     // does not seed a new group, and it does not ACK a duplicate frontier.
-    let known_contact = {
+    let (known_contact, sender_blocked) = {
         let contacts = state.contacts.read().await;
-        contacts.trust_level(&sender).rank() >= crate::contacts::TrustLevel::Known.rank()
+        (
+            contacts.trust_level(&sender).rank() >= crate::contacts::TrustLevel::Known.rank(),
+            contacts.is_blocked(&sender),
+        )
     };
     let contact_or_grant = if known_contact {
         true
@@ -1313,6 +1320,13 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     };
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
+    if sender_blocked {
+        tracing::debug!(
+            sender = %LogHexId::agent(&sender_hex),
+            "ignoring public-group bootstrap from a blocked sender"
+        );
+        return Err("public-group bootstrap sender is not a known contact".to_string());
+    }
     if !contact_or_grant {
         let catchup_consent = {
             let groups = state.named_groups.read().await;
