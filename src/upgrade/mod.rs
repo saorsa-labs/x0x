@@ -166,14 +166,21 @@ pub fn latest_versioned_backup(target: &Path, from_version: &str) -> Option<Path
         .map(|(_, path)| path)
 }
 
-/// Remove older versioned backups of `target` and keep `keep` (D194: keep the
-/// previous binary, delete older ones). Only `<binary>.backup-*` files older
-/// than `min_age` are removed; the legacy `<binary>.backup`, other binaries'
-/// backups and operator copies are never touched. Best-effort.
+/// Remove versioned backups of `target` that are older than the last
+/// known-good release (D194, review F6).
+///
+/// `known_good` is the release this process runs: it started and served, so
+/// its bytes are the last known-good copy. A backup is removed only when its
+/// name parses as `<binary>.backup-<release>-<sha8>`, `<release>` is older
+/// than `known_good`, it is not in `keep`, and it is older than `min_age`.
+/// So the known-good copy and every newer, not yet proven copy stay until a
+/// later release proves itself. The legacy `<binary>.backup`, unparseable
+/// names, other binaries' backups and operator copies are never touched.
+/// Best-effort.
 pub fn prune_versioned_backups(
     target: &Path,
     keep: &[&Path],
-    _known_good: &Version,
+    known_good: &Version,
     min_age: std::time::Duration,
 ) -> usize {
     let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
@@ -190,9 +197,18 @@ pub fn prune_versioned_backups(
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if keep.contains(&path.as_path())
-            || !entry.file_name().to_string_lossy().starts_with(&prefix)
-        {
+        if keep.contains(&path.as_path()) {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let older_than_known_good = rest
+            .rsplit_once('-')
+            .and_then(|(release, _sha8)| Version::parse(release).ok())
+            .is_some_and(|release| &release < known_good);
+        if !older_than_known_good {
             continue;
         }
         let aged = entry
@@ -203,7 +219,7 @@ pub fn prune_versioned_backups(
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= min_age);
         if aged && std::fs::remove_file(&path).is_ok() {
-            info!(path = %path.display(), "Removed an older versioned upgrade backup");
+            info!(path = %path.display(), "Removed a versioned upgrade backup older than the known-good release");
             removed += 1;
         }
     }
