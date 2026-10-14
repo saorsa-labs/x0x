@@ -2347,9 +2347,10 @@ true`. When the release applies, the answer is the usual `{"applied": true,
 "version", "previous_version", "restart_scheduled": true}`.
 
 **`now=true` (D185).** `POST /upgrade/apply?now=true` (query, optional, bool)
-skips the wait and the shared-install participant gate for this host only.
-Eligibility, holds and every install check stay. The bypass and who asked are
-recorded in `upgrade-rollout.json` and on the WARN summary line.
+skips the wait for this host only, and on a shared install the other daemons'
+waits. Eligibility, holds (also the other daemons' holds) and every install
+check stay. The bypass and who asked are recorded in `upgrade-rollout.json` and
+on the WARN summary line.
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
 binary cannot read the `owner_certified` policy variant and crash-loops; the
