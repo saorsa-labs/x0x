@@ -258,9 +258,6 @@ pub struct Upgrader {
     /// SHA-256 of the bytes this process runs, when the target is this
     /// process's own executable (#1106 F1 version evidence).
     running_sha256: Option<[u8; 32]>,
-    /// Installed release to assume when no other evidence exists (the
-    /// companion CLI follows its daemon's installed release).
-    installed_release_hint: Option<Version>,
 }
 
 /// What a host-locked swap does, decided under the lock before any binary
@@ -415,19 +412,19 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The upgrader for the companion `x0x` CLI beside the daemon.
+///
+/// Review R3: the CLI needs its own version evidence (the marker in its
+/// bytes or its own matching install record). The daemon's release is never
+/// assumed for unknown CLI bytes, so an interrupted pair swap or a separate
+/// CLI install cannot be downgraded. The daemon's swap plan is decided
+/// first and is not used as CLI evidence.
 pub fn companion_upgrader(
     cli_path: PathBuf,
     current_version: Version,
-    daemon_plan: &LockedSwapPlan,
-    target_version: &Version,
+    _daemon_plan: &LockedSwapPlan,
+    _target_version: &Version,
 ) -> Upgrader {
-    let hint = match daemon_plan {
-        LockedSwapPlan::AlreadyInstalled => target_version.clone(),
-        LockedSwapPlan::Replace {
-            installed_release, ..
-        } => installed_release.clone(),
-    };
-    Upgrader::new(cli_path, current_version).with_installed_release_hint(hint)
+    Upgrader::new(cli_path, current_version)
 }
 
 /// SHA-256 of the bytes this process runs, computed once (#1106 F1).
@@ -456,7 +453,6 @@ impl Upgrader {
             target_path,
             current_version,
             running_sha256: None,
-            installed_release_hint: None,
         }
     }
 
@@ -465,13 +461,6 @@ impl Upgrader {
     /// version.
     pub fn with_running_sha256(mut self, running_sha256: Option<[u8; 32]>) -> Self {
         self.running_sha256 = running_sha256;
-        self
-    }
-
-    /// Installed release to assume when neither the running hash nor an
-    /// install record identifies the installed bytes (#1106 F1).
-    pub fn with_installed_release_hint(mut self, release: Version) -> Self {
-        self.installed_release_hint = Some(release);
         self
     }
 
@@ -648,7 +637,7 @@ impl Upgrader {
         if self.running_sha256.as_ref() == Some(installed_sha256) {
             return Some(self.current_version.clone());
         }
-        self.installed_release_hint.clone()
+        None
     }
 
     /// Decide the swap under the lock, before any binary changes (#1106 F1).
