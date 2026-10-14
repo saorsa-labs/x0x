@@ -5,6 +5,10 @@
 /// the manifest, create identity/configuration, contact peers, or install bytes.
 #[doc(hidden)]
 pub fn run_if_requested() -> Option<anyhow::Result<()>> {
+    // Both x0xd and x0x call this at start: keep the release marker in the
+    // binary so a later writer can read this release from the bytes
+    // (#1106 review R2/R3).
+    std::hint::black_box(super::RELEASE_MARKER);
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--verify-release-manifest")) {
         return None;

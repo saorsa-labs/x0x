@@ -486,11 +486,6 @@ pub async fn serve_with_options(
     // #1106: report a self-update that the previous process applied, once,
     // at WARN level ("x0xd upgraded from X to Y").
     announce_completed_upgrade(&config.data_dir);
-    // #1106 F1: hash the running bytes now, before any writer on this host
-    // can replace the installed file (version evidence for the swap).
-    if self_update_enabled && config.update.enabled {
-        tokio::task::spawn_blocking(x0x::upgrade::prime_running_binary_sha256);
-    }
 
     // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
     // by the binary (see `run_update_check_and_report`) before it ever calls

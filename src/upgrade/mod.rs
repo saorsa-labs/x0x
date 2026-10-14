@@ -365,8 +365,53 @@ pub const RELEASE_MARKER: &str = concat!("X0X-RELEASE-MARKER:", env!("CARGO_PKG_
 /// The release embedded in the bytes at `path`: `Some` when the bytes carry
 /// exactly one marker release, `None` when they carry none (a binary from
 /// before 0.48.1) or markers of different releases.
-pub fn embedded_release(_path: &Path) -> Result<Option<Version>, UpgradeError> {
-    Ok(None)
+pub fn embedded_release(path: &Path) -> Result<Option<Version>, UpgradeError> {
+    // The needle is built at run time, so this function's own bytes do not
+    // add a second copy of the prefix to the binary.
+    let prefix: Vec<u8> = MARKER_PREFIX_REVERSED.iter().rev().copied().collect();
+    let bytes = std::fs::read(path)
+        .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))?;
+    let mut found: Option<Version> = None;
+    let mut at = 0;
+    while let Some(offset) = find_subslice(&bytes[at..], &prefix) {
+        let start = at + offset + prefix.len();
+        at = start;
+        let window = &bytes[start..bytes.len().min(start + 64)];
+        let Some(end) = find_subslice(window, b":END") else {
+            continue;
+        };
+        let Some(release) = std::str::from_utf8(&window[..end])
+            .ok()
+            .and_then(|v| Version::parse(v).ok())
+        else {
+            continue;
+        };
+        match &found {
+            None => found = Some(release),
+            Some(seen) if *seen == release => {}
+            Some(_) => return Ok(None), // two releases: no evidence
+        }
+    }
+    Ok(found)
+}
+
+/// `"X0X-RELEASE-MARKER:"` reversed.
+const MARKER_PREFIX_REVERSED: &[u8] = b":REKRAM-ESAELER-X0X";
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let first = *needle.first()?;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        match haystack[i..].iter().position(|b| *b == first) {
+            Some(p) => i += p,
+            None => return None,
+        }
+        if haystack.get(i..i + needle.len()) == Some(needle) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The upgrader for the companion `x0x` CLI beside the daemon.
@@ -387,24 +432,22 @@ pub fn companion_upgrader(
 
 /// SHA-256 of the bytes this process runs, computed once (#1106 F1).
 ///
-/// On Linux it reads `/proc/self/exe`, which names the running image even
-/// after a rename replaced the installed file. Elsewhere it hashes the
-/// executable path; [`prime_running_binary_sha256`] runs at daemon start so
-/// the value is taken before any swap.
+/// Linux only: `/proc/self/exe` names the running image even after a rename
+/// replaced the installed file, so the hash is bound to the running image.
+/// Elsewhere a pathname hash could be the hash of bytes another daemon
+/// installed later (review R2), so there is no such evidence (`None`) and
+/// the swap relies on the release marker in the installed bytes or a
+/// matching install record.
 pub fn running_binary_sha256() -> Option<[u8; 32]> {
-    static RUNNING: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
-    *RUNNING.get_or_init(|| {
-        #[cfg(target_os = "linux")]
-        let path = PathBuf::from("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let path = apply::current_binary_path().ok()?;
-        sha256_file(&path).ok()
-    })
-}
-
-/// Compute [`running_binary_sha256`] now (call early at daemon start).
-pub fn prime_running_binary_sha256() {
-    let _ = running_binary_sha256();
+    #[cfg(target_os = "linux")]
+    {
+        static RUNNING: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+        *RUNNING.get_or_init(|| sha256_file(Path::new("/proc/self/exe")).ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 impl Upgrader {
@@ -588,16 +631,22 @@ impl Upgrader {
     /// backup that no later writer overwrites, and then the new bytes replace
     /// the target. `staging_dir` must be on the target's filesystem.
     /// The installed release for bytes with `installed_sha256`, from
-    /// verified evidence only: this process's own bytes, a matching install
-    /// record, or the caller's hint (the companion follows its daemon).
+    /// verified evidence only.
+    ///
+    /// Evidence order (review R2): the release marker in the installed bytes
+    /// themselves, then an install record whose hash matches, then (Linux
+    /// only) the hash of the running image.
     fn installed_release(&self, installed_sha256: &[u8; 32]) -> Option<Version> {
-        if self.running_sha256.as_ref() == Some(installed_sha256) {
-            return Some(self.current_version.clone());
+        if let Ok(Some(release)) = embedded_release(&self.target_path) {
+            return Some(release);
         }
         if let Some(release) =
             InstallRecord::read(&self.target_path).and_then(|r| r.release_for(installed_sha256))
         {
             return Some(release);
+        }
+        if self.running_sha256.as_ref() == Some(installed_sha256) {
+            return Some(self.current_version.clone());
         }
         self.installed_release_hint.clone()
     }
