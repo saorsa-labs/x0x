@@ -232,8 +232,8 @@ impl AutoApplyUpgrader {
     }
 
     /// Gate the shared swap on every participant being due (#1106 review
-    /// F2). `None` skips the gate (the D185 `now=true` bypass, and callers
-    /// outside the daemon).
+    /// F2). D185 `now=true` keeps the gate with `skip_waits` (review R5).
+    /// `None` skips the gate (callers outside the daemon).
     pub fn with_shared_install_gate(mut self, gate: Option<SharedInstallGate>) -> Self {
         self.shared_install_gate = gate;
         self

@@ -1716,14 +1716,17 @@ pub(in crate::server) fn spawn_updates_off_participant(
     })
 }
 
-/// The shared-install gate of an HTTP apply. `bypass` is D185 `now=true`.
+/// The shared-install gate of an HTTP apply (review R5). `bypass` is D185
+/// `now=true`: it skips the WAIT only, so the gate stays on in skip-waits
+/// mode. Other participants' remaining waits do not stop the swap; their
+/// holds, unreadable records and this daemon's missing record still do.
 pub(in crate::server) fn http_install_gate(
     data_dir: &std::path::Path,
     bypass: bool,
 ) -> Option<x0x::upgrade::apply::SharedInstallGate> {
-    (!bypass).then(|| x0x::upgrade::apply::SharedInstallGate {
+    Some(x0x::upgrade::apply::SharedInstallGate {
         own_key: x0x::upgrade::participants::participant_key(data_dir),
-        skip_waits: false,
+        skip_waits: bypass,
     })
 }
 
@@ -1744,9 +1747,10 @@ pub(in crate::server) struct ApplyUpgradeQuery {
 /// trigger. While this node still waits, the handler reports `applied:
 /// false, staged: true` with the delay and the remaining wait, and the
 /// daemon applies the release when the wait is served. `?now=true` (D185)
-/// skips the wait and the shared-install participant gate for this host
-/// only; eligibility, holds and every transaction check stay, and the
-/// rollout state and the WARN summary line record the bypass and who asked.
+/// skips the wait for this host only, and the other participants' waits on
+/// a shared install; eligibility, holds (this daemon's and the other
+/// participants') and every transaction check stay, and the rollout state
+/// and the WARN summary line record the bypass and who asked.
 /// When the wait is served, this handler serializes the destructive apply with the
 /// background update workers, performs the verified binary swap, returns a
 /// JSON result, then schedules restart/exec after the response has a chance

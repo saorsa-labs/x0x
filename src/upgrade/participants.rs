@@ -267,7 +267,7 @@ pub fn check_all_due(
     own_key: &str,
     release: &Version,
     now_unix: u64,
-    _skip_waits: bool,
+    skip_waits: bool,
 ) -> Result<ParticipantGate, UpgradeError> {
     let dir = participants_dir(target);
     let unknown = |reason: String| UpgradeError::ParticipantsUnknown { reason };
@@ -326,6 +326,8 @@ pub fn check_all_due(
         }
         match participant_not_due(&record, release) {
             None => {}
+            // D185 now=true skips other participants' waits, not their holds.
+            Some(NotDue::Wait(_)) if skip_waits => {}
             Some(NotDue::Wait(reason) | NotDue::Hold(reason)) => pending.push(PendingParticipant {
                 key: key.to_string(),
                 machine_id: record.machine_id.clone(),
