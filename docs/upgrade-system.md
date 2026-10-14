@@ -30,20 +30,34 @@ independently, and the second one copied the already-new bytes over the single
   `<install dir>/.<binary>.upgrade-lock` (for example `/opt/x0x/.x0xd.upgrade-lock`)
   after the restart plan resolves and before the download. It holds the lock
   through the swap and the restart; the OS releases it when the process exits.
-  A second writer waits at most 10 minutes and then fails before any change.
-  The lock file is never deleted.
+  `POST /upgrade/apply` carries the lock, the pre-swap restart plan and the
+  backup path into its deferred restart, so no other writer can swap during the
+  response window. A second writer waits at most 10 minutes and then fails before
+  any change. The lock file is never deleted.
+- **Installed-release check.** Under the lock, the writer names the installed
+  release from verified evidence only: the bytes this process runs, or the install
+  record `<install dir>/.<binary>.installed.json` (release + SHA-256, written after
+  each swap) when its hash matches the installed bytes. An installed release that
+  is not older than the target is refused (`InstalledReleaseNotOlder`): another
+  writer installed it, so there is no on-disk downgrade. Unknown bytes (for example
+  a hand copy without a restart) are refused (`InstalledReleaseUnknown`); restart
+  the daemon on those bytes to make them known. The check runs before either
+  binary changes.
 - **Skip when installed.** Under the lock, when the installed bytes already
   equal the verified binary, the writer does not swap. Another writer on the host
   installed them, so this daemon only restarts onto them.
 - **Versioned backup.** The previous bytes are copied to
-  `<binary>.backup-<running version>-<first 8 hex of their SHA-256>`, for example
-  `/opt/x0x/x0xd.backup-0.48.0-f9149f65`. The copy is fsynced and renamed into
-  place. A different file under that name is never overwritten. The companion
-  `x0x` CLI uses the same rule (`x0x.backup-<version>-<sha8>`).
-- **Retention.** After a swap, older `<binary>.backup-*` files older than one
-  hour are removed, so the previous release stays (D194). The legacy
-  `<binary>.backup`, other binaries' backups and operator copies such as
-  `x0xd.v0480-pre0481` are not touched.
+  `<binary>.backup-<their release>-<first 8 hex of their SHA-256>`, for example
+  `/opt/x0x/x0xd.backup-0.48.0-f9149f65`. The release comes from the bytes being
+  saved, not from the running version. The copy is fsynced and renamed into place.
+  A different file under that name is never overwritten. The companion `x0x` CLI
+  uses the same rule (`x0x.backup-<release>-<sha8>`).
+- **Retention.** After a swap, a `<binary>.backup-<release>-<sha8>` file is removed
+  only when `<release>` is older than the release this daemon runs and the file is
+  older than one hour. The running release started and served, so its copy is the
+  last known-good copy and stays, with every newer, not yet proven copy (D194). The
+  legacy `<binary>.backup`, unparseable names, other binaries' backups and
+  operator copies such as `x0xd.v0480-pre0481` are not touched.
 - The handoff/intent record `upgrade-handoff.json` names the versioned backup in
   `backup_path`. The daemon no longer writes `<binary>.backup`. A file with that
   name is left from an older release and may be very old: do not restore it.
@@ -336,7 +350,7 @@ no gossip, binds nothing, and takes no instance lock.
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and stage it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, stage if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip, stage
-4. **`POST /upgrade/apply`**: authenticated manual request; it stages the release like the other paths
+4. **`POST /upgrade/apply`** (CLI `x0x upgrade --apply`): authenticated manual request; it stages the release like the other paths, and `?now=true` (`--now`) skips the wait for this host (D185)
 
 Every path verifies a release first and then offers it to the staged rollout below. A release applies only when this node's wait is served.
 
@@ -361,40 +375,64 @@ delay = SHA-256(MachineId ‖ version)[0..8] as u64 × window_secs / 2^64     (i
 - The wait starts at this node's first eligible receipt, so discovery lag adds to
   the window (#1169).
 - `<data_dir>/upgrade-rollout.json` keeps, per release: the first trigger and
-  receipt time (diagnostic), the window, the chosen delay and the served wait.
-  The file is versioned JSON (`"format": "x0x.upgrade-rollout"`, `"version": 1`)
-  and is written with a record barrier (temp file, fsync, rename, directory
-  fsync). A duplicate receipt or a restart keeps the delay and the served wait.
-  The delay is a pure function, so it cannot re-roll. The wait is counted on the
-  monotonic clock while the daemon runs and checkpointed every 30 s; time while
-  the daemon is stopped does not count, and the wall clock never decides the due
-  time. A changed window gives the delay for the new window and keeps the served
-  wait. An unreadable or newer-format file is moved aside to
-  `upgrade-rollout.json.unreadable-<unix ms>` and the wait starts again, which
-  can only make it longer.
+  receipt time (diagnostic), the window, the chosen delay, the served wait and
+  any `now=true` bypass (who asked, when). The file is versioned JSON
+  (`"format": "x0x.upgrade-rollout"`, `"version": 1`) and is written with a record
+  barrier (temp file, fsync, rename, directory fsync). A duplicate receipt or a
+  restart keeps the delay and the served wait. The delay is a pure function, so
+  it cannot re-roll. The wait is counted on the monotonic clock while the daemon
+  runs and checkpointed every 30 s; time while the daemon is stopped does not
+  count, and the wall clock never decides the due time. A changed window gives the
+  delay for the new window and keeps the served wait.
+- **Unreadable state fails closed (ADR 0094 §6).** When the file cannot be read or
+  parsed, or has another format or a newer version, the daemon starts and serves
+  normally but applies nothing: every trigger, `now=true` included, answers
+  "blocked", and the file is kept byte for byte (one WARN at start; the HTTP answer
+  says `blocked: true`). Repair: run a binary that reads that format, or move the
+  file away (`mv <data_dir>/upgrade-rollout.json <data_dir>/upgrade-rollout.json.bad`)
+  and restart; the wait then starts again.
 - While a node waits it downloads and replaces nothing. A waiter task applies
-  the release when the wait is served. A newer release supersedes a waiting one.
-- `POST /upgrade/apply` also waits. While the node waits it answers
-  `{"ok": true, "applied": false, "staged": true, "reason": …, "version": …,
-  "delay_secs": …, "remaining_secs": …, "window_minutes": …}`, and the daemon
-  applies the release when the wait is served. There is no bypass yet: ADR 0094
-  left the HTTP bypass as an open question.
+  the release when the wait is served. A newer release supersedes a waiting one,
+  also after a restart: the newest staged release in the file is the active one,
+  and an older manifest that arrives first is not staged.
+- `POST /upgrade/apply` (CLI `x0x upgrade --apply`) also waits. While the node
+  waits it answers `{"ok": true, "applied": false, "staged": true, "reason": …,
+  "version": …, "delay_secs": …, "remaining_secs": …, "window_minutes": …}`, and
+  the daemon applies the release when the wait is served.
+- **`now=true` (D185).** `POST /upgrade/apply?now=true` (CLI `x0x upgrade --apply
+  --now`) skips the wait for this host only. It keeps eligibility (signature, age,
+  newer), holds (a blocked state) and every install check (host lock, installed
+  release). It also skips the shared-install gate below, so it moves every daemon
+  on that install early. The rollout state and the WARN summary line record the
+  bypass and who asked.
 - A due apply keeps the #1196 behaviour on every trigger: when the only refusal
   is an unaged systemd start-rate window, it waits that window out and retries
   once.
-- Shared installs: each daemon on a host waits its own delay. The first one due
-  swaps the shared binary under the host lock; the next one finds the bytes
-  installed and only restarts. ADR 0094 §1 asks that a shared install wait for
-  every participant; that needs the participant inventory of ADR 0094 §2 (M2
-  slice S2) and is not done yet.
+- **Shared installs wait for every participant (ADR 0094 §1).** Each daemon that may
+  self-update keeps a record in `<install dir>/.<binary>.participants/<key>.json`
+  (key = first 16 hex of SHA-256 of its data dir): MachineId, data dir, pid,
+  running version, the active staged release with its delay, remaining wait and
+  due flag, and any blocked state. It refreshes the record every 5 minutes and at
+  each stage and checkpoint. Under the host lock, a due daemon swaps the shared
+  binary only when every live participant runs the release or has staged it with
+  its wait served. Otherwise it waits (`ParticipantsNotDue`, not a failure) and
+  checks again every 30 s; the HTTP answer lists `pending_participants`.
+  - *Stale participant.* A record not refreshed for 30 minutes (a removed or
+    long-stopped daemon) does not block; the writer logs it at WARN before the swap.
+    Delete the file of a daemon that is gone. A daemon that starts with self-update
+    off removes its own record.
+  - *Participants cannot be established.* When the directory cannot be read, this
+    daemon's own record is missing, or a record is unreadable or of another format,
+    the swap is refused (`ParticipantsUnknown`, WARN).
 
 ### Upgrade log lines
 
 Fleet units run `RUST_LOG=warn`. Two WARN lines record a self-update:
 
 - Before the restart: `x0xd self-update applied: <from> -> <to> via
-  <startup|gossip|poll|manual> (sender <agent hex | local API | unknown>, staged
-  delay <n>s, swap <performed|already_installed>, backup <path>, exit
+  <startup|gossip|poll|manual> (sender <agent hex | local API (durable token) |
+  unknown>, staged delay <n>s <served|bypassed by now=true>, swap
+  <performed|already_installed>, backup <path>, exit
   <supervised_exit(code=0)|transactional_handoff|deferred_restart(…)>)`.
 - At the next start: `x0xd upgraded from <from> to <to>`, from the existing
   `upgrade-handoff.json`. It is written once per handoff transaction (the reported
