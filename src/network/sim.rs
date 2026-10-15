@@ -274,6 +274,25 @@ struct LinkState {
     generation: u64,
     ordinal: u64,
     closed: Arc<AtomicBool>,
+    /// Set when one endpoint's winner disagrees with [`Self::generation`].
+    /// The named endpoint reads `generation`; the other endpoint still
+    /// reads [`Self::generation`]. Models a one-sided supersede
+    /// (ant-quic#332) without a wire change.
+    one_sided: Option<(Key, u64)>,
+    /// Virtual time of the last admitted send from each end.
+    /// Index 0 is the lower key of the pair.
+    sent_at: [Option<Duration>; 2],
+    /// Virtual time of the last admitted receive at each end.
+    recv_at: [Option<Duration>; 2],
+}
+
+impl LinkState {
+    fn generation_for(&self, endpoint: Key) -> u64 {
+        match self.one_sided {
+            Some((who, generation)) if who == endpoint => generation,
+            _ => self.generation,
+        }
+    }
 }
 
 struct Queued {
@@ -454,6 +473,7 @@ impl SimFabric {
         state.next_generation = new.saturating_add(1);
         if let Some(link) = state.links.get_mut(&key) {
             link.generation = new;
+            link.one_sided = None;
         }
         if !publish {
             return Some((old, new));
@@ -495,10 +515,30 @@ impl SimFabric {
         match self.lock().links.get_mut(&pair(a.0, b.0)) {
             Some(link) => {
                 link.generation = generation;
+                link.one_sided = None;
                 true
             }
             None => false,
         }
+    }
+
+    /// #1419 test hook: move the winner on `viewer` only. `other` keeps
+    /// the previous generation. Sends between them are refused until a
+    /// later dial installs one shared generation. No lifecycle event is
+    /// published.
+    pub(crate) fn supersede_one_sided_for_test(
+        &self,
+        viewer: &PeerId,
+        other: &PeerId,
+    ) -> Option<(u64, u64)> {
+        let key = pair(viewer.0, other.0);
+        let mut state = self.lock();
+        let new = state.next_generation;
+        state.next_generation = new.saturating_add(1);
+        let link = state.links.get_mut(&key)?;
+        let old = link.generation_for(viewer.0);
+        link.one_sided = Some((viewer.0, new));
+        Some((old, new))
     }
 
     /// Record a harness event (barrier, receipt, fault step) in the trace.
@@ -1055,6 +1095,9 @@ impl SimFabric {
                 generation,
                 ordinal,
                 closed: Arc::new(AtomicBool::new(false)),
+                one_sided: None,
+                sent_at: [None, None],
+                recv_at: [None, None],
             },
         );
         state.trace.push(TraceEvent::Link {
@@ -1108,14 +1151,20 @@ impl SimFabric {
         let class = LaneClass::of(bytes);
         let mut state = self.lock();
         let key = pair(from, to);
-        let live = state
-            .links
-            .get(&key)
-            .map(|link| (link.generation, link.ordinal));
-        let Some((link_generation, ordinal)) =
-            live.filter(|(current, _)| generation.is_none_or(|wanted| wanted == *current))
-        else {
-            let reason = if live.is_some() {
+        let admitted = state.links.get(&key).map(|link| {
+            let sender = link.generation_for(from);
+            let receiver = link.generation_for(to);
+            // A one-sided winner (the two ends disagree) refuses every
+            // send. A pinned send whose generation is no longer the
+            // sender's winner is refused the same way.
+            if sender != receiver || generation.is_some_and(|wanted| wanted != sender) {
+                None
+            } else {
+                Some((sender, link.ordinal))
+            }
+        });
+        let Some((link_generation, ordinal)) = admitted.flatten() else {
+            let reason = if state.links.contains_key(&key) {
                 RefusalReason::GenerationSuperseded
             } else {
                 RefusalReason::NoLink
@@ -1206,6 +1255,12 @@ impl SimFabric {
             bytes,
             delivered,
         });
+        if let Some(link) = state.links.get_mut(&key) {
+            let send_idx = usize::from(from != key.0);
+            let recv_idx = usize::from(to != key.0);
+            link.sent_at[send_idx] = Some(at);
+            link.recv_at[recv_idx] = Some(at);
+        }
         drop(state);
         self.wake.notify_one();
         Ok(())
@@ -1861,6 +1916,16 @@ impl std::fmt::Debug for SimLink {
     }
 }
 
+/// Map a fabric virtual timestamp onto a `std::time::Instant` age.
+///
+/// `ConnectionHealth` stores wall-clock instants. The fabric's clock is
+/// tokio virtual time, which a paused test can advance. Subtracting the
+/// virtual age from `Instant::now` makes that age visible to the
+/// one-sided-link gate without sleeping on the wall clock.
+fn virtual_age_instant(now_virtual: Duration, at: Duration) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_sub(now_virtual.saturating_sub(at))
+}
+
 impl SimLink {
     pub(crate) fn peer_id(&self) -> PeerId {
         self.me
@@ -1964,11 +2029,22 @@ impl SimLink {
     /// real daemon on a healthy connection does not make (W3-H #1207 S0
     /// round 4).
     pub(crate) fn connection_health(&self, peer_id: &PeerId) -> ant_quic::ConnectionHealth {
-        let generation = self.current_connection_generation(peer_id);
+        let now_virtual = self.fabric.now();
+        let key = pair(self.me.0, peer_id.0);
+        let state = self.fabric.lock();
+        let link = state.links.get(&key);
+        let generation = link.map(|link| link.generation_for(self.me.0));
+        let idx = usize::from(self.me.0 != key.0);
+        let (sent, received) = link
+            .map(|link| (link.sent_at[idx], link.recv_at[idx]))
+            .unwrap_or((None, None));
+        drop(state);
         ant_quic::ConnectionHealth {
             connected: generation.is_some(),
             generation,
             reader_task_active: generation.is_some().then_some(true),
+            last_sent_at: sent.and_then(|at| virtual_age_instant(now_virtual, at)),
+            last_received_at: received.and_then(|at| virtual_age_instant(now_virtual, at)),
             ..ant_quic::ConnectionHealth::default()
         }
     }
@@ -2125,7 +2201,7 @@ impl SimLink {
             .lock()
             .links
             .get(&pair(self.me.0, peer.0))
-            .map(|link| link.generation)
+            .map(|link| link.generation_for(self.me.0))
     }
 
     pub(crate) fn session_connection(&self, peer: &PeerId) -> Option<SimConnection> {
@@ -2134,7 +2210,7 @@ impl SimLink {
             .links
             .get(&pair(self.me.0, peer.0))
             .map(|link| SimConnection {
-                generation: link.generation,
+                generation: link.generation_for(self.me.0),
                 closed: Arc::clone(&link.closed),
             })
     }

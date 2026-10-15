@@ -20,8 +20,10 @@ Examples:
 `status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers
 for its whole uptime past a 120 s bootstrap grace (issue #262 — the wedged
 transport signal; `ok` stays `true` because the process itself is alive). A
-degraded response carries a `degraded_reason` string. Fleet deployments under
-a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
+degraded response carries a `degraded_reason` string. A connected peer whose
+send or receive age is at least 60 s, while another peer still has traffic
+at most 10 s old, is also `degraded` (issue #1419, a one-sided link). Fleet
+deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
 that long at zero peers — off by default.
 
@@ -907,7 +909,7 @@ or an illegal placement; `501` ceremony disabled.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/peers` | `x0x peers` | Connected gossip peers |
+| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that link is one-sided, #1419) |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |

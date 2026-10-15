@@ -1301,11 +1301,21 @@ pub async fn serve_with_options(
                     .await
                     .map(|p| p.len())
                     .unwrap_or(0);
-                let send_ready = match snapshot_state.agent.network() {
-                    Some(network) => network.send_ready_peers().await.len(),
-                    None => 0,
+                let (send_ready, one_sided) = match snapshot_state.agent.network() {
+                    Some(network) => {
+                        // #1419: sample connection health off the /health
+                        // request path, publish the count, then re-dial.
+                        // The handler stays a lock-free snapshot read (#600).
+                        let one_sided = network.one_sided_peer_ids().await;
+                        let count = one_sided.len();
+                        network.repair_one_sided_links(&one_sided).await;
+                        (network.send_ready_peers().await.len(), count)
+                    }
+                    None => (0, 0),
                 };
-                snapshot_state.health_snapshot.store(peers, send_ready);
+                snapshot_state
+                    .health_snapshot
+                    .store(peers, send_ready, one_sided);
             }
         }));
     }

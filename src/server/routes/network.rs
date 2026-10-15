@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Serialize)]
 pub(in crate::server) struct PeerEntry {
     id: String,
+    /// `healthy`, or `degraded` when this peer's link is one-sided (#1419).
+    link: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,12 +121,27 @@ pub(in crate::server) async fn network_status(
 
 /// GET /peers
 pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let degraded: Vec<[u8; 32]> = match state.agent.network() {
+        Some(network) => network
+            .one_sided_peer_ids()
+            .await
+            .into_iter()
+            .map(|peer| peer.0)
+            .collect(),
+        None => Vec::new(),
+    };
     match state.agent.peers().await {
         Ok(peer_list) => {
             let entries: Vec<PeerEntry> = peer_list
                 .into_iter()
-                .map(|p| PeerEntry {
-                    id: hex::encode(p.to_bytes()),
+                .map(|p| {
+                    let id = hex::encode(p.to_bytes());
+                    let link = if degraded.iter().any(|peer| hex::encode(peer) == id) {
+                        "degraded"
+                    } else {
+                        "healthy"
+                    };
+                    PeerEntry { id, link }
                 })
                 .collect();
             (
