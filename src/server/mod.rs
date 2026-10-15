@@ -50,15 +50,16 @@ use routes::{
     ack_diagnostics, acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add,
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
     add_named_group_member, add_task, agent_info, agent_reachability, agent_sign,
-    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
-    apply_direct_kv_store_delta, apply_named_group_metadata_event_inner_serialized, apply_upgrade,
-    approve_join_request, ban_group_member, bootstrap_cache_stats, broadcast_current_manifest,
-    cancel_join_request, causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
+    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_completed_upgrade,
+    announce_identity, apply_direct_kv_store_delta,
+    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
+    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
+    causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
     connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
-    daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
+    delete_contact, delete_discovery_subscription, delete_kv_value, delete_machine,
+    direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
     discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
     dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
@@ -75,10 +76,10 @@ use routes::{
     identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
     join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
     list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
-    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
-    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
+    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
@@ -86,13 +87,14 @@ use routes::{
     publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
-    remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    remove_named_group_member, replay_pending_causal_approvals, report_available_update,
+    requester_offer_step, restore_treekem_groups, revoke_contact, run_direct_metadata_listener,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -100,13 +102,12 @@ use routes::{
     update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -258,17 +259,20 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     serve_with_options(config, options).await?.wait().await
 }
 
-/// CLI `--check-updates`: run the startup update check, print its outcome, and
-/// return without serving. Mirrors the print-and-exit behaviour the daemon had
-/// inline before the [`serve_with_options`] extraction. Only the binary calls
-/// this; the embed path never installs updates.
+/// CLI `--check-updates`: check for a newer verified release, print the
+/// result, and return without serving. Report only (ADR 0094 §1, #1106): it
+/// installs no binary and no SKILL.md, so it cannot bypass the running
+/// daemon's staged-rollout wait. Only the binary calls this.
 pub async fn run_update_check_and_report(
     config: &DaemonConfig,
     skip_update_check: bool,
 ) -> anyhow::Result<()> {
     if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None, None).await {
-            Ok(Some(version)) => println!("x0xd updated to {version}"),
+        match report_available_update(config).await {
+            Ok(Some(version)) => println!(
+                "x0xd update available: {version} (report only: nothing was installed; \
+                 the running daemon applies it after its staged-rollout wait)"
+            ),
             Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
             Err(e) => return Err(e).context("self-update check failed"),
         }
@@ -453,6 +457,8 @@ pub async fn serve_with_options(
     // for startup checks, background gossip/poll workers, and `/upgrade/apply`.
     // The config itself stays unchanged, so a later ordinary launch still
     // participates in the normal release train.
+    // The daemon binary is configured for self-update; embedders are not.
+    let configured_for_self_update = self_update_enabled;
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
     // Ensure data directory exists early so self-update has a working directory.
     tokio::fs::create_dir_all(&config.data_dir)
@@ -477,6 +483,9 @@ pub async fn serve_with_options(
         pid = std::process::id(),
         "x0xd started"
     );
+    // #1106: report a self-update that the previous process applied, once,
+    // at WARN level ("x0xd upgraded from X to Y").
+    announce_completed_upgrade(&config.data_dir);
 
     // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
     // by the binary (see `run_update_check_and_report`) before it ever calls
@@ -1698,31 +1707,45 @@ pub async fn serve_with_options(
     // HTTP timeout in the background instead of delaying API readiness.
     // Gates unchanged: `self_update_enabled` (embedders /
     // `--skip-update-check`) AND `[update] enabled`.
-    if self_update_enabled && config.update.enabled {
+    // One staged-rollout scheduler per daemon (#1106, ADR 0094 §1): the
+    // startup check, the gossip listener, the fallback poll and
+    // `POST /upgrade/apply` all offer verified releases to it, and it applies
+    // a release only after this node's delay. It carries the #261 restart
+    // planner context (bound API address + graceful-shutdown hook), which
+    // exists only now, post-bind.
+    let rollout = (self_update_enabled && config.update.enabled)
+        .then(|| routes::rollout_scheduler_for(&state));
+    if let Some(window) = rollout.as_ref().map(|r| r.window_minutes()) {
+        tracing::info!(
+            rollout_window_minutes = window,
+            "Staged rollout active: releases apply 0-{window} min after first receipt"
+        );
+    }
+    // #1106 review F2/R1: every daemon that runs from the install keeps a
+    // fresh participant record beside the shared executable, written under
+    // the host lock. One with self-update off (`--skip-update-check`,
+    // `[update] enabled = false`) registers as such and never becomes due.
+    if let Some(heartbeat) = rollout
+        .as_ref()
+        .and_then(|r| r.spawn_participant_heartbeat())
+    {
+        bg_tasks.push(heartbeat);
+    } else if configured_for_self_update {
+        if let Ok(exe) = x0x::upgrade::apply::current_binary_path() {
+            bg_tasks.push(routes::spawn_updates_off_participant(
+                exe,
+                *state.agent.machine_id().as_bytes(),
+                config.data_dir.clone(),
+                state.shutdown_notify.subscribe(),
+            ));
+        }
+    }
+
+    if let Some(rollout) = rollout.as_ref() {
         let startup_check_config = config.clone();
-        // #261: the apply's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel) —
-        // both exist only now, post-bind.
-        let startup_api_addr = state.api_address;
-        let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
-        let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
-        let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        let startup_rollout = Arc::clone(rollout);
         bg_tasks.push(tokio::spawn(async move {
-            let data_dir = startup_check_config.data_dir.clone();
-            if let Err(e) = run_startup_update_check(
-                &startup_check_config,
-                None,
-                Some(StartupUpdateCheckRuntime {
-                    restart_context: listener_restart_context(
-                        &data_dir,
-                        startup_api_addr,
-                        startup_shutdown,
-                    ),
-                    upgrade_apply_lock: startup_apply_lock,
-                    shutdown_watch: startup_shutdown_watch,
-                }),
-            )
-            .await
+            if let Err(e) = run_startup_update_check(&startup_check_config, &startup_rollout).await
             {
                 tracing::warn!(error = %e, "Startup update check failed: {e}");
             }
@@ -1732,25 +1755,17 @@ pub async fn serve_with_options(
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
-    if self_update_enabled && config.update.enabled && config.update.gossip_updates {
-        let update_config = config.update.clone();
+    if let Some(rollout) = rollout.as_ref().filter(|_| config.update.gossip_updates) {
         let agent_for_gossip = Arc::clone(&state.agent);
         let data_dir = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        // #261: the listener's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel).
-        let gossip_api_addr = state.api_address;
-        let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let gossip_rollout = Arc::clone(rollout);
         bg_tasks.push(tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
-                update_config,
                 data_dir,
-                upgrade_apply_lock,
                 self_published_for_gossip,
-                gossip_api_addr,
-                gossip_shutdown,
+                gossip_rollout,
             )
             .await;
         }));
@@ -1782,26 +1797,22 @@ pub async fn serve_with_options(
 
     // GitHub fallback poll (safety net, default every 48h). Install/restart
     // capable, so gated on `self_update_enabled` (embedders opt out).
-    if self_update_enabled
-        && config.update.enabled
-        && config.update.fallback_check_interval_minutes > 0
+    if let Some(rollout) = rollout
+        .as_ref()
+        .filter(|_| config.update.fallback_check_interval_minutes > 0)
     {
         let update_config = config.update.clone();
         let agent_for_poll = Arc::clone(&state.agent);
         let data_dir_for_poll = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        let poll_api_addr = state.api_address;
-        let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let poll_rollout = Arc::clone(rollout);
         bg_tasks.push(tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
                 update_config,
                 data_dir_for_poll,
-                upgrade_apply_lock,
                 self_published_for_poll,
-                poll_api_addr,
-                poll_shutdown,
+                poll_rollout,
             )
             .await;
         }));

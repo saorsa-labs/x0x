@@ -25,8 +25,10 @@ SSH ops unnecessary:
   and downloads the announced archive
 - `src/upgrade/apply.rs` does the atomic binary replacement with
   rollback
-- `src/upgrade/rollout.rs` provides a deterministic per-machine
-  staggered delay
+- `src/upgrade/rollout.rs` provides a deterministic per-machine,
+  per-release staggered delay; since 0.48.1 every apply path waits it
+  (`[update] rollout_window_minutes`, default 60; #1106,
+  [upgrade system](../upgrade-system.md#staged-rollout-1106-adr-0094-1))
 
 This is exactly what we need for "deploy via gossip", with one missing
 piece: the **release-signing key is GitHub-only**. A test or operator
@@ -101,7 +103,9 @@ python3 tests/e2e_vps_groups.py --anchor nyc
 After the one-time seed of trust keys, **every subsequent deploy is
 zero SSH** and naturally acquires symmetric gossip propagation,
 quality-scored bootstrap-cache enrichment, and per-machine rollout
-staggering — properties the SSH-driven path doesn't have.
+staggering (0–`rollout_window_minutes` after first receipt, since 0.48.1;
+#1106) — properties the SSH-driven path doesn't have. A test deploy that must
+land at once sets `rollout_window_minutes = 0` on its private hosts (D184).
 
 ## Acceptance criteria
 

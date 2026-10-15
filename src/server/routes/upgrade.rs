@@ -16,14 +16,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
-use x0x::upgrade::apply::{AutoApplyUpgrader, RestartContext};
+use x0x::upgrade::apply::{ApplySummary, AutoApplyUpgrader, RestartContext};
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::restart::RestartOwnershipError;
+use x0x::upgrade::rollout::{RolloutState, RolloutTrigger, StagedRelease};
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::Agent;
 
@@ -123,22 +125,6 @@ pub(in crate::server) fn daemon_shutdown_hook(
         let _ = notify.send(true);
         let _ = tx.try_send(());
     })
-}
-
-/// Runtime pieces the daemon's startup check needs now that it runs AFTER
-/// the API listener is bound (#1086), concurrently with the other updater
-/// tasks: the #261 restart planner context (bound API address for the
-/// health commit + the graceful-shutdown hook) and the apply lock shared
-/// with the gossip release listener and the fallback poll.
-pub(in crate::server) struct StartupUpdateCheckRuntime {
-    /// Restart planner context for a successful apply (bound API address +
-    /// shutdown hook).
-    pub restart_context: RestartContext,
-    /// Serializes destructive binary replacement with the other apply paths.
-    pub upgrade_apply_lock: Arc<Mutex<()>>,
-    /// Daemon shutdown watch; cancels the #1196 start-rate window wait so
-    /// shutdown is never held up by a time-bound refusal.
-    pub shutdown_watch: watch::Receiver<bool>,
 }
 
 /// Background-listener context (gossip + fallback poll): the running daemon's
@@ -289,24 +275,955 @@ where
     };
     attempt().await
 }
+
+// ---------------------------------------------------------------------------
+// Staged rollout (#1106, ADR 0094 §1, rulings D183/D184)
+// ---------------------------------------------------------------------------
+
+/// How often a waiting release checkpoints its served wait to disk.
+const ROLLOUT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A version that failed to apply is not retried by an automatic trigger for
+/// this long. One backoff now serves every apply path.
+const APPLY_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// Future returned by [`RolloutApplier::apply`].
+pub(in crate::server) type ApplyFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// The destructive half of a due apply. Production uses [`DaemonApplier`];
+/// inert tests count attempts instead.
+pub(in crate::server) trait RolloutApplier: Send + Sync {
+    /// Apply `manifest` now. The scheduler holds the in-process apply lock.
+    fn apply<'a>(&'a self, manifest: &'a ReleaseManifest, summary: ApplySummary)
+        -> ApplyFuture<'a>;
+}
+
+/// Production applier: the shared #261 restart planner and the host-locked
+/// swap in [`AutoApplyUpgrader::apply_upgrade_from_manifest`].
+pub(in crate::server) struct DaemonApplier {
+    /// `[update] stop_on_upgrade`.
+    pub stop_on_upgrade: bool,
+    /// Restart planner context (data dir, API address, shutdown hook).
+    pub restart_context: RestartContext,
+    /// This daemon's shared-install participant gate (#1106 review F2).
+    pub shared_install_gate: Option<x0x::upgrade::apply::SharedInstallGate>,
+}
+
+impl RolloutApplier for DaemonApplier {
+    fn apply<'a>(
+        &'a self,
+        manifest: &'a ReleaseManifest,
+        summary: ApplySummary,
+    ) -> ApplyFuture<'a> {
+        Box::pin(async move {
+            let skip_waits = summary.bypass;
+            AutoApplyUpgrader::new("x0xd")
+                .with_stop_on_upgrade(self.stop_on_upgrade)
+                .with_restart_context(self.restart_context.clone())
+                .with_apply_summary(summary)
+                .with_shared_install_gate(
+                    self.shared_install_gate
+                        .clone()
+                        .map(|gate| x0x::upgrade::apply::SharedInstallGate { skip_waits, ..gate }),
+                )
+                .apply_upgrade_from_manifest(manifest)
+                .await
+        })
+    }
+}
+
+/// Everything the scheduler needs from the running daemon.
+pub(in crate::server) struct RolloutEnv {
+    /// This instance's MachineId: the stagger key (ADR 0094 §1).
+    pub node_id: [u8; 32],
+    /// Effective `[update] rollout_window_minutes` (D183/D184).
+    pub window_minutes: u64,
+    /// Instance data directory; holds `upgrade-rollout.json`.
+    pub data_dir: PathBuf,
+    /// The in-process apply lock shared with `POST /upgrade/apply`.
+    pub upgrade_apply_lock: Arc<Mutex<()>>,
+    /// Daemon shutdown watch: stops waiters and the #1196 retry wait.
+    pub shutdown_watch: watch::Receiver<bool>,
+    /// The destructive half of a due apply.
+    pub applier: Arc<dyn RolloutApplier>,
+    /// The installed executable this daemon runs from. When set, the daemon
+    /// keeps its shared-install participant record beside it (#1106 F2).
+    pub install_target: Option<PathBuf>,
+}
+
+/// What the scheduler decided for one offered release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) enum RolloutOffer {
+    /// Not newer than the running version.
+    NotNewer,
+    /// This process already applied this version or a newer one.
+    AlreadyApplied,
+    /// The version failed to apply recently (automatic triggers only).
+    BackoffActive,
+    /// A newer release is already staged; this one is not applied.
+    Superseded {
+        /// The newer staged version.
+        by: String,
+    },
+    /// The node still waits. A waiter task applies the release when due.
+    Waiting(StagedRelease),
+    /// The wait is served. The caller applies now with
+    /// [`RolloutScheduler::apply_due`].
+    Due(StagedRelease),
+    /// The stored rollout state cannot be trusted (ADR 0094 §6 fail
+    /// closed): nothing applies until a supported binary or an explicit
+    /// repair resolves it.
+    Blocked {
+        /// Why the state is blocked.
+        reason: String,
+    },
+}
+
+/// Per-instance staged-rollout scheduler.
+///
+/// Every apply path (startup check, gossip listener, fallback poll and
+/// `POST /upgrade/apply`) verifies a release first and then offers it here.
+/// The scheduler stages the release in the persisted state, and applies it
+/// only after this node's delay. While it waits, nothing is downloaded or
+/// replaced.
+pub(in crate::server) struct RolloutScheduler {
+    env: RolloutEnv,
+    state_path: PathBuf,
+    inner: Mutex<RolloutInner>,
+}
+
+struct RolloutInner {
+    state: RolloutState,
+    waiter: Option<RolloutWaiter>,
+    failed: HashMap<String, Instant>,
+    applied: Option<String>,
+    /// The latest participant record; the heartbeat writes it under the
+    /// host lock (review R1).
+    participant_tx: watch::Sender<Option<x0x::upgrade::participants::ParticipantRecord>>,
+}
+
+impl RolloutInner {
+    fn is_current_waiter(&self, version: &str) -> bool {
+        self.waiter.as_ref().is_some_and(|w| w.version == version)
+    }
+}
+
+struct RolloutWaiter {
+    version: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Log the result of a staged apply the way every path logged it before.
+fn log_apply_result(
+    trigger: RolloutTrigger,
+    result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) {
+    match result {
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+            tracing::info!(%version, %trigger, "Successfully upgraded to version {version}");
+        }
+        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
+            tracing::warn!(%reason, %trigger, "Upgrade rolled back");
+        }
+        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => {}
+        Err(e @ x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }) => {
+            tracing::info!(%trigger, "Upgrade waits: {e}");
+        }
+        // D194 (review S3): reported at WARN (every 10 minutes while it
+        // lasts), not counted as a failure.
+        Err(e @ x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => {
+            tracing::warn!(%trigger, "Upgrade waits for disk space: {e}");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %trigger, "Upgrade failed: {e}");
+        }
+    }
+}
+
+/// Write this daemon's shared-install participant record (#1106 review F2)
+/// from the scheduler state: the active staged release, its wait, and any
+/// blocked state. The record goes to the heartbeat task, which writes it
+/// under the host lock (review R1). Until it is written, this daemon's own
+/// swap waits (its participants are not established).
+fn publish_participant_record(env: &RolloutEnv, inner: &RolloutInner) {
+    if env.install_target.is_none() {
+        return;
+    }
+    let staged = inner.state.newest_release(x0x::VERSION).map(|entry| {
+        x0x::upgrade::participants::ParticipantStage {
+            release: entry.version.clone(),
+            delay_secs: entry.delay_secs,
+            remaining_secs: entry.remaining().as_secs(),
+            due: entry.is_due(),
+        }
+    });
+    let record = x0x::upgrade::participants::ParticipantRecord::new(
+        &env.node_id,
+        &env.data_dir,
+        x0x::VERSION,
+        unix_now_secs(),
+        staged,
+        inner.state.blocked.clone(),
+    );
+    inner.participant_tx.send_replace(Some(record));
+}
+
+/// Write a participant record under the host upgrade lock (review R1). The
+/// wait for the lock is bounded; a failure is a WARN, because the shared
+/// install then cannot count this daemon.
+async fn write_participant_record_locked(
+    target: &std::path::Path,
+    key: &str,
+    record: &x0x::upgrade::participants::ParticipantRecord,
+) -> bool {
+    let written =
+        match x0x::upgrade::HostUpgradeLock::acquire(target, x0x::upgrade::HOST_UPGRADE_LOCK_WAIT)
+            .await
+        {
+            Ok(lock) => x0x::upgrade::participants::write_own(&lock, target, key, record)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                install = %target.display(),
+                "Failed to write this daemon's shared-install participant record; until it is \
+                 written, this daemon holds the unregistered signal and no daemon on the install \
+                 swaps the shared binary"
+            );
+            false
+        }
+    }
+}
+
+/// Why a queued apply attempt for `version` must not run (review R6).
+fn attempt_must_not_apply(inner: &RolloutInner, version: &str) -> Option<&'static str> {
+    if inner
+        .applied
+        .as_deref()
+        .is_some_and(|applied| !is_newer(version, applied))
+    {
+        return Some("already applied");
+    }
+    if inner.state.blocked.is_some() {
+        return Some("staged-rollout state is blocked");
+    }
+    if inner
+        .state
+        .newest_release(x0x::VERSION)
+        .is_some_and(|active| is_newer(&active.version, version))
+    {
+        return Some("superseded by a newer staged release");
+    }
+    match inner.state.entry(version) {
+        Some(entry) if entry.is_due() || entry.bypass.is_some() => None,
+        Some(_) => Some("its staged-rollout wait is not served"),
+        None => Some("no longer staged"),
+    }
+}
+
+/// A wait, not a failure: the shared install waits for a participant, or
+/// staging would break the 1 GiB disk reserve (D194, review S3). No backoff
+/// is counted; a waiter checks again.
+fn is_participant_wait(
+    result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) -> bool {
+    matches!(
+        result,
+        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }
+            | x0x::upgrade::UpgradeError::InsufficientDisk { .. })
+    )
+}
+
+/// How long a waiter pauses before it tries a waiting release again.
+fn wait_pause(
+    result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) -> Duration {
+    match result {
+        Err(x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => DISK_RECHECK,
+        _ => x0x::upgrade::participants::PARTICIPANT_RECHECK,
+    }
+}
+
+/// How often a waiter checks the disk reserve again after insufficient_disk.
+const DISK_RECHECK: Duration = Duration::from_secs(10 * 60);
+
+impl RolloutScheduler {
+    /// Load the persisted state and build the scheduler.
+    pub(in crate::server) fn new(env: RolloutEnv) -> Arc<Self> {
+        let state_path = RolloutState::path_in(&env.data_dir);
+        let (state, problem) = RolloutState::load(&state_path);
+        if let Some(problem) = problem {
+            tracing::warn!(
+                path = %state_path.display(),
+                reason = %problem.reason,
+                "Staged-rollout state is unreadable; self-update apply is BLOCKED until a \
+                 supported binary or an operator repair resolves it (the record is kept)"
+            );
+        }
+        let inner = RolloutInner {
+            state,
+            waiter: None,
+            failed: HashMap::new(),
+            applied: None,
+            participant_tx: watch::channel(None).0,
+        };
+        // Register as a shared-install participant (#1106 review F2).
+        publish_participant_record(&env, &inner);
+        Arc::new(Self {
+            env,
+            state_path,
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// Refresh this daemon's participant record every
+    /// [`x0x::upgrade::participants::PARTICIPANT_REFRESH`] until shutdown,
+    /// so other daemons on the install do not see it as stale.
+    pub(in crate::server) fn spawn_participant_heartbeat(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let target = self.env.install_target.clone()?;
+        let this = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            let key = x0x::upgrade::participants::participant_key(&this.env.data_dir);
+            let mut records = this.inner.lock().await.participant_tx.subscribe();
+            let mut shutdown = this.env.shutdown_watch.clone();
+            // Review S1: until its record is written, this daemon holds the
+            // shared "unregistered" signal, so no writer swaps meanwhile.
+            let mut unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+            let mut registered = false;
+            loop {
+                let latest = records.borrow_and_update().clone();
+                if let Some(mut record) = latest {
+                    record.updated_unix = unix_now_secs();
+                    if !registered && unregistered.is_none() {
+                        unregistered =
+                            x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+                    }
+                    if write_participant_record_locked(&target, &key, &record).await {
+                        registered = true;
+                        unregistered = None;
+                    }
+                }
+                let pause = if registered {
+                    x0x::upgrade::participants::PARTICIPANT_REFRESH
+                } else {
+                    x0x::upgrade::participants::PARTICIPANT_RECHECK
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(pause) => {}
+                    changed = records.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Start a waiter for `manifest` if none runs for it (a due release that
+    /// waits for the other shared-install participants).
+    pub(in crate::server) async fn ensure_waiter(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        let running = inner
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.version == manifest.version && !w.task.is_finished());
+        if running {
+            return;
+        }
+        let this = Arc::clone(self);
+        let waiter_manifest = manifest.clone();
+        let task = tokio::spawn(async move {
+            this.run_waiter(waiter_manifest, trigger, sender).await;
+        });
+        inner.waiter = Some(RolloutWaiter {
+            version: manifest.version.clone(),
+            task,
+        });
+    }
+
+    /// The effective rollout window in minutes.
+    pub(in crate::server) fn window_minutes(&self) -> u64 {
+        self.env.window_minutes
+    }
+
+    fn persist(&self, state: &RolloutState) {
+        if let Err(e) = state.save(&self.state_path) {
+            tracing::warn!(
+                path = %self.state_path.display(),
+                error = %e,
+                "Failed to persist the staged-rollout wait; a restart may serve it again"
+            );
+        }
+    }
+
+    /// Whether `version` failed to apply within [`APPLY_RETRY_AFTER`].
+    pub(in crate::server) async fn backoff_active(&self, version: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        inner
+            .failed
+            .retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
+        inner.failed.contains_key(version)
+    }
+
+    /// Record that this process applied `version` (the HTTP path applies
+    /// inline), so no waiter applies it a second time.
+    pub(in crate::server) async fn mark_applied(&self, version: &str) {
+        self.inner.lock().await.applied = Some(version.to_string());
+    }
+
+    /// Offer a verified release. The caller has checked its signature and
+    /// age. The release is staged (idempotent: a duplicate receipt or a
+    /// restart keeps the served wait), and then either reported due or left
+    /// to a waiter task.
+    pub(in crate::server) async fn offer(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+    ) -> RolloutOffer {
+        self.offer_inner(manifest, trigger, sender, None).await
+    }
+
+    async fn offer_inner(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+        bypass_by: Option<&str>,
+    ) -> RolloutOffer {
+        let version = manifest.version.as_str();
+        if !is_newer(version, x0x::VERSION) {
+            return RolloutOffer::NotNewer;
+        }
+        let mut inner = self.inner.lock().await;
+        // ADR 0094 §6 fail closed (review F4): an untrusted stored state
+        // blocks every trigger, the manual one included.
+        if let Some(reason) = &inner.state.blocked {
+            return RolloutOffer::Blocked {
+                reason: reason.clone(),
+            };
+        }
+        if let Some(applied) = &inner.applied {
+            if !is_newer(version, applied) {
+                return RolloutOffer::AlreadyApplied;
+            }
+        }
+        if let Some(waiter) = &inner.waiter {
+            if !waiter.task.is_finished() && is_newer(&waiter.version, version) {
+                return RolloutOffer::Superseded {
+                    by: waiter.version.clone(),
+                };
+            }
+        }
+        // The stored active release supersedes older ones across restarts
+        // (review F5): an older manifest that arrives first after a restart
+        // must not start or resume its own wait.
+        if let Some(active) = inner.state.newest_release(x0x::VERSION) {
+            if is_newer(&active.version, version) {
+                return RolloutOffer::Superseded {
+                    by: active.version.clone(),
+                };
+            }
+        }
+        if trigger != RolloutTrigger::Manual {
+            inner
+                .failed
+                .retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
+            if inner.failed.contains_key(version) {
+                return RolloutOffer::BackoffActive;
+            }
+        }
+
+        let before = inner.state.clone();
+        let (staged, is_new) = inner.state.stage(
+            version,
+            &self.env.node_id,
+            self.env.window_minutes,
+            trigger,
+            unix_now_secs(),
+            x0x::VERSION,
+        );
+        // A duplicate receipt changes nothing; do not rewrite the file.
+        if inner.state != before {
+            self.persist(&inner.state);
+            publish_participant_record(&self.env, &inner);
+        }
+        if is_new {
+            tracing::info!(
+                version = %staged.version,
+                %trigger,
+                delay_secs = staged.delay_secs,
+                window_minutes = staged.window_minutes,
+                "Staged release v{}: this node applies it {}s after first receipt \
+                 ({}-minute rollout window, ADR 0094 §1)",
+                staged.version,
+                staged.delay_secs,
+                staged.window_minutes
+            );
+        }
+
+        // D185: `now=true` skips the wait for this host only, after every
+        // check above (blocked hold, already applied, superseded). The
+        // bypass and who asked are kept in the rollout state.
+        if let Some(requested_by) = bypass_by {
+            let staged = inner
+                .state
+                .record_bypass(version, requested_by, unix_now_secs())
+                .unwrap_or(staged);
+            self.persist(&inner.state);
+            publish_participant_record(&self.env, &inner);
+            tracing::info!(
+                version = %staged.version,
+                requested_by,
+                delay_secs = staged.delay_secs,
+                remaining_secs = staged.remaining().as_secs(),
+                "now=true: skipping the staged-rollout wait for this host (D185)"
+            );
+            // A waiter for this release stops at its next checkpoint; the
+            // caller applies now.
+            inner.waiter = None;
+            return RolloutOffer::Due(staged);
+        }
+
+        let same_waiter = inner
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.version == version && !w.task.is_finished());
+        if same_waiter {
+            return RolloutOffer::Waiting(staged);
+        }
+        // An older waiter, if any, is superseded: it sees that it is no
+        // longer current at its next checkpoint and stops without applying.
+        inner.waiter = None;
+        if staged.is_due() {
+            return RolloutOffer::Due(staged);
+        }
+        let this = Arc::clone(self);
+        let waiter_manifest = manifest.clone();
+        let task = tokio::spawn(async move {
+            this.run_waiter(waiter_manifest, trigger, sender).await;
+        });
+        inner.waiter = Some(RolloutWaiter {
+            version: version.to_string(),
+            task,
+        });
+        RolloutOffer::Waiting(staged)
+    }
+
+    /// D185: an authenticated `now=true` request. It stages the release
+    /// like any receipt and then skips the wait for this host only.
+    pub(in crate::server) async fn offer_now(
+        self: &Arc<Self>,
+        manifest: &ReleaseManifest,
+        requested_by: &str,
+    ) -> RolloutOffer {
+        self.offer_inner(
+            manifest,
+            RolloutTrigger::Manual,
+            Some(requested_by.to_string()),
+            Some(requested_by),
+        )
+        .await
+    }
+
+    /// Apply a due release now, under the in-process apply lock, with the
+    /// #1196 single retry after an unaged systemd start-rate window.
+    pub(in crate::server) async fn apply_due(
+        &self,
+        manifest: &ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+        staged: &StagedRelease,
+    ) -> Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError> {
+        // Review S5: a recorded now=true bypass stays on every attempt: the
+        // summary names it and its requester, and the shared gate runs in
+        // skip-waits mode (holds still stop it).
+        let summary = ApplySummary {
+            trigger: Some(trigger),
+            sender: staged
+                .bypass
+                .as_ref()
+                .map(|b| b.requested_by.clone())
+                .or(sender),
+            delay_secs: staged.delay_secs,
+            bypass: staged.bypass.is_some(),
+        };
+        let mut shutdown = self.env.shutdown_watch.clone();
+        let attempt = || {
+            let summary = summary.clone();
+            async move {
+                // Review R6: this attempt holds the apply lock now, and it
+                // may have queued on it (or on the #1196 retry window).
+                // Recheck under the lock, before any download or swap.
+                let skip = {
+                    let inner = self.inner.lock().await;
+                    attempt_must_not_apply(&inner, &manifest.version)
+                };
+                if let Some(reason) = skip {
+                    tracing::info!(
+                        version = %manifest.version,
+                        reason,
+                        "Staged apply of v{} cancelled before download",
+                        manifest.version
+                    );
+                    return Ok(x0x::upgrade::UpgradeResult::NoUpgrade);
+                }
+                self.env.applier.apply(manifest, summary).await
+            }
+        };
+        let result =
+            apply_with_start_rate_retry(Some(&self.env.upgrade_apply_lock), attempt, &mut shutdown)
+                .await;
+        let mut inner = self.inner.lock().await;
+        match &result {
+            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
+                inner.applied = Some(version.clone());
+            }
+            // A shared install that waits for another participant is a
+            // wait, not a failed apply (#1106 review F2).
+            Err(
+                x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }
+                | x0x::upgrade::UpgradeError::InsufficientDisk { .. },
+            ) => {}
+            Ok(x0x::upgrade::UpgradeResult::RolledBack { .. }) | Err(_) => {
+                inner
+                    .failed
+                    .insert(manifest.version.clone(), Instant::now());
+            }
+            Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => {}
+        }
+        result
+    }
+
+    /// Store the served wait. Returns whether `version` is still the
+    /// current waiter.
+    async fn checkpoint(&self, version: &str, waited_secs: u64) -> bool {
+        let mut inner = self.inner.lock().await;
+        inner.state.set_waited(version, waited_secs);
+        self.persist(&inner.state);
+        publish_participant_record(&self.env, &inner);
+        inner.is_current_waiter(version)
+    }
+
+    async fn run_waiter(
+        self: Arc<Self>,
+        manifest: ReleaseManifest,
+        trigger: RolloutTrigger,
+        sender: Option<String>,
+    ) {
+        let version = manifest.version.clone();
+        let mut shutdown = self.env.shutdown_watch.clone();
+        loop {
+            let (waited, remaining) = {
+                let inner = self.inner.lock().await;
+                if !inner.is_current_waiter(&version) {
+                    return;
+                }
+                match inner.state.entry(&version) {
+                    // Review S5: a recorded now=true bypass skips the wait
+                    // here too (a retry after a participant wait).
+                    Some(entry) if entry.bypass.is_some() => (entry.waited_secs, Duration::ZERO),
+                    Some(entry) => (entry.waited_secs, entry.remaining()),
+                    None => return,
+                }
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            let step = remaining.min(ROLLOUT_CHECKPOINT_INTERVAL);
+            let started = tokio::time::Instant::now();
+            let stopped = tokio::select! {
+                _ = tokio::time::sleep(step) => false,
+                changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+            };
+            let served = waited.saturating_add(started.elapsed().as_secs());
+            let current = self.checkpoint(&version, served).await;
+            if stopped || !current {
+                return;
+            }
+        }
+
+        loop {
+            let staged = {
+                let inner = self.inner.lock().await;
+                if !inner.is_current_waiter(&version) {
+                    return;
+                }
+                inner.state.entry(&version).cloned()
+            };
+            let Some(staged) = staged else {
+                return;
+            };
+            tracing::info!(
+                %version,
+                %trigger,
+                delay_secs = staged.delay_secs,
+                "Staged-rollout wait served; applying v{version}"
+            );
+            let result = self
+                .apply_due(&manifest, trigger, sender.clone(), &staged)
+                .await;
+            log_apply_result(trigger, &result);
+            if !is_participant_wait(&result) {
+                break;
+            }
+            // #1106 review F2: another participant of the shared install is
+            // not due yet. Refresh this daemon's record and check again.
+            {
+                let inner = self.inner.lock().await;
+                if !inner.is_current_waiter(&version) {
+                    return;
+                }
+                publish_participant_record(&self.env, &inner);
+            }
+            let stopped = tokio::select! {
+                _ = tokio::time::sleep(wait_pause(&result)) => false,
+                changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+            };
+            if stopped {
+                return;
+            }
+        }
+        let mut inner = self.inner.lock().await;
+        if inner.is_current_waiter(&version) {
+            inner.waiter = None;
+        }
+    }
+}
+
+/// One scheduler per daemon data directory, shared by the background apply
+/// paths and `POST /upgrade/apply`. Weak entries: the scheduler lives as long
+/// as a task or a request holds it.
+static ROLLOUT_SCHEDULERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<RolloutScheduler>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The scheduler environment of a running daemon.
+fn rollout_env_for(state: &AppState) -> RolloutEnv {
+    RolloutEnv {
+        node_id: *state.agent.machine_id().as_bytes(),
+        window_minutes: state.update_config.rollout_window_minutes,
+        data_dir: state.data_dir.clone(),
+        upgrade_apply_lock: Arc::clone(&state.upgrade_apply_lock),
+        shutdown_watch: state.shutdown_notify.subscribe(),
+        applier: Arc::new(DaemonApplier {
+            stop_on_upgrade: state.update_config.stop_on_upgrade,
+            restart_context: listener_restart_context(
+                &state.data_dir,
+                state.api_address,
+                daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
+            ),
+            shared_install_gate: Some(x0x::upgrade::apply::SharedInstallGate {
+                own_key: x0x::upgrade::participants::participant_key(&state.data_dir),
+                skip_waits: false,
+            }),
+        }),
+        install_target: x0x::upgrade::apply::current_binary_path().ok(),
+    }
+}
+
+/// The staged-rollout scheduler of this daemon (created on first use).
+pub(in crate::server) fn rollout_scheduler_for(state: &AppState) -> Arc<RolloutScheduler> {
+    let mut map = ROLLOUT_SCHEDULERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = map.get(&state.data_dir).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    let scheduler = RolloutScheduler::new(rollout_env_for(state));
+    map.insert(state.data_dir.clone(), Arc::downgrade(&scheduler));
+    scheduler
+}
+
+/// At start, report a completed self-update once at WARN level:
+/// "x0xd upgraded from X to Y" (#1106). The previous version comes from the
+/// handoff record that the old process wrote before it exited.
+///
+/// The line is written once per handoff transaction: the reported
+/// transaction is kept in `upgrade-rollout.json`, so a later restart of the
+/// same binary (for example a crash loop) does not repeat it. A stale
+/// handoff record from an older upgrade says nothing.
+pub(in crate::server) fn announce_completed_upgrade(data_dir: &std::path::Path) {
+    let handoff_path = data_dir.join(x0x::upgrade::restart::HANDOFF_FILE_NAME);
+    let Ok(handoff) = x0x::upgrade::restart::UpgradeHandoff::read(&handoff_path) else {
+        return;
+    };
+    if handoff.to_version != x0x::VERSION {
+        return;
+    }
+    let state_path = RolloutState::path_in(data_dir);
+    let (mut state, problem) = RolloutState::load(&state_path);
+    if let Some(problem) = problem {
+        tracing::debug!(
+            path = %state_path.display(),
+            reason = %problem.reason,
+            "Staged-rollout state is unreadable; the reported upgrade is not recorded"
+        );
+    }
+    let Some(notice) = state.take_upgrade_notice(
+        &handoff.from_version,
+        &handoff.to_version,
+        handoff.started_at,
+        x0x::VERSION,
+    ) else {
+        return;
+    };
+    tracing::warn!(
+        from_version = %notice.from_version,
+        to_version = %notice.to_version,
+        mode = ?handoff.mode,
+        handoff_started_at = notice.started_at,
+        "x0xd upgraded from {} to {}",
+        notice.from_version,
+        notice.to_version
+    );
+    if let Err(e) = state.save(&state_path) {
+        tracing::debug!(
+            path = %state_path.display(),
+            error = %e,
+            "Failed to record the reported upgrade; a restart may report it again"
+        );
+    }
+}
+
+/// Offer a verified release to the staged rollout, and apply it when this
+/// node's wait is served (#1106, ADR 0094 §1). Returns the applied version
+/// when this call applied it. While the node waits, nothing is downloaded or
+/// replaced; a waiter task applies the release when it is due.
+async fn stage_and_apply_if_due(
+    rollout: &Arc<RolloutScheduler>,
+    manifest: &ReleaseManifest,
+    trigger: RolloutTrigger,
+    sender: Option<String>,
+) -> Option<String> {
+    match rollout.offer(manifest, trigger, sender.clone()).await {
+        RolloutOffer::Due(staged) => {
+            tracing::info!(
+                version = %manifest.version,
+                %trigger,
+                delay_secs = staged.delay_secs,
+                "Staged-rollout wait served; applying v{}",
+                manifest.version
+            );
+            let result = rollout
+                .apply_due(manifest, trigger, sender.clone(), &staged)
+                .await;
+            log_apply_result(trigger, &result);
+            if is_participant_wait(&result) {
+                // #1106 review F2: the shared install waits for another
+                // participant; a waiter checks again until all are due.
+                rollout.ensure_waiter(manifest, trigger, sender).await;
+            }
+            match result {
+                Ok(x0x::upgrade::UpgradeResult::Success { version }) => Some(version),
+                _ => None,
+            }
+        }
+        RolloutOffer::Waiting(staged) => {
+            tracing::debug!(
+                version = %manifest.version,
+                %trigger,
+                remaining_secs = staged.remaining().as_secs(),
+                "Release v{} is staged; this node still waits",
+                manifest.version
+            );
+            None
+        }
+        RolloutOffer::BackoffActive => {
+            tracing::debug!(
+                version = %manifest.version,
+                %trigger,
+                "Skipping recently failed upgrade v{} (apply backoff active)",
+                manifest.version
+            );
+            None
+        }
+        RolloutOffer::Superseded { by } => {
+            tracing::debug!(
+                version = %manifest.version,
+                superseded_by = %by,
+                "Release v{} is superseded by staged v{by}",
+                manifest.version
+            );
+            None
+        }
+        RolloutOffer::Blocked { reason } => {
+            tracing::warn!(
+                version = %manifest.version,
+                %trigger,
+                %reason,
+                "Release v{} not applied: the staged-rollout state is unreadable (apply blocked until repair)",
+                manifest.version
+            );
+            None
+        }
+        RolloutOffer::AlreadyApplied | RolloutOffer::NotNewer => None,
+    }
+}
+
+/// `x0xd --check-updates`: report whether a newer verified release exists.
+///
+/// Report only (ADR 0094 §1: "Make the fifth path, `x0xd --check-updates`,
+/// report-only"). It installs no binary and no SKILL.md. The running daemon
+/// applies the release after its staged-rollout wait.
+pub(in crate::server) async fn report_available_update(
+    config: &DaemonConfig,
+) -> Result<Option<String>> {
+    let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_include_prereleases(config.update.include_prereleases);
+    let checked = monitor
+        .check_for_updates()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(checked.map(|verified| verified.manifest.version))
+}
+
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
-/// `runtime` distinguishes the two callers: the daemon's startup check —
-/// spawned by `serve_with_options` as a background task after the API
+/// Spawned by `serve_with_options` as a background task after the API
 /// listener is bound (#1086: a firewalled update endpoint must never gate
-/// API readiness on its ~30 s HTTP timeout) — hands the restart to the #261
-/// planner because a daemon process must come back up, and serializes its
-/// apply against the gossip release listener and the fallback poll. On a
-/// systemd host whose activation has not yet outlived
-/// `StartLimitIntervalUSec`, it waits out the window and retries the apply
-/// once (#1196) instead of skipping the version. The CLI `--check-updates`
-/// print-and-exit mode passes `None` — there is no daemon to keep alive,
-/// and a handoff respawn of `x0xd --check-updates` could never serve
-/// `/health`, so it would spuriously roll a good update back.
+/// API readiness on its ~30 s HTTP timeout). A newer verified release is
+/// offered to the staged rollout like every other trigger: it applies only
+/// when this node's wait is served (#1106). A due apply hands the restart to
+/// the #261 planner and serializes against the gossip release listener and
+/// the fallback poll. On a systemd host whose activation has not yet
+/// outlived `StartLimitIntervalUSec`, it waits out the window and retries
+/// the apply once (#1196) instead of skipping the version.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
-    agent: Option<&Arc<Agent>>,
-    runtime: Option<StartupUpdateCheckRuntime>,
+    rollout: &Arc<RolloutScheduler>,
 ) -> Result<Option<String>> {
     let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -344,77 +1261,18 @@ pub(in crate::server) async fn run_startup_update_check(
 
     tracing::info!(
         new_version = %verified.manifest.version,
-        "Startup check: new version available, applying immediately"
+        "Startup check: new version available"
     );
 
     // Update SKILL.md before upgrading (independent of binary update)
     update_skill_if_changed(&verified.manifest, &config.data_dir).await;
 
-    // Broadcast to gossip so other nodes benefit from our discovery
-    if let Some(agent) = agent {
-        if let Err(e) = agent
-            .publish(RELEASE_TOPIC, verified.gossip_payload.clone())
-            .await
-        {
-            tracing::debug!(error = %e, "Failed to broadcast discovered release: {e}");
-        }
-    }
-
     // The startup check runs beside the gossip release listener and the
-    // fallback poll now that it no longer gates startup (#1086); each apply
-    // attempt takes the shared apply lock before touching the binary,
-    // exactly as they do. The lock is taken per attempt (not held across
-    // the #1196 start-rate window wait) so concurrent apply paths are not
-    // starved behind a time-bound refusal.
-    let apply_lock = runtime
-        .as_ref()
-        .map(|runtime| Arc::clone(&runtime.upgrade_apply_lock));
-    let mut shutdown_watch = runtime
-        .as_ref()
-        .map(|runtime| runtime.shutdown_watch.clone());
-
-    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-        .with_stop_on_upgrade(config.update.stop_on_upgrade);
-    let upgrader = match runtime {
-        Some(runtime) => upgrader
-            .with_restart_on_success(true)
-            .with_restart_context(runtime.restart_context),
-        // CLI `--check-updates`: no daemon to keep alive, so no restart —
-        // but the apply planner still needs the data dir and configured
-        // address for its bookkeeping.
-        None => upgrader
-            .with_restart_on_success(false)
-            .with_restart_context(RestartContext {
-                data_dir: Some(config.data_dir.clone()),
-                api_addr: Some(config.api_address),
-                shutdown: None,
-            }),
-    };
-
-    let attempt = || upgrader.apply_upgrade_from_manifest(&verified.manifest);
-    let result = match shutdown_watch.as_mut() {
-        // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
-        // aged-out systemd start-rate window is waited out (bounded by the
-        // readback's own remaining window) and retried once, instead of
-        // skipping the version until the 6-hourly fallback poll.
-        Some(shutdown) => apply_with_start_rate_retry(apply_lock.as_ref(), attempt, shutdown).await,
-        // CLI `--check-updates`: no daemon, no shutdown watch — a single
-        // apply attempt, exactly as before #1196.
-        None => attempt().await,
-    };
-
-    match result {
-        Ok(x0x::upgrade::UpgradeResult::Success { version }) => Ok(Some(version)),
-        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-            tracing::warn!(%reason, "Startup upgrade rolled back");
-            Ok(None)
-        }
-        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => Ok(None),
-        Err(e) => {
-            tracing::error!(error = %e, "Startup upgrade failed: {e}");
-            Ok(None)
-        }
-    }
+    // fallback poll now that it no longer gates startup (#1086). A due
+    // apply takes the shared apply lock per attempt (not across the #1196
+    // start-rate window wait), so concurrent apply paths are not starved
+    // behind a time-bound refusal.
+    Ok(stage_and_apply_if_due(rollout, &verified.manifest, RolloutTrigger::Startup, None).await)
 }
 
 /// Broadcast the current release manifest to gossip after joining the network.
@@ -466,17 +1324,16 @@ pub(in crate::server) async fn broadcast_current_manifest(
 
 /// Gossip-based release subscription — the primary update mechanism for x0xd.
 ///
-/// When an upgrade attempt fails (e.g. hash mismatch), the failed version is
-/// tracked so it won't block future attempts. A newer release superseding the
-/// failed version will be picked up normally.
+/// A verified, newer manifest is rebroadcast at once and then offered to the
+/// staged rollout (#1106): it applies only when this node's wait is served.
+/// When an upgrade attempt fails (e.g. hash mismatch), the scheduler backs
+/// the version off for 30 minutes, so a release that can never apply here
+/// is not re-downloaded on every receipt. A newer release supersedes it.
 pub(in crate::server) async fn run_gossip_update_listener(
     agent: Arc<Agent>,
-    config: DaemonUpdateConfig,
     data_dir: PathBuf,
-    upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    api_addr: SocketAddr,
-    shutdown: Arc<dyn Fn() + Send + Sync>,
+    rollout: Arc<RolloutScheduler>,
 ) {
     let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
         Ok(sub) => sub,
@@ -492,19 +1349,18 @@ pub(in crate::server) async fn run_gossip_update_listener(
     // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
     let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
 
-    // Track versions that failed to *apply* so a release that can never succeed
-    // in this environment (e.g. a locked binary that won't replace) is not
-    // re-downloaded and re-extracted on every gossip receipt. Without this the
-    // gossip path retried indefinitely — the cause of the Windows disk-fill
-    // loop. Mirrors the backoff in run_fallback_github_poll.
-    let mut failed_apply_versions: HashMap<String, Instant> = HashMap::new();
-    const APPLY_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
-
     while let Some(msg) = release_sub.recv().await {
-        tracing::info!("Received release manifest via gossip");
-
-        // Drop expired backoff entries so the map stays bounded.
-        failed_apply_versions.retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
+        // The publisher of this copy (a rebroadcast re-signs with the
+        // rebroadcaster's agent key), when its signature verified.
+        let sender = msg
+            .sender
+            .as_ref()
+            .filter(|_| msg.verified)
+            .map(|id| hex::encode(id.as_bytes()));
+        tracing::info!(
+            sender = sender.as_deref().unwrap_or("unknown"),
+            "Received release manifest via gossip"
+        );
 
         // Decode wire format: length-prefixed manifest JSON + signature
         let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
@@ -620,64 +1476,26 @@ pub(in crate::server) async fn run_gossip_update_listener(
         // Update SKILL.md if changed (independent of binary update)
         update_skill_if_changed(&manifest, &data_dir).await;
 
-        // Skip versions that recently failed to apply. A release that can never
-        // succeed here would otherwise re-download and re-extract on every
-        // gossip receipt; the backoff caps that to one attempt per 30 minutes.
-        if let Some(failed_at) = failed_apply_versions.get(&manifest.version) {
-            if failed_at.elapsed() < APPLY_RETRY_AFTER {
-                tracing::debug!(
-                    version = %manifest.version,
-                    "Skipping recently failed upgrade v{} (apply backoff active)",
-                    manifest.version
-                );
-                continue;
-            }
-        }
-
-        tracing::info!(
-            version = %manifest.version,
-            "Applying upgrade immediately"
-        );
-
-        let _upgrade_guard = upgrade_apply_lock.lock().await;
-        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-            .with_stop_on_upgrade(config.stop_on_upgrade)
-            .with_restart_context(listener_restart_context(
-                &data_dir,
-                api_addr,
-                Arc::clone(&shutdown),
-            ));
-        match upgrader.apply_upgrade_from_manifest(&manifest).await {
-            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-                tracing::info!(%version, "Successfully upgraded to version {version}");
-            }
-            Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-                tracing::warn!(%reason, "Upgrade rolled back");
-                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Upgrade failed: {e}");
-                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
-            }
-            _ => {}
-        }
+        // Stage, and apply only when this node's wait is served. The
+        // scheduler skips versions that recently failed to apply: a release
+        // that can never succeed here would otherwise re-download and
+        // re-extract on every gossip receipt.
+        stage_and_apply_if_due(&rollout, &manifest, RolloutTrigger::Gossip, sender).await;
     }
 }
 
 /// Background GitHub fallback poll (safety net, every 48h by default).
 /// Also broadcasts discovered manifests to gossip and syncs SKILL.md.
 ///
-/// Tracks versions that failed to apply (e.g. due to hash mismatch) and skips
-/// them for 30 minutes before retrying. A newer release superseding the failed
-/// version will be picked up immediately.
+/// A found release is offered to the staged rollout (#1106) like every other
+/// trigger. Versions that failed to apply are skipped for 30 minutes; a
+/// newer release supersedes the failed version.
 pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
     data_dir: PathBuf,
-    upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    api_addr: SocketAddr,
-    shutdown: Arc<dyn Fn() + Send + Sync>,
+    rollout: Arc<RolloutScheduler>,
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
@@ -686,20 +1504,9 @@ pub(in crate::server) async fn run_fallback_github_poll(
     // first fetch waits one full interval instead of racing it.
     ticker.tick().await;
 
-    let mut failed_version: Option<(String, Instant)> = None;
-    const RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
-
     loop {
         ticker.tick().await;
         tracing::debug!("Fallback GitHub check");
-
-        // Clear expired failure skip
-        if let Some((_, failed_at)) = &failed_version {
-            if failed_at.elapsed() >= RETRY_AFTER {
-                tracing::info!("Retry timeout elapsed, clearing failed version skip");
-                failed_version = None;
-            }
-        }
 
         let monitor = match UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION) {
             Ok(m) => m.with_include_prereleases(config.include_prereleases),
@@ -712,15 +1519,13 @@ pub(in crate::server) async fn run_fallback_github_poll(
         match monitor.check_for_updates().await {
             Ok(Some(verified)) => {
                 // Skip versions that recently failed to apply
-                if let Some((ref ver, _)) = failed_version {
-                    if ver == &verified.manifest.version {
-                        tracing::debug!(
-                            version = %verified.manifest.version,
-                            "Skipping recently failed version {}",
-                            verified.manifest.version
-                        );
-                        continue;
-                    }
+                if rollout.backoff_active(&verified.manifest.version).await {
+                    tracing::debug!(
+                        version = %verified.manifest.version,
+                        "Skipping recently failed version {}",
+                        verified.manifest.version
+                    );
+                    continue;
                 }
 
                 tracing::info!(
@@ -760,31 +1565,8 @@ pub(in crate::server) async fn run_fallback_github_poll(
                     }
                 });
 
-                let _upgrade_guard = upgrade_apply_lock.lock().await;
-                let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                    .with_stop_on_upgrade(config.stop_on_upgrade)
-                    .with_restart_context(listener_restart_context(
-                        &data_dir,
-                        api_addr,
-                        Arc::clone(&shutdown),
-                    ));
-                match upgrader
-                    .apply_upgrade_from_manifest(&verified.manifest)
-                    .await
-                {
-                    Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-                        tracing::info!(%version, "Fallback upgrade successful");
-                    }
-                    Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-                        tracing::warn!(%reason, "Fallback upgrade rolled back");
-                        failed_version = Some((verified.manifest.version.clone(), Instant::now()));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Fallback upgrade failed: {e}");
-                        failed_version = Some((verified.manifest.version.clone(), Instant::now()));
-                    }
-                    _ => {}
-                }
+                stage_and_apply_if_due(&rollout, &verified.manifest, RolloutTrigger::Poll, None)
+                    .await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -978,16 +1760,113 @@ async fn store_upgrade_response(
     upgrade_response(status, body)
 }
 
+/// Keep this daemon in the shared-install participant set while it runs with
+/// self-update off (review R1).
+///
+/// It writes a record with `updates_enabled = false` under the host lock,
+/// keeping any rollout-state block. That is a configured hold: the other
+/// daemons on the install do not swap the shared binary while it runs, and
+/// D185 `now=true` does not skip it (review S4). Re-enable updates and
+/// restart the daemon, or stop it (stale after 30 minutes), to release it.
+pub(in crate::server) async fn register_updates_off_participant(
+    target: &std::path::Path,
+    node_id: &[u8; 32],
+    data_dir: &std::path::Path,
+) -> bool {
+    let key = x0x::upgrade::participants::participant_key(data_dir);
+    // Review S4: keep an existing rollout-state block in the record.
+    let (state, _) = RolloutState::load(&RolloutState::path_in(data_dir));
+    let record = x0x::upgrade::participants::ParticipantRecord::new(
+        node_id,
+        data_dir,
+        x0x::VERSION,
+        unix_now_secs(),
+        None,
+        state.blocked,
+    )
+    .with_updates_enabled(false);
+    write_participant_record_locked(target, &key, &record).await
+}
+
+/// Refresh [`register_updates_off_participant`] every
+/// [`x0x::upgrade::participants::PARTICIPANT_REFRESH`] until shutdown.
+pub(in crate::server) fn spawn_updates_off_participant(
+    target: PathBuf,
+    node_id: [u8; 32],
+    data_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Review S1: hold the unregistered signal until the first write.
+        let mut unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+        let mut registered = false;
+        loop {
+            if !registered && unregistered.is_none() {
+                unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+            }
+            if register_updates_off_participant(&target, &node_id, &data_dir).await {
+                registered = true;
+                unregistered = None;
+            }
+            let pause = if registered {
+                x0x::upgrade::participants::PARTICIPANT_REFRESH
+            } else {
+                x0x::upgrade::participants::PARTICIPANT_RECHECK
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(pause) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The shared-install gate of an HTTP apply (review R5). `bypass` is D185
+/// `now=true`: it skips the WAIT only, so the gate stays on in skip-waits
+/// mode. Other participants' remaining waits do not stop the swap; their
+/// holds, unreadable records and this daemon's missing record still do.
+pub(in crate::server) fn http_install_gate(
+    data_dir: &std::path::Path,
+    bypass: bool,
+) -> Option<x0x::upgrade::apply::SharedInstallGate> {
+    Some(x0x::upgrade::apply::SharedInstallGate {
+        own_key: x0x::upgrade::participants::participant_key(data_dir),
+        skip_waits: bypass,
+    })
+}
+
+/// Query of `POST /upgrade/apply`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(in crate::server) struct ApplyUpgradeQuery {
+    /// D185: skip the staged-rollout wait for this host only. Eligibility,
+    /// holds and every transaction check stay.
+    #[serde(default)]
+    now: bool,
+}
+
 /// POST /upgrade/apply — fetch the latest signed manifest and apply it.
 ///
 /// On a same-version run the monitor returns `None` and the handler reports
-/// `applied: false` with `reason: "no upgrade available"`. When a newer
-/// manifest is available, this handler serializes the destructive apply with
-/// the background update workers, performs the verified binary swap, returns a
-/// JSON result, then schedules restart/exec after the response has a chance to
-/// flush.
+/// `applied: false` with `reason: "no upgrade available"`. A newer verified
+/// manifest is offered to the staged rollout (#1106) like every other
+/// trigger. While this node still waits, the handler reports `applied:
+/// false, staged: true` with the delay and the remaining wait, and the
+/// daemon applies the release when the wait is served. `?now=true` (D185)
+/// skips the wait for this host only, and the other participants' waits on
+/// a shared install; eligibility, holds (this daemon's and the other
+/// participants') and every transaction check stay, and the rollout state
+/// and the WARN summary line record the bypass and who asked.
+/// When the wait is served, this handler serializes the destructive apply with the
+/// background update workers, performs the verified binary swap, returns a
+/// JSON result, then schedules restart/exec after the response has a chance
+/// to flush.
 pub(in crate::server) async fn apply_upgrade(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ApplyUpgradeQuery>,
 ) -> impl IntoResponse {
     if !state.self_update_enabled {
         // Embed path: never replace/restart the host process via the API.
@@ -1055,6 +1934,92 @@ pub(in crate::server) async fn apply_upgrade(
         }
     };
 
+    let rollout = rollout_scheduler_for(&state);
+    let requested_by = "local API (durable token)";
+    let sender = Some(requested_by.to_string());
+    let offer = if params.now {
+        rollout.offer_now(&release.manifest, requested_by).await
+    } else {
+        rollout
+            .offer(&release.manifest, RolloutTrigger::Manual, sender.clone())
+            .await
+    };
+    let staged = match offer {
+        RolloutOffer::Due(staged) => staged,
+        RolloutOffer::Waiting(staged) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "reason": format!(
+                        "staged rollout: v{} applies in {}s (this node's delay is {}s of a \
+                         {}-minute window, ADR 0094 §1)",
+                        staged.version,
+                        staged.remaining().as_secs(),
+                        staged.delay_secs,
+                        staged.window_minutes
+                    ),
+                    "version": staged.version,
+                    "delay_secs": staged.delay_secs,
+                    "remaining_secs": staged.remaining().as_secs(),
+                    "window_minutes": staged.window_minutes,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+        RolloutOffer::Superseded { by } => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "reason": format!("superseded by staged v{by}"),
+                    "version": by,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+        RolloutOffer::AlreadyApplied => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "reason": "upgrade already applied; restart pending",
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+        RolloutOffer::Blocked { reason } => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "blocked": true,
+                    "reason": format!(
+                        "staged-rollout state is unreadable; apply blocked until repair: {reason}"
+                    ),
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+        RolloutOffer::NotNewer | RolloutOffer::BackoffActive => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "reason": "no upgrade available",
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            );
+        }
+    };
+
     let stop_on_upgrade = state.update_config.stop_on_upgrade;
     let restart_context = RestartContext {
         data_dir: Some(state.data_dir.clone()),
@@ -1067,14 +2032,68 @@ pub(in crate::server) async fn apply_upgrade(
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
         .with_stop_on_upgrade(stop_on_upgrade)
         .with_restart_on_success(false)
-        .with_restart_context(restart_context.clone());
+        .with_restart_context(restart_context.clone())
+        .with_apply_summary(ApplySummary {
+            trigger: Some(RolloutTrigger::Manual),
+            sender: sender.clone(),
+            delay_secs: staged.delay_secs,
+            bypass: staged.bypass.is_some(),
+        })
+        .with_shared_install_gate(http_install_gate(&state.data_dir, staged.bypass.is_some()));
 
-    match upgrader
-        .apply_upgrade_from_manifest(&release.manifest)
-        .await
-    {
-        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-            schedule_restart_after_response(stop_on_upgrade, restart_context, version.clone());
+    match upgrader.apply_upgrade_prepared(&release.manifest).await {
+        Err(e @ x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => {
+            // D194 (review S3): not a failure; a waiter checks again.
+            rollout
+                .ensure_waiter(&release.manifest, RolloutTrigger::Manual, sender)
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "insufficient_disk": true,
+                    "reason": e.to_string(),
+                    "version": release.manifest.version,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            )
+        }
+        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
+            release: due_release,
+            pending,
+        }) => {
+            // #1106 review F2: this node is due, another participant of the
+            // shared install is not. A waiter applies when all are due.
+            rollout
+                .ensure_waiter(&release.manifest, RolloutTrigger::Manual, sender)
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "reason": format!(
+                        "staged rollout: v{due_release} waits for the other daemons on this \
+                         install to be due (ADR 0094 §1): {}",
+                        pending.join("; ")
+                    ),
+                    "version": due_release,
+                    "pending_participants": pending,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            )
+        }
+        Ok((x0x::upgrade::UpgradeResult::Success { version }, prepared)) => {
+            rollout.mark_applied(&version).await;
+            schedule_restart_after_response(
+                stop_on_upgrade,
+                restart_context,
+                version.clone(),
+                prepared,
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1086,7 +2105,7 @@ pub(in crate::server) async fn apply_upgrade(
                 })),
             )
         }
-        Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => (
+        Ok((x0x::upgrade::UpgradeResult::RolledBack { reason }, _)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "ok": false,
@@ -1095,7 +2114,7 @@ pub(in crate::server) async fn apply_upgrade(
                 "reason": reason
             })),
         ),
-        Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => (
+        Ok((x0x::upgrade::UpgradeResult::NoUpgrade, _)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
@@ -1121,13 +2140,22 @@ fn schedule_restart_after_response(
     stop_on_upgrade: bool,
     restart_context: RestartContext,
     target_version: String,
+    prepared: Option<x0x::upgrade::apply::PreparedRestart>,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(750)).await;
         // Same planner as every other apply path (#261): unsupervised daemons
         // get the transactional handoff here too — never a bare exit(0).
         let upgrader = deferred_restart_upgrader(stop_on_upgrade, restart_context);
-        if let Err(e) = upgrader.restart_current_binary(&target_version).await {
+        // #1106 review F3: restart with the host lock, the plan from before
+        // the swap and this transaction's backup. No other writer on the
+        // host can swap during the response window, and no fresh plan is
+        // resolved after the swap.
+        let result = match prepared {
+            Some(prepared) => upgrader.restart_prepared(prepared),
+            None => upgrader.restart_current_binary(&target_version).await,
+        };
+        if let Err(e) = result {
             tracing::error!(error = %e, "failed to restart after manual upgrade apply");
         }
     });
@@ -1232,6 +2260,842 @@ mod tests {
             after_ttl,
         );
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
+    }
+
+    // ------------------------------------------------------------------
+    // #1106 / ADR 0094 §1: the staged-rollout scheduler (inert: a counting
+    // applier stands in for the download and swap; paused tokio time).
+    // ------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct CountingApplier {
+        attempts: AtomicU64,
+        summaries: std::sync::Mutex<Vec<ApplySummary>>,
+    }
+
+    impl CountingApplier {
+        fn attempts(&self) -> u64 {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RolloutApplier for CountingApplier {
+        fn apply<'a>(
+            &'a self,
+            manifest: &'a ReleaseManifest,
+            summary: ApplySummary,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.summaries
+                    .lock()
+                    .expect("summaries poisoned")
+                    .push(summary);
+                Ok(x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                })
+            })
+        }
+    }
+
+    fn test_scheduler(
+        data_dir: &std::path::Path,
+        node_id: [u8; 32],
+        window_minutes: u64,
+        applier: Arc<CountingApplier>,
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
+        test_scheduler_with(data_dir, node_id, window_minutes, applier, None)
+    }
+
+    fn test_scheduler_with(
+        data_dir: &std::path::Path,
+        node_id: [u8; 32],
+        window_minutes: u64,
+        applier: Arc<dyn RolloutApplier>,
+        install_target: Option<PathBuf>,
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
+        test_scheduler_locked(
+            data_dir,
+            node_id,
+            window_minutes,
+            applier,
+            install_target,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    fn test_scheduler_locked(
+        data_dir: &std::path::Path,
+        node_id: [u8; 32],
+        window_minutes: u64,
+        applier: Arc<dyn RolloutApplier>,
+        install_target: Option<PathBuf>,
+        upgrade_apply_lock: Arc<Mutex<()>>,
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_watch) = watch::channel(false);
+        let scheduler = RolloutScheduler::new(RolloutEnv {
+            node_id,
+            window_minutes,
+            data_dir: data_dir.to_path_buf(),
+            upgrade_apply_lock,
+            shutdown_watch,
+            applier,
+            install_target,
+        });
+        (scheduler, shutdown_tx)
+    }
+
+    /// Answers "participants not yet due" for the first `not_due` attempts,
+    /// then applies (Codex F2).
+    struct ParticipantWaitApplier {
+        attempts: AtomicU64,
+        not_due: u64,
+    }
+
+    impl RolloutApplier for ParticipantWaitApplier {
+        fn apply<'a>(
+            &'a self,
+            manifest: &'a ReleaseManifest,
+            _summary: ApplySummary,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n < self.not_due {
+                    return Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
+                        release: manifest.version.clone(),
+                        pending: vec!["x0xd-443 (due in 600s)".to_string()],
+                    });
+                }
+                Ok(x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_wait_is_retried_without_a_failure_backoff() {
+        // Codex F2: a due daemon on a shared install waits for the other
+        // participant. That is a wait, not a failed apply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let applier = Arc::new(ParticipantWaitApplier {
+            attempts: AtomicU64::new(0),
+            not_due: 2,
+        });
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [3; 32], 0, applier.clone(), None);
+        let manifest = manifest_with_version(&version_newer_than_current());
+        let applied =
+            stage_and_apply_if_due(&scheduler, &manifest, RolloutTrigger::Gossip, None).await;
+        assert_eq!(applied, None, "the first attempt waits for the participant");
+        assert!(
+            !scheduler.backoff_active(&manifest.version).await,
+            "a participant wait is not a failure"
+        );
+        assert!(
+            wait_until(
+                || applier.attempts.load(Ordering::SeqCst) == 3,
+                Duration::from_secs(300)
+            )
+            .await,
+            "the daemon re-checks the participants until they are due"
+        );
+        assert_eq!(
+            scheduler
+                .offer(&manifest, RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::AlreadyApplied
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_scheduler_publishes_its_participant_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), id, 60, applier.clone(), Some(target.clone()));
+        let key = x0x::upgrade::participants::participant_key(dir.path());
+        let path = x0x::upgrade::participants::record_path(&target, &key);
+        let read = || -> x0x::upgrade::participants::ParticipantRecord {
+            serde_json::from_slice(&std::fs::read(&path).expect("record written")).unwrap()
+        };
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        assert!(wait_until(|| path.exists(), Duration::from_secs(10)).await);
+        assert_eq!(read().staged, None, "registered at start, nothing staged");
+        assert_eq!(read().machine_id, hex::encode(id));
+
+        let RolloutOffer::Waiting(staged) = scheduler
+            .offer(
+                &manifest_with_version(&version),
+                RolloutTrigger::Gossip,
+                None,
+            )
+            .await
+        else {
+            panic!("a 60-minute window stages the release");
+        };
+        assert!(wait_until(|| read().staged.is_some(), Duration::from_secs(10)).await);
+        let stage = read().staged.expect("the staged release is published");
+        assert_eq!(stage.release, version);
+        assert!(!stage.due);
+        assert_eq!(stage.delay_secs, staged.delay_secs);
+
+        assert!(
+            wait_until(
+                || applier.attempts() == 1,
+                staged.delay() + Duration::from_secs(10)
+            )
+            .await
+        );
+        assert!(
+            wait_until(
+                || read().staged.is_some_and(|s| s.due),
+                Duration::from_secs(10)
+            )
+            .await,
+            "published as due"
+        );
+    }
+
+    /// A node whose 60-minute-window delay for `version` is in `range`.
+    fn node_with_delay(version: &str, range: std::ops::Range<u64>) -> [u8; 32] {
+        (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let delay = x0x::upgrade::rollout::StagedRollout::new(id, 60)
+                    .calculate_delay_for_version(version)
+                    .as_secs();
+                range.contains(&delay)
+            })
+            .expect("one of 256 nodes has a delay in the range")
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        done()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_staged_release_is_not_applied_before_its_delay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version);
+
+        let offer = scheduler
+            .offer(&manifest, RolloutTrigger::Gossip, Some("ab".into()))
+            .await;
+        let RolloutOffer::Waiting(staged) = offer else {
+            panic!("a 60-minute window must stage the release, got {offer:?}");
+        };
+        assert!(staged.delay_secs >= 600, "delay {}s", staged.delay_secs);
+
+        // A duplicate receipt neither applies nor resets the wait.
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let again = scheduler.offer(&manifest, RolloutTrigger::Poll, None).await;
+        assert!(
+            matches!(&again, RolloutOffer::Waiting(s) if s.delay_secs == staged.delay_secs),
+            "duplicate receipt: {again:?}"
+        );
+
+        // One second before the delay: still nothing applied.
+        tokio::time::sleep(staged.delay() - Duration::from_secs(46)).await;
+        assert_eq!(applier.attempts(), 0, "no apply before the delay");
+
+        // After the delay: exactly one apply, with the served delay reported.
+        assert!(
+            wait_until(|| applier.attempts() == 1, Duration::from_secs(10)).await,
+            "the waiter applies once the delay is served"
+        );
+        let summaries = applier.summaries.lock().unwrap().clone();
+        assert_eq!(
+            summaries,
+            vec![ApplySummary {
+                trigger: Some(RolloutTrigger::Gossip),
+                sender: Some("ab".into()),
+                delay_secs: staged.delay_secs,
+                bypass: false,
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_resumes_the_staged_wait_without_a_reroll() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let manifest = manifest_with_version(&version);
+
+        let applier = Arc::new(CountingApplier::default());
+        let (first, shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        let RolloutOffer::Waiting(before) =
+            first.offer(&manifest, RolloutTrigger::Gossip, None).await
+        else {
+            panic!("a 60-minute window must stage the release");
+        };
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        // Daemon stops: the waiter checkpoints and exits.
+        shutdown.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(first);
+
+        // The restarted daemon (same data dir, same MachineId) gets the
+        // release again and resumes the wait.
+        let (second, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        let RolloutOffer::Waiting(after) =
+            second.offer(&manifest, RolloutTrigger::Startup, None).await
+        else {
+            panic!("the restarted node must still wait");
+        };
+        assert_eq!(
+            after.delay_secs, before.delay_secs,
+            "no re-roll after restart"
+        );
+        assert!(
+            after.waited_secs >= 60,
+            "the served wait survives the restart: {after:?}"
+        );
+        assert_eq!(after.first_trigger, RolloutTrigger::Gossip);
+        assert_eq!(applier.attempts(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_nodes_stage_one_release_with_different_delays() {
+        let version = version_newer_than_current();
+        let mut delays = Vec::new();
+        for byte in [1u8, 2u8] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let applier = Arc::new(CountingApplier::default());
+            let (scheduler, _shutdown) = test_scheduler(dir.path(), [byte; 32], 60, applier);
+            let offer = scheduler
+                .offer(
+                    &manifest_with_version(&version),
+                    RolloutTrigger::Gossip,
+                    None,
+                )
+                .await;
+            let staged = match offer {
+                RolloutOffer::Waiting(s) | RolloutOffer::Due(s) => s,
+                other => panic!("unexpected offer {other:?}"),
+            };
+            delays.push(staged.delay_secs);
+        }
+        assert_ne!(delays[0], delays[1], "two MachineIds, two delays");
+        assert!(delays.iter().all(|d| *d < 3600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_window_is_due_at_first_receipt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), [9; 32], 0, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version_newer_than_current());
+        let offer = scheduler.offer(&manifest, RolloutTrigger::Poll, None).await;
+        let RolloutOffer::Due(staged) = offer else {
+            panic!("window 0 must be due at once, got {offer:?}");
+        };
+        let result = scheduler
+            .apply_due(&manifest, RolloutTrigger::Poll, None, &staged)
+            .await;
+        assert!(matches!(
+            result,
+            Ok(x0x::upgrade::UpgradeResult::Success { .. })
+        ));
+        assert_eq!(applier.attempts(), 1);
+        assert_eq!(
+            scheduler
+                .offer(&manifest, RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::AlreadyApplied,
+            "a later receipt does not apply the same version again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_release_supersedes_a_waiting_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let older = version_newer_than_current();
+        let newer = {
+            let mut v = semver::Version::parse(&older).unwrap();
+            v.patch += 1;
+            v.to_string()
+        };
+        // A node that waits for both releases.
+        let id = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let r = x0x::upgrade::rollout::StagedRollout::new(id, 60);
+                r.calculate_delay_for_version(&older).as_secs() > 600
+                    && r.calculate_delay_for_version(&newer).as_secs() > 600
+            })
+            .expect("a node that waits for both releases");
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        assert!(matches!(
+            scheduler
+                .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Waiting(_)
+        ));
+        assert!(matches!(
+            scheduler
+                .offer(&manifest_with_version(&newer), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Waiting(_)
+        ));
+        assert_eq!(
+            scheduler
+                .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Superseded { by: newer }
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(applier.attempts(), 1, "only the newer release applies");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_rollout_state_blocks_every_apply() {
+        // Codex F4: an unreadable or newer-format record must not restart
+        // the wait or apply; it stays in place until repair.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = RolloutState::path_in(dir.path());
+        let bytes = br#"{"format":"x0x.upgrade-rollout","version":2,"releases":[]}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), [5; 32], 0, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version_newer_than_current());
+        for trigger in [RolloutTrigger::Gossip, RolloutTrigger::Manual] {
+            let offer = scheduler.offer(&manifest, trigger, None).await;
+            assert!(
+                matches!(offer, RolloutOffer::Blocked { .. }),
+                "{trigger}: {offer:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(applier.attempts(), 0, "nothing applies while blocked");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the record is kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_keeps_a_newer_staged_release_ahead_of_an_older_receipt() {
+        // Codex F5: 0.x.2 supersedes a waiting 0.x.1; after a restart the
+        // older manifest arrives first and must still be superseded.
+        let dir = tempfile::TempDir::new().unwrap();
+        let older = version_newer_than_current();
+        let newer = {
+            let mut v = semver::Version::parse(&older).unwrap();
+            v.patch += 1;
+            v.to_string()
+        };
+        let id = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let r = x0x::upgrade::rollout::StagedRollout::new(id, 60);
+                r.calculate_delay_for_version(&older).as_secs() > 600
+                    && r.calculate_delay_for_version(&newer).as_secs() > 600
+            })
+            .expect("a node that waits for both releases");
+        let applier = Arc::new(CountingApplier::default());
+        let (first, shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        first
+            .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+            .await;
+        first
+            .offer(&manifest_with_version(&newer), RolloutTrigger::Gossip, None)
+            .await;
+        shutdown.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(first);
+
+        let (second, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        assert_eq!(
+            second
+                .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Superseded { by: newer.clone() },
+            "the stored newer release still supersedes the older one"
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(applier.attempts(), 0, "the older release never applies");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_now_request_skips_the_wait_and_records_who_asked() {
+        // D185: now=true skips the wait for this host only, and the
+        // rollout state records the bypass and who asked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), id, 60, Arc::clone(&applier));
+        let manifest = manifest_with_version(&version);
+        let offer = scheduler
+            .offer_now(&manifest, "local API (durable token)")
+            .await;
+        let RolloutOffer::Due(staged) = offer else {
+            panic!("now=true must not wait, got {offer:?}");
+        };
+        assert!(staged.delay_secs >= 600, "the delay is still recorded");
+        assert_eq!(
+            staged.bypass.as_ref().map(|b| b.requested_by.as_str()),
+            Some("local API (durable token)")
+        );
+        let (stored, _) = RolloutState::load(&RolloutState::path_in(dir.path()));
+        assert_eq!(stored.entry(&version).unwrap().bypass, staged.bypass);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_now_request_keeps_the_blocked_hold() {
+        // D185: the bypass keeps holds. An unreadable state stays blocked.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(RolloutState::path_in(dir.path()), b"{ not json").unwrap();
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) = test_scheduler(dir.path(), [6; 32], 60, applier);
+        let offer = scheduler
+            .offer_now(&manifest_with_version(&version_newer_than_current()), "api")
+            .await;
+        assert!(matches!(offer, RolloutOffer::Blocked { .. }), "{offer:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn participant_records_change_only_under_the_host_lock() {
+        // Codex R1: registration, refresh and removal must take the host
+        // lock, so a writer that holds it sees a frozen participant set.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        // Another writer holds the host transaction lock.
+        let held = x0x::upgrade::HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the test takes the host lock");
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [8; 32], 60, applier, Some(target.clone()));
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !path.exists(),
+            "no participant record may appear while another writer holds the lock"
+        );
+        drop(held);
+        assert!(
+            wait_until(|| path.exists(), Duration::from_secs(30)).await,
+            "the record is written once the lock is free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_with_updates_off_keeps_its_participant_record() {
+        // Codex R1: removing a running daemon's record when its updates are
+        // off hid it from the other writers on the install.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        register_updates_off_participant(&target, &[9; 32], dir.path()).await;
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        let record: x0x::upgrade::participants::ParticipantRecord =
+            serde_json::from_slice(&std::fs::read(&path).expect("the record stays")).unwrap();
+        assert!(!record.updates_enabled);
+        assert_eq!(record.machine_id, hex::encode([9u8; 32]));
+    }
+
+    #[test]
+    fn a_now_request_keeps_the_participant_holds() {
+        // Codex R5 / D185: now=true skips the other participants' WAITS
+        // only; their holds and record checks still run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let gate = http_install_gate(dir.path(), true).expect("the gate stays on now=true");
+        assert!(gate.skip_waits);
+        let normal = http_install_gate(dir.path(), false).expect("the ordinary gate");
+        assert!(!normal.skip_waits);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_older_attempt_does_not_apply_after_a_newer_release_is_staged() {
+        // Codex R6: the older waiter is due but waits for the in-process
+        // apply lock (an HTTP apply holds it). Meanwhile a newer release is
+        // staged. When the lock frees, the older attempt must not apply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let older = version_newer_than_current();
+        let newer = {
+            let mut v = semver::Version::parse(&older).unwrap();
+            v.patch += 1;
+            v.to_string()
+        };
+        let id = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|id| {
+                let r = x0x::upgrade::rollout::StagedRollout::new(id, 60);
+                r.calculate_delay_for_version(&older).as_secs() < 300
+                    && r.calculate_delay_for_version(&newer).as_secs() > 900
+            })
+            .expect("a node that is due soon for the older release only");
+        let lock = Arc::new(Mutex::new(()));
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_locked(dir.path(), id, 60, applier.clone(), None, Arc::clone(&lock));
+        let held = lock.lock().await;
+        let RolloutOffer::Waiting(first) = scheduler
+            .offer(&manifest_with_version(&older), RolloutTrigger::Gossip, None)
+            .await
+        else {
+            panic!("the older release waits");
+        };
+        // The older wait is served; its attempt queues on the apply lock.
+        tokio::time::sleep(first.delay() + Duration::from_secs(5)).await;
+        assert_eq!(applier.attempts(), 0);
+        assert!(matches!(
+            scheduler
+                .offer(&manifest_with_version(&newer), RolloutTrigger::Gossip, None)
+                .await,
+            RolloutOffer::Waiting(_)
+        ));
+        drop(held);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            applier.attempts(),
+            0,
+            "a superseded attempt must not reach the download or swap"
+        );
+    }
+
+    /// Answers `error` for the first `failures` attempts, then applies, and
+    /// records every summary.
+    struct ScriptedApplier {
+        attempts: AtomicU64,
+        failures: u64,
+        error: fn(&str) -> x0x::upgrade::UpgradeError,
+        summaries: std::sync::Mutex<Vec<ApplySummary>>,
+    }
+
+    impl ScriptedApplier {
+        fn new(failures: u64, error: fn(&str) -> x0x::upgrade::UpgradeError) -> Self {
+            Self {
+                attempts: AtomicU64::new(0),
+                failures,
+                error,
+                summaries: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn attempts(&self) -> u64 {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RolloutApplier for ScriptedApplier {
+        fn apply<'a>(
+            &'a self,
+            manifest: &'a ReleaseManifest,
+            summary: ApplySummary,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                self.summaries.lock().expect("summaries").push(summary);
+                if self.attempts.fetch_add(1, Ordering::SeqCst) < self.failures {
+                    return Err((self.error)(&manifest.version));
+                }
+                Ok(x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insufficient_disk_is_retried_without_a_failure_backoff() {
+        // D194 (review S3): insufficient_disk is reported, not counted as a
+        // failure; the daemon checks again later.
+        let dir = tempfile::TempDir::new().unwrap();
+        let applier = Arc::new(ScriptedApplier::new(1, |_| {
+            x0x::upgrade::UpgradeError::InsufficientDisk {
+                available: 10,
+                needed: 20,
+                reserve: x0x::upgrade::DISK_RESERVE_BYTES,
+            }
+        }));
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [12; 32], 0, applier.clone(), None);
+        let manifest = manifest_with_version(&version_newer_than_current());
+        assert_eq!(
+            stage_and_apply_if_due(&scheduler, &manifest, RolloutTrigger::Poll, None).await,
+            None
+        );
+        assert!(
+            !scheduler.backoff_active(&manifest.version).await,
+            "insufficient_disk is not a failure"
+        );
+        assert!(
+            wait_until(|| applier.attempts() == 2, Duration::from_secs(1800)).await,
+            "the daemon checks the disk again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_wait_keeps_the_now_bypass() {
+        // Codex S5: now=true was requested, the first attempt waited for a
+        // participant; the retry must keep the bypass (no fresh delay, the
+        // skip-waits gate, the bypass in the summary).
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(ScriptedApplier::new(1, |release| {
+            x0x::upgrade::UpgradeError::ParticipantsNotDue {
+                release: release.to_string(),
+                pending: vec!["own record pending".to_string()],
+            }
+        }));
+        let (scheduler, _shutdown) = test_scheduler_with(dir.path(), id, 60, applier.clone(), None);
+        let manifest = manifest_with_version(&version);
+        let RolloutOffer::Due(staged) = scheduler
+            .offer_now(&manifest, "local API (durable token)")
+            .await
+        else {
+            panic!("now=true is due at once");
+        };
+        let first = scheduler
+            .apply_due(
+                &manifest,
+                RolloutTrigger::Manual,
+                Some("local API (durable token)".into()),
+                &staged,
+            )
+            .await;
+        assert!(is_participant_wait(&first), "{first:?}");
+        scheduler
+            .ensure_waiter(
+                &manifest,
+                RolloutTrigger::Manual,
+                Some("local API (durable token)".into()),
+            )
+            .await;
+        assert!(
+            wait_until(|| applier.attempts() == 2, Duration::from_secs(120)).await,
+            "the retry runs within the participant recheck, not after the {}s delay",
+            staged.delay_secs
+        );
+        let summaries = applier.summaries.lock().unwrap().clone();
+        assert!(summaries.iter().all(|s| s.bypass), "{summaries:?}");
+        assert!(summaries
+            .iter()
+            .all(|s| s.sender.as_deref() == Some("local API (durable token)")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unregistered_daemon_signals_until_its_record_is_written() {
+        // Codex S1: until its record is written, a daemon holds the shared
+        // "unregistered" signal, so no other writer can swap.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let held = x0x::upgrade::HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the test holds the host lock, so registration must wait");
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [13; 32], 60, applier, Some(target.clone()));
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let signal_path = x0x::upgrade::participants::unregistered_signal_path(&target);
+        let probe = || -> bool {
+            std::fs::File::open(&signal_path)
+                .map(|f| f.try_lock().is_ok())
+                .unwrap_or(true)
+        };
+        assert!(
+            !probe(),
+            "the unregistered daemon is visible to other writers"
+        );
+        drop(held);
+        assert!(
+            wait_until(probe, Duration::from_secs(30)).await,
+            "the signal is released once the record is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_daemon_keeps_its_blocked_rollout_state() {
+        // Codex S4: publishing the updates-off record must keep an existing
+        // rollout-state block.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(RolloutState::path_in(dir.path()), b"{ not json").unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        register_updates_off_participant(&target, &[14; 32], dir.path()).await;
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        let record: x0x::upgrade::participants::ParticipantRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!record.updates_enabled);
+        assert!(record.blocked.is_some(), "the block is published");
+    }
+
+    #[test]
+    fn the_upgraded_from_line_is_one_warn_line_after_the_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handoff = restart::UpgradeHandoff {
+            from_version: "0.0.1".to_string(),
+            to_version: x0x::VERSION.to_string(),
+            target_path: PathBuf::from("/opt/x0x/x0xd"),
+            backup_path: PathBuf::from("/opt/x0x/x0xd.backup-0.0.1-00112233"),
+            argv: vec!["/opt/x0x/x0xd".to_string()],
+            cwd: "/".to_string(),
+            env: std::collections::BTreeMap::new(),
+            old_pid: 1,
+            api_addr: "127.0.0.1:12600".parse().unwrap(),
+            started_at: 42,
+            mode: restart::RestartMode::SupervisedExit,
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        handoff
+            .write(&dir.path().join(restart::HANDOFF_FILE_NAME))
+            .unwrap();
+
+        let (first, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            announce_completed_upgrade(dir.path());
+        });
+        let lines: Vec<&str> = first.lines().collect();
+        assert_eq!(lines.len(), 1, "one line at the first start: {first:?}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("x0xd upgraded from 0.0.1 to {}", x0x::VERSION)),
+            "{}",
+            lines[0]
+        );
+
+        let (second, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            announce_completed_upgrade(dir.path());
+        });
+        assert!(
+            second.is_empty(),
+            "a later restart of the same binary is silent: {second:?}"
+        );
     }
 
     fn daemon_restart_context() -> RestartContext {
@@ -1400,26 +3264,35 @@ mod tests {
         }
     }
 
-    /// The daemon-side runtime the end-to-end tests need: a restart
-    /// context over the given data dir, a fresh apply lock and a live
-    /// (never-signalled) shutdown watch. The returned sender keeps the
-    /// watch's sender alive — a dropped sender would read as shutdown.
+    /// The daemon-side rollout the end-to-end tests need: the production
+    /// applier with a restart context over the given data dir, a fresh
+    /// apply lock and a live (never-signalled) shutdown watch. The rollout
+    /// window is 0, so the startup check is due at first receipt (#1196 is
+    /// about the start-rate retry, not the stagger). The returned sender
+    /// keeps the watch's sender alive — a dropped sender would read as
+    /// shutdown.
     fn e2e_startup_runtime(
         data_dir: &std::path::Path,
-    ) -> (StartupUpdateCheckRuntime, watch::Sender<bool>) {
+    ) -> (Arc<RolloutScheduler>, watch::Sender<bool>) {
         let (shutdown_tx, shutdown_watch) = watch::channel(false);
-        (
-            StartupUpdateCheckRuntime {
+        let rollout = RolloutScheduler::new(RolloutEnv {
+            node_id: [0x11; 32],
+            window_minutes: 0,
+            data_dir: data_dir.to_path_buf(),
+            upgrade_apply_lock: Arc::new(Mutex::new(())),
+            shutdown_watch,
+            applier: Arc::new(DaemonApplier {
+                stop_on_upgrade: true,
                 restart_context: listener_restart_context(
                     data_dir,
                     SocketAddr::from(([127, 0, 0, 1], 12700)),
                     Arc::new(|| {}),
                 ),
-                upgrade_apply_lock: Arc::new(Mutex::new(())),
-                shutdown_watch,
-            },
-            shutdown_tx,
-        )
+                shared_install_gate: None,
+            }),
+            install_target: None,
+        });
+        (rollout, shutdown_tx)
     }
 
     /// The #1196 fleet scenario, end to end: a default unit
@@ -1474,10 +3347,10 @@ mod tests {
             data_dir: data_dir.path().to_path_buf(),
             ..Default::default()
         };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        let (rollout, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
 
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, &rollout).await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -1529,9 +3402,9 @@ mod tests {
             data_dir: data_dir.path().to_path_buf(),
             ..Default::default()
         };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        let (rollout, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, &rollout).await;
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
@@ -1573,9 +3446,9 @@ mod tests {
             data_dir: data_dir.path().to_path_buf(),
             ..Default::default()
         };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        let (rollout, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, &rollout).await;
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,

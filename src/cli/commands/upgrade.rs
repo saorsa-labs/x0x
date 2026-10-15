@@ -1,10 +1,13 @@
 //! Read-only GitHub release checks. Installation belongs to the daemon.
 //!
 //! Standalone applies are refused before any I/O: daemon discovery cannot
-//! prove that no instance is using the installed binary.
+//! prove that no instance is using the installed binary. `x0x upgrade
+//! --apply [--now]` delegates to the running daemon's authenticated
+//! `POST /upgrade/apply` (ADR 0094 §1); it never writes a binary itself.
 
 use anyhow::Result;
 
+use crate::cli::{print_value, DaemonClient};
 use crate::upgrade::monitor::UpgradeMonitor;
 use crate::upgrade::UpgradeError;
 
@@ -15,8 +18,8 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     if !check_only {
         anyhow::bail!(
             "Standalone upgrade installation is disabled to avoid replacing a live daemon. \
-             Use authenticated POST /upgrade/apply on the running daemon \
-             (Authorization: Bearer <api-token>); use `x0x upgrade --check` for a read-only check."
+             Use `x0x upgrade --apply` (authenticated POST /upgrade/apply on the running daemon, \
+             Authorization: Bearer <api-token>); use `x0x upgrade --check` for a read-only check."
         );
     }
 
@@ -63,6 +66,21 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     eprintln!("Update available: v{current} → v{new_version}");
     eprintln!("Use authenticated POST /upgrade/apply on the running daemon to install.");
 
+    Ok(())
+}
+
+/// `x0x upgrade --apply [--now]`: ask the running daemon to apply the latest
+/// verified release through its authenticated `POST /upgrade/apply`. The
+/// daemon applies after its staged-rollout wait; `now` sends `now=true`
+/// (D185), which skips the wait for this host only.
+pub async fn apply_via_daemon(client: &DaemonClient, now: bool) -> Result<()> {
+    let path = if now {
+        "/upgrade/apply?now=true"
+    } else {
+        "/upgrade/apply"
+    };
+    let resp = client.post_empty(path).await?;
+    print_value(client.format(), &resp);
     Ok(())
 }
 

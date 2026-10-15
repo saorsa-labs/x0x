@@ -8,9 +8,13 @@ use tracing::{debug, info, warn};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{current_platform_target, ReleaseManifest};
+use super::participants::{self, ParticipantGate};
 use super::restart;
+use super::rollout::RolloutTrigger;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
-use super::{UpgradeError, UpgradeResult, Upgrader};
+use super::{
+    HostUpgradeLock, SwapOutcome, UpgradeError, UpgradeResult, Upgrader, HOST_UPGRADE_LOCK_WAIT,
+};
 
 /// Removes an upgrade temp dir when dropped, so it is never leaked on an
 /// early-return error path (e.g. a failed binary replace on Windows, which
@@ -54,6 +58,172 @@ pub struct RestartContext {
     pub shutdown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// What the WARN summary line of an applied upgrade reports (#1106).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplySummary {
+    /// The apply path. `None` for a caller outside the daemon's rollout.
+    pub trigger: Option<RolloutTrigger>,
+    /// Who offered the release: the gossip sender's AgentId (hex) or the
+    /// local API caller. `None` when unknown.
+    pub sender: Option<String>,
+    /// The staged-rollout delay this node served before the apply.
+    pub delay_secs: u64,
+    /// An authenticated `now=true` request skipped the wait (D185).
+    pub bypass: bool,
+}
+
+/// The shared-install gate of a daemon apply (#1106 review F2): this
+/// daemon's participant record key. Under the host lock the apply swaps the
+/// shared binary only when every live participant is due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedInstallGate {
+    /// This daemon's participant record key.
+    pub own_key: String,
+    /// D185 `now=true`: other participants' remaining waits do not stop
+    /// the swap; their holds and every record check still do.
+    pub skip_waits: bool,
+}
+
+/// A swapped install whose restart still has to run (#1106 review F3).
+///
+/// The HTTP apply restarts after its response. This value carries the host
+/// upgrade lock, the restart plan resolved before the swap and this
+/// transaction's backup into that deferred restart, so the restart uses
+/// exactly them and no other writer on the host can swap in between. The
+/// lock is released when the value is dropped (after a completed refusal or
+/// restore) or when the process exits.
+pub struct PreparedRestart {
+    host_lock: Option<HostUpgradeLock>,
+    plan: restart::RestartPlan,
+    backup_path: Option<PathBuf>,
+    target_version: String,
+}
+
+impl PreparedRestart {
+    /// The restart plan resolved before the swap.
+    pub fn plan(&self) -> &restart::RestartPlan {
+        &self.plan
+    }
+
+    /// This transaction's versioned backup, if this writer made one.
+    pub fn backup_path(&self) -> Option<&Path> {
+        self.backup_path.as_deref()
+    }
+
+    /// The installed release.
+    pub fn target_version(&self) -> &str {
+        &self.target_version
+    }
+
+    /// Whether this value still holds the host upgrade lock.
+    pub fn holds_host_lock(&self) -> bool {
+        self.host_lock.is_some()
+    }
+}
+
+/// Carry the host lock, plan and backup of a completed swap into its
+/// deferred restart.
+pub(crate) fn prepare_restart(
+    host_lock: HostUpgradeLock,
+    plan: restart::RestartPlan,
+    backup_path: Option<PathBuf>,
+    target_version: &str,
+) -> PreparedRestart {
+    PreparedRestart {
+        host_lock: Some(host_lock),
+        plan,
+        backup_path,
+        target_version: target_version.to_string(),
+    }
+}
+
+/// The fields of one applied-upgrade summary line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AppliedSummaryLine<'a> {
+    pub trigger: &'a str,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub sender: &'a str,
+    pub delay_secs: u64,
+    pub rollout: &'a str,
+    pub swap: &'a str,
+    pub backup: &'a str,
+    pub exit: &'a str,
+}
+
+/// Bounded pause before a supervised exit so the non-blocking log writer can
+/// write the WARN summary line (#1106).
+const SUPERVISED_EXIT_LOG_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The release this daemon ran before the current one, from the handoff
+/// record its predecessor wrote, or from the reported upgrade in the
+/// rollout state (D194 retention keeps its backup; review S3).
+fn previous_release_of(data_dir: Option<&Path>) -> Option<semver::Version> {
+    let data_dir = data_dir?;
+    let from_handoff = restart::UpgradeHandoff::read(&data_dir.join(restart::HANDOFF_FILE_NAME))
+        .ok()
+        .filter(|h| h.to_version == crate::VERSION)
+        .map(|h| h.from_version);
+    let from_state = || {
+        super::rollout::RolloutState::load(&super::rollout::RolloutState::path_in(data_dir))
+            .0
+            .announced_upgrade
+            .filter(|a| a.to_version == crate::VERSION)
+            .map(|a| a.from_version)
+    };
+    from_handoff
+        .or_else(from_state)
+        .and_then(|v| semver::Version::parse(&v).ok())
+}
+
+/// How the process leaves after an applied upgrade, for the summary line.
+/// `restart_now` is false when the HTTP handler restarts after its response.
+pub(crate) fn exit_description(
+    mode: restart::RestartMode,
+    exit_code: Option<i32>,
+    restart_now: bool,
+) -> String {
+    let base = match mode {
+        restart::RestartMode::SupervisedExit => {
+            format!("supervised_exit(code={})", exit_code.unwrap_or(0))
+        }
+        restart::RestartMode::TransactionalHandoff => "transactional_handoff".to_string(),
+    };
+    if restart_now {
+        base
+    } else {
+        format!("deferred_restart({base})")
+    }
+}
+
+/// Emit the one summary line per applied upgrade (#1106).
+///
+/// WARN level on purpose: fleet units run `RUST_LOG=warn`, and before this
+/// line no upgrade step was visible at that level (self-update audit Q4).
+pub(crate) fn log_applied_summary(line: &AppliedSummaryLine<'_>) {
+    warn!(
+        trigger = line.trigger,
+        from_version = line.from,
+        to_version = line.to,
+        sender = line.sender,
+        delay_secs = line.delay_secs,
+        rollout = line.rollout,
+        swap = line.swap,
+        backup = line.backup,
+        exit = line.exit,
+        "x0xd self-update applied: {} -> {} via {} (sender {}, staged delay {}s {}, swap {}, backup {}, exit {})",
+        line.from,
+        line.to,
+        line.trigger,
+        line.sender,
+        line.delay_secs,
+        line.rollout,
+        line.swap,
+        line.backup,
+        line.exit
+    );
+}
+
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
     /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
@@ -64,6 +234,10 @@ pub struct AutoApplyUpgrader {
     restart_on_success: bool,
     /// Data directory / API address / shutdown hook for the restart planner.
     restart_context: RestartContext,
+    /// Trigger, sender and served delay for the WARN summary line.
+    apply_summary: ApplySummary,
+    /// The shared-install participant gate (#1106 review F2).
+    shared_install_gate: Option<SharedInstallGate>,
 }
 
 impl AutoApplyUpgrader {
@@ -73,7 +247,24 @@ impl AutoApplyUpgrader {
             stop_on_upgrade: false,
             restart_on_success: true,
             restart_context: RestartContext::default(),
+            apply_summary: ApplySummary::default(),
+            shared_install_gate: None,
         }
+    }
+
+    /// Gate the shared swap on every participant being due (#1106 review
+    /// F2). D185 `now=true` keeps the gate with `skip_waits` (review R5).
+    /// `None` skips the gate (callers outside the daemon).
+    pub fn with_shared_install_gate(mut self, gate: Option<SharedInstallGate>) -> Self {
+        self.shared_install_gate = gate;
+        self
+    }
+
+    /// Supply the trigger, sender and served rollout delay that the WARN
+    /// summary line of a successful apply reports (#1106).
+    pub fn with_apply_summary(mut self, summary: ApplySummary) -> Self {
+        self.apply_summary = summary;
+        self
     }
 
     pub fn with_stop_on_upgrade(mut self, stop: bool) -> Self {
@@ -108,7 +299,7 @@ impl AutoApplyUpgrader {
     pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
         let target_path = current_binary_path()?;
         let plan = self.resolve_restart_plan(&target_path).await?;
-        self.trigger_restart(&plan, target_version)
+        self.trigger_restart(&plan, target_version, None)
     }
 
     /// Classify the restart mode for the current environment (I0).
@@ -182,6 +373,33 @@ impl AutoApplyUpgrader {
         &self,
         manifest: &ReleaseManifest,
     ) -> Result<UpgradeResult, UpgradeError> {
+        let (result, prepared) = self.apply_upgrade_prepared(manifest).await?;
+        if let Some(prepared) = prepared.filter(|_| self.restart_on_success) {
+            if let Err(e) = self.restart_prepared(prepared) {
+                warn!(
+                    error = %e,
+                    installed_bytes = true,
+                    restart = "not_started",
+                    readiness_observed = false,
+                    "Restart after successful upgrade did not start: {e}; \
+                     old process keeps serving"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// Apply a manifest up to the restart (#1106 review F3).
+    ///
+    /// The same steps as [`Self::apply_upgrade_from_manifest`], but a
+    /// successful swap returns a [`PreparedRestart`] instead of restarting.
+    /// It holds the host lock and carries the restart plan resolved before
+    /// the swap and this transaction's backup. The HTTP handler passes it to
+    /// its deferred restart; dropping it releases the lock.
+    pub async fn apply_upgrade_prepared(
+        &self,
+        manifest: &ReleaseManifest,
+    ) -> Result<(UpgradeResult, Option<PreparedRestart>), UpgradeError> {
         let current_version_str = crate::VERSION;
         let target_version = semver::Version::parse(&manifest.version)
             .map_err(|e| UpgradeError::Other(format!("invalid version: {e}")))?;
@@ -235,10 +453,81 @@ impl AutoApplyUpgrader {
         // non-test builds; an uninstalled hook changes nothing.
         #[cfg(test)]
         if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
-            return Ok(result);
+            return Ok((result, None));
         }
 
-        let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
+        // #1106: one binary writer per host. Two daemons that share this
+        // executable (x0xd and x0xd-443) take the same OS lock, so only one
+        // downloads, backs up and swaps at a time. The lock is held through
+        // the restart below: a supervised exit or handoff releases it when
+        // this process exits; any other return drops it here.
+        let host_lock = HostUpgradeLock::acquire(&target_path, HOST_UPGRADE_LOCK_WAIT).await?;
+        debug!(lock = %host_lock.path().display(), "Host upgrade lock held");
+
+        // #1106 review F2 (ADR 0094 §1): a shared install swaps only when
+        // every live participant is due. Checked under the lock, before any
+        // download. `None` is the D185 `now=true` bypass.
+        if let Some(gate) = &self.shared_install_gate {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match participants::check_all_due(
+                &target_path,
+                &gate.own_key,
+                &target_version,
+                now_unix,
+                gate.skip_waits,
+            ) {
+                Ok(ParticipantGate::AllDue { stale }) => {
+                    for record in stale {
+                        warn!(
+                            %record,
+                            "Ignoring a stale shared-install participant record (a removed or \
+                             stopped daemon); delete it if that daemon is gone"
+                        );
+                    }
+                }
+                Ok(ParticipantGate::Waiting { pending, .. }) => {
+                    let pending: Vec<String> = pending.into_iter().map(|p| p.reason).collect();
+                    info!(
+                        version = %target_version,
+                        pending = ?pending,
+                        "Shared install: waiting for every participant to be due before the swap"
+                    );
+                    return Err(UpgradeError::ParticipantsNotDue {
+                        release: target_version.to_string(),
+                        pending,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "Refusing the shared-install swap: {e}");
+                    return Err(e);
+                }
+            }
+        }
+
+        // D194 (review S3): refuse staging when the archive, the extracted
+        // binaries and their backups would leave less than 1 GiB free. Not
+        // a failure: the scheduler waits and checks again.
+        let companion_path = target_path.with_file_name(if cfg!(target_os = "windows") {
+            "x0x.exe"
+        } else {
+            "x0x"
+        });
+        if let Some(available) = target_path.parent().and_then(super::free_space_bytes) {
+            let needed = super::apply_peak_bytes(&[&target_path, &companion_path]);
+            if let Err(e) = super::check_disk_reserve(available, needed) {
+                warn!(error = %e, "Refusing to stage the release: {e}");
+                return Err(e);
+            }
+        }
+
+        let previous_release = previous_release_of(self.restart_context.data_dir.as_deref());
+        // #1106 F1: the running bytes are version evidence for the install.
+        let upgrader = Upgrader::new(target_path.clone(), current_version.clone())
+            .with_running_sha256(super::running_binary_sha256())
+            .with_previous_release(previous_release.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
         let _temp_guard = TempDirGuard {
@@ -296,6 +585,13 @@ impl AutoApplyUpgrader {
         let extracted_path = temp_dir.join("extracted-binary");
         extract_binary_from_archive(&archive_path, &extracted_path, &binary_name)?;
 
+        // #1106 F1: decide the daemon swap under the lock before EITHER
+        // binary changes. An installed release that is not older than the
+        // target (another writer on this host installed it), or unknown
+        // installed bytes, refuse the whole apply here.
+        let daemon_plan =
+            upgrader.plan_locked_swap(&host_lock, &extracted_path, &target_version)?;
+
         // If we are upgrading x0xd, also check for companion x0x binary and upgrade it too.
         if self.binary_name == "x0xd" {
             let parent_dir = target_path
@@ -314,17 +610,65 @@ impl AutoApplyUpgrader {
                 {
                     warn!("Failed to extract companion x0x binary: {e}");
                 } else {
-                    let x0x_upgrader = Upgrader::new(x0x_path.clone(), current_version.clone());
-                    match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
-                        Ok(_) => info!("x0x companion upgraded successfully"),
+                    // The CLI ships in the same archive as the daemon: with
+                    // no install record of its own, it follows the daemon's
+                    // installed release.
+                    let x0x_upgrader = super::companion_upgrader(
+                        x0x_path.clone(),
+                        current_version.clone(),
+                        &daemon_plan,
+                        &target_version,
+                    )
+                    .with_previous_release(previous_release.clone());
+                    match x0x_upgrader.perform_locked_upgrade(
+                        &host_lock,
+                        &extracted_x0x,
+                        &target_version,
+                        &temp_dir,
+                    ) {
+                        Ok(SwapOutcome::Swapped { backup_path }) => info!(
+                            backup = %backup_path.display(),
+                            "x0x companion upgraded successfully"
+                        ),
+                        Ok(SwapOutcome::AlreadyInstalled) => {
+                            info!("x0x companion already upgraded by another writer on this host")
+                        }
+                        Ok(SwapOutcome::RolledBack { reason }) => {
+                            warn!("Failed to upgrade x0x companion: {reason}")
+                        }
                         Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
                     }
                 }
             }
         }
 
-        // Replace binary (with backup + rollback)
-        let result = upgrader.perform_upgrade(&extracted_path, &target_version)?;
+        // Replace binary (versioned backup + rollback), or skip the swap when
+        // another writer on this host already installed these bytes.
+        let swap = upgrader.perform_locked_upgrade(
+            &host_lock,
+            &extracted_path,
+            &target_version,
+            &temp_dir,
+        )?;
+        let (result, backup_path, swap_label) = match swap {
+            SwapOutcome::Swapped { backup_path } => (
+                UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
+                Some(backup_path),
+                "performed",
+            ),
+            SwapOutcome::AlreadyInstalled => (
+                UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
+                super::latest_versioned_backup(&target_path, current_version_str),
+                "already_installed",
+            ),
+            SwapOutcome::RolledBack { reason } => {
+                (UpgradeResult::RolledBack { reason }, None, "rolled_back")
+            }
+        };
 
         // Clean up temp dir
         if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
@@ -346,21 +690,65 @@ impl AutoApplyUpgrader {
                  replacement readiness has not been observed yet",
                 target_version
             );
-            if self.restart_on_success {
-                if let Err(e) = self.trigger_restart(&restart_plan, &target_version.to_string()) {
-                    warn!(
-                        error = %e,
-                        installed_bytes = true,
-                        restart = "not_started",
-                        readiness_observed = false,
-                        "Restart after successful upgrade did not start: {e}; \
-                         old process keeps serving"
-                    );
-                }
-            }
+            // #1106: the one WARN summary line of this applied upgrade,
+            // written before the restart so the fleet log keeps it.
+            let backup_display = backup_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let exit = exit_description(
+                restart_plan.mode,
+                restart_plan.supervised_exit_code,
+                self.restart_on_success,
+            );
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: self
+                    .apply_summary
+                    .trigger
+                    .map(RolloutTrigger::as_str)
+                    .unwrap_or("unknown"),
+                from: current_version_str,
+                to: &target_version.to_string(),
+                sender: self.apply_summary.sender.as_deref().unwrap_or("unknown"),
+                delay_secs: self.apply_summary.delay_secs,
+                rollout: if self.apply_summary.bypass {
+                    "bypassed by now=true"
+                } else {
+                    "served"
+                },
+                swap: swap_label,
+                backup: &backup_display,
+                exit: &exit,
+            });
+            // The host lock, the plan from before the swap and this backup
+            // go to the restart together (#1106 review F3).
+            let prepared = prepare_restart(
+                host_lock,
+                restart_plan,
+                backup_path,
+                &target_version.to_string(),
+            );
+            return Ok((result, Some(prepared)));
         }
 
-        Ok(result)
+        Ok((result, None))
+    }
+
+    /// Run the restart of a [`PreparedRestart`] with its own plan and backup
+    /// (#1106 review F3). On success it does not return (supervised exit or
+    /// transactional handoff); the OS releases the host lock at exit. On a
+    /// refusal or a completed restore it returns the error, and the lock is
+    /// released then.
+    pub fn restart_prepared(&self, prepared: PreparedRestart) -> Result<(), UpgradeError> {
+        let PreparedRestart {
+            host_lock,
+            plan,
+            backup_path,
+            target_version,
+        } = prepared;
+        let result = self.trigger_restart(&plan, &target_version, backup_path.as_deref());
+        drop(host_lock);
+        result
     }
 
     /// Execute an already-resolved restart plan (#261, ADR-0061 §1).
@@ -375,12 +763,24 @@ impl AutoApplyUpgrader {
     /// - `TransactionalHandoff` (genuinely unsupervised, including the default
     ///   `stop_on_upgrade = true` terminal launch) runs the helper, which
     ///   proves `/health` on the new binary or restores the backup.
+    ///
+    /// `backup_path` is this transaction's versioned backup (#1106). When it
+    /// is `None` (another writer swapped, or the HTTP path restarts later),
+    /// the newest versioned backup of the running version is used, and the
+    /// legacy `<exe>.backup` name only when none exists.
     fn trigger_restart(
         &self,
         plan: &restart::RestartPlan,
         target_version: &str,
+        backup_path: Option<&Path>,
     ) -> Result<(), UpgradeError> {
-        let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        let mut handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        if let Some(backup) = backup_path
+            .map(Path::to_path_buf)
+            .or_else(|| super::latest_versioned_backup(&plan.executable, crate::VERSION))
+        {
+            handoff.backup_path = backup;
+        }
         let handoff_path = plan.handoff_path();
 
         match plan.mode {
@@ -413,6 +813,10 @@ impl AutoApplyUpgrader {
                      replacement readiness is observed by the supervisor, not by x0xd",
                     exit_code
                 );
+                // The daemon's stdout log writer is non-blocking (#600), and
+                // `process::exit` runs no destructors. Give the writer thread
+                // a short, bounded moment to write the summary line (#1106).
+                std::thread::sleep(SUPERVISED_EXIT_LOG_DRAIN);
                 std::process::exit(exit_code);
             }
             restart::RestartMode::TransactionalHandoff => restart::begin_transactional_handoff(
@@ -803,6 +1207,119 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_applied_upgrade_summary_is_one_warn_line() {
+        // #1106: the fleet runs RUST_LOG=warn, so the success path must be
+        // visible at WARN: path, versions, sender, served delay and exit.
+        let (logged, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: "gossip",
+                from: "0.48.0",
+                to: "0.48.1",
+                sender: "ab12cd34",
+                delay_secs: 1234,
+                rollout: "served",
+                swap: "performed",
+                backup: "/opt/x0x/x0xd.backup-0.48.0-0011aabb",
+                exit: "supervised_exit(code=0)",
+            })
+        });
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 1, "one summary line, got: {logged:?}");
+        let line = lines[0];
+        assert!(line.contains("WARN"), "summary must be WARN level: {line}");
+        for needle in [
+            "x0xd self-update applied: 0.48.0 -> 0.48.1 via gossip",
+            "sender ab12cd34",
+            "staged delay 1234s served",
+            "swap performed",
+            "backup /opt/x0x/x0xd.backup-0.48.0-0011aabb",
+            "exit supervised_exit(code=0)",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line}");
+        }
+    }
+
+    #[test]
+    fn a_prepared_restart_carries_the_host_lock_plan_and_backup() {
+        // Codex F3: the deferred HTTP restart must hold the host lock and
+        // use the plan and backup of its own swap, not a fresh plan.
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let lock = HostUpgradeLock::try_acquire(&target).unwrap().unwrap();
+        let plan = restart::RestartPlan {
+            mode: restart::RestartMode::SupervisedExit,
+            supervised_exit_code: Some(0),
+            supervision_signal: Some("INVOCATION_ID".to_string()),
+            executable: target.clone(),
+            argv: vec![target.display().to_string()],
+            cwd: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
+            api_addr: "127.0.0.1:12600".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        let backup = dir.path().join("x0xd.backup-0.48.0-00112233");
+        let prepared = prepare_restart(lock, plan.clone(), Some(backup.clone()), "0.48.1");
+
+        assert!(prepared.holds_host_lock());
+        assert!(
+            HostUpgradeLock::try_acquire(&target).unwrap().is_none(),
+            "no other writer can swap during the response window"
+        );
+        assert_eq!(prepared.plan(), &plan, "the plan from before the swap");
+        assert_eq!(prepared.backup_path(), Some(backup.as_path()));
+        assert_eq!(prepared.target_version(), "0.48.1");
+
+        // A completed refusal or restore drops it: the lock is free again.
+        drop(prepared);
+        assert!(HostUpgradeLock::try_acquire(&target).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_summary_line_records_a_now_bypass() {
+        // D185: the bypass and who asked are on the WARN line.
+        let (logged, ()) = crate::upgrade::log_capture::capture_warn(|| {
+            log_applied_summary(&AppliedSummaryLine {
+                trigger: "manual",
+                from: "0.48.0",
+                to: "0.48.1",
+                sender: "local API (durable token)",
+                delay_secs: 1234,
+                rollout: "bypassed by now=true",
+                swap: "performed",
+                backup: "/opt/x0x/x0xd.backup-0.48.0-0011aabb",
+                exit: "deferred_restart(supervised_exit(code=0))",
+            })
+        });
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(
+            logged.contains("staged delay 1234s bypassed by now=true"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("sender local API (durable token)"),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn exit_description_names_the_restart_owner() {
+        assert_eq!(
+            exit_description(restart::RestartMode::SupervisedExit, Some(0), true),
+            "supervised_exit(code=0)"
+        );
+        assert_eq!(
+            exit_description(restart::RestartMode::TransactionalHandoff, None, true),
+            "transactional_handoff"
+        );
+        assert_eq!(
+            exit_description(restart::RestartMode::SupervisedExit, Some(0), false),
+            "deferred_restart(supervised_exit(code=0))"
+        );
+    }
 
     /// Magic prefix of a native executable on the host platform, so archive
     /// contents built by these tests pass the post-extraction magic check.

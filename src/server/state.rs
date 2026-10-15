@@ -599,9 +599,15 @@ pub(super) struct DaemonUpdateConfig {
     #[serde(default = "default_true")]
     pub(super) enabled: bool,
 
-    /// Maximum rollout window in minutes. Default: 0 (immediate — no delay).
-    /// Set to a positive value (e.g. 1440 for 24h) to spread upgrades across
-    /// the fleet using a deterministic hash of the node MachineId.
+    /// Staged-rollout window in minutes (ADR 0094 §1, #1106). Default: 60
+    /// (D183). Every apply path (startup check, gossip, fallback poll and
+    /// `POST /upgrade/apply`) waits `SHA-256(MachineId ‖ version)` × window
+    /// after this node first receives a verified release, so nodes apply at
+    /// different times in `[0, window)` and the order changes per release.
+    /// The served wait is kept in `<data_dir>/upgrade-rollout.json` across
+    /// restarts. `0` applies on first receipt (private rehearsal hosts only,
+    /// D184). Fleet hosts use at least 60 (D184; the fleet inventory check
+    /// enforces that minimum, not the daemon).
     #[serde(default = "default_rollout_window_minutes")]
     pub(super) rollout_window_minutes: u64,
 
@@ -640,7 +646,7 @@ impl Default for DaemonUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            rollout_window_minutes: 0,
+            rollout_window_minutes: default_rollout_window_minutes(),
             stop_on_upgrade: true,
             fallback_check_interval_minutes: 2880,
             repo: default_update_repo(),
@@ -655,7 +661,7 @@ fn default_true() -> bool {
 }
 
 fn default_rollout_window_minutes() -> u64 {
-    0
+    x0x::upgrade::rollout::DEFAULT_ROLLOUT_WINDOW_MINUTES
 }
 
 fn default_fallback_check_interval_minutes() -> u64 {

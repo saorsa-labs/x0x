@@ -291,17 +291,23 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<TasksSub>,
     },
-    /// Check releases; use authenticated POST /upgrade/apply to install.
+    /// Check releases; `--apply` asks the running daemon to install.
     Upgrade {
         /// Just check for updates, don't apply.
         #[arg(long)]
         check: bool,
-        /// Installation is refused; use authenticated POST /upgrade/apply.
-        /// With --check, only a read-only release check is performed.
+        /// Ask the running daemon to apply the latest verified release
+        /// (authenticated POST /upgrade/apply). The daemon applies after this
+        /// node's staged-rollout wait. With --check, only a read-only release
+        /// check is performed.
         #[arg(long)]
         apply: bool,
+        /// With --apply: skip the staged-rollout wait for this host only
+        /// (now=true, D185). Eligibility, holds and every install check stay.
+        #[arg(long, requires = "apply")]
+        now: bool,
         /// With --check, fetch the current manifest regardless of version.
-        /// Does not bypass the refusal to install.
+        /// Does not install anything.
         #[arg(long)]
         force: bool,
     },
@@ -2094,11 +2100,15 @@ async fn run(
             let client = DaemonClient::new(name, api, format).ok();
             return commands::constitution::display(client.as_ref(), *raw, *json).await;
         }
+        // `--apply` (without --check) delegates to the running daemon below
+        // (ADR 0094 §1: CLI install requests delegate to authenticated daemon
+        // apply). Everything else is the read-only check or the refusal.
         Commands::Upgrade {
             check,
-            apply: _,
+            apply,
             force,
-        } => {
+            ..
+        } if *check || !*apply => {
             return commands::upgrade::run(*check, *force).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
@@ -3102,9 +3112,7 @@ async fn run(
                 .await
             }
         },
-        Commands::Upgrade { .. } => {
-            anyhow::bail!("command dispatched earlier — dispatch table out of sync")
-        }
+        Commands::Upgrade { now, .. } => commands::upgrade::apply_via_daemon(&client, now).await,
         Commands::Ws { sub } => match sub {
             None => commands::ws::general(&client).await,
             Some(WsSub::Sessions) => commands::ws::sessions(&client).await,
@@ -3382,7 +3390,7 @@ x0x (v{VERSION})
 |
 +-- System
     +-- constitution       Display the x0x Constitution
-    +-- upgrade            Read-only release check; use POST /upgrade/apply to install
+    +-- upgrade            Release check; --apply [--now] asks the daemon to install
     |   +-- --check        Just check, don't apply
     |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI

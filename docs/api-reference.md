@@ -2325,14 +2325,34 @@ Run a command on **another** agent's machine. Disabled by default; every request
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
-| POST | `/upgrade/apply` | — (CLI does not call this) | Daemon applies the latest verified release manifest with transactional restart |
+| POST | `/upgrade/apply` | `x0x upgrade --apply [--now]` | Daemon applies the latest verified release manifest after this node's staged-rollout wait, with transactional restart; `?now=true` skips the wait for this host (D185) |
 
-**The CLI only checks; it never installs.** `x0x upgrade --check` is a
-read-only check against GitHub and needs **no running daemon**. `x0x upgrade`,
-`--apply` and `--force` refuse installation (N2, v0.46.0): install with the
-authenticated daemon endpoint `POST /upgrade/apply` (or let the daemon's
-self-update apply it), over REST or the GUI. See
-[docs/upgrade-system.md](upgrade-system.md).
+**The CLI never installs a binary itself.** `x0x upgrade --check` is a
+read-only check against GitHub and needs **no running daemon**. `x0x upgrade`
+without `--check` or `--apply`, and `--force`, refuse installation (N2,
+v0.46.0). `x0x upgrade --apply [--now]` asks the running daemon to install
+through the authenticated endpoint `POST /upgrade/apply[?now=true]` (ADR 0094
+§1: CLI install requests delegate to authenticated daemon apply). The GUI and
+REST use the same endpoint. See [docs/upgrade-system.md](upgrade-system.md).
+
+**Staged rollout (#1106).** `POST /upgrade/apply` waits for this node's
+staged-rollout delay like every other apply path. While the node waits it
+answers `200` with `{"ok": true, "applied": false, "staged": true, "reason":
+"staged rollout: …", "version", "delay_secs", "remaining_secs",
+"window_minutes", "current_version"}`, and the daemon applies the release
+when the wait is served. On a shared install whose other daemons are not yet
+due, the answer is `staged: true` with `pending_participants`. When staging
+would leave less than 1 GiB free, the answer is `staged: true,
+insufficient_disk: true` (not a failure; the daemon checks again). When the
+staged-rollout state is unreadable, the answer is `applied: false, blocked:
+true`. When the release applies, the answer is the usual `{"applied": true,
+"version", "previous_version", "restart_scheduled": true}`.
+
+**`now=true` (D185).** `POST /upgrade/apply?now=true` (query, optional, bool)
+skips the wait for this host only, and on a shared install the other daemons'
+waits. Eligibility, every install check and every configured hold stay
+(self-update off or a blocked state on any daemon of the install). The bypass and who asked are recorded in `upgrade-rollout.json` and
+on the WARN summary line.
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
 binary cannot read the `owner_certified` policy variant and crash-loops; the

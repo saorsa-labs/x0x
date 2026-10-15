@@ -1744,9 +1744,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/upgrade/apply",
         cli_name: "upgrade --apply",
-        description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply refuses and directs callers here)",
+        description: "Daemon applies the latest verified release manifest after this node's staged-rollout wait, with transactional restart; now=true skips the wait for this host (D185)",
         category: "upgrade",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
