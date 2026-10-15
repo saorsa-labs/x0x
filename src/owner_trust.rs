@@ -431,6 +431,30 @@ impl OwnerTrust {
         devices.is_enrolled(machine_id, &owner).await
     }
 
+    /// Whether `sender` may reopen a corrupt revocation carrier because its
+    /// authenticated machine is enrolled to the local owner (#1116).
+    ///
+    /// This does not read the revocation set. A resync hold must not hide
+    /// the owner's other machine. A busy lock, a missing binding, a missing
+    /// owner, or an enrollment that is not current returns false.
+    pub(crate) fn try_enrolled_snapshot_authority(&self, sender: &AgentId) -> bool {
+        let Some(owner) = self.local_owner else {
+            return false;
+        };
+        let Some(devices) = self.device_store() else {
+            return false;
+        };
+        let Ok(bindings) = self.bindings.try_read() else {
+            return false;
+        };
+        let Some(machine) = bindings.peek(sender).map(|binding| binding.machine_id) else {
+            return false;
+        };
+        drop(bindings);
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        devices.try_evidence_enrolled(&machine, &owner, now_ms) == Some(true)
+    }
+
     /// Whether `(agent_id, machine_id)` is owner-trusted (module docs, 1–5).
     ///
     /// `machine_id` must be the transport-authenticated peer machine (the

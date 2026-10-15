@@ -246,16 +246,22 @@ All notable changes to this project will be documented in this file.
   tombstone. Other pubsub, DM, and direct messages stay withheld.
   One peer does not open a carrier. The node's own publish does not open
   it. An empty snapshot does not open it. A snapshot that omits a
-  revocation this node has already verified does not open it. A carrier
-  opens when two other peers have published the same snapshot and every
-  record in it has verified. x0xd then writes that carrier to the live
-  path and leaves the quarantine file in place. The next start loads the
-  live file. Placing a readable file on the live path is a rebuild for the
-  next start. It does not change the set of a process that is already
-  running. Do not delete the quarantine file. Do not replace it with a
-  zero-byte file. v1 and v2 revocation writes fsync the file and its
-  directory. Accepted transient record:
-  `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not folded).
+  revocation this node has already verified does not open it. Two free
+  agent keys do not open it. A carrier opens only when the snapshot comes
+  from a trusted authority and every record in it has verified. A trusted
+  authority is a machine enrolled to the local owner, or an Active owner
+  or admin in the local journal for a group this node belongs to.
+  Otherwise the carrier stays closed until an operator rebuild. x0xd then
+  writes that carrier to the live path and leaves the quarantine file in
+  place. An incomplete snapshot is not written, so a restart cannot admit
+  a revoked agent from it. The next start loads the live file. Placing a
+  readable file on the live path is a rebuild for the next start. It does
+  not change the set of a process that is already running. Do not delete
+  the quarantine file. Do not replace it with a zero-byte file. v1 and v2
+  revocation writes fsync the file and its directory. Accepted transient
+  record: `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not
+  folded). Sender rule, Proposed:
+  `docs/adr/transient/T-revocation-snapshot-authority.md` (slot A03, not folded).
 
 - **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
   The roster removal left the leaf in place, so the leaver could derive later

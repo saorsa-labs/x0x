@@ -449,6 +449,39 @@ pub fn record_startup_diagnostic(event: &str) {
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
+/// Install the check that reopens a corrupt revocation carrier (#1116).
+///
+/// A trusted sender is a machine enrolled to the local owner, or an Active
+/// owner or admin in a local group this node belongs to. The callback holds
+/// a `Weak` so the revocation set does not keep `AppState` alive. A busy
+/// lock fails closed. The callback does not take the revocation lock.
+async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
+    let weak = Arc::downgrade(state);
+    let authority = x0x::revocation::SnapshotAuthority::new(move |sender| {
+        let Some(state) = weak.upgrade() else {
+            return false;
+        };
+        if state
+            .agent
+            .revocation_snapshot_from_enrolled_machine(sender)
+        {
+            return true;
+        }
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        let sender_hex = hex::encode(sender.as_bytes());
+        x0x::groups::sender_is_active_group_authority(groups.values(), &local, &sender_hex)
+    });
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .set_snapshot_authority(authority);
+}
+
 /// Start the x0x server in-process with explicit runtime options.
 ///
 /// All synchronous, fallible startup (data-dir create, identity load/gen,
@@ -1237,6 +1270,8 @@ pub async fn serve_with_options(
         #[cfg(test)]
         named_group_test_recorders: state::NamedGroupTestRecorders::default(),
     });
+
+    install_revocation_snapshot_authority(&state).await;
 
     // ADR-0068 D1: teach the history retention reaper which scopes are
     // fork-quarantined. Installed HERE because this is the first point at

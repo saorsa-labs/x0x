@@ -4490,7 +4490,7 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 /// record's owner-key authority, insert, and persist `revocations-v3.bin`
 /// when anything was new. Records of any other subject are ignored here —
 /// they have their own carriers.
-/// After a verified carrier quorum, write that carrier's live file (#1116).
+/// After a trusted authority opens a carrier, write that live file (#1116).
 ///
 /// The quarantine sibling is left in place. A hold that is still open is
 /// not written, so a restart cannot treat a partial set as a rebuild.
@@ -14065,6 +14065,16 @@ impl Agent {
     /// and diagnostics.
     pub fn revocation_set(&self) -> std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>> {
         std::sync::Arc::clone(&self.revocation_set)
+    }
+
+    /// Whether `sender` is an enrolled machine of the local owner for a
+    /// corrupt-revocation snapshot (#1116). The group-journal half of that
+    /// check lives with the daemon, which owns the named-group map.
+    pub(crate) fn revocation_snapshot_from_enrolled_machine(
+        &self,
+        sender: &identity::AgentId,
+    ) -> bool {
+        self.owner_trust.try_enrolled_snapshot_authority(sender)
     }
 
     /// Return the shared identity discovery cache (`pub(crate)` — used by the

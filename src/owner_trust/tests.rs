@@ -192,6 +192,27 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn enrolled_machine_is_revocation_snapshot_authority_1116() {
+    let (_owner, enrolled) = Fixture::same_owner().await;
+    assert!(enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&enrolled.agent_id));
+    assert!(!enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&AgentId([0xEE; 32])));
+
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let missing = Fixture::new(&owner, Some(&owner), None, Enrollment::None).await;
+    assert!(!missing
+        .trust
+        .try_enrolled_snapshot_authority(&missing.agent_id));
+    let expired = Fixture::new(&owner, Some(&owner), None, Enrollment::Expired).await;
+    assert!(!expired
+        .trust
+        .try_enrolled_snapshot_authority(&expired.agent_id));
+}
+
 // (1) R3: an owner's own certified agent on an enrolled machine passes the
 // stream gate with NO contact entry and NO ACL edit.
 #[tokio::test]
