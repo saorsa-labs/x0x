@@ -31,7 +31,7 @@ We will lift a self-leave fork marker with the existing local clear. The clear d
 
 The marker is the ADR 0066 marker. It is never gossiped. Each node that holds it must clear its own copy. Before a force clear, the operator follows `docs/runbooks/fork-quarantine.md` §4.3c: compare `GET /groups/:id/state` heads, read `snapshot.classification`, have an admin of the agreed chain advance it, re-seat members who still hold the disowned sibling, then clear. The reason names that runbook and what was verified.
 
-A relayed TreeKEM commit that the signed roster binding does not cover is rejected and sets no marker. This clear does not apply to that fork.
+A mismatched digest-bound rekey is rejected and sets no marker. The legacy epoch-only binding is the separate #1337 finding. This clear does not apply to that fork.
 
 `POST /groups/:id/quarantine/clear` is the route. `clear_group_quarantine` implements it. Only the durable API token may call it. A session token is refused and the marker stays.
 
