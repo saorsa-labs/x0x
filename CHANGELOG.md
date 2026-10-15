@@ -261,7 +261,7 @@ All notable changes to this project will be documented in this file.
   revocation writes fsync the file and its directory. Accepted transient
   record: `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not
   folded). Sender rule, Proposed:
-  `docs/adr/transient/T-revocation-snapshot-authority.md` (slot A03, not folded).
+  `docs/adr/transient/T-revocation-snapshot-authority.md` (slot A02, not folded).
 
 - **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
   The roster removal left the leaf in place, so the leaver could derive later

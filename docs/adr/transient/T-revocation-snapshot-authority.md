@@ -1,7 +1,7 @@
 # T-revocation-snapshot-authority: a trusted authority reopens a corrupt revocation carrier
 
 - **Status:** Proposed
-- **Target slot:** A03
+- **Target slot:** A02
 - **Date:** 2026-10-15
 - **Decision owners:** David Irvine
 - **Reviewers:** <pending>
