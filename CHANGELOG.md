@@ -133,14 +133,15 @@ All notable changes to this project will be documented in this file.
 - **The designated admin finishes TreeKEM catch-up before a startup self-leave rekey.**
   Startup no longer waits 250 ms and then seals. When a removed member still
   has a live leaf and another active member remains, the lowest active admin
-  asks those members for catch-up and seals only after each asked peer reports
-  the same saved membership head. An empty page, a truncated page, and a
-  KeyPackage reply do not clear that wait. Failed sends retry within three
-  attempts, including one attempt after the network join. The wait does not
-  expire into a seal. While it is open, new TreeKEM ciphertext is withheld.
+  asks each of those members for catch-up. Each peer may be asked three
+  times. A fourth peer is still asked. A later retry, including the network
+  join and a 30 second backoff, asks a peer that still has a send remaining.
+  An empty page, a truncated page, a missing hash, and a KeyPackage reply do
+  not clear that peer. When every asked peer has reported the saved head or
+  has spent its three sends, the wait ends and the designated admin may seal.
+  While a peer still has a send remaining, new TreeKEM ciphertext is withheld.
   When no other active member remains, startup seals. Historical Removed rows
-  with no live leaf do not start the wait. A 30 second backoff uses any
-  send that is still inside the bound. `T-self-leave-catchup-before-seal`
+  with no live leaf do not start the wait. `T-self-leave-catchup-before-seal`
   (Proposed, slot A07).
 
 ## [v0.48.0] - 2026-10-13

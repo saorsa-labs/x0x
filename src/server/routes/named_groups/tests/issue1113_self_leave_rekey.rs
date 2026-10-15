@@ -2114,8 +2114,9 @@ async fn historical_removed_row_does_not_open_the_startup_wait() -> Result<()> {
     Ok(())
 }
 
-/// A failed startup send stays pending. Reconnect may retry inside the bound.
-/// Past the bound the leaf stays, and new ciphertext stays withheld.
+/// A failed startup send stays pending. Reconnect may retry inside the
+/// per-peer bound. When that peer's three sends are spent, the wait ends
+/// and the designated admin seals.
 #[tokio::test]
 async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -> Result<()> {
     let (fixture, _witness) = startup_with_witness(&"c5".repeat(16)).await?;
@@ -2138,23 +2139,91 @@ async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a second failed send must not seal"
+    );
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "spending the per-peer send bound must end the wait and seal"
+    );
+    assert_ne!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "ciphertext must not stay withheld after the send bound"
+    );
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(
         self_leave_startup_send_count(&fixture.group_id),
         3,
         "the send bound must stop further catch-up requests"
     );
+    Ok(())
+}
+
+/// Four other members each receive a startup ask. The old group-wide cap
+/// stopped at three, so the fourth peer was never asked.
+#[tokio::test]
+async fn startup_asks_a_fourth_peer_and_reasks_a_peer_that_returns() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"c7".repeat(16)).await?;
+    let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        for byte in [0x11u8, 0x22, 0x33] {
+            let peer = x0x::identity::AgentId([byte; 32]);
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+        }
+    }
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        4,
+        "each of the four peers must be asked"
+    );
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
-        "spending the send bound must not seal"
+        "the first ask must not seal"
     );
     assert_eq!(
         encrypt_status(&fixture.state, &fixture.group_id).await,
-        StatusCode::CONFLICT,
-        "ciphertext stays withheld after the send bound"
+        StatusCode::CONFLICT
+    );
+    let late = x0x::identity::AgentId([0x44; 32]);
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.add_member(
+            hex::encode(late.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+    }
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        9,
+        "the four peers are asked again and the returning peer is asked once"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a peer that still has a send remaining must keep the wait open"
     );
     Ok(())
 }

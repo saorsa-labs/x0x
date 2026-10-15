@@ -22885,19 +22885,29 @@ fn self_leave_rekey_fence_catchup_peer(group_ids: &[String], peer: &str, open: b
     }
 }
 
-/// How many catch-up sends one startup obligation may make. A failed send
-/// does not seal. Attempts that remain are used after the network join
-/// and after [`SELF_LEAVE_STARTUP_CATCHUP_BACKOFF`].
+/// How many catch-up sends one peer may receive for one startup obligation.
+/// The bound is per peer, so a fourth peer is still asked. A failed send
+/// does not seal. Attempts that remain are used when that peer is asked
+/// again, including after the network join and after
+/// [`SELF_LEAVE_STARTUP_CATCHUP_BACKOFF`].
 const SELF_LEAVE_STARTUP_CATCHUP_SENDS: u32 = 3;
 
 /// Delay before a startup catch-up send that the first pass did not use.
-/// The sleep does not seal. The send bound still applies.
+/// The sleep does not seal. Each peer's send bound still applies.
 const SELF_LEAVE_STARTUP_CATCHUP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct StartupCatchupPeer {
+    sends: u32,
+    satisfied: bool,
+}
 
 struct StartupCatchupObligation {
     aliases: Vec<String>,
-    peers: HashSet<String>,
-    sends: u32,
+    peers: HashMap<String, StartupCatchupPeer>,
+}
+
+fn startup_peer_still_blocks(peer: &StartupCatchupPeer) -> bool {
+    !peer.satisfied && peer.sends < SELF_LEAVE_STARTUP_CATCHUP_SENDS
 }
 
 fn self_leave_startup_obligations(
@@ -22933,7 +22943,8 @@ fn self_leave_startup_open(group_id: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.values().any(|obligation| {
-        !obligation.peers.is_empty() && (obligation.aliases.iter().any(|alias| alias == group_id))
+        obligation.aliases.iter().any(|alias| alias == group_id)
+            && obligation.peers.values().any(startup_peer_still_blocks)
     })
 }
 
@@ -22947,8 +22958,7 @@ fn self_leave_startup_require(group_ids: &[String], peers: &[String]) {
     let key = group_ids[0].clone();
     let obligation = guard.entry(key).or_insert(StartupCatchupObligation {
         aliases: Vec::new(),
-        peers: HashSet::new(),
-        sends: 0,
+        peers: HashMap::new(),
     });
     for group_id in group_ids {
         if !obligation.aliases.iter().any(|alias| alias == group_id) {
@@ -22956,7 +22966,13 @@ fn self_leave_startup_require(group_ids: &[String], peers: &[String]) {
         }
     }
     for peer in peers {
-        obligation.peers.insert(peer.clone());
+        obligation
+            .peers
+            .entry(peer.clone())
+            .or_insert(StartupCatchupPeer {
+                sends: 0,
+                satisfied: false,
+            });
     }
 }
 
@@ -22976,9 +22992,8 @@ fn self_leave_startup_satisfy_peer(group_ids: &[String], peer: &str) {
         .collect();
     for key in keys {
         if let Some(obligation) = guard.get_mut(&key) {
-            obligation.peers.remove(peer);
-            if obligation.peers.is_empty() {
-                guard.remove(&key);
+            if let Some(row) = obligation.peers.get_mut(peer) {
+                row.satisfied = true;
             }
         }
     }
@@ -22996,17 +23011,22 @@ fn self_leave_startup_retire(group_ids: &[String]) {
     });
 }
 
-fn self_leave_startup_note_send(group_ids: &[String]) {
+fn self_leave_startup_note_send(group_ids: &[String], peer: &str) {
     let mut guard = self_leave_startup_obligations()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for obligation in guard.values_mut() {
-        if obligation
+        if !obligation
             .aliases
             .iter()
             .any(|alias| group_ids.iter().any(|id| id == alias))
         {
-            obligation.sends = obligation.sends.saturating_add(1);
+            continue;
+        }
+        if let Some(row) = obligation.peers.get_mut(peer) {
+            if startup_peer_still_blocks(row) {
+                row.sends = row.sends.saturating_add(1);
+            }
         }
     }
 }
@@ -23016,12 +23036,27 @@ fn self_leave_startup_sends_remaining(group_ids: &[String]) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.values().any(|obligation| {
-        obligation.sends < SELF_LEAVE_STARTUP_CATCHUP_SENDS
-            && !obligation.peers.is_empty()
+        obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
+            && obligation.peers.values().any(startup_peer_still_blocks)
+    })
+}
+
+fn self_leave_startup_peer_wants_send(group_ids: &[String], peer: &str) -> bool {
+    let guard = self_leave_startup_obligations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.values().any(|obligation| {
+        obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
             && obligation
-                .aliases
-                .iter()
-                .any(|alias| group_ids.iter().any(|id| id == alias))
+                .peers
+                .get(peer)
+                .is_some_and(startup_peer_still_blocks)
     })
 }
 
@@ -23033,7 +23068,7 @@ pub(in crate::server) fn self_leave_startup_send_count(group_id: &str) -> u32 {
     guard
         .values()
         .find(|obligation| obligation.aliases.iter().any(|alias| alias == group_id))
-        .map(|obligation| obligation.sends)
+        .map(|obligation| obligation.peers.values().map(|peer| peer.sends).sum())
         .unwrap_or(0)
 }
 
@@ -24217,11 +24252,12 @@ async fn send_startup_self_leave_catchup(state: &Arc<AppState>, plans: &[Startup
             continue;
         }
         for peer in &plan.peers {
-            if !self_leave_startup_sends_remaining(&plan.ids) {
-                break;
+            let peer_hex = hex::encode(peer.as_bytes());
+            if !self_leave_startup_peer_wants_send(&plan.ids, &peer_hex) {
+                continue;
             }
             let _sent = request_treekem_catchup_page(state, &plan.group_key, peer).await;
-            self_leave_startup_note_send(&plan.ids);
+            self_leave_startup_note_send(&plan.ids, &peer_hex);
         }
     }
 }
@@ -24250,11 +24286,11 @@ pub(in crate::server) async fn startup_self_leave_rekey(state: &Arc<AppState>) {
     }
 }
 
-/// Later sends after the first startup attempt. Does not seal when the
-/// bound is spent or the saved head is still unproven.
+/// Later sends after the first startup attempt.
 ///
 /// The network-join path calls this once. The backoff task calls it until
-/// the send bound is spent. Each call still refuses a seal.
+/// each peer has spent its three sends. A peer that comes back inside that
+/// bound is asked again. When no peer still blocks, the rekey may seal.
 fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
     tokio::spawn(async move {
         for _ in 0..SELF_LEAVE_STARTUP_CATCHUP_SENDS {
@@ -24264,10 +24300,14 @@ fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
     });
 }
 
-/// One more bounded catch-up attempt after reconnect. Does not seal when
-/// the bound is spent or the saved head is still unproven.
+/// Ask again after reconnect, and ask a peer that was not in the first set.
+///
+/// A peer that still has a send remaining is asked. A peer that has spent
+/// its three sends is not. When no peer still blocks, the following rekey
+/// may seal.
 pub(in crate::server) async fn retry_startup_self_leave_catchup(state: &Arc<AppState>) {
     let plans = startup_self_leave_plans(state).await;
+    install_startup_self_leave_gates(&plans);
     send_startup_self_leave_catchup(state, &plans).await;
     rekey_outstanding_treekem_self_leaves(state).await;
 }
