@@ -1336,6 +1336,16 @@ pub(super) struct AppState {
             std::sync::Arc<tokio::sync::Notify>,
         )>,
     >,
+    /// Token of this daemon's startup catch-up backoff task. Zero means no
+    /// task owns the state. The task clears the token on exit and on
+    /// cancellation, and only when it still holds that token. A second
+    /// daemon has its own token, so one task cannot block the other.
+    pub(super) startup_catchup_backoff_owner: std::sync::atomic::AtomicU64,
+    /// Abort handle for the backoff task above. Tests cancel it and then
+    /// check that a new task can take the token. Dropping the handle does
+    /// not abort the task.
+    #[cfg(test)]
+    pub(super) startup_catchup_backoff_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     /// Per-instance named-group transport observations. These remain on the
     /// exact `AppState` whose route emitted them so parallel tests cannot
     /// clear or append another instance's evidence (#759 item 4).
