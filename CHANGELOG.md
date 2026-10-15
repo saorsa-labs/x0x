@@ -159,7 +159,7 @@ All notable changes to this project will be documented in this file.
   group again. An ordinary group (`no_anchor`) needs `force` and a reason
   on `POST /groups/:id/quarantine/clear`, and the durable API token. The
   clear does not roll the sealed TreeKEM epoch back.
-  `T-self-leave-fork-quarantine-recovery` (Proposed, slot A14).
+  `T-self-leave-fork-quarantine-clear` (Proposed, slot A14).
 
 ## [v0.48.0] - 2026-10-13
 

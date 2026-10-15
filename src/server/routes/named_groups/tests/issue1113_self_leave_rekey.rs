@@ -3147,33 +3147,51 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
     Ok(())
 }
 
-async fn deliver_conflicting_description(
+/// A second self-leave rekey of the same leaver, chained from `parent`.
+/// An update on a restored pre-seal tree makes the TreeKEM commit differ
+/// from the sealed rekey. The signed roster binding names those bytes.
+async fn deliver_conflicting_self_leave_rekey(
     fixture: &LeaveFixture,
     parent: &x0x::groups::GroupInfo,
+    pre_seal_snapshot: &[u8],
     actor_hex: &str,
-    description: &str,
 ) -> Result<bool> {
-    let mut sibling_meta = parent.public_meta();
-    sibling_meta.description = description.to_string();
-    let sibling = x0x::groups::GroupStateCommit::sign(
-        parent.stable_group_id().to_string(),
-        parent.state_revision.saturating_add(1),
-        Some(parent.state_hash.clone()),
-        x0x::groups::compute_roster_root(&parent.members_v2),
-        x0x::groups::compute_policy_hash(&parent.policy),
-        x0x::groups::compute_public_meta_hash(&sibling_meta),
-        parent.security_binding.clone(),
-        false,
-        now_millis_u64(),
-        fixture.state.agent.identity().agent_keypair(),
+    let leaver_hex = hex::encode(fixture.member_id.as_bytes());
+    let kp_b64 = parent
+        .members_v2
+        .get(&leaver_hex)
+        .and_then(current_member_treekem_key_package)
+        .expect("the parent roster still holds the leaver KeyPackage");
+    let kp_bytes = base64::engine::general_purpose::STANDARD.decode(kp_b64)?;
+    let group_id_bytes = hex::decode(&fixture.group_id)?;
+    let seed = super::super::agent_treekem_seed(fixture.state.agent.as_ref(), &group_id_bytes);
+    let mut fork_tree = x0x::mls::TreeKemMlsGroup::restore(
+        pre_seal_snapshot,
+        fixture.state.agent.agent_id(),
+        &seed,
     )?;
-    let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+    fork_tree.update()?;
+    let treekem_commit = fork_tree.remove_member_verified(fixture.member_id, &kp_bytes)?;
+    let treekem_epoch = fork_tree.epoch();
+    let mut sibling = parent.clone();
+    sibling.roster_revision = sibling.roster_revision.saturating_add(1);
+    let revision = sibling.roster_revision;
+    sibling.remove_member(&leaver_hex, Some(actor_hex.to_string()));
+    sibling.secret_epoch = treekem_epoch;
+    sibling.security_binding = Some(treekem_commit_binding(treekem_epoch, &treekem_commit));
+    let commit = sibling.seal_commit(
+        fixture.state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )?;
+    let event = NamedGroupMetadataEvent::MemberRemoved {
         group_id: fixture.group_id.clone(),
-        revision: parent.state_revision.saturating_add(1),
+        revision,
         actor: actor_hex.to_string(),
-        name: None,
-        description: Some(description.to_string()),
-        commit: Some(sibling),
+        agent_id: leaver_hex,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(&treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
+        commit: Some(commit),
     };
     let applied = apply_named_group_metadata_event(
         &fixture.state,
@@ -3186,9 +3204,9 @@ async fn deliver_conflicting_description(
     Ok(applied.accepted)
 }
 
-/// A conflicting description commit arrives on the metadata receive path.
+/// A conflicting self-leave rekey arrives on the metadata receive path.
 /// The existing clear lifts the local marker and re-arms the evidence gate.
-/// The next conflicting commit quarantines the group again. The sealed
+/// The next conflicting rekey quarantines the group again. The sealed
 /// epoch stays.
 #[tokio::test]
 async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Result<()> {
@@ -3223,6 +3241,11 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
         let info = groups.get_mut(&fixture.group_id).expect("group");
         info.remove_member(&lower_hex, Some(lower_hex.clone()));
     }
+    let pre_seal_snapshot = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let guard = group.lock().await;
+        guard.to_snapshot_bytes()?
+    };
     startup_self_leave_rekey(&fixture.state).await;
     let sealed_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
     assert!(
@@ -3231,16 +3254,12 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
         fixture.epoch_before
     );
 
-    let accepted = deliver_conflicting_description(
-        &fixture,
-        &parent,
-        &admin_hex,
-        "sibling-of-the-self-leave-rekey",
-    )
-    .await?;
+    let accepted =
+        deliver_conflicting_self_leave_rekey(&fixture, &parent, &pre_seal_snapshot, &admin_hex)
+            .await?;
     assert!(
         !accepted,
-        "the receive path must not adopt the conflicting description"
+        "the receive path must not adopt the conflicting self-leave rekey"
     );
     let quarantined = {
         let groups = fixture.state.named_groups.read().await;
@@ -3322,16 +3341,12 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
         "the clear must leave the sealed epoch in place"
     );
 
-    let accepted_again = deliver_conflicting_description(
-        &fixture,
-        &parent,
-        &admin_hex,
-        "second-conflict-after-the-clear",
-    )
-    .await?;
+    let accepted_again =
+        deliver_conflicting_self_leave_rekey(&fixture, &parent, &pre_seal_snapshot, &admin_hex)
+            .await?;
     assert!(
         !accepted_again,
-        "the later conflict must not replace the head"
+        "the later self-leave rekey must not replace the head"
     );
     let again = {
         let groups = fixture.state.named_groups.read().await;

@@ -1,4 +1,4 @@
-# T-self-leave-fork-quarantine-recovery: clear a local self-leave fork marker
+# T-self-leave-fork-quarantine-clear: clear a local self-leave fork marker
 
 - **Status:** Proposed
 - **Date:** 2026-10-14
@@ -11,9 +11,9 @@
 
 ## Context
 
-David accepted `T-self-leave-rekey-committer` (D274, 14 Oct 2026, slot A09), including the fork-quarantine consequence. A node that seals while it is behind can sign a second child of the same parent. ADR 0064 and ADR 0066 then set the local marker. The two sealed epochs stay split. This record does not merge them.
+David accepted `T-self-leave-rekey-committer` (D274, 14 Oct 2026, slot A09). A node that seals while it is behind can sign a second child of the same parent. ADR 0064 and ADR 0066 then set the local marker. The two sealed epochs stay split. This record does not merge them.
 
-A14 owns recovery actions. This record is the operator clear of a local marker. It does not repair membership, so it does not target A08. The slot follows the subject.
+A14 owns this local clear. It does not repair membership, so it does not target A08.
 
 ## Decision Drivers
 
@@ -27,9 +27,11 @@ The accepted A09 record already names the marker. One node's clear does not clea
 
 ## Decision
 
-We will lift a self-leave fork marker with the existing local clear. This is not fleet recovery and it does not choose a TreeKEM epoch.
+We will lift a self-leave fork marker with the existing local clear. The clear does not choose a TreeKEM epoch.
 
-The marker is the ADR 0066 marker. It is never gossiped. Each node that holds it must clear its own copy. Before a force clear, the operator follows `docs/runbooks/fork-quarantine.md` §4.3: compare `GET /groups/:id/state` heads, read `snapshot.classification`, have an admin of the agreed chain advance it, re-seat members who still hold the disowned sibling, then clear. The reason names that runbook and what was verified.
+The marker is the ADR 0066 marker. It is never gossiped. Each node that holds it must clear its own copy. Before a force clear, the operator follows `docs/runbooks/fork-quarantine.md` §4.3c: compare `GET /groups/:id/state` heads, read `snapshot.classification`, have an admin of the agreed chain advance it, re-seat members who still hold the disowned sibling, then clear. The reason names that runbook and what was verified.
+
+A relayed TreeKEM commit that the signed roster binding does not cover is rejected and sets no marker. This clear does not apply to that fork.
 
 `POST /groups/:id/quarantine/clear` is the route. `clear_group_quarantine` implements it. Only the durable API token may call it. A session token is refused and the marker stays.
 
@@ -39,8 +41,8 @@ Every clear calls `reset_fork_evidence_after_quarantine_clear`. The evidence gat
 
 ## Consequences
 
-The operator can serve the group on this node after the clear. The other sealed epoch remains. Another node stays quarantined until that node clears. A later conflicting commit quarantines this node again. This record stays Proposed until David accepts it. The accepted A09 bytes stay unchanged.
+The operator can serve the group on this node after the clear. The other sealed epoch remains. A later conflicting commit quarantines this node again. This record stays Proposed until David accepts it. The accepted A09 bytes stay unchanged.
 
 ## Validation
 
-One test applies a roster-only self-leave, then lets startup seal after the other admin is gone. A conflicting `GroupMetadataUpdated` arrives through `apply_named_group_metadata_event`. The marker is set, `no_anchor` is true, and the group is refused. A session token is forbidden and the marker stays. The durable force clear removes the marker and leaves the sealed epoch. A second conflicting description commit on that same receive path quarantines the group again.
+One test applies a roster-only self-leave, then lets startup seal after the other admin is gone. A conflicting self-leave rekey (`MemberRemoved` with a different TreeKEM commit) arrives through `apply_named_group_metadata_event`. The marker is set, `no_anchor` is true, and the group is refused. A session token is forbidden and the marker stays. The durable force clear removes the marker and leaves the sealed epoch. A second conflicting self-leave rekey on that same receive path quarantines the group again.
