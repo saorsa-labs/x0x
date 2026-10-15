@@ -2522,8 +2522,7 @@ async fn startup_hold_refuses_the_group_store_protector() -> Result<()> {
     let before = {
         let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
         let guard = group.lock().await;
-        let bytes = guard.to_snapshot_bytes()?;
-        bytes
+        guard.to_snapshot_bytes()?
     };
     let info = fixture
         .state
@@ -2542,14 +2541,15 @@ async fn startup_hold_refuses_the_group_store_protector() -> Result<()> {
     let signing =
         x0x::kv::AuthorSigning::from_keypair(fixture.state.agent.identity().agent_keypair())
             .expect("signing");
-    let sealed = protector.seal_record(
-        &signing,
-        x0x::kv::KvMutationKind::Control,
-        &x0x::kv::KvStoreId::new([9; 32]),
-        b"withheld-control",
-        false,
-    )
-    .await;
+    let sealed = protector
+        .seal_record(
+            &signing,
+            x0x::kv::KvMutationKind::Control,
+            &x0x::kv::KvStoreId::new([9; 32]),
+            b"withheld-control",
+            false,
+        )
+        .await;
     assert!(
         matches!(
             sealed,
@@ -2560,8 +2560,7 @@ async fn startup_hold_refuses_the_group_store_protector() -> Result<()> {
     let after = {
         let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
         let guard = group.lock().await;
-        let bytes = guard.to_snapshot_bytes()?;
-        bytes
+        guard.to_snapshot_bytes()?
     };
     assert_eq!(
         before, after,
