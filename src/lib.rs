@@ -18805,6 +18805,22 @@ fn schedule_reconnect(
         );
 
         'attempts: for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
+            // A one-sided repair disconnects with Transport, which reaches
+            // this scheduler. That repair already dialled (or is dialling).
+            // Wait out its backoff before this ladder's first dial so the
+            // 1 s retry does not ignore the 60 s bound (#1419).
+            if let Some(hold) = network.one_sided_repair_backoff_remaining(peer_id_bytes) {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    hold_secs = hold.as_secs(),
+                    "reconnect waiting out one-sided repair backoff",
+                );
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    _ = tokio::time::sleep(hold) => {}
+                }
+            }
             // Wait with cancellation before each attempt. Apply bounded jitter
             // so peers that disconnected together do not redial in lockstep.
             tokio::select! {
@@ -18838,6 +18854,21 @@ fn schedule_reconnect(
                     "reconnect cancelled: peer already connected",
                 );
                 break;
+            }
+
+            // A repair may have claimed the backoff during the wait above.
+            // Do not dial inside that window. The next attempt waits it out.
+            if network
+                .one_sided_repair_backoff_remaining(peer_id_bytes)
+                .is_some()
+            {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect skipped: one-sided repair owns the backoff",
+                );
+                continue;
             }
 
             // Refresh discovery-cache candidate addresses on EVERY attempt

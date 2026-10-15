@@ -47,10 +47,12 @@ All notable changes to this project will be documented in this file.
   A connected peer whose send age or receive age is at least 60 s, while
   another connected peer still has traffic at most 10 s old, is `degraded`
   on `GET /health` and `GET /status`. `GET /peers` sets that peer's `link`
-  to `degraded`. The health refresher writes one warning and re-dials that
-  peer once (disconnect, then dial), with a 3 s bound and a 60 s backoff.
-  `ok` stays true. No wire change. The plane gate is unchanged. ant-quic#332
-  remains the transport fix.
+  to `degraded`. The health refresher stores that count before it re-dials.
+  It writes one warning and re-dials that peer once (disconnect, then dial),
+  with a 3 s bound and a 60 s backoff. The proactive reconnect scheduler
+  waits out that same backoff. A sample with no fresh comparison traffic
+  keeps the warning and the backoff. `ok` stays true. No wire change. The
+  plane gate is unchanged. ant-quic#332 remains the transport fix.
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **The GUI recovers after a saved owner token is rejected (#1417).** An

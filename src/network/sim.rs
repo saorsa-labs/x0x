@@ -1257,9 +1257,10 @@ impl SimFabric {
         });
         if let Some(link) = state.links.get_mut(&key) {
             let send_idx = usize::from(from != key.0);
-            let recv_idx = usize::from(to != key.0);
+            // Receive age moves when the frame is delivered, not when it
+            // is queued. A delay or a later drop must not look like a
+            // fresh receive (#1419).
             link.sent_at[send_idx] = Some(at);
-            link.recv_at[recv_idx] = Some(at);
         }
         drop(state);
         self.wake.notify_one();
@@ -1612,6 +1613,11 @@ impl SimFabric {
                     {
                         if let Some(ack) = queued.delivered {
                             let _ = ack.send(());
+                        }
+                        let key = pair(lane.src, lane.dst);
+                        if let Some(link) = state.links.get_mut(&key) {
+                            let recv_idx = usize::from(lane.dst != key.0);
+                            link.recv_at[recv_idx] = Some(at);
                         }
                         Fate::Delivered { at }
                     } else {
@@ -2953,6 +2959,71 @@ mod fabric_tests {
         assert!(!gone.connected);
         assert_eq!(gone.generation, None);
         assert_eq!(gone.reader_task_active, None);
+    }
+
+    /// #1419: receive age is the last successful delivery. A frame that is
+    /// still delayed, or later discarded, must not look freshly received.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn receive_age_advances_only_when_a_frame_is_delivered() {
+        let fabric = SimFabric::new(1419);
+        fabric.add_rule(|write| {
+            if write.bytes.first() == Some(&0x7f) {
+                Fault::Delay(Duration::from_secs(5))
+            } else {
+                Fault::Pass
+            }
+        });
+        let (a, b) = two_links(&fabric).await;
+        a.send(&key(2), b"\x7fdelayed")
+            .expect("queue the delayed frame");
+        let queued = b.connection_health(&key(1));
+        assert!(
+            a.connection_health(&key(2)).last_sent_at.is_some(),
+            "a queued send is a send"
+        );
+        assert!(
+            queued.last_received_at.is_none(),
+            "a delayed frame is not a receive yet: {:?}",
+            queued.last_received_at
+        );
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let delivered = b.connection_health(&key(1));
+        let received_at = delivered
+            .last_received_at
+            .expect("delivery records the receive");
+        let age = std::time::Instant::now().saturating_duration_since(received_at);
+        assert!(
+            age < Duration::from_millis(1500),
+            "the receive age is the delivery time, not the queue time: {age:?}"
+        );
+
+        a.send(&key(2), b"\x7fdiscard")
+            .expect("queue a frame to discard");
+        let queued_again = b.connection_health(&key(1));
+        let queued_age = std::time::Instant::now().saturating_duration_since(
+            queued_again
+                .last_received_at
+                .expect("the earlier delivery is still the receive"),
+        );
+        assert!(
+            queued_age > Duration::from_millis(500),
+            "queuing a frame is not a receive: {queued_age:?}"
+        );
+        fabric
+            .supersede_link_for_test(&key(1), &key(2), false)
+            .expect("the link exists");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let after_drop = b.connection_health(&key(1));
+        let drop_age = std::time::Instant::now().saturating_duration_since(
+            after_drop
+                .last_received_at
+                .expect("a discarded frame must not clear the last delivery"),
+        );
+        assert!(
+            drop_age > Duration::from_secs(5),
+            "a frame dropped before delivery must not refresh the receive age: {drop_age:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -367,11 +367,59 @@ pub(crate) fn one_sided_link_indexes(ages: &[LinkTrafficAge]) -> Vec<usize> {
         .collect()
 }
 
+/// One connected peer and the ages the one-sided check reads (#1419).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LinkAgeSample {
+    pub peer: AntPeerId,
+    pub age: LinkTrafficAge,
+}
+
+/// Peers whose link is one-sided, in sample order.
+pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerId> {
+    let ages: Vec<LinkTrafficAge> = samples.iter().map(|sample| sample.age).collect();
+    one_sided_link_indexes(&ages)
+        .into_iter()
+        .map(|index| samples[index].peer)
+        .collect()
+}
+
 /// One re-dial episode for a peer that is one-sided (#1419).
 #[derive(Debug, Default)]
 struct OneSidedRepair {
     last_attempt: Option<Instant>,
     warned: bool,
+}
+
+/// Keep backoff and the warning unless the peer's own link has recovered.
+///
+/// A sample that drops the peer because no other peer still has fresh
+/// traffic is not recovery. The timestamp stays through
+/// [`ONE_SIDED_REDIAL_BACKOFF`]. Recovery (connected, and neither direction
+/// stale) clears the warning so a later episode can log again. The
+/// timestamp still blocks a dial inside the backoff.
+fn plan_one_sided_repairs(
+    map: &mut HashMap<AntPeerId, OneSidedRepair>,
+    samples: &[LinkAgeSample],
+    now: Instant,
+) -> Vec<AntPeerId> {
+    for sample in samples {
+        if sample.age.stale() {
+            continue;
+        }
+        if let Some(entry) = map.get_mut(&sample.peer) {
+            entry.warned = false;
+        }
+    }
+    map.retain(|peer, entry| {
+        let in_backoff = entry
+            .last_attempt
+            .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
+        let connected_stale = samples
+            .iter()
+            .any(|sample| sample.peer == *peer && sample.age.stale());
+        in_backoff || connected_stale
+    });
+    one_sided_peer_ids_from(samples)
 }
 
 /// Minimum interval between successful app-level liveness checks for a peer.
@@ -2149,6 +2197,14 @@ pub struct NetworkNode {
     /// How many one-sided re-dials this node has started.
     #[cfg(test)]
     one_sided_redials: Arc<std::sync::atomic::AtomicU32>,
+    /// How many one-sided warnings this node has logged.
+    #[cfg(test)]
+    one_sided_warnings: Arc<std::sync::atomic::AtomicU32>,
+    /// Test-only pause after the repair disconnect and before its dial.
+    /// Models a slow re-dial so the proactive scheduler can be observed
+    /// inside the window (#1419).
+    #[cfg(test)]
+    one_sided_redial_pause: Arc<Mutex<Duration>>,
     /// Reconnect-suppression tombstones, keyed by peer id. Set when a peer is
     /// disconnected for a non-transport reason (policy rejection, pool
     /// eviction, admin, revocation, shutdown) so neither the proactive
@@ -2567,6 +2623,10 @@ impl NetworkNode {
             one_sided_repairs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             one_sided_redials: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(test)]
+            one_sided_warnings: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(test)]
+            one_sided_redial_pause: Arc::new(Mutex::new(Duration::ZERO)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
@@ -2763,13 +2823,11 @@ impl NetworkNode {
         Some(node.connection_health(&peer_id).await)
     }
 
-    /// Connected peers whose link is one-sided (#1419).
+    /// Connected peers and their send/receive ages (#1419).
     ///
-    /// A peer is one-sided when its send age or receive age is at least
-    /// [`ONE_SIDED_STALE`] and another connected peer still has traffic at
-    /// most [`ONE_SIDED_FLOWING`] old. `GET /health` does not call this.
-    /// The health refresher does, off the watchdog path (#600).
-    pub(crate) async fn one_sided_peer_ids(&self) -> Vec<AntPeerId> {
+    /// `GET /health` does not call this. The health refresher does, off
+    /// the watchdog path (#600).
+    pub(crate) async fn connected_link_ages(&self) -> Vec<LinkAgeSample> {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return Vec::new();
         };
@@ -2781,9 +2839,9 @@ impl NetworkNode {
             if !health.connected {
                 continue;
             }
-            rows.push((
-                connection.peer_id,
-                LinkTrafficAge {
+            rows.push(LinkAgeSample {
+                peer: connection.peer_id,
+                age: LinkTrafficAge {
                     sent_ago: health
                         .last_sent_at
                         .map(|at| now.saturating_duration_since(at)),
@@ -2791,28 +2849,63 @@ impl NetworkNode {
                         .last_received_at
                         .map(|at| now.saturating_duration_since(at)),
                 },
-            ));
+            });
         }
-        let ages: Vec<LinkTrafficAge> = rows.iter().map(|(_, age)| *age).collect();
-        one_sided_link_indexes(&ages)
-            .into_iter()
-            .map(|index| rows[index].0)
-            .collect()
+        rows
+    }
+
+    /// Connected peers whose link is one-sided (#1419).
+    ///
+    /// A peer is one-sided when its send age or receive age is at least
+    /// [`ONE_SIDED_STALE`] and another connected peer still has traffic at
+    /// most [`ONE_SIDED_FLOWING`] old.
+    pub(crate) async fn one_sided_peer_ids(&self) -> Vec<AntPeerId> {
+        one_sided_peer_ids_from(&self.connected_link_ages().await)
+    }
+
+    /// Time left before the proactive reconnect scheduler may dial `peer_id`.
+    ///
+    /// The one-sided repair records its attempt before it disconnects. That
+    /// disconnect is reconnect-eligible, so the scheduler also runs. It
+    /// must wait out this backoff. The repair dial is the attempt inside
+    /// the window.
+    pub(crate) fn one_sided_repair_backoff_remaining(&self, peer_id: [u8; 32]) -> Option<Duration> {
+        let map = match self.one_sided_repairs.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let at = map.get(&ant_quic::PeerId(peer_id))?.last_attempt?;
+        let left =
+            ONE_SIDED_REDIAL_BACKOFF.saturating_sub(Instant::now().saturating_duration_since(at));
+        if left.is_zero() {
+            None
+        } else {
+            Some(left)
+        }
     }
 
     /// Re-dial each one-sided peer at most once per [`ONE_SIDED_REDIAL_BACKOFF`].
     ///
-    /// The peer is still connected, so the post-disconnect reconnect
-    /// scheduler does not run. This path disconnects, then dials, so both
-    /// ends install one new winner. A suppressed peer is not dialled.
-    /// The first observation of a peer writes one WARN line.
-    pub(crate) async fn repair_one_sided_links(&self, peers: &[AntPeerId]) {
-        if let Ok(mut map) = self.one_sided_repairs.lock() {
-            map.retain(|peer, _| peers.iter().any(|id| id == peer));
-        }
+    /// `samples` is the connected-peer observation, not only the one-sided
+    /// subset. A peer that leaves that subset because comparison traffic
+    /// went quiet keeps its backoff and its warning. Recovery clears the
+    /// warning. This path disconnects, then dials, so both ends install
+    /// one new winner. A suppressed peer is not dialled. The proactive
+    /// reconnect scheduler waits out the same backoff
+    /// ([`Self::one_sided_repair_backoff_remaining`]).
+    pub(crate) async fn repair_one_sided_links(&self, samples: &[LinkAgeSample]) {
+        let peers = {
+            let mut map = match self.one_sided_repairs.lock() {
+                Ok(map) => map,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            plan_one_sided_repairs(&mut map, samples, Instant::now())
+        };
         for peer in peers {
             let suppressed = self.is_reconnect_suppressed(peer.0);
-            if self.mark_one_sided_warned(peer) {
+            if self.mark_one_sided_warned(&peer) {
+                #[cfg(test)]
+                self.one_sided_warnings.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     target: "x0x::connect",
                     peer_id_prefix = %hex_prefix(&peer.0, 4),
@@ -2820,13 +2913,26 @@ impl NetworkNode {
                     "one-sided peer link: send or receive is idle while other peers still exchange traffic"
                 );
             }
-            if suppressed || !self.claim_one_sided_redial(peer) {
+            if suppressed || !self.claim_one_sided_redial(&peer) {
                 continue;
             }
-            #[cfg(test)]
-            self.one_sided_redials.fetch_add(1, Ordering::Relaxed);
-            self.redial_one_sided_peer(peer).await;
+            self.redial_one_sided_peer(&peer).await;
         }
+    }
+
+    /// The sim link, so a server test can age traffic without a socket.
+    #[cfg(test)]
+    pub(crate) fn sim_link_for_test(&self) -> Option<Arc<sim::SimLink>> {
+        self.sim_link.clone()
+    }
+
+    /// Hold the repair dial so a test can observe the scheduler first.
+    #[cfg(test)]
+    pub(crate) fn pause_one_sided_redial_for_test(&self, pause: Duration) {
+        *self
+            .one_sided_redial_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pause;
     }
 
     fn mark_one_sided_warned(&self, peer: &AntPeerId) -> bool {
@@ -2872,6 +2978,22 @@ impl NetworkNode {
                     );
                 }
             }
+            // The disconnect above is reconnect-eligible. The claim already
+            // recorded `last_attempt`, so the proactive scheduler waits out
+            // the backoff instead of dialling on its 1 s ladder. The pause
+            // is zero outside tests.
+            #[cfg(test)]
+            {
+                let pause = *self
+                    .one_sided_redial_pause
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+            }
+            #[cfg(test)]
+            self.one_sided_redials.fetch_add(1, Ordering::Relaxed);
             self.connect_peer(*peer).await
         };
         match tokio::time::timeout(ONE_SIDED_REDIAL_TIMEOUT, dial).await {
@@ -8716,20 +8838,21 @@ mod tests {
         a_link.send(&peer_c, b"\x7fac2").unwrap();
         c_link.send(&peer_a, b"\x7fca2").unwrap();
 
-        let stale = a.one_sided_peer_ids().await;
+        let samples = a.connected_link_ages().await;
+        let stale = one_sided_peer_ids_from(&samples);
         assert_eq!(
             stale,
             vec![peer_b],
             "A sees B as one-sided while C still exchanges traffic"
         );
 
-        a.repair_one_sided_links(&stale).await;
+        a.repair_one_sided_links(&samples).await;
         assert_eq!(
             a.one_sided_redials.load(Ordering::Relaxed),
             1,
             "the repair dials once"
         );
-        a.repair_one_sided_links(&stale).await;
+        a.repair_one_sided_links(&samples).await;
         assert_eq!(
             a.one_sided_redials.load(Ordering::Relaxed),
             1,
@@ -8762,6 +8885,239 @@ mod tests {
             b_to_a.len()
         );
 
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: losing the comparison peer is not recovery. The backoff and
+    /// the warning stay. Recovery clears the warning and still keeps the
+    /// 60 s timestamp.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_inconclusive_sample_keeps_backoff_and_warning() {
+        let plane = "issue1419-backoff";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let node = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 1], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let broken = test_ant_peer(2);
+        let other = test_ant_peer(3);
+        let stale = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(90)),
+        };
+        let fresh = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let conclusive = [
+            LinkAgeSample {
+                peer: broken,
+                age: stale,
+            },
+            LinkAgeSample {
+                peer: other,
+                age: fresh,
+            },
+        ];
+        node.repair_one_sided_links(&conclusive).await;
+        assert_eq!(node.one_sided_redials.load(Ordering::Relaxed), 1);
+        assert_eq!(node.one_sided_warnings.load(Ordering::Relaxed), 1);
+
+        node.repair_one_sided_links(&[]).await;
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "an empty sample must not dial"
+        );
+        assert_eq!(
+            node.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "an empty sample must not re-arm the warning"
+        );
+        node.repair_one_sided_links(&conclusive).await;
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the same broken peer stays inside the backoff"
+        );
+
+        node.repair_one_sided_links(&[LinkAgeSample {
+            peer: broken,
+            age: stale,
+        }])
+        .await;
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "an inconclusive sample must not dial"
+        );
+        assert_eq!(
+            node.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "an inconclusive sample must not re-arm the warning"
+        );
+
+        node.repair_one_sided_links(&conclusive).await;
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the backoff holds when comparison traffic returns"
+        );
+        assert_eq!(
+            node.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "the warning stays armed without recovery"
+        );
+
+        node.repair_one_sided_links(&[
+            LinkAgeSample {
+                peer: broken,
+                age: fresh,
+            },
+            LinkAgeSample {
+                peer: other,
+                age: fresh,
+            },
+        ])
+        .await;
+        node.repair_one_sided_links(&conclusive).await;
+        assert_eq!(
+            node.one_sided_warnings.load(Ordering::Relaxed),
+            2,
+            "recovery lets the next episode warn"
+        );
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "recovery does not erase the 60s backoff"
+        );
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: the repair's Transport disconnect arms the production
+    /// reconnect scheduler. That scheduler must not dial inside the 60 s
+    /// repair backoff. The counter is the scheduler's phase-2 dial, not
+    /// the repair helper.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_scheduler_does_not_dial_inside_repair_backoff() {
+        let plane = "issue1419-scheduler";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = Arc::new(NetworkNode::new(config(1), None, None).await.unwrap());
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let c = NetworkNode::new(config(3), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let c_link = Arc::clone(c.sim_link.as_ref().expect("sim link"));
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&a.peer_id(), b"\x7fca").unwrap();
+        fabric
+            .supersede_one_sided_for_test(&a.peer_id(), &peer_b)
+            .expect("the A-B link exists");
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&a.peer_id(), b"\x7fca2").unwrap();
+
+        {
+            let mut dials = crate::RECONNECT_PHASE2_DIALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            dials.remove(&peer_b.0);
+        }
+        a.pause_one_sided_redial_for_test(Duration::from_secs(2));
+
+        let mut events = a.subscribe();
+        let token = tokio_util::sync::CancellationToken::new();
+        let listen_token = token.clone();
+        let network = Arc::clone(&a);
+        let cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::<
+            crate::identity::MachineId,
+            crate::DiscoveredMachine,
+        >::new()));
+        let tracker = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            [u8; 32],
+            tokio::task::JoinHandle<()>,
+        >::new()));
+        let listener_cache = Arc::clone(&cache);
+        let listener_tracker = Arc::clone(&tracker);
+        let cancel = listen_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    event = events.recv() => match event {
+                        Ok(NetworkEvent::PeerDisconnected { peer_id, reason })
+                            if reason.reconnect_eligible() =>
+                        {
+                            crate::schedule_reconnect(
+                                Arc::clone(&network),
+                                Arc::clone(&listener_cache),
+                                listen_token.clone(),
+                                peer_id,
+                                Arc::clone(&listener_tracker),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let repair_node = Arc::clone(&a);
+        let repair = tokio::spawn(async move {
+            let samples = repair_node.connected_link_ages().await;
+            repair_node.repair_one_sided_links(&samples).await;
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let phase2 = crate::RECONNECT_PHASE2_DIALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&peer_b.0)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            phase2, 0,
+            "the reconnect scheduler must not dial inside the 60s repair backoff"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        repair.await.unwrap();
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the repair itself dials once"
+        );
+        token.cancel();
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();

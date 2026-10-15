@@ -71,6 +71,23 @@ impl HealthSnapshot {
     }
 }
 
+/// Sample one-sided links, store the snapshot, then re-dial.
+///
+/// The store runs before [`x0x::network::NetworkNode::repair_one_sided_links`].
+/// A re-dial may wait 3 s, and peers are repaired one at a time. `/health`
+/// must already show degraded while that wait is in progress (#1419).
+pub(in crate::server) async fn publish_one_sided_health(
+    network: &x0x::network::NetworkNode,
+    snapshot: &HealthSnapshot,
+    peers: usize,
+) {
+    let samples = network.connected_link_ages().await;
+    let one_sided = x0x::network::one_sided_peer_ids_from(&samples);
+    let send_ready = network.send_ready_peers().await.len();
+    snapshot.store(peers, send_ready, one_sided.len());
+    network.repair_one_sided_links(&samples).await;
+}
+
 /// Generic JSON response wrapper.
 #[derive(Debug, Serialize)]
 pub(in crate::server) struct ApiResponse<T: Serialize> {
@@ -366,6 +383,7 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{classify_health, classify_runtime_status, HealthSnapshot};
+    use crate as x0x;
 
     /// The `health` handler's own source, for the structural guard below.
     /// Matches the `include_str!`-of-route-source convention in
@@ -535,5 +553,73 @@ mod tests {
         let (status, reason) = classify_runtime_status(4, 4, 2_400, false, 1);
         assert_eq!(status, "degraded");
         assert!(reason.is_some());
+    }
+
+    /// #1419: the degraded count is visible while a slow re-dial is still
+    /// waiting. Publishing after the repair would leave `/health` healthy
+    /// for up to 3 s per peer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn one_sided_health_is_published_before_the_redial_wait() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let plane = "issue1419-publish";
+        let fabric = x0x::network::sim::SimFabric::new(1419);
+        x0x::network::sim::register(plane, &fabric);
+        let config = |host: u8| x0x::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        };
+        let a = x0x::network::NetworkNode::new(config(1), None, None)
+            .await
+            .unwrap();
+        let b = x0x::network::NetworkNode::new(config(2), None, None)
+            .await
+            .unwrap();
+        let c = x0x::network::NetworkNode::new(config(3), None, None)
+            .await
+            .unwrap();
+        let peer_b = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        let a_link = a.sim_link_for_test().expect("sim link");
+        let c_link = c.sim_link_for_test().expect("sim link");
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&a.peer_id(), b"\x7fca").unwrap();
+        fabric
+            .supersede_one_sided_for_test(&a.peer_id(), &peer_b)
+            .expect("the A-B link exists");
+        tokio::time::sleep(x0x::network::ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&a.peer_id(), b"\x7fca2").unwrap();
+        a.pause_one_sided_redial_for_test(Duration::from_secs(3));
+
+        let snapshot = Arc::new(HealthSnapshot::default());
+        let published = Arc::clone(&snapshot);
+        let task = tokio::spawn(async move {
+            super::publish_one_sided_health(&a, &published, 2).await;
+            a
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            snapshot.load().2,
+            1,
+            "the degraded count is stored before the re-dial wait finishes"
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let a = task.await.unwrap();
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
     }
 }
