@@ -65,6 +65,9 @@ fn resolve_instance_startup(
 }
 
 fn main() -> anyhow::Result<()> {
+    // #1106 review S2: off Linux, open the running image before anything
+    // else, so self-update can bind the installed bytes to this release.
+    x0x::upgrade::capture_running_image();
     if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
         return result;
     }

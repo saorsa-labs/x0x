@@ -147,16 +147,18 @@ impl HostUpgradeLock {
 
 /// SHA-256 of a file, streamed.
 pub fn sha256_file(path: &Path) -> Result<[u8; 32], UpgradeError> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))?;
+    sha256_reader(file)
+        .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))
+}
+
+fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| UpgradeError::Other(format!("cannot read {}: {e}", path.display())))?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -393,24 +395,49 @@ pub fn companion_upgrader(
     Upgrader::new(cli_path, current_version)
 }
 
-/// SHA-256 of the bytes this process runs, computed once (#1106 F1).
-///
-/// Linux only: `/proc/self/exe` names the running image even after a rename
-/// replaced the installed file, so the hash is bound to the running image.
-/// Elsewhere a pathname hash could be the hash of bytes another daemon
-/// installed later (review R2), so there is no such evidence (`None`) and
-/// the swap relies on the release marker in the installed bytes or a
-/// matching install record.
-pub fn running_binary_sha256() -> Option<[u8; 32]> {
-    #[cfg(target_os = "linux")]
-    {
-        static RUNNING: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
-        *RUNNING.get_or_init(|| sha256_file(Path::new("/proc/self/exe")).ok())
-    }
+/// The executable this process opened at process start (non-Linux).
+#[cfg(not(target_os = "linux"))]
+static RUNNING_IMAGE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+
+/// Open this process's executable before anything else runs (x0xd calls
+/// it first in `main`). Off Linux the descriptor keeps naming the image this
+/// process started from even after a rename replaces the installed file, as
+/// `/proc/self/exe` does on Linux. A no-op on Linux.
+pub fn capture_running_image() {
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        let _ = RUNNING_IMAGE.set(
+            apply::current_binary_path()
+                .ok()
+                .and_then(|path| std::fs::File::open(path).ok()),
+        );
     }
+}
+
+/// SHA-256 of the bytes this process runs, computed once (#1106 F1).
+///
+/// Linux: `/proc/self/exe` names the running image even after a rename
+/// replaced the installed file. Elsewhere: the executable opened by
+/// [`capture_running_image`] at process start; without that capture there
+/// is no such evidence (`None`), because a pathname hash could be the hash
+/// of bytes another daemon installed later (review R2). This hash binds the
+/// installed bytes to the running release; the embedded release marker is
+/// only a cross-check of it (review S2).
+pub fn running_binary_sha256() -> Option<[u8; 32]> {
+    static RUNNING: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    *RUNNING.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            sha256_file(Path::new("/proc/self/exe")).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::io::Seek;
+            let mut image = RUNNING_IMAGE.get()?.as_ref()?;
+            image.seek(std::io::SeekFrom::Start(0)).ok()?;
+            sha256_reader(image).ok()
+        }
+    })
 }
 
 impl Upgrader {
@@ -596,22 +623,28 @@ impl Upgrader {
     /// The installed release for bytes with `installed_sha256`, from
     /// verified evidence only.
     ///
-    /// Evidence order (review R2): the release marker in the installed bytes
-    /// themselves, then an install record whose hash matches, then (Linux
-    /// only) the hash of the running image.
+    /// Review S2: only hash-bound evidence names the installed release: an
+    /// install record whose hash matches (bytes this updater verified and
+    /// recorded), or the hash of this process's running image. The embedded
+    /// release marker never counts alone; it is a cross-check. When the
+    /// sources disagree (record against running image, or either against
+    /// the marker), the bytes are unknown. Partial or changed bytes match no
+    /// hash, so they are unknown too.
     fn installed_release(&self, installed_sha256: &[u8; 32]) -> Option<Version> {
-        if let Ok(Some(release)) = embedded_release(&self.target_path) {
-            return Some(release);
+        let recorded =
+            InstallRecord::read(&self.target_path).and_then(|r| r.release_for(installed_sha256));
+        let running = (self.running_sha256.as_ref() == Some(installed_sha256))
+            .then(|| self.current_version.clone());
+        let bound = match (recorded, running) {
+            (Some(recorded), Some(running)) if recorded != running => return None,
+            (Some(release), _) | (None, Some(release)) => release,
+            (None, None) => return None,
+        };
+        match embedded_release(&self.target_path) {
+            Ok(Some(marker)) if marker != bound => None,
+            Ok(_) => Some(bound),
+            Err(_) => None,
         }
-        if let Some(release) =
-            InstallRecord::read(&self.target_path).and_then(|r| r.release_for(installed_sha256))
-        {
-            return Some(release);
-        }
-        if self.running_sha256.as_ref() == Some(installed_sha256) {
-            return Some(self.current_version.clone());
-        }
-        None
     }
 
     /// Decide the swap under the lock, before any binary changes (#1106 F1).
