@@ -13319,6 +13319,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             // Captured before `treekem_payload` is moved into the commit install.
             let roster_only_removal = treekem_payload.is_none();
+            if let Some((commit_b64, epoch)) = treekem_payload.as_ref() {
+                let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                if !treekem_removal_binding_covers_commit(&commit, *epoch, &commit_bytes) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "rejecting TreeKEM removal: the signed roster commit does not bind these commit bytes"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
+            let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
@@ -13334,7 +13347,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     next.remove_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = signed_binding.clone();
                     } else if let Some(secret_epoch) = secret_epoch {
                         let old_epoch = next.secret_epoch;
                         next.secret_epoch = secret_epoch;
@@ -22433,6 +22446,10 @@ async fn wipe_local_group_crypto_material(
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
+        let path = self_leave_rekey_outbox_path(state, alias);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            let _ = sync_parent_dir_for_path(&path);
+        }
     }
 }
 
@@ -23019,12 +23036,15 @@ async fn install_saved_self_leave_rekey(
     let NamedGroupMetadataEvent::MemberRemoved {
         agent_id: leaver_hex,
         revision,
-        treekem_commit_b64: Some(_),
+        treekem_commit_b64: Some(commit_b64),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(saved_commit),
         ..
     } = &event
     else {
+        return SelfLeaveRekeyStep::Deferred;
+    };
+    let Ok(saved_treekem) = BASE64.decode(commit_b64) else {
         return SelfLeaveRekeyStep::Deferred;
     };
     let Some(event_key) = self_leave_outbox_event_key(&event) else {
@@ -23090,7 +23110,7 @@ async fn install_saved_self_leave_rekey(
     }
     next.remove_member(leaver_hex, Some(local_agent_hex));
     next.secret_epoch = *treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    next.security_binding = Some(treekem_commit_binding(*treekem_epoch, &saved_treekem));
     // `seal_commit` advances `state_revision` before it hashes. The saved
     // commit's hash includes that revision. A bare roster recompute does not.
     let previous_hash = next.state_hash.clone();
@@ -23163,6 +23183,7 @@ async fn install_saved_self_leave_rekey(
             return SelfLeaveRekeyStep::Deferred;
         }
     }
+    drop_persisted_self_leave_snapshot(state, group_key, &event).await;
     save_mls_groups(state).await;
     let _ = prune_treekem_cache_member(state, group_key, leaver_hex, "self_leave_rekey").await;
     remember_treekem_membership_event(state, &event).await;
@@ -23267,8 +23288,8 @@ fn self_leave_outbox_event_key(event: &NamedGroupMetadataEvent) -> Option<String
                 .as_ref()
                 .map(|commit| commit.state_hash.clone())
                 .unwrap_or_default();
-            // The roster hash does not cover the TreeKEM commit bytes. Two
-            // commits for one logical removal must stay two outbound records.
+            // The signed state names the TreeKEM commit digest. The event key
+            // still includes those bytes so two payloads stay two records.
             let commit_bytes = treekem_commit_b64.as_deref().unwrap_or("");
             let commit_id = blake3::hash(commit_bytes.as_bytes()).to_hex();
             Some(format!(
@@ -23356,6 +23377,51 @@ fn self_leave_outbox_drop_snapshot(file: &mut SelfLeaveOutboxFile, key: &str) {
     file.committer_snapshots.retain(|row| row.event_key != key);
 }
 
+/// Signed binding for a TreeKEM removal. The digest is inside `security_binding`,
+/// which the roster commit signs. A relay cannot swap the TreeKEM bytes.
+fn treekem_commit_binding(epoch: u64, commit: &[u8]) -> String {
+    let digest = blake3::hash(commit).to_hex();
+    format!("treekem:epoch={epoch}:commit={digest}")
+}
+
+/// `treekem:epoch=<n>` is the shipped admin removal. It does not name the
+/// TreeKEM bytes. A self-leave rekey seals [`treekem_commit_binding`].
+fn treekem_removal_binding_covers_commit(
+    signed: &x0x::groups::state_commit::GroupStateCommit,
+    epoch: u64,
+    commit_bytes: &[u8],
+) -> bool {
+    let Some(binding) = signed.security_binding.as_deref() else {
+        return false;
+    };
+    if binding == treekem_commit_binding(epoch, commit_bytes) {
+        return true;
+    }
+    binding == format!("treekem:epoch={epoch}")
+}
+
+/// The epoch is durable in the TreeKEM snapshot. Drop the outbox copy of
+/// that private tree. Keep the pending event until publish succeeds.
+async fn drop_persisted_self_leave_snapshot(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    let Some(key) = self_leave_outbox_event_key(event) else {
+        return;
+    };
+    if let Err(error) = mutate_self_leave_outbox(state, group_key, |file| {
+        self_leave_outbox_drop_snapshot(file, &key);
+    })
+    .await
+    {
+        tracing::error!(
+            group_id = %LogHexId::group(group_key),
+            "self-leave committer snapshot was not deleted after the epoch was persisted: {error}"
+        );
+    }
+}
+
 fn self_leave_outbox_store_snapshot(
     file: &mut SelfLeaveOutboxFile,
     event_key: String,
@@ -23372,30 +23438,6 @@ fn self_leave_outbox_store_snapshot(
     }
 }
 
-async fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let write = async {
-        let mut file = tokio::fs::File::create(&temporary).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&temporary, path).await?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = write {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
-    }
-    // A rename without a parent-directory fsync can disappear on power loss.
-    // Report that failure. Do not treat the write as durable.
-    sync_parent_dir_for_path(path)
-}
-
 async fn write_self_leave_rekey_outbox(
     path: &std::path::Path,
     file: &SelfLeaveOutboxFile,
@@ -23407,7 +23449,11 @@ async fn write_self_leave_rekey_outbox(
         return sync_parent_dir_for_path(path);
     }
     let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
-    write_atomic_bytes(path, &bytes).await?;
+    // Same 0600 helper as the other TreeKEM files. `File::create` would
+    // leave the post-commit private tree at 0644.
+    crate::storage::save_private_bytes_to(path, bytes)
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
     #[cfg(test)]
     if self_leave_outbox_write_should_fail() {
         // The rename already landed. The caller sees a failure and must not
@@ -23416,7 +23462,9 @@ async fn write_self_leave_rekey_outbox(
             "self-leave outbox parent directory fsync failed",
         ));
     }
-    Ok(())
+    // A rename without a parent-directory fsync can disappear on power loss.
+    // Report that failure. Do not treat the write as durable.
+    sync_parent_dir_for_path(path)
 }
 
 #[cfg(test)]
@@ -24038,18 +24086,6 @@ async fn commit_treekem_self_leave_rekey_from(
     let revision = next.roster_revision;
     next.remove_member(&leaver_hex, Some(local_agent_hex.clone()));
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
-        Ok(commit) => commit,
-        Err(error) => {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_key),
-                leaver = %LogHexId::agent(&leaver_hex),
-                "self-leave TreeKEM rekey deferred: seal failed: {error}"
-            );
-            return SelfLeaveRekeyStep::Deferred;
-        }
-    };
     let rollback_snapshot = match guard.to_snapshot_bytes() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -24088,6 +24124,27 @@ async fn commit_treekem_self_leave_rekey_from(
         );
         return SelfLeaveRekeyStep::Deferred;
     }
+    // Seal after the TreeKEM bytes exist so the signed binding names them.
+    next.security_binding = Some(treekem_commit_binding(treekem_epoch, &treekem_commit));
+    let commit = match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            rollback_treekem_group_after_failed_install(
+                state,
+                group_key,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "self_leave_rekey_seal_failed",
+            );
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                leaver = %LogHexId::agent(&leaver_hex),
+                "self-leave TreeKEM rekey deferred: seal failed: {error}"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+    };
     quiesce_member_join_egress(state, group_key, &leaver_hex).await;
     // Re-check under the membership lock, after the awaits above, and
     // before the epoch becomes durable.
@@ -24195,6 +24252,7 @@ async fn commit_treekem_self_leave_rekey_from(
             return SelfLeaveRekeyStep::Deferred;
         }
     }
+    drop_persisted_self_leave_snapshot(state, group_key, &event).await;
     drop(guard);
 
     save_mls_groups(state).await;

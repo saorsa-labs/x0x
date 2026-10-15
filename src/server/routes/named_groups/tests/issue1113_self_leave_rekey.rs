@@ -1158,30 +1158,15 @@ async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()>
         } => base64::engine::general_purpose::STANDARD.decode(commit_b64)?,
         _ => panic!("pending event must be the rekey"),
     };
-    let event_key = self_leave_outbox_event_key(pending).expect("event key");
-    let saved_tree = saved
-        .committer_snapshots
-        .iter()
-        .find(|row| row.event_key == event_key)
-        .map(|row| base64::engine::general_purpose::STANDARD.decode(&row.snapshot_b64))
-        .transpose()?
-        .expect("the failed write must keep the post-commit tree");
+    assert!(
+        saved.committer_snapshots.is_empty(),
+        "a durable epoch must not keep the post-commit private tree in the outbox"
+    );
     let published = published_removal_commit(&fixture.state).expect("published bytes");
     assert_eq!(
         published, saved_bytes,
         "the published commit must be the saved commit, not a second payload"
     );
-    let group_id_bytes = hex::decode(&fixture.group_id)?;
-    let seed = agent_treekem_seed(fixture.state.agent.as_ref(), &group_id_bytes);
-    // The committer cannot process_commit its own UpdatePath. The saved
-    // snapshot is the tree remove_member already installed.
-    let mut restored =
-        x0x::mls::TreeKemMlsGroup::restore(&saved_tree, fixture.state.agent.agent_id(), &seed)?;
-    let ciphertext = encrypt(&fixture.state, &fixture.group_id, b"same-keys").await?;
-    let opened = restored
-        .decrypt_message(&ciphertext)
-        .expect("the saved snapshot's keys must match the installed tree");
-    assert_eq!(opened, b"same-keys");
     let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
     fail_self_leave_outbox_write_number(0);
     rekey_outstanding_treekem_self_leaves(&fixture.state).await;
@@ -1307,6 +1292,243 @@ async fn resume_keeps_a_rekey_until_the_membership_lock_shows_it_stored() -> Res
     assert!(
         publish_count(&fixture.state) > before,
         "resume must publish once the stored chain holds the commit"
+    );
+    Ok(())
+}
+
+fn unix_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// The outbox holds the post-commit private tree at mode 0600. Persist
+/// deletes that copy. A later wipe deletes the file.
+#[tokio::test]
+async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    skip_self_leave_rekey_ack(true);
+    fixture
+        .state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
+    assert_eq!(unix_mode(&path), 0o600, "outbox_mode");
+    let file = read_self_leave_rekey_outbox(&path).await;
+    assert!(
+        file.committer_snapshots.is_empty(),
+        "persist must delete the outbox private tree"
+    );
+    let live_snap = treekem_snapshot_path(&fixture.state.treekem_dir, &fixture.group_id);
+    assert_eq!(unix_mode(&live_snap), 0o600, "live_snap_mode");
+
+    let pending = file.pending.first().expect("pending rekey").clone();
+    let snapshot = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let guard = group.lock().await;
+        guard.to_snapshot_bytes()?
+    };
+    remember_durable_self_leave_rekey(&fixture.state, &fixture.group_id, &pending, Some(&snapshot))
+        .await?;
+    assert_eq!(unix_mode(&path), 0o600, "crash-window outbox_mode");
+    let parked = read_self_leave_rekey_outbox(&path).await;
+    assert_eq!(parked.committer_snapshots.len(), 1);
+    let saved_tree = base64::engine::general_purpose::STANDARD
+        .decode(&parked.committer_snapshots[0].snapshot_b64)?;
+    let group_id_bytes = hex::decode(&fixture.group_id)?;
+    let seed = agent_treekem_seed(fixture.state.agent.as_ref(), &group_id_bytes);
+    let mut restored =
+        x0x::mls::TreeKemMlsGroup::restore(&saved_tree, fixture.state.agent.agent_id(), &seed)?;
+    let ciphertext = encrypt(&fixture.state, &fixture.group_id, b"live").await?;
+    let opened = restored
+        .decrypt_message(&ciphertext)
+        .expect("snapshot_decrypts_live");
+    assert_eq!(opened, b"live");
+
+    wipe_local_group_crypto_material(&fixture.state, &fixture.group_id, None, "test-wipe").await;
+    assert!(
+        !tokio::fs::try_exists(&path).await?,
+        "after_wipe_outbox_snapshots"
+    );
+    skip_self_leave_rekey_ack(false);
+    Ok(())
+}
+
+/// A member may relay an admin's signed removal. It may not attach its own
+/// TreeKEM commit. The victim stays on the pre-rekey epoch, then the genuine
+/// rekey installs and the leaver cannot read it.
+#[tokio::test]
+async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> {
+    let mut fixture = two_member_treekem_group().await?;
+    let member_b_kp = x0x::identity::AgentKeypair::generate()?;
+    let member_b = member_b_kp.agent_id();
+    let (victim_state, _victim_dir) = secure_endpoint_test_state().await?;
+    let victim_id = victim_state.agent.agent_id();
+
+    let b_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_b, &[4u8; 32])?;
+    let b_pkg = b_prepared.key_package_bytes().to_vec();
+    let b_added = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.add_member(member_b, &b_pkg)?
+    };
+    fixture.leaver_group.process_commit(&b_added.commit)?;
+    let mut member_b_group =
+        x0x::mls::TreeKemMlsGroup::join_from_welcome(b_prepared, &b_added.welcome)?;
+
+    let victim_seed = [5u8; 32];
+    let victim_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(victim_id, &victim_seed)?;
+    let victim_pkg = victim_prepared.key_package_bytes().to_vec();
+    let victim_added = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.add_member(victim_id, &victim_pkg)?
+    };
+    fixture.leaver_group.process_commit(&victim_added.commit)?;
+    member_b_group.process_commit(&victim_added.commit)?;
+    let victim_group =
+        x0x::mls::TreeKemMlsGroup::join_from_welcome(victim_prepared, &victim_added.welcome)?;
+
+    let epoch_before = live_epoch(&fixture.state, &fixture.group_id).await;
+    let b_hex = hex::encode(member_b.as_bytes());
+    let victim_hex = hex::encode(victim_id.as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+        info.add_member(
+            b_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &b_hex,
+            base64::engine::general_purpose::STANDARD.encode(&b_pkg),
+        );
+        info.add_member(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &victim_hex,
+            base64::engine::general_purpose::STANDARD.encode(&victim_pkg),
+        );
+        info.secret_epoch = epoch_before;
+        info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+        info.recompute_state_hash();
+    }
+    let shared = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).expect("group").clone()
+    };
+    victim_state
+        .named_groups
+        .write()
+        .await
+        .insert(fixture.group_id.clone(), shared);
+    victim_state.treekem_groups.write().await.insert(
+        fixture.group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(victim_group)),
+    );
+
+    let attacker_commit = member_b_group.update()?;
+    let leave = signed_self_leave(&fixture).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let applied = apply_named_group_metadata_event(
+        &fixture.state,
+        leave.clone(),
+        fixture.member_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        applied.accepted,
+        "the admin must seal the leave: {applied:?}"
+    );
+    let victim_leave =
+        apply_named_group_metadata_event(&victim_state, leave, fixture.member_id, true, None).await;
+    assert!(
+        victim_leave.accepted,
+        "the victim must apply the roster leave: {victim_leave:?}"
+    );
+    assert_eq!(
+        live_epoch(&victim_state, &fixture.group_id).await,
+        epoch_before,
+        "the roster leave must not advance the victim's epoch"
+    );
+    let genuine = published_removal_event(&fixture.state).expect("genuine rekey");
+    let genuine_hash = named_group_metadata_event_commit(&genuine)
+        .expect("signed commit")
+        .state_hash
+        .clone();
+    let mut relayed = genuine.clone();
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64, ..
+    } = &mut relayed
+    {
+        *treekem_commit_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(&attacker_commit));
+    }
+    let relayed_hash = named_group_metadata_event_commit(&relayed)
+        .expect("signed commit")
+        .state_hash
+        .clone();
+    assert_eq!(genuine_hash, relayed_hash, "roster_hash_equal");
+
+    let admin_id = fixture.state.agent.agent_id();
+    let rejected =
+        apply_named_group_metadata_event(&victim_state, relayed, admin_id, true, None).await;
+    assert!(
+        !rejected.accepted,
+        "a relayed TreeKEM commit from another member must be rejected: {rejected:?}"
+    );
+    assert_eq!(
+        live_epoch(&victim_state, &fixture.group_id).await,
+        epoch_before,
+        "the victim must stay on the pre-rekey epoch"
+    );
+
+    let installed =
+        apply_named_group_metadata_event(&victim_state, genuine, admin_id, true, None).await;
+    assert!(
+        installed.accepted,
+        "the genuine rekey must still install: {installed:?}"
+    );
+    assert_eq!(
+        live_epoch(&victim_state, &fixture.group_id).await,
+        live_epoch(&fixture.state, &fixture.group_id).await
+    );
+    let ciphertext = encrypt(&fixture.state, &fixture.group_id, b"after-genuine").await?;
+    let victim_opened = {
+        let group = live_treekem_group(&victim_state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.decrypt_message(&ciphertext)?
+    };
+    assert_eq!(victim_opened, b"after-genuine");
+    assert!(
+        fixture.leaver_group.decrypt_message(&ciphertext).is_err(),
+        "the leaver must not read the victim's new traffic"
+    );
+    assert!(
+        member_b_group.decrypt_message(&ciphertext).is_err(),
+        "the other member's own update must not read the genuine epoch"
     );
     Ok(())
 }
