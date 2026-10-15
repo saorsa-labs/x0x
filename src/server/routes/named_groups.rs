@@ -23136,7 +23136,8 @@ pub(in crate::server) async fn self_leave_startup_withholds_ciphertext(
     let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) else {
         return false;
     };
-    if !self_leave_startup_open(state, key) && !self_leave_startup_open(state, info.stable_group_id())
+    if !self_leave_startup_open(state, key)
+        && !self_leave_startup_open(state, info.stable_group_id())
     {
         return false;
     }
