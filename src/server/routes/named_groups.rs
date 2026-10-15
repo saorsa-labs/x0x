@@ -2638,6 +2638,12 @@ fn group_card_signature_accepted(card: &x0x::groups::GroupCard) -> bool {
                     refused,
                     "refused unsigned or unverifiable GroupCard: {error}"
                 );
+            } else {
+                tracing::debug!(
+                    group_id = %card.group_id,
+                    refused,
+                    "refused unsigned or unverifiable GroupCard: {error}"
+                );
             }
             false
         }
