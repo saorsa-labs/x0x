@@ -2212,11 +2212,11 @@ While this node holds a fork-quarantine marker for a group (see the 409
 `fork_quarantined` section under Error handling), the history surface splits in
 two: **reads always serve, the purge always refuses.**
 
-**Reads are annotated, never refused.** `GET /history`,
+**Fork quarantine annotates reads. It does not refuse the scope.** `GET /history`,
 `GET /history/message/:msg_id`, `GET /history/search`, `GET /history/scopes`,
 `GET /history/stats`, `GET /diagnostics/history` and
-`GET /groups/:id/messages` return the same rows they always did and add two
-envelope fields:
+`GET /groups/:id/messages` still return rows for a fork-quarantined group, and
+they add two envelope fields:
 
 A session bearer outside an active local group seat still receives retained
 history content under the existing history authorization rules, but the
@@ -2288,6 +2288,40 @@ sentence names the **roster key** (the spelling the roster is filed under), but
 since #732 `POST /groups/:id/quarantine/clear` accepts either spelling too, so
 either id in the refusal is usable. `/history/stats` + `/diagnostics/history`
 list both spellings when they differ.
+
+### Author refusal on stored reads (#1229)
+
+A stored read hides a row when its author is revoked or Blocked at the time of
+that read. The store keeps the row. A later read returns the row when that
+author is allowed again. A row with no author stays visible.
+
+These reads hide a refused author:
+
+- `GET /history`
+- `GET /history/message/:msg_id`
+- `GET /history/search`
+- `GET /groups/:id/messages`
+
+A direct-message row is also hidden when its originating machine is revoked,
+or when the agent–machine binding is revoked.
+
+`GET /history` and `GET /history/search` apply `limit` before this filter. The
+page can then contain fewer records than `limit`. `next_before_id` still names
+the last stored row of that page, including a hidden row, so the next page
+moves forward. `GET /groups/:id/messages` reads at most 500 stored rows, then
+applies the same author filter.
+
+`GET /history/scopes`, `GET /history/stats`, and `GET /diagnostics/history` do
+not return message bodies. This filter does not change those responses.
+
+WebSocket topic backfill and WebSocket direct backfill check each row before
+they insert it on the session queue. They do not check that row again when the
+socket writer sends it. A block or a revoke that happens after the row is
+queued can still reach the socket.
+
+`GET /direct/events?backfill=N` checks each row before it yields that event. A
+block or a revoke that happens between events hides each row that has not been
+yielded yet.
 
 ## Remote exec
 

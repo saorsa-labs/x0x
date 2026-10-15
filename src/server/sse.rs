@@ -175,11 +175,11 @@ pub(super) async fn direct_events_sse(
     let mut rx = state.agent.subscribe_direct();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
 
-    // Stored rows fetched up-front so the stream! block stays simple; the
-    // live tap above is already established, so nothing is missed while the
-    // (blocking) store query runs.
-    let mut backfill_rows: Vec<serde_json::Value> = Vec::new();
-    let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+    // Stored rows are fetched up-front so the live tap above is already
+    // established while the blocking query runs. Author refusal is NOT
+    // decided here: a slow client can pause between events, and the check
+    // must see the revocation state at the moment each event is emitted.
+    let mut backfill_records: Option<Vec<crate::history::HistoryRecord>> = None;
     if let Some(limit) = params.backfill {
         if let Some(history) = state.agent.history() {
             let store = std::sync::Arc::clone(history.store());
@@ -191,22 +191,7 @@ pub(super) async fn direct_events_sse(
             match tokio::task::spawn_blocking(move || store.query(&q)).await {
                 Ok(Ok(mut rows)) => {
                     rows.reverse(); // oldest-first replay
-                    let mut hashes = std::collections::HashSet::new();
-                    for row in &rows {
-                        let r = &row.record;
-                        hashes.insert(*blake3::hash(&r.payload).as_bytes());
-                        backfill_rows.push(serde_json::json!({
-                            "sender": r.author_agent,
-                            "machine_id": r.author_machine,
-                            "payload": BASE64.encode(&r.payload),
-                            "received_at": r.seen_at_ms,
-                            "verified": matches!(
-                                r.provenance,
-                                crate::history::Provenance::VerifiedEnvelope
-                            ),
-                        }));
-                    }
-                    backfill_hashes = Some(hashes);
+                    backfill_records = Some(rows.into_iter().map(|row| row.record).collect());
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("direct SSE backfill query failed: {e}");
@@ -218,17 +203,48 @@ pub(super) async fn direct_events_sse(
         }
     }
     let emit_marker = params.backfill.is_some();
+    let gate_state = Arc::clone(&state);
 
     let stream = async_stream::stream! {
-        for data in backfill_rows {
-            yield Ok(Event::default()
-                .event("history_direct_message")
-                .data(data.to_string()));
+        // Hashes of rows actually emitted. A refused row is omitted so a
+        // later live frame is not dropped if that sender is allowed again.
+        let mut dedupe = if backfill_records.is_some() {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
+        if let Some(records) = backfill_records {
+            for record in records {
+                if super::delivery_gate::stored_dm_delivery_refused(
+                    &gate_state,
+                    record.author_agent.as_deref(),
+                    record.author_machine.as_deref(),
+                )
+                .await
+                {
+                    continue;
+                }
+                if let Some(hashes) = dedupe.as_mut() {
+                    hashes.insert(*blake3::hash(&record.payload).as_bytes());
+                }
+                let data = serde_json::json!({
+                    "sender": record.author_agent,
+                    "machine_id": record.author_machine,
+                    "payload": BASE64.encode(&record.payload),
+                    "received_at": record.seen_at_ms,
+                    "verified": matches!(
+                        record.provenance,
+                        crate::history::Provenance::VerifiedEnvelope
+                    ),
+                });
+                yield Ok(Event::default()
+                    .event("history_direct_message")
+                    .data(data.to_string()));
+            }
         }
         if emit_marker {
             yield Ok(Event::default().event("live").data("{}"));
         }
-        let mut dedupe = backfill_hashes;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {

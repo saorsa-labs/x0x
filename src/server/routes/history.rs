@@ -669,6 +669,19 @@ fn group_history_message(
     Some(message)
 }
 
+/// Drop history rows the delivery gate refuses. The caller keeps the
+/// stored-page cursor from the unfiltered rows.
+async fn visible_history_rows(state: &AppState, rows: Vec<StoredRecord>) -> Vec<StoredRecord> {
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !crate::server::delivery_gate::history_record_delivery_refused(state, &row.record).await
+        {
+            kept.push(row);
+        }
+    }
+    kept
+}
+
 /// GET /history — scoped durable-history listing (newest first, keyset
 /// paginated via `before_id`).
 pub(in crate::server) async fn history_list(
@@ -730,6 +743,10 @@ pub(in crate::server) async fn history_list(
                 markers_for_scopes(&state, std::iter::once(&scope)).await,
             )
             .await;
+            // #1229: hide refused authors. `limit` already bound the store page,
+            // so `count` can be smaller than the requested limit. The cursor
+            // stays on the last stored row, including a hidden one.
+            let rows = visible_history_rows(&state, rows).await;
             let items: Vec<_> = rows
                 .iter()
                 .map(|row| row_json(row, marker_for(&markers, &row.record.scope)))
@@ -810,6 +827,17 @@ pub(in crate::server) async fn history_message(
 
     match lookup {
         Ok(Ok(Some(row))) => {
+            // #1229: a refused author is hidden. The response matches a
+            // missing row so the lookup does not reveal the stored body.
+            if crate::server::delivery_gate::history_record_delivery_refused(&state, &row.record)
+                .await
+            {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "no history row for msg_id (canonical group ids require ?scope=group:<stable_id>; \
+                     scan budget covers the newest 4096 rows of the scope)",
+                );
+            }
             // ADR-0066 §3a (row 13): the row's OWN scope decides, so a
             // point lookup made without `?scope=` is annotated too.
             let markers = visible_markers(
@@ -944,6 +972,9 @@ pub(in crate::server) async fn history_search(
                 .await,
             )
             .await;
+            // #1229: same author filter as `GET /history`. Markers were taken
+            // from the stored page, before hidden rows were removed.
+            let rows = visible_history_rows(&state, rows).await;
             let items: Vec<_> = rows
                 .iter()
                 .map(|row| row_json(row, marker_for(&markers, &row.record.scope)))
