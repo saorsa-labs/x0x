@@ -322,11 +322,16 @@ impl RolloutApplier for DaemonApplier {
         summary: ApplySummary,
     ) -> ApplyFuture<'a> {
         Box::pin(async move {
+            let skip_waits = summary.bypass;
             AutoApplyUpgrader::new("x0xd")
                 .with_stop_on_upgrade(self.stop_on_upgrade)
                 .with_restart_context(self.restart_context.clone())
                 .with_apply_summary(summary)
-                .with_shared_install_gate(self.shared_install_gate.clone())
+                .with_shared_install_gate(
+                    self.shared_install_gate
+                        .clone()
+                        .map(|gate| x0x::upgrade::apply::SharedInstallGate { skip_waits, ..gate }),
+                )
                 .apply_upgrade_from_manifest(manifest)
                 .await
         })
@@ -838,11 +843,18 @@ impl RolloutScheduler {
         sender: Option<String>,
         staged: &StagedRelease,
     ) -> Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError> {
+        // Review S5: a recorded now=true bypass stays on every attempt: the
+        // summary names it and its requester, and the shared gate runs in
+        // skip-waits mode (holds still stop it).
         let summary = ApplySummary {
             trigger: Some(trigger),
-            sender,
+            sender: staged
+                .bypass
+                .as_ref()
+                .map(|b| b.requested_by.clone())
+                .or(sender),
             delay_secs: staged.delay_secs,
-            bypass: false,
+            bypass: staged.bypass.is_some(),
         };
         let mut shutdown = self.env.shutdown_watch.clone();
         let attempt = || {
@@ -913,6 +925,9 @@ impl RolloutScheduler {
                     return;
                 }
                 match inner.state.entry(&version) {
+                    // Review S5: a recorded now=true bypass skips the wait
+                    // here too (a retry after a participant wait).
+                    Some(entry) if entry.bypass.is_some() => (entry.waited_secs, Duration::ZERO),
                     Some(entry) => (entry.waited_secs, entry.remaining()),
                     None => return,
                 }
