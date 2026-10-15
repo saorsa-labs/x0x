@@ -194,14 +194,13 @@ struct LruEntry {
 
 /// Place of each certificate-recovery miss list (#1116).
 ///
-/// `cursors` holds at most 64 streams. When a stream loses its slot, its
-/// next index is kept in `fallback_next`. A later visit continues from
-/// that index instead of the first subject.
+/// `cursors` holds at most 64 streams whose next subject is not the first.
+/// A list that does not fit is left unstored, so it cannot replace an
+/// earlier list's index.
 #[derive(Debug, Default)]
 pub(crate) struct CertRecoveryAttempts {
     pub(crate) cursors: HashMap<u64, u64>,
     pub(crate) cursor_order: VecDeque<u64>,
-    pub(crate) fallback_next: u64,
     #[cfg(test)]
     pub(crate) attempted: HashSet<identity::AgentId>,
 }
@@ -217,8 +216,8 @@ pub struct AnnounceBlobCache {
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
     /// Next index of each revocation miss list. v1 and v2 share it. A
-    /// shorter list does not move a longer list, and dropping an old list
-    /// keeps that list's next index (#1116).
+    /// shorter list does not move a longer list, and a later list does not
+    /// replace an earlier list's index (#1116).
     cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
     #[cfg(test)]
     bounded_fetch_fails: AtomicBool,

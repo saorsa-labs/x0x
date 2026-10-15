@@ -2741,9 +2741,9 @@ fn plan_subject_cert_recovery(
 
 /// How many recovery streams keep an exact next index.
 ///
-/// A stream is one ordered miss list. A stream that no longer has a slot
-/// keeps its next index, so the next visit does not start again at the
-/// first subject.
+/// A stream is one ordered miss list. Only a list whose next subject is
+/// not the first uses a slot. A list that does not fit is not stored, so
+/// a later list cannot replace an earlier list's index.
 const MAX_CERT_RECOVERY_STREAMS: usize = 64;
 
 fn recovery_stream_fingerprint<T, K>(misses: &[T], key_of: &impl Fn(&T) -> K) -> u64
@@ -2764,11 +2764,7 @@ fn recovery_stream_start(
     fingerprint: u64,
     len: usize,
 ) -> usize {
-    let next = progress
-        .cursors
-        .get(&fingerprint)
-        .copied()
-        .unwrap_or(progress.fallback_next);
+    let next = progress.cursors.get(&fingerprint).copied().unwrap_or(0);
     (next as usize) % len
 }
 
@@ -2777,26 +2773,29 @@ fn remember_recovery_stream(
     fingerprint: u64,
     next: u64,
 ) {
-    if let std::collections::hash_map::Entry::Occupied(mut entry) =
-        progress.cursors.entry(fingerprint)
-    {
-        entry.insert(next);
+    use std::collections::hash_map::Entry;
+    // Index 0 is the start for a list that has no slot. Keeping it would
+    // let a singleton eviction replace another list's saved index.
+    if next == 0 {
+        progress.cursors.remove(&fingerprint);
         progress.cursor_order.retain(|item| *item != fingerprint);
-        progress.cursor_order.push_back(fingerprint);
         return;
     }
-    while progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS {
-        let Some(old) = progress.cursor_order.pop_front() else {
-            break;
-        };
-        if let Some(cursor) = progress.cursors.remove(&old) {
-            // Keep the discarded stream's place. A later visit continues
-            // here instead of looking like a subject that was never tried.
-            progress.fallback_next = cursor;
+    let at_capacity = progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS;
+    match progress.cursors.entry(fingerprint) {
+        Entry::Occupied(mut entry) => {
+            entry.insert(next);
+            progress.cursor_order.retain(|item| *item != fingerprint);
+            progress.cursor_order.push_back(fingerprint);
+        }
+        Entry::Vacant(entry) => {
+            if at_capacity {
+                return;
+            }
+            entry.insert(next);
+            progress.cursor_order.push_back(fingerprint);
         }
     }
-    progress.cursors.insert(fingerprint, next);
-    progress.cursor_order.push_back(fingerprint);
 }
 
 /// The next misses that may start a fetch.
@@ -2804,7 +2803,8 @@ fn remember_recovery_stream(
 /// The place is an index into this ordered list. The same list continues
 /// there on the next call. A different list has its own index, so a
 /// shorter batch cannot rewind a longer one. A fetch that fails still
-/// advances the index. Dropping an old list keeps that index.
+/// advances the index. A later list does not replace an earlier list's
+/// index.
 fn select_recovery_misses<T, K>(
     misses: &[T],
     key_of: impl Fn(&T) -> K,
@@ -2845,8 +2845,8 @@ fn provenanced_blob_cert(
 
 /// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
 /// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. Each miss
-/// list keeps its own place, and trimming that record does not send the
-/// next fetch back to subjects that were already tried (#1116).
+/// list keeps its own place, and a later list does not replace an earlier
+/// list's place (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -32874,6 +32874,42 @@ mod tests {
             "unrelated batches hid subject 8; selected {}",
             seen.len()
         );
+    }
+
+    /// #1116: a later eviction must not replace an earlier list's saved
+    /// index. One nine-miss list, then 65 singleton lists, over 128 cycles,
+    /// still selects subject 8. The retained map stays within 64 streams.
+    #[test]
+    fn later_eviction_does_not_replace_an_earlier_stream_index_1116() {
+        let nine: Vec<u16> = (0..9).collect();
+        let singletons: Vec<[u16; 1]> = (0..65).map(|index| [1_000 + index]).collect();
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        let mut seen = std::collections::HashSet::new();
+        for _cycle in 0..128 {
+            let chosen = select_recovery_misses(
+                &nine,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            seen.extend(chosen);
+            for singleton in &singletons {
+                let chosen = select_recovery_misses(
+                    singleton,
+                    |subject| *subject,
+                    &mut progress,
+                    MAX_CERT_RECOVERY_SUBJECTS,
+                );
+                seen.extend(chosen);
+            }
+        }
+        assert!(
+            seen.contains(&8),
+            "a later eviction hid subject 8; selected {}",
+            seen.len()
+        );
+        assert!(progress.cursors.len() <= MAX_CERT_RECOVERY_STREAMS);
+        assert!(progress.cursor_order.len() <= MAX_CERT_RECOVERY_STREAMS);
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still
