@@ -25,7 +25,7 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
-use super::routes::named_groups::RequesterOfferObligation;
+use super::routes::named_groups::{RequesterOfferObligation, StartupCatchupObligation};
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
@@ -1336,6 +1336,16 @@ pub(super) struct AppState {
             std::sync::Arc<tokio::sync::Notify>,
         )>,
     >,
+    /// This daemon's startup catch-up obligations, keyed by a group id
+    /// this state reserved. A second daemon with the same group id has
+    /// its own map, so that daemon's matching head does not clear this
+    /// hold. Dropping the state drops the map.
+    pub(super) startup_catchup_obligations: StdMutex<HashMap<String, StartupCatchupObligation>>,
+    /// True after this daemon has installed its startup self-leave gates.
+    /// It starts true, so a test that never takes the hold can seal.
+    /// Production sets it false before the direct metadata listener and
+    /// true after the gates exist. A second daemon has its own flag.
+    pub(super) startup_catchup_gates_ready: AtomicBool,
     /// Token of this daemon's startup catch-up backoff task. Zero means no
     /// task owns the state. The task clears the token on exit and on
     /// cancellation, and only when it still holds that token. A second

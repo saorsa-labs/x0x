@@ -26,7 +26,7 @@ A timed wait cannot prove that catch-up finished. `truncated: false` cannot prov
 
 ## Decision
 
-We will require verified head evidence before the designated committer seals a startup self-leave rekey, when a removed member still has a live ratchet leaf and another active member remains.
+We will require verified head evidence before the designated committer seals a startup self-leave rekey, when a removed member has a live ratchet leaf and another active member remains.
 
 On startup, the daemon installs every such obligation before it resumes an outbox, sends a request, or lets a live rekey path seal. A page clears one peer only when `responder_state_hash` equals the local saved head. An empty page, a truncated page, a missing hash, a different hash, and a KeyPackage reply do not clear the peer. A terminal page records that peer even when another peer's page stream is open. Open streams still refuse the seal.
 
@@ -36,8 +36,8 @@ When no other active member remains, the daemon retires the obligation and may s
 
 ## Consequences
 
-A restarted committer does not seal because a timer fired or because a cold peer sent an empty page. When every peer has spent its three sends, the designated committer seals. The outbox and the lowest-admin rule stay as accepted in A09. This record stays Proposed until David accepts it. It is not folded.
+A restarted committer does not seal because a timer fired or because a cold peer sent an empty page. When every peer has spent its three sends, the designated committer seals. The outbox and the lowest-admin rule stay as accepted in A09. This record stays Proposed until David accepts it.
 
 ## Validation
 
-The epoch stays still until a page reports the local saved head, or until every remaining peer has spent its three sends. A newer head, a missing hash, and a KeyPackage reply do not clear a peer. Four peers are each asked. Encrypt returns conflict, and the group-store protector refuses, while a peer still blocks. The epoch advances when the last other member leaves, when a departed peer is dropped and the survivor is satisfied, and when every current peer, including one added on a later pass, has spent the per-peer bound. A matching head kept behind another open stream lets the seal proceed when that stream closes. Overlapping retries do not send a fourth request after three are reserved. A historical Removed row does not open the wait.
+The epoch stays still until a page reports the local saved head, or until every remaining peer has spent its three sends. A newer head, a missing hash, and a KeyPackage reply do not clear a peer. Four peers are each asked. Encrypt returns conflict, and the group-store protector refuses, while a peer still blocks. The epoch advances when the last other member leaves, when a departed peer is dropped and the survivor is satisfied, and when every current peer, including one added on a later pass, has spent the per-peer bound. A matching head kept behind another open stream lets the seal proceed when that stream closes. Overlapping retries do not send a fourth request after three are reserved. A historical Removed row does not open the wait. Another daemon cannot clear this hold.
