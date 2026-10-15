@@ -22922,10 +22922,16 @@ fn self_leave_startup_ready_flag() -> &'static std::sync::atomic::AtomicBool {
     READY.get_or_init(|| std::sync::atomic::AtomicBool::new(true))
 }
 
-fn self_leave_startup_backoff_running() -> &'static std::sync::atomic::AtomicBool {
+fn next_startup_backoff_token() -> u64 {
     use std::sync::OnceLock;
-    static RUNNING: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
-    RUNNING.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    let next = NEXT.get_or_init(|| AtomicU64::new(1));
+    loop {
+        let token = next.fetch_add(1, Ordering::SeqCst);
+        if token != 0 {
+            return token;
+        }
+    }
 }
 
 /// Block live self-leave seals until [`startup_self_leave_rekey`] has
@@ -24313,44 +24319,95 @@ pub(in crate::server) async fn startup_self_leave_rekey(state: &Arc<AppState>) {
     }
 }
 
+/// Releases this state's backoff token when the task ends or is cancelled.
+///
+/// The token is per daemon. A second `AppState` has its own token, so this
+/// task cannot keep that daemon from scheduling. Drop clears the token only
+/// when this task still owns it, which covers runtime cancellation. A
+/// successor that already took the token is left alone.
+struct StartupBackoffOwner {
+    state: Arc<AppState>,
+    token: u64,
+    armed: bool,
+}
+
+impl Drop for StartupBackoffOwner {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.state.startup_catchup_backoff_owner.compare_exchange(
+            self.token,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+fn try_arm_startup_catchup_backoff(state: &AppState) -> Option<u64> {
+    let token = next_startup_backoff_token();
+    state
+        .startup_catchup_backoff_owner
+        .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| token)
+}
+
 /// Later sends after the first startup attempt.
 ///
-/// One task sleeps, then asks again, while any current peer still has an
-/// attempt left. A peer added on a later pass keeps the attempts that
-/// remain. There is no second global cap. The per-peer bound ends the
-/// wait. The first action is the sleep, so arming the task does not send
-/// immediately.
+/// One task for this daemon sleeps, then asks again, while any of its
+/// current peers still has an attempt left. A peer added on a later pass
+/// keeps the attempts that remain. There is no second global cap. The
+/// per-peer bound ends the wait. The first action is the sleep, so arming
+/// the task does not send immediately. Cancelling the task releases this
+/// daemon's token so a later schedule can start again.
 fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
-    if !arm_startup_catchup_backoff() {
+    let Some(token) = try_arm_startup_catchup_backoff(&state) else {
         return;
-    }
-    tokio::spawn(async move {
+    };
+    let owner = StartupBackoffOwner {
+        state: Arc::clone(&state),
+        token,
+        armed: true,
+    };
+    let task = tokio::spawn(async move {
+        let mut owner = owner;
         loop {
             tokio::time::sleep(SELF_LEAVE_STARTUP_CATCHUP_BACKOFF).await;
-            retry_startup_self_leave_catchup(&state).await;
-            if startup_backoff_still_needed(&state).await {
+            retry_startup_self_leave_catchup(&owner.state).await;
+            if startup_backoff_still_needed(&owner.state).await {
                 continue;
             }
-            // Drop the flag, then look again. A peer who joined in that
-            // window must not lose the attempts that remain.
-            self_leave_startup_backoff_running().store(false, std::sync::atomic::Ordering::SeqCst);
-            if startup_backoff_still_needed(&state).await && arm_startup_catchup_backoff() {
-                continue;
+            // Give the token back, then look again. A peer who joined in
+            // that window must not lose the attempts that remain. Drop must
+            // not clear a token a successor already took.
+            let released = owner
+                .state
+                .startup_catchup_backoff_owner
+                .compare_exchange(owner.token, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            owner.armed = false;
+            if released && startup_backoff_still_needed(&owner.state).await {
+                if let Some(token) = try_arm_startup_catchup_backoff(&owner.state) {
+                    owner.token = token;
+                    owner.armed = true;
+                    continue;
+                }
             }
             break;
         }
     });
-}
-
-fn arm_startup_catchup_backoff() -> bool {
-    self_leave_startup_backoff_running()
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_ok()
+    #[cfg(test)]
+    {
+        let abort = task.abort_handle();
+        let mut slot = state
+            .startup_catchup_backoff_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(abort);
+    }
+    drop(task);
 }
 
 /// True when a current startup plan still has a peer under the send bound.
@@ -44795,6 +44852,8 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             owner_sync,
+            startup_catchup_backoff_owner: AtomicU64::new(0),
+            startup_catchup_backoff_abort: std::sync::Mutex::new(None),
             named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(test)]
             named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),

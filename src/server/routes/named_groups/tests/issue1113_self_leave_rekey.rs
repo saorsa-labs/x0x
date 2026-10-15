@@ -2771,3 +2771,156 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
     );
     Ok(())
 }
+
+fn backoff_owner(state: &AppState) -> u64 {
+    state
+        .startup_catchup_backoff_owner
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn arm_startup_pair(group_id: &str) -> Result<LeaveFixture> {
+    let (fixture, _witness) = startup_with_witness(group_id).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_ne!(
+        backoff_owner(&fixture.state),
+        0,
+        "startup and the join retry must leave this daemon's backoff armed"
+    );
+    Ok(fixture)
+}
+
+async fn yield_for(duration: std::time::Duration) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < duration {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Two daemons in one process each keep a backoff. The first daemon's task
+/// must not consume the only ownership token. Both seal on the same tick.
+#[tokio::test]
+async fn two_startup_states_each_run_their_own_backoff() -> Result<()> {
+    let first = arm_startup_pair(&"e2".repeat(16)).await?;
+    let second = arm_startup_pair(&"e3".repeat(16)).await?;
+    assert_ne!(
+        backoff_owner(&first.state),
+        backoff_owner(&second.state),
+        "each daemon must hold its own backoff token"
+    );
+    yield_for(std::time::Duration::from_millis(50)).await;
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let sealed = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let first_sealed = self_leave_startup_send_count(&first.group_id) == 3
+                && live_epoch(&first.state, &first.group_id).await > first.epoch_before;
+            let second_sealed = self_leave_startup_send_count(&second.group_id) == 3
+                && live_epoch(&second.state, &second.group_id).await > second.epoch_before;
+            if first_sealed && second_sealed {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    assert!(
+        sealed,
+        "both daemons must seal from their own timers; first sends {}, second sends {}",
+        self_leave_startup_send_count(&first.group_id),
+        self_leave_startup_send_count(&second.group_id)
+    );
+    assert_ne!(
+        encrypt_status(&first.state, &first.group_id).await,
+        StatusCode::CONFLICT
+    );
+    assert_ne!(
+        encrypt_status(&second.state, &second.group_id).await,
+        StatusCode::CONFLICT,
+        "the second daemon must not stay on REST 409 after the shared tick"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    yield_for(std::time::Duration::from_millis(50)).await;
+    assert_eq!(self_leave_startup_send_count(&first.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&second.group_id), 3);
+    Ok(())
+}
+
+/// Cancelling the backoff releases that daemon's token. A later retry can
+/// arm a new task, and that task still spends the attempt that remains.
+#[tokio::test]
+async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"e4".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_ne!(backoff_owner(&fixture.state), 0);
+    yield_for(std::time::Duration::from_millis(50)).await;
+    {
+        let mut slot = fixture
+            .state
+            .startup_catchup_backoff_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.take().expect("the backoff task is armed").abort();
+    }
+    assert!(
+        yield_until(|| backoff_owner(&fixture.state) == 0).await,
+        "cancellation must release this daemon's backoff token"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        1,
+        "cancellation must not itself spend another attempt"
+    );
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_ne!(
+        backoff_owner(&fixture.state),
+        0,
+        "a retry after cancellation must arm a new backoff"
+    );
+    yield_for(std::time::Duration::from_millis(50)).await;
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let sealed = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let spent = self_leave_startup_send_count(&fixture.group_id) == 3;
+            let advanced =
+                live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before;
+            if spent && advanced {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    assert!(
+        sealed,
+        "the restarted backoff must spend the last attempt and seal; sends {}, epoch {}",
+        self_leave_startup_send_count(&fixture.group_id),
+        live_epoch(&fixture.state, &fixture.group_id).await
+    );
+    assert_ne!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT
+    );
+    Ok(())
+}

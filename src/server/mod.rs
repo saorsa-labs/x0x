@@ -1206,6 +1206,9 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(test)]
+        startup_catchup_backoff_abort: std::sync::Mutex::new(None),
         #[cfg(test)]
         named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         #[cfg(test)]
