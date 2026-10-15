@@ -2741,10 +2741,66 @@ fn plan_subject_cert_recovery(
 
 /// How many recovery streams keep an exact next index.
 ///
-/// A stream is one ordered miss list. Only a list whose next subject is
-/// not the first uses a slot. A list that does not fit is not stored, so
-/// a later list cannot replace an earlier list's index.
+/// A stream is one ordered miss list. The live table and the set-aside
+/// table each hold at most this many lists. A list whose next subject is
+/// the first uses no slot.
 const MAX_CERT_RECOVERY_STREAMS: usize = 64;
+
+fn touch_recovery_order(order: &mut std::collections::VecDeque<u64>, fingerprint: u64) {
+    order.retain(|item| *item != fingerprint);
+    order.push_back(fingerprint);
+}
+
+fn forget_recovery_stream(progress: &mut announce_blob::CertRecoveryAttempts, fingerprint: u64) {
+    progress.cursors.remove(&fingerprint);
+    progress.cursor_order.retain(|item| *item != fingerprint);
+    progress.retained.remove(&fingerprint);
+    progress.retained_order.retain(|item| *item != fingerprint);
+}
+
+/// Keep `cursor` for `fingerprint` after it leaves the live table.
+///
+/// The index stays under that fingerprint. A later list does not replace
+/// it. When the set-aside table is full, only its oldest entry is dropped.
+fn park_recovery_stream(
+    progress: &mut announce_blob::CertRecoveryAttempts,
+    fingerprint: u64,
+    cursor: u64,
+) {
+    if cursor == 0 {
+        progress.retained.remove(&fingerprint);
+        progress.retained_order.retain(|item| *item != fingerprint);
+        return;
+    }
+    if let Some(saved) = progress.retained.get_mut(&fingerprint) {
+        *saved = cursor;
+        touch_recovery_order(&mut progress.retained_order, fingerprint);
+        return;
+    }
+    while progress.retained.len() >= MAX_CERT_RECOVERY_STREAMS {
+        let Some(old) = progress.retained_order.pop_front() else {
+            break;
+        };
+        progress.retained.remove(&old);
+    }
+    if progress.retained.len() >= MAX_CERT_RECOVERY_STREAMS {
+        return;
+    }
+    progress.retained.insert(fingerprint, cursor);
+    progress.retained_order.push_back(fingerprint);
+}
+
+fn free_recovery_stream_slot(progress: &mut announce_blob::CertRecoveryAttempts) {
+    while progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS {
+        let Some(old) = progress.cursor_order.pop_front() else {
+            break;
+        };
+        let Some(cursor) = progress.cursors.remove(&old) else {
+            continue;
+        };
+        park_recovery_stream(progress, old, cursor);
+    }
+}
 
 fn recovery_stream_fingerprint<T, K>(misses: &[T], key_of: &impl Fn(&T) -> K) -> u64
 where
@@ -2764,7 +2820,12 @@ fn recovery_stream_start(
     fingerprint: u64,
     len: usize,
 ) -> usize {
-    let next = progress.cursors.get(&fingerprint).copied().unwrap_or(0);
+    let next = progress
+        .cursors
+        .get(&fingerprint)
+        .or_else(|| progress.retained.get(&fingerprint))
+        .copied()
+        .unwrap_or(0);
     (next as usize) % len
 }
 
@@ -2773,29 +2834,28 @@ fn remember_recovery_stream(
     fingerprint: u64,
     next: u64,
 ) {
-    use std::collections::hash_map::Entry;
-    // Index 0 is the start for a list that has no slot. Keeping it would
-    // let a singleton eviction replace another list's saved index.
+    // Index 0 is the start for a list with no slot. A singleton stores
+    // that index, so keeping the slot would fill the table with lists
+    // that do not need one.
     if next == 0 {
-        progress.cursors.remove(&fingerprint);
-        progress.cursor_order.retain(|item| *item != fingerprint);
+        forget_recovery_stream(progress, fingerprint);
         return;
     }
-    let at_capacity = progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS;
-    match progress.cursors.entry(fingerprint) {
-        Entry::Occupied(mut entry) => {
-            entry.insert(next);
-            progress.cursor_order.retain(|item| *item != fingerprint);
-            progress.cursor_order.push_back(fingerprint);
-        }
-        Entry::Vacant(entry) => {
-            if at_capacity {
-                return;
-            }
-            entry.insert(next);
-            progress.cursor_order.push_back(fingerprint);
-        }
+    if let Some(cursor) = progress.cursors.get_mut(&fingerprint) {
+        *cursor = next;
+        touch_recovery_order(&mut progress.cursor_order, fingerprint);
+        progress.retained.remove(&fingerprint);
+        progress.retained_order.retain(|item| *item != fingerprint);
+        return;
     }
+    progress.retained.remove(&fingerprint);
+    progress.retained_order.retain(|item| *item != fingerprint);
+    free_recovery_stream_slot(progress);
+    if progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS {
+        return;
+    }
+    progress.cursors.insert(fingerprint, next);
+    progress.cursor_order.push_back(fingerprint);
 }
 
 /// The next misses that may start a fetch.
@@ -2803,8 +2863,8 @@ fn remember_recovery_stream(
 /// The place is an index into this ordered list. The same list continues
 /// there on the next call. A different list has its own index, so a
 /// shorter batch cannot rewind a longer one. A fetch that fails still
-/// advances the index. A later list does not replace an earlier list's
-/// index.
+/// advances the index. When the live table is full, the oldest list is
+/// set aside under its own index so a new list can be saved.
 fn select_recovery_misses<T, K>(
     misses: &[T],
     key_of: impl Fn(&T) -> K,
@@ -2845,8 +2905,8 @@ fn provenanced_blob_cert(
 
 /// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
 /// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. Each miss
-/// list keeps its own place, and a later list does not replace an earlier
-/// list's place (#1116).
+/// list keeps its own place. A full table sets the oldest list aside
+/// under its own index (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -32910,6 +32970,55 @@ mod tests {
         );
         assert!(progress.cursors.len() <= MAX_CERT_RECOVERY_STREAMS);
         assert!(progress.cursor_order.len() <= MAX_CERT_RECOVERY_STREAMS);
+    }
+
+    /// #1116: 64 nine-miss lists that do not return must not keep a new
+    /// nine-miss list on subjects 0–7. The new list's ninth subject is
+    /// selected, and a list set aside for it does not restart at subject 0.
+    #[test]
+    fn stale_nine_miss_lists_do_not_block_a_new_list_1116() {
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        for batch in 0..MAX_CERT_RECOVERY_STREAMS {
+            let start = u16::try_from(batch).unwrap_or(0).saturating_mul(9);
+            let list: Vec<u16> = (start..start + 9).collect();
+            let _ = select_recovery_misses(
+                &list,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+        }
+        let target: Vec<u16> = (1_000..1_009).collect();
+        let mut seen = std::collections::HashSet::new();
+        for _call in 0..128 {
+            let chosen = select_recovery_misses(
+                &target,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            seen.extend(chosen);
+        }
+        assert!(
+            seen.contains(&1_008),
+            "stale cursors hid subject 1008; selected {}",
+            seen.len()
+        );
+        let displaced: Vec<u16> = (0..9).collect();
+        let chosen = select_recovery_misses(
+            &displaced,
+            |subject| *subject,
+            &mut progress,
+            MAX_CERT_RECOVERY_SUBJECTS,
+        );
+        assert!(
+            chosen.contains(&8),
+            "a list set aside restarted before subject 8: {chosen:?}"
+        );
+        assert!(progress.cursors.len() <= MAX_CERT_RECOVERY_STREAMS);
+        assert!(progress.cursor_order.len() <= MAX_CERT_RECOVERY_STREAMS);
+        assert!(progress.retained.len() <= MAX_CERT_RECOVERY_STREAMS);
+        assert!(progress.retained_order.len() <= MAX_CERT_RECOVERY_STREAMS);
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still

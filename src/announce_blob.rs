@@ -194,13 +194,16 @@ struct LruEntry {
 
 /// Place of each certificate-recovery miss list (#1116).
 ///
-/// `cursors` holds at most 64 streams whose next subject is not the first.
-/// A list that does not fit is left unstored, so it cannot replace an
-/// earlier list's index.
+/// `cursors` holds at most 64 lists whose next subject is not the first.
+/// When that table is full, the oldest list moves to `retained` with its
+/// own index. A later list does not write over that index. `retained` is
+/// also at most 64 lists; the oldest retained list is the one dropped.
 #[derive(Debug, Default)]
 pub(crate) struct CertRecoveryAttempts {
     pub(crate) cursors: HashMap<u64, u64>,
     pub(crate) cursor_order: VecDeque<u64>,
+    pub(crate) retained: HashMap<u64, u64>,
+    pub(crate) retained_order: VecDeque<u64>,
     #[cfg(test)]
     pub(crate) attempted: HashSet<identity::AgentId>,
 }
@@ -216,8 +219,8 @@ pub struct AnnounceBlobCache {
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
     /// Next index of each revocation miss list. v1 and v2 share it. A
-    /// shorter list does not move a longer list, and a later list does not
-    /// replace an earlier list's index (#1116).
+    /// shorter list does not move a longer list. A full table sets the
+    /// oldest list aside under its own index (#1116).
     cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
     #[cfg(test)]
     bounded_fetch_fails: AtomicBool,
