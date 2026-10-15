@@ -41,6 +41,8 @@ jobs:
       GITHUB_BEFORE: ${{ github.event.before }}
       # Pull request: exact base commit. The count check uses this on pull_request.
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # D280. The event pull request number. A file in the checkout cannot set it.
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - uses: actions/checkout@v4
         with:

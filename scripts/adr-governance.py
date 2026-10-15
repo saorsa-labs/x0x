@@ -40,6 +40,10 @@ Enforces:
   After acceptance, the body bytes stay frozen across later commits and
   folding. Deleting or editing those bytes fails. Folding is recorded in
   ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
+  One exception (David, 15 Oct 2026, D280): pull request 1401 may change
+  ``docs/adr/transient/T-installed-catchup-admin-consent.md`` in place.
+  The number is ``GITHUB_PR_NUMBER``, set from
+  ``github.event.pull_request.number``. Any other file or number stays frozen.
 """
 from __future__ import annotations
 
@@ -646,6 +650,25 @@ RECORD_RE = re.compile(
 )
 TRANSIENT_STATUSES = {"Proposed", "Accepted"}
 TRANSIENT_SUPPORT = {"docs/adr/transient/README.md"}
+# David, 15 Oct 2026 (D280). One Accepted file, one pull request.
+# The number comes from the Actions event, not from a file in the checkout.
+_D280_ACCEPTED_TRANSIENT = "docs/adr/transient/T-installed-catchup-admin-consent.md"
+_D280_PULL_REQUEST = "1401"
+
+
+def d280_in_place_edit_allowed(name: str) -> bool:
+    """Whether this Accepted transient may change in place.
+
+    True only when *name* is the D280 file and ``GITHUB_PR_NUMBER`` is
+    ``1401``. The workflow sets that variable from
+    ``github.event.pull_request.number``. A missing number, any other
+    number, and any other path stay immutable. Deletion is not an
+    in-place edit; the caller still rejects a missing file.
+    """
+    if name != _D280_ACCEPTED_TRANSIENT:
+        return False
+    number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
+    return number == _D280_PULL_REQUEST
 
 
 def _transient_shape_errors(path: str, text: str) -> list[str]:
@@ -775,6 +798,8 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
             errors.append(move_error)
             continue
         if head_text is None or head_text != snapshot_text:
+            if head_text is not None and d280_in_place_edit_allowed(name):
+                continue
             errors.append(
                 f"{name}: Accepted transient records are immutable. "
                 f"Folding does not change these bytes."

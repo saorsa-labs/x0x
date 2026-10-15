@@ -148,6 +148,7 @@ def _run_validator(
         "GITHUB_BASE_REF",
         "GITHUB_BEFORE",
         "GITHUB_BASE_SHA",
+        "GITHUB_PR_NUMBER",
     ),
 ) -> tuple[int, str]:
     """Invoke the production ``adr-governance.py`` from ``work``.
@@ -304,7 +305,7 @@ def _run_validator_with_shim(
     so the validator picks the local merge-base path.
     """
     env = os.environ.copy()
-    for var in ("GITHUB_BASE_REF", "GITHUB_BEFORE", "GITHUB_BASE_SHA"):
+    for var in ("GITHUB_BASE_REF", "GITHUB_BEFORE", "GITHUB_BASE_SHA", "GITHUB_PR_NUMBER"):
         env.pop(var, None)
     if env_overrides:
         env.update(env_overrides)
@@ -2307,6 +2308,59 @@ David folded this Accepted record into A02. The Accepted file stays unchanged.
         rc, out = _run_validator(work)
         results.append(check(
             "transient: the support README is not a decision record",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    _CONSENT = """\
+# Installed catch-up consent
+
+- **Status:** Accepted
+- **Target slot:** A08
+
+## Decision
+
+Use option 2.
+"""
+
+    def _edit_accepted(work: Path, relative: str) -> None:
+        path = work / relative
+        path.parent.mkdir(parents=True)
+        path.write_text(_CONSENT)
+        _commit_all(work, "accept transient record")
+        path.write_text(_CONSENT.replace("Use option 2.", "Use option 2. Sender is not Blocked."))
+        _commit_all(work, "edit accepted transient body")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-installed-catchup-admin-consent.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1402"})
+        results.append(check(
+            "D280: a different pull request cannot edit the Accepted consent record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-installed-catchup-admin-consent.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-other-accepted.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1401"})
+        results.append(check(
+            "D280: pull request 1401 cannot edit a different Accepted record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-other-accepted.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-installed-catchup-admin-consent.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1401"})
+        results.append(check(
+            "D280: pull request 1401 may edit the Accepted consent record in place",
             rc == 0 and "ADR governance passed" in out,
         ))
 
