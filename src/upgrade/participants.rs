@@ -405,8 +405,9 @@ fn own_record_missing(own_key: &str, dir: &Path) -> PendingParticipant {
     }
 }
 
-/// Why a live participant is not due: a wait (time or configuration; D185
-/// `now=true` may skip it) or a hold (it never ends by waiting).
+/// Why a live participant is not due: a wait (time; D185 `now=true` may
+/// skip it) or a hold (a blocked rollout state or self-update off; it never
+/// ends by waiting, and now=true does not skip it).
 enum NotDue {
     Wait(String),
     Hold(String),
@@ -427,9 +428,11 @@ fn participant_not_due(record: &ParticipantRecord, release: &Version) -> Option<
     if Version::parse(&record.running_version).is_ok_and(|running| &running >= release) {
         return None;
     }
+    // Review S4 (controller ruling): a configured hold, [update] enabled =
+    // false, always wins, also over now=true.
     if !record.updates_enabled {
-        return Some(NotDue::Wait(format!(
-            "{label}: self-update is off for this daemon"
+        return Some(NotDue::Hold(format!(
+            "{label}: self-update is off for this daemon (a configured hold)"
         )));
     }
     let reason = match &record.staged {

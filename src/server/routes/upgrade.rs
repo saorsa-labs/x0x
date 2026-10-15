@@ -1723,23 +1723,26 @@ async fn store_upgrade_response(
 /// Keep this daemon in the shared-install participant set while it runs with
 /// self-update off (review R1).
 ///
-/// It writes a record with `updates_enabled = false` under the host lock.
-/// Such a daemon never becomes due, so the other daemons on the install do
-/// not swap the shared binary while it runs (only D185 `now=true` skips
-/// that wait). Before round 3 its record was removed, which hid it.
+/// It writes a record with `updates_enabled = false` under the host lock,
+/// keeping any rollout-state block. That is a configured hold: the other
+/// daemons on the install do not swap the shared binary while it runs, and
+/// D185 `now=true` does not skip it (review S4). Re-enable updates and
+/// restart the daemon, or stop it (stale after 30 minutes), to release it.
 pub(in crate::server) async fn register_updates_off_participant(
     target: &std::path::Path,
     node_id: &[u8; 32],
     data_dir: &std::path::Path,
 ) -> bool {
     let key = x0x::upgrade::participants::participant_key(data_dir);
+    // Review S4: keep an existing rollout-state block in the record.
+    let (state, _) = RolloutState::load(&RolloutState::path_in(data_dir));
     let record = x0x::upgrade::participants::ParticipantRecord::new(
         node_id,
         data_dir,
         x0x::VERSION,
         unix_now_secs(),
         None,
-        None,
+        state.blocked,
     )
     .with_updates_enabled(false);
     write_participant_record_locked(target, &key, &record).await
