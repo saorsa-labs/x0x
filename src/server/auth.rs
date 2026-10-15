@@ -358,8 +358,9 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
         return true;
     }
     // #1228: legacy MLS control is an owner act on every method. The
-    // join-request list and quarantine clear are owner acts too. Approve,
-    // reject, and request cancel keep their current token rules.
+    // quarantine clear is an owner act too. #1347: the join-request list,
+    // approve and reject are NOT in this table. Their class depends on the
+    // group (the Home fence), so the handlers decide it, not this layer.
     if is_legacy_mls_group_path(path) {
         return true;
     }
@@ -383,7 +384,7 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
         Method::DELETE => is_sync_device_path(path),
         // ADR 0116 §3: the local history policy, with its counters and the
         // fork-quarantine pins, is an owner-only read.
-        Method::GET => path == "/history/policy" || is_join_request_list(path),
+        Method::GET => path == "/history/policy",
         _ => false,
     }
 }
@@ -420,20 +421,6 @@ fn is_group_quarantine_clear(path: &str) -> bool {
             segs.next().is_some_and(|id| !id.is_empty())
                 && segs.next() == Some("quarantine")
                 && segs.next() == Some("clear")
-                && segs.next().is_none()
-        }
-        None => false,
-    }
-}
-
-/// `true` for exactly `/groups/<nonempty-id>/requests` (the list, not
-/// approve, reject, create, or cancel).
-fn is_join_request_list(path: &str) -> bool {
-    match path.strip_prefix("/groups/") {
-        Some(rest) => {
-            let mut segs = rest.split('/');
-            segs.next().is_some_and(|id| !id.is_empty())
-                && segs.next() == Some("requests")
                 && segs.next().is_none()
         }
         None => false,
@@ -1387,10 +1374,6 @@ mod tests {
             &Method::POST,
             &format!("/groups/{group}/quarantine/clear")
         ));
-        assert!(requires_durable_owner(
-            &Method::GET,
-            &format!("/groups/{group}/requests")
-        ));
         assert!(requires_durable_owner(&Method::GET, "/mls/groups"));
         assert!(requires_durable_owner(
             &Method::POST,
@@ -1400,7 +1383,13 @@ mod tests {
             &Method::DELETE,
             &format!("/mls/groups/{group}/members/{request}")
         ));
-        // C-1228-2: approve and reject keep the session token.
+        // #1347: the join-request list, approve and reject take one
+        // group-dependent class (the Home fence in the handlers), so none
+        // of them is durable-owner at the route layer.
+        assert!(!requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{group}/requests")
+        ));
         assert!(!requires_durable_owner(
             &Method::POST,
             &format!("/groups/{group}/requests/{request}/approve")

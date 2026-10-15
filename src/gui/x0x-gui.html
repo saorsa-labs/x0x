@@ -739,8 +739,9 @@ function maybeRefreshSession(){
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
 // /sync/devices*, /announce with user identity, /home/rename,
 // /upgrade/apply, PATCH on the Home group, /direct/send with
-// reserved exec payloads, GET /groups/:id/requests, and /mls/groups*)
-// require the DURABLE API token — a session
+// reserved exec payloads, and /mls/groups*) require the DURABLE API
+// token. #1347: on a Home or an owner-certified group, the join-request
+// list, approve and reject need it too. A session
 // bearer gets a typed 403 naming it. ownerApi() prefers a remembered
 // owner token, and on the durable-required 403 prompts once, keeps it
 // in sessionStorage ONLY (never localStorage, never a URL), and
@@ -5467,10 +5468,13 @@ async function nagRenderAdmin(gid){
   const host=document.getElementById('nag-admin-'+gid);
   if(!host)return;
   // Learn the seat with the session token first. The join-request list
-  // needs the durable token, so it is fetched only for an Admin+ seat.
-  // A render must not prompt: a non-admin never sees the prompt, and an
-  // admin who has not saved a token sees the refusal instead of an empty
-  // list. The prompt is the panel button.
+  // needs an Admin+ seat, so it is fetched only for one. #1347: the list,
+  // approve and reject take one token class and send one bearer: the
+  // saved durable token, else the session token. On an ordinary group
+  // the session token is enough. On a Home the daemon asks for the
+  // durable token. A render must not prompt: a non-admin never sees the
+  // prompt, and an admin who has not saved a token sees the refusal
+  // instead of an empty list. The prompt is the panel button.
   const [stateResp,membersResp,meResp]=await Promise.all([
     api('/groups/'+gid+'/state').catch(()=>null),
     api('/groups/'+gid+'/members').catch(()=>null),
@@ -5483,7 +5487,7 @@ async function nagRenderAdmin(gid){
   const isAdminOrAbove=myRole==='owner'||myRole==='admin';
   let requestsHtml='';
   if(isAdminOrAbove){
-    const requestsResp=await apiWith(OWNER_TOKEN||SESSION_TOKEN,'/groups/'+gid+'/requests').catch(()=>null);
+    const requestsResp=await apiWith(joinRequestBearer(),'/groups/'+gid+'/requests').catch(()=>null);
     if(durableRequired(requestsResp)){
       requestsHtml=nagRequestsPanelHtml(gid,[],'durable token needed');
     }else{
@@ -5749,16 +5753,21 @@ function nagRequestFeedback(gid,rid,msg,tone){
   nagSetFeedback(`[data-nag-requests="${gid}"] [data-nag-request="${rid}"] [data-k="feedback"]`,msg,tone);
 }
 
+// #1347: the join-request list, approve and reject send this one bearer.
+// ownerApi() sends the same bearer first, and prompts on a click only
+// when the daemon asks for the durable token and none is saved.
+function joinRequestBearer(){return OWNER_TOKEN||SESSION_TOKEN}
+
 async function nagApproveRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await api(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
+  const r=await ownerApi(`/groups/${gid}/requests/${rid}/approve`,{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Approved.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Approve failed.','err')}
 }
 
 async function nagRejectRequest(gid,rid){
   nagRequestFeedback(gid,rid,'Working…');
-  const r=await api(`/groups/${gid}/requests/${rid}/reject`,{method:'POST'});
+  const r=await ownerApi(`/groups/${gid}/requests/${rid}/reject`,{method:'POST'});
   if(r&&r.ok){nagRequestFeedback(gid,rid,'Rejected.','ok');nagRenderAdmin(gid)}
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
 }

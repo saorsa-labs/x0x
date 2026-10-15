@@ -102,7 +102,8 @@ use std::sync::Arc;
 use crate as x0x;
 use crate::server::rider_auth::ActorContext;
 use crate::server::routes::named_groups::{
-    local_join_membership_state, open_envelope_withdrawn_group_conflict, reject_fork_quarantined,
+    home_mutation_requires_durable, local_join_membership_state,
+    open_envelope_withdrawn_group_conflict, reject_fork_quarantined,
     reject_fork_quarantined_for_actor, reject_unverified_owner_certified_restore,
     reject_withdrawn_group, require_admin_or_above,
 };
@@ -311,10 +312,11 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // the bearer matters only through the Home durable fence the
     // handlers keep at entry. The requests LISTING carries the same
     // seat gate but NO withdrawn check (today's shape — a withdrawn
-    // shell's requests stay listable) and, since #1228, also requires
-    // the durable owner. display-name is an active local seat of any
-    // role on any token class. The label is local, so it has no Home
-    // durable fence (C-1228-3).
+    // shell's requests stay listable). #1347: the listing also takes the
+    // same Home fence, so list, approve and reject accept one token
+    // class (#1228 had made the listing durable-only). display-name is
+    // an active local seat of any role on any token class. The label is
+    // local, so it has no Home durable fence (C-1228-3).
     // Request create stays PublicWrite. Request cancel is the owner
     // who filed it (SessionBearer plus the handler's requester check).
     // Leave is the daemon's own active seat (JoinSelf).
@@ -381,7 +383,7 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/requests",
-        level: AccessLevel::OwnerDurable,
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
@@ -1284,7 +1286,7 @@ impl GroupAccess {
     #[cfg(test)]
     pub(in crate::server) fn for_handler_tests(acting_hex: impl Into<String>) -> Self {
         Self {
-            level: AccessLevel::OwnerDurable,
+            level: AccessLevel::Admin,
             stable_id: String::new(),
             acting_hex: acting_hex.into(),
         }
@@ -1407,28 +1409,28 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
 }
 
 /// `GET /groups/:id/requests` — the one S3 route that takes the
-/// extractor. #1228 refuses a session token before the local-seat
-/// admin gate. The handler re-runs [`admit_join_request_listing`]
-/// under its own lock before serving (the `/members` pattern, r2/P2-1)
-/// and repeats the durable-owner check for direct callers.
+/// extractor. #1347: the list takes the token class of approve and
+/// reject. The central Home fence ([`home_mutation_requires_durable`],
+/// the fence of every roster change) runs first, then the local-seat
+/// admin gate. So a session token is refused on a Home or an
+/// owner-certified group with the same 403 as approve and reject, and is
+/// accepted on an ordinary group. The handler re-runs the fence and
+/// [`admit_join_request_listing`] under its own lock before serving (the
+/// `/members` pattern, r2/P2-1).
 async fn admit_join_requests_route(
     state: &AppState,
     actor: &ActorContext,
     id: &str,
 ) -> Result<GroupAccess, Response> {
-    if !actor.is_durable_owner() {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "listing join requests requires the durable API token (not a session token)",
-        )
-        .into_response());
+    if let Some(refusal) = home_mutation_requires_durable(state, actor, id).await {
+        return Err(refusal.into_response());
     }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let info =
         admit_join_request_listing(&groups, id, &local_hex).map_err(IntoResponse::into_response)?;
     Ok(GroupAccess {
-        level: AccessLevel::OwnerDurable,
+        level: AccessLevel::Admin,
         stable_id: info.stable_group_id().to_string(),
         acting_hex: local_hex,
     })
@@ -1924,11 +1926,7 @@ mod tests {
                 AccessLevel::Admin,
             ),
             (Method::DELETE, "/groups/:id", AccessLevel::JoinSelf),
-            (
-                Method::GET,
-                "/groups/:id/requests",
-                AccessLevel::OwnerDurable,
-            ),
+            (Method::GET, "/groups/:id/requests", AccessLevel::Admin),
             (
                 Method::POST,
                 "/groups/:id/requests",
