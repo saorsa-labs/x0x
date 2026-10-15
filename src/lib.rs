@@ -10508,11 +10508,18 @@ impl Agent {
 
     /// Attach a contact store for trust-based message filtering.
     ///
-    /// When set, the gossip pub/sub layer will:
+    /// `AgentBuilder::build` already attaches the agent's own contact store
+    /// when a gossip runtime exists. This call installs a store only when
+    /// none is installed yet. A later call with a different store has no
+    /// effect (first caller wins). x0xd passes `agent.contacts()`, the same
+    /// `Arc` `build` already attached.
+    ///
+    /// When a store is set, the gossip pub/sub layer will:
     /// - Drop messages from `Blocked` senders (don't deliver, don't rebroadcast)
     /// - Annotate messages with the sender's trust level for consumers
     ///
-    /// Without a contact store, all messages pass through (open relay mode).
+    /// The call also attaches this agent's revocation set when that delivery
+    /// lock is still empty.
     pub fn set_contacts(&self, store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>) {
         if let Some(runtime) = &self.gossip_runtime {
             let pubsub = runtime.pubsub();
@@ -19878,6 +19885,11 @@ impl AgentBuilder {
         ));
         owner_trust.install_announced_bindings(std::sync::Arc::clone(&announced_machine_bindings));
         if let Some(runtime) = gossip_runtime.as_ref() {
+            // #1230: a bare agent must drop Blocked senders without a later
+            // `Agent::set_contacts`. x0xd passes this same `Arc`.
+            runtime
+                .pubsub()
+                .set_contacts(std::sync::Arc::clone(&contact_store));
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
                 std::sync::Arc::clone(&revocation_set),
