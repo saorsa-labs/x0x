@@ -7,11 +7,13 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod direct_metadata_lanes;
 mod fair_admission;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
+pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
@@ -15326,13 +15328,16 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
 /// only ends this wait. An apply that has started runs to completion, and
 /// the drain waits for it before the Agent stops.
 ///
-/// Order: the listener awaits each apply before it receives its next
-/// message, so it still applies its events one at a time, in arrival order,
-/// as it did inline. An aborted listener applies nothing further.
+/// Order: the caller awaits each apply before it applies its next event, so
+/// it still applies its events one at a time, in arrival order, as it did
+/// inline. The caller is the per-group topic listener, or one group's lane
+/// of the direct listener (#1238, `direct_metadata_lanes`). An aborted
+/// caller applies nothing further.
 ///
 /// `None`: the apply did not run to completion, because shutdown refused it
-/// before it started, or because it panicked. The caller stops listening,
-/// as it would have died with a panicking inline apply.
+/// before it started, or because it panicked. The topic listener stops, as
+/// it would have died with a panicking inline apply. A direct lane counts
+/// it and goes on with its next event.
 pub(in crate::server) async fn apply_listener_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -15354,42 +15359,6 @@ pub(in crate::server) async fn apply_listener_metadata_event(
             .await
         }))
         .await
-}
-
-/// The named-group metadata listener on the direct channel (spawned once by
-/// the server; `rx` is its direct-message subscription). It applies
-/// authority-authored commits that are direct-delivered (see
-/// `spawn_named_group_event_delivery`), through the same apply path as the
-/// per-group metadata topic listener, shielded (#1275).
-pub(in crate::server) async fn run_direct_metadata_listener(
-    state: Arc<AppState>,
-    mut rx: x0x::direct::DirectMessageReceiver,
-) {
-    loop {
-        let Some(msg) = rx.recv().await else { break };
-        let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
-            continue; // not a named-group metadata event
-        };
-        tracing::debug!(
-            target: "treekem.trace",
-            stage = "direct_classified_metadata_event",
-            sender = %hex::encode(msg.sender.as_bytes()),
-            len = msg.payload.len(),
-            verified = msg.verified,
-            event = named_group_metadata_event_kind(&event),
-        );
-        let applied = apply_listener_metadata_event(
-            &state,
-            event,
-            msg.sender,
-            msg.verified,
-            None, // direct DM path — no V2 envelope bytes available
-        )
-        .await;
-        if applied.is_none() {
-            break;
-        }
-    }
 }
 
 /// Spawn every gossip listener a member needs for a named group.

@@ -2098,7 +2098,9 @@ pub async fn serve_with_options(
     // This mirrors the per-group metadata topic-subscription apply loop; the
     // shared apply handler re-validates the signed commit, enforces the same
     // authorization checks, and is idempotent, so applying via both the direct
-    // and gossip channels is safe.
+    // and gossip channels is safe. #1238: each group's events apply in a
+    // bounded lane of their own, in arrival order, so one slow apply (a
+    // Welcome fetch) does not hold the events of the other groups.
     bg_tasks.push(tokio::spawn(run_direct_metadata_listener(
         Arc::clone(&state),
         state.agent.subscribe_direct(),
