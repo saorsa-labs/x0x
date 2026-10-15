@@ -30,6 +30,12 @@ All notable changes to this project will be documented in this file.
   While the warning cooldown is active, each rejected signature still logs
   its group, refusal count and error at debug level.
 
+- **Opening a secure envelope requires the durable owner token (#1228).**
+  `POST /groups/secure/open-envelope` refuses browser sessions and rider
+  credentials with a typed `403` before JSON parsing. The handler repeats
+  the owner check, and the GUI uses its owner-token prompt. Envelope validation
+  and withdrawn-group checks still apply.
+
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **The GUI recovers after a saved owner token is rejected (#1417).** An

@@ -669,3 +669,151 @@ async fn minted_session_token_is_refused_before_the_body() -> Result<()> {
     assert_eq!(body["requests"].as_array().map(Vec::len), Some(0), "{body}");
     Ok(())
 }
+
+fn open_envelope_test_body(state: &AppState) -> Result<serde_json::Value> {
+    let group_id = "issue1228-open-envelope";
+    let recipient = hex::encode(state.agent.agent_id().as_bytes());
+    let aad = secure_share_aad(group_id, &recipient, 7);
+    let (kem_ct, nonce, aead_ct) = x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+        &state.agent_kem_keypair.public_bytes,
+        &aad,
+        &[7_u8; 32],
+    )?;
+    Ok(serde_json::json!({
+        "group_id": group_id,
+        "recipient": recipient,
+        "secret_epoch": 7,
+        "kem_ciphertext_b64": BASE64.encode(kem_ct),
+        "aead_nonce_b64": BASE64.encode(nonce),
+        "aead_ciphertext_b64": BASE64.encode(aead_ct),
+    }))
+}
+
+async fn post_open_envelope(
+    app: axum::Router,
+    token: Option<&str>,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::post("/groups/secure/open-envelope")
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let request = request
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("request builds");
+    let response = app
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    json_response(response).await
+}
+
+/// Exercise the production middleware with real issued credentials and the
+/// real handler. No listener or network transport is started by this fixture.
+#[tokio::test]
+async fn issue1228_open_envelope_middleware_refuses_scoped_tokens_before_body() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    assert!(state.agent.network().is_none(), "fixture must stay inert");
+    let session_token = state.sessions.issue(std::time::Instant::now());
+    let (rider_token, _) = state
+        .rider_tokens
+        .lock()
+        .await
+        .issue(
+            "aa".repeat(32),
+            vec!["issue1228-open-envelope".to_string()],
+            None,
+            60,
+            "bb".repeat(32),
+            None,
+            None,
+            crate::server::rider_auth::unix_now_secs(),
+        )
+        .await?;
+    let app = axum::Router::new()
+        .route(
+            "/groups/secure/open-envelope",
+            axum::routing::post(secure_open_envelope_adversarial),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::server::auth::auth_middleware,
+        ))
+        .with_state(Arc::clone(&state));
+    let valid_body = open_envelope_test_body(&state)?.to_string();
+
+    for (token, error) in [
+        (session_token.as_str(), "requires the durable API token"),
+        (rider_token.as_str(), "rider tokens are denied"),
+    ] {
+        for request_body in ["not-json", valid_body.as_str()] {
+            let (status, body) = post_open_envelope(app.clone(), Some(token), request_body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(error)),
+                "expected the actor refusal before parsing or opening: {body}"
+            );
+            assert!(body.get("secret_b64").is_none(), "{body}");
+        }
+    }
+    for token in [None, Some("not-a-token")] {
+        let (status, body) = post_open_envelope(app.clone(), token, "not-json").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    // The durable credential reaches parsing and can open a correctly sealed
+    // envelope, so the refusal above is not a blanket-deny or bad fixture.
+    let (status, _) = post_open_envelope(app.clone(), Some(&state.api_token), "not-json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = post_open_envelope(app.clone(), Some(&state.api_token), &valid_body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["opened"], true, "{body}");
+    assert_eq!(body["secret_b64"], BASE64.encode([7_u8; 32]), "{body}");
+
+    // Owner authority does not bypass the envelope's AAD authentication.
+    let mut wrong_aad = serde_json::from_str::<serde_json::Value>(&valid_body)?;
+    wrong_aad["recipient"] = serde_json::Value::String("cc".repeat(32));
+    let (status, body) =
+        post_open_envelope(app, Some(&state.api_token), &wrong_aad.to_string()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["opened"], false, "{body}");
+    assert!(body.get("secret_b64").is_none(), "{body}");
+    Ok(())
+}
+
+/// Bypass auth middleware and inject each actor directly. The handler must
+/// independently refuse session/rider actors even for a decryptable envelope.
+#[tokio::test]
+async fn issue1228_open_envelope_handler_requires_durable_owner() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    assert!(state.agent.network().is_none(), "fixture must stay inert");
+    let request_body = open_envelope_test_body(&state)?.to_string();
+    for (actor, is_durable) in [(session(), false), (rider(), false), (durable(), true)] {
+        let app = axum::Router::new()
+            .route(
+                "/groups/secure/open-envelope",
+                axum::routing::post(secure_open_envelope_adversarial),
+            )
+            .layer(Extension(actor))
+            .with_state(Arc::clone(&state));
+        let (status, body) = post_open_envelope(app, None, &request_body).await;
+        if is_durable {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["secret_b64"], BASE64.encode([7_u8; 32]), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("durable API token")),
+                "{body}"
+            );
+            assert!(body.get("secret_b64").is_none(), "{body}");
+        }
+    }
+    Ok(())
+}
