@@ -310,6 +310,7 @@ impl AnnounceBlobCache {
         let digest = *digest;
         let agent_id = *agent_id;
         let machine_id = *machine_id;
+        // The revocation recovery path waits. This announce path does not.
         #[cfg(test)]
         self.diagnostics
             .fetches_spawned
@@ -338,6 +339,42 @@ impl AnnounceBlobCache {
             }
         });
         None
+    }
+
+    /// One verified fetch for a revocation subject, bounded by the blob
+    /// deadline (#1116).
+    ///
+    /// A cache hit returns at once. A miss waits for
+    /// [`fetch_and_verify`] and caches only a verified blob. One attempt.
+    pub(crate) async fn fetch_bounded(
+        &self,
+        pubsub: &Arc<PubSubManager>,
+        digest: &[u8; 32],
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+    ) -> Option<Arc<CachedBlob>> {
+        if let Some(hit) = self.get(digest).await {
+            return Some(hit);
+        }
+        match fetch_and_verify(pubsub, self, digest, agent_id, machine_id).await {
+            Ok(blob) => {
+                self.stats_fetches_ok.fetch_add(1, Ordering::Relaxed);
+                let digest = blob.digest;
+                self.insert_verified(blob).await;
+                self.get(&digest).await
+            }
+            Err(reason) => {
+                self.stats_fetches_failed.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    target: "announce.blob",
+                    digest = %hex::encode(digest),
+                    agent = %hex::encode(agent_id.0),
+                    %reason,
+                    "revocation subject certificate fetch failed"
+                );
+                None
+            }
+        }
     }
 
     /// Serve a blob request from our own current announcement state only.

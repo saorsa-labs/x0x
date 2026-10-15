@@ -2700,6 +2700,103 @@ fn subject_certs_with_provenance(
     certs
 }
 
+/// How many missing subject certificates one revocation batch may fetch.
+const MAX_CERT_RECOVERY_SUBJECTS: usize = 8;
+
+/// Subjects still missing a certificate, capped, with the announced
+/// binding that names each digest. Built while the caller holds the
+/// discovery locks. The fetch runs after those locks are dropped.
+struct CertRecoveryPlan {
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    fetches: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+}
+
+fn plan_subject_cert_recovery(
+    sources: &ProvenanceSources<'_>,
+    subjects: impl IntoIterator<Item = identity::AgentId>,
+) -> CertRecoveryPlan {
+    let subjects: Vec<identity::AgentId> = subjects.into_iter().collect();
+    let found = collect_subject_certs(sources, subjects.iter().copied());
+    let mut fetches = Vec::new();
+    for subject in subjects {
+        if found.contains_key(&subject) {
+            continue;
+        }
+        if fetches.len() >= MAX_CERT_RECOVERY_SUBJECTS {
+            break;
+        }
+        let Some(announced) = sources.announced.peek(&subject) else {
+            continue;
+        };
+        let Some(digest) = announced.cert_digest else {
+            continue;
+        };
+        if !announce_blob::fetch_warranted(&digest) {
+            continue;
+        }
+        fetches.push((subject, announced));
+    }
+    CertRecoveryPlan { found, fetches }
+}
+
+/// Finish [`plan_subject_cert_recovery`] with cache hits and at most one
+/// bounded fetch per planned subject (#1116).
+async fn finish_subject_cert_recovery(
+    mut plan: CertRecoveryPlan,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    let Some(cache) = blob_cache else {
+        return plan.found;
+    };
+    for (subject, announced) in plan.fetches {
+        let Some(digest) = announced.cert_digest else {
+            continue;
+        };
+        let blob = if let Some(hit) = cache.get(&digest).await {
+            hit
+        } else if let Some(pubsub) = pubsub {
+            let Some(fetched) = cache
+                .fetch_bounded(pubsub, &digest, &subject, &announced.machine_id)
+                .await
+            else {
+                continue;
+            };
+            fetched
+        } else {
+            continue;
+        };
+        let Some(cert) = blob.agent_certificate.clone() else {
+            continue;
+        };
+        if cert.agent_id().ok().as_ref() != Some(&subject) {
+            continue;
+        }
+        if identity_authority::has_authenticated_provenance(&cert, Some(announced)) {
+            plan.found.insert(subject, vec![cert]);
+        }
+    }
+    plan.found
+}
+
+/// Certificates for `subjects`, including one bounded blob fetch for a
+/// subject the local cache does not already hold (#1116).
+///
+/// A fetch runs only when a class A or B announcement committed to a
+/// digest and the blob is not cached. The wait is the blob fetch deadline.
+/// A certificate is kept only when that announcement's digest matches.
+/// A subject that has no committed digest is not fetched.
+#[cfg(test)]
+async fn recover_subject_certs(
+    sources: &ProvenanceSources<'_>,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
+    subjects: impl IntoIterator<Item = identity::AgentId>,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    let plan = plan_subject_cert_recovery(sources, subjects);
+    finish_subject_cert_recovery(plan, blob_cache, pubsub).await
+}
+
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
 fn collect_subject_certs(
     sources: &ProvenanceSources<'_>,
@@ -4494,7 +4591,7 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 ///
 /// The quarantine sibling is left in place. A hold that is still open is
 /// not written, so a restart cannot treat a partial set as a rebuild.
-async fn persist_completed_revocation_rebuild(
+pub(crate) async fn persist_completed_revocation_rebuild(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
 ) {
@@ -4506,43 +4603,48 @@ async fn persist_completed_revocation_rebuild(
         .map(std::path::Path::to_path_buf)
         .or_else(storage::x0x_home_dir)
     else {
+        revocation_set
+            .write()
+            .await
+            .requeue_rebuild_pending(pending);
         return;
     };
-    let (v1, v2, v3) = {
+    let encoded = {
         let set = revocation_set.read().await;
-        (
-            (pending & revocation::REVOCATION_CARRIER_V1 != 0)
-                .then(|| set.to_bytes().ok())
-                .flatten(),
-            (pending & revocation::REVOCATION_CARRIER_V2 != 0)
-                .then(|| set.to_bytes_v2().ok())
-                .flatten(),
-            (pending & revocation::REVOCATION_CARRIER_V3 != 0)
-                .then(|| set.to_bytes_v3().ok())
-                .flatten(),
-        )
+        [
+            (revocation::REVOCATION_CARRIER_V1, set.to_bytes()),
+            (revocation::REVOCATION_CARRIER_V2, set.to_bytes_v2()),
+            (revocation::REVOCATION_CARRIER_V3, set.to_bytes_v3()),
+        ]
     };
-    if let Some(bytes) = v1 {
-        if let Err(error) =
-            storage::save_rebuilt_revocation_file(&dir.join("revocations.bin"), bytes).await
-        {
-            tracing::warn!("revocations.bin rebuild failed: {error}");
+    let mut retry = 0u8;
+    for (carrier, bytes) in encoded {
+        if pending & carrier == 0 {
+            continue;
+        }
+        let name = match carrier {
+            revocation::REVOCATION_CARRIER_V1 => "revocations.bin",
+            revocation::REVOCATION_CARRIER_V2 => "revocations-v2.bin",
+            _ => SHARE_GRANT_REVOCATIONS_FILE,
+        };
+        let Ok(bytes) = bytes else {
+            tracing::warn!("{name} rebuild could not be encoded");
+            retry |= carrier;
+            continue;
+        };
+        match storage::save_rebuilt_revocation_file_typed(&dir.join(name), bytes).await {
+            Ok(()) => {}
+            Err(error) if error.crossed_rename() => {
+                tracing::warn!("{name} rebuild failed after the rename: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("{name} rebuild failed before the rename: {error}");
+                retry |= carrier;
+            }
         }
     }
-    if let Some(bytes) = v2 {
-        if let Err(error) =
-            storage::save_rebuilt_revocation_file(&dir.join("revocations-v2.bin"), bytes).await
-        {
-            tracing::warn!("revocations-v2.bin rebuild failed: {error}");
-        }
-    }
-    if let Some(bytes) = v3 {
-        if let Err(error) =
-            storage::save_rebuilt_revocation_file(&dir.join(SHARE_GRANT_REVOCATIONS_FILE), bytes)
-                .await
-        {
-            tracing::warn!("revocations-v3.bin rebuild failed: {error}");
-        }
+    if retry != 0 {
+        revocation_set.write().await.requeue_rebuild_pending(retry);
     }
 }
 
@@ -11680,20 +11782,28 @@ impl Agent {
                         let subject_certs = {
                             let journal =
                                 load_journal_certs(journal_path_for_listener.as_deref()).await;
-                            let announced = announced_machine_bindings.read().await;
-                            let cache = cache.read().await;
-                            collect_subject_certs(
-                                &ProvenanceSources {
-                                    cache: &cache,
-                                    announced: &announced,
-                                    evidence: Some(&evidence_for_listener),
-                                    local_user: own_user_id,
-                                    journal: &journal,
-                                },
-                                records.iter().filter_map(
-                                    revocation::RevocationRecord::needs_certificate_authority,
-                                ),
+                            let plan = {
+                                let announced = announced_machine_bindings.read().await;
+                                let cache = cache.read().await;
+                                plan_subject_cert_recovery(
+                                    &ProvenanceSources {
+                                        cache: &cache,
+                                        announced: &announced,
+                                        evidence: Some(&evidence_for_listener),
+                                        local_user: own_user_id,
+                                        journal: &journal,
+                                    },
+                                    records.iter().filter_map(
+                                        revocation::RevocationRecord::needs_certificate_authority,
+                                    ),
+                                )
+                            };
+                            finish_subject_cert_recovery(
+                                plan,
+                                Some(&announce_blob_cache),
+                                Some(&blob_pubsub),
                             )
+                            .await
                         };
                         {
                             let _share_grant_barrier = owner_trust_for_listener
@@ -11886,20 +11996,28 @@ impl Agent {
                         let subject_certs = {
                             let journal =
                                 load_journal_certs(journal_path_for_listener.as_deref()).await;
-                            let announced = announced_machine_bindings.read().await;
-                            let cache = cache.read().await;
-                            collect_subject_certs(
-                                &ProvenanceSources {
-                                    cache: &cache,
-                                    announced: &announced,
-                                    evidence: Some(&evidence_for_listener),
-                                    local_user: own_user_id,
-                                    journal: &journal,
-                                },
-                                records.iter().filter_map(
-                                    revocation::RevocationRecord::needs_certificate_authority,
-                                ),
+                            let plan = {
+                                let announced = announced_machine_bindings.read().await;
+                                let cache = cache.read().await;
+                                plan_subject_cert_recovery(
+                                    &ProvenanceSources {
+                                        cache: &cache,
+                                        announced: &announced,
+                                        evidence: Some(&evidence_for_listener),
+                                        local_user: own_user_id,
+                                        journal: &journal,
+                                    },
+                                    records.iter().filter_map(
+                                        revocation::RevocationRecord::needs_certificate_authority,
+                                    ),
+                                )
+                            };
+                            finish_subject_cert_recovery(
+                                plan,
+                                Some(&announce_blob_cache),
+                                Some(&blob_pubsub),
                             )
+                            .await
                         };
                         let mut inserted = false;
                         let mut share_grant_inserted = false;
@@ -14070,11 +14188,15 @@ impl Agent {
     /// Whether `sender` is an enrolled machine of the local owner for a
     /// corrupt-revocation snapshot (#1116). The group-journal half of that
     /// check lives with the daemon, which owns the named-group map.
+    /// `revoked` is the set already held by the caller. An explicit
+    /// revocation rejects the sender. The resync hold does not.
     pub(crate) fn revocation_snapshot_from_enrolled_machine(
         &self,
         sender: &identity::AgentId,
+        revoked: &revocation::RevocationSet,
     ) -> bool {
-        self.owner_trust.try_enrolled_snapshot_authority(sender)
+        self.owner_trust
+            .try_enrolled_snapshot_authority(sender, revoked)
     }
 
     /// Return the shared identity discovery cache (`pub(crate)` — used by the
@@ -32153,6 +32275,98 @@ mod tests {
             "an issuer-revocation must be rejected without the subject cert \
              (the pre-fix gossip behavior this closes)"
         );
+    }
+
+    /// #1116: a cold discovery cache still verifies a binding tombstone when
+    /// a class A or B announcement committed to the digest and the blob
+    /// cache holds that certificate. A mismatched digest does not.
+    #[tokio::test]
+    async fn cold_cache_recovers_binding_cert_from_announced_digest_1116() {
+        let user = identity::UserKeypair::generate().unwrap();
+        let issued_agent = identity::AgentKeypair::generate().unwrap();
+        let agent_id = issued_agent.agent_id();
+        let cert = identity::AgentCertificate::issue(&user, &issued_agent).unwrap();
+        let machine = identity::MachineId([9u8; 32]);
+        let digest = identity_authority::certificate_digest(&cert);
+        let cache = std::collections::HashMap::new();
+        let mut announced = dm_inbox::AuthenticatedMachineBindingCache::default();
+        announced.record_announcement(agent_id, machine, 1, Some(digest), cert.not_after());
+        let sources = ProvenanceSources {
+            cache: &cache,
+            announced: &announced,
+            evidence: None,
+            local_user: None,
+            journal: &[],
+        };
+        assert!(
+            collect_subject_certs(&sources, [agent_id]).is_empty(),
+            "a cold discovery cache has no subject certificate"
+        );
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        blobs
+            .insert_verified(announce_blob::CachedBlob {
+                digest,
+                payload_version: 1,
+                user_id: cert.user_id().ok(),
+                agent_certificate: Some(cert.clone()),
+                fetched_at_unix: 1,
+            })
+            .await;
+        let found = recover_subject_certs(&sources, Some(&blobs), None, [agent_id]).await;
+        let looked_up = found
+            .get(&agent_id)
+            .and_then(|certs| certs.first())
+            .expect("the announced digest recovers the cached certificate");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let binding = revocation::AgentMachineBinding {
+            agent: agent_id,
+            machine,
+            move_epoch: 1,
+        };
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::AgentMachineBinding(binding.clone()),
+            user.public_key(),
+            user.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+        let mut set = revocation::RevocationSet::new();
+        assert!(set
+            .verify_and_insert(record.clone(), Some(looked_up))
+            .unwrap());
+        assert!(set.is_binding_revoked(&agent_id, &machine));
+
+        let mut mismatched = dm_inbox::AuthenticatedMachineBindingCache::default();
+        mismatched.record_announcement(agent_id, machine, 1, Some([0xCD; 32]), cert.not_after());
+        let mismatched_sources = ProvenanceSources {
+            cache: &cache,
+            announced: &mismatched,
+            evidence: None,
+            local_user: None,
+            journal: &[],
+        };
+        blobs
+            .insert_verified(announce_blob::CachedBlob {
+                digest: [0xCD; 32],
+                payload_version: 1,
+                user_id: cert.user_id().ok(),
+                agent_certificate: Some(cert.clone()),
+                fetched_at_unix: 1,
+            })
+            .await;
+        let missed =
+            recover_subject_certs(&mismatched_sources, Some(&blobs), None, [agent_id]).await;
+        assert!(
+            !missed.contains_key(&agent_id),
+            "a digest that is not the certificate's digest is not provenance"
+        );
+        assert!(revocation::RevocationSet::new()
+            .verify_and_insert(record, None)
+            .is_err());
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still

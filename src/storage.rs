@@ -478,18 +478,27 @@ pub async fn write_private_bytes_durable_typed(
     write_private_bytes_durable_guarded(path, bytes, guard).await
 }
 
-/// V3's read/merge already validated the file and holds its write guard.
-/// Consume that guard through fsync rather than reading the file twice.
 /// Write a carrier that a verified group resync just rebuilt (#1116).
 ///
 /// The quarantine sibling stays in place as evidence. This does not run
 /// the missing-file refusal, so a hold can become a readable live file
 /// only after the caller has finished that resync.
+#[cfg(test)]
 pub(crate) async fn save_rebuilt_revocation_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
-    let guard = lock_revocation_path(path).await;
-    let result = write_private_bytes_durable_guarded(path, bytes, Some(guard))
+    save_rebuilt_revocation_file_typed(path, bytes)
         .await
-        .map_err(durable_write_identity_error);
+        .map_err(durable_write_identity_error)
+}
+
+/// The before-rename / after-rename split of a rebuilt carrier (#1116).
+/// A before-rename error leaves no live file. An after-rename error means
+/// the new bytes are already in place.
+pub(crate) async fn save_rebuilt_revocation_file_typed(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), DurableWriteError> {
+    let guard = lock_revocation_path(path).await;
+    let result = write_private_bytes_durable_guarded(path, bytes, Some(guard)).await;
     if result.is_ok() {
         let mut states = revocation_store_states().lock().await;
         if let Some(state) = states.get_mut(path) {

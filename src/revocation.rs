@@ -547,8 +547,10 @@ pub const REVOCATION_ARCHIVE_FAILED: &str = "A revocation store could not be dec
 ///
 /// A free agent key is not enough. The daemon installs this check from
 /// owner enrollment and the local group journal. Tests install a predicate.
+type SnapshotAuthorityCheck = dyn Fn(&AgentId, &RevocationSet) -> bool + Send + Sync;
+
 #[derive(Clone)]
-pub(crate) struct SnapshotAuthority(Arc<dyn Fn(&AgentId) -> bool + Send + Sync>);
+pub(crate) struct SnapshotAuthority(Arc<SnapshotAuthorityCheck>);
 
 impl std::fmt::Debug for SnapshotAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -557,12 +559,14 @@ impl std::fmt::Debug for SnapshotAuthority {
 }
 
 impl SnapshotAuthority {
-    pub(crate) fn new(check: impl Fn(&AgentId) -> bool + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(
+        check: impl Fn(&AgentId, &RevocationSet) -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self(Arc::new(check))
     }
 
-    fn allows(&self, sender: &AgentId) -> bool {
-        (self.0)(sender)
+    fn allows(&self, sender: &AgentId, set: &RevocationSet) -> bool {
+        (self.0)(sender, set)
     }
 }
 
@@ -647,12 +651,13 @@ pub(crate) async fn arm_incoming_revocation_snapshot(
     let Ok(records) = bincode::deserialize::<Vec<RevocationRecord>>(payload) else {
         return;
     };
-    let trusted = set
-        .read()
-        .await
-        .snapshot_authority
-        .as_ref()
-        .is_some_and(|authority| authority.allows(sender));
+    let trusted = {
+        let guard = set.read().await;
+        guard
+            .snapshot_authority
+            .as_ref()
+            .is_some_and(|authority| authority.allows(sender, &guard))
+    };
     set.write()
         .await
         .observe_remote_carrier_snapshot(carrier, sender, &records, trusted);
@@ -707,6 +712,15 @@ impl RevocationSet {
         let pending = self.rebuild_pending;
         self.rebuild_pending = 0;
         pending
+    }
+
+    /// Put carrier bits back after a rebuild that failed before the rename.
+    ///
+    /// The in-memory carrier stays open. The next retry writes the same
+    /// bytes. A failure after the rename must not call this: the live file
+    /// is already in place.
+    pub(crate) fn requeue_rebuild_pending(&mut self, carriers: u8) {
+        self.rebuild_pending |= carriers;
     }
 
     /// Empty set that closes membership for one carrier (#1116).
@@ -1726,7 +1740,9 @@ mod tests {
         let admin = AgentId([0xA5; 32]);
         set.write()
             .await
-            .set_snapshot_authority(SnapshotAuthority::new(move |sender| *sender == admin));
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == admin
+            }));
 
         let peer_a = AgentId([0xA1; 32]);
         let peer_b = AgentId([0xB2; 32]);
@@ -2031,7 +2047,9 @@ mod tests {
         );
         set.write()
             .await
-            .set_snapshot_authority(SnapshotAuthority::new(move |sender| *sender == attacker));
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == attacker
+            }));
         arm_incoming_revocation_snapshot(
             &set,
             crate::REVOCATION_TOPIC,
@@ -2047,7 +2065,9 @@ mod tests {
         let admin = AgentId([0xE5; 32]);
         set.write()
             .await
-            .set_snapshot_authority(SnapshotAuthority::new(move |sender| *sender == admin));
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == admin
+            }));
         arm_incoming_revocation_snapshot(
             &set,
             crate::REVOCATION_TOPIC,
@@ -2219,7 +2239,9 @@ mod tests {
         );
         set.write()
             .await
-            .set_snapshot_authority(SnapshotAuthority::new(move |sender| *sender == authority));
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
         arm_incoming_revocation_snapshot(
             &set,
             crate::REVOCATION_TOPIC,
@@ -2246,6 +2268,113 @@ mod tests {
         .unwrap();
         assert!(!again.revocation_resync_required());
         assert!(again.is_agent_revoked(&revoked.agent_id()));
+    }
+
+    /// Open a quarantined v1 carrier from one trusted sender and return the
+    /// set plus the revoked agent. No live file is written yet.
+    async fn open_v1_carrier_for_rebuild(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
+        crate::identity::AgentId,
+    ) {
+        let path = dir.join("revocations.bin");
+        tokio::fs::write(&path, b"truncated-looking-but-garbage")
+            .await
+            .unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&vec![record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        assert!(!set.read().await.revocation_resync_required());
+        (set, revoked.agent_id())
+    }
+
+    /// #1116: a before-rename failure keeps the pending bit. Removing the
+    /// fault and calling the helper again writes the same bytes. No new
+    /// revocation is required.
+    #[tokio::test]
+    async fn rebuild_pending_retries_after_before_rename_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let (set, revoked) = open_v1_carrier_for_rebuild(dir.path()).await;
+        let records_before = set.read().await.len();
+        tokio::fs::create_dir(&path).await.unwrap();
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_dir(), "the before-rename fault leaves no live file");
+        assert!(!set.read().await.revocation_resync_required());
+        assert_eq!(set.read().await.len(), records_before);
+        tokio::fs::remove_dir(&path).await.unwrap();
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the retry writes the live file");
+        assert!(!set.read().await.revocation_resync_required());
+        assert_eq!(set.read().await.len(), records_before);
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!again.revocation_resync_required());
+        assert!(again.is_agent_revoked(&revoked));
+    }
+
+    /// #1116: a failure after the rename leaves the new bytes in place and
+    /// does not queue another rebuild.
+    #[tokio::test]
+    async fn rebuild_after_rename_is_not_requeued_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let (set, revoked) = open_v1_carrier_for_rebuild(dir.path()).await;
+        let _guard = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the rename already published the live file");
+        assert!(!set.read().await.revocation_resync_required());
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!again.revocation_resync_required());
+        assert!(again.is_agent_revoked(&revoked));
     }
 
     #[tokio::test]

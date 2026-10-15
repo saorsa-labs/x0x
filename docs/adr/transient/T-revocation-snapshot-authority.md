@@ -13,7 +13,7 @@
 
 The Accepted record `T-revocation-store-corrupt` (slot A03, David, 2026-10-13) stays unchanged. It says membership stays closed until revocation state is rebuilt or resynced from the group. It says a carrier opens only when every record in the snapshot has verified. It does not name the sender.
 
-After quarantine the known set starts empty. Two free agent keys can publish the same throwaway self-revocation. The old rule treats that match as the group, opens the carrier, and writes the short set. Restart then admits the lost subject.
+After quarantine the known set starts empty. Two free agent keys can publish the same throwaway self-revocation. The old rule treats that match as the group, opens the carrier, and writes the short set.
 
 David confirmed the sender rule on 15 Oct 2026. This Proposed record states that rule. It does not edit the Accepted file.
 
@@ -34,7 +34,7 @@ David confirmed the sender rule on 15 Oct 2026. This Proposed record states that
 
 A snapshot reopens one waiting revocation carrier only when both of these are true. The sender is a trusted authority. Every record in that snapshot has verified. The snapshot must include every revocation this node has already verified for that carrier.
 
-A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal of a group that is not withdrawn and where the local agent is also Active. Enrollment uses the authenticated agent-to-machine binding and a current owner enrollment. The resync hold does not reject that machine. Either condition is enough.
+A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal of a non-withdrawn group where the local agent is also Active. Enrollment uses the authenticated binding and a current owner enrollment. The resync hold does not reject that machine. An explicit revocation of that agent, machine, or binding does. Either condition is enough.
 
 The node's own publish does not open a carrier. An empty snapshot does not open it. A snapshot that omits a known revocation does not open it. Two free agent keys do not open it. Otherwise the carrier stays closed until an operator places a readable file on the live path and restarts.
 

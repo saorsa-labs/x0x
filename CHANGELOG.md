@@ -250,11 +250,17 @@ All notable changes to this project will be documented in this file.
   agent keys do not open it. A carrier opens only when the snapshot comes
   from a trusted authority and every record in it has verified. A trusted
   authority is a machine enrolled to the local owner, or an Active owner
-  or admin in the local journal for a group this node belongs to.
-  Otherwise the carrier stays closed until an operator rebuild. x0xd then
-  writes that carrier to the live path and leaves the quarantine file in
-  place. An incomplete snapshot is not written, so a restart cannot admit
-  a revoked agent from it. The next start loads the live file. Placing a
+  or admin in the local journal for a group this node belongs to. An
+  explicit revocation of that agent, its machine, or that binding rejects
+  the sender. The resync hold does not. Otherwise the carrier stays closed
+  until an operator rebuild. x0xd then writes that carrier to the live path
+  and leaves the quarantine file in place. A rebuild that fails before the
+  rename stays pending, and the next call writes those same bytes. A
+  failure after the rename is not queued again. When the discovery cache
+  has no subject certificate, one bounded fetch uses the digest a class A
+  or B announcement committed to. An incomplete snapshot is not written,
+  so a restart cannot admit a revoked agent from it. The next start loads
+  the live file. Placing a
   readable file on the live path is a rebuild for the next start. It does
   not change the set of a process that is already running. Do not delete
   the quarantine file. Do not replace it with a zero-byte file. v1 and v2

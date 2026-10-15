@@ -452,18 +452,26 @@ pub fn record_startup_diagnostic(event: &str) {
 /// Install the check that reopens a corrupt revocation carrier (#1116).
 ///
 /// A trusted sender is a machine enrolled to the local owner, or an Active
-/// owner or admin in a local group this node belongs to. The callback holds
-/// a `Weak` so the revocation set does not keep `AppState` alive. A busy
-/// lock fails closed. The callback does not take the revocation lock.
+/// owner or admin in a local group this node belongs to. An explicit
+/// revocation of that agent, machine, or binding does not qualify. The
+/// callback holds a `Weak` so the revocation set does not keep `AppState`
+/// alive. It reads the set the caller already holds. A busy lock fails closed.
 async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
     let weak = Arc::downgrade(state);
-    let authority = x0x::revocation::SnapshotAuthority::new(move |sender| {
+    let authority = x0x::revocation::SnapshotAuthority::new(move |sender, revoked| {
         let Some(state) = weak.upgrade() else {
             return false;
         };
         if state
             .agent
-            .revocation_snapshot_from_enrolled_machine(sender)
+            .owner_trust()
+            .snapshot_sender_explicitly_revoked(sender, revoked)
+        {
+            return false;
+        }
+        if state
+            .agent
+            .revocation_snapshot_from_enrolled_machine(sender, revoked)
         {
             return true;
         }

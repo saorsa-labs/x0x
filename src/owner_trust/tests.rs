@@ -25,6 +25,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     agent_kp: AgentKeypair,
     agent_id: AgentId,
+    machine_kp: MachineKeypair,
     machine_id: MachineId,
     contacts: Arc<RwLock<ContactStore>>,
     cache: Arc<RwLock<HashMap<AgentId, DiscoveredAgent>>>,
@@ -49,9 +50,8 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("tmpdir");
         let agent_kp = AgentKeypair::generate().expect("agent keygen");
         let agent_id = agent_kp.agent_id();
-        let machine_id = MachineKeypair::generate()
-            .expect("machine keygen")
-            .machine_id();
+        let machine_kp = MachineKeypair::generate().expect("machine keygen");
+        let machine_id = machine_kp.machine_id();
         let cert = cert_signer.map(|signer| {
             AgentCertificate::issue_with_expiry(signer, &agent_kp, cert_not_after)
                 .expect("cert issue")
@@ -117,6 +117,7 @@ impl Fixture {
             _dir: dir,
             agent_kp,
             agent_id,
+            machine_kp,
             machine_id,
             contacts: Arc::new(RwLock::new(contacts)),
             cache: Arc::new(RwLock::new(cache)),
@@ -194,23 +195,243 @@ impl Fixture {
 
 #[tokio::test]
 async fn enrolled_machine_is_revocation_snapshot_authority_1116() {
-    let (_owner, enrolled) = Fixture::same_owner().await;
+    let (owner, enrolled) = Fixture::same_owner().await;
+    let open = RevocationSet::new();
     assert!(enrolled
         .trust
-        .try_enrolled_snapshot_authority(&enrolled.agent_id));
+        .try_enrolled_snapshot_authority(&enrolled.agent_id, &open));
     assert!(!enrolled
         .trust
-        .try_enrolled_snapshot_authority(&AgentId([0xEE; 32])));
+        .try_enrolled_snapshot_authority(&AgentId([0xEE; 32]), &open));
 
-    let owner = UserKeypair::generate().expect("owner keygen");
-    let missing = Fixture::new(&owner, Some(&owner), None, Enrollment::None).await;
+    let other = UserKeypair::generate().expect("owner keygen");
+    let missing = Fixture::new(&other, Some(&other), None, Enrollment::None).await;
     assert!(!missing
         .trust
-        .try_enrolled_snapshot_authority(&missing.agent_id));
-    let expired = Fixture::new(&owner, Some(&owner), None, Enrollment::Expired).await;
+        .try_enrolled_snapshot_authority(&missing.agent_id, &open));
+    let expired = Fixture::new(&other, Some(&other), None, Enrollment::Expired).await;
     assert!(!expired
         .trust
-        .try_enrolled_snapshot_authority(&expired.agent_id));
+        .try_enrolled_snapshot_authority(&expired.agent_id, &open));
+
+    // The unknown-carrier hold is not a revocation of this machine.
+    let held = RevocationSet::quarantined_carrier(crate::revocation::REVOCATION_CARRIER_V3);
+    assert!(held.revocation_resync_required());
+    assert!(!enrolled
+        .trust
+        .snapshot_sender_explicitly_revoked(&enrolled.agent_id, &held));
+    assert!(enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&enrolled.agent_id, &held));
+
+    let agent_record = RevocationRecord::sign(
+        RevokedSubject::Agent(enrolled.agent_id),
+        enrolled.agent_kp.public_key(),
+        enrolled.agent_kp.secret_key(),
+        1_000,
+        None,
+    )
+    .expect("agent revocation");
+    let mut agent_revoked =
+        RevocationSet::quarantined_carrier(crate::revocation::REVOCATION_CARRIER_V3);
+    assert!(agent_revoked
+        .verify_and_insert(agent_record, None)
+        .expect("insert"));
+    assert!(agent_revoked.revocation_resync_required());
+    assert!(!enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&enrolled.agent_id, &agent_revoked));
+
+    let machine_record = RevocationRecord::sign(
+        RevokedSubject::Machine(enrolled.machine_id),
+        enrolled.machine_kp.public_key(),
+        enrolled.machine_kp.secret_key(),
+        1_000,
+        None,
+    )
+    .expect("machine revocation");
+    let mut machine_revoked =
+        RevocationSet::quarantined_carrier(crate::revocation::REVOCATION_CARRIER_V3);
+    assert!(machine_revoked
+        .verify_and_insert(machine_record, None)
+        .expect("insert"));
+    assert!(machine_revoked.is_machine_revoked(&enrolled.machine_id));
+    assert!(machine_revoked.revocation_resync_required());
+    assert!(!enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&enrolled.agent_id, &machine_revoked));
+
+    let cert = enrolled
+        .cache
+        .read()
+        .await
+        .get(&enrolled.agent_id)
+        .and_then(|entry| entry.agent_certificate.clone())
+        .expect("subject cert");
+    let binding = crate::revocation::AgentMachineBinding {
+        agent: enrolled.agent_id,
+        machine: enrolled.machine_id,
+        move_epoch: 1,
+    };
+    let binding_record = RevocationRecord::sign(
+        RevokedSubject::AgentMachineBinding(binding),
+        owner.public_key(),
+        owner.secret_key(),
+        1_000,
+        None,
+    )
+    .expect("binding revocation");
+    let mut binding_revoked =
+        RevocationSet::quarantined_carrier(crate::revocation::REVOCATION_CARRIER_V3);
+    assert!(binding_revoked
+        .verify_and_insert(binding_record, Some(&cert))
+        .expect("insert"));
+    assert!(binding_revoked.is_binding_revoked(&enrolled.agent_id, &enrolled.machine_id));
+    assert!(!enrolled
+        .trust
+        .try_enrolled_snapshot_authority(&enrolled.agent_id, &binding_revoked));
+}
+
+/// #1116: a revoked enrolled machine must not reopen a corrupt v3 carrier
+/// by publishing an unrelated grant. The signed agent id is the source.
+/// A relay peer id is not. The non-revoked twin writes the live file.
+async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
+    let (owner, fixture) = Fixture::same_owner().await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("revocations-v3.bin");
+    tokio::fs::write(&path, b"not-a-v3-file")
+        .await
+        .expect("garbage");
+    let mut loaded =
+        crate::storage::read_revocation_store(&path, crate::storage::RevocationStore::V3, false)
+            .await
+            .expect("load")
+            .expect("quarantined carrier");
+    assert!(loaded.revocation_resync_required());
+
+    if revoke_machine {
+        let record = RevocationRecord::sign(
+            RevokedSubject::Machine(fixture.machine_id),
+            fixture.machine_kp.public_key(),
+            fixture.machine_kp.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("machine revocation");
+        assert!(loaded.verify_and_insert(record, None).expect("insert"));
+        assert!(loaded.is_machine_revoked(&fixture.machine_id));
+        assert!(loaded.revocation_resync_required());
+    }
+
+    let trust = fixture.trust.clone();
+    loaded.set_snapshot_authority(crate::revocation::SnapshotAuthority::new(
+        move |sender, revoked| {
+            if trust.snapshot_sender_explicitly_revoked(sender, revoked) {
+                return false;
+            }
+            trust.try_enrolled_snapshot_authority(sender, revoked)
+        },
+    ));
+
+    let lost_grant = [0x11u8; 32];
+    let unrelated = [0x22u8; 32];
+    let now = crate::Agent::unix_timestamp_secs();
+    let grant = crate::revocation::ShareGrantRevocation {
+        grant_id: unrelated,
+        owner: owner.user_id(),
+        grant_expiry: u64::MAX,
+    };
+    let record = RevocationRecord::sign(
+        RevokedSubject::ShareGrant(grant),
+        owner.public_key(),
+        owner.secret_key(),
+        now,
+        None,
+    )
+    .expect("grant revocation");
+    let payload = bincode::serialize(&vec![record.clone()]).expect("payload");
+    let set = Arc::new(RwLock::new(loaded));
+    let relay = AgentId([0xAB; 32]);
+    crate::revocation::arm_incoming_revocation_snapshot(
+        &set,
+        crate::REVOCATION_V3_TOPIC,
+        &payload,
+        Some(&relay),
+        None,
+    )
+    .await;
+    assert!(set.read().await.revocation_resync_required());
+    crate::revocation::arm_incoming_revocation_snapshot(
+        &set,
+        crate::REVOCATION_V3_TOPIC,
+        &payload,
+        Some(&fixture.agent_id),
+        None,
+    )
+    .await;
+    assert!(set
+        .write()
+        .await
+        .verify_and_insert_at(record, None, now)
+        .expect("ingest"));
+
+    if revoke_machine {
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a revoked enrolled machine must not open the carrier"
+        );
+        assert!(!set
+            .read()
+            .await
+            .is_share_grant_revoked(&lost_grant, &owner.user_id()));
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(
+            !path.is_file(),
+            "a revoked machine must not write the live file"
+        );
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .expect("reload")
+        .expect("still quarantined");
+        assert!(again.revocation_resync_required());
+        assert!(!again.is_share_grant_revoked(&lost_grant, &owner.user_id()));
+        assert!(!again.is_share_grant_revoked(&unrelated, &owner.user_id()));
+    } else {
+        assert!(!set.read().await.revocation_resync_required());
+        assert!(set
+            .read()
+            .await
+            .is_share_grant_revoked(&unrelated, &owner.user_id()));
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the enrolled source rebuilds the live file");
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .expect("reload")
+        .expect("live file");
+        assert!(!again.revocation_resync_required());
+        assert!(again.is_share_grant_revoked(&unrelated, &owner.user_id()));
+        assert!(!again.is_share_grant_revoked(&lost_grant, &owner.user_id()));
+    }
+}
+
+#[tokio::test]
+async fn revoked_enrolled_machine_cannot_reopen_corrupt_v3_1116() {
+    corrupt_v3_from_enrolled_source(true).await;
+}
+
+#[tokio::test]
+async fn enrolled_machine_reopens_corrupt_v3_1116() {
+    corrupt_v3_from_enrolled_source(false).await;
 }
 
 // (1) R3: an owner's own certified agent on an enrolled machine passes the
