@@ -388,6 +388,9 @@ pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerI
 struct OneSidedRepair {
     last_attempt: Option<Instant>,
     warned: bool,
+    /// Scheduler attempt armed across the discovery-cache wait and both
+    /// dials. A repair claim cancels it so that attempt cannot also dial.
+    scheduler_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Keep backoff and the warning unless the peer's own link has recovered.
@@ -2194,6 +2197,11 @@ pub struct NetworkNode {
     liveness_repair_semaphore: Arc<Semaphore>,
     /// One re-dial record per peer that has been one-sided (#1419).
     one_sided_repairs: Arc<Mutex<HashMap<AntPeerId, OneSidedRepair>>>,
+    /// One dial permit per peer, shared by the one-sided repair and the
+    /// proactive reconnect scheduler (#1419). The holder is the only task
+    /// that may dial. The permit stays held across the scheduler's cache
+    /// wait and both of its dials, and across the repair dial.
+    one_sided_dial_gate: Arc<Mutex<HashMap<AntPeerId, Arc<tokio::sync::Mutex<()>>>>>,
     /// How many one-sided re-dials this node has started.
     #[cfg(test)]
     one_sided_redials: Arc<std::sync::atomic::AtomicU32>,
@@ -2621,6 +2629,7 @@ impl NetworkNode {
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
             one_sided_repairs: Arc::new(Mutex::new(HashMap::new())),
+            one_sided_dial_gate: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             one_sided_redials: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
@@ -2863,6 +2872,43 @@ impl NetworkNode {
         one_sided_peer_ids_from(&self.connected_link_ages().await)
     }
 
+    /// The shared dial permit for `peer` (#1419).
+    ///
+    /// The repair and the proactive scheduler both dial only while holding
+    /// this permit. `lock_owned` keeps the guard `Send` across the cache
+    /// wait and the dials inside `tokio::spawn`.
+    pub(crate) fn one_sided_dial_gate(&self, peer: AntPeerId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = match self.one_sided_dial_gate.lock() {
+            Ok(gates) => gates,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        gates
+            .entry(peer)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Arm the scheduler attempt that is about to wait on the discovery cache.
+    ///
+    /// [`Self::claim_one_sided_redial`] cancels the token. The scheduler
+    /// must not call either dial after that, and it must drop the dial
+    /// permit so the repair can take it.
+    pub(crate) fn arm_one_sided_scheduler_attempt(
+        &self,
+        peer: &AntPeerId,
+    ) -> tokio_util::sync::CancellationToken {
+        let mut map = match self.one_sided_repairs.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = map.entry(*peer).or_default();
+        let token = tokio_util::sync::CancellationToken::new();
+        if let Some(previous) = entry.scheduler_cancel.replace(token.clone()) {
+            previous.cancel();
+        }
+        token
+    }
+
     /// Time left before the proactive reconnect scheduler may dial `peer_id`.
     ///
     /// The one-sided repair records its attempt before it disconnects. That
@@ -2962,12 +3008,31 @@ impl NetworkNode {
             return false;
         }
         entry.last_attempt = Some(Instant::now());
+        // The scheduler may already be inside its cache wait or a dial.
+        // Cancel that attempt. It drops the shared permit without another
+        // candidate or fallback call.
+        if let Some(token) = entry.scheduler_cancel.take() {
+            token.cancel();
+        }
         true
+    }
+
+    /// Claim the repair window without dialling, so a test can interleave
+    /// the claim with the scheduler's cache wait.
+    #[cfg(test)]
+    pub(crate) fn claim_one_sided_redial_for_test(&self, peer: &AntPeerId) -> bool {
+        self.claim_one_sided_redial(peer)
     }
 
     async fn redial_one_sided_peer(&self, peer: &AntPeerId) {
         let prefix = hex_prefix(&peer.0, 4);
+        let gate = self.one_sided_dial_gate(*peer);
         let dial = async {
+            // Same permit the scheduler holds across its cache wait and
+            // both dials. This wait is inside the 3 s bound: a cancelled
+            // scheduler attempt drops the permit instead of finishing a
+            // competing dial.
+            let _permit = gate.lock_owned().await;
             if self.is_connected(peer).await {
                 if let Err(error) = self.disconnect(peer).await {
                     debug!(
@@ -9121,6 +9186,190 @@ mod tests {
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
+    }
+
+    fn reconnect_observation(
+        peer: [u8; 32],
+        map: &std::sync::Mutex<HashMap<[u8; 32], u32>>,
+    ) -> u32 {
+        map.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn clear_reconnect_observations(peer: [u8; 32]) {
+        for map in [
+            &*crate::RECONNECT_PHASE1_DIALS,
+            &*crate::RECONNECT_PHASE2_DIALS,
+            &*crate::RECONNECT_CACHE_WAITS,
+        ] {
+            map.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&peer);
+        }
+    }
+
+    fn discovered_for_reconnect(peer: [u8; 32], addr: SocketAddr) -> crate::DiscoveredMachine {
+        crate::DiscoveredMachine {
+            machine_id: crate::identity::MachineId(peer),
+            addresses: vec![addr],
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
+            agent_ids: Vec::new(),
+            user_ids: Vec::new(),
+        }
+    }
+
+    /// Drive `schedule_reconnect` against a held discovery-cache lock.
+    ///
+    /// `claim_during_wait` claims the repair only after the scheduler has
+    /// entered the cache read, which is the gap after both hold checks.
+    async fn scheduler_dials_for_repair_claim(
+        plane: &str,
+        seed: u64,
+        peer_byte: u8,
+        address: Option<SocketAddr>,
+        claim_during_wait: bool,
+    ) -> (u32, u32) {
+        let fabric = sim::SimFabric::new(seed);
+        sim::register(plane, &fabric);
+        let config = NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, peer_byte], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let node = Arc::new(NetworkNode::new(config, None, None).await.unwrap());
+        let peer = [peer_byte; 32];
+        clear_reconnect_observations(peer);
+        let cache = Arc::new(tokio::sync::RwLock::new(HashMap::<
+            crate::identity::MachineId,
+            crate::DiscoveredMachine,
+        >::new()));
+        if let Some(addr) = address {
+            cache.write().await.insert(
+                crate::identity::MachineId(peer),
+                discovered_for_reconnect(peer, addr),
+            );
+        }
+        let writer = cache.write().await;
+        if !claim_during_wait {
+            assert!(
+                node.claim_one_sided_redial_for_test(&ant_quic::PeerId(peer)),
+                "the repair claim must take the window"
+            );
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        let tracker = Arc::new(std::sync::Mutex::new(HashMap::<
+            [u8; 32],
+            tokio::task::JoinHandle<()>,
+        >::new()));
+        crate::schedule_reconnect(
+            Arc::clone(&node),
+            Arc::clone(&cache),
+            token.clone(),
+            peer,
+            tracker,
+        );
+        if claim_during_wait {
+            let mut reached_cache = false;
+            for _ in 0..40 {
+                if reconnect_observation(peer, &crate::RECONNECT_CACHE_WAITS) >= 1 {
+                    reached_cache = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                reached_cache,
+                "the scheduler must be inside the discovery-cache read before the claim"
+            );
+            assert!(
+                node.claim_one_sided_redial_for_test(&ant_quic::PeerId(peer)),
+                "the repair claim must take the window during the cache wait"
+            );
+        } else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let phase1 = reconnect_observation(peer, &crate::RECONNECT_PHASE1_DIALS);
+        let phase2 = reconnect_observation(peer, &crate::RECONNECT_PHASE2_DIALS);
+        token.cancel();
+        node.try_shutdown().await.unwrap();
+        (phase1, phase2)
+    }
+
+    /// #1419: a hold that is already active when the scheduler starts
+    /// produces no candidate dial and no fallback dial.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_existing_repair_hold_blocks_scheduler_dials() {
+        let (phase1, phase2) = scheduler_dials_for_repair_claim(
+            "issue1419-hold",
+            141_901,
+            31,
+            Some(SocketAddr::from(([198, 18, 0, 50], 5483))),
+            false,
+        )
+        .await;
+        assert_eq!(
+            phase1, 0,
+            "an existing repair hold must not start a discovery-cache dial"
+        );
+        assert_eq!(
+            phase2, 0,
+            "an existing repair hold must not start a bootstrap-cache dial"
+        );
+        assert_eq!(
+            reconnect_observation([31; 32], &crate::RECONNECT_CACHE_WAITS),
+            0,
+            "an existing repair hold waits out the backoff before the cache read"
+        );
+    }
+
+    /// #1419: a claim while the scheduler is blocked on a populated cache
+    /// must not make the candidate call or the fallback call.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_claim_during_populated_cache_wait_does_not_dial() {
+        let (phase1, phase2) = scheduler_dials_for_repair_claim(
+            "issue1419-populated",
+            141_902,
+            32,
+            Some(SocketAddr::from(([198, 18, 0, 51], 5483))),
+            true,
+        )
+        .await;
+        assert_eq!(
+            (phase1, phase2),
+            (0, 0),
+            "a claim during the populated-cache wait must not call phase 1 or phase 2"
+        );
+    }
+
+    /// #1419: a claim while the scheduler is blocked on an empty cache
+    /// must not make the fallback call.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_claim_during_empty_cache_wait_does_not_dial() {
+        let (phase1, phase2) =
+            scheduler_dials_for_repair_claim("issue1419-empty", 141_903, 33, None, true).await;
+        assert_eq!(phase1, 0, "an empty cache has no discovery-cache candidate");
+        assert_eq!(
+            phase2, 0,
+            "a claim during the empty-cache wait must not call the fallback dial"
+        );
     }
 
     #[test]
