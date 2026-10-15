@@ -141,7 +141,7 @@ All notable changes to this project will be documented in this file.
   When no other active member remains, startup seals. Historical Removed rows
   with no live leaf do not start the wait. A 30 second backoff uses any
   send that is still inside the bound. `T-self-leave-catchup-before-seal`
-  (Proposed, slot A09).
+  (Proposed, slot A07).
 
 ## [v0.48.0] - 2026-10-13
 
