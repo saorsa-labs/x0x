@@ -2102,7 +2102,7 @@ async fn historical_removed_row_does_not_open_the_startup_wait() -> Result<()> {
     );
     startup_self_leave_rekey(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         0,
         "a historical Removed row must not send startup catch-up"
     );
@@ -2126,7 +2126,7 @@ async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -
         .catchup_page_force_ok
         .store(false, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 1);
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -2138,14 +2138,14 @@ async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -
         "new ciphertext must be withheld while the live leaf remains"
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 2);
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
         "a second failed send must not seal"
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 3);
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
         "spending the per-peer send bound must end the wait and seal"
@@ -2157,7 +2157,7 @@ async fn failed_startup_send_retries_within_a_bound_and_withholds_ciphertext() -
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         3,
         "the send bound must stop further catch-up requests"
     );
@@ -2190,7 +2190,7 @@ async fn startup_asks_a_fourth_peer_and_reasks_a_peer_that_returns() -> Result<(
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         4,
         "each of the four peers must be asked"
     );
@@ -2216,7 +2216,7 @@ async fn startup_asks_a_fourth_peer_and_reasks_a_peer_that_returns() -> Result<(
     }
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         9,
         "the four peers are asked again and the returning peer is asked once"
     );
@@ -2239,7 +2239,7 @@ async fn sent_startup_request_without_a_response_keeps_the_gate() -> Result<()> 
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 1);
     let recorded = fixture
         .state
         .named_group_test_recorders
@@ -2320,7 +2320,7 @@ async fn startup_gates_every_group_before_either_send() -> Result<()> {
     let (first, witness) = startup_with_witness(&"c8".repeat(16)).await?;
     let second_id = "c9".repeat(16);
     let second_epoch = add_removed_leaf_group(&first.state, &second_id).await?;
-    self_leave_startup_hold_for_gate_install();
+    self_leave_startup_hold_for_gate_install(&first.state);
     schedule_self_leave_rekey_if_idle(&first.state, &second_id).await;
     assert_eq!(
         live_epoch(&first.state, &second_id).await,
@@ -2338,8 +2338,8 @@ async fn startup_gates_every_group_before_either_send() -> Result<()> {
         first.epoch_before
     );
     assert_eq!(live_epoch(&first.state, &second_id).await, second_epoch);
-    assert_eq!(self_leave_startup_send_count(&first.group_id), 1);
-    assert_eq!(self_leave_startup_send_count(&second_id), 1);
+    assert_eq!(self_leave_startup_send_count(&first.state, &first.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&first.state, &second_id), 1);
     let recorded = first
         .state
         .named_group_test_recorders
@@ -2397,7 +2397,7 @@ async fn departed_startup_peer_stops_blocking_while_a_survivor_remains() -> Resu
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 2);
     let head = saved_head(&fixture.state, &fixture.group_id).await;
     handle_treekem_catchup_response(
         &fixture.state,
@@ -2431,7 +2431,7 @@ async fn departed_startup_peer_stops_blocking_while_a_survivor_remains() -> Resu
         StatusCode::CONFLICT
     );
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         1,
         "the survivor must keep the one send already spent"
     );
@@ -2585,7 +2585,7 @@ async fn overlapping_startup_retries_cannot_exceed_the_send_bound() -> Result<()
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
     retry_startup_self_leave_catchup(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 2);
     let helper_calls = |state: &AppState, group_id: &str| -> usize {
         state
             .named_group_test_recorders
@@ -2608,7 +2608,7 @@ async fn overlapping_startup_retries_cannot_exceed_the_send_bound() -> Result<()
         "the third send must park inside the helper"
     );
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         3,
         "the attempt is reserved before the helper returns"
     );
@@ -2619,11 +2619,11 @@ async fn overlapping_startup_retries_cannot_exceed_the_send_bound() -> Result<()
         2,
         "an overlapping retry must not send once the bound is reserved"
     );
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 3);
     drop(pause);
     first.await.expect("first retry");
     assert_eq!(helper_calls(&fixture.state, &fixture.group_id), 3);
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 3);
     Ok(())
 }
 
@@ -2661,13 +2661,13 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         1,
         "startup asks the first peer once and arms the backoff"
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         2,
         "the network-join retry spends the first peer's second attempt"
     );
@@ -2680,27 +2680,27 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
     add_roster_peer(&fixture.state, &fixture.group_id, 0x41).await;
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     assert!(
-        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 4).await,
+        yield_until(|| self_leave_startup_send_count(&fixture.state, &fixture.group_id) >= 4).await,
         "the first timer pass must ask the new peer"
     );
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 4);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 4);
 
     add_roster_peer(&fixture.state, &fixture.group_id, 0x42).await;
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     assert!(
-        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 6).await,
+        yield_until(|| self_leave_startup_send_count(&fixture.state, &fixture.group_id) >= 6).await,
         "the second timer pass must ask the peer added before it"
     );
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 6);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 6);
 
     add_roster_peer(&fixture.state, &fixture.group_id, 0x43).await;
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     assert!(
-        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 9).await,
+        yield_until(|| self_leave_startup_send_count(&fixture.state, &fixture.group_id) >= 9).await,
         "three timer passes leave the newest peers short of three asks"
     );
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         9,
         "counts after three passes are A=3, B=3, C=2, D=1"
     );
@@ -2717,10 +2717,10 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
 
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     assert!(
-        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 11).await,
+        yield_until(|| self_leave_startup_send_count(&fixture.state, &fixture.group_id) >= 11).await,
         "a fixed roster must keep the backoff running"
     );
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 11);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 11);
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -2731,7 +2731,7 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
     let sealed = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let spent = self_leave_startup_send_count(&fixture.group_id) == 12;
+            let spent = self_leave_startup_send_count(&fixture.state, &fixture.group_id) == 12;
             let advanced =
                 live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before;
             if spent && advanced {
@@ -2746,7 +2746,7 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
     assert!(
         sealed,
         "the fixed roster must seal once every eligible peer has spent three sends; sends {}, epoch {}",
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         live_epoch(&fixture.state, &fixture.group_id).await
     );
     assert_ne!(
@@ -2761,7 +2761,7 @@ async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> 
         tokio::task::yield_now().await;
     }
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         12,
         "a later interval must not ask a peer that has spent three sends"
     );
@@ -2786,9 +2786,9 @@ async fn arm_startup_pair(group_id: &str) -> Result<LeaveFixture> {
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 1);
     retry_startup_self_leave_catchup(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 2);
     assert_ne!(
         backoff_owner(&fixture.state),
         0,
@@ -2821,9 +2821,9 @@ async fn two_startup_states_each_run_their_own_backoff() -> Result<()> {
     let sealed = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let first_sealed = self_leave_startup_send_count(&first.group_id) == 3
+            let first_sealed = self_leave_startup_send_count(&first.state, &first.group_id) == 3
                 && live_epoch(&first.state, &first.group_id).await > first.epoch_before;
-            let second_sealed = self_leave_startup_send_count(&second.group_id) == 3
+            let second_sealed = self_leave_startup_send_count(&second.state, &second.group_id) == 3
                 && live_epoch(&second.state, &second.group_id).await > second.epoch_before;
             if first_sealed && second_sealed {
                 break true;
@@ -2837,8 +2837,8 @@ async fn two_startup_states_each_run_their_own_backoff() -> Result<()> {
     assert!(
         sealed,
         "both daemons must seal from their own timers; first sends {}, second sends {}",
-        self_leave_startup_send_count(&first.group_id),
-        self_leave_startup_send_count(&second.group_id)
+        self_leave_startup_send_count(&first.state, &first.group_id),
+        self_leave_startup_send_count(&second.state, &second.group_id)
     );
     assert_ne!(
         encrypt_status(&first.state, &first.group_id).await,
@@ -2851,8 +2851,8 @@ async fn two_startup_states_each_run_their_own_backoff() -> Result<()> {
     );
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     yield_for(std::time::Duration::from_millis(50)).await;
-    assert_eq!(self_leave_startup_send_count(&first.group_id), 3);
-    assert_eq!(self_leave_startup_send_count(&second.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&first.state, &first.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&second.state, &second.group_id), 3);
     Ok(())
 }
 
@@ -2867,7 +2867,7 @@ async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
     startup_self_leave_rekey(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 1);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 1);
     assert_ne!(backoff_owner(&fixture.state), 0);
     yield_for(std::time::Duration::from_millis(50)).await;
     {
@@ -2883,12 +2883,12 @@ async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
         "cancellation must release this daemon's backoff token"
     );
     assert_eq!(
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         1,
         "cancellation must not itself spend another attempt"
     );
     retry_startup_self_leave_catchup(&fixture.state).await;
-    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    assert_eq!(self_leave_startup_send_count(&fixture.state, &fixture.group_id), 2);
     assert_ne!(
         backoff_owner(&fixture.state),
         0,
@@ -2900,7 +2900,7 @@ async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
     let sealed = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let spent = self_leave_startup_send_count(&fixture.group_id) == 3;
+            let spent = self_leave_startup_send_count(&fixture.state, &fixture.group_id) == 3;
             let advanced =
                 live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before;
             if spent && advanced {
@@ -2915,12 +2915,179 @@ async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
     assert!(
         sealed,
         "the restarted backoff must spend the last attempt and seal; sends {}, epoch {}",
-        self_leave_startup_send_count(&fixture.group_id),
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
         live_epoch(&fixture.state, &fixture.group_id).await
     );
     assert_ne!(
         encrypt_status(&fixture.state, &fixture.group_id).await,
         StatusCode::CONFLICT
+    );
+    Ok(())
+}
+
+/// Designated admin A and ordinary member B share one roster and one group
+/// id, with distinct identities and storage. B's terminal page for a later
+/// admin-signed head must not clear A's hold on the earlier head.
+#[tokio::test]
+async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result<()> {
+    let admin = two_member_treekem_group_with_id("e5".repeat(16)).await?;
+    let (member_state, _member_dir) = secure_endpoint_test_state().await?;
+    let member_id = member_state.agent.agent_id();
+    let witness = x0x::identity::AgentId([0xff; 32]);
+    mark_leaver_removed(&admin).await;
+    {
+        let mut groups = admin.state.named_groups.write().await;
+        let info = groups.get_mut(&admin.group_id).expect("group");
+        let admin_hex = hex::encode(admin.state.agent.agent_id().as_bytes());
+        info.add_member(
+            hex::encode(member_id.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        let witness_hex = fixed_admin_hex([0xff; 32], &admin.state.agent.agent_id(), false);
+        add_fixed_admin(info, admin.state.agent.agent_id(), witness_hex);
+        info.seal_commit(
+            admin.state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )?;
+    }
+    let h1_info = {
+        let groups = admin.state.named_groups.read().await;
+        groups.get(&admin.group_id).expect("group").clone()
+    };
+    let h1 = h1_info.state_hash.clone();
+    member_state
+        .named_groups
+        .write()
+        .await
+        .insert(admin.group_id.clone(), h1_info.clone());
+    let mut advanced = h1_info;
+    advanced.description = "later-admin-head".to_string();
+    let commit = advanced.seal_commit(
+        admin.state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )?;
+    let h2 = commit.state_hash.clone();
+    assert_ne!(h1, h2, "the admin-signed description must move the head");
+    let applied = apply_named_group_metadata_event(
+        &member_state,
+        NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: admin.group_id.clone(),
+            revision: advanced.roster_revision,
+            actor: hex::encode(admin.state.agent.agent_id().as_bytes()),
+            name: None,
+            description: Some("later-admin-head".to_string()),
+            commit: Some(commit),
+        },
+        admin.state.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        applied.accepted,
+        "admin-signed H2 must apply on the ordinary member: {applied:?}"
+    );
+    assert_eq!(saved_head(&admin.state, &admin.group_id).await, h1);
+    assert_eq!(saved_head(&member_state, &admin.group_id).await, h2);
+
+    admin
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&admin.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&admin.state, &admin.group_id),
+        2,
+        "startup asks the ordinary member and the witness once each"
+    );
+    assert_eq!(
+        live_epoch(&admin.state, &admin.group_id).await,
+        admin.epoch_before
+    );
+    assert_eq!(
+        encrypt_status(&admin.state, &admin.group_id).await,
+        StatusCode::CONFLICT
+    );
+
+    handle_treekem_catchup_response(
+        &admin.state,
+        &member_id,
+        true,
+        catchup_page(&admin.group_id, false, Some(h1.clone())),
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&admin.state, &admin.group_id).await,
+        admin.epoch_before,
+        "the member's matching head leaves the witness unsatisfied"
+    );
+    assert_eq!(
+        encrypt_status(&admin.state, &admin.group_id).await,
+        StatusCode::CONFLICT
+    );
+
+    let witness_page = catchup_page(&admin.group_id, false, Some(h2.clone()));
+    handle_treekem_catchup_response(&admin.state, &witness, true, witness_page.clone()).await;
+    assert_eq!(
+        saved_head(&admin.state, &admin.group_id).await,
+        h1,
+        "a later head delivered to the admin must not replace H1"
+    );
+    assert_eq!(
+        live_epoch(&admin.state, &admin.group_id).await,
+        admin.epoch_before,
+        "the admin must refuse the witness page for H2"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&admin.state, &admin.group_id),
+        2
+    );
+    assert_eq!(
+        encrypt_status(&admin.state, &admin.group_id).await,
+        StatusCode::CONFLICT
+    );
+
+    handle_treekem_catchup_response(&member_state, &witness, true, witness_page).await;
+    assert_eq!(saved_head(&member_state, &admin.group_id).await, h2);
+    assert_eq!(
+        saved_head(&admin.state, &admin.group_id).await,
+        h1,
+        "the member's receipt must not change the admin's saved head"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&admin.state, &admin.group_id),
+        2,
+        "the member's terminal H2 receipt must not spend or clear the admin's sends"
+    );
+    assert_eq!(
+        live_epoch(&admin.state, &admin.group_id).await,
+        admin.epoch_before,
+        "the member's terminal H2 receipt must not let the admin rekey"
+    );
+    assert_eq!(
+        encrypt_status(&admin.state, &admin.group_id).await,
+        StatusCode::CONFLICT,
+        "the member's terminal H2 receipt must leave the admin on HTTP 409"
+    );
+
+    schedule_self_leave_rekey_if_idle(&admin.state, &admin.group_id).await;
+    retry_startup_self_leave_catchup(&admin.state).await;
+    assert_eq!(
+        live_epoch(&admin.state, &admin.group_id).await,
+        admin.epoch_before,
+        "a later retry must not seal while the admin's H1 hold remains"
+    );
+    assert_eq!(
+        encrypt_status(&admin.state, &admin.group_id).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&admin.state, &admin.group_id),
+        3,
+        "the witness still blocks, so the retry asks that peer once more"
     );
     Ok(())
 }

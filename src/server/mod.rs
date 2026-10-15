@@ -1206,6 +1206,8 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
+        startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
         #[cfg(test)]
         startup_catchup_backoff_abort: std::sync::Mutex::new(None),
@@ -2108,7 +2110,7 @@ pub async fn serve_with_options(
     // Welcome fetch) does not hold the events of the other groups.
     // Install startup self-leave gates before this listener can schedule a
     // rekey. `startup_self_leave_rekey` clears the hold after the gates exist.
-    routes::named_groups::self_leave_startup_hold_for_gate_install();
+    routes::named_groups::self_leave_startup_hold_for_gate_install(&state);
     bg_tasks.push(tokio::spawn(run_direct_metadata_listener(
         Arc::clone(&state),
         state.agent.subscribe_direct(),
