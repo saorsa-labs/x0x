@@ -1296,6 +1296,7 @@ async fn resume_keeps_a_rekey_until_the_membership_lock_shows_it_stored() -> Res
     Ok(())
 }
 
+#[cfg(unix)]
 fn unix_mode(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -1322,14 +1323,18 @@ async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> R
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
+    #[cfg(unix)]
     assert_eq!(unix_mode(&path), 0o600, "outbox_mode");
     let file = read_self_leave_rekey_outbox(&path).await;
     assert!(
         file.committer_snapshots.is_empty(),
         "persist must delete the outbox private tree"
     );
-    let live_snap = treekem_snapshot_path(&fixture.state.treekem_dir, &fixture.group_id);
-    assert_eq!(unix_mode(&live_snap), 0o600, "live_snap_mode");
+    #[cfg(unix)]
+    {
+        let live_snap = treekem_snapshot_path(&fixture.state.treekem_dir, &fixture.group_id);
+        assert_eq!(unix_mode(&live_snap), 0o600, "live_snap_mode");
+    }
 
     let pending = file.pending.first().expect("pending rekey").clone();
     let snapshot = {
@@ -1339,6 +1344,7 @@ async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> R
     };
     remember_durable_self_leave_rekey(&fixture.state, &fixture.group_id, &pending, Some(&snapshot))
         .await?;
+    #[cfg(unix)]
     assert_eq!(unix_mode(&path), 0o600, "crash-window outbox_mode");
     let parked = read_self_leave_rekey_outbox(&path).await;
     assert_eq!(parked.committer_snapshots.len(), 1);
