@@ -155,6 +155,27 @@ pub(crate) struct AppliedSummaryLine<'a> {
 /// write the WARN summary line (#1106).
 const SUPERVISED_EXIT_LOG_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The release this daemon ran before the current one, from the handoff
+/// record its predecessor wrote, or from the reported upgrade in the
+/// rollout state (D194 retention keeps its backup; review S3).
+fn previous_release_of(data_dir: Option<&Path>) -> Option<semver::Version> {
+    let data_dir = data_dir?;
+    let from_handoff = restart::UpgradeHandoff::read(&data_dir.join(restart::HANDOFF_FILE_NAME))
+        .ok()
+        .filter(|h| h.to_version == crate::VERSION)
+        .map(|h| h.from_version);
+    let from_state = || {
+        super::rollout::RolloutState::load(&super::rollout::RolloutState::path_in(data_dir))
+            .0
+            .announced_upgrade
+            .filter(|a| a.to_version == crate::VERSION)
+            .map(|a| a.from_version)
+    };
+    from_handoff
+        .or_else(from_state)
+        .and_then(|v| semver::Version::parse(&v).ok())
+}
+
 /// How the process leaves after an applied upgrade, for the summary line.
 /// `restart_now` is false when the HTTP handler restarts after its response.
 pub(crate) fn exit_description(
@@ -486,9 +507,27 @@ impl AutoApplyUpgrader {
             }
         }
 
+        // D194 (review S3): refuse staging when the archive, the extracted
+        // binaries and their backups would leave less than 1 GiB free. Not
+        // a failure: the scheduler waits and checks again.
+        let companion_path = target_path.with_file_name(if cfg!(target_os = "windows") {
+            "x0x.exe"
+        } else {
+            "x0x"
+        });
+        if let Some(available) = target_path.parent().and_then(super::free_space_bytes) {
+            let needed = super::apply_peak_bytes(&[&target_path, &companion_path]);
+            if let Err(e) = super::check_disk_reserve(available, needed) {
+                warn!(error = %e, "Refusing to stage the release: {e}");
+                return Err(e);
+            }
+        }
+
+        let previous_release = previous_release_of(self.restart_context.data_dir.as_deref());
         // #1106 F1: the running bytes are version evidence for the install.
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone())
-            .with_running_sha256(super::running_binary_sha256());
+            .with_running_sha256(super::running_binary_sha256())
+            .with_previous_release(previous_release.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
         let _temp_guard = TempDirGuard {
@@ -579,7 +618,8 @@ impl AutoApplyUpgrader {
                         current_version.clone(),
                         &daemon_plan,
                         &target_version,
-                    );
+                    )
+                    .with_previous_release(previous_release.clone());
                     match x0x_upgrader.perform_locked_upgrade(
                         &host_lock,
                         &extracted_x0x,

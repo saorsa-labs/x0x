@@ -35,11 +35,51 @@ pub const NEWEST_BACKUPS_KEPT: usize = 3;
 
 /// Refuse staging when `available` minus the peak space an apply needs
 /// would leave less than [`DISK_RESERVE_BYTES`] (D194, review S3).
-pub fn check_disk_reserve(_available: u64, _needed: u64) -> Result<(), UpgradeError> {
+pub fn check_disk_reserve(available: u64, needed: u64) -> Result<(), UpgradeError> {
+    if available < needed.saturating_add(DISK_RESERVE_BYTES) {
+        return Err(UpgradeError::InsufficientDisk {
+            available,
+            needed,
+            reserve: DISK_RESERVE_BYTES,
+        });
+    }
     Ok(())
 }
 
+/// The peak space an apply of the binaries at `targets` needs on their
+/// filesystem: the archive, the extracted binaries and their backups, each
+/// estimated by the size of the installed binaries.
+pub fn apply_peak_bytes(targets: &[&Path]) -> u64 {
+    let installed: u64 = targets
+        .iter()
+        .filter_map(|t| std::fs::metadata(t).ok())
+        .map(|m| m.len())
+        .sum();
+    installed.saturating_mul(3)
+}
+
 /// Free bytes available to this process on the filesystem holding `path`.
+/// `None` where it cannot be read (and on non-Unix targets).
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // statvfs field widths differ per platform
+pub fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stats` is a
+    // valid out-pointer for one `statvfs`; it is read only after success.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned 0, so it initialised `stats`.
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+/// Free bytes available to this process on the filesystem holding `path`.
+/// `None` where it cannot be read (and on non-Unix targets).
+#[cfg(not(unix))]
 pub fn free_space_bytes(_path: &Path) -> Option<u64> {
     None
 }
@@ -190,6 +230,55 @@ pub fn latest_versioned_backup(target: &Path, from_version: &str) -> Option<Path
         })
         .max()
         .map(|(_, path)| path)
+}
+
+/// Bounded retention of `<binary>.backup-<release>-<sha8>` files (D194,
+/// controller ruling on review S3).
+///
+/// Kept: every path in `keep` (this swap's backup), every backup of a
+/// release in `known_good` (the release this daemon runs and the release it
+/// ran before it: the last known-good pair), and the `newest` backups by
+/// release. Only older backups are deleted. Unparseable names, the legacy
+/// `<binary>.backup`, other binaries' backups and operator copies are never
+/// touched. There is no age rule. Best-effort.
+pub fn prune_versioned_backups(
+    target: &Path,
+    keep: &[&Path],
+    known_good: &[Version],
+    newest: usize,
+) -> usize {
+    let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return 0;
+    };
+    let Some(dir) = target.parent() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let prefix = format!("{name}.backup-");
+    let mut backups: Vec<(Version, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let (release, _sha8) = file_name.strip_prefix(&prefix)?.rsplit_once('-')?;
+            Some((Version::parse(release).ok()?, entry.path()))
+        })
+        .collect();
+    backups.sort();
+    let deletable = backups.len().saturating_sub(newest);
+    let mut removed = 0;
+    for (release, path) in backups.into_iter().take(deletable) {
+        if keep.contains(&path.as_path()) || known_good.contains(&release) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            info!(path = %path.display(), "Removed an older versioned upgrade backup (D194 retention)");
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// fsync the directory that holds `path`, so a rename in it is durable.
@@ -738,10 +827,16 @@ impl Upgrader {
                     warn!(error = %e, "Failed to write the install record after the swap");
                 }
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
-                // No automatic pruning (review R4): before ADR 0094 M2 there
-                // is no host-commit evidence for the last known-good pair
-                // (D194), so every versioned backup stays until an operator
-                // removes it.
+                // D194 retention (review S3): keep the known-good pair and
+                // the newest backups; delete only older ones.
+                let mut known_good = vec![self.current_version.clone()];
+                known_good.extend(self.previous_release.clone());
+                prune_versioned_backups(
+                    &self.target_path,
+                    &[backup_path.as_path()],
+                    &known_good,
+                    NEWEST_BACKUPS_KEPT,
+                );
                 Ok(SwapOutcome::Swapped { backup_path })
             }
             Err(replace_err) => {
