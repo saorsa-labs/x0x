@@ -120,10 +120,12 @@ All notable changes to this project will be documented in this file.
   saves the roster-only leave and the removal event before the new epoch is
   durable, and it does not send the removal again after a successful publish.
   A missing KeyPackage on a live leaf is a logged deferral, not a finished
-  rekey.   Catch-up applies a removal only after the commit signature verifies.
-  The signed roster commit names the TreeKEM commit digest, so a relay
-  cannot attach another member's TreeKEM commit. One peer's truncated page
-  stays open until that peer's last page. The outbox copy of the post-commit
+  rekey. Catch-up applies a removal only after the commit signature verifies.
+  A third-party relay may carry TreeKEM bytes only when that signature names
+  their digest. The shipped admin removal `treekem:epoch=<n>` still applies
+  when the authenticated author delivers it. A relay of that form does not
+  install. `T-self-leave-relay-commit-binding` (Proposed, slot A15). One peer's
+  truncated page stays open until that peer's last page. The outbox copy of the post-commit
   private tree is mode 0600. It is deleted when the epoch persist succeeds
   and when the group wipe runs. A
   failed or timed-out publish leaves the removal pending. Other admins hold

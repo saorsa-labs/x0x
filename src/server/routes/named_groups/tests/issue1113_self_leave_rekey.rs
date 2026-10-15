@@ -1538,3 +1538,314 @@ async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> 
     );
     Ok(())
 }
+
+struct CatchupRelay {
+    fixture: LeaveFixture,
+    victim_state: Arc<AppState>,
+    _victim_dir: tempfile::TempDir,
+    member_b: x0x::identity::AgentId,
+    attacker_commit: Vec<u8>,
+    epoch_before: u64,
+}
+
+async fn catchup_relay_fixture() -> Result<CatchupRelay> {
+    let mut fixture = two_member_treekem_group().await?;
+    let member_b_kp = x0x::identity::AgentKeypair::generate()?;
+    let member_b = member_b_kp.agent_id();
+    let (victim_state, victim_dir) = secure_endpoint_test_state().await?;
+    let victim_id = victim_state.agent.agent_id();
+
+    let b_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_b, &[4u8; 32])?;
+    let b_pkg = b_prepared.key_package_bytes().to_vec();
+    let b_added = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.add_member(member_b, &b_pkg)?
+    };
+    fixture.leaver_group.process_commit(&b_added.commit)?;
+    let mut member_b_group =
+        x0x::mls::TreeKemMlsGroup::join_from_welcome(b_prepared, &b_added.welcome)?;
+
+    let victim_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(victim_id, &[5u8; 32])?;
+    let victim_pkg = victim_prepared.key_package_bytes().to_vec();
+    let victim_added = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.add_member(victim_id, &victim_pkg)?
+    };
+    fixture.leaver_group.process_commit(&victim_added.commit)?;
+    member_b_group.process_commit(&victim_added.commit)?;
+    let victim_group =
+        x0x::mls::TreeKemMlsGroup::join_from_welcome(victim_prepared, &victim_added.welcome)?;
+
+    let epoch_before = live_epoch(&fixture.state, &fixture.group_id).await;
+    let b_hex = hex::encode(member_b.as_bytes());
+    let victim_hex = hex::encode(victim_id.as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+        info.add_member(
+            b_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &b_hex,
+            base64::engine::general_purpose::STANDARD.encode(&b_pkg),
+        );
+        info.add_member(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &victim_hex,
+            base64::engine::general_purpose::STANDARD.encode(&victim_pkg),
+        );
+        info.secret_epoch = epoch_before;
+        info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+        info.recompute_state_hash();
+    }
+    let shared = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).expect("group").clone()
+    };
+    victim_state
+        .named_groups
+        .write()
+        .await
+        .insert(fixture.group_id.clone(), shared);
+    victim_state.treekem_groups.write().await.insert(
+        fixture.group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(victim_group)),
+    );
+    let attacker_commit = member_b_group.update()?;
+    Ok(CatchupRelay {
+        fixture,
+        victim_state,
+        _victim_dir: victim_dir,
+        member_b,
+        attacker_commit,
+        epoch_before,
+    })
+}
+
+fn swap_treekem_commit(event: &NamedGroupMetadataEvent, commit: &[u8]) -> NamedGroupMetadataEvent {
+    let mut relayed = event.clone();
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64, ..
+    } = &mut relayed
+    {
+        *treekem_commit_b64 = Some(base64::engine::general_purpose::STANDARD.encode(commit));
+    }
+    relayed
+}
+
+async fn deliver_catchup(
+    state: &Arc<AppState>,
+    sender: &x0x::identity::AgentId,
+    group_id: &str,
+    event: NamedGroupMetadataEvent,
+) {
+    handle_treekem_catchup_response(
+        state,
+        sender,
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: group_id.to_string(),
+            events: vec![event],
+            truncated: false,
+        },
+    )
+    .await;
+}
+
+async fn group_is_quarantined(state: &AppState, group_id: &str) -> bool {
+    let groups = state.named_groups.read().await;
+    groups.get(group_id).expect("group").is_fork_quarantined()
+}
+
+/// The admin remove route still seals `treekem:epoch=N`. A third party
+/// cannot relay those bytes, substituted or genuine. The author can.
+#[tokio::test]
+async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
+    let mut cast = catchup_relay_fixture().await?;
+    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
+    cast.fixture
+        .state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let response = remove_named_group_member(
+        State(Arc::clone(&cast.fixture.state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((cast.fixture.group_id.clone(), member_hex)),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the admin remove route must seal"
+    );
+    let genuine = published_removal_event(&cast.fixture.state).expect("legacy removal");
+    let binding = named_group_metadata_event_commit(&genuine)
+        .expect("signed commit")
+        .security_binding
+        .clone()
+        .expect("legacy binding");
+    assert!(
+        binding.starts_with("treekem:epoch=") && !binding.contains(":commit="),
+        "the admin remove route must keep the legacy binding, got {binding}"
+    );
+    let substituted = swap_treekem_commit(&genuine, &cast.attacker_commit);
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        substituted,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "a substituted legacy relay must not advance the epoch"
+    );
+    assert!(
+        !group_is_quarantined(&cast.victim_state, &cast.fixture.group_id).await,
+        "a rejected legacy relay must not quarantine the group"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        genuine.clone(),
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "a third party must not install a legacy TreeKEM commit"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.fixture.state.agent.agent_id(),
+        &cast.fixture.group_id,
+        genuine,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        live_epoch(&cast.fixture.state, &cast.fixture.group_id).await,
+        "the author must still deliver the legacy removal"
+    );
+    let ciphertext = encrypt(&cast.fixture.state, &cast.fixture.group_id, b"author-epoch").await?;
+    let victim_opened = {
+        let group = live_treekem_group(&cast.victim_state, &cast.fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.decrypt_message(&ciphertext)?
+    };
+    assert_eq!(victim_opened, b"author-epoch");
+    assert!(
+        cast.fixture
+            .leaver_group
+            .decrypt_message(&ciphertext)
+            .is_err(),
+        "the removed member must not read the author's new ciphertext"
+    );
+    Ok(())
+}
+
+/// A digest-bound rekey can be relayed. Substituted bytes cannot.
+#[tokio::test]
+async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
+    let mut cast = catchup_relay_fixture().await?;
+    cast.fixture
+        .state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let leave = signed_self_leave(&cast.fixture).await?;
+    let applied = apply_named_group_metadata_event(
+        &cast.fixture.state,
+        leave.clone(),
+        cast.fixture.member_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        applied.accepted,
+        "the admin must seal the leave: {applied:?}"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        leave,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "the roster leave must not advance the epoch"
+    );
+    let genuine = published_removal_event(&cast.fixture.state).expect("digest rekey");
+    let binding = named_group_metadata_event_commit(&genuine)
+        .expect("signed commit")
+        .security_binding
+        .clone()
+        .expect("digest binding");
+    assert!(
+        binding.contains(":commit="),
+        "the self-leave rekey must name the TreeKEM digest, got {binding}"
+    );
+    let substituted = swap_treekem_commit(&genuine, &cast.attacker_commit);
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        substituted,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "a substituted digest relay must not install"
+    );
+    assert!(
+        !group_is_quarantined(&cast.victim_state, &cast.fixture.group_id).await,
+        "a rejected digest relay must not quarantine the group"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        genuine,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        live_epoch(&cast.fixture.state, &cast.fixture.group_id).await,
+        "a third party must relay the genuine digest-bound rekey"
+    );
+    let ciphertext = encrypt(&cast.fixture.state, &cast.fixture.group_id, b"digest-epoch").await?;
+    let victim_opened = {
+        let group = live_treekem_group(&cast.victim_state, &cast.fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.decrypt_message(&ciphertext)?
+    };
+    assert_eq!(victim_opened, b"digest-epoch");
+    assert!(
+        cast.fixture
+            .leaver_group
+            .decrypt_message(&ciphertext)
+            .is_err(),
+        "the leaver must not read the relayed epoch"
+    );
+    Ok(())
+}

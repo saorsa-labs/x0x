@@ -11408,8 +11408,11 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
                 // T-self-leave-catchup-author. The actor field is not authority.
-                let apply_sender =
-                    verified_catchup_member_removed_author(&event).unwrap_or(*sender);
+                // A third party may supply TreeKEM bytes only when the signed
+                // binding names those bytes. T-self-leave-relay-commit-binding.
+                let apply_sender = verified_catchup_member_removed_author(&event)
+                    .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
+                    .unwrap_or(*sender);
                 apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
                 if let Some(ev) = recovery_event {
                     apply_recovered_member_key_package(state, &ev).await;
@@ -11520,6 +11523,41 @@ fn verified_catchup_member_removed_author(
     }
     commit.verify_structure().ok()?;
     parse_agent_id_hex(&commit.committed_by).ok()
+}
+
+/// A third-party relay may apply a removal as its signer only when the
+/// signed binding authenticates the attached TreeKEM bytes. The legacy
+/// `treekem:epoch=<n>` form does not. The authenticated author may still
+/// deliver that form.
+fn catchup_may_apply_removed_as_author(
+    event: &NamedGroupMetadataEvent,
+    transport_sender: &x0x::identity::AgentId,
+    author: &x0x::identity::AgentId,
+) -> bool {
+    if transport_sender == author {
+        return true;
+    }
+    let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64,
+        treekem_epoch,
+        commit,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(commit) = commit.as_ref() else {
+        return false;
+    };
+    let (Some(commit_b64), Some(epoch)) = (treekem_commit_b64.as_ref(), *treekem_epoch) else {
+        // A roster-only leave has no TreeKEM payload for a relay to swap.
+        return treekem_commit_b64.is_none() && treekem_epoch.is_none();
+    };
+    let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+        return false;
+    };
+    commit.security_binding.as_deref()
+        == Some(treekem_commit_binding(epoch, &commit_bytes).as_str())
 }
 
 fn self_leave_key_package_reply(
