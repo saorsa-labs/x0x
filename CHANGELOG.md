@@ -53,6 +53,13 @@ All notable changes to this project will be documented in this file.
     lane counts it, writes a warning and applies the next event.
   - Shutdown stops the listener and the lanes at once. An apply in progress
     is still shielded and runs to completion. No wire or storage change.
+- **W3-H join receipts no longer infer a request's transport from trace order
+  (#1245, partial).** The #1143 case reports observed requests and matching
+  direct frame deliveries separately. Batched watcher receipts no longer
+  cause a direct request to be labelled as gossip delivery. Per-request
+  transport remains unknown without message identity correlation; verdicts
+  and the outstanding determinism work are unchanged.
+
 - **A subscription opened before the revocation stores are attached drops a
   revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
   store and the revocation set when it decodes each payload. A store
