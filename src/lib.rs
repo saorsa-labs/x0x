@@ -2762,6 +2762,8 @@ fn forget_recovery_stream(progress: &mut announce_blob::CertRecoveryAttempts, fi
 ///
 /// The index stays under that fingerprint. A later list does not replace
 /// it. When the set-aside table is full, only its oldest entry is dropped.
+/// That drop is counted so a later visit with no slot does not stay on
+/// the first subjects.
 fn park_recovery_stream(
     progress: &mut announce_blob::CertRecoveryAttempts,
     fingerprint: u64,
@@ -2781,7 +2783,9 @@ fn park_recovery_stream(
         let Some(old) = progress.retained_order.pop_front() else {
             break;
         };
-        progress.retained.remove(&old);
+        if progress.retained.remove(&old).is_some() {
+            progress.discards = progress.discards.wrapping_add(1);
+        }
     }
     if progress.retained.len() >= MAX_CERT_RECOVERY_STREAMS {
         return;
@@ -2815,18 +2819,41 @@ where
     hasher.finish()
 }
 
+/// SplitMix64. The low bits change when the input's low bits do not, so a
+/// cycle whose length is a multiple of the list length still moves.
+fn mix_unsaved_service(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn unsaved_recovery_start(service: u64, len: usize) -> usize {
+    let mixed = mix_unsaved_service(service).wrapping_add(service);
+    usize::try_from(mixed % u64::try_from(len).unwrap_or(1)).unwrap_or(0)
+}
+
 fn recovery_stream_start(
-    progress: &announce_blob::CertRecoveryAttempts,
+    progress: &mut announce_blob::CertRecoveryAttempts,
     fingerprint: u64,
     len: usize,
 ) -> usize {
-    let next = progress
+    if let Some(next) = progress
         .cursors
         .get(&fingerprint)
         .or_else(|| progress.retained.get(&fingerprint))
         .copied()
-        .unwrap_or(0);
-    (next as usize) % len
+    {
+        return (next as usize) % len;
+    }
+    // A list with no slot starts at its first subject until a saved index
+    // has been dropped. After that, each such visit takes a later window.
+    if progress.discards == 0 || len <= 1 {
+        return 0;
+    }
+    let start = unsaved_recovery_start(progress.unsaved_service, len);
+    progress.unsaved_service = progress.unsaved_service.wrapping_add(1);
+    start
 }
 
 fn remember_recovery_stream(
@@ -2864,7 +2891,8 @@ fn remember_recovery_stream(
 /// there on the next call. A different list has its own index, so a
 /// shorter batch cannot rewind a longer one. A fetch that fails still
 /// advances the index. When the live table is full, the oldest list is
-/// set aside under its own index so a new list can be saved.
+/// set aside under its own index so a new list can be saved. A list whose
+/// index was dropped takes a later window on its next visit.
 fn select_recovery_misses<T, K>(
     misses: &[T],
     key_of: impl Fn(&T) -> K,
@@ -2906,7 +2934,8 @@ fn provenanced_blob_cert(
 /// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
 /// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. Each miss
 /// list keeps its own place. A full table sets the oldest list aside
-/// under its own index (#1116).
+/// under its own index. A dropped index still reaches later subjects on
+/// a later visit (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -33019,6 +33048,98 @@ mod tests {
         assert!(progress.cursor_order.len() <= MAX_CERT_RECOVERY_STREAMS);
         assert!(progress.retained.len() <= MAX_CERT_RECOVERY_STREAMS);
         assert!(progress.retained_order.len() <= MAX_CERT_RECOVERY_STREAMS);
+    }
+
+    /// #1116: dropping a saved index must not pin that list to its first
+    /// subjects. 129 nine-miss lists are one past the live and set-aside
+    /// tables together. After 128 cycles every ninth subject is selected.
+    /// The same holds when 64 lists fill the tables and do not return. A
+    /// cycle of 128 still reaches every ninth subject.
+    #[test]
+    fn evicted_recovery_index_still_reaches_later_subjects_1116() {
+        fn nine_lists(count: usize, origin: u32) -> Vec<Vec<u32>> {
+            (0..count)
+                .map(|batch| {
+                    let batch = u32::try_from(batch).unwrap_or(0);
+                    let start = origin.saturating_add(batch.saturating_mul(9));
+                    (start..start + 9).collect()
+                })
+                .collect()
+        }
+        fn visit_lists(
+            progress: &mut announce_blob::CertRecoveryAttempts,
+            lists: &[Vec<u32>],
+            rounds: usize,
+        ) -> std::collections::HashSet<u32> {
+            let mut seen = std::collections::HashSet::new();
+            for _round in 0..rounds {
+                for list in lists {
+                    seen.extend(select_recovery_misses(
+                        list,
+                        |subject| *subject,
+                        progress,
+                        MAX_CERT_RECOVERY_SUBJECTS,
+                    ));
+                }
+            }
+            seen
+        }
+        fn assert_recovery_bounds(progress: &announce_blob::CertRecoveryAttempts) {
+            assert!(progress.cursors.len() <= MAX_CERT_RECOVERY_STREAMS);
+            assert_eq!(progress.cursors.len(), progress.cursor_order.len());
+            assert!(progress.retained.len() <= MAX_CERT_RECOVERY_STREAMS);
+            assert_eq!(progress.retained.len(), progress.retained_order.len());
+            assert!(progress
+                .cursors
+                .keys()
+                .all(|key| !progress.retained.contains_key(key)));
+        }
+        fn missing_ninths(lists: &[Vec<u32>], seen: &std::collections::HashSet<u32>) -> usize {
+            lists.iter().filter(|list| !seen.contains(&list[8])).count()
+        }
+
+        let control = nine_lists(MAX_CERT_RECOVERY_STREAMS * 2, 0);
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        let seen = visit_lists(&mut progress, &control, 2);
+        let missing = missing_ninths(&control, &seen);
+        assert_eq!(
+            missing, 0,
+            "a 128-list cycle left {missing} ninth subjects unselected"
+        );
+        assert_recovery_bounds(&progress);
+
+        let active = nine_lists(MAX_CERT_RECOVERY_STREAMS * 2 + 1, 100_000);
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        let seen = visit_lists(&mut progress, &active, 128);
+        let missing = missing_ninths(&active, &seen);
+        assert_eq!(
+            missing, 0,
+            "a 129-list cycle left {missing} ninth subjects unselected"
+        );
+        assert!(
+            progress.discards > 0,
+            "the 129-list cycle never dropped a saved index"
+        );
+        assert_recovery_bounds(&progress);
+
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        for list in nine_lists(MAX_CERT_RECOVERY_STREAMS, 200_000) {
+            let _ = select_recovery_misses(
+                &list,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+        }
+        let under_stale = nine_lists(MAX_CERT_RECOVERY_STREAMS * 2 + 1, 300_000);
+        let seen = visit_lists(&mut progress, &under_stale, 128);
+        let missing = missing_ninths(&under_stale, &seen);
+        assert_eq!(missing, 0, "stale lists hid {missing} later subjects");
+        assert!(
+            progress.discards > 0,
+            "stale lists never forced a saved index to be dropped"
+        );
+        assert_recovery_bounds(&progress);
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still

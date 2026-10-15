@@ -262,7 +262,9 @@ All notable changes to this project will be documented in this file.
   place. A shorter list does not move that place. When the table is full,
   the oldest list is set aside under its own index, so a new list can
   save its place and the older list does not start again at its first
-  subject. An incomplete snapshot
+  subject. When that saved index is dropped, a later visit still moves
+  on to later subjects. The live table and the set-aside table each stay
+  at 64 lists. An incomplete snapshot
   is not written, so a restart cannot admit a revoked agent from it. The
   next start loads the live file. Placing a
   readable file on the live path is a rebuild for the next start. It does

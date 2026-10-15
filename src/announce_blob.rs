@@ -198,12 +198,17 @@ struct LruEntry {
 /// When that table is full, the oldest list moves to `retained` with its
 /// own index. A later list does not write over that index. `retained` is
 /// also at most 64 lists; the oldest retained list is the one dropped.
+/// `discards` counts those drops. `unsaved_service` moves the next window
+/// of a list whose index was dropped, so that list does not stay on its
+/// first subjects.
 #[derive(Debug, Default)]
 pub(crate) struct CertRecoveryAttempts {
     pub(crate) cursors: HashMap<u64, u64>,
     pub(crate) cursor_order: VecDeque<u64>,
     pub(crate) retained: HashMap<u64, u64>,
     pub(crate) retained_order: VecDeque<u64>,
+    pub(crate) discards: u64,
+    pub(crate) unsaved_service: u64,
     #[cfg(test)]
     pub(crate) attempted: HashSet<identity::AgentId>,
 }
@@ -220,7 +225,8 @@ pub struct AnnounceBlobCache {
     stats_fetches_failed: AtomicU64,
     /// Next index of each revocation miss list. v1 and v2 share it. A
     /// shorter list does not move a longer list. A full table sets the
-    /// oldest list aside under its own index (#1116).
+    /// oldest list aside under its own index. A dropped index still
+    /// reaches later subjects on a later visit (#1116).
     cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
     #[cfg(test)]
     bounded_fetch_fails: AtomicBool,
