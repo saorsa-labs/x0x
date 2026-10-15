@@ -478,7 +478,7 @@ async fn write_participant_record_locked(
     target: &std::path::Path,
     key: &str,
     record: &x0x::upgrade::participants::ParticipantRecord,
-) {
+) -> bool {
     let written =
         match x0x::upgrade::HostUpgradeLock::acquire(target, x0x::upgrade::HOST_UPGRADE_LOCK_WAIT)
             .await
@@ -487,14 +487,18 @@ async fn write_participant_record_locked(
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
-    if let Err(e) = written {
-        tracing::warn!(
-            error = %e,
-            install = %target.display(),
-            "Failed to write this daemon's shared-install participant record; this daemon \
-             cannot swap the shared binary, and the other daemons on the install cannot count \
-             it until the record is written"
-        );
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                install = %target.display(),
+                "Failed to write this daemon's shared-install participant record; until it is \
+                 written, this daemon holds the unregistered signal and no daemon on the install \
+                 swaps the shared binary"
+            );
+            false
+        }
     }
 }
 
@@ -574,14 +578,30 @@ impl RolloutScheduler {
             let key = x0x::upgrade::participants::participant_key(&this.env.data_dir);
             let mut records = this.inner.lock().await.participant_tx.subscribe();
             let mut shutdown = this.env.shutdown_watch.clone();
+            // Review S1: until its record is written, this daemon holds the
+            // shared "unregistered" signal, so no writer swaps meanwhile.
+            let mut unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+            let mut registered = false;
             loop {
                 let latest = records.borrow_and_update().clone();
                 if let Some(mut record) = latest {
                     record.updated_unix = unix_now_secs();
-                    write_participant_record_locked(&target, &key, &record).await;
+                    if !registered && unregistered.is_none() {
+                        unregistered =
+                            x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+                    }
+                    if write_participant_record_locked(&target, &key, &record).await {
+                        registered = true;
+                        unregistered = None;
+                    }
                 }
+                let pause = if registered {
+                    x0x::upgrade::participants::PARTICIPANT_REFRESH
+                } else {
+                    x0x::upgrade::participants::PARTICIPANT_RECHECK
+                };
                 tokio::select! {
-                    _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_REFRESH) => {}
+                    _ = tokio::time::sleep(pause) => {}
                     changed = records.changed() => {
                         if changed.is_err() {
                             return;
@@ -1711,7 +1731,7 @@ pub(in crate::server) async fn register_updates_off_participant(
     target: &std::path::Path,
     node_id: &[u8; 32],
     data_dir: &std::path::Path,
-) {
+) -> bool {
     let key = x0x::upgrade::participants::participant_key(data_dir);
     let record = x0x::upgrade::participants::ParticipantRecord::new(
         node_id,
@@ -1722,7 +1742,7 @@ pub(in crate::server) async fn register_updates_off_participant(
         None,
     )
     .with_updates_enabled(false);
-    write_participant_record_locked(target, &key, &record).await;
+    write_participant_record_locked(target, &key, &record).await
 }
 
 /// Refresh [`register_updates_off_participant`] every
@@ -1734,10 +1754,24 @@ pub(in crate::server) fn spawn_updates_off_participant(
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Review S1: hold the unregistered signal until the first write.
+        let mut unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+        let mut registered = false;
         loop {
-            register_updates_off_participant(&target, &node_id, &data_dir).await;
+            if !registered && unregistered.is_none() {
+                unregistered = x0x::upgrade::participants::UnregisteredSignal::hold(&target);
+            }
+            if register_updates_off_participant(&target, &node_id, &data_dir).await {
+                registered = true;
+                unregistered = None;
+            }
+            let pause = if registered {
+                x0x::upgrade::participants::PARTICIPANT_REFRESH
+            } else {
+                x0x::upgrade::participants::PARTICIPANT_RECHECK
+            };
             tokio::select! {
-                _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_REFRESH) => {}
+                _ = tokio::time::sleep(pause) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         return;

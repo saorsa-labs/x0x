@@ -184,9 +184,27 @@ pub struct UnregisteredSignal {
 }
 
 impl UnregisteredSignal {
-    /// Take the shared signal lock for the install at `target`.
-    pub fn hold(_target: &Path) -> Option<Self> {
-        None
+    /// Take the shared signal lock for the install at `target`. The signal
+    /// file is created (with the install's sharing) when this account may,
+    /// else opened read-only. `None` when it cannot be opened or a writer
+    /// holds it right now; the caller tries again.
+    pub fn hold(target: &Path) -> Option<Self> {
+        let path = unregistered_signal_path(target);
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(file) => {
+                super::share_like_install(&path, target, false);
+                file
+            }
+            Err(_) => std::fs::File::open(&path).ok()?,
+        };
+        file.try_lock_shared().ok()?;
+        Some(Self { _file: file })
     }
 }
 
@@ -213,14 +231,17 @@ pub fn write_own(
     let dir = participants_dir(target);
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir)?;
-        share_like_install_dir(&dir, target)?;
         sync_dir_of(&dir)?;
     }
+    // Review S1: also an existing directory (older code, an interrupted
+    // creation) gets the install's sharing, so every account can register.
+    super::share_like_install(&dir, target, true);
     let path = record_path(target, key);
     let tmp = dir.join(format!("{key}.json.tmp-{}", std::process::id()));
     let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
     let written = std::fs::File::create(&tmp).and_then(|mut file| {
         file.write_all(&json)?;
+        super::share_like_install(&tmp, target, false);
         file.sync_all()
     });
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
@@ -239,30 +260,6 @@ pub fn remove_own(_lock: &super::HostUpgradeLock, target: &Path, key: &str) -> s
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-/// Give the new participants directory the install directory's group
-/// write bit (plus setgid), so every account that can write the install
-/// can register.
-#[cfg(unix)]
-fn share_like_install_dir(dir: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let install_mode = target
-        .parent()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.permissions().mode())
-        .unwrap_or(0o755);
-    let mode = if install_mode & 0o020 != 0 {
-        0o2775
-    } else {
-        0o755
-    };
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn share_like_install_dir(_dir: &Path, _target: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// fsync the directory that holds `path`.
@@ -365,6 +362,29 @@ pub fn check_all_due(
         // Registration is pending or failed (logged by that daemon at
         // WARN). The set is not established: no swap, in any mode.
         pending.push(own_record_missing(own_key, &dir));
+    }
+    // Review S1: a live daemon that runs from this install but has no
+    // record (it cannot write one) holds the shared "unregistered" signal.
+    // Then no writer may swap, in any mode.
+    let signal = unregistered_signal_path(target);
+    match std::fs::File::open(&signal) {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => pending.push(PendingParticipant {
+                key: String::new(),
+                machine_id: String::new(),
+                reason: format!(
+                    "a daemon that runs from this install is not registered (it holds {}; \
+                     registration pending or failed)",
+                    signal.display()
+                ),
+            }),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(unknown(format!("cannot probe {}: {e}", signal.display())))
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(unknown(format!("cannot open {}: {e}", signal.display()))),
     }
     if pending.is_empty() {
         Ok(ParticipantGate::AllDue { stale })

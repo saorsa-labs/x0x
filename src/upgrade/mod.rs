@@ -150,6 +150,7 @@ impl HostUpgradeLock {
             path: path.clone(),
             source,
         })?;
+        share_like_install(&path, target, false);
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file, path })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -279,6 +280,39 @@ pub fn prune_versioned_backups(
         }
     }
     removed
+}
+
+/// Give an upgrade registry file or directory the install directory's
+/// sharing (review S1): on a group-writable install, mode 0o664 (files) or
+/// 0o2775 (directories) and the install directory's group; otherwise 0o644
+/// or 0o755. The mode is set explicitly, so the process umask does not
+/// narrow it. Best-effort: only the owner can change it, and a failure is
+/// logged at DEBUG.
+pub(crate) fn share_like_install(path: &Path, target: &Path, is_dir: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Some(install) = target.parent().and_then(|p| std::fs::metadata(p).ok()) else {
+            return;
+        };
+        let group_shared = install.mode() & 0o020 != 0;
+        let mode = match (is_dir, group_shared) {
+            (true, true) => 0o2775,
+            (true, false) => 0o755,
+            (false, true) => 0o664,
+            (false, false) => 0o644,
+        };
+        if group_shared {
+            if let Err(e) = std::os::unix::fs::chown(path, None, Some(install.gid())) {
+                debug!(path = %path.display(), error = %e, "Cannot set the install group");
+            }
+        }
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            debug!(path = %path.display(), error = %e, "Cannot set the shared mode");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, target, is_dir);
 }
 
 /// fsync the directory that holds `path`, so a rename in it is durable.
