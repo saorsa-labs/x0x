@@ -25,6 +25,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -188,6 +190,13 @@ struct LruEntry {
     access_counter: u64,
 }
 
+/// Fetch attempts for revocation certificate recovery (#1116).
+#[derive(Debug, Default)]
+pub(crate) struct CertRecoveryAttempts {
+    pub(crate) next_stamp: u64,
+    pub(crate) last_attempt: HashMap<identity::AgentId, u64>,
+}
+
 /// The blob cache: in-memory `HashMap` + optional disk persistence.
 pub struct AnnounceBlobCache {
     blobs: tokio::sync::RwLock<HashMap<[u8; 32], Arc<CachedBlob>>>,
@@ -198,9 +207,13 @@ pub struct AnnounceBlobCache {
     stats_misses: AtomicU64,
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
-    /// Next index into a revocation batch's cache misses. A later batch
-    /// continues past misses that already spent a fetch (#1116).
-    cert_recovery_miss_cursor: AtomicU64,
+    /// Subjects that already spent a certificate fetch, with the stamp of
+    /// that attempt. v1 and v2 share the map. A subject with no stamp is
+    /// chosen before a subject that has one, so a short batch cannot hide
+    /// a subject an earlier batch left untried (#1116).
+    cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
+    #[cfg(test)]
+    bounded_fetch_fails: AtomicBool,
     #[cfg(test)]
     diagnostics: AnnounceBlobDiagnosticCounters,
 }
@@ -217,7 +230,9 @@ impl AnnounceBlobCache {
             stats_misses: AtomicU64::new(0),
             stats_fetches_ok: AtomicU64::new(0),
             stats_fetches_failed: AtomicU64::new(0),
-            cert_recovery_miss_cursor: AtomicU64::new(0),
+            cert_recovery_attempts: std::sync::Mutex::new(CertRecoveryAttempts::default()),
+            #[cfg(test)]
+            bounded_fetch_fails: AtomicBool::new(false),
             #[cfg(test)]
             diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
@@ -345,15 +360,36 @@ impl AnnounceBlobCache {
         None
     }
 
-    /// Where the next revocation batch should start among cache misses.
-    pub(crate) fn cert_recovery_miss_cursor(&self) -> usize {
-        usize::try_from(self.cert_recovery_miss_cursor.load(Ordering::Relaxed)).unwrap_or(0)
+    /// The shared v1 and v2 record of certificate-fetch attempts.
+    pub(crate) fn lock_cert_recovery_attempts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, CertRecoveryAttempts> {
+        self.cert_recovery_attempts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Remember that a revocation batch spent fetches through `cursor`.
-    pub(crate) fn store_cert_recovery_miss_cursor(&self, cursor: usize) {
-        self.cert_recovery_miss_cursor
-            .store(u64::try_from(cursor).unwrap_or(u64::MAX), Ordering::Relaxed);
+    /// Test fetches return no blob and do not open a network request.
+    #[cfg(test)]
+    pub(crate) fn set_bounded_fetch_fails_for_testing(&self, fail: bool) {
+        self.bounded_fetch_fails.store(fail, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::set_bounded_fetch_fails_for_testing`] is set.
+    #[cfg(test)]
+    pub(crate) fn bounded_fetch_fails_for_testing(&self) -> bool {
+        self.bounded_fetch_fails.load(Ordering::Relaxed)
+    }
+
+    /// Whether recovery has already spent a fetch on `subject`.
+    #[cfg(test)]
+    pub(crate) fn cert_recovery_was_attempted_for_testing(
+        &self,
+        subject: &identity::AgentId,
+    ) -> bool {
+        self.lock_cert_recovery_attempts()
+            .last_attempt
+            .contains_key(subject)
     }
 
     /// One verified fetch for a revocation subject, bounded by the blob

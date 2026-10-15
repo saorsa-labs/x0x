@@ -2739,23 +2739,62 @@ fn plan_subject_cert_recovery(
     CertRecoveryPlan { found, fetches }
 }
 
-/// The next `budget` cache misses, starting at `cursor` and wrapping once.
+/// How many subject attempt-stamps the recovery map keeps.
 ///
-/// The returned cursor is where the following batch continues, so a miss
-/// that already spent a fetch does not hide the subjects after it.
-fn budget_recovery_misses<T: Clone>(misses: &[T], cursor: usize, budget: usize) -> (Vec<T>, usize) {
+/// A stamp is written only after a subject is chosen for a fetch. A
+/// subject that has no stamp stays ahead of one that has a stamp, so
+/// dropping an old stamp cannot hide a subject that has never been
+/// fetched.
+const MAX_CERT_RECOVERY_ATTEMPT_STAMPS: usize = 64;
+
+/// The next misses that may start a fetch.
+///
+/// Subjects with no stamp come first, then the oldest stamp. Equal stamps
+/// keep the order of `misses`. Each chosen subject records one attempt,
+/// including when the fetch then fails. The map drops the oldest stamp
+/// once it holds more than [`MAX_CERT_RECOVERY_ATTEMPT_STAMPS`] subjects.
+fn select_recovery_misses<T, K>(
+    misses: &[T],
+    key_of: impl Fn(&T) -> K,
+    next_stamp: &mut u64,
+    last_attempt: &mut std::collections::HashMap<K, u64>,
+    budget: usize,
+) -> Vec<T>
+where
+    T: Clone,
+    K: Copy + Eq + std::hash::Hash,
+{
     if misses.is_empty() || budget == 0 {
-        return (Vec::new(), 0);
+        return Vec::new();
     }
-    let start = cursor % misses.len();
+    let mut order: Vec<(u64, usize)> = misses
+        .iter()
+        .enumerate()
+        .map(|(index, miss)| {
+            let stamp = last_attempt.get(&key_of(miss)).copied().unwrap_or(0);
+            (stamp, index)
+        })
+        .collect();
+    order.sort_by_key(|(stamp, index)| (*stamp, *index));
+    *next_stamp = next_stamp.saturating_add(1);
+    let stamp = *next_stamp;
     let mut chosen = Vec::new();
-    let mut offset = 0usize;
-    while chosen.len() < budget && offset < misses.len() {
-        chosen.push(misses[(start + offset) % misses.len()].clone());
-        offset += 1;
+    for (_, index) in order.into_iter().take(budget) {
+        let miss = misses[index].clone();
+        last_attempt.insert(key_of(&miss), stamp);
+        chosen.push(miss);
     }
-    let next = (start + chosen.len()) % misses.len();
-    (chosen, next)
+    while last_attempt.len() > MAX_CERT_RECOVERY_ATTEMPT_STAMPS {
+        let oldest = last_attempt
+            .iter()
+            .min_by_key(|(_, attempt)| *attempt)
+            .map(|(key, _)| *key);
+        let Some(oldest) = oldest else {
+            break;
+        };
+        last_attempt.remove(&oldest);
+    }
+    chosen
 }
 
 fn provenanced_blob_cert(
@@ -2771,8 +2810,9 @@ fn provenanced_blob_cert(
 }
 
 /// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
-/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch, and the
-/// cache cursor moves past those misses for the next batch (#1116).
+/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. A subject
+/// that has not been fetched is chosen before one that has, so a shorter
+/// batch cannot hide a subject an earlier batch left untried (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -2794,20 +2834,34 @@ async fn finish_subject_cert_recovery(
         }
         misses.push((subject, announced));
     }
-    let Some(pubsub) = pubsub else {
+    let fail_fetches = cert_recovery_fetches_fail(cache);
+    if pubsub.is_none() && !fail_fetches {
         return plan.found;
+    }
+    let budgeted = {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        let mut next_stamp = attempts.next_stamp;
+        let budgeted = select_recovery_misses(
+            &misses,
+            |(subject, _announced)| *subject,
+            &mut next_stamp,
+            &mut attempts.last_attempt,
+            MAX_CERT_RECOVERY_SUBJECTS,
+        );
+        attempts.next_stamp = next_stamp;
+        budgeted
     };
-    let (budgeted, next_cursor) = budget_recovery_misses(
-        &misses,
-        cache.cert_recovery_miss_cursor(),
-        MAX_CERT_RECOVERY_SUBJECTS,
-    );
     if budgeted.is_empty() {
         return plan.found;
     }
-    cache.store_cert_recovery_miss_cursor(next_cursor);
     for (subject, announced) in budgeted {
         let Some(digest) = announced.cert_digest else {
+            continue;
+        };
+        if fail_fetches {
+            continue;
+        }
+        let Some(pubsub) = pubsub else {
             continue;
         };
         let Some(blob) = cache
@@ -2821,6 +2875,19 @@ async fn finish_subject_cert_recovery(
         }
     }
     plan.found
+}
+
+/// The test hook spends the fetch budget and then returns no blob.
+fn cert_recovery_fetches_fail(cache: &announce_blob::AnnounceBlobCache) -> bool {
+    #[cfg(test)]
+    {
+        cache.bounded_fetch_fails_for_testing()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cache;
+        false
+    }
 }
 
 /// Certificates for `subjects`, including one bounded blob fetch for a
@@ -32624,13 +32691,88 @@ mod tests {
     #[test]
     fn recovery_miss_budget_retains_the_untried_tail_1116() {
         let misses: Vec<u8> = (0..9).collect();
-        let (first, cursor) = budget_recovery_misses(&misses, 0, MAX_CERT_RECOVERY_SUBJECTS);
+        let mut next_stamp = 0u64;
+        let mut last_attempt = std::collections::HashMap::new();
+        let first = select_recovery_misses(
+            &misses,
+            |subject| *subject,
+            &mut next_stamp,
+            &mut last_attempt,
+            MAX_CERT_RECOVERY_SUBJECTS,
+        );
         assert_eq!(first, (0..8).collect::<Vec<_>>());
-        assert_eq!(cursor, 8);
-        let (second, next) = budget_recovery_misses(&misses, cursor, MAX_CERT_RECOVERY_SUBJECTS);
+        let second = select_recovery_misses(
+            &misses,
+            |subject| *subject,
+            &mut next_stamp,
+            &mut last_attempt,
+            MAX_CERT_RECOVERY_SUBJECTS,
+        );
         assert_eq!(second.first().copied(), Some(8));
-        assert_eq!(second.len(), 8);
-        assert_eq!(next, 7);
+        assert_eq!(second.len(), MAX_CERT_RECOVERY_SUBJECTS);
+    }
+
+    /// #1116: a one-miss batch must not rewind a nine-miss batch.
+    ///
+    /// Nine misses take subjects 0–7 and leave 8. The next batch is one
+    /// miss. Each chosen fetch fails, so every subject stays a miss.
+    /// Twelve rounds of that schedule must still fetch subject 8.
+    #[test]
+    fn alternating_recovery_batches_still_reach_the_ninth_miss_1116() {
+        let nine: Vec<u8> = (0..9).collect();
+        let one = [0u8];
+        let mut next_stamp = 0u64;
+        let mut last_attempt = std::collections::HashMap::new();
+        let mut fetched = std::collections::HashSet::new();
+        for _round in 0..12 {
+            let chosen = select_recovery_misses(
+                &nine,
+                |subject| *subject,
+                &mut next_stamp,
+                &mut last_attempt,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            fetched.extend(chosen);
+            let chosen = select_recovery_misses(
+                &one,
+                |subject| *subject,
+                &mut next_stamp,
+                &mut last_attempt,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            fetched.extend(chosen);
+        }
+        assert!(
+            fetched.contains(&8),
+            "a one-miss batch hid subject 8; fetched {fetched:?}"
+        );
+        assert!(last_attempt.len() <= MAX_CERT_RECOVERY_ATTEMPT_STAMPS);
+    }
+
+    /// #1116: failed fetches still record the attempt. Alternating a
+    /// nine-miss batch with a one-miss batch must fetch the ninth subject.
+    #[tokio::test]
+    async fn alternating_failed_fetches_still_reach_the_ninth_subject_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(9, 0).await;
+        blobs.set_bounded_fetch_fails_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let nine: Vec<_> = subjects.iter().map(|subject| subject.agent_id).collect();
+        let one = [nine[0]];
+        let ninth = nine[8];
+        for _round in 0..12 {
+            let found =
+                recover_subject_certs(&sources, Some(&blobs), None, nine.iter().copied()).await;
+            assert!(
+                !found.contains_key(&ninth),
+                "a failed fetch must not invent a certificate"
+            );
+            let _ = recover_subject_certs(&sources, Some(&blobs), None, one.iter().copied()).await;
+        }
+        assert!(
+            blobs.cert_recovery_was_attempted_for_testing(&ninth),
+            "a one-miss batch hid the ninth subject"
+        );
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still
