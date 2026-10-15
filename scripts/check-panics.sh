@@ -39,7 +39,8 @@ trap cleanup_regions EXIT
 # body closes at ';' or ','. A crate-level #![cfg(test)] (no open brace, paren,
 # or bracket) runs to EOF. A nested #![cfg(test)] closes with its module. An
 # attribute inside an unclassified macro argument does not start a region:
-# the macro can drop it and emit the item as production code. A proved
+# the macro can drop it and emit the item as production code. A weak keyword
+# (such as union) and a raw identifier (r#name) are macro names. A proved
 # enclosing test item still covers those bytes. '-> !' is a never type, not
 # a macro. A macro token tree in a signature or expression is not the body. A
 # macro item closes at its '}' or at ';' / ',' after ')' or ']'. An attributed
@@ -71,6 +72,8 @@ INTRODUCERS = frozenset({
     "use", "union", "async", "unsafe", "extern", "where",
     "if", "while", "loop", "match", "let", "for", "return", "else", "move",
 })
+# Weak keywords may name a macro. union is also an item introducer.
+WEAK_KEYWORDS = frozenset({"union", "macro_rules", "safe", "raw"})
 _CLOSERS = {"{": "}", "(": ")", "[": "]"}
 
 
@@ -159,11 +162,13 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
     def at_item_level() -> bool:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
 
-    def _finish_ident() -> None:
+    def _finish_ident(ch: str = "", nxt: str = "") -> None:
         nonlocal ident, prev_token, saw_introducer
         if not ident:
             return
         prev_token = ident
+        # union! is a macro. union Foo is an item. The '!' decides.
+        macro_bang = ch == "!" and nxt != "=" and _is_macro_name(ident)
         if (
             active
             and not body
@@ -171,6 +176,7 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
             and not pending
             and at_item_level()
             and ident in INTRODUCERS
+            and not macro_bang
         ):
             saw_introducer = True
         ident = ""
@@ -250,8 +256,16 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
                 i += 1
                 continue
 
+            if ident == "r" and ch == "#":
+                # Do not reuse `body`: that flag means the test item has opened.
+                raw_name = _raw_ident_body(line, i + 1)
+                if raw_name is not None:
+                    ident = "r#" + raw_name
+                    i += 1 + len(raw_name)
+                    continue
+
             if ident and not (ch.isalnum() or ch == "_"):
-                _finish_ident()
+                _finish_ident(ch, nxt)
 
             if ch.isspace():
                 i += 1
@@ -458,10 +472,35 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
     return _specs(regions, line_bytes), _specs(comments, line_bytes)
 
 
-def _is_macro_name(token: str) -> bool:
-    if not token or token[0].isdigit() or token in INTRODUCERS:
+def _is_ident(token: str) -> bool:
+    if not token or token[0].isdigit() or not (token[0].isalpha() or token[0] == "_"):
         return False
     return all(ch.isalnum() or ch == "_" for ch in token)
+
+
+def _raw_ident_body(line: str, start: int) -> str | None:
+    """Identifier after ``r#``, or None when this is a raw string."""
+    if start >= len(line):
+        return None
+    ch = line[start]
+    if ch in "\"#":
+        return None
+    if not (ch.isalpha() or ch == "_"):
+        return None
+    end = start + 1
+    while end < len(line) and (line[end].isalnum() or line[end] == "_"):
+        end += 1
+    return line[start:end]
+
+
+def _is_macro_name(token: str) -> bool:
+    if token.startswith("r#") and _is_ident(token[2:]):
+        return True
+    if not _is_ident(token):
+        return False
+    if token in INTRODUCERS and token not in WEAK_KEYWORDS:
+        return False
+    return True
 
 
 def _specs(spans_by_line: dict[int, list[list[int]]], line_bytes: list[int]) -> dict[int, str]:

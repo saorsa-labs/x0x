@@ -436,6 +436,58 @@ class PanicScanner(unittest.TestCase):
                     self.assertIn(visible, result.stdout)
                     self.assertIn(self._found(kind), result.stdout)
 
+    def test_keyword_and_raw_macro_names_do_not_hide_production_calls(self):
+        # union is a weak keyword and r#type is a raw identifier. Both are
+        # valid macro names. An attribute inside either argument stays
+        # production, same as emit!.
+        for kind in ("expect", "unwrap", "panic"):
+            visible = self._call(kind, "visible")
+            for macro in ("union", "r#type"):
+                shapes = {
+                    "inner": (
+                        f"macro_rules! {macro} {{ (#![cfg(test)] $item:item) => {{ $item }}; }}\n"
+                        f"{macro}! {{\n"
+                        "    #![cfg(test)]\n"
+                        f"    pub fn prod() {{ {visible}; }}\n"
+                        "}\n"
+                        "pub fn witness() { prod(); }\n"
+                    ),
+                    "outer": (
+                        f"macro_rules! {macro} {{ (#[cfg(test)] $item:item) => {{ $item }}; }}\n"
+                        f"{macro}! {{\n"
+                        "    #[cfg(test)]\n"
+                        f"    pub fn prod() {{ {visible}; }}\n"
+                        "}\n"
+                        "pub fn witness() { prod(); }\n"
+                    ),
+                }
+                for name, source in shapes.items():
+                    with self.subTest(kind=kind, macro=macro, shape=name):
+                        result = self.scan("src/keyword_macro.rs", source)
+                        self.assertEqual(result.returncode, 1, result.stdout)
+                        self.assertIn(visible, result.stdout)
+                        self.assertIn(self._found(kind), result.stdout)
+
+    def test_raw_string_inside_test_module_stays_test_code(self):
+        # r#"..."# is a raw string, not the raw identifier r#type. A brace
+        # inside the string must not close the proved test module.
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "mod tests {\n"
+                    "    fn t() {\n"
+                    '        let json = r#"{"type":"u"}"#;\n'
+                    f"        {hidden};\n"
+                    "    }\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/raw_string.rs", source)
+                self._assert_rejected(result, kind)
+
     def test_proved_module_still_hides_a_call_inside_a_macro(self):
         for kind in ("expect", "unwrap", "panic"):
             with self.subTest(kind=kind):
