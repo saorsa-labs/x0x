@@ -406,6 +406,54 @@ class PanicScanner(unittest.TestCase):
                 result = self.scan("src/tuple_closer.rs", source)
                 self._assert_rejected(result, kind)
 
+    def test_attr_inside_brace_macro_input_is_production(self):
+        # A macro can consume the attribute and emit the item unchanged.
+        # The call inside that item stays production.
+        for kind in ("expect", "unwrap", "panic"):
+            visible = self._call(kind, "visible")
+            shapes = {
+                "inner": (
+                    "macro_rules! emit { (#![cfg(test)] $item:item) => { $item }; }\n"
+                    "emit! {\n"
+                    "    #![cfg(test)]\n"
+                    f"    pub fn prod() {{ {visible}; }}\n"
+                    "}\n"
+                    "pub fn witness() { prod(); }\n"
+                ),
+                "outer": (
+                    "macro_rules! emit { (#[cfg(test)] $item:item) => { $item }; }\n"
+                    "emit! {\n"
+                    "    #[cfg(test)]\n"
+                    f"    pub fn prod() {{ {visible}; }}\n"
+                    "}\n"
+                    "pub fn witness() { prod(); }\n"
+                ),
+            }
+            for name, source in shapes.items():
+                with self.subTest(kind=kind, shape=name):
+                    result = self.scan("src/emit_macro.rs", source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(visible, result.stdout)
+                    self.assertIn(self._found(kind), result.stdout)
+
+    def test_proved_module_still_hides_a_call_inside_a_macro(self):
+        for kind in ("expect", "unwrap", "panic"):
+            with self.subTest(kind=kind):
+                hidden = self._call(kind, "hidden")
+                visible = self._call(kind, "visible")
+                source = (
+                    "#[cfg(test)]\n"
+                    "mod tests {\n"
+                    "    emit! {\n"
+                    "        #[cfg(test)]\n"
+                    f"        fn helper() {{ {hidden}; }}\n"
+                    "    }\n"
+                    "}\n"
+                    f"fn prod() {{ {visible}; }}\n"
+                )
+                result = self.scan("src/proved_macro.rs", source)
+                self._assert_rejected(result, kind)
+
     def test_inner_cfg_in_macro_args_does_not_exempt_the_file(self):
         # Brace depth zero is not crate scope. A macro can swallow the attribute.
         for kind in ("expect", "unwrap", "panic"):

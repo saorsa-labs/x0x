@@ -37,8 +37,10 @@ trap cleanup_regions EXIT
 # #[cfg(test)], #![cfg(test)], #[cfg(all(test, unix))], #[test], #[tokio::test],
 # and #[tokio::test(...)]. A body closes at the matching '}'. An item with no
 # body closes at ';' or ','. A crate-level #![cfg(test)] (no open brace, paren,
-# or bracket) runs to EOF. A nested #![cfg(test)] closes with its module. One
-# inside a macro argument does not mark the file. '-> !' is a never type, not
+# or bracket) runs to EOF. A nested #![cfg(test)] closes with its module. An
+# attribute inside an unclassified macro argument does not start a region:
+# the macro can drop it and emit the item as production code. A proved
+# enclosing test item still covers those bytes. '-> !' is a never type, not
 # a macro. A macro token tree in a signature or expression is not the body. A
 # macro item closes at its '}' or at ';' / ',' after ')' or ']'. An attributed
 # element also ends when its enclosing array or tuple closes. An unclosed
@@ -115,6 +117,8 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
     saw_introducer = False
     pending = False
     pending_item = False
+    # The next '(' / '[' / '{' is an unclassified macro argument.
+    await_macro = False
     comment_origin: tuple[int, int] | None = None
 
     def add_span(store: dict[int, list[list[int]]], line_no: int, start: int, end: int) -> None:
@@ -132,7 +136,7 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
         add_span(store, end_line, 0, end_byte)
 
     def _clear_header() -> None:
-        nonlocal active, body, origin, ident, prev_token, saw_introducer, pending, pending_item
+        nonlocal active, body, origin, ident, prev_token, saw_introducer, pending, pending_item, await_macro
         active = False
         body = False
         origin = None
@@ -141,6 +145,7 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
         saw_introducer = False
         pending = False
         pending_item = False
+        await_macro = False
         macro_frames.clear()
 
     def commit(end_line: int, end_byte: int) -> None:
@@ -302,6 +307,17 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
                 pending = False
                 discard()
 
+            if await_macro:
+                if ch in "({[":
+                    await_macro = False
+                    i = _open_frame(ch, False, i)
+                    continue
+                if ch.isalnum() or ch == "_":
+                    while i < n and (line[i].isalnum() or line[i] == "_"):
+                        i += 1
+                    continue
+                await_macro = False
+
             if line[:i].strip() == "":
                 kind, length = _attr_kind(line[i:])
                 if kind == "file" and depth == 0 and paren == 0 and bracket == 0:
@@ -335,20 +351,19 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
                         i += length
                         continue
 
-            if active and not body and (ch.isalnum() or ch == "_"):
+            if ch.isalnum() or ch == "_":
                 ident += ch
                 i += 1
                 continue
 
-            if (
-                ch == "!"
-                and nxt != "="
-                and active
-                and not body
-                and _is_macro_name(prev_token)
-            ):
-                pending = True
-                pending_item = (not saw_introducer) and at_item_level()
+            if ch == "!" and nxt != "=" and _is_macro_name(prev_token):
+                if active and not body:
+                    pending = True
+                    pending_item = (not saw_introducer) and at_item_level()
+                else:
+                    # Not a proved test header. The argument stays production
+                    # even when it contains a test attribute.
+                    await_macro = True
                 prev_token = "!"
                 i += 1
                 continue
