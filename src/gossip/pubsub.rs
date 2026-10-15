@@ -873,8 +873,10 @@ struct OwnerSetup {
     sender_id: u64,
     started: bool,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
-    contacts: Option<Arc<RwLock<ContactStore>>>,
-    revocation_set: Option<Arc<RwLock<crate::revocation::RevocationSet>>>,
+    /// Live handles. Delivery reads them per payload (#1230).
+    contacts: Arc<std::sync::OnceLock<Arc<RwLock<ContactStore>>>>,
+    revocation_set: Arc<std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>>,
+    group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     stats: Arc<PubSubStats>,
     sub_topic: String,
 }
@@ -895,8 +897,9 @@ impl Drop for OwnerSetup {
         let deliveries = Arc::clone(&self.deliveries);
         let topic_id = self.topic_id;
         let plumtree = Arc::clone(&self.plumtree);
-        let contacts = self.contacts.clone();
-        let revocation_set = self.revocation_set.clone();
+        let contacts = Arc::clone(&self.contacts);
+        let revocation_set = Arc::clone(&self.revocation_set);
+        let group_identity = Arc::clone(&self.group_identity);
         let stats = Arc::clone(&self.stats);
         let sub_topic = self.sub_topic.clone();
         // The owner task is gone. Joiners already on the slot still need
@@ -921,6 +924,7 @@ impl Drop for OwnerSetup {
                 stats,
                 contacts,
                 revocation_set,
+                group_identity,
                 sub_topic,
                 stamped_rx,
             )
@@ -947,8 +951,9 @@ async fn run_delivery_forwarder(
     deliveries: Arc<TopicDeliveryMap>,
     topic_id: TopicId,
     stats: Arc<PubSubStats>,
-    contacts: Option<Arc<RwLock<ContactStore>>>,
-    revocation_set: Option<Arc<RwLock<crate::revocation::RevocationSet>>>,
+    contacts: Arc<std::sync::OnceLock<Arc<RwLock<ContactStore>>>>,
+    revocation_set: Arc<std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>>,
+    group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     sub_topic: String,
     mut stamped_rx: mpsc::UnboundedReceiver<StampedDelivery>,
 ) {
@@ -956,8 +961,9 @@ async fn run_delivery_forwarder(
     let _forwarder_done = ForwarderDone(Arc::clone(&slot));
     let env = ForwardEnv {
         stats: &stats,
-        contacts: contacts.as_ref(),
-        revocation_set: revocation_set.as_ref(),
+        contacts: &contacts,
+        revocation_set: &revocation_set,
+        group_identity: &group_identity,
         sub_topic: &sub_topic,
     };
     loop {
@@ -1104,8 +1110,9 @@ fn count_undecoded_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64
 
 struct ForwardEnv<'a> {
     stats: &'a PubSubStats,
-    contacts: Option<&'a Arc<RwLock<ContactStore>>>,
-    revocation_set: Option<&'a Arc<RwLock<crate::revocation::RevocationSet>>>,
+    contacts: &'a std::sync::OnceLock<Arc<RwLock<ContactStore>>>,
+    revocation_set: &'a std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>,
+    group_identity: &'a std::sync::OnceLock<GroupIdentityContext>,
     sub_topic: &'a str,
 }
 
@@ -1124,12 +1131,41 @@ async fn forward_plumtree_payload(
         payload_len = encoded_payload.len(),
         "[4/6 pubsub] received from PlumTree, decoding"
     );
-    match decode_for_delivery(encoded_payload, env.contacts, env.revocation_set).await {
-        Some(message) => {
+    // #1230: read the stores now. `set_revocation_set` wins when it has run.
+    // Otherwise delivery uses the revocation set `AgentBuilder::build` stored
+    // on group identity. A subscribe-time snapshot would miss both.
+    let installed = env.revocation_set.get();
+    let identity = env.group_identity.get();
+    let from_builder = identity.map(|ctx| &ctx.revoked);
+    let revocation = installed.or(from_builder);
+    match decode_for_delivery(encoded_payload, env.contacts.get(), revocation).await {
+        DeliveryVerdict::Delivered(message) => {
             let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
             deliver_copied_notification(slot, env.stats, env.sub_topic, &notification, &recipients);
         }
-        None => count_undecoded_deliveries(env.stats, env.sub_topic, recipients.len() as u64),
+        DeliveryVerdict::Rejected => {
+            count_undecoded_deliveries(env.stats, env.sub_topic, recipients.len() as u64);
+        }
+        DeliveryVerdict::Refused(sender) => {
+            count_refused_deliveries(env.stats, env.sub_topic, &sender, recipients.len() as u64);
+        }
+    }
+}
+
+fn count_refused_deliveries(stats: &PubSubStats, sub_topic: &str, sender: &AgentId, waiting: u64) {
+    if waiting == 0 {
+        return;
+    }
+    stats.incoming_total.fetch_add(waiting, Ordering::Relaxed);
+    stats
+        .incoming_sender_refused
+        .fetch_add(waiting, Ordering::Relaxed);
+    if sender_refusal_log_due(&stats.sender_refusal_logged_at_ms) {
+        tracing::debug!(
+            topic = %sub_topic,
+            %sender,
+            "dropping a pubsub payload from a revoked or blocked sender"
+        );
     }
 }
 
@@ -2890,8 +2926,12 @@ impl PubSubManager {
             // then the notification is copied (#869). Dropping the last
             // sender ends this task promptly so the PlumTree registration
             // is not pinned on a quiet topic (#238).
-            let contacts = self.contacts.get().cloned();
-            let revocation_set = self.revocation_set.get().cloned();
+            // #1230: the task holds the locks, not a subscribe-time snapshot.
+            // `set_revocation_set` wins when it has run. Otherwise delivery uses
+            // the revocation set `AgentBuilder::build` stored on group identity.
+            let contacts = Arc::clone(&self.contacts);
+            let revocation_set = Arc::clone(&self.revocation_set);
+            let group_identity = Arc::clone(&self.group_identity);
             let mut setup = OwnerSetup {
                 deliveries: Arc::clone(&self.topic_deliveries),
                 topic_id,
@@ -2899,8 +2939,9 @@ impl PubSubManager {
                 sender_id: claimed.sender_id,
                 started: false,
                 plumtree: Arc::clone(&self.plumtree),
-                contacts: contacts.clone(),
-                revocation_set: revocation_set.clone(),
+                contacts: Arc::clone(&contacts),
+                revocation_set: Arc::clone(&revocation_set),
+                group_identity: Arc::clone(&group_identity),
                 stats: Arc::clone(&self.stats),
                 sub_topic: topic.clone(),
             };
@@ -2935,6 +2976,7 @@ impl PubSubManager {
                     stats,
                     contacts,
                     revocation_set,
+                    group_identity,
                     sub_topic,
                     stamped_rx,
                 )
