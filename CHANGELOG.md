@@ -256,9 +256,10 @@ All notable changes to this project will be documented in this file.
   until an operator rebuild. x0xd then writes that carrier to the live path
   and leaves the quarantine file in place. A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
-  failure after the rename is not queued again. When the discovery cache
-  has no subject certificate, one bounded fetch uses the digest a class A
-  or B announcement committed to. An incomplete snapshot is not written,
+  failure after the rename is not queued again.   When the discovery cache
+  has no subject certificate, every distinct cached blob is used. The
+  eight-fetch budget applies only to a miss, and the next batch continues
+  with the misses that remain. An incomplete snapshot is not written,
   so a restart cannot admit a revoked agent from it. The next start loads
   the live file. Placing a
   readable file on the live path is a rebuild for the next start. It does

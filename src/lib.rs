@@ -2700,12 +2700,14 @@ fn subject_certs_with_provenance(
     certs
 }
 
-/// How many missing subject certificates one revocation batch may fetch.
+/// How many certificate fetches one revocation batch may start.
+///
+/// Blob-cache hits do not spend this budget (#1116).
 const MAX_CERT_RECOVERY_SUBJECTS: usize = 8;
 
-/// Subjects still missing a certificate, capped, with the announced
-/// binding that names each digest. Built while the caller holds the
-/// discovery locks. The fetch runs after those locks are dropped.
+/// Subjects still missing a certificate, with the announced binding that
+/// names each digest. One entry per subject. Built while the caller holds
+/// the discovery locks. Cache hits and fetches run after those locks drop.
 struct CertRecoveryPlan {
     found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     fetches: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
@@ -2718,12 +2720,10 @@ fn plan_subject_cert_recovery(
     let subjects: Vec<identity::AgentId> = subjects.into_iter().collect();
     let found = collect_subject_certs(sources, subjects.iter().copied());
     let mut fetches = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for subject in subjects {
-        if found.contains_key(&subject) {
+        if !seen.insert(subject) || found.contains_key(&subject) {
             continue;
-        }
-        if fetches.len() >= MAX_CERT_RECOVERY_SUBJECTS {
-            break;
         }
         let Some(announced) = sources.announced.peek(&subject) else {
             continue;
@@ -2739,8 +2739,40 @@ fn plan_subject_cert_recovery(
     CertRecoveryPlan { found, fetches }
 }
 
-/// Finish [`plan_subject_cert_recovery`] with cache hits and at most one
-/// bounded fetch per planned subject (#1116).
+/// The next `budget` cache misses, starting at `cursor` and wrapping once.
+///
+/// The returned cursor is where the following batch continues, so a miss
+/// that already spent a fetch does not hide the subjects after it.
+fn budget_recovery_misses<T: Clone>(misses: &[T], cursor: usize, budget: usize) -> (Vec<T>, usize) {
+    if misses.is_empty() || budget == 0 {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % misses.len();
+    let mut chosen = Vec::new();
+    let mut offset = 0usize;
+    while chosen.len() < budget && offset < misses.len() {
+        chosen.push(misses[(start + offset) % misses.len()].clone());
+        offset += 1;
+    }
+    let next = (start + chosen.len()) % misses.len();
+    (chosen, next)
+}
+
+fn provenanced_blob_cert(
+    blob: &announce_blob::CachedBlob,
+    subject: &identity::AgentId,
+    announced: dm_inbox::AuthenticatedMachineBinding,
+) -> Option<identity::AgentCertificate> {
+    let cert = blob.agent_certificate.clone()?;
+    if cert.agent_id().ok().as_ref() != Some(subject) {
+        return None;
+    }
+    identity_authority::has_authenticated_provenance(&cert, Some(announced)).then_some(cert)
+}
+
+/// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
+/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch, and the
+/// cache cursor moves past those misses for the next batch (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -2749,30 +2781,42 @@ async fn finish_subject_cert_recovery(
     let Some(cache) = blob_cache else {
         return plan.found;
     };
+    let mut misses = Vec::new();
     for (subject, announced) in plan.fetches {
         let Some(digest) = announced.cert_digest else {
             continue;
         };
-        let blob = if let Some(hit) = cache.get(&digest).await {
-            hit
-        } else if let Some(pubsub) = pubsub {
-            let Some(fetched) = cache
-                .fetch_bounded(pubsub, &digest, &subject, &announced.machine_id)
-                .await
-            else {
+        if let Some(hit) = cache.get(&digest).await {
+            if let Some(cert) = provenanced_blob_cert(&hit, &subject, announced) {
+                plan.found.insert(subject, vec![cert]);
                 continue;
-            };
-            fetched
-        } else {
-            continue;
-        };
-        let Some(cert) = blob.agent_certificate.clone() else {
-            continue;
-        };
-        if cert.agent_id().ok().as_ref() != Some(&subject) {
-            continue;
+            }
         }
-        if identity_authority::has_authenticated_provenance(&cert, Some(announced)) {
+        misses.push((subject, announced));
+    }
+    let Some(pubsub) = pubsub else {
+        return plan.found;
+    };
+    let (budgeted, next_cursor) = budget_recovery_misses(
+        &misses,
+        cache.cert_recovery_miss_cursor(),
+        MAX_CERT_RECOVERY_SUBJECTS,
+    );
+    if budgeted.is_empty() {
+        return plan.found;
+    }
+    cache.store_cert_recovery_miss_cursor(next_cursor);
+    for (subject, announced) in budgeted {
+        let Some(digest) = announced.cert_digest else {
+            continue;
+        };
+        let Some(blob) = cache
+            .fetch_bounded(pubsub, &digest, &subject, &announced.machine_id)
+            .await
+        else {
+            continue;
+        };
+        if let Some(cert) = provenanced_blob_cert(&blob, &subject, announced) {
             plan.found.insert(subject, vec![cert]);
         }
     }
@@ -32367,6 +32411,226 @@ mod tests {
         assert!(revocation::RevocationSet::new()
             .verify_and_insert(record, None)
             .is_err());
+    }
+
+    /// One cold subject: announcement, optional blob, and a signed binding tombstone.
+    struct CachedBindingSubject {
+        agent_id: identity::AgentId,
+        record: revocation::RevocationRecord,
+        cert: identity::AgentCertificate,
+        digest: [u8; 32],
+    }
+
+    async fn insert_subject_blob(
+        blobs: &announce_blob::AnnounceBlobCache,
+        subject: &CachedBindingSubject,
+    ) {
+        blobs
+            .insert_verified(announce_blob::CachedBlob {
+                digest: subject.digest,
+                payload_version: 1,
+                user_id: subject.cert.user_id().ok(),
+                agent_certificate: Some(subject.cert.clone()),
+                fetched_at_unix: 1,
+            })
+            .await;
+    }
+
+    /// `cached_prefix` subjects get a blob immediately. The rest stay misses
+    /// until [`insert_subject_blob`].
+    async fn cache_binding_subjects(
+        count: usize,
+        cached_prefix: usize,
+    ) -> (
+        identity::UserKeypair,
+        dm_inbox::AuthenticatedMachineBindingCache,
+        std::sync::Arc<announce_blob::AnnounceBlobCache>,
+        Vec<CachedBindingSubject>,
+        u64,
+    ) {
+        let user = identity::UserKeypair::generate().unwrap();
+        let mut announced = dm_inbox::AuthenticatedMachineBindingCache::default();
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut subjects = Vec::with_capacity(count);
+        for index in 0..count {
+            let agent = identity::AgentKeypair::generate().unwrap();
+            let agent_id = agent.agent_id();
+            let cert = identity::AgentCertificate::issue(&user, &agent).unwrap();
+            let machine =
+                identity::MachineId([u8::try_from(index).unwrap_or(1).saturating_add(1); 32]);
+            let digest = identity_authority::certificate_digest(&cert);
+            announced.record_announcement(agent_id, machine, 1, Some(digest), cert.not_after());
+            let record = revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                    agent: agent_id,
+                    machine,
+                    move_epoch: 1,
+                }),
+                user.public_key(),
+                user.secret_key(),
+                now,
+                None,
+            )
+            .unwrap();
+            let subject = CachedBindingSubject {
+                agent_id,
+                record,
+                cert,
+                digest,
+            };
+            if index < cached_prefix {
+                insert_subject_blob(&blobs, &subject).await;
+            }
+            subjects.push(subject);
+        }
+        (user, announced, blobs, subjects, now)
+    }
+
+    fn cold_sources<'a>(
+        cache: &'a std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        announced: &'a dm_inbox::AuthenticatedMachineBindingCache,
+    ) -> ProvenanceSources<'a> {
+        ProvenanceSources {
+            cache,
+            announced,
+            evidence: None,
+            local_user: None,
+            journal: &[],
+        }
+    }
+
+    /// Arm `records` on a held v2 carrier from one trusted sender.
+    async fn arm_held_v2(
+        records: &[revocation::RevocationRecord],
+    ) -> std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>> {
+        let mut loaded =
+            revocation::RevocationSet::quarantined_carrier(revocation::REVOCATION_CARRIER_V2);
+        let authority = identity::AgentId([0x51; 32]);
+        loaded.set_snapshot_authority(revocation::SnapshotAuthority::new(
+            move |sender, _revoked| *sender == authority,
+        ));
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let payload = bincode::serialize(records).unwrap();
+        revocation::arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_V2_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set.read().await.revocation_resync_required());
+        set
+    }
+
+    fn verified_bindings(
+        guard: &revocation::RevocationSet,
+        subjects: &[CachedBindingSubject],
+    ) -> usize {
+        subjects
+            .iter()
+            .filter(|subject| match &subject.record.subject {
+                revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                    guard.is_binding_revoked(&binding.agent, &binding.machine)
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// #1116: blob-cache hits do not spend the eight-fetch budget. Nine
+    /// cached subjects still verify when the list starts with eight copies
+    /// of the first id. Three passes stay open. Eight subjects are the
+    /// control.
+    #[tokio::test]
+    async fn cached_subjects_above_the_recovery_budget_all_verify_1116() {
+        for count in [8usize, 9] {
+            let (_user, announced, blobs, subjects, now) =
+                cache_binding_subjects(count, count).await;
+            let discovery = std::collections::HashMap::new();
+            let sources = cold_sources(&discovery, &announced);
+            let ids: Vec<_> = subjects.iter().map(|subject| subject.agent_id).collect();
+            assert!(
+                collect_subject_certs(&sources, ids.iter().copied()).is_empty(),
+                "discovery stays cold"
+            );
+            let records: Vec<_> = subjects
+                .iter()
+                .map(|subject| subject.record.clone())
+                .collect();
+            let set = arm_held_v2(&records).await;
+            // Eight copies of the first id used to fill the budget before
+            // the other subjects were considered.
+            let mut repeated = vec![ids[0]; MAX_CERT_RECOVERY_SUBJECTS];
+            repeated.extend(ids.iter().copied());
+            for pass in 0..3 {
+                let found =
+                    recover_subject_certs(&sources, Some(&blobs), None, repeated.iter().copied())
+                        .await;
+                assert_eq!(
+                    found.len(),
+                    count,
+                    "pass {pass}: {count} cached subjects, recovered {}",
+                    found.len()
+                );
+                let mut guard = set.write().await;
+                for subject in &subjects {
+                    let Some(cert) = found.get(&subject.agent_id).and_then(|certs| certs.first())
+                    else {
+                        continue;
+                    };
+                    let _ = guard.verify_and_insert_at(subject.record.clone(), Some(cert), now);
+                }
+                let verified = verified_bindings(&guard, &subjects);
+                assert_eq!(
+                    verified, count,
+                    "pass {pass}: verified {verified} of {count}"
+                );
+                assert!(
+                    !guard.revocation_resync_required(),
+                    "pass {pass}: {count} verified tombstones must open the v2 carrier"
+                );
+            }
+        }
+    }
+
+    /// #1116: once eight certificates are cached, a ninth that arrives in
+    /// the blob cache is recovered on the next pass. The same first eight
+    /// must not keep spending the budget.
+    #[tokio::test]
+    async fn later_cached_subject_is_not_stuck_behind_recovery_budget_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(9, 8).await;
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let ids: Vec<_> = subjects.iter().map(|subject| subject.agent_id).collect();
+        let ninth = subjects[8].agent_id;
+        let first = recover_subject_certs(&sources, Some(&blobs), None, ids.iter().copied()).await;
+        assert_eq!(first.len(), 8, "the eight cached hits recover together");
+        assert!(!first.contains_key(&ninth));
+        insert_subject_blob(&blobs, &subjects[8]).await;
+        let second = recover_subject_certs(&sources, Some(&blobs), None, ids.iter().copied()).await;
+        assert_eq!(
+            second.len(),
+            9,
+            "the later cache hit is not stuck behind the first eight"
+        );
+        assert!(second.contains_key(&ninth));
+    }
+
+    #[test]
+    fn recovery_miss_budget_retains_the_untried_tail_1116() {
+        let misses: Vec<u8> = (0..9).collect();
+        let (first, cursor) = budget_recovery_misses(&misses, 0, MAX_CERT_RECOVERY_SUBJECTS);
+        assert_eq!(first, (0..8).collect::<Vec<_>>());
+        assert_eq!(cursor, 8);
+        let (second, next) = budget_recovery_misses(&misses, cursor, MAX_CERT_RECOVERY_SUBJECTS);
+        assert_eq!(second.first().copied(), Some(8));
+        assert_eq!(second.len(), 8);
+        assert_eq!(next, 7);
     }
 
     /// An announcement without NAT fields (as produced by old nodes) should still

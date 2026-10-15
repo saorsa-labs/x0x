@@ -198,6 +198,9 @@ pub struct AnnounceBlobCache {
     stats_misses: AtomicU64,
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
+    /// Next index into a revocation batch's cache misses. A later batch
+    /// continues past misses that already spent a fetch (#1116).
+    cert_recovery_miss_cursor: AtomicU64,
     #[cfg(test)]
     diagnostics: AnnounceBlobDiagnosticCounters,
 }
@@ -214,6 +217,7 @@ impl AnnounceBlobCache {
             stats_misses: AtomicU64::new(0),
             stats_fetches_ok: AtomicU64::new(0),
             stats_fetches_failed: AtomicU64::new(0),
+            cert_recovery_miss_cursor: AtomicU64::new(0),
             #[cfg(test)]
             diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
@@ -339,6 +343,17 @@ impl AnnounceBlobCache {
             }
         });
         None
+    }
+
+    /// Where the next revocation batch should start among cache misses.
+    pub(crate) fn cert_recovery_miss_cursor(&self) -> usize {
+        usize::try_from(self.cert_recovery_miss_cursor.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Remember that a revocation batch spent fetches through `cursor`.
+    pub(crate) fn store_cert_recovery_miss_cursor(&self, cursor: usize) {
+        self.cert_recovery_miss_cursor
+            .store(u64::try_from(cursor).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// One verified fetch for a revocation subject, bounded by the blob
