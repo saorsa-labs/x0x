@@ -736,7 +736,7 @@ impl RevocationSet {
     /// An empty snapshot leaves membership closed. If any record fails
     /// verification, nothing is inserted and no carrier opens. Inserting
     /// records is not proof that the group snapshot is complete. A carrier
-    /// opens only through [`Self::observe_remote_carrier_snapshot`].
+    /// opens only when remote peers agree on one verified snapshot.
     /// Binding tombstones and issuer revocations need the subject
     /// certificate; pass it through
     /// [`Self::apply_group_revocation_resync_with_certs`].
