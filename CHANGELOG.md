@@ -58,6 +58,27 @@ All notable changes to this project will be documented in this file.
 
 - **The Signing path 100k acceptance job limit is 45 minutes.** The job `signing-path-100k` in `.github/workflows/ci.yml` moves from 30 minutes to 45 minutes. The ignored 100k signing-path test stays the same. On pull request #1401 the test passed at 29m22s, and the job then hit the 30-minute limit during the post-cache step. A main run of the same job passed in 29m24s. No other job limit changes.
 
+### Fixed
+
+- **A finished join attempt is removed, including when a seat or an
+  existing outcome wins (#1191).** A timed-out join with no carry can
+  redeem a later invite whose base already seats the joiner. The poll
+  then reaches its deadline while that seat still wins. That exit left
+  the attempt registered. Owner removal deleted the membership row and
+  did not clear the attempt. A re-invite on the same process returned
+  `409 join_already_pending` until restart.
+  - The finalizer retires matching attempt bookkeeping when the
+    requested outcome does not apply. A newer attempt id stays in
+    place. A superseded or already-finalized poll uses the same
+    bookkeeping-only cleanup, so a newer attempt and its inviter pin
+    stay. Those exits do not count a timeout.
+  - The finalizer clears that attempt's inviter pin while it still
+    holds the attempt registry mutex. A new join can record the same
+    key as soon as the mutex drops, and that new pin stays.
+  - Self-removal retires the matching attempt before the apply
+    returns. A re-invite on that process does not wait for the join
+    poll's next tick.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.
