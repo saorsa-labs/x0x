@@ -1561,7 +1561,7 @@ async fn withdrawn_card_from_non_admin_does_not_terminate_live_keyed_group() {
         .send()
         .await
         .unwrap();
-    assert_eq!(import.status(), StatusCode::OK);
+    assert_eq!(import.status(), StatusCode::CONFLICT);
 
     let state: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}/state")))

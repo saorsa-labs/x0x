@@ -7,7 +7,8 @@
 //! bytes and a `state_hash` tying them to the current signed state commit.
 //! Relays may re-publish exact signed card blobs but cannot mint new
 //! revisions unless they are group-state authorities. Receivers drop cards
-//! whose signature fails or whose revision is stale.
+//! whose signature fails or whose revision is stale, and a cached card is
+//! replaced only by its own authority ([`GroupCard::replacement_verdict`]).
 
 use crate::groups::policy::GroupPolicySummary;
 use crate::groups::state_commit::{ApplyError, CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS};
@@ -17,6 +18,54 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+/// Largest revision step a card may take over the live cached card it
+/// replaces.
+///
+/// A group's state chain advances by one revision for each sealed commit,
+/// and a live cached card is at most one card TTL old (24 h). 2^20 commits
+/// in one TTL is about 12 commits per second for a full day, which is far
+/// above real use. A larger step does not come from a live state chain.
+pub const MAX_CARD_REVISION_STEP: u64 = 1 << 20;
+
+/// Why a card cannot take the place of the live cached card for its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardRefusal {
+    /// The card uses the reserved top revision (`u64::MAX`), which no state
+    /// chain reaches.
+    RevisionCeiling,
+    /// The card advances the revision by more than
+    /// [`MAX_CARD_REVISION_STEP`] over the cached card.
+    RevisionStep,
+    /// The card is not signed by an authority of the cached card.
+    Authority,
+}
+
+impl CardRefusal {
+    /// Stable short name for logs and counters.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RevisionCeiling => "revision_ceiling",
+            Self::RevisionStep => "revision_step",
+            Self::Authority => "authority",
+        }
+    }
+}
+
+/// Result of a comparison between a card and the live cached card for the
+/// same group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardReplacement {
+    /// The card can take the place of the cached card (or remove it, for a
+    /// withdrawal). This is also the result when no card is cached.
+    Replace,
+    /// The card comes from an authority of the cached card but is not newer.
+    Stale,
+    /// The card is refused.
+    Refused(CardRefusal),
+}
 
 /// Public-facing card for a discoverable group.
 ///
@@ -160,8 +209,9 @@ impl GroupCard {
     /// - `signature` verifies over `signable_bytes()`.
     ///
     /// Returns `Ok(())` on success. Does **not** check whether the signer
-    /// is currently authorised for the group (that is done at
-    /// apply-time against the local roster view).
+    /// is currently authorised for the group: that is done at apply time
+    /// against the local roster view, and by
+    /// [`GroupCard::replacement_verdict`] for cached cards.
     pub fn verify_signature(&self) -> Result<(), ApplyError> {
         if self.signature.is_empty() || self.authority_public_key.is_empty() {
             return Err(ApplyError::InvalidSignature("missing signature".into()));
@@ -210,6 +260,122 @@ impl GroupCard {
         }
         self.revision > other.revision
             || (self.revision == other.revision && self.issued_at > other.issued_at)
+    }
+
+    /// True when the card carries an authority signature. This does not
+    /// verify it: callers run [`Self::verify_signature`] first.
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        !self.signature.is_empty() && !self.authority_public_key.is_empty()
+    }
+
+    /// Unix milliseconds after which this card is no longer live. A card
+    /// without a usable `expires_at` lives one default TTL from `issued_at`.
+    #[must_use]
+    pub fn expiry_millis(&self) -> u64 {
+        if self.expires_at > self.issued_at {
+            self.expires_at
+        } else {
+            self.issued_at
+                .saturating_add(Self::default_ttl_secs().saturating_mul(1_000))
+        }
+    }
+
+    /// Decide whether this card can take the place of `cached`, the live
+    /// cached card for the same group.
+    ///
+    /// A cached card is replaced only by its own authority:
+    /// - a card signed with the same key, in normal revision order;
+    /// - a card from an agent in `roster_admins` when the cached signer is
+    ///   not in it (`roster_admins` holds the active admins of this node's
+    ///   own roster for the group, and is empty for a non-member);
+    /// - a card from the owner that `cached` names, when `cached` was signed
+    ///   by another agent.
+    ///
+    /// A signed card replaces an unsigned legacy card; an unsigned card never
+    /// replaces a signed one. The top revision is always refused, and a
+    /// revision step above [`MAX_CARD_REVISION_STEP`] is refused when normal
+    /// order applies. The caller removes expired cards from the cache first,
+    /// and verifies the signature of a signed card first.
+    #[must_use]
+    pub fn replacement_verdict(
+        &self,
+        cached: Option<&GroupCard>,
+        roster_admins: &BTreeSet<String>,
+    ) -> CardReplacement {
+        self.authority_verdict(cached, roster_admins, |card, cached| {
+            card.supersedes(cached)
+        })
+    }
+
+    /// Like [`Self::replacement_verdict`], for a withdrawal card that would
+    /// remove `cached`. In normal order an equal revision with an equal or
+    /// later `issued_at` also removes, as before.
+    #[must_use]
+    pub fn withdrawal_verdict(
+        &self,
+        cached: Option<&GroupCard>,
+        roster_admins: &BTreeSet<String>,
+    ) -> CardReplacement {
+        self.authority_verdict(cached, roster_admins, |card, cached| {
+            card.revision > cached.revision
+                || (card.revision == cached.revision && card.issued_at >= cached.issued_at)
+        })
+    }
+
+    fn authority_verdict(
+        &self,
+        cached: Option<&GroupCard>,
+        roster_admins: &BTreeSet<String>,
+        is_newer: impl Fn(&GroupCard, &GroupCard) -> bool,
+    ) -> CardReplacement {
+        if self.revision == u64::MAX {
+            return CardReplacement::Refused(CardRefusal::RevisionCeiling);
+        }
+        let Some(cached) = cached else {
+            return CardReplacement::Replace;
+        };
+        if self.group_id != cached.group_id {
+            return CardReplacement::Stale;
+        }
+        let in_order = || {
+            if self.revision > cached.revision.saturating_add(MAX_CARD_REVISION_STEP) {
+                CardReplacement::Refused(CardRefusal::RevisionStep)
+            } else if is_newer(self, cached) {
+                CardReplacement::Replace
+            } else {
+                CardReplacement::Stale
+            }
+        };
+        match (self.is_signed(), cached.is_signed()) {
+            (false, true) => return CardReplacement::Refused(CardRefusal::Authority),
+            (true, false) => return CardReplacement::Replace,
+            (false, false) => return in_order(),
+            (true, true) => {}
+        }
+        if self.authority_agent_id == cached.authority_agent_id
+            && self
+                .authority_public_key
+                .eq_ignore_ascii_case(&cached.authority_public_key)
+        {
+            return in_order();
+        }
+        let signer_in_roster = roster_admins.contains(&self.authority_agent_id);
+        let cached_in_roster = roster_admins.contains(&cached.authority_agent_id);
+        match (signer_in_roster, cached_in_roster) {
+            (true, true) => return in_order(),
+            (true, false) => return CardReplacement::Replace,
+            (false, true) => return CardReplacement::Refused(CardRefusal::Authority),
+            (false, false) => {}
+        }
+        if !cached.owner_agent_id.is_empty()
+            && self
+                .authority_agent_id
+                .eq_ignore_ascii_case(&cached.owner_agent_id)
+        {
+            return CardReplacement::Replace;
+        }
+        CardReplacement::Refused(CardRefusal::Authority)
     }
 }
 

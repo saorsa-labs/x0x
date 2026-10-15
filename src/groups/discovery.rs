@@ -26,10 +26,10 @@
 //! validity mechanism — D.3 signed `GroupCard::supersedes` drives
 //! immediate replacement.
 
-use crate::groups::directory::GroupCard;
+use crate::groups::directory::{CardRefusal, CardReplacement, GroupCard};
 use crate::groups::policy::GroupDiscoverability;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Number of shards per shard kind. 65,536 = 16-bit space, plenty of room
 /// to amortise popular tags/names across many peers.
@@ -351,6 +351,70 @@ impl DirectoryShardCache {
             }
         }
         true
+    }
+
+    /// Insert a card received from another node.
+    ///
+    /// Like [`Self::insert`], but a live cached card for the same group, in
+    /// any shard, is replaced or withdrawn only by its own authority (see
+    /// [`GroupCard::replacement_verdict`]). Cards that expired before
+    /// `now_ms` do not count. Returns `Ok(true)` when the card was stored or
+    /// the withdrawal applied, `Ok(false)` when it was stale, and `Err` when
+    /// it was refused. The caller verifies the signature first.
+    pub fn insert_checked(
+        &mut self,
+        kind: ShardKind,
+        shard: u32,
+        card: GroupCard,
+        roster_admins: &BTreeSet<String>,
+        now_ms: u64,
+    ) -> Result<bool, CardRefusal> {
+        let verdict_for = |cached: Option<&GroupCard>| {
+            if card.withdrawn {
+                card.withdrawal_verdict(cached, roster_admins)
+            } else {
+                card.replacement_verdict(cached, roster_admins)
+            }
+        };
+        let mut live = self
+            .shards
+            .values()
+            .filter_map(|slot| slot.get(&card.group_id))
+            .filter(|cached| cached.expiry_millis() >= now_ms)
+            .peekable();
+        if live.peek().is_none() {
+            if let CardReplacement::Refused(refusal) = verdict_for(None) {
+                return Err(refusal);
+            }
+        }
+        for cached in live {
+            if let CardReplacement::Refused(refusal) = verdict_for(Some(cached)) {
+                return Err(refusal);
+            }
+        }
+
+        let key = (kind, shard);
+        let same_shard = self
+            .shards
+            .get(&key)
+            .and_then(|slot| slot.get(&card.group_id));
+        if let Some(cached) = same_shard {
+            let expired = cached.expiry_millis() < now_ms;
+            match verdict_for(Some(cached)) {
+                _ if expired => self.remove(kind, shard, &card.group_id),
+                CardReplacement::Replace => {
+                    if !card.withdrawn {
+                        // An authority may replace a card that is not
+                        // older than its own; plain `insert` keeps only
+                        // revision order, so clear the slot first.
+                        self.remove(kind, shard, &card.group_id);
+                    }
+                }
+                CardReplacement::Stale => return Ok(false),
+                CardReplacement::Refused(refusal) => return Err(refusal),
+            }
+        }
+        Ok(self.insert(kind, shard, card))
     }
 
     /// Look up a card by `group_id` across all subscribed shards.
