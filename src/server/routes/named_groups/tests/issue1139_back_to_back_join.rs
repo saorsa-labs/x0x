@@ -1084,15 +1084,22 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
         verified == "verified",
         "the exact reference's pull finished as {verified}; a corrupt served payload must not verify"
     );
+    // The roster persist that makes join state `active` returns before the
+    // in-memory TreeKEM map insert. `verified` is recorded when apply is
+    // spawned, so both have to be observed inside the same failure bound.
     let active_bound = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < active_bound
-        && join_state(&s.j2, &s.group_key).await != "active"
-    {
+    while tokio::time::Instant::now() < active_bound {
+        let active = join_state(&s.j2, &s.group_key).await == "active";
+        let keyed = s.j2.treekem_groups.read().await.contains_key(&s.group_key);
+        if active && keyed {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let installed = join_state(&s.j2, &s.group_key).await == "active"
+        && s.j2.treekem_groups.read().await.contains_key(&s.group_key);
     anyhow::ensure!(
-        tokio::time::Instant::now() < active_bound
-            || join_state(&s.j2, &s.group_key).await == "active",
+        tokio::time::Instant::now() < active_bound || installed,
         "verified consumption did not install the carry within the failure bound"
     );
     assert_eq!(

@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
+
 - **Stored reads and backfill hide a revoked or Blocked author (#1229).**
   The row stays in the store and in the cache. A later read serves it again
   when that author is allowed. There is no wire change and no stored-format

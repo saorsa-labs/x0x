@@ -13,7 +13,7 @@ metric. See [runbooks/fleet-cpu-metrics.md](runbooks/fleet-cpu-metrics.md)
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<current_version>","peers":4,"send_ready_peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<current_version>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
 ```
 
 ## Rich Status

@@ -85,6 +85,9 @@ pub(in crate::server) struct HealthData {
     /// non-sensitive advisories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<serde_json::Value>,
+    /// GroupCards this process refused at discovery, shard, contact, and
+    /// metadata ingress because the signature did not verify (#1224).
+    unsigned_group_cards_refused: u64,
 }
 
 /// Classify liveness for `GET /health` (issue #262).
@@ -181,6 +184,7 @@ pub(in crate::server) async fn health(
             uptime_secs,
             degraded_reason,
             warnings: Vec::new(),
+            unsigned_group_cards_refused: super::named_groups::unsigned_group_cards_refused(),
         },
     })
 }
