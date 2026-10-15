@@ -164,6 +164,32 @@ pub fn participant_key(data_dir: &Path) -> String {
     hex::encode(&digest[..8])
 }
 
+/// `<install dir>/.<binary>.unregistered-lock` (review S1). A daemon that
+/// runs from the install holds a shared lock on it until its participant
+/// record is written; a writer that cannot take it exclusively knows that a
+/// live daemon is not registered.
+pub fn unregistered_signal_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "x0xd".to_string());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".{name}.unregistered-lock"))
+}
+
+/// A held "not yet registered" signal (review S1). Dropping it releases it.
+#[derive(Debug)]
+pub struct UnregisteredSignal {
+    _file: std::fs::File,
+}
+
+impl UnregisteredSignal {
+    /// Take the shared signal lock for the install at `target`.
+    pub fn hold(_target: &Path) -> Option<Self> {
+        None
+    }
+}
+
 /// Path of the record with `key`.
 pub fn record_path(target: &Path, key: &str) -> PathBuf {
     participants_dir(target).join(format!("{key}.json"))
@@ -627,10 +653,6 @@ mod tests {
         let install = install();
         let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
         register(&install, "/b", 2, "0.48.0", NOW, stage("0.48.1", false));
-        let key = participant_key(Path::new("/off"));
-        let off = ParticipantRecord::new(&[3; 32], Path::new("/off"), "0.48.0", NOW, None, None)
-            .with_updates_enabled(false);
-        write_record(&install, &key, &off);
         assert!(
             matches!(
                 check_all_due(&install.target, &a, &release(), NOW, true).unwrap(),
@@ -638,6 +660,21 @@ mod tests {
             ),
             "waits do not stop a now=true swap"
         );
+
+        // Codex S4 / controller ruling: a configured hold ([update] enabled
+        // = false) always wins over now=true.
+        let key = participant_key(Path::new("/off"));
+        let off = ParticipantRecord::new(&[3; 32], Path::new("/off"), "0.48.0", NOW, None, None)
+            .with_updates_enabled(false);
+        write_record(&install, &key, &off);
+        assert!(
+            matches!(
+                check_all_due(&install.target, &a, &release(), NOW, true).unwrap(),
+                ParticipantGate::Waiting { .. }
+            ),
+            "a daemon with updates off holds the shared install"
+        );
+        std::fs::remove_file(record_path(&install.target, &key)).unwrap();
 
         // A blocked (held) participant still stops it.
         let held_key = participant_key(Path::new("/held"));
@@ -690,6 +727,105 @@ mod tests {
             mode & 0o020,
             0,
             "group write follows the install dir: {mode:o}"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_live_daemon_blocks_every_writer() {
+        // Codex S1: B runs from the install but could not write its record.
+        // It holds the shared "unregistered" signal, so A must not swap.
+        let install = install();
+        let a = register(&install, "/a", 1, "0.48.0", NOW, stage("0.48.1", true));
+        let signal = std::fs::File::create(unregistered_signal_path(&install.target)).unwrap();
+        signal.try_lock_shared().unwrap();
+        for skip_waits in [false, true] {
+            assert!(
+                matches!(
+                    check_all_due(&install.target, &a, &release(), NOW, skip_waits).unwrap(),
+                    ParticipantGate::Waiting { .. }
+                ),
+                "skip_waits={skip_waits}"
+            );
+        }
+        drop(signal);
+        assert!(matches!(
+            check_all_due(&install.target, &a, &release(), NOW, false).unwrap(),
+            ParticipantGate::AllDue { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registration_fixes_an_existing_owner_only_participants_dir() {
+        // Codex S1: a participants dir left at 0755 (older code, an
+        // interrupted creation) must become group-writable on a shared install.
+        use std::os::unix::fs::PermissionsExt;
+        let install = install();
+        let dir = install.target.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let participants = participants_dir(&install.target);
+        std::fs::create_dir_all(&participants).unwrap();
+        std::fs::set_permissions(&participants, std::fs::Permissions::from_mode(0o755)).unwrap();
+        register(&install, "/a", 1, "0.48.0", NOW, None);
+        let mode = std::fs::metadata(&participants)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o020, 0, "group write is restored: {mode:o}");
+    }
+
+    // Two-account control (review S1), as two processes: a child registers
+    // under umask 077; every registry file must stay usable by the install
+    // group. (A real second account needs a host; this is the inert proxy.)
+    const UMASK_TARGET: &str = "X0X_1106_UMASK_TARGET";
+
+    #[test]
+    fn umask_writer_child() {
+        let Ok(target) = std::env::var(UMASK_TARGET) else {
+            return; // a no-op unless the test below started this process
+        };
+        let target = PathBuf::from(target);
+        let lock = super::super::HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the child takes the host lock");
+        let key = participant_key(Path::new("/umask"));
+        let record =
+            ParticipantRecord::new(&[7; 32], Path::new("/umask"), "0.48.0", NOW, None, None);
+        write_own(&lock, &target, &key, &record).unwrap();
+        drop(lock);
+        drop(UnregisteredSignal::hold(&target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_files_stay_group_usable_under_umask_077() {
+        use std::os::unix::fs::PermissionsExt;
+        let install = install();
+        let dir = install.target.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 077 && exec \"$0\" --exact upgrade::participants::tests::umask_writer_child --test-threads=1 --quiet")
+            .arg(&exe)
+            .env(UMASK_TARGET, &install.target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the umask 077 writer ran");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let participants = participants_dir(&install.target);
+        assert_eq!(mode(&participants) & 0o070, 0o070, "group can add records");
+        let record = record_path(&install.target, &participant_key(Path::new("/umask")));
+        assert_ne!(mode(&record) & 0o040, 0, "group can read the record");
+        let lock = super::super::HostUpgradeLock::lock_path_for(&install.target);
+        assert_ne!(mode(&lock) & 0o040, 0, "group can open the host lock");
+        let signal = unregistered_signal_path(&install.target);
+        assert_ne!(
+            mode(&signal) & 0o040,
+            0,
+            "group can hold the unregistered signal"
         );
     }
 

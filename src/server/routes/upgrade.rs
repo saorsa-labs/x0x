@@ -2786,6 +2786,180 @@ mod tests {
         );
     }
 
+    /// Answers `error` for the first `failures` attempts, then applies, and
+    /// records every summary.
+    struct ScriptedApplier {
+        attempts: AtomicU64,
+        failures: u64,
+        error: fn(&str) -> x0x::upgrade::UpgradeError,
+        summaries: std::sync::Mutex<Vec<ApplySummary>>,
+    }
+
+    impl ScriptedApplier {
+        fn new(failures: u64, error: fn(&str) -> x0x::upgrade::UpgradeError) -> Self {
+            Self {
+                attempts: AtomicU64::new(0),
+                failures,
+                error,
+                summaries: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn attempts(&self) -> u64 {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RolloutApplier for ScriptedApplier {
+        fn apply<'a>(
+            &'a self,
+            manifest: &'a ReleaseManifest,
+            summary: ApplySummary,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                self.summaries.lock().expect("summaries").push(summary);
+                if self.attempts.fetch_add(1, Ordering::SeqCst) < self.failures {
+                    return Err((self.error)(&manifest.version));
+                }
+                Ok(x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insufficient_disk_is_retried_without_a_failure_backoff() {
+        // D194 (review S3): insufficient_disk is reported, not counted as a
+        // failure; the daemon checks again later.
+        let dir = tempfile::TempDir::new().unwrap();
+        let applier = Arc::new(ScriptedApplier::new(1, |_| {
+            x0x::upgrade::UpgradeError::InsufficientDisk {
+                available: 10,
+                needed: 20,
+                reserve: x0x::upgrade::DISK_RESERVE_BYTES,
+            }
+        }));
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [12; 32], 0, applier.clone(), None);
+        let manifest = manifest_with_version(&version_newer_than_current());
+        assert_eq!(
+            stage_and_apply_if_due(&scheduler, &manifest, RolloutTrigger::Poll, None).await,
+            None
+        );
+        assert!(
+            !scheduler.backoff_active(&manifest.version).await,
+            "insufficient_disk is not a failure"
+        );
+        assert!(
+            wait_until(|| applier.attempts() == 2, Duration::from_secs(1800)).await,
+            "the daemon checks the disk again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_wait_keeps_the_now_bypass() {
+        // Codex S5: now=true was requested, the first attempt waited for a
+        // participant; the retry must keep the bypass (no fresh delay, the
+        // skip-waits gate, the bypass in the summary).
+        let dir = tempfile::TempDir::new().unwrap();
+        let version = version_newer_than_current();
+        let id = node_with_delay(&version, 600..3000);
+        let applier = Arc::new(ScriptedApplier::new(1, |release| {
+            x0x::upgrade::UpgradeError::ParticipantsNotDue {
+                release: release.to_string(),
+                pending: vec!["own record pending".to_string()],
+            }
+        }));
+        let (scheduler, _shutdown) = test_scheduler_with(dir.path(), id, 60, applier.clone(), None);
+        let manifest = manifest_with_version(&version);
+        let RolloutOffer::Due(staged) = scheduler
+            .offer_now(&manifest, "local API (durable token)")
+            .await
+        else {
+            panic!("now=true is due at once");
+        };
+        let first = scheduler
+            .apply_due(
+                &manifest,
+                RolloutTrigger::Manual,
+                Some("local API (durable token)".into()),
+                &staged,
+            )
+            .await;
+        assert!(is_participant_wait(&first), "{first:?}");
+        scheduler
+            .ensure_waiter(
+                &manifest,
+                RolloutTrigger::Manual,
+                Some("local API (durable token)".into()),
+            )
+            .await;
+        assert!(
+            wait_until(|| applier.attempts() == 2, Duration::from_secs(120)).await,
+            "the retry runs within the participant recheck, not after the {}s delay",
+            staged.delay_secs
+        );
+        let summaries = applier.summaries.lock().unwrap().clone();
+        assert!(summaries.iter().all(|s| s.bypass), "{summaries:?}");
+        assert!(summaries
+            .iter()
+            .all(|s| s.sender.as_deref() == Some("local API (durable token)")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unregistered_daemon_signals_until_its_record_is_written() {
+        // Codex S1: until its record is written, a daemon holds the shared
+        // "unregistered" signal, so no other writer can swap.
+        let dir = tempfile::TempDir::new().unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        let held = x0x::upgrade::HostUpgradeLock::try_acquire(&target)
+            .unwrap()
+            .expect("the test holds the host lock, so registration must wait");
+        let applier = Arc::new(CountingApplier::default());
+        let (scheduler, _shutdown) =
+            test_scheduler_with(dir.path(), [13; 32], 60, applier, Some(target.clone()));
+        let _heartbeat = scheduler.spawn_participant_heartbeat();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let signal_path = x0x::upgrade::participants::unregistered_signal_path(&target);
+        let probe = || -> bool {
+            std::fs::File::open(&signal_path)
+                .map(|f| f.try_lock().is_ok())
+                .unwrap_or(true)
+        };
+        assert!(
+            !probe(),
+            "the unregistered daemon is visible to other writers"
+        );
+        drop(held);
+        assert!(
+            wait_until(probe, Duration::from_secs(30)).await,
+            "the signal is released once the record is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_daemon_keeps_its_blocked_rollout_state() {
+        // Codex S4: publishing the updates-off record must keep an existing
+        // rollout-state block.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(RolloutState::path_in(dir.path()), b"{ not json").unwrap();
+        let install = tempfile::TempDir::new().unwrap();
+        let target = install.path().join("x0xd");
+        std::fs::write(&target, b"bytes").unwrap();
+        register_updates_off_participant(&target, &[14; 32], dir.path()).await;
+        let path = x0x::upgrade::participants::record_path(
+            &target,
+            &x0x::upgrade::participants::participant_key(dir.path()),
+        );
+        let record: x0x::upgrade::participants::ParticipantRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!record.updates_enabled);
+        assert!(record.blocked.is_some(), "the block is published");
+    }
+
     #[test]
     fn the_upgraded_from_line_is_one_warn_line_after_the_restart() {
         let dir = tempfile::TempDir::new().unwrap();
