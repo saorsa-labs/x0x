@@ -40,7 +40,10 @@ trap cleanup_regions EXIT
 # or bracket) runs to EOF. A nested #![cfg(test)] closes with its module. An
 # attribute inside an unclassified macro argument does not start a region:
 # the macro can drop it and emit the item as production code. A weak keyword
-# (such as union) and a raw identifier (r#name) are macro names. A proved
+# (such as union) and a raw identifier (r#name) are macro names. A name that
+# can be either an item or a macro stays unclassified across whitespace and
+# comments. The next significant token decides: '!' is a macro, anything else
+# is an item. A proved
 # enclosing test item still covers those bytes. '-> !' is a never type, not
 # a macro. A macro token tree in a signature or expression is not the body. A
 # macro item closes at its '}' or at ';' / ',' after ')' or ']'. An attributed
@@ -118,6 +121,8 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
     ident = ""
     prev_token = ""
     saw_introducer = False
+    # Introducer that may still be a macro once separators are skipped.
+    pending_introducer = False
     pending = False
     pending_item = False
     # The next '(' / '[' / '{' is an unclassified macro argument.
@@ -139,13 +144,14 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
         add_span(store, end_line, 0, end_byte)
 
     def _clear_header() -> None:
-        nonlocal active, body, origin, ident, prev_token, saw_introducer, pending, pending_item, await_macro
+        nonlocal active, body, origin, ident, prev_token, saw_introducer, pending_introducer, pending, pending_item, await_macro
         active = False
         body = False
         origin = None
         ident = ""
         prev_token = ""
         saw_introducer = False
+        pending_introducer = False
         pending = False
         pending_item = False
         await_macro = False
@@ -163,11 +169,11 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
         return depth == floor and paren == paren_floor and bracket == bracket_floor
 
     def _finish_ident(ch: str = "", nxt: str = "") -> None:
-        nonlocal ident, prev_token, saw_introducer
+        nonlocal ident, prev_token, saw_introducer, pending_introducer
         if not ident:
             return
         prev_token = ident
-        # union! is a macro. union Foo is an item. The '!' decides.
+        # An adjacent '!' is a macro. A separator is not a decision yet.
         macro_bang = ch == "!" and nxt != "=" and _is_macro_name(ident)
         if (
             active
@@ -178,7 +184,10 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
             and ident in INTRODUCERS
             and not macro_bang
         ):
-            saw_introducer = True
+            if _is_macro_name(ident) and _is_separator(ch, nxt):
+                pending_introducer = True
+            else:
+                saw_introducer = True
         ident = ""
 
     def _open_frame(ch: str, is_item: bool, i: int) -> int:
@@ -279,6 +288,19 @@ def test_lines(text: str) -> tuple[dict[int, str], dict[int, str]]:
                 comment_origin = (line_no, byte_ofs[idx][i])
                 i += 2
                 continue
+
+            if pending_introducer:
+                # The next significant token chooses item or macro.
+                if not (ch == "!" and nxt != "=" and _is_macro_name(prev_token)):
+                    if (
+                        active
+                        and not body
+                        and not macro_frames
+                        and not pending
+                        and at_item_level()
+                    ):
+                        saw_introducer = True
+                pending_introducer = False
 
             if ch == '"':
                 hashes = _raw_hashes(line, i)
@@ -491,6 +513,13 @@ def _raw_ident_body(line: str, start: int) -> str | None:
     while end < len(line) and (line[end].isalnum() or line[end] == "_"):
         end += 1
     return line[start:end]
+
+
+def _is_separator(ch: str, nxt: str) -> bool:
+    """Whitespace, a line break, or a comment is not a classification token."""
+    if ch == "" or ch.isspace():
+        return True
+    return ch == "/" and nxt in "/*"
 
 
 def _is_macro_name(token: str) -> bool:

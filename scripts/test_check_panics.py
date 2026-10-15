@@ -468,6 +468,53 @@ class PanicScanner(unittest.TestCase):
                         self.assertIn(visible, result.stdout)
                         self.assertIn(self._found(kind), result.stdout)
 
+    def test_separator_before_macro_bang_closes_the_test_span(self):
+        # Whitespace or a comment may sit between a macro name and '!'.
+        # The next significant token decides. '!' closes the test span
+        # with the macro, so the production call is reported.
+        separators = {
+            "space": " ! ",
+            "newline": "\n!",
+            "block_comment": " /* sep */ ! ",
+            "line_comment": " // sep\n!",
+            "tight_block": "/*sep*/!",
+        }
+        for kind in ("expect", "unwrap", "panic"):
+            hidden = self._call(kind, "hidden")
+            visible = self._call(kind, "visible")
+            for macro in ("union", "r#type", "safe"):
+                for name, separator in separators.items():
+                    with self.subTest(kind=kind, macro=macro, separator=name):
+                        source = (
+                            f"macro_rules! {macro} {{ ($item:item) => {{ $item }}; }}\n"
+                            "#[cfg(test)]\n"
+                            f"{macro}{separator} {{\n"
+                            f"    pub fn helper() {{ {hidden}; }}\n"
+                            "}\n"
+                            f"pub fn prod() {{ {visible}; }}\n"
+                            "pub fn witness() { prod(); }\n"
+                        )
+                        result = self.scan("src/separated_bang.rs", source)
+                        self._assert_rejected(result, kind)
+
+    def test_separator_before_union_name_still_closes_the_item(self):
+        # union /* sep */ Foo is an item. The span still closes at '}'.
+        for kind in ("expect", "unwrap", "panic"):
+            visible = self._call(kind, "visible")
+            shapes = {
+                "space": "union Foo {\n    x: u8,\n}\n",
+                "newline": "union\nFoo {\n    x: u8,\n}\n",
+                "block_comment": "union /* sep */ Foo {\n    x: u8,\n}\n",
+                "line_comment": "union // sep\nFoo {\n    x: u8,\n}\n",
+            }
+            for name, item in shapes.items():
+                with self.subTest(kind=kind, separator=name):
+                    source = f"#[cfg(test)]\n{item}pub fn prod() {{ {visible}; }}\n"
+                    result = self.scan("src/union_item.rs", source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(visible, result.stdout)
+                    self.assertIn(self._found(kind), result.stdout)
+
     def test_raw_string_inside_test_module_stays_test_code(self):
         # r#"..."# is a raw string, not the raw identifier r#type. A brace
         # inside the string must not close the proved test module.
