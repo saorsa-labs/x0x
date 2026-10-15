@@ -23678,7 +23678,7 @@ async fn deliver_self_leave_rekey(
 fn self_leave_rekey_ack_withheld() -> bool {
     #[cfg(test)]
     {
-        return skip_self_leave_rekey_ack_flag().load(std::sync::atomic::Ordering::SeqCst);
+        skip_self_leave_rekey_ack_flag().load(std::sync::atomic::Ordering::SeqCst)
     }
     #[cfg(not(test))]
     false
