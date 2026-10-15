@@ -1,6 +1,8 @@
-//! #1228: session tokens must not clear fork quarantine, list join
-//! requests, or drive legacy MLS routes. Display-name requires an active
-//! seat of any role. Cancelling a join request is limited to an owner.
+//! #1228: session tokens must not clear fork quarantine or drive legacy
+//! MLS routes. Display-name requires an active seat of any role.
+//! Cancelling a join request is limited to an owner. #1347: the
+//! join-request list takes the class of approve and reject (the Home
+//! fence); `issue1347_join_request_token_class` tests all three.
 
 use super::super::super::groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
@@ -142,34 +144,48 @@ async fn session_token_cannot_clear_fork_quarantine() -> Result<()> {
     Ok(())
 }
 
-/// A session token cannot list join requests. The durable owner, holding
-/// an admin seat, can.
+/// #1347: the join-request list takes the Home fence, as approve and
+/// reject do. A session token lists an ordinary group's requests with an
+/// admin seat. On a Home the session token is refused and the durable
+/// owner lists.
 #[tokio::test]
-async fn session_token_cannot_list_join_requests() -> Result<()> {
+async fn session_token_lists_join_requests_only_outside_a_home() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
-    let group_id = "cd".repeat(32);
-    let mut info = group_with_local_role(&state, &group_id, x0x::groups::GroupRole::Admin);
-    let request = x0x::groups::JoinRequest::new(group_id.clone(), "ee".repeat(32), None, 1);
-    let request_id = request.request_id.clone();
-    info.join_requests.insert(request_id, request);
-    state
-        .named_groups
-        .write()
-        .await
-        .insert(group_id.clone(), info);
+    let ordinary_id = "cd".repeat(32);
+    let home_id = "ce".repeat(32);
     let local = hex::encode(state.agent.agent_id().as_bytes());
-
-    let (status, body) = json_response(
+    for (group_id, home) in [(&ordinary_id, false), (&home_id, true)] {
+        let mut info = group_with_local_role(&state, group_id, x0x::groups::GroupRole::Admin);
+        if home {
+            info.home = Some(x0x::groups::HomeMetadata {
+                primary_agent: local.clone(),
+                placements: std::collections::BTreeMap::new(),
+                provisioned_at_ms: 1,
+            });
+        }
+        let request = x0x::groups::JoinRequest::new(group_id.clone(), "ee".repeat(32), None, 1);
+        info.join_requests
+            .insert(request.request_id.clone(), request);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+    }
+    let list = |actor, group_id: &String| {
         list_join_requests(
             State(Arc::clone(&state)),
-            Extension(session()),
+            Extension(actor),
             Path(group_id.clone()),
             group_access::GroupAccess::for_handler_tests(local.clone()),
         )
-        .await
-        .into_response(),
-    )
-    .await;
+    };
+
+    let (status, body) = json_response(list(session(), &ordinary_id).await.into_response()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["requests"].as_array().map(Vec::len), Some(1), "{body}");
+
+    let (status, body) = json_response(list(session(), &home_id).await.into_response()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
         body["error"]
@@ -179,17 +195,7 @@ async fn session_token_cannot_list_join_requests() -> Result<()> {
         "{body}"
     );
 
-    let (status, body) = json_response(
-        list_join_requests(
-            State(Arc::clone(&state)),
-            Extension(durable()),
-            Path(group_id),
-            group_access::GroupAccess::for_handler_tests(local),
-        )
-        .await
-        .into_response(),
-    )
-    .await;
+    let (status, body) = json_response(list(durable(), &home_id).await.into_response()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["requests"].as_array().map(Vec::len), Some(1), "{body}");
     Ok(())
@@ -584,7 +590,8 @@ async fn session_owner_can_cancel_its_own_join_request() -> Result<()> {
 }
 
 /// A minted session token is refused by auth middleware before a malformed
-/// body is parsed. The durable token can list join requests.
+/// body is parsed. #1347: on an ordinary group the list takes a session
+/// token and the durable token alike.
 #[tokio::test]
 async fn minted_session_token_is_refused_before_the_body() -> Result<()> {
     use axum::body::Body;
@@ -645,7 +652,8 @@ async fn minted_session_token_is_refused_before_the_body() -> Result<()> {
         .await
         .unwrap_or_else(|never| match never {});
     let (status, body) = json_response(response).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["requests"].as_array().map(Vec::len), Some(0), "{body}");
 
     let response = app
         .oneshot(

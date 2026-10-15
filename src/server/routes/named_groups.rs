@@ -25316,8 +25316,10 @@ fn last_admin_precheck(
 /// /groups/:id (leave/terminal withdraw), POST+DELETE
 /// /groups/:id/members[...], PATCH /groups/:id/members/:agent_id/role,
 /// POST+DELETE /groups/:id/ban/..., POST /groups/:id/invite, and POST
-/// /groups/:id/requests/:request_id/approve|reject.
-async fn home_mutation_requires_durable(
+/// /groups/:id/requests/:request_id/approve|reject. #1347: GET
+/// /groups/:id/requests (the extractor and the handler) runs it too, so
+/// the join-request list, approve and reject take one token class.
+pub(in crate::server) async fn home_mutation_requires_durable(
     state: &AppState,
     actor: &crate::server::rider_auth::ActorContext,
     group_id: &str,
@@ -26126,20 +26128,22 @@ pub(in crate::server) async fn unban_group_member(
     )
 }
 
-/// GET /groups/:id/requests — list join requests (durable owner, admin seat).
+/// GET /groups/:id/requests — list join requests (admin seat, Home fence).
 ///
 /// #1166 S3: admission (unknown-group 404, the local-seat admin gate —
 /// and NO withdrawn check, today's shape) lives in the `GroupAccess`
 /// extractor; the list below is served from this handler's OWN lock
 /// read, so the admission core runs AGAIN on that same snapshot
-/// (r2/P2-1). #1228: a session token is refused before that seat gate.
+/// (r2/P2-1). #1347: the Home fence runs before that seat gate, as on
+/// approve and reject. A session token is refused on a Home or an
+/// owner-certified group and accepted on an ordinary group.
 pub(in crate::server) async fn list_join_requests(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
-    if let Err(response) = durable_owner_or_forbid(&actor, "listing join requests") {
+    if let Some(response) = home_mutation_requires_durable(&state, &actor, &id).await {
         return response;
     }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -41270,6 +41274,7 @@ pub(in crate::server) mod tests {
     mod issue1274_detached_group_tasks;
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
+    mod issue1347_join_request_token_class;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;

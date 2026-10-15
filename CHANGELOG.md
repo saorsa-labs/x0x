@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **One token class for the join-request admin task (#1347).** `GET /groups/:id/requests`, `POST /groups/:id/requests/:request_id/approve` and `POST /groups/:id/requests/:request_id/reject` now take the same token class. It is the class of the other routes that change the roster (member add and remove, role change, ban and unban, invite): the Home fence `home_mutation_requires_durable`.
+  - On an ordinary group a session token is accepted on all three routes. The list no longer needs the durable API token there. In v0.48.0 (#1334) it did, but approve and reject accepted a session token.
+  - On a Home, or on a group with `OwnerCertified` admission, all three routes need the durable API token. A session token gets the same typed 403 on all three, and no request changes.
+  - All three routes still need an Admin+ seat for the local agent. Rider tokens are still refused.
+  - The GUI sends the same bearer on all three calls: the durable token saved in the tab, else the session token. A render never prompts. On an ordinary group the GUI does not prompt.
+
 ### Fixed
 
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.

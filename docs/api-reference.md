@@ -69,9 +69,10 @@ Auth-class labels used throughout this reference:
   `PATCH /groups/:id/policy` **when the target carries Home metadata**
   (metadata presence is the marker — never the current policy axes, so
   the Home cannot be policy-flipped around the rename gate), and
-  (#1228) `POST /groups/:id/quarantine/clear`, `GET /groups/:id/requests`,
-  and every `/mls/groups*` route. Approving or rejecting a join request
-  stays an admin-seat route and still accepts a session token.
+  (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
+  route. The join-request list, approve and reject are not on this list.
+  They take one class that depends on the group: see **Join-request admin
+  (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -97,6 +98,31 @@ agent. For a known group without that seat, both endpoints return typed 403
 joiner awaiting the authority commit receives only `ok`, `group_id`, and
 `membership_state: "pending_authority_commit"` from `GET /groups/:id`;
 `GET /groups/:id/members` remains 403. Rider tokens are denied on both routes.
+
+**Join-request admin (#1347):** `GET /groups/:id/requests`,
+`POST /groups/:id/requests/:request_id/approve` and
+`POST /groups/:id/requests/:request_id/reject` take one token class. It is
+the class of the other routes that change the roster:
+`POST /groups/:id/members`, `DELETE /groups/:id/members/:agent_id`,
+`PATCH /groups/:id/members/:agent_id/role`, `POST` and
+`DELETE /groups/:id/ban/:agent_id`, and `POST /groups/:id/invite`. All of
+these routes use the same Home fence (`home_mutation_requires_durable`).
+
+- On an ordinary group, the durable API token and a session token are both
+  accepted.
+- On a Home (a group with Home metadata), or on a group with `OwnerCertified`
+  admission, all three routes need the durable API token. A session token
+  gets the same typed `403` on all three routes, and no request changes.
+- All three routes also need an Admin+ seat for the local agent.
+- Rider tokens are refused (ADR-0039 deny-by-default).
+
+The GUI sends the same bearer on all three calls: the durable token saved
+in this tab if there is one, else the session token. On an ordinary group
+the session token is enough, so the GUI does not prompt. A page render
+never prompts. On a Home the request list shows "durable token needed" and
+a button. The button prompts once and keeps the token in this tab's
+`sessionStorage` only. An approve or reject click prompts only when the
+daemon refuses the session token and asks for the durable token.
 
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
@@ -1228,10 +1254,10 @@ token. A session token is refused before the body is read.
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
-| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires the durable API token and a local admin seat |
+| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
 | POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
-| POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored) |
-| POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored) |
+| POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored). Same token class as the list (#1347) |
+| POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored). Same token class as the list (#1347) |
 | DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request. An owner credential (session or durable) is enough; the request must belong to this daemon |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
