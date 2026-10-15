@@ -21,6 +21,30 @@ All notable changes to this project will be documented in this file.
   - `limit` is applied before the filter, so a history page can contain
     fewer records than `limit`. `next_before_id` still names the last stored
     row of that page, including a hidden row.
+- **One group's slow apply no longer holds the direct metadata events of
+  every other group (#1238).** The shared direct metadata listener awaited
+  each named-group apply inline. A seating `MemberAdded` whose Welcome is
+  staged by reference waits in the Welcome fetch, up to 115 s. During that
+  wait, the direct events of all other groups waited too. Now the listener
+  sends each event to a lane for its group. A lane is a bounded queue and
+  one worker task. The worker applies the events of its group one at a
+  time, in arrival order, through the same shielded apply (#1275). Other
+  groups apply at the same time.
+  - Bounds: 32 queued events for each group and 16 lanes (worker tasks)
+    at once. A worker with an empty queue exits after 5 s. At a bound the
+    listener waits (back-pressure) and drops nothing. While it waits, new
+    direct messages stay in the bounded subscriber queue of the agent, with
+    its existing drop-oldest policy and counter. When all 16 lanes are in
+    use, the listener first takes back a lane with nothing pending.
+  - The order for one group does not change. Events that name one group by
+    a different spelling (map key, stable id or MLS id) share one lane.
+    Events for groups that are not local share one lane.
+  - The membership lock and the ADR 0066 epoch re-check stay inside the
+    apply. No lane waits while it holds a lock.
+  - An apply that panics no longer stops the listener for every group. Its
+    lane counts it, writes a warning and applies the next event.
+  - Shutdown stops the listener and the lanes at once. An apply in progress
+    is still shielded and runs to completion. No wire or storage change.
 - **A subscription opened before the revocation stores are attached drops a
   revoked or Blocked sender (#1230, #1344).** Delivery reads the contact
   store and the revocation set when it decodes each payload. A store
