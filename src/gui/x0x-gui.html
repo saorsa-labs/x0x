@@ -2190,10 +2190,7 @@ async function mountSpace(){
     // Capture confidentiality so sendSpaceChat() can branch
     // between gossip (MlsEncrypted) and the daemon-signed REST path
     // (SignedPublic). Fall back to '' if the daemon shape changes.
-    currentSpaceConfidentiality=
-      (g.policy && g.policy.confidentiality) ||
-      (g.policy_summary && g.policy_summary.confidentiality) ||
-      '';
+    currentSpaceConfidentiality=(g.policy && g.policy.confidentiality) || '';
   }
   // Tear down any previous SignedPublic receive state, then re-arm
   // for this space if it is SignedPublic. Two receive paths run in
@@ -3145,7 +3142,7 @@ async function openSpacePageStore(sid,app){
     observeSpacePolicy(sid,SPACE_POLICY_UNAVAILABLE,ticket);
     return {ok:false,reason:'This space could not be loaded, so its pages are unavailable. '+apiError(g)};
   }
-  const conf=String((g.policy&&g.policy.confidentiality)||(g.policy_summary&&g.policy_summary.confidentiality)||'');
+  const conf=String((g.policy&&g.policy.confidentiality)||'');
   const obs=observeSpacePolicy(sid,conf,ticket);
   if(obs.conf!==conf){
     // Our own policy reply arrived AFTER a newer one. Do not act on it.
@@ -5807,6 +5804,17 @@ async function nagRejectRequest(gid,rid){
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
 }
 
+function spaceDetailEncryptedBadge(g){
+  if(!(g&&g.policy&&g.policy.confidentiality==='mls_encrypted'))return '';
+  return '<div style="margin-top:8px"><span class="policy policy-encrypted">&#128274; End-to-end encrypted</span></div>';
+}
+function spaceOwnDisplayName(g,agentId){
+  const members=(g&&Array.isArray(g.members))?g.members:[];
+  const mine=members.find(m=>m&&m.agent_id===agentId);
+  const name=mine&&mine.display_name;
+  return typeof name==='string'?name:'';
+}
+
 async function renderSpaceDetail(el,data){
   const g=await api('/groups/'+data.groupId);
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
@@ -5823,7 +5831,7 @@ async function renderSpaceDetail(el,data){
       <div style="font-size:12px;color:var(--tx3);margin-bottom:8px">${g.description||'No description'}</div>
       <div style="font-size:11px"><span style="color:var(--tx3)">Members:</span> ${g.member_count||1}</div>
       <div style="font-size:11px"><span style="color:var(--tx3)">Creator:</span> <span class="aid-short">${short(g.creator)}</span></div>
-      ${g.mls_group_id?'<div style="margin-top:8px"><span class="policy policy-encrypted">&#128274; End-to-end encrypted</span></div>':''}
+      ${spaceDetailEncryptedBadge(g)}
     </div>
     <h3>Invite</h3>
     <div class="card mb">
@@ -5832,7 +5840,7 @@ async function renderSpaceDetail(el,data){
     </div>
     <h3>Display Name</h3>
     <div class="card mb">
-      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(g.display_names&&g.display_names[S.get('agentId')]||'')}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
+      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(spaceOwnDisplayName(g,S.get('agentId')))}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
     </div>
     <h3 style="margin-top:16px">Manage</h3>
     <div id="nag-admin-${data.groupId}" class="mb">

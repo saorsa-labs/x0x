@@ -90,6 +90,12 @@ All notable changes to this project will be documented in this file.
   and decodes it.
   `setSpaceDisplayName` sent `display_name`. `PUT /groups/:id/display-name`
   reads `name`. The call now sends `name`.
+  The space detail pane read `mls_group_id` for the encrypted badge and
+  `display_names` for the saved name. `GET /groups/:id` returns neither.
+  The badge now follows `policy.confidentiality` equal to `mls_encrypted`.
+  The name field now shows this agent's `members[].display_name`.
+  The parity table no longer allows `policy_summary`, `mls_group_id`, or
+  `display_names` on that route.
   Secure encrypt sent `plaintext`. `POST /groups/:id/secure/encrypt` reads
   `payload_b64`. The call now sends `payload_b64` as standard base64. The
   cipher box stores `ciphertext_b64`, `nonce_b64`, and `secret_epoch`.

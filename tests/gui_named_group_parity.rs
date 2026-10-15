@@ -1789,14 +1789,12 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
             &[
                 "chat_topic",
                 "policy",
-                "policy_summary",
                 "group_id",
                 "name",
                 "description",
                 "member_count",
                 "creator",
-                "mls_group_id",
-                "display_names",
+                "members",
                 "membership_state",
             ],
         ),
@@ -2084,6 +2082,141 @@ fn issue_1399_old_body_keys_do_not_match_the_routes() {
     assert!(!response_fields(Method::Post, "/mls/groups/:id/decrypt").contains(&"plaintext"));
     assert!(response_fields(Method::Post, "/groups/:id/secure/decrypt").contains(&"payload_b64"));
     assert!(!response_fields(Method::Post, "/groups/:id/secure/decrypt").contains(&"plaintext"));
+}
+
+fn js_function(name: &str) -> String {
+    let marker = format!("function {name}(");
+    let start = GUI_HTML
+        .find(&marker)
+        .unwrap_or_else(|| panic!("GUI is missing {name}"));
+    let brace = GUI_HTML[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{name} has no body"));
+    let end = match_delim(GUI_HTML, brace, b'{', b'}')
+        .unwrap_or_else(|| panic!("{name} body does not close"));
+    GUI_HTML[start..=end].to_string()
+}
+
+#[test]
+fn get_group_detail_renders_the_handler_response() {
+    let fields = response_fields(Method::Get, "/groups/:id");
+    for absent in ["policy_summary", "mls_group_id", "display_names"] {
+        assert!(
+            !fields.contains(&absent),
+            "GET /groups/:id does not return {absent}"
+        );
+    }
+    assert!(fields.contains(&"policy"));
+    assert!(fields.contains(&"members"));
+
+    let render = js_function("renderSpaceDetail");
+    assert!(
+        render.contains("spaceDetailEncryptedBadge(g)"),
+        "the space pane must paint the badge from the handler policy"
+    );
+    assert!(
+        render.contains("spaceOwnDisplayName(g,S.get('agentId'))"),
+        "the space pane must fill the name from the caller's member row"
+    );
+    assert!(
+        !render.contains("mls_group_id") && !render.contains("display_names"),
+        "renderSpaceDetail still reads a field GET /groups/:id does not return"
+    );
+
+    let src = format!(
+        "{}\n{}\n",
+        js_function("spaceDetailEncryptedBadge"),
+        js_function("spaceOwnDisplayName")
+    );
+    let dir = std::env::temp_dir().join(format!("x0x-gui-1399-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let fns = dir.join("fns.js");
+    let run = dir.join("run.js");
+    std::fs::write(&fns, src).expect("write functions");
+    std::fs::write(
+        &run,
+        r#"
+const fs = require('node:fs');
+const vm = require('node:vm');
+const src = fs.readFileSync(process.env.FNS, 'utf8');
+const handler = {
+  ok: true,
+  group_id: 'aabb',
+  membership_state: 'active',
+  name: 'Lab',
+  description: 'notes',
+  creator: 'cc',
+  chat_topic: 'topic',
+  withdrawn: false,
+  policy: {
+    discoverability: 'hidden',
+    admission: 'invite_only',
+    confidentiality: 'mls_encrypted',
+    read_access: 'members_only',
+    write_access: 'members_only'
+  },
+  member_count: 2,
+  members: [
+    { agent_id: 'bob', role: 'member', state: 'active', display_name: 'Bob', joined_at: 1, added_by: null },
+    { agent_id: 'ada', role: 'owner', state: 'active', display_name: 'Ada', joined_at: 1, added_by: null }
+  ]
+};
+const signed = JSON.parse(JSON.stringify(handler));
+signed.policy.confidentiality = 'signed_public';
+const alias = {
+  ok: true,
+  mls_group_id: 'dead',
+  display_names: { ada: 'Ada' },
+  policy_summary: { confidentiality: 'mls_encrypted' }
+};
+const empty = JSON.parse(JSON.stringify(handler));
+empty.members[1].display_name = '';
+const result = {};
+vm.runInNewContext(src + `
+  result.encrypted = spaceDetailEncryptedBadge(handler);
+  result.signed = spaceDetailEncryptedBadge(signed);
+  result.alias = spaceDetailEncryptedBadge(alias);
+  result.name = spaceOwnDisplayName(handler, 'ada');
+  result.aliasName = spaceOwnDisplayName(alias, 'ada');
+  result.empty = spaceOwnDisplayName(empty, 'ada');
+`, { handler, signed, alias, empty, result });
+const banned = ['policy_summary', 'mls_group_id', 'display_names'];
+result.handlerHasAlias = banned.some((key) => Object.prototype.hasOwnProperty.call(handler, key));
+console.log(JSON.stringify(result));
+"#,
+    )
+    .expect("write node driver");
+    let output = std::process::Command::new("node")
+        .arg(&run)
+        .env("FNS", &fns)
+        .output()
+        .expect("node is required to render the space detail fixture");
+    assert!(
+        output.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).expect("node JSON");
+    let encrypted = rendered["encrypted"].as_str().unwrap_or("");
+    assert!(
+        encrypted.contains("End-to-end encrypted"),
+        "handler-shaped mls_encrypted group hid the badge: {encrypted}"
+    );
+    assert_eq!(rendered["signed"].as_str().unwrap_or("missing"), "");
+    assert_eq!(
+        rendered["alias"].as_str().unwrap_or("missing"),
+        "",
+        "mls_group_id and policy_summary must not paint the badge"
+    );
+    assert_eq!(rendered["name"].as_str().unwrap_or(""), "Ada");
+    assert_eq!(
+        rendered["aliasName"].as_str().unwrap_or("missing"),
+        "",
+        "display_names must not fill the saved name"
+    );
+    assert_eq!(rendered["empty"].as_str().unwrap_or("missing"), "");
+    assert_eq!(rendered["handlerHasAlias"], false);
 }
 
 #[test]
