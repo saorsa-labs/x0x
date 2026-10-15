@@ -138,7 +138,7 @@ async fn staged(
         .cloned()
 }
 
-fn welcome_id_of(event: &NamedGroupMetadataEvent) -> Option<String> {
+pub(super) fn welcome_id_of(event: &NamedGroupMetadataEvent) -> Option<String> {
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             welcome_ref: Some(reference),
@@ -405,21 +405,21 @@ async fn deliver(
         .await;
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     dir: std::path::PathBuf,
-    authority: Arc<AppState>,
+    pub(super) authority: Arc<AppState>,
     authority_id: AgentId,
-    group_key: String,
-    stable: String,
+    pub(super) group_key: String,
+    pub(super) stable: String,
     /// The invite base both first invites carried (r).
     base: u64,
-    j1: Arc<AppState>,
+    pub(super) j1: Arc<AppState>,
     j2: Arc<AppState>,
     j2_kp: (Vec<u8>, Vec<u8>),
     j1_attempt: String,
     j2_attempt: String,
     /// J1's sealed add at r+1, as the authority staged it.
-    j1_add: NamedGroupMetadataEvent,
+    pub(super) j1_add: NamedGroupMetadataEvent,
     /// J2's sealed add at r+2 (Welcome by reference), as staged.
     j2_add: NamedGroupMetadataEvent,
 }
@@ -427,7 +427,7 @@ struct Fixture {
 /// Two Home devices join through the REAL route with two invites minted from
 /// the same base r; the authority seals both through its REAL `MemberJoined`
 /// apply (r+1 for J1, r+2 for J2), staging each join result and Welcome.
-async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
+pub(super) async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
     let authority = super::super::super::home::tests::owned_state(dir, OWNER_SEED).await?;
     super::super::super::home::provision_home(&authority).await;
     let owner = authority

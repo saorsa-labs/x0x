@@ -17949,6 +17949,13 @@ pub(in crate::server) mod detached_send_test_seam {
     pub(in crate::server) fn public_bootstrap_key(group_id: &str, recipient_hex: &str) -> String {
         format!("public-bootstrap:{group_id}:{recipient_hex}")
     }
+
+    /// #1238: the joiner's Welcome `FetchRequest` for `welcome_id`. Parked,
+    /// it stands in for a request whose delivery receipt never arrives, so
+    /// the seat apply waits in its Welcome fetch.
+    pub(in crate::server) fn welcome_fetch_key(welcome_id: &str) -> String {
+        format!("welcome-fetch:{welcome_id}")
+    }
 }
 
 /// Fan-out a persisted public group message as a race: gossip topic publish
@@ -39989,6 +39996,11 @@ async fn send_welcome_fetch_request(
     request: &WelcomeBlobMessage,
 ) -> std::result::Result<(), WelcomeFetchSendError> {
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
+    #[cfg(test)]
+    if let WelcomeBlobMessage::FetchRequest { welcome_id, .. } = request {
+        detached_send_test_seam::park(&detached_send_test_seam::welcome_fetch_key(welcome_id))
+            .await;
+    }
     state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
@@ -41138,6 +41150,7 @@ pub(in crate::server) mod tests {
     mod issue1146_refused_join_record;
     pub(in crate::server) mod issue1187_durable_journal;
     mod issue1228_actor_checks;
+    mod issue1238_direct_metadata_lanes;
     mod issue1256_metadata_listener;
     mod issue1266_survivor_store_rekey_gap;
     mod issue1269_shutdown_apply_boundary;
