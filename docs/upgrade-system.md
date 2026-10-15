@@ -35,17 +35,20 @@ independently, and the second one copied the already-new bytes over the single
   response window. A second writer waits at most 10 minutes and then fails before
   any change. The lock file is never deleted.
 - **Installed-release check.** Under the lock, the writer names the installed
-  release of each binary from verified evidence only, in this order:
-  1. the release marker in the installed bytes themselves: every x0x binary from
-     0.48.1 on embeds `X0X-RELEASE-MARKER:<version>:END` (exactly one release
-     must be found);
-  2. the install record `<install dir>/.<binary>.installed.json` (release +
-     SHA-256, written after each swap), when its hash matches the installed bytes;
-  3. on Linux only, the hash of the running image (`/proc/self/exe`). Off Linux a
-     pathname hash cannot prove which image runs, so it is not evidence.
+  release of each binary from hash-bound evidence only:
+  - the install record `<install dir>/.<binary>.installed.json` (release +
+    SHA-256, written after each swap of bytes this updater verified), when its
+    hash matches the installed bytes; or
+  - the hash of this process's running image: `/proc/self/exe` on Linux;
+    elsewhere the executable `x0xd` opens first in `main` (a descriptor keeps
+    naming the started image after a rename).
 
-  The companion `x0x` CLI needs its own evidence; the daemon's release is never
-  assumed for it. An installed release that is not older than the target is
+  When these disagree, the bytes are unknown. The release marker that every x0x
+  binary from 0.48.1 on embeds (`X0X-RELEASE-MARKER:<version>:END`) is only a
+  cross-check: alone it is no evidence, and a marker that disagrees with the
+  hash-bound release makes the bytes unknown. Partial or changed bytes match no
+  hash, so they are unknown. The companion `x0x` CLI needs its own evidence; the
+  daemon's release is never assumed for it. An installed release that is not older than the target is
   refused (`InstalledReleaseNotOlder`): another writer installed it, so there is
   no on-disk downgrade. Unknown bytes (for example a pre-0.48.1 hand copy) are
   refused (`InstalledReleaseUnknown`). The daemon decision runs before either
@@ -59,12 +62,18 @@ independently, and the second one copied the already-new bytes over the single
   saved, not from the running version. The copy is fsynced and renamed into place.
   A different file under that name is never overwritten. The companion `x0x` CLI
   uses the same rule (`x0x.backup-<release>-<sha8>`).
-- **Retention.** No backup is deleted automatically. Before ADR 0094 M2 there is no
-  host-commit state, so nothing proves which pair is the last committed one (D194),
-  and an unresolved handoff may still name an older copy. Every
-  `<binary>.backup-<release>-<sha8>` stays until an operator removes it (each one is
-  one release of the binary, about 40–80 MB). The legacy `<binary>.backup` and
-  operator copies such as `x0xd.v0480-pre0481` are not touched either.
+- **Retention (D194).** After a swap, each binary keeps: this swap's backup, every
+  backup of the release this daemon runs and of the release it ran before it (the
+  known-good pair, from the handoff record or the reported upgrade), and the newest
+  3 versioned backups. Only older `<binary>.backup-<release>-<sha8>` files are
+  deleted; there is no age rule. The legacy `<binary>.backup`, unparseable names and
+  operator copies such as `x0xd.v0480-pre0481` are not touched.
+- **Disk reserve (D194).** Before the download, the apply estimates its peak space
+  (archive, extracted binaries and their backups: 3 × the installed daemon + CLI
+  size). It refuses with `insufficient_disk` when staging would leave less than
+  1 GiB free on the install filesystem. That is not a failure: the daemon logs it at
+  WARN and checks again every 10 minutes; `POST /upgrade/apply` answers
+  `insufficient_disk: true`.
 - The handoff/intent record `upgrade-handoff.json` names the versioned backup in
   `backup_path`. The daemon no longer writes `<binary>.backup`. A file with that
   name is left from an older release and may be very old: do not restore it.
@@ -408,11 +417,13 @@ delay = SHA-256(MachineId ‖ version)[0..8] as u64 × window_secs / 2^64     (i
   the daemon applies the release when the wait is served.
 - **`now=true` (D185).** `POST /upgrade/apply?now=true` (CLI `x0x upgrade --apply
   --now`) skips the wait for this host only. It keeps eligibility (signature, age,
-  newer), holds (a blocked state) and every install check (host lock, installed
-  release). On a shared install it also skips the other participants' waits, so it
-  moves every daemon on that install early, but their holds (a blocked rollout
-  state), unreadable records and this daemon's missing record still stop the swap.
-  The rollout state and the WARN summary line record the bypass and who asked.
+  newer), holds and every install check (host lock, installed release). On a shared
+  install it also skips the other participants' waits, so it moves every daemon on
+  that install early. A configured hold always wins: a participant with
+  self-update off or a blocked rollout state, an unreadable record, and an
+  unregistered live daemon still stop the swap. When such a hold makes the request
+  wait, the retry keeps the bypass. The rollout state and the WARN summary line
+  record the bypass and who asked.
 - A due apply keeps the #1196 behaviour on every trigger: when the only refusal
   is an unaged systemd start-rate window, it waits that window out and retries
   once. Each attempt rechecks, under the in-process apply lock and before any
@@ -431,19 +442,23 @@ delay = SHA-256(MachineId ‖ version)[0..8] as u64 × window_secs / 2^64     (i
   served. Otherwise it waits (`ParticipantsNotDue`, not a failure) and checks again
   every 30 s; the HTTP answer lists `pending_participants`.
   - *Self-update off.* A daemon with self-update off (`--skip-update-check`,
-    `[update] enabled = false`) stays a participant and never becomes due, so the
-    shared swap waits while it runs. Turn its updates on, stop it, or use `now=true`.
+    `[update] enabled = false`) stays a participant (with its rollout-state block,
+    if any). That is a configured hold: the shared swap waits while it runs, and
+    `now=true` does not skip it. Turn its updates on and restart it, or stop it.
   - *Stale participant.* A record not refreshed for 30 minutes (a removed or
     long-stopped daemon) does not block; the writer logs it at WARN before the swap.
     Delete the file of a daemon that is gone.
-  - *Not established.* While this daemon's own record is missing (registration
-    pending or failed, logged at WARN), the swap waits. When the directory cannot
-    be read or a record is unreadable or of another format, the swap is refused
-    (`ParticipantsUnknown`, WARN).
-  - *Shared accounts.* The participants directory gets the install directory's
-    group-write bit (0o2775 on a group-writable install), and the host lock also
-    works through a read-only lock file, so daemons that run as different accounts
-    of one group can share an install.
+  - *Not established.* Until its record is written, a daemon holds a shared lock on
+    `<install dir>/.<binary>.unregistered-lock`; a daemon whose registration keeps
+    failing holds it for its whole life (and logs WARN). While any daemon holds it,
+    or while this daemon's own record is missing, no writer swaps, in any mode. When
+    the directory or a record cannot be read, or a record is of another format, the
+    swap is refused (`ParticipantsUnknown`, WARN).
+  - *Shared accounts.* Registry files get the install directory's sharing,
+    independent of the umask: on a group-writable install 0o2775 directories and
+    0o664 files with the install directory's group (also an existing participants
+    directory, when its owner writes next), else 0o755 and 0o644. The host lock
+    also works through a read-only lock file.
 
 ### Upgrade log lines
 

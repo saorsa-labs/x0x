@@ -2341,15 +2341,17 @@ answers `200` with `{"ok": true, "applied": false, "staged": true, "reason":
 "staged rollout: …", "version", "delay_secs", "remaining_secs",
 "window_minutes", "current_version"}`, and the daemon applies the release
 when the wait is served. On a shared install whose other daemons are not yet
-due, the answer is `staged: true` with `pending_participants`. When the
+due, the answer is `staged: true` with `pending_participants`. When staging
+would leave less than 1 GiB free, the answer is `staged: true,
+insufficient_disk: true` (not a failure; the daemon checks again). When the
 staged-rollout state is unreadable, the answer is `applied: false, blocked:
 true`. When the release applies, the answer is the usual `{"applied": true,
 "version", "previous_version", "restart_scheduled": true}`.
 
 **`now=true` (D185).** `POST /upgrade/apply?now=true` (query, optional, bool)
 skips the wait for this host only, and on a shared install the other daemons'
-waits. Eligibility, holds (also the other daemons' holds) and every install
-check stay. The bypass and who asked are recorded in `upgrade-rollout.json` and
+waits. Eligibility, every install check and every configured hold stay
+(self-update off or a blocked state on any daemon of the install). The bypass and who asked are recorded in `upgrade-rollout.json` and
 on the WARN summary line.
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
