@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-14
-- **Target slot:** A09
+- **Target slot:** A07
 - **Decision owners:** David Irvine
 - **Reviewers:** pending
 - **Supersedes:** none
@@ -13,7 +13,7 @@
 
 David accepted `T-self-leave-rekey-committer` (D274, 14 Oct 2026, slot A09). Its single committer is the lowest active admin. A 250 ms startup wait proves nothing. That record adds no timeout and no second committer.
 
-A09 says group encryption must follow committed membership. The responder sets `truncated` from an in-memory event log that is empty after restart, so an empty page can come from a peer whose saved head is newer. A KeyPackage reply carries no head.
+The accepted A09 record says group encryption must follow committed membership. The responder sets `truncated` from an in-memory event log that is empty after restart, so an empty page can come from a peer whose saved head is newer. A KeyPackage reply carries no head.
 
 ## Decision Drivers
 
@@ -38,7 +38,7 @@ When no other active member remains, the daemon retires the obligation under the
 
 ## Consequences
 
-A restarted committer does not seal because a timer fired or because a cold peer sent an empty page. New ciphertext stays withheld while a live removed leaf remains. If the three sends find no peer, the leaf stays and new ciphertext stays withheld. The outbox and the lowest-admin rule stay as accepted in A09. This record stays Proposed until David accepts it. A09 may hold it beside the accepted rekey record.
+A restarted committer does not seal because a timer fired or because a cold peer sent an empty page. New ciphertext stays withheld while a live removed leaf remains. If the three sends find no peer, the leaf stays and new ciphertext stays withheld. The outbox and the lowest-admin rule stay as accepted in A09. This record stays Proposed until David accepts it. It is not folded.
 
 ## Validation
 
