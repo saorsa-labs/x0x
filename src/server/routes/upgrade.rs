@@ -442,6 +442,11 @@ fn log_apply_result(
         Err(e @ x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }) => {
             tracing::info!(%trigger, "Upgrade waits: {e}");
         }
+        // D194 (review S3): reported at WARN (every 10 minutes while it
+        // lasts), not counted as a failure.
+        Err(e @ x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => {
+            tracing::warn!(%trigger, "Upgrade waits for disk space: {e}");
+        }
         Err(e) => {
             tracing::error!(error = %e, %trigger, "Upgrade failed: {e}");
         }
@@ -533,14 +538,31 @@ fn attempt_must_not_apply(inner: &RolloutInner, version: &str) -> Option<&'stati
     }
 }
 
+/// A wait, not a failure: the shared install waits for a participant, or
+/// staging would break the 1 GiB disk reserve (D194, review S3). No backoff
+/// is counted; a waiter checks again.
 fn is_participant_wait(
     result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
 ) -> bool {
     matches!(
         result,
-        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. })
+        Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }
+            | x0x::upgrade::UpgradeError::InsufficientDisk { .. })
     )
 }
+
+/// How long a waiter pauses before it tries a waiting release again.
+fn wait_pause(
+    result: &Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) -> Duration {
+    match result {
+        Err(x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => DISK_RECHECK,
+        _ => x0x::upgrade::participants::PARTICIPANT_RECHECK,
+    }
+}
+
+/// How often a waiter checks the disk reserve again after insufficient_disk.
+const DISK_RECHECK: Duration = Duration::from_secs(10 * 60);
 
 impl RolloutScheduler {
     /// Load the persisted state and build the scheduler.
@@ -889,7 +911,10 @@ impl RolloutScheduler {
             }
             // A shared install that waits for another participant is a
             // wait, not a failed apply (#1106 review F2).
-            Err(x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }) => {}
+            Err(
+                x0x::upgrade::UpgradeError::ParticipantsNotDue { .. }
+                | x0x::upgrade::UpgradeError::InsufficientDisk { .. },
+            ) => {}
             Ok(x0x::upgrade::UpgradeResult::RolledBack { .. }) | Err(_) => {
                 inner
                     .failed
@@ -982,7 +1007,7 @@ impl RolloutScheduler {
                 publish_participant_record(&self.env, &inner);
             }
             let stopped = tokio::select! {
-                _ = tokio::time::sleep(x0x::upgrade::participants::PARTICIPANT_RECHECK) => false,
+                _ = tokio::time::sleep(wait_pause(&result)) => false,
                 changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
             };
             if stopped {
@@ -2017,6 +2042,24 @@ pub(in crate::server) async fn apply_upgrade(
         .with_shared_install_gate(http_install_gate(&state.data_dir, staged.bypass.is_some()));
 
     match upgrader.apply_upgrade_prepared(&release.manifest).await {
+        Err(e @ x0x::upgrade::UpgradeError::InsufficientDisk { .. }) => {
+            // D194 (review S3): not a failure; a waiter checks again.
+            rollout
+                .ensure_waiter(&release.manifest, RolloutTrigger::Manual, sender)
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "applied": false,
+                    "staged": true,
+                    "insufficient_disk": true,
+                    "reason": e.to_string(),
+                    "version": release.manifest.version,
+                    "current_version": env!("CARGO_PKG_VERSION")
+                })),
+            )
+        }
         Err(x0x::upgrade::UpgradeError::ParticipantsNotDue {
             release: due_release,
             pending,
