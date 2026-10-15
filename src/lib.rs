@@ -2739,61 +2739,95 @@ fn plan_subject_cert_recovery(
     CertRecoveryPlan { found, fetches }
 }
 
-/// How many subject attempt-stamps the recovery map keeps.
+/// How many recovery streams keep an exact next index.
 ///
-/// A stamp is written only after a subject is chosen for a fetch. A
-/// subject that has no stamp stays ahead of one that has a stamp, so
-/// dropping an old stamp cannot hide a subject that has never been
-/// fetched.
-const MAX_CERT_RECOVERY_ATTEMPT_STAMPS: usize = 64;
+/// A stream is one ordered miss list. A stream that no longer has a slot
+/// keeps its next index, so the next visit does not start again at the
+/// first subject.
+const MAX_CERT_RECOVERY_STREAMS: usize = 64;
+
+fn recovery_stream_fingerprint<T, K>(misses: &[T], key_of: &impl Fn(&T) -> K) -> u64
+where
+    K: std::hash::Hash,
+{
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    misses.len().hash(&mut hasher);
+    for miss in misses {
+        key_of(miss).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn recovery_stream_start(
+    progress: &announce_blob::CertRecoveryAttempts,
+    fingerprint: u64,
+    len: usize,
+) -> usize {
+    let next = progress
+        .cursors
+        .get(&fingerprint)
+        .copied()
+        .unwrap_or(progress.fallback_next);
+    (next as usize) % len
+}
+
+fn remember_recovery_stream(
+    progress: &mut announce_blob::CertRecoveryAttempts,
+    fingerprint: u64,
+    next: u64,
+) {
+    if let std::collections::hash_map::Entry::Occupied(mut entry) =
+        progress.cursors.entry(fingerprint)
+    {
+        entry.insert(next);
+        progress.cursor_order.retain(|item| *item != fingerprint);
+        progress.cursor_order.push_back(fingerprint);
+        return;
+    }
+    while progress.cursors.len() >= MAX_CERT_RECOVERY_STREAMS {
+        let Some(old) = progress.cursor_order.pop_front() else {
+            break;
+        };
+        if let Some(cursor) = progress.cursors.remove(&old) {
+            // Keep the discarded stream's place. A later visit continues
+            // here instead of looking like a subject that was never tried.
+            progress.fallback_next = cursor;
+        }
+    }
+    progress.cursors.insert(fingerprint, next);
+    progress.cursor_order.push_back(fingerprint);
+}
 
 /// The next misses that may start a fetch.
 ///
-/// Subjects with no stamp come first, then the oldest stamp. Equal stamps
-/// keep the order of `misses`. Each chosen subject records one attempt,
-/// including when the fetch then fails. The map drops the oldest stamp
-/// once it holds more than [`MAX_CERT_RECOVERY_ATTEMPT_STAMPS`] subjects.
+/// The place is an index into this ordered list. The same list continues
+/// there on the next call. A different list has its own index, so a
+/// shorter batch cannot rewind a longer one. A fetch that fails still
+/// advances the index. Dropping an old list keeps that index.
 fn select_recovery_misses<T, K>(
     misses: &[T],
     key_of: impl Fn(&T) -> K,
-    next_stamp: &mut u64,
-    last_attempt: &mut std::collections::HashMap<K, u64>,
+    progress: &mut announce_blob::CertRecoveryAttempts,
     budget: usize,
 ) -> Vec<T>
 where
     T: Clone,
-    K: Copy + Eq + std::hash::Hash,
+    K: std::hash::Hash,
 {
     if misses.is_empty() || budget == 0 {
         return Vec::new();
     }
-    let mut order: Vec<(u64, usize)> = misses
-        .iter()
-        .enumerate()
-        .map(|(index, miss)| {
-            let stamp = last_attempt.get(&key_of(miss)).copied().unwrap_or(0);
-            (stamp, index)
-        })
-        .collect();
-    order.sort_by_key(|(stamp, index)| (*stamp, *index));
-    *next_stamp = next_stamp.saturating_add(1);
-    let stamp = *next_stamp;
+    let fingerprint = recovery_stream_fingerprint(misses, &key_of);
+    let start = recovery_stream_start(progress, fingerprint, misses.len());
     let mut chosen = Vec::new();
-    for (_, index) in order.into_iter().take(budget) {
-        let miss = misses[index].clone();
-        last_attempt.insert(key_of(&miss), stamp);
-        chosen.push(miss);
+    let mut offset = 0usize;
+    while chosen.len() < budget && offset < misses.len() {
+        chosen.push(misses[(start + offset) % misses.len()].clone());
+        offset += 1;
     }
-    while last_attempt.len() > MAX_CERT_RECOVERY_ATTEMPT_STAMPS {
-        let oldest = last_attempt
-            .iter()
-            .min_by_key(|(_, attempt)| *attempt)
-            .map(|(key, _)| *key);
-        let Some(oldest) = oldest else {
-            break;
-        };
-        last_attempt.remove(&oldest);
-    }
+    let next = (start + chosen.len()) % misses.len();
+    remember_recovery_stream(progress, fingerprint, u64::try_from(next).unwrap_or(0));
     chosen
 }
 
@@ -2810,9 +2844,9 @@ fn provenanced_blob_cert(
 }
 
 /// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
-/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. A subject
-/// that has not been fetched is chosen before one that has, so a shorter
-/// batch cannot hide a subject an earlier batch left untried (#1116).
+/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. Each miss
+/// list keeps its own place, and trimming that record does not send the
+/// next fetch back to subjects that were already tried (#1116).
 async fn finish_subject_cert_recovery(
     mut plan: CertRecoveryPlan,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -2840,15 +2874,18 @@ async fn finish_subject_cert_recovery(
     }
     let budgeted = {
         let mut attempts = cache.lock_cert_recovery_attempts();
-        let mut next_stamp = attempts.next_stamp;
         let budgeted = select_recovery_misses(
             &misses,
             |(subject, _announced)| *subject,
-            &mut next_stamp,
-            &mut attempts.last_attempt,
+            &mut attempts,
             MAX_CERT_RECOVERY_SUBJECTS,
         );
-        attempts.next_stamp = next_stamp;
+        #[cfg(test)]
+        {
+            for (subject, _) in &budgeted {
+                attempts.attempted.insert(*subject);
+            }
+        }
         budgeted
     };
     if budgeted.is_empty() {
@@ -32691,21 +32728,18 @@ mod tests {
     #[test]
     fn recovery_miss_budget_retains_the_untried_tail_1116() {
         let misses: Vec<u8> = (0..9).collect();
-        let mut next_stamp = 0u64;
-        let mut last_attempt = std::collections::HashMap::new();
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
         let first = select_recovery_misses(
             &misses,
             |subject| *subject,
-            &mut next_stamp,
-            &mut last_attempt,
+            &mut progress,
             MAX_CERT_RECOVERY_SUBJECTS,
         );
         assert_eq!(first, (0..8).collect::<Vec<_>>());
         let second = select_recovery_misses(
             &misses,
             |subject| *subject,
-            &mut next_stamp,
-            &mut last_attempt,
+            &mut progress,
             MAX_CERT_RECOVERY_SUBJECTS,
         );
         assert_eq!(second.first().copied(), Some(8));
@@ -32721,23 +32755,20 @@ mod tests {
     fn alternating_recovery_batches_still_reach_the_ninth_miss_1116() {
         let nine: Vec<u8> = (0..9).collect();
         let one = [0u8];
-        let mut next_stamp = 0u64;
-        let mut last_attempt = std::collections::HashMap::new();
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
         let mut fetched = std::collections::HashSet::new();
         for _round in 0..12 {
             let chosen = select_recovery_misses(
                 &nine,
                 |subject| *subject,
-                &mut next_stamp,
-                &mut last_attempt,
+                &mut progress,
                 MAX_CERT_RECOVERY_SUBJECTS,
             );
             fetched.extend(chosen);
             let chosen = select_recovery_misses(
                 &one,
                 |subject| *subject,
-                &mut next_stamp,
-                &mut last_attempt,
+                &mut progress,
                 MAX_CERT_RECOVERY_SUBJECTS,
             );
             fetched.extend(chosen);
@@ -32746,7 +32777,7 @@ mod tests {
             fetched.contains(&8),
             "a one-miss batch hid subject 8; fetched {fetched:?}"
         );
-        assert!(last_attempt.len() <= MAX_CERT_RECOVERY_ATTEMPT_STAMPS);
+        assert!(progress.cursors.len() <= MAX_CERT_RECOVERY_STREAMS);
     }
 
     /// #1116: failed fetches still record the attempt. Alternating a
@@ -32772,6 +32803,76 @@ mod tests {
         assert!(
             blobs.cert_recovery_was_attempted_for_testing(&ninth),
             "a one-miss batch hid the ninth subject"
+        );
+    }
+
+    /// #1116: a miss list longer than the attempt map must not return to
+    /// its prefix. Call 9 of a fixed 73-subject batch must not select
+    /// subjects 0–7 while subject 72 has never been selected.
+    #[test]
+    fn fixed_batch_past_the_attempt_map_still_reaches_the_tail_1116() {
+        let misses: Vec<u16> = (0..73).collect();
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        let mut seen = std::collections::HashSet::new();
+        for call in 0..128 {
+            let chosen = select_recovery_misses(
+                &misses,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            if call == 9 && !seen.contains(&72) {
+                assert_ne!(
+                    chosen,
+                    (0..8).collect::<Vec<_>>(),
+                    "call 9 returned to subjects 0-7 before subject 72"
+                );
+            }
+            seen.extend(chosen);
+        }
+        assert!(
+            seen.contains(&72),
+            "subject 72 was never selected; selected {}",
+            seen.len()
+        );
+        assert!(
+            seen.iter().any(|subject| *subject > 7),
+            "no subject past the evicted prefix was selected"
+        );
+    }
+
+    /// #1116: eight unrelated full batches must not evict the place of a
+    /// nine-subject batch. Its ninth subject is selected within 12 cycles.
+    #[test]
+    fn unrelated_batches_do_not_hide_the_ninth_subject_1116() {
+        let nine: Vec<u16> = (0..9).collect();
+        let others: Vec<Vec<u16>> = (0..8)
+            .map(|batch| (100 + batch * 8..100 + (batch + 1) * 8).collect())
+            .collect();
+        let mut progress = announce_blob::CertRecoveryAttempts::default();
+        let mut seen = std::collections::HashSet::new();
+        for _cycle in 0..12 {
+            let chosen = select_recovery_misses(
+                &nine,
+                |subject| *subject,
+                &mut progress,
+                MAX_CERT_RECOVERY_SUBJECTS,
+            );
+            seen.extend(chosen);
+            for batch in &others {
+                let chosen = select_recovery_misses(
+                    batch,
+                    |subject| *subject,
+                    &mut progress,
+                    MAX_CERT_RECOVERY_SUBJECTS,
+                );
+                seen.extend(chosen);
+            }
+        }
+        assert!(
+            seen.contains(&8),
+            "unrelated batches hid subject 8; selected {}",
+            seen.len()
         );
     }
 

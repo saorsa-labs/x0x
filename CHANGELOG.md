@@ -258,9 +258,10 @@ All notable changes to this project will be documented in this file.
   rename stays pending, and the next call writes those same bytes. A
   failure after the rename is not queued again. When the discovery cache
   has no subject certificate, every distinct cached blob is used. The
-  eight-fetch budget applies only to a miss. A subject that has not been
-  fetched is chosen before a subject that has. A shorter batch does not
-  hide a subject that an earlier batch left untried. An incomplete snapshot
+  eight-fetch budget applies only to a miss. Each miss list keeps its own
+  place. A shorter list does not move that place. Trimming the record does
+  not send the next fetch back to subjects that were already tried. An
+  incomplete snapshot
   is not written, so a restart cannot admit a revoked agent from it. The
   next start loads the live file. Placing a
   readable file on the live path is a rebuild for the next start. It does

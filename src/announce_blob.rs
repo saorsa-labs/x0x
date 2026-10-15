@@ -23,7 +23,9 @@
 //! Disk persistence: bincode file under the daemon data dir, loaded at
 //! startup, saved on insert. Bounded at `BLOB_CACHE_MAX_ENTRIES` (LRU).
 
-use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -190,11 +192,18 @@ struct LruEntry {
     access_counter: u64,
 }
 
-/// Fetch attempts for revocation certificate recovery (#1116).
+/// Place of each certificate-recovery miss list (#1116).
+///
+/// `cursors` holds at most 64 streams. When a stream loses its slot, its
+/// next index is kept in `fallback_next`. A later visit continues from
+/// that index instead of the first subject.
 #[derive(Debug, Default)]
 pub(crate) struct CertRecoveryAttempts {
-    pub(crate) next_stamp: u64,
-    pub(crate) last_attempt: HashMap<identity::AgentId, u64>,
+    pub(crate) cursors: HashMap<u64, u64>,
+    pub(crate) cursor_order: VecDeque<u64>,
+    pub(crate) fallback_next: u64,
+    #[cfg(test)]
+    pub(crate) attempted: HashSet<identity::AgentId>,
 }
 
 /// The blob cache: in-memory `HashMap` + optional disk persistence.
@@ -207,10 +216,9 @@ pub struct AnnounceBlobCache {
     stats_misses: AtomicU64,
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
-    /// Subjects that already spent a certificate fetch, with the stamp of
-    /// that attempt. v1 and v2 share the map. A subject with no stamp is
-    /// chosen before a subject that has one, so a short batch cannot hide
-    /// a subject an earlier batch left untried (#1116).
+    /// Next index of each revocation miss list. v1 and v2 share it. A
+    /// shorter list does not move a longer list, and dropping an old list
+    /// keeps that list's next index (#1116).
     cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
     #[cfg(test)]
     bounded_fetch_fails: AtomicBool,
@@ -388,8 +396,8 @@ impl AnnounceBlobCache {
         subject: &identity::AgentId,
     ) -> bool {
         self.lock_cert_recovery_attempts()
-            .last_attempt
-            .contains_key(subject)
+            .attempted
+            .contains(subject)
     }
 
     /// One verified fetch for a revocation subject, bounded by the blob
