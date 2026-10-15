@@ -30,7 +30,7 @@ use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
-use x0x::network::{NetworkConfig, NetworkEvent, PeerAdmission};
+use x0x::network::{DisconnectReason, NetworkConfig, NetworkEvent, PeerAdmission};
 use x0x::Agent;
 
 /// Upper bound for one `join_network` call in a normal topology. Phase 1
@@ -630,14 +630,36 @@ async fn issue1321_cached_cross_plane_peer_is_not_a_join_seed() {
 /// The other ordering: no slow cached dial, so Phase 1 ends as soon as the
 /// cross-plane dial returns and the JOIN can start before either plane
 /// hello is processed. The peer must still not become a seed.
+///
+/// #1403: the testnet peer refuses prod before prod joins (a
+/// `PolicyRejection` tombstone, as after a first contact). So the test
+/// takes the long branch on every run: testnet closes each prod connection
+/// at accept, prod gets no hello and writes no tombstone, and each JOIN
+/// attempt answers and then loses its connection. Before #1403 the legacy
+/// grace clock could carry over from an earlier connection generation, and
+/// attempt 9 or 10 then joined through the refused peer (about 1 run in 6
+/// on this branch).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1321_cross_plane_peer_refused_after_phase1_is_not_a_join_seed() {
     install_join_capture();
     let dir = tempfile::tempdir().expect("tmpdir");
-    let (_testnet, testnet_peer, testnet_addr) =
+    let (testnet, testnet_peer, testnet_addr) =
         remote_agent(dir.path(), "testnet", Some("x0x.test.testnet")).await;
     let prod = build_agent(dir.path(), "prod", Some("x0x.test.prod")).await;
     cache_peer(&prod, testnet_peer, testnet_addr).await;
+
+    // The long branch: testnet already refused prod. Prod is not connected
+    // yet, so the transport disconnect can fail; the tombstone is written
+    // before it.
+    let prod_peer = ant_quic::PeerId(prod.machine_id().0);
+    let testnet_network = testnet.network().expect("testnet network");
+    let _ = testnet_network
+        .disconnect_with_reason(&prod_peer, DisconnectReason::PolicyRejection)
+        .await;
+    assert!(
+        testnet_network.is_reconnect_suppressed(prod_peer.0),
+        "scenario: testnet must hold a PolicyRejection tombstone for prod"
+    );
 
     let prod_network = prod.network().expect("prod network");
     let mut prod_events = prod_network.subscribe();

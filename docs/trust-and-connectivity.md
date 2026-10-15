@@ -268,7 +268,20 @@ peers, who drop it harmlessly):
 - **No hello** (pre-#206 code, open-plane embedders) → the peer is held
   out of gossip sets for a 10 s legacy grace window, then admitted. This
   keeps rolling upgrades from partitioning the fleet; full isolation
-  requires both sides on the new code.
+  requires both sides on the new code. The window counts per connection
+  generation (#1403): one connection must stay the transport winner, with
+  no hello, for the full 10 s. A new connection starts a new window, and
+  time while the peer is disconnected never counts. A winner change that
+  ant-quic has published (`Replaced`) also starts a new window, even when
+  ant-quic later restores the old connection with its old generation
+  number. Known gap (partial fix, decision D281; full fix in 0.49 with
+  [ant-quic#330](https://github.com/saorsa-labs/ant-quic/issues/330)): if
+  a new connection supersedes the old one, closes, and ant-quic restores
+  the old connection before it publishes `Replaced`, the gate cannot see
+  the change. ant-quic 0.27.60 does not bound that wait. The restored
+  connection can then use the window from its earlier winner period, and
+  if ant-quic later reads the old connection as live again, it sends no
+  `Replaced` at all.
 
 Until cleared, a peer is excluded from eager sets, membership keepalives,
 and CRDT sync targets, and its inbound gossip frames are dropped — the
