@@ -2373,3 +2373,257 @@ async fn startup_gates_every_group_before_either_send() -> Result<()> {
     );
     Ok(())
 }
+
+/// A peer who leaves before spending three sends must not block the seal
+/// while another survivor remains. The survivor keeps the sends already spent.
+#[tokio::test]
+async fn departed_startup_peer_stops_blocking_while_a_survivor_remains() -> Result<()> {
+    let (fixture, survivor) = startup_with_witness(&"d1".repeat(16)).await?;
+    let departed = x0x::identity::AgentId([0x21; 32]);
+    let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.add_member(
+            hex::encode(departed.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+    }
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    let head = saved_head(&fixture.state, &fixture.group_id).await;
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &survivor,
+        true,
+        catchup_page(&fixture.group_id, false, Some(head)),
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the departed peer must still block before the roster drops that row"
+    );
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.remove_member(
+            &hex::encode(departed.as_bytes()),
+            Some(hex::encode(fixture.state.agent.agent_id().as_bytes())),
+        );
+    }
+    for _ in 0..5 {
+        retry_startup_self_leave_catchup(&fixture.state).await;
+    }
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "a departed peer must not keep the wait open while a survivor remains"
+    );
+    assert_ne!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        1,
+        "the survivor must keep the one send already spent"
+    );
+    Ok(())
+}
+
+/// B's matching head is kept while A's page stream is open. A's later
+/// terminal page can then seal without a replay of B.
+#[tokio::test]
+async fn matching_head_is_kept_while_another_peers_page_is_open() -> Result<()> {
+    let (fixture, peer_b) = startup_with_witness(&"d2".repeat(16)).await?;
+    let peer_a = x0x::identity::AgentId([0x31; 32]);
+    let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.add_member(
+            hex::encode(peer_a.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+    }
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    let head = saved_head(&fixture.state, &fixture.group_id).await;
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &peer_a,
+        true,
+        catchup_page(&fixture.group_id, true, Some(head.clone())),
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a truncated page must not seal"
+    );
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &peer_b,
+        true,
+        catchup_page(&fixture.group_id, false, Some(head.clone())),
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "B's head must not seal while A's page stream is open"
+    );
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &peer_a,
+        true,
+        catchup_page(&fixture.group_id, false, Some(head)),
+    )
+    .await;
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "B's saved receipt must let the seal proceed when A's stream closes"
+    );
+    assert_ne!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT
+    );
+    Ok(())
+}
+
+/// The shared group-store protector withholds ciphertext while a startup
+/// peer still blocks. REST already returns conflict. The ratchet must not move.
+#[tokio::test]
+async fn startup_hold_refuses_the_group_store_protector() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"d3".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT
+    );
+    let before = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let guard = group.lock().await;
+        let bytes = guard.to_snapshot_bytes()?;
+        bytes
+    };
+    let info = fixture
+        .state
+        .named_groups
+        .read()
+        .await
+        .get(&fixture.group_id)
+        .expect("group")
+        .clone();
+    let protector = crate::server::routes::stores::treekem_task_list_protector(
+        &fixture.state,
+        &fixture.group_id,
+        &info,
+    )
+    .expect("shared TreeKEM protector");
+    let signing =
+        x0x::kv::AuthorSigning::from_keypair(fixture.state.agent.identity().agent_keypair())
+            .expect("signing");
+    let sealed = protector.seal_record(
+        &signing,
+        x0x::kv::KvMutationKind::Control,
+        &x0x::kv::KvStoreId::new([9; 32]),
+        b"withheld-control",
+        false,
+    )
+    .await;
+    assert!(
+        matches!(
+            sealed,
+            Err(x0x::kv::KvError::SecureRecord(ref message)) if message.contains("withheld")
+        ),
+        "the protector must withhold the control record: {sealed:?}"
+    );
+    let after = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let guard = group.lock().await;
+        let bytes = guard.to_snapshot_bytes()?;
+        bytes
+    };
+    assert_eq!(
+        before, after,
+        "a withheld seal must not advance the ratchet the removed member can still read"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before
+    );
+    Ok(())
+}
+
+/// Two overlapping retries at two sends must not make a fourth helper call.
+/// The third attempt is reserved before the helper is awaited.
+#[tokio::test]
+async fn overlapping_startup_retries_cannot_exceed_the_send_bound() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"d4".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 2);
+    let helper_calls = |state: &AppState, group_id: &str| -> usize {
+        state
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|bytes| bytes.as_slice() == group_id.as_bytes())
+            .count()
+    };
+    assert_eq!(helper_calls(&fixture.state, &fixture.group_id), 2);
+    let pause = detached_send_test_seam::arm(&format!("treekem-catchup-page:{}", fixture.group_id));
+    let state = Arc::clone(&fixture.state);
+    let first = tokio::spawn(async move {
+        retry_startup_self_leave_catchup(&state).await;
+    });
+    wait_until(|| pause.reached()).await;
+    assert!(
+        pause.reached(),
+        "the third send must park inside the helper"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        3,
+        "the attempt is reserved before the helper returns"
+    );
+    assert_eq!(helper_calls(&fixture.state, &fixture.group_id), 2);
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(
+        helper_calls(&fixture.state, &fixture.group_id),
+        2,
+        "an overlapping retry must not send once the bound is reserved"
+    );
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    drop(pause);
+    first.await.expect("first retry");
+    assert_eq!(helper_calls(&fixture.state, &fixture.group_id), 3);
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
+    Ok(())
+}

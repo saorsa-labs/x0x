@@ -139,10 +139,13 @@ All notable changes to this project will be documented in this file.
   An empty page, a truncated page, a missing hash, and a KeyPackage reply do
   not clear that peer. When every asked peer has reported the saved head or
   has spent its three sends, the wait ends and the designated admin may seal.
-  While a peer still has a send remaining, new TreeKEM ciphertext is withheld.
-  When no other active member remains, startup seals. Historical Removed rows
-  with no live leaf do not start the wait. `T-self-leave-catchup-before-seal`
-  (Proposed, slot A07).
+  While a peer still has a send remaining, new TreeKEM ciphertext is withheld
+  on REST encrypt and on the group-store protector. A peer who leaves the
+  roster is dropped, and a survivor keeps the sends already spent. A terminal
+  matching head is recorded while another peer's page stream is open. The
+  send is reserved before the request is awaited. When no other active member
+  remains, startup seals. Historical Removed rows with no live leaf do not
+  start the wait. `T-self-leave-catchup-before-seal` (Proposed, slot A07).
 
 ## [v0.48.0] - 2026-10-13
 
