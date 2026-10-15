@@ -445,3 +445,90 @@ fn gui_api_path_checker_accepts_concatenated_parameterized_paths() {
         "concatenated and query-bearing GUI paths should normalize to registered endpoints"
     );
 }
+
+/// Exercise the actual owner API helper with offline HTTP and tab-storage fakes.
+/// Bounds auth recovery without retrying successful mutations or other failures.
+#[test]
+fn gui_owner_token_recovery_is_bounded() {
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(r#"const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const html=fs.readFileSync(process.env.X0X_GUI_HTML_PATH,'utf8');
+const start=html.indexOf('function readOwnerToken()');
+const end=html.indexOf('const DEFAULT_SYMPHONY_DAEMON_URL=',start);
+assert(start>=0&&end>start,'owner API helper section exists');
+const source=html.slice(start,end);
+const ok={status:200,data:{ok:true}};
+const unauthorized={status:401,data:{ok:false,error:'invalid bearer'}};
+const durable={status:403,data:{ok:false,error:'requires the durable API token'}};
+const denied={status:403,data:{ok:false,error:'blocked'}};
+const cases=[
+ {name:'valid saved owner',owner:'owner',responses:[ok],tokens:['owner'],saved:'owner'},
+ {name:'ordinary session',responses:[ok],tokens:['session']},
+ {name:'rejected owner falls back to session',owner:'stale',responses:[unauthorized,ok],tokens:['stale','session']},
+ {name:'rejected owner prompts once when durable required',owner:'stale',responses:[unauthorized,durable,ok],answers:[' fresh '],tokens:['stale','session','fresh'],saved:'fresh'},
+ {name:'rejected prompted token is forgotten',responses:[durable,unauthorized],answers:['wrong'],tokens:['session','wrong'],status:401},
+ {name:'cancel after rejected owner',owner:'stale',responses:[unauthorized,durable],answers:[null],tokens:['stale','session'],status:403},
+ {name:'blank after rejected owner',owner:'stale',responses:[unauthorized,durable],answers:['  '],tokens:['stale','session'],status:403},
+ {name:'generic forbidden is not retried',owner:'owner',responses:[denied],tokens:['owner'],saved:'owner',status:403},
+ {name:'network failure is not retried',owner:'owner',responses:[{networkError:true}],tokens:['owner'],saved:'owner',status:null},
+ {name:'server failure is not retried',owner:'owner',responses:[{status:500,data:{ok:false}}],tokens:['owner'],saved:'owner',status:500},
+ {name:'invalid session does not prompt',responses:[unauthorized],tokens:['session'],status:401},
+ {name:'newer owner survives stale response',owner:'stale',responses:[{...unauthorized,install:'newer'},ok],tokens:['stale','session'],saved:'newer'},
+ {name:'newer owner survives rejected prompt response',responses:[durable,{...unauthorized,install:'newer'}],answers:['wrong'],tokens:['session','wrong'],saved:'newer',status:401},
+ {name:'unavailable sessionStorage does not break prompt',responses:[durable,ok],answers:['fresh'],tokens:['session','fresh'],saved:'fresh',storageThrows:true},
+ {name:'prompted token network failure does not retry',responses:[durable,{networkError:true}],answers:['fresh'],tokens:['session','fresh'],saved:'fresh',status:null},
+ {name:'rejected fallback session stops',owner:'stale',responses:[unauthorized,unauthorized],tokens:['stale','session'],status:401},
+ {name:'successful HTTP refusal does not retry',owner:'owner',responses:[{status:200,data:{ok:false,error:'not applied'}}],tokens:['owner'],saved:'owner'},
+];
+(async()=>{
+ let failed=0;
+ for(const c of cases){
+  try{
+   const stored=new Map(c.owner?[['x0x_owner_token',c.owner]]:[]);
+   const calls=[],prompts=[];
+   let context;
+   const storage={
+    getItem(k){if(c.storageThrows)throw Error('storage unavailable');return stored.get(k)||null},
+    setItem(k,v){if(c.storageThrows)throw Error('storage unavailable');stored.set(k,v)},
+    removeItem(k){if(c.storageThrows)throw Error('storage unavailable');stored.delete(k)},
+   };
+   context=vm.createContext({SESSION_TOKEN:'session',BASE:'http://127.0.0.1:12700',sessionStorage:storage,
+    prompt(message){prompts.push(message);assert(prompts.length<2,'at most one prompt');return(c.answers||[])[prompts.length-1]},
+    async fetch(url,opt){
+     const i=calls.length;calls.push({url,opt});
+     assert(i<c.responses.length,'no unexpected retry');
+     const response=c.responses[i];
+     if(response.install){context.installedOwner=response.install;vm.runInContext('OWNER_TOKEN=installedOwner',context);stored.set('x0x_owner_token',response.install)}
+     if(response.networkError)throw Error('offline');
+     return{status:response.status,ok:response.status>=200&&response.status<300,json:async()=>({...response.data})};
+    }
+   });
+   vm.runInContext(source,context);
+   const result=await vm.runInContext('ownerApi("/owner-action",{method:"POST",body:"requested-change"})',context);
+   assert.deepEqual(calls.map(x=>x.opt.headers.Authorization?.replace('Bearer ','')),c.tokens,'bearers and bounded request count');
+   assert.equal(prompts.length,(c.answers||[]).length,'prompt count');
+   assert.equal(vm.runInContext('OWNER_TOKEN',context),c.saved||'','in-memory token');
+   if(!c.storageThrows)assert.equal(stored.get('x0x_owner_token')||'',c.saved||'','tab token');
+   assert.equal(result?result._http_status:null,c.status===undefined?200:c.status,'final status');
+   for(const call of calls){assert.equal(call.url,'http://127.0.0.1:12700/owner-action');assert.equal(call.opt.method,'POST');assert.equal(call.opt.body,'requested-change')}
+   console.log('PASS '+c.name);
+  }catch(error){failed++;console.error('FAIL '+c.name+': '+error.message)}
+ }
+ console.log((cases.length-failed)+' passed; '+failed+' failed');
+ process.exitCode=failed?1:0;
+})();
+"#)
+        .env(
+            "X0X_GUI_HTML_PATH",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/gui/x0x-gui.html"),
+        )
+        .output()
+        .expect("Node is required for the offline GUI behavior check");
+    assert!(
+        output.status.success(),
+        "owner-token behavior check failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
