@@ -134,8 +134,10 @@ All notable changes to this project will be documented in this file.
   Startup no longer waits 250 ms and then seals. When a removed member still
   has a live leaf and another active member remains, the lowest active admin
   asks each of those members for catch-up. Each peer may be asked three
-  times. A fourth peer is still asked. A later retry, including the network
+  times. A fourth peer is still asked.   A later retry, including the network
   join and a 30 second backoff, asks a peer that still has a send remaining.
+  A peer added on a later pass still receives the asks that remain. The
+  backoff continues until every current peer has spent its three sends.
   An empty page, a truncated page, a missing hash, and a KeyPackage reply do
   not clear that peer. When every asked peer has reported the saved head or
   has spent its three sends, the wait ends and the designated admin may seal.

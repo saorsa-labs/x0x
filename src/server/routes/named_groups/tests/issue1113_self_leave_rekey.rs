@@ -2626,3 +2626,148 @@ async fn overlapping_startup_retries_cannot_exceed_the_send_bound() -> Result<()
     assert_eq!(self_leave_startup_send_count(&fixture.group_id), 3);
     Ok(())
 }
+
+async fn add_roster_peer(state: &AppState, group_id: &str, byte: u8) {
+    let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut groups = state.named_groups.write().await;
+    let info = groups.get_mut(group_id).expect("group");
+    info.add_member(
+        hex::encode(x0x::identity::AgentId([byte; 32]).as_bytes()),
+        x0x::groups::GroupRole::Member,
+        Some(admin_hex),
+        None,
+    );
+}
+
+/// Wall-clock wait. `tokio::time::sleep` does not advance while the clock is paused.
+async fn yield_until(mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !ready() && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    ready()
+}
+
+/// One new roster peer before each of three timer passes must not freeze the
+/// later peers below three asks. After the roster stops changing, the same
+/// backoff spends what remains and the designated admin seals.
+#[tokio::test]
+async fn peers_added_across_backoff_passes_seal_once_every_budget_is_spent() -> Result<()> {
+    let (fixture, _witness) = startup_with_witness(&"e1".repeat(16)).await?;
+    fixture
+        .state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    startup_self_leave_rekey(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        1,
+        "startup asks the first peer once and arms the backoff"
+    );
+    retry_startup_self_leave_catchup(&fixture.state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        2,
+        "the network-join retry spends the first peer's second attempt"
+    );
+    let armed = std::time::Instant::now();
+    while armed.elapsed() < std::time::Duration::from_millis(50) {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+
+    add_roster_peer(&fixture.state, &fixture.group_id, 0x41).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(
+        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 4).await,
+        "the first timer pass must ask the new peer"
+    );
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 4);
+
+    add_roster_peer(&fixture.state, &fixture.group_id, 0x42).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(
+        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 6).await,
+        "the second timer pass must ask the peer added before it"
+    );
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 6);
+
+    add_roster_peer(&fixture.state, &fixture.group_id, 0x43).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(
+        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 9).await,
+        "three timer passes leave the newest peers short of three asks"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        9,
+        "counts after three passes are A=3, B=3, C=2, D=1"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "remaining attempts must hold the old epoch"
+    );
+    assert_eq!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "REST encrypt stays 409 while a later peer still has an attempt"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(
+        yield_until(|| self_leave_startup_send_count(&fixture.group_id) >= 11).await,
+        "a fixed roster must keep the backoff running"
+    );
+    assert_eq!(self_leave_startup_send_count(&fixture.group_id), 11);
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "one peer still has an attempt, so the epoch must stay"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let sealed = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let spent = self_leave_startup_send_count(&fixture.group_id) == 12;
+            let advanced =
+                live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before;
+            if spent && advanced {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    assert!(
+        sealed,
+        "the fixed roster must seal once every eligible peer has spent three sends; sends {}, epoch {}",
+        self_leave_startup_send_count(&fixture.group_id),
+        live_epoch(&fixture.state, &fixture.group_id).await
+    );
+    assert_ne!(
+        encrypt_status(&fixture.state, &fixture.group_id).await,
+        StatusCode::CONFLICT,
+        "ciphertext must not stay withheld after every attempt is spent"
+    );
+    let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let quiet = std::time::Instant::now();
+    while quiet.elapsed() < std::time::Duration::from_millis(50) {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.group_id),
+        12,
+        "a later interval must not ask a peer that has spent three sends"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        epoch_after
+    );
+    Ok(())
+}

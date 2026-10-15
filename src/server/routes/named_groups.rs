@@ -22922,6 +22922,12 @@ fn self_leave_startup_ready_flag() -> &'static std::sync::atomic::AtomicBool {
     READY.get_or_init(|| std::sync::atomic::AtomicBool::new(true))
 }
 
+fn self_leave_startup_backoff_running() -> &'static std::sync::atomic::AtomicBool {
+    use std::sync::OnceLock;
+    static RUNNING: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    RUNNING.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
 /// Block live self-leave seals until [`startup_self_leave_rekey`] has
 /// installed every startup obligation. Tests leave this ready.
 pub(in crate::server) fn self_leave_startup_hold_for_gate_install() {
@@ -24309,28 +24315,73 @@ pub(in crate::server) async fn startup_self_leave_rekey(state: &Arc<AppState>) {
 
 /// Later sends after the first startup attempt.
 ///
-/// The network-join path calls this once. The backoff task calls it until
-/// each peer has spent its three sends. A peer that comes back inside that
-/// bound is asked again. When no peer still blocks, the rekey may seal.
+/// One task sleeps, then asks again, while any current peer still has an
+/// attempt left. A peer added on a later pass keeps the attempts that
+/// remain. There is no second global cap. The per-peer bound ends the
+/// wait. The first action is the sleep, so arming the task does not send
+/// immediately.
 fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
+    if !arm_startup_catchup_backoff() {
+        return;
+    }
     tokio::spawn(async move {
-        for _ in 0..SELF_LEAVE_STARTUP_CATCHUP_SENDS {
+        loop {
             tokio::time::sleep(SELF_LEAVE_STARTUP_CATCHUP_BACKOFF).await;
             retry_startup_self_leave_catchup(&state).await;
+            if startup_backoff_still_needed(&state).await {
+                continue;
+            }
+            // Drop the flag, then look again. A peer who joined in that
+            // window must not lose the attempts that remain.
+            self_leave_startup_backoff_running().store(false, std::sync::atomic::Ordering::SeqCst);
+            if startup_backoff_still_needed(&state).await && arm_startup_catchup_backoff() {
+                continue;
+            }
+            break;
         }
     });
+}
+
+fn arm_startup_catchup_backoff() -> bool {
+    self_leave_startup_backoff_running()
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+/// True when a current startup plan still has a peer under the send bound.
+///
+/// The roster is reconciled first. A peer who left does not keep the task
+/// alive. A peer who joined is enrolled at zero sends and does keep it alive.
+async fn startup_backoff_still_needed(state: &AppState) -> bool {
+    let plans = startup_self_leave_plans(state).await;
+    install_startup_self_leave_gates(&plans);
+    plans
+        .iter()
+        .any(|plan| self_leave_startup_open(&plan.group_key))
 }
 
 /// Ask again after reconnect, and ask a peer that was not in the first set.
 ///
 /// A peer that still has a send remaining is asked. A peer that has spent
-/// its three sends is not. When no peer still blocks, the following rekey
-/// may seal.
+/// its three sends is not. When a peer still blocks and the backoff task
+/// is not running, this schedules it. When no peer still blocks, the
+/// following rekey may seal.
 pub(in crate::server) async fn retry_startup_self_leave_catchup(state: &Arc<AppState>) {
     let plans = startup_self_leave_plans(state).await;
     install_startup_self_leave_gates(&plans);
     send_startup_self_leave_catchup(state, &plans).await;
     rekey_outstanding_treekem_self_leaves(state).await;
+    if plans
+        .iter()
+        .any(|plan| self_leave_startup_open(&plan.group_key))
+    {
+        schedule_startup_catchup_backoff(Arc::clone(state));
+    }
 }
 
 /// How many roster-removed leaves one pass will commit.
