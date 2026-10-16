@@ -274,10 +274,9 @@ struct LinkState {
     generation: u64,
     ordinal: u64,
     closed: Arc<AtomicBool>,
-    /// Set when one endpoint's winner disagrees with [`Self::generation`].
-    /// The named endpoint reads `generation`; the other endpoint still
-    /// reads [`Self::generation`]. Models a one-sided supersede
-    /// (ant-quic#332) without a wire change.
+    /// Set when one endpoint's winner moved and the other end did not
+    /// (ant-quic#332). Sends from the named endpoint are refused. The other
+    /// endpoint still sends on [`Self::generation`].
     one_sided: Option<(Key, u64)>,
     /// Virtual time of the last admitted send from each end.
     /// Index 0 is the lower key of the pair.
@@ -520,6 +519,36 @@ impl SimFabric {
             }
             None => false,
         }
+    }
+
+    /// #1419 test hook: move the winner on `viewer` only. `other` keeps
+    /// the shared generation. Sends from `viewer` are refused. Sends from
+    /// `other` are still admitted. No lifecycle event is published.
+    pub(crate) fn supersede_one_sided_for_test(
+        &self,
+        viewer: &PeerId,
+        other: &PeerId,
+    ) -> Option<(u64, u64)> {
+        let key = pair(viewer.0, other.0);
+        let mut state = self.lock();
+        let new = state.next_generation;
+        state.next_generation = new.saturating_add(1);
+        let link = state.links.get_mut(&key)?;
+        let old = link.generation;
+        link.one_sided = Some((viewer.0, new));
+        Some((old, new))
+    }
+
+    /// The one-ended winner, when one end has moved and the other has not.
+    pub(crate) fn one_sided_winner_for_test(
+        &self,
+        a: &PeerId,
+        b: &PeerId,
+    ) -> Option<([u8; 32], u64)> {
+        self.lock()
+            .links
+            .get(&pair(a.0, b.0))
+            .and_then(|link| link.one_sided)
     }
 
     /// Record a harness event (barrier, receipt, fault step) in the trace.
@@ -1135,11 +1164,16 @@ impl SimFabric {
         let admitted = state.links.get(&key).map(|link| {
             let sender = link.generation_for(from);
             let receiver = link.generation_for(to);
-            // A one-sided winner (the two ends disagree) refuses every
-            // send. A pinned send whose generation is no longer the
-            // sender's winner is refused the same way.
-            if sender != receiver || generation.is_some_and(|wanted| wanted != sender) {
+            // The endpoint whose winner moved cannot send. The other end
+            // still sends on the shared generation, so one direction can
+            // stay fresh (#1419). A pinned send on a generation that is
+            // not the sender's winner is refused either way.
+            let winner_moved = link.one_sided.is_some_and(|(who, _)| who == from);
+            let pinned_old = generation.is_some_and(|wanted| wanted != sender);
+            if winner_moved || pinned_old {
                 None
+            } else if sender != receiver {
+                Some((link.generation, link.ordinal))
             } else {
                 Some((sender, link.ordinal))
             }

@@ -58,8 +58,11 @@ All notable changes to this project will be documented in this file.
   holder still has it. A claim during the scheduler's cache wait or dial
   cancels that attempt. The scheduler waits out the same backoff. A sample
   that omits the peer keeps the warning and the backoff. A quiet connected
-  peer clears the warning and keeps the backoff. `ok` stays true. No wire
-  change. The plane gate is unchanged. ant-quic#332 remains the transport fix.
+  peer clears the warning and keeps the backoff. A one-ended winner refuses
+  that end's sends and still accepts the other end, and one repair restores
+  both directions. Both directions stale stays outside this fix. `ok` stays
+  true. No wire change. The plane gate is unchanged. ant-quic#332 remains
+  the transport fix.
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **The GUI recovers after a saved owner token is rejected (#1417).** An

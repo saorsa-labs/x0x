@@ -9077,6 +9077,116 @@ mod tests {
         c.try_shutdown().await.unwrap();
     }
 
+    /// #1419: a one-ended winner, not a healthy link with aged timestamps.
+    /// Sends from the moved end fail. The other end can still deliver, so
+    /// the link is degraded. One repair restores both directions.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_one_ended_winner_is_repaired_once() {
+        let plane = "issue1419-winner";
+        let fabric = sim::SimFabric::new(1420);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let b_link = Arc::clone(b.sim_link.as_ref().expect("sim link"));
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (old, new) = fabric
+            .supersede_one_sided_for_test(&peer_a, &peer_b)
+            .expect("the A-B link exists");
+        assert_ne!(old, new);
+        assert_eq!(
+            fabric.one_sided_winner_for_test(&peer_a, &peer_b),
+            Some((peer_a.0, new)),
+            "the fault moves A's winner only"
+        );
+        assert!(
+            a_link.send(&peer_b, b"\x7fab-blocked").is_err(),
+            "A cannot send on the moved winner"
+        );
+        b_link.send(&peer_a, b"\x7fba-live").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        b_link.send(&peer_a, b"\x7fba-fresh").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let samples = a.connected_link_ages().await;
+        assert_eq!(
+            one_sided_peer_ids_from(&samples),
+            vec![peer_b],
+            "A's send is stale and A's receive is fresh, so /health and /status are degraded"
+        );
+        assert_ne!(
+            a.try_connection_generation(&peer_b).unwrap(),
+            b.try_connection_generation(&peer_a).unwrap(),
+            "the two ends do not share a winner before the repair"
+        );
+
+        a.repair_one_sided_links(&samples).await;
+        assert_eq!(a.one_sided_warnings.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the repair dials once"
+        );
+        a.repair_one_sided_links(&samples).await;
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "a second pass inside the backoff does not dial"
+        );
+        assert_eq!(
+            fabric.one_sided_winner_for_test(&peer_a, &peer_b),
+            None,
+            "the re-dial installs one shared winner"
+        );
+        assert_eq!(
+            a.try_connection_generation(&peer_b).unwrap(),
+            b.try_connection_generation(&peer_a).unwrap(),
+            "both ends agree on that winner"
+        );
+
+        let since = fabric.now();
+        a_link
+            .send(&peer_b, b"\x7fhealed-ab")
+            .expect("A to B is admitted after the re-dial");
+        b_link
+            .send(&peer_a, b"\x7fhealed-ba")
+            .expect("B to A is admitted after the re-dial");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let a_to_b = fabric.delivered_from_since(&peer_a, since);
+        let b_to_a = fabric.delivered_from_since(&peer_b, since);
+        assert!(
+            a_to_b.iter().any(|(dst, _, _)| *dst == peer_b.0),
+            "A's bytes reach B after the re-dial (deliveries: {})",
+            a_to_b.len()
+        );
+        assert!(
+            b_to_a.iter().any(|(dst, _, _)| *dst == peer_a.0),
+            "B's bytes reach A after the re-dial (deliveries: {})",
+            b_to_a.len()
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+    }
+
     /// #1419: a sample that omits the peer is not recovery. A quiet
     /// connected peer is recovery: it clears the warning and keeps the
     /// 60 s timestamp. A finished repair drops its dial permit.
