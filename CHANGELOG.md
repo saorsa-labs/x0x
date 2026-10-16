@@ -210,6 +210,30 @@ All notable changes to this project will be documented in this file.
     returns. A re-invite on that process does not wait for the join
     poll's next tick.
 
+- **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
+  The roster removal left the leaf in place, so the leaver could derive later
+  epoch keys. The lowest active admin now commits the existing admin
+  `MemberRemoved` that carries `treekem_commit_b64` and `treekem_epoch`.
+  That commit runs only when the leave is still the stored head, the TreeKEM
+  queue is empty, and catch-up is not waiting on a later page. The daemon
+  saves the roster-only leave and the removal event before the new epoch is
+  durable, and it does not send the removal again after a successful publish.
+  A missing KeyPackage on a live leaf is a logged deferral, not a finished
+  rekey. Catch-up applies a removal only after the commit signature verifies.
+  A third-party relay may carry TreeKEM bytes only when that signature names
+  their digest. The shipped admin removal `treekem:epoch=<n>` still applies
+  when the authenticated author delivers it. A relay of that form does not
+  install. `T-self-leave-relay-commit-binding` (Proposed, slot A15). One peer's
+  truncated page stays open until that peer's last page. The outbox copy of the post-commit
+  private tree is mode 0600. It is deleted when the epoch persist succeeds
+  and when the group wipe runs. A corrupt or unreadable outbox is left in
+  place, and the rekey waits. Only a missing file is an empty outbox. A
+  failed or timed-out publish leaves the removal pending. Other admins hold
+  off. A self-leave rekey sets `security_binding` to
+  `treekem:epoch=<n>:commit=<blake3>`. A v0.48 receiver rebuilds
+  `treekem:epoch=<n>`, gets `StateHashMismatch`, and leaves a group that
+  contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
+
 ## [v0.48.0] - 2026-10-13
 
 A minor release. It removes one unused public module and changes two public file-transfer types (breaking for Rust code that used them), makes some group routes stricter, and contains connection, delivery and durability fixes. It pins ant-quic 0.27.60.

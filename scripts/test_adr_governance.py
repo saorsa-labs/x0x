@@ -2364,6 +2364,106 @@ Use option 2.
             rc == 0 and "ADR governance passed" in out,
         ))
 
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-self-leave-rekey-committer.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1338"})
+        results.append(check(
+            "PR 1337: a different pull request cannot edit the Accepted committer record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-other-accepted.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: pull request 1337 cannot edit a different Accepted record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-other-accepted.md" in out,
+        ))
+
+    def _committer_text(sentence: str, *, status: str, slot: str) -> str:
+        return (
+            "# T-self-leave-rekey-committer\n\n"
+            f"- **Status:** {status}\n"
+            f"- **Target slot:** {slot}\n\n"
+            f"{sentence}\n\n"
+            "## Decision\n\n"
+            "One committer.\n"
+        )
+
+    _accepted_status = "Accepted (David, D274, 14 Oct 2026, slot A09, PR #1337)."
+    _before = adr._PR1337_CLAIM_BEFORE
+    _after = adr._PR1337_CLAIM_AFTER
+
+    def _commit_committer_edit(work: Path, text: str) -> None:
+        path = work / "docs/adr/transient/T-self-leave-rekey-committer.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_committer_text(_before, status=_accepted_status, slot="A09"))
+        _commit_all(work, "accept transient record")
+        path.write_text(text)
+        _commit_all(work, "edit accepted transient body")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-self-leave-rekey-committer.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: an unrelated body edit of the Accepted committer record fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _commit_committer_edit(
+            work, _committer_text(_after, status=_accepted_status, slot="A09")
+        )
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: the accepted security_binding sentence is the only allowed edit",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _commit_committer_edit(
+            work,
+            _committer_text(_after, status="Proposed", slot="A09"),
+        )
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: a status edit of the Accepted committer record fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _commit_committer_edit(
+            work,
+            _committer_text(_after, status=_accepted_status, slot="A15"),
+        )
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: a slot edit of the Accepted committer record fails",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0

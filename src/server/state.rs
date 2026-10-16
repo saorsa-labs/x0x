@@ -1467,6 +1467,17 @@ pub(super) struct NamedGroupTestRecorders {
     /// ADR 0107 (r6): seconds added to the stream seam's clock, to land a
     /// certificate expiry between the pre-phase and the seam.
     pub(super) seam_clock_skew_secs: std::sync::atomic::AtomicU64,
+    /// #1113: admins the test treats as not running the responsive rekey.
+    /// Production has no such list. See `T-self-leave-rekey-committer`.
+    pub(super) incapable_self_leave_admins: StdMutex<Vec<[u8; 32]>>,
+    /// #1113: when set, metadata publish reports this outcome and does not
+    /// call the transport. `timeout` is the timeout arm. Any other text is
+    /// a transport error. Production leaves this empty.
+    pub(super) metadata_publish_fault: StdMutex<Option<String>>,
+    /// #1113: the unit-test agent has no gossip runtime, so a real publish
+    /// returns an error. Tests that want the success arm set this. Production
+    /// leaves it false and uses the transport result.
+    pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]

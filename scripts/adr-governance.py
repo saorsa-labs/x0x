@@ -42,6 +42,11 @@ Enforces:
   ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
   One exception (David, 15 Oct 2026, D280): pull request 1401 may change
   ``docs/adr/transient/T-installed-catchup-admin-consent.md`` in place.
+  One exception (David, 16 Oct 2026): pull request 1337 may replace
+  one sentence in
+  ``docs/adr/transient/T-self-leave-rekey-committer.md``. The sentence
+  states the changed ``security_binding`` value and the mixed-version
+  break. A status edit, a slot edit, or any other body edit still fails.
   The number is ``GITHUB_PR_NUMBER``, set from
   ``github.event.pull_request.number``. Any other file or number stays frozen.
 """
@@ -654,6 +659,21 @@ TRANSIENT_SUPPORT = {"docs/adr/transient/README.md"}
 # The number comes from the Actions event, not from a file in the checkout.
 _D280_ACCEPTED_TRANSIENT = "docs/adr/transient/T-installed-catchup-admin-consent.md"
 _D280_PULL_REQUEST = "1401"
+# David, 16 Oct 2026. One sentence, one file, one pull request.
+# The number comes from the Actions event, not from a file in the checkout.
+_PR1337_ACCEPTED_TRANSIENT = "docs/adr/transient/T-self-leave-rekey-committer.md"
+_PR1337_PULL_REQUEST = "1337"
+_PR1337_CLAIM_BEFORE = (
+    "This record is Proposed. It does not change Accepted ADR bytes and adds no wire field."
+)
+_PR1337_CLAIM_AFTER = (
+    "This record is Proposed. It does not change Accepted ADR bytes. "
+    "A self-leave rekey sets `security_binding` to "
+    "`treekem:epoch=<n>:commit=<blake3>`. "
+    "A v0.48 receiver rebuilds `treekem:epoch=<n>`, gets `StateHashMismatch`, "
+    "and leaves a group that contains an upgraded member. "
+    "Admin removal keeps `treekem:epoch=<n>`."
+)
 
 
 def d280_in_place_edit_allowed(name: str) -> bool:
@@ -669,6 +689,34 @@ def d280_in_place_edit_allowed(name: str) -> bool:
         return False
     number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
     return number == _D280_PULL_REQUEST
+
+
+def pr1337_in_place_edit_allowed(name: str, snapshot: bytes, head: bytes) -> bool:
+    """Whether this Accepted transient edit is the one accepted sentence.
+
+    True only when *name* is the self-leave committer record,
+    ``GITHUB_PR_NUMBER`` is ``1337``, and the only byte change replaces
+    the old wire-field sentence with the ``security_binding`` sentence
+    David accepted on 16 Oct 2026. A status edit, a slot edit, or any
+    other body edit returns false. A missing number, any other number,
+    and any other path stay immutable. Deletion is not an in-place edit;
+    the caller still rejects a missing file.
+    """
+    if name != _PR1337_ACCEPTED_TRANSIENT:
+        return False
+    number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
+    if number != _PR1337_PULL_REQUEST:
+        return False
+    try:
+        old = snapshot.decode("utf-8")
+        new = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if old.count(_PR1337_CLAIM_BEFORE) != 1 or new.count(_PR1337_CLAIM_AFTER) != 1:
+        return False
+    if _PR1337_CLAIM_BEFORE in new or _PR1337_CLAIM_AFTER in old:
+        return False
+    return old.replace(_PR1337_CLAIM_BEFORE, _PR1337_CLAIM_AFTER, 1) == new
 
 
 def _transient_shape_errors(path: str, text: str) -> list[str]:
@@ -798,7 +846,13 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
             errors.append(move_error)
             continue
         if head_text is None or head_text != snapshot_text:
-            if head_text is not None and d280_in_place_edit_allowed(name):
+            if head_text is not None and (
+                d280_in_place_edit_allowed(name)
+                or (
+                    snapshot_text is not None
+                    and pr1337_in_place_edit_allowed(name, snapshot_text, head_text)
+                )
+            ):
                 continue
             errors.append(
                 f"{name}: Accepted transient records are immutable. "
