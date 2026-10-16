@@ -22,7 +22,12 @@ All notable changes to this project will be documented in this file.
   and that item's closing delimiter is matched. An unclosed or uncertain
   span stays production, so a later `unwrap`, `expect`, or `panic!` is
   reported.
-
+- **SIGTERM is registered before the daemon accepts HTTP (#371).**
+  `/health` can be ready before a watcher that installs the handler
+  afterwards. A signal in that window killed the process (signal 15)
+  instead of the bounded clean exit. The handler is installed before the
+  server starts, and a registration failure stops startup. The clean exit
+  and the deadline are unchanged.
 - **Corrected the revoke documentation (#1108).** The single-id form of
   `POST /identity/revoke` supports the daemon's own agent, not its machine or
   an owner-authorized third-party revocation. The API reference and CLI/handler

@@ -386,6 +386,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     // opts in to configured self-update unless this invocation supplied the
     // process-scoped skip flag, and owns Ctrl-C itself — the library must not
     // steal the host's signal.
+    //
+    // SIGTERM is registered here, before `serve_with_options` advertises
+    // readiness. `/health` returns as soon as the server is listening, and a
+    // supervisor (or `sigterm_exits_within_bounded_deadline`) can signal in
+    // that window. Installing the handler only inside the post-start watcher
+    // leaves the default terminate action in place, so the process dies by
+    // signal 15 instead of taking the bounded clean exit (#371).
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
     let self_update_enabled = config.update_enabled();
     let options = ServeOptions {
         skip_update_check,
@@ -412,17 +422,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     // SIGTERM (what systemd/launchd send on stop/restart) must drive the same
     // graceful exit as Ctrl-C: the shutdown path closes connections and
     // flushes the bootstrap peer cache so learned peers survive restart.
+    // The stream was registered before the server started; this watcher only
+    // waits on it.
     #[cfg(unix)]
     {
         let cancel = handle.cancellation_token();
         tokio::spawn(async move {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    if sigterm.recv().await.is_some() {
-                        cancel.cancel();
-                    }
-                }
-                Err(e) => tracing::warn!("failed to install SIGTERM handler: {e}"),
+            if sigterm.recv().await.is_some() {
+                cancel.cancel();
             }
         });
     }
