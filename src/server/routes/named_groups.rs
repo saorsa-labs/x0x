@@ -23036,12 +23036,21 @@ fn hash_only_removed_members(
     rows
 }
 
+enum PendingSelfLeaveRekey {
+    /// A saved commit extends this head.
+    Saved(NamedGroupMetadataEvent),
+    /// The file is missing, or it holds no commit for this head.
+    Absent,
+    /// The file is present and was not read. Do not author a new commit.
+    Unreadable,
+}
+
 async fn pending_self_leave_rekey_for_head(
     state: &AppState,
     group_key: &str,
     leaver_hex: &str,
     head_hash: &str,
-) -> Option<NamedGroupMetadataEvent> {
+) -> PendingSelfLeaveRekey {
     let path = self_leave_rekey_outbox_path(state, group_key);
     let file = {
         let _guard = self_leave_outbox_lock().lock().await;
@@ -23052,25 +23061,28 @@ async fn pending_self_leave_rekey_for_head(
                     group_id = %LogHexId::group(group_key),
                     "self-leave outbox was not read: {error}"
                 );
-                return None;
+                return PendingSelfLeaveRekey::Unreadable;
             }
         }
     };
-    file.pending.into_iter().find(|event| match event {
-        NamedGroupMetadataEvent::MemberRemoved {
-            agent_id,
-            treekem_commit_b64,
-            commit,
-            ..
-        } => {
-            agent_id == leaver_hex
-                && treekem_commit_b64.is_some()
-                && commit
-                    .as_ref()
-                    .is_some_and(|commit| commit.prev_state_hash.as_deref() == Some(head_hash))
-        }
-        _ => false,
-    })
+    file.pending
+        .into_iter()
+        .find(|event| match event {
+            NamedGroupMetadataEvent::MemberRemoved {
+                agent_id,
+                treekem_commit_b64,
+                commit,
+                ..
+            } => {
+                agent_id == leaver_hex
+                    && treekem_commit_b64.is_some()
+                    && commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.prev_state_hash.as_deref() == Some(head_hash))
+            }
+            _ => false,
+        })
+        .map_or(PendingSelfLeaveRekey::Absent, PendingSelfLeaveRekey::Saved)
 }
 
 async fn install_saved_self_leave_rekey(
@@ -23568,6 +23580,25 @@ fn skip_self_leave_rekey_ack_flag() -> &'static std::sync::atomic::AtomicBool {
 #[cfg(test)]
 pub(in crate::server) fn skip_self_leave_rekey_ack(skip: bool) {
     skip_self_leave_rekey_ack_flag().store(skip, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn fresh_self_leave_rekey_attempts() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    static ATTEMPTS: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+}
+
+/// How many times this process started a new self-leave commit after an
+/// outbox read that found no saved event. A read error must not increment it.
+#[cfg(test)]
+pub(in crate::server) fn take_fresh_self_leave_rekey_attempts() -> usize {
+    fresh_self_leave_rekey_attempts().swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn note_fresh_self_leave_rekey_attempt() {
+    fresh_self_leave_rekey_attempts().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn mutate_self_leave_outbox<F>(
@@ -24141,11 +24172,23 @@ async fn commit_treekem_self_leave_rekey_from(
         }
         return SelfLeaveRekeyStep::Deferred;
     };
-    if let Some(saved) =
-        pending_self_leave_rekey_for_head(state, group_key, &leaver_hex, &info.state_hash).await
-    {
-        return install_saved_self_leave_rekey(state, group_key, &info, &mut guard, saved).await;
+    match pending_self_leave_rekey_for_head(state, group_key, &leaver_hex, &info.state_hash).await {
+        PendingSelfLeaveRekey::Saved(saved) => {
+            return install_saved_self_leave_rekey(state, group_key, &info, &mut guard, saved)
+                .await;
+        }
+        PendingSelfLeaveRekey::Unreadable => {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                leaver = %LogHexId::agent(&leaver_hex),
+                "self-leave TreeKEM rekey deferred: the outbox could not be read"
+            );
+            return SelfLeaveRekeyStep::Deferred;
+        }
+        PendingSelfLeaveRekey::Absent => {}
     }
+    #[cfg(test)]
+    note_fresh_self_leave_rekey_attempt();
     let Ok(target_agent) = parse_agent_id_hex(&leaver_hex) else {
         tracing::warn!(
             group_id = %LogHexId::group(group_key),

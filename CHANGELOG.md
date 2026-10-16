@@ -227,7 +227,7 @@ All notable changes to this project will be documented in this file.
   truncated page stays open until that peer's last page. The outbox copy of the post-commit
   private tree is mode 0600. It is deleted when the epoch persist succeeds
   and when the group wipe runs. A corrupt or unreadable outbox is left in
-  place. Only a missing file is an empty outbox. A
+  place, and the rekey waits. Only a missing file is an empty outbox. A
   failed or timed-out publish leaves the removal pending. Other admins hold
   off. This adds no new wire message.
 

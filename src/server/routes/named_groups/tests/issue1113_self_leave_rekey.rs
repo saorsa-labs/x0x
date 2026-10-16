@@ -1411,6 +1411,33 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
         corrupt,
         "resume must leave a corrupt outbox in place"
     );
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.remove_member(&member_hex, Some(member_hex.clone()));
+        info.recompute_state_hash();
+    }
+    fixture
+        .state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let epoch_before = live_epoch(&fixture.state, &fixture.group_id).await;
+    let _ = take_fresh_self_leave_rekey_attempts();
+    resume_durable_self_leave_rekeys(&fixture.state).await;
+    rekey_outstanding_treekem_self_leaves(&fixture.state).await;
+    assert_eq!(
+        take_fresh_self_leave_rekey_attempts(),
+        0,
+        "a corrupt outbox must not start a new rekey"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        epoch_before,
+        "a corrupt outbox must not advance the epoch"
+    );
+    assert_eq!(tokio::fs::read(&path).await?, corrupt);
 
     tokio::fs::remove_file(&path).await?;
     tokio::fs::create_dir(&path).await?;
@@ -1426,6 +1453,18 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
         tokio::fs::metadata(&path).await?.is_dir(),
         "the unreadable path must stay in place"
     );
+    let _ = take_fresh_self_leave_rekey_attempts();
+    rekey_outstanding_treekem_self_leaves(&fixture.state).await;
+    assert_eq!(
+        take_fresh_self_leave_rekey_attempts(),
+        0,
+        "an unreadable outbox must not start a new rekey"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        epoch_before
+    );
+    assert!(tokio::fs::metadata(&path).await?.is_dir());
 
     tokio::fs::remove_dir(&path).await?;
     let missing = read_self_leave_rekey_outbox(&path).await?;
@@ -1441,6 +1480,33 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
     let written = read_self_leave_rekey_outbox(&path).await?;
     assert_eq!(written.pending.len(), 1);
     assert_eq!(written.committer_snapshots.len(), 1);
+
+    // The same removed-leaf setup authors a commit when the outbox is missing.
+    // That is what makes a zero above mean "deferred", not "the pass never ran".
+    let open = two_member_treekem_group().await?;
+    let open_hex = hex::encode(open.member_id.as_bytes());
+    {
+        let mut groups = open.state.named_groups.write().await;
+        let info = groups.get_mut(&open.group_id).expect("group");
+        info.remove_member(&open_hex, Some(open_hex.clone()));
+        info.recompute_state_hash();
+    }
+    open.state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let open_epoch = live_epoch(&open.state, &open.group_id).await;
+    let _ = take_fresh_self_leave_rekey_attempts();
+    rekey_outstanding_treekem_self_leaves(&open.state).await;
+    assert_eq!(
+        take_fresh_self_leave_rekey_attempts(),
+        1,
+        "a missing outbox still starts one rekey"
+    );
+    assert!(
+        live_epoch(&open.state, &open.group_id).await > open_epoch,
+        "a missing outbox still lets the designated admin seal"
+    );
     Ok(())
 }
 
