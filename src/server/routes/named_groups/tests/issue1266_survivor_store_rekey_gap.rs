@@ -713,17 +713,7 @@ fn loopback_daemon_options() -> crate::server::ServeOptions {
     }
 }
 
-fn tracked_task_count(state: &AppState) -> usize {
-    state
-        .agent
-        .tracked_tasks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .handles
-        .len()
-}
-
-fn unfinished_tracked_since(state: &AppState, from: usize) -> usize {
+fn unfinished_tracked_ids(state: &AppState) -> Vec<tokio::task::Id> {
     state
         .agent
         .tracked_tasks
@@ -731,8 +721,17 @@ fn unfinished_tracked_since(state: &AppState, from: usize) -> usize {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .handles
         .iter()
-        .skip(from)
         .filter(|handle| !handle.is_finished())
+        .map(tokio::task::JoinHandle::id)
+        .collect()
+}
+
+/// Tasks started after `before`. Finished handles are reaped, so a vec
+/// index from before the repair spawn does not identify the repair.
+fn new_unfinished_tracked(state: &AppState, before: &[tokio::task::Id]) -> usize {
+    unfinished_tracked_ids(state)
+        .into_iter()
+        .filter(|id| !before.contains(id))
         .count()
 }
 
@@ -792,16 +791,17 @@ async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()
         assert!(!delivered.should_exit);
         // Hold the publication gate so the repair parks on it.
         gate = Some(Arc::clone(&state.gss_publication_gate).write_owned().await);
-        let tracked_before = tracked_task_count(&state);
+        let tracked_before = unfinished_tracked_ids(&state);
         let (status, _) = get_value(&state, &topic, "absent").await?;
         assert_eq!(status, StatusCode::NOT_FOUND);
         tokio::time::sleep(Duration::from_millis(300)).await;
         // Exactly one repair for this store. Other daemon work may also be
         // tracked in this window (seen on Linux CI), so the tracked-task
         // check only requires the repair to be among the unfinished tasks.
+        // Reaping finished handles moves later tasks to lower indexes.
         assert_eq!(seam::repairs(&topic), 1, "exactly one repair starts");
         assert!(
-            unfinished_tracked_since(&state, tracked_before) >= 1,
+            new_unfinished_tracked(&state, &tracked_before) >= 1,
             "the repair runs as a tracked Agent task"
         );
         assert_eq!(
@@ -815,7 +815,7 @@ async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()
         // Every tracked task honours the shutdown token; allow the other
         // tracked work a short margin to observe it too.
         let parked = wait_for_count(
-            || u64::from(unfinished_tracked_since(&state, tracked_before) == 0),
+            || u64::from(new_unfinished_tracked(&state, &tracked_before) == 0),
             1,
             Duration::from_secs(5),
         )
