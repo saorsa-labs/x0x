@@ -430,6 +430,25 @@ pub async fn serve(config: DaemonConfig) -> anyhow::Result<ServerHandle> {
     serve_with_options(config, options).await
 }
 
+/// Write one startup-order line to stderr when `X0X_CHILD_DIAGNOSTICS` is set.
+///
+/// The line is `x0xd: {event} mono_ns={elapsed}`. `mono_ns` is nanoseconds
+/// since the first call in this process, so two lines compare. The isolated
+/// SIGTERM test reads them after a failed child. Normal runs leave the
+/// variable unset and write nothing.
+pub fn record_startup_diagnostic(event: &str) {
+    if std::env::var_os("X0X_CHILD_DIAGNOSTICS").is_none() {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let mono_ns = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos();
+    eprintln!("x0xd: {event} mono_ns={mono_ns}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
 /// Start the x0x server in-process with explicit runtime options.
 ///
 /// All synchronous, fallible startup (data-dir create, identity load/gen,
@@ -2742,6 +2761,9 @@ pub async fn serve_with_options(
         let _identity_lock = identity_lock;
         let mut server_shutdown_rx = state.shutdown_notify.subscribe();
         let mut server = tokio::spawn(async move {
+            // Before the accept loop. A `/health` success cannot precede this
+            // line, so a child log can show whether SIGTERM was registered first.
+            record_startup_diagnostic("http server accepting");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = server_shutdown_rx.changed().await;

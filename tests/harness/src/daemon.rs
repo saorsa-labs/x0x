@@ -54,6 +54,8 @@ pub struct DaemonFixture {
     api_token: String,
     tempdir: TempDir,
     identity_dir: PathBuf,
+    /// Child stderr, retained only when the test asked for it.
+    stderr_log: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -63,8 +65,20 @@ impl DaemonFixture {
         Self::start_with_config(prefix, "").await
     }
 
+    /// Start a daemon and keep its stderr in the data dir.
+    ///
+    /// `sigterm_exits_within_bounded_deadline` reads that log on failure. Other
+    /// tests keep the null stderr of [`start`].
+    pub async fn start_retaining_child_stderr(prefix: &str) -> Self {
+        Self::start_inner(prefix, "", true).await
+    }
+
     /// Start a daemon with extra TOML config appended to the generated config.
     pub async fn start_with_config(prefix: &str, extra_config: &str) -> Self {
+        Self::start_inner(prefix, extra_config, false).await
+    }
+
+    async fn start_inner(prefix: &str, extra_config: &str, retain_stderr: bool) -> Self {
         let name = format!("{prefix}-{}", rand::random::<u32>());
         let binary = find_x0xd_binary();
         assert!(binary.exists(), "Build x0xd first: cargo build --bin x0xd");
@@ -138,8 +152,20 @@ impl DaemonFixture {
             .arg("--config")
             .arg(&config_path)
             .arg("--skip-update-check")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::null());
+        let stderr_log = if retain_stderr {
+            let path = tempdir.path().join("child-stderr.log");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open child stderr log");
+            process_cmd.stderr(Stdio::from(file));
+            Some(path)
+        } else {
+            process_cmd.stderr(Stdio::null());
+            None
+        };
         // `Command` inherits the parent environment by default, so `RUST_LOG`
         // and `X0X_LOG_DIR` set in the test parent's env reach the daemon
         // without explicit forwarding. The single non-redundant behavior
@@ -158,6 +184,7 @@ impl DaemonFixture {
             api_token: String::new(),
             tempdir,
             identity_dir,
+            stderr_log,
         };
 
         fixture.wait_for_startup().await;
@@ -186,7 +213,7 @@ impl DaemonFixture {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         self.api_addr = loop {
             if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for port file");
+                self.panic_with_child_stderr("Timeout waiting for port file");
             }
             if let Ok(addr) = std::fs::read_to_string(&port_file) {
                 let trimmed = addr.trim();
@@ -204,7 +231,7 @@ impl DaemonFixture {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for health");
+                self.panic_with_child_stderr("Timeout waiting for health");
             }
             if let Ok(resp) = client
                 .get(format!("http://{}/health", self.api_addr))
@@ -228,7 +255,7 @@ impl DaemonFixture {
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("Timeout waiting for api-token file");
+                self.panic_with_child_stderr("Timeout waiting for api-token file");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
@@ -325,6 +352,22 @@ impl DaemonFixture {
     /// Poll child process exit status.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.process.try_wait()
+    }
+
+    /// Child stderr captured for this daemon, or empty when it was discarded.
+    pub fn child_stderr(&self) -> String {
+        self.stderr_log
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    }
+
+    fn panic_with_child_stderr(&self, message: &str) -> ! {
+        let log = self.child_stderr();
+        if log.is_empty() {
+            panic!("{message}");
+        }
+        panic!("{message}\n--- child stderr ---\n{log}");
     }
 }
 
