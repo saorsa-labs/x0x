@@ -260,6 +260,21 @@ pub struct AnnounceBlobCache {
     recovery_apply_entered: AtomicUsize,
     #[cfg(test)]
     recovery_tasks_finished: AtomicUsize,
+    /// Fetch children that have stopped, including ones that were aborted.
+    #[cfg(test)]
+    recovery_fetch_children_finished: AtomicUsize,
+    /// When set, a batch waits once after it claims slots and before it
+    /// subscribes for a free slot.
+    #[cfg(test)]
+    recovery_pre_wait_hold: AtomicBool,
+    #[cfg(test)]
+    recovery_pre_wait_arrived: AtomicUsize,
+    /// Wakes the first batch paused before its slot wait.
+    #[cfg(test)]
+    recovery_pre_wait_release: tokio::sync::Notify,
+    /// Wakes every later batch paused before its slot wait.
+    #[cfg(test)]
+    recovery_pre_wait_release_rest: tokio::sync::Notify,
     #[cfg(test)]
     diagnostics: AnnounceBlobDiagnosticCounters,
 }
@@ -292,6 +307,16 @@ impl AnnounceBlobCache {
             recovery_apply_entered: AtomicUsize::new(0),
             #[cfg(test)]
             recovery_tasks_finished: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_fetch_children_finished: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_pre_wait_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_pre_wait_arrived: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_pre_wait_release: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            recovery_pre_wait_release_rest: tokio::sync::Notify::new(),
             #[cfg(test)]
             diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
@@ -546,6 +571,75 @@ impl AnnounceBlobCache {
     #[cfg(test)]
     pub(crate) fn recovery_tasks_finished_for_testing(&self) -> usize {
         self.recovery_tasks_finished.load(Ordering::SeqCst)
+    }
+
+    /// A fetch child has stopped. The child task records this itself.
+    #[cfg(test)]
+    pub(crate) fn note_recovery_fetch_child_finished_for_testing(&self) {
+        self.recovery_fetch_children_finished
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Fetch children that have stopped.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_children_finished_for_testing(&self) -> usize {
+        self.recovery_fetch_children_finished.load(Ordering::SeqCst)
+    }
+
+    /// Hold each batch once, after its claim and before its first slot wait.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_pre_wait_hold_for_testing(&self, hold: bool) {
+        self.recovery_pre_wait_hold.store(hold, Ordering::SeqCst);
+        if !hold {
+            self.recovery_pre_wait_release.notify_waiters();
+            self.recovery_pre_wait_release_rest.notify_waiters();
+        }
+    }
+
+    /// Let every paused batch after the first leave the pre-wait gate.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_pre_wait_rest_for_testing(&self) {
+        self.recovery_pre_wait_release_rest.notify_waiters();
+    }
+
+    /// Whether the next recovery batch should pause before its first wait.
+    #[cfg(test)]
+    pub(crate) fn recovery_pre_wait_hold_for_testing(&self) -> bool {
+        self.recovery_pre_wait_hold.load(Ordering::SeqCst)
+    }
+
+    /// Batches paused before their first slot wait.
+    #[cfg(test)]
+    pub(crate) fn recovery_pre_wait_arrived_for_testing(&self) -> usize {
+        self.recovery_pre_wait_arrived.load(Ordering::SeqCst)
+    }
+
+    /// Subscribe for this batch's pre-wait release, then record that it is paused.
+    ///
+    /// The first batch waits on its own notification. Later batches wait on
+    /// another, so a test can let one proceed while the other stays parked.
+    #[cfg(test)]
+    pub(crate) async fn arrive_and_wait_recovery_pre_wait_for_testing(&self) {
+        let wait_first = self.recovery_pre_wait_release.notified();
+        let wait_rest = self.recovery_pre_wait_release_rest.notified();
+        let arrived = self
+            .recovery_pre_wait_arrived
+            .fetch_add(1, Ordering::SeqCst);
+        if arrived == 0 {
+            wait_first.await;
+        } else {
+            wait_rest.await;
+        }
+    }
+
+    /// Drop one shared reservation and wake slot waiters.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_reservation_for_testing(&self, digest: &[u8; 32]) {
+        let notify = self.lock_cert_recovery_attempts().in_flight.remove(digest);
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+            self.budget_notify.notify_waiters();
+        }
     }
 
     /// One verified fetch for a revocation subject, bounded by the blob

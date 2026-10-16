@@ -261,8 +261,10 @@ All notable changes to this project will be documented in this file.
   eight-fetch budget applies only to a miss, and only while a carrier
   is waiting for resync. Those fetches share one blob deadline and run
   outside the listener loop. Overlapping batches share that eight-fetch
-  allowance. A digest already being fetched is not fetched again. Agent
-  shutdown joins this recovery before it applies or persists the batch.
+  allowance. A digest already being fetched is not fetched again. A batch
+  subscribes for a free slot and checks that allowance again before it
+  waits. Agent shutdown joins this recovery, including its fetch tasks,
+  before it releases their slots or applies and persists the batch.
   A failed digest is not fetched again until
   its backoff has elapsed. Each miss list keeps its own
   place. A shorter list does not move that place. When the table is full,

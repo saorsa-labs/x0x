@@ -3166,6 +3166,8 @@ fn spawn_reserved_fetch(
     let _ = shutdown;
     pending.spawn(async move {
         #[cfg(test)]
+        let _child_finished = RecoveryFetchChildGuard(std::sync::Arc::clone(&cache));
+        #[cfg(test)]
         if cache.recovery_fetch_hold_for_testing() {
             tokio::select! {
                 biased;
@@ -3232,11 +3234,66 @@ async fn absorb_finished_followers(
     }
 }
 
+/// Abort the fetch children and wait until each one has stopped.
+///
+/// `settle` keeps a finished certificate and records a real miss. Shutdown
+/// passes `false`: a cancelled child is not a failed digest.
+async fn join_fetch_children(
+    pending: &mut tokio::task::JoinSet<FetchedSubjectCert>,
+    found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    unresolved: &mut std::collections::HashSet<[u8; 32]>,
+    flight: &mut RecoveryFlightGuard,
+    cache: &announce_blob::AnnounceBlobCache,
+    settle: bool,
+) {
+    pending.abort_all();
+    while let Some(joined) = pending.join_next().await {
+        if settle {
+            if let Ok(joined) = joined {
+                take_fetched_cert(found, unresolved, flight, cache, joined);
+            }
+        }
+    }
+}
+
+/// Reserve any `later` jobs that now fit in the shared allowance.
+fn start_available_later(
+    claim: &mut RecoveryClaim,
+    cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: &Option<std::sync::Arc<crate::gossip::PubSubManager>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    unresolved: &mut std::collections::HashSet<[u8; 32]>,
+    pending: &mut tokio::task::JoinSet<FetchedSubjectCert>,
+    flight: &mut RecoveryFlightGuard,
+) {
+    if claim.later.is_empty() {
+        return;
+    }
+    let more = {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        let jobs = std::mem::take(&mut claim.later)
+            .into_iter()
+            .map(|job| (job.subject, job.announced))
+            .collect();
+        claim_recovery_fetches(&mut attempts, jobs)
+    };
+    for job in more.start {
+        flight.digests.push(job.digest);
+        unresolved.insert(job.digest);
+        spawn_reserved_fetch(pending, cache, pubsub, shutdown, job);
+    }
+    claim.follow.extend(more.follow);
+    claim.later = more.later;
+}
+
 /// Fetch the budgeted misses together, under one blob deadline.
 ///
 /// A digest that failed recently is not fetched again. Overlapping batches
 /// share the eight-fetch allowance and reserve each digest before the
-/// request. `stopped` means shutdown won and the caller must not apply.
+/// request. The batch subscribes for a free slot and then looks again, so
+/// a release that happened before the wait is not lost. Shutdown and the
+/// deadline join the fetch tasks before those reservations are released.
+/// `stopped` means shutdown won and the caller must not apply.
 async fn fetch_subject_cert_misses(
     found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     misses: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
@@ -3332,33 +3389,89 @@ async fn drive_shared_cert_fetches(
         announce_blob::BLOB_FETCH_TIMEOUT_SECS,
     ));
     tokio::pin!(sleep);
+    #[cfg(test)]
+    let mut passed_pre_wait = false;
     loop {
-        absorb_finished_followers(cache, &mut found, &mut claim.follow).await;
+        #[cfg(test)]
+        if !passed_pre_wait {
+            passed_pre_wait = true;
+            if cache.recovery_pre_wait_hold_for_testing() {
+                cache.arrive_and_wait_recovery_pre_wait_for_testing().await;
+            }
+        }
         if shutdown.is_cancelled() {
-            pending.abort_all();
+            join_fetch_children(
+                &mut pending,
+                &mut found,
+                &mut unresolved,
+                &mut flight,
+                cache,
+                false,
+            )
+            .await;
             return SubjectCertFetch {
                 found,
                 stopped: true,
             };
         }
-        if claim.later.is_empty() && claim.follow.is_empty() && pending.is_empty() {
-            break;
-        }
+        // Subscribe before reading followers or free slots. `notify_waiters`
+        // is visible to a `Notified` future from the moment it is created.
         let budget = cache.budget_notify();
         let budget_wait = budget.notified();
         tokio::pin!(budget_wait);
+        absorb_finished_followers(cache, &mut found, &mut claim.follow).await;
+        if shutdown.is_cancelled() {
+            join_fetch_children(
+                &mut pending,
+                &mut found,
+                &mut unresolved,
+                &mut flight,
+                cache,
+                false,
+            )
+            .await;
+            return SubjectCertFetch {
+                found,
+                stopped: true,
+            };
+        }
+        start_available_later(
+            &mut claim,
+            cache,
+            &pubsub,
+            shutdown,
+            &mut unresolved,
+            &mut pending,
+            &mut flight,
+        );
+        if claim.later.is_empty() && claim.follow.is_empty() && pending.is_empty() {
+            break;
+        }
         let waiting_for_slot = !claim.later.is_empty() || !claim.follow.is_empty();
         tokio::select! {
             biased;
             () = shutdown.cancelled() => {
-                pending.abort_all();
+                join_fetch_children(
+                    &mut pending,
+                    &mut found,
+                    &mut unresolved,
+                    &mut flight,
+                    cache,
+                    false,
+                )
+                .await;
                 return SubjectCertFetch { found, stopped: true };
             }
             () = &mut sleep => {
-                pending.abort_all();
-                while let Some(Ok(joined)) = pending.try_join_next() {
-                    take_fetched_cert(&mut found, &mut unresolved, &mut flight, cache, joined);
-                }
+                join_fetch_children(
+                    &mut pending,
+                    &mut found,
+                    &mut unresolved,
+                    &mut flight,
+                    cache,
+                    true,
+                )
+                .await;
                 break;
             }
             joined = pending.join_next(), if !pending.is_empty() => {
@@ -3366,31 +3479,20 @@ async fn drive_shared_cert_fetches(
                     take_fetched_cert(&mut found, &mut unresolved, &mut flight, cache, joined);
                 }
             }
-            _ = &mut budget_wait, if waiting_for_slot => {
-                if claim.later.is_empty() {
-                    continue;
-                }
-                let more = {
-                    let mut attempts = cache.lock_cert_recovery_attempts();
-                    let jobs = std::mem::take(&mut claim.later)
-                        .into_iter()
-                        .map(|job| (job.subject, job.announced))
-                        .collect();
-                    claim_recovery_fetches(&mut attempts, jobs)
-                };
-                for job in more.start {
-                    flight.digests.push(job.digest);
-                    unresolved.insert(job.digest);
-                    spawn_reserved_fetch(&mut pending, cache, &pubsub, shutdown, job);
-                }
-                claim.follow.extend(more.follow);
-                claim.later = more.later;
-            }
+            _ = &mut budget_wait, if waiting_for_slot => {}
         }
     }
     absorb_finished_followers(cache, &mut found, &mut claim.follow).await;
     if shutdown.is_cancelled() {
-        pending.abort_all();
+        join_fetch_children(
+            &mut pending,
+            &mut found,
+            &mut unresolved,
+            &mut flight,
+            cache,
+            false,
+        )
+        .await;
         return SubjectCertFetch {
             found,
             stopped: true,
@@ -3693,6 +3795,20 @@ struct RecoveryFinishedGuard(std::sync::Arc<announce_blob::AnnounceBlobCache>);
 impl Drop for RecoveryFinishedGuard {
     fn drop(&mut self) {
         self.0.note_recovery_task_finished_for_testing();
+    }
+}
+
+/// Counts a fetch child when that child task stops.
+///
+/// The outer batch must join the child before it returns. Shutdown then
+/// observes this count, not only the outer task.
+#[cfg(test)]
+struct RecoveryFetchChildGuard(std::sync::Arc<announce_blob::AnnounceBlobCache>);
+
+#[cfg(test)]
+impl Drop for RecoveryFetchChildGuard {
+    fn drop(&mut self) {
+        self.0.note_recovery_fetch_child_finished_for_testing();
     }
 }
 
@@ -33548,11 +33664,292 @@ mod tests {
             0,
             "shutdown left a digest reserved"
         );
+        assert_eq!(
+            blobs.recovery_fetch_children_finished_for_testing(),
+            MAX_CERT_RECOVERY_SUBJECTS,
+            "shutdown returned before the fetch children terminated"
+        );
         let registry = agent.tracked_tasks.lock().expect("tracked");
         assert!(registry.closed, "shutdown must close the task registry");
         assert!(
             registry.handles.is_empty(),
             "shutdown must join the recovery tasks"
+        );
+    }
+
+    /// #1116: a slot freed after the claim and before the first wait must
+    /// start a `later` job. The release notification is already gone.
+    #[tokio::test]
+    async fn recovery_starts_a_later_job_when_the_last_slot_frees_before_the_wait_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(16, 0).await;
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        blobs.set_recovery_pre_wait_hold_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let held: Vec<_> = subjects[..8]
+            .iter()
+            .map(|subject| subject.agent_id)
+            .collect();
+        let waiting: Vec<_> = subjects[8..]
+            .iter()
+            .map(|subject| subject.agent_id)
+            .collect();
+        let held_records: Vec<_> = subjects[..8]
+            .iter()
+            .map(|subject| subject.record.clone())
+            .collect();
+        let waiting_records: Vec<_> = subjects[8..]
+            .iter()
+            .map(|subject| subject.record.clone())
+            .collect();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let identity_dir = Some(dir.path().to_path_buf());
+        let plan = plan_subject_cert_recovery(&sources, held.iter().copied());
+        let (found_held, pending_held) = partition_subject_cert_plan(plan, &blobs).await;
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_held,
+            pending_held,
+            CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
+                records: held_records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir: identity_dir.clone(),
+                owner_trust: agent.owner_trust.clone(),
+                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
+                machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
+            })),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let arrived = blobs.recovery_pre_wait_arrived_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            if arrived == 1 && inflight == MAX_CERT_RECOVERY_SUBJECTS {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "arrived {arrived}, in flight {inflight}"
+            );
+            tokio::task::yield_now().await;
+        }
+        let plan = plan_subject_cert_recovery(&sources, waiting.iter().copied());
+        let (found_waiting, pending_waiting) = partition_subject_cert_plan(plan, &blobs).await;
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_waiting,
+            pending_waiting,
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: waiting_records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir,
+                owner_trust: agent.owner_trust.clone(),
+            })),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let arrived = blobs.recovery_pre_wait_arrived_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let held_fetches: u32 = subjects[..8]
+                .iter()
+                .map(|subject| blobs.recovery_fetch_count_for_testing(&subject.digest))
+                .sum();
+            if arrived == 2 && inflight == MAX_CERT_RECOVERY_SUBJECTS && held_fetches == 8 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "arrived {arrived}, in flight {inflight}, held fetches {held_fetches}"
+            );
+            tokio::task::yield_now().await;
+        }
+        let waiting_fetches: u32 = subjects[8..]
+            .iter()
+            .map(|subject| blobs.recovery_fetch_count_for_testing(&subject.digest))
+            .sum();
+        assert_eq!(
+            waiting_fetches, 0,
+            "the waiter reserved a fetch before a slot freed"
+        );
+        blobs.release_recovery_reservation_for_testing(&subjects[0].digest);
+        assert_eq!(
+            blobs.recovery_in_flight_len_for_testing(),
+            MAX_CERT_RECOVERY_SUBJECTS - 1,
+            "the last occupied slot is still reserved"
+        );
+        blobs.set_recovery_pre_wait_hold_for_testing(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let waiting_fetches: u32 = subjects[8..]
+                .iter()
+                .map(|subject| blobs.recovery_fetch_count_for_testing(&subject.digest))
+                .sum();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            assert!(
+                inflight <= MAX_CERT_RECOVERY_SUBJECTS,
+                "in flight {inflight} exceeded the shared allowance"
+            );
+            if waiting_fetches == 1 && inflight == MAX_CERT_RECOVERY_SUBJECTS {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiting fetches {waiting_fetches}, in flight {inflight}"
+            );
+            tokio::task::yield_now().await;
+        }
+        agent.shutdown().await;
+        assert_eq!(blobs.recovery_apply_count_for_testing(), 0);
+        assert_eq!(
+            blobs.recovery_fetch_children_finished_for_testing(),
+            MAX_CERT_RECOVERY_SUBJECTS + 1,
+            "shutdown returned before the fetch children terminated"
+        );
+    }
+
+    /// #1116: a batch that already has children must start a `later` job
+    /// when one of those children frees a slot. The occupier stays parked,
+    /// so no other release can wake the waiter.
+    #[tokio::test]
+    async fn recovery_starts_a_later_job_when_its_own_child_finishes_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(9, 0).await;
+        blobs.set_recovery_pre_wait_hold_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let occupier = [subjects[0].agent_id];
+        let waiter: Vec<_> = subjects[1..]
+            .iter()
+            .map(|subject| subject.agent_id)
+            .collect();
+        let occupier_records = vec![subjects[0].record.clone()];
+        let waiter_records: Vec<_> = subjects[1..]
+            .iter()
+            .map(|subject| subject.record.clone())
+            .collect();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let identity_dir = Some(dir.path().to_path_buf());
+        let plan = plan_subject_cert_recovery(&sources, occupier.iter().copied());
+        let (found_occupier, pending_occupier) = partition_subject_cert_plan(plan, &blobs).await;
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_occupier,
+            pending_occupier,
+            CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
+                records: occupier_records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir: identity_dir.clone(),
+                owner_trust: agent.owner_trust.clone(),
+                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
+                machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
+            })),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let arrived = blobs.recovery_pre_wait_arrived_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            if arrived == 1 && inflight == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "arrived {arrived}, in flight {inflight}"
+            );
+            tokio::task::yield_now().await;
+        }
+        let plan = plan_subject_cert_recovery(&sources, waiter.iter().copied());
+        let (found_waiter, pending_waiter) = partition_subject_cert_plan(plan, &blobs).await;
+        assert_eq!(pending_waiter.len(), 8, "the waiter must keep every miss");
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_waiter,
+            pending_waiter,
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: waiter_records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir,
+                owner_trust: agent.owner_trust.clone(),
+            })),
+        );
+        let later = subjects[8].digest;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let arrived = blobs.recovery_pre_wait_arrived_for_testing();
+            let children = blobs.recovery_fetch_children_finished_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let later_fetches = blobs.recovery_fetch_count_for_testing(&later);
+            if arrived == 2
+                && children == 8
+                && inflight == MAX_CERT_RECOVERY_SUBJECTS
+                && later_fetches == 0
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "arrived {arrived}, children {children}, in flight {inflight}, later {later_fetches}"
+            );
+            tokio::task::yield_now().await;
+        }
+        blobs.release_recovery_pre_wait_rest_for_testing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let later_fetches = blobs.recovery_fetch_count_for_testing(&later);
+            let children = blobs.recovery_fetch_children_finished_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let applied = blobs.recovery_apply_count_for_testing();
+            assert!(
+                inflight <= MAX_CERT_RECOVERY_SUBJECTS,
+                "in flight {inflight} exceeded the shared allowance"
+            );
+            if later_fetches == 1 && children == 9 && applied == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "later {later_fetches}, children {children}, in flight {inflight}, applied {applied}"
+            );
+            tokio::task::yield_now().await;
+        }
+        let waiter_fetches: u32 = subjects[1..]
+            .iter()
+            .map(|subject| blobs.recovery_fetch_count_for_testing(&subject.digest))
+            .sum();
+        assert_eq!(waiter_fetches, 8, "the batch dropped a pending subject");
+        blobs.set_recovery_pre_wait_hold_for_testing(false);
+        agent.shutdown().await;
+        assert_eq!(
+            blobs.recovery_fetch_children_finished_for_testing(),
+            9,
+            "shutdown returned before the fetch children terminated"
         );
     }
 
