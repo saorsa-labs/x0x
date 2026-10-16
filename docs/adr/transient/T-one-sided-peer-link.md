@@ -10,7 +10,7 @@
 
 A MASQUE relay can supersede the live link on one side only (ant-quic#332). The other side still reports the old connection as connected. `GET /health`, `GET /peers` and `GET /status` then read healthy.
 
-`last_sent_at` and `last_received_at` in ant-quic 0.27.60 count application data only. A healthy peer can be quiet on both directions. An eph run with both ages above 600 s, while other pairs were fresh, is not this rule. Both ages on that peer were stale.
+`last_sent_at` and `last_received_at` in ant-quic 0.27.60 count application data only. A healthy peer can be quiet on both directions. Both directions stale is outside this fix. That case stays open under #1419 so it is not dropped silently.
 
 ant-quic owns the connection winner. This decision does not change that crate or the plane gate. Until ant-quic#332 is fixed, x0x detects a one-sided link and makes one bounded re-dial.
 
@@ -24,7 +24,7 @@ Repair disconnects that peer and dials it once, with a 3 s bound. A suppressed p
 
 ## Consequences
 
-A monitor that pages on `degraded` will see a one-sided link. A quiet peer stays up. A repeated one-sided winner waits 60 s. Peer counts stay current while a re-dial waits.
+A monitor that pages on `degraded` will see a one-sided link. A quiet peer stays up. A both-directions-stale peer is not repaired here. Peer counts stay current while a re-dial waits.
 
 ## Alternatives
 
@@ -40,5 +40,5 @@ Probe a quiet peer and disconnect when the probe fails. A probe can drop a healt
 
 ## Validation
 
-A quiet peer stays up while another peer is fresh. One stale direction and one fresh direction on the same peer is on the list. The re-dial runs once. A second pass inside the backoff does not dial. An empty sample keeps the warning and does not dial. A quiet sample clears the warning and keeps the backoff. The degraded count is stored before the repair task runs. The dial permit does not stay after the repair, or after the peer is gone, unless another holder remains. An active hold, and a claim during the cache wait, do not dial.
+A quiet peer stays up while another peer is fresh. A one-ended winner refuses that end's sends. The other end can still deliver, so the peer is degraded. The re-dial runs once and restores both directions. A second pass inside the backoff does not dial. An empty sample keeps the warning and does not dial. A quiet sample clears the warning and keeps the backoff. The degraded count is stored before the repair task runs. The dial permit does not stay after the repair, or after the peer is gone, unless another holder remains. An active hold, and a claim during the cache wait, do not dial.
 
