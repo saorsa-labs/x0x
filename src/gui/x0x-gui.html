@@ -2190,10 +2190,7 @@ async function mountSpace(){
     // Capture confidentiality so sendSpaceChat() can branch
     // between gossip (MlsEncrypted) and the daemon-signed REST path
     // (SignedPublic). Fall back to '' if the daemon shape changes.
-    currentSpaceConfidentiality=
-      (g.policy && g.policy.confidentiality) ||
-      (g.policy_summary && g.policy_summary.confidentiality) ||
-      '';
+    currentSpaceConfidentiality=(g.policy && g.policy.confidentiality) || '';
   }
   // Tear down any previous SignedPublic receive state, then re-arm
   // for this space if it is SignedPublic. Two receive paths run in
@@ -3145,7 +3142,7 @@ async function openSpacePageStore(sid,app){
     observeSpacePolicy(sid,SPACE_POLICY_UNAVAILABLE,ticket);
     return {ok:false,reason:'This space could not be loaded, so its pages are unavailable. '+apiError(g)};
   }
-  const conf=String((g.policy&&g.policy.confidentiality)||(g.policy_summary&&g.policy_summary.confidentiality)||'');
+  const conf=String((g.policy&&g.policy.confidentiality)||'');
   const obs=observeSpacePolicy(sid,conf,ticket);
   if(obs.conf!==conf){
     // Our own policy reply arrived AFTER a newer one. Do not act on it.
@@ -3981,15 +3978,22 @@ async function pollNetworkView(){
   if(d&&d.ok){
     const e=id=>document.getElementById(id);
     const fmt=v=>v==null?'<span style="color:var(--tx3)">unknown</span>':(v===true?'<span class="trust trust-trusted" style="font-size:10px">yes</span>':(v===false?'<span class="trust trust-unknown" style="font-size:10px">no</span>':esc(String(v))));
+    const relay=d.relay||{};
+    const coord=d.coordinator||{};
+    const mdns=d.mdns||{};
+    const mapping=d.port_mapping||{};
+    const env=d.transport_environment||{};
     if(e('n-diag-nat'))e('n-diag-nat').innerHTML=d.nat_type?esc(d.nat_type):fmt(null);
     if(e('n-diag-direct'))e('n-diag-direct').innerHTML=fmt(d.can_receive_direct);
-    if(e('n-diag-relay'))e('n-diag-relay').innerHTML=fmt(d.is_relay);
-    if(e('n-diag-coord'))e('n-diag-coord').innerHTML=fmt(d.is_coordinator);
-    if(e('n-diag-lan'))e('n-diag-lan').innerHTML=fmt(d.lan_discovery_enabled);
-    if(e('n-diag-upnp'))e('n-diag-upnp').innerHTML=fmt(d.upnp_enabled);
+    if(e('n-diag-relay'))e('n-diag-relay').innerHTML=fmt(relay.is_relaying);
+    if(e('n-diag-coord'))e('n-diag-coord').innerHTML=fmt(coord.is_coordinating);
+    if(e('n-diag-lan'))e('n-diag-lan').innerHTML=fmt(mdns.browsing===true||mdns.advertising===true);
+    if(e('n-diag-upnp'))e('n-diag-upnp').innerHTML=fmt(mapping.active);
     const notes=document.getElementById('n-diag-notes');
-    if(notes&&Array.isArray(d.notes)&&d.notes.length){
-      notes.innerHTML=d.notes.map(n=>'<div>• '+esc(n)+'</div>').join('');
+    const lines=[].concat(env.reasons||[]);
+    if(env.guidance)lines.push(env.guidance);
+    if(notes&&lines.length){
+      notes.innerHTML=lines.map(n=>'<div>• '+esc(n)+'</div>').join('');
     }else if(notes){
       notes.innerHTML='';
     }
@@ -4011,7 +4015,8 @@ async function pollNetworkView(){
   const c=await api('/network/bootstrap-cache');
   if(c&&c.ok){
     const el=document.getElementById('n-cache');
-    if(el)el.textContent='Cached peers: '+(c.cached_peers||0);
+    const peers=Array.isArray(c.connected_peers)?c.connected_peers.length:0;
+    if(el)el.textContent='Connected peers: '+peers;
   }
   // Gossip pipeline drop-detection counters (release 0.18.0+).
   const gt=await api('/diagnostics/transport');
@@ -4160,11 +4165,12 @@ async function findAgent(){
   const r=await api('/presence/find/'+encodeURIComponent(id));
   const el=document.getElementById('p-result');
   if(!el)return;
-  if(!r||r.error){el.innerHTML='<span style="color:var(--rd)">Not found: '+esc((r&&r.error)||id)+'</span>';return}
-  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(r.agent_id||id)}</span></div>
-  <div><span class="k">Reachable</span>: ${r.reachable?'yes':'no'}</div>
-  <div><span class="k">Addresses</span>: ${(r.addresses||[]).map(esc).join(', ')||'—'}</div>
-  <div><span class="k">Via FOAF</span>: ${r.via?short(r.via,12):'—'}</div>`;
+  const a=r&&r.agent;
+  if(!r||r.error||!a){el.innerHTML='<span style="color:var(--rd)">Not found: '+esc((r&&r.error)||id)+'</span>';return}
+  const seen=a.last_seen?new Date(a.last_seen*1000).toLocaleString():'—';
+  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(a.agent_id||id)}</span></div>
+  <div><span class="k">Addresses</span>: ${(a.addresses||[]).map(esc).join(', ')||'—'}</div>
+  <div><span class="k">Last seen</span>: ${esc(seen)}</div>`;
 }
 
 async function showPresenceStatus(agentId){
@@ -4173,11 +4179,12 @@ async function showPresenceStatus(agentId){
   const el=document.getElementById('p-result');
   if(!el)return;
   if(!r||!r.ok){el.innerHTML='<span style="color:var(--rd)">No status: '+esc(agentId)+'</span>';return}
-  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(agentId)}</span></div>
+  const a=r.agent||{};
+  const seen=a.last_seen?new Date(a.last_seen*1000).toLocaleString():'—';
+  el.innerHTML=`<div><span class="k">Agent</span>: <span class="aid-short">${esc(a.agent_id||agentId)}</span></div>
   <div><span class="k">Online</span>: ${r.online?'yes':'no'}</div>
-  <div><span class="k">Reachable</span>: ${r.reachable===true?'yes':r.reachable===false?'no':'unknown'}</div>
-  <div><span class="k">Last beacon</span>: ${r.last_beacon_secs!=null?fmtUp(r.last_beacon_secs)+' ago':'—'}</div>
-  <div><span class="k">Trust</span>: ${esc(r.trust_level||'—')}</div>`;
+  <div><span class="k">Addresses</span>: ${(a.addresses||[]).map(esc).join(', ')||'—'}</div>
+  <div><span class="k">Last seen</span>: ${esc(seen)}</div>`;
 }
 
 function togglePresenceLive(on){
@@ -4343,7 +4350,7 @@ async function mlsSendWelcome(gid){
 async function mlsEncryptSelected(){
   if(!selectedMlsGroup){toast('Select a group first','warn');return}
   const plaintext=document.getElementById('mls-plain').value||'';
-  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
+  const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/encrypt',{method:'POST',body:JSON.stringify({payload:u8encode(plaintext)})});
   const result=document.getElementById('mls-crypto-result');
   if(r&&r.ciphertext){
     document.getElementById('mls-cipher').value=r.ciphertext;
@@ -4360,8 +4367,10 @@ async function mlsDecryptSelected(){
   const epoch=parseInt(document.getElementById('mls-epoch').value||'0',10);
   const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
   const result=document.getElementById('mls-crypto-result');
-  if(r&&r.plaintext){
-    document.getElementById('mls-plain').value=r.plaintext;
+  if(r&&r.payload){
+    let text=r.payload;
+    try{text=u8decode(r.payload)}catch(e){}
+    document.getElementById('mls-plain').value=text;
     result.innerHTML='<span style="color:var(--gn)">Decrypted OK</span>';
   }else{
     result.innerHTML='<span style="color:var(--rd)">Failed: '+esc((r&&r.error)||'unknown')+'</span>';
@@ -4388,6 +4397,7 @@ function renderAdmin(){
         <button onclick="adminFetchUserId()">Fetch my user-id</button>
         <button onclick="adminFetchIntroduction()">Fetch introduction card</button>
       </div>
+      <input id="admin-sign-context" placeholder="Signing context (a-z, 0-9, . _ -)" value="gui-admin-sign" style="width:100%;margin-bottom:var(--sp2)">
       <textarea id="admin-sign-payload" placeholder="Payload to sign" rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
       <button onclick="adminSignPayload()">Sign payload</button>
       <div id="admin-identity-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2)"></div>
@@ -4429,22 +4439,24 @@ function renderAdmin(){
     <div class="card">
       <h3 style="margin-top:0">Secure Envelopes</h3>
       <p style="font-size:11px;color:var(--tx2)">
-        Pairwise post-quantum encryption for a named group. Encrypt a payload for
-        all current members, decrypt what you received, or re-seal for a rotated
-        membership set.
+        Group shared-secret encryption. Encrypt a payload for current members,
+        decrypt a ciphertext, or re-seal the current secret to one member.
       </p>
       <div class="row mb" style="gap:var(--sp2)">
         <input id="admin-se-group" placeholder="Group ID" style="flex:1">
       </div>
-      <textarea id="admin-se-plain" placeholder="Plaintext (UTF-8) for encrypt / reseal" rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <textarea id="admin-se-plain" placeholder="Plaintext (UTF-8) to encrypt" rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
       <div class="row mb" style="gap:var(--sp2)">
         <button onclick="adminSecureEncrypt()">Encrypt</button>
-        <button onclick="adminSecureReseal()">Re-seal (new epoch)</button>
       </div>
-      <textarea id="admin-se-cipher" placeholder='{"ciphertext":"...","epoch":0}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <div class="row mb" style="gap:var(--sp2)">
+        <input id="admin-se-recipient" placeholder="Recipient agent ID" style="flex:1">
+        <button onclick="adminSecureReseal()">Re-seal to recipient</button>
+      </div>
+      <textarea id="admin-se-cipher" placeholder='{"ciphertext_b64":"...","nonce_b64":"...","secret_epoch":0}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
       <button onclick="adminSecureDecrypt()">Decrypt</button>
       <p style="font-size:11px;color:var(--tx2);margin-top:var(--sp3)">Or open a raw envelope payload:</p>
-      <textarea id="admin-envelope" placeholder='{"envelope":"..."}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
+      <textarea id="admin-envelope" placeholder='{"group_id":"...","recipient":"...","secret_epoch":0,"kem_ciphertext_b64":"...","aead_nonce_b64":"...","aead_ciphertext_b64":"..."}' rows="2" style="width:100%;margin-bottom:var(--sp2)"></textarea>
       <button onclick="adminOpenEnvelope()">Open envelope</button>
       <div id="admin-env-out" style="font-size:11px;color:var(--tx3);margin-top:var(--sp2);white-space:pre-wrap;max-height:200px;overflow:auto"></div>
     </div>
@@ -4567,8 +4579,10 @@ async function adminFetchIntroduction(){
 }
 async function adminSignPayload(){
   const payload=document.getElementById('admin-sign-payload').value||'';
+  const context=(document.getElementById('admin-sign-context').value||'').trim();
   if(!payload){adminOut('admin-identity-out',null,'Enter a payload to sign');return}
-  const r=await ownerApi('/agent/sign',{method:'POST',body:JSON.stringify({payload_b64:u8encode(payload)})});
+  if(!context){adminOut('admin-identity-out',null,'Enter a signing context');return}
+  const r=await ownerApi('/agent/sign',{method:'POST',body:JSON.stringify({context,payload_b64:u8encode(payload)})});
   adminOut('admin-identity-out',r);
 }
 
@@ -4635,17 +4649,20 @@ async function adminSecureEncrypt(){
   const gid=(document.getElementById('admin-se-group').value||'').trim();
   const plaintext=document.getElementById('admin-se-plain').value||'';
   if(!gid){adminOut('admin-env-out',null,'Enter a group ID');return}
-  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/encrypt',{method:'POST',body:JSON.stringify({plaintext})});
-  if(r&&r.ciphertext){
-    document.getElementById('admin-se-cipher').value=JSON.stringify({ciphertext:r.ciphertext,epoch:r.epoch||0});
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/encrypt',{method:'POST',body:JSON.stringify({payload_b64:u8encode(plaintext)})});
+  if(r&&r.ciphertext_b64){
+    document.getElementById('admin-se-cipher').value=JSON.stringify({ciphertext_b64:r.ciphertext_b64,nonce_b64:r.nonce_b64||'',secret_epoch:r.secret_epoch||0});
   }
   adminOut('admin-env-out',r);
 }
 async function adminSecureReseal(){
   const gid=(document.getElementById('admin-se-group').value||'').trim();
-  const plaintext=document.getElementById('admin-se-plain').value||'';
-  if(!gid){adminOut('admin-env-out',null,'Enter a group ID');return}
-  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/reseal',{method:'POST',body:JSON.stringify({plaintext})});
+  const recipient=(document.getElementById('admin-se-recipient').value||'').trim();
+  if(!gid||!recipient){adminOut('admin-env-out',null,'Enter a group ID and a recipient agent ID');return}
+  const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/reseal',{method:'POST',body:JSON.stringify({recipient})});
+  if(r&&r.kem_ciphertext_b64){
+    document.getElementById('admin-envelope').value=JSON.stringify({group_id:r.group_id,recipient:r.recipient,secret_epoch:r.secret_epoch,kem_ciphertext_b64:r.kem_ciphertext_b64,aead_nonce_b64:r.aead_nonce_b64,aead_ciphertext_b64:r.aead_ciphertext_b64});
+  }
   adminOut('admin-env-out',r);
 }
 async function adminSecureDecrypt(){
@@ -4655,8 +4672,10 @@ async function adminSecureDecrypt(){
   try{body=JSON.parse(document.getElementById('admin-se-cipher').value||'{}')}
   catch(e){adminOut('admin-env-out',null,'Ciphertext JSON invalid');return}
   const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/decrypt',{method:'POST',body:JSON.stringify(body)});
-  if(r&&r.plaintext){
-    document.getElementById('admin-se-plain').value=r.plaintext;
+  if(r&&r.payload_b64){
+    let text=r.payload_b64;
+    try{text=u8decode(r.payload_b64)}catch(e){}
+    document.getElementById('admin-se-plain').value=text;
   }
   adminOut('admin-env-out',r);
 }
@@ -5785,6 +5804,17 @@ async function nagRejectRequest(gid,rid){
   else{nagRequestFeedback(gid,rid,(r&&r.error)||'Reject failed.','err')}
 }
 
+function spaceDetailEncryptedBadge(g){
+  if(!(g&&g.policy&&g.policy.confidentiality==='mls_encrypted'))return '';
+  return '<div style="margin-top:8px"><span class="policy policy-encrypted">&#128274; End-to-end encrypted</span></div>';
+}
+function spaceOwnDisplayName(g,agentId){
+  const members=(g&&Array.isArray(g.members))?g.members:[];
+  const mine=members.find(m=>m&&m.agent_id===agentId);
+  const name=mine&&mine.display_name;
+  return typeof name==='string'?name:'';
+}
+
 async function renderSpaceDetail(el,data){
   const g=await api('/groups/'+data.groupId);
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
@@ -5801,7 +5831,7 @@ async function renderSpaceDetail(el,data){
       <div style="font-size:12px;color:var(--tx3);margin-bottom:8px">${g.description||'No description'}</div>
       <div style="font-size:11px"><span style="color:var(--tx3)">Members:</span> ${g.member_count||1}</div>
       <div style="font-size:11px"><span style="color:var(--tx3)">Creator:</span> <span class="aid-short">${short(g.creator)}</span></div>
-      ${g.mls_group_id?'<div style="margin-top:8px"><span class="policy policy-encrypted">&#128274; End-to-end encrypted</span></div>':''}
+      ${spaceDetailEncryptedBadge(g)}
     </div>
     <h3>Invite</h3>
     <div class="card mb">
@@ -5810,7 +5840,7 @@ async function renderSpaceDetail(el,data){
     </div>
     <h3>Display Name</h3>
     <div class="card mb">
-      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(g.display_names&&g.display_names[S.get('agentId')]||'')}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
+      <div class="row"><input id="detail-dname" placeholder="Your name in this space" value="${esc(spaceOwnDisplayName(g,S.get('agentId')))}"><button onclick="setSpaceDisplayName('${data.groupId}')">Set</button></div>
     </div>
     <h3 style="margin-top:16px">Manage</h3>
     <div id="nag-admin-${data.groupId}" class="mb">
@@ -5843,7 +5873,7 @@ async function genSpaceInvite(gid){
 async function setSpaceDisplayName(gid){
   const name=document.getElementById('detail-dname').value.trim();
   if(!name)return;
-  await api('/groups/'+gid+'/display-name',{method:'PUT',body:JSON.stringify({display_name:name})});
+  await api('/groups/'+gid+'/display-name',{method:'PUT',body:JSON.stringify({name})});
   toast('Display name set','success');
 }
 
