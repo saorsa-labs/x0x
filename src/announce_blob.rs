@@ -254,6 +254,9 @@ pub struct AnnounceBlobCache {
     recovery_fetch_hold: AtomicBool,
     #[cfg(test)]
     recovery_hold_release: tokio::sync::Notify,
+    /// Reserved fetches that have subscribed for the hold release.
+    #[cfg(test)]
+    recovery_hold_entered: AtomicUsize,
     #[cfg(test)]
     recovery_parked: AtomicUsize,
     #[cfg(test)]
@@ -301,6 +304,8 @@ impl AnnounceBlobCache {
             recovery_fetch_hold: AtomicBool::new(false),
             #[cfg(test)]
             recovery_hold_release: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            recovery_hold_entered: AtomicUsize::new(0),
             #[cfg(test)]
             recovery_parked: AtomicUsize::new(0),
             #[cfg(test)]
@@ -526,9 +531,20 @@ impl AnnounceBlobCache {
     }
 
     /// Wait until the hold is released. Shutdown is the caller's other arm.
+    ///
+    /// The notification future is created before the arrival count changes,
+    /// so a release after that count is visible is not lost.
     #[cfg(test)]
     pub(crate) async fn wait_recovery_hold_release_for_testing(&self) {
-        self.recovery_hold_release.notified().await;
+        let wait = self.recovery_hold_release.notified();
+        self.recovery_hold_entered.fetch_add(1, Ordering::SeqCst);
+        wait.await;
+    }
+
+    /// Reserved fetches waiting for the hold to clear.
+    #[cfg(test)]
+    pub(crate) fn recovery_hold_entered_for_testing(&self) -> usize {
+        self.recovery_hold_entered.load(Ordering::SeqCst)
     }
 
     /// How many digests are reserved by an in-flight fetch.

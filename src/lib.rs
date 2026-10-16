@@ -33827,6 +33827,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_starts_a_later_job_when_its_own_child_finishes_1116() {
         let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(9, 0).await;
+        blobs.set_recovery_fetch_hold_for_testing(true);
         blobs.set_recovery_pre_wait_hold_for_testing(true);
         let discovery = std::collections::HashMap::new();
         let sources = cold_sources(&discovery, &announced);
@@ -33873,12 +33874,13 @@ mod tests {
         loop {
             let arrived = blobs.recovery_pre_wait_arrived_for_testing();
             let inflight = blobs.recovery_in_flight_len_for_testing();
-            if arrived == 1 && inflight == 1 {
+            let held = blobs.recovery_hold_entered_for_testing();
+            if arrived == 1 && inflight == 1 && held == 1 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "arrived {arrived}, in flight {inflight}"
+                "arrived {arrived}, in flight {inflight}, held {held}"
             );
             tokio::task::yield_now().await;
         }
@@ -33903,11 +33905,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let arrived = blobs.recovery_pre_wait_arrived_for_testing();
-            let children = blobs.recovery_fetch_children_finished_for_testing();
+            let held = blobs.recovery_hold_entered_for_testing();
             let inflight = blobs.recovery_in_flight_len_for_testing();
             let later_fetches = blobs.recovery_fetch_count_for_testing(&later);
             if arrived == 2
-                && children == 8
+                && held == 8
                 && inflight == MAX_CERT_RECOVERY_SUBJECTS
                 && later_fetches == 0
             {
@@ -33915,7 +33917,22 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "arrived {arrived}, children {children}, in flight {inflight}, later {later_fetches}"
+                "arrived {arrived}, held {held}, in flight {inflight}, later {later_fetches}"
+            );
+            tokio::task::yield_now().await;
+        }
+        blobs.set_recovery_fetch_hold_for_testing(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let children = blobs.recovery_fetch_children_finished_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let later_fetches = blobs.recovery_fetch_count_for_testing(&later);
+            if children == 8 && inflight == MAX_CERT_RECOVERY_SUBJECTS && later_fetches == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "children {children}, in flight {inflight}, later {later_fetches}"
             );
             tokio::task::yield_now().await;
         }
