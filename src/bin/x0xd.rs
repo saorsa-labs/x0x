@@ -387,15 +387,17 @@ async fn run_daemon() -> anyhow::Result<()> {
     // process-scoped skip flag, and owns Ctrl-C itself — the library must not
     // steal the host's signal.
     //
-    // SIGTERM is registered here, before `serve_with_options` advertises
-    // readiness. `/health` returns as soon as the server is listening, and a
-    // supervisor (or `sigterm_exits_within_bounded_deadline`) can signal in
-    // that window. Installing the handler only inside the post-start watcher
-    // leaves the default terminate action in place, so the process dies by
-    // signal 15 instead of taking the bounded clean exit (#371).
+    // Register SIGTERM before `serve_with_options` can accept HTTP. `/health`
+    // returns as soon as the server is listening, and a supervisor can signal
+    // in that window. The stream is installed here and moved into the watcher
+    // below. A registration failure stops startup before readiness. A coverage
+    // failure showed a raw signal-15 exit and did not record this order;
+    // `X0X_CHILD_DIAGNOSTICS` records it for the isolated test.
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
+    #[cfg(unix)]
+    x0x::server::record_startup_diagnostic("sigterm stream registered");
     let self_update_enabled = config.update_enabled();
     let options = ServeOptions {
         skip_update_check,

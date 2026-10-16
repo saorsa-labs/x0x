@@ -40,7 +40,12 @@ const BOUNDED_EXIT_DEADLINE: Duration = Duration::from_secs(6);
 /// destroy the clean-shutdown guarantees the moment the bound is missed.
 #[tokio::test]
 async fn sigterm_exits_within_bounded_deadline() {
-    let mut d = DaemonFixture::start("sigterm-bound").await;
+    // The child writes two stderr lines only when this is set: SIGTERM stream
+    // registration, then the HTTP accept loop. A failure below prints whether
+    // registration preceded accept. The coverage log showed a raw signal-15
+    // exit and did not record that order.
+    std::env::set_var("X0X_CHILD_DIAGNOSTICS", "1");
+    let mut d = DaemonFixture::start_retaining_child_stderr("sigterm-bound").await;
 
     let started = Instant::now();
     let status = Command::new("kill")
@@ -66,14 +71,61 @@ async fn sigterm_exits_within_bounded_deadline() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let elapsed = started.elapsed();
+    let child_log = d.child_stderr();
+    let registered = diagnostic_mono_ns(&child_log, "sigterm stream registered");
+    let accepting = diagnostic_mono_ns(&child_log, "http server accepting");
+    let order = sigterm_registration_order(&child_log);
     let status = exited.unwrap_or_else(|| {
         panic!(
             "daemon did not exit within {BOUNDED_EXIT_DEADLINE:?} of SIGTERM \
-             ({elapsed:?} elapsed) — bounded-shutdown contract violated (#371)"
+             ({elapsed:?} elapsed) — bounded-shutdown contract violated (#371)\n\
+             {order}"
         )
     });
     assert!(
         status.success(),
-        "daemon exited with {status} after SIGTERM (bounded exit must be clean)"
+        "daemon exited with {status} after SIGTERM (bounded exit must be clean)\n{order}"
     );
+    assert!(
+        matches!((registered, accepting), (Some(r), Some(a)) if r < a),
+        "child diagnostics did not record sigterm registration before HTTP accept\n{order}"
+    );
+}
+
+/// Whether the child recorded SIGTERM registration before the HTTP accept loop.
+///
+/// Both lines carry `mono_ns` from one process clock. A missing line stays
+/// "not recorded"; the raw stderr is included either way.
+fn sigterm_registration_order(stderr: &str) -> String {
+    let registered = diagnostic_mono_ns(stderr, "sigterm stream registered");
+    let accepting = diagnostic_mono_ns(stderr, "http server accepting");
+    let whether = match (registered, accepting) {
+        (Some(registered_ns), Some(accepting_ns)) if registered_ns < accepting_ns => {
+            format!("yes (registered mono_ns={registered_ns}, http accept mono_ns={accepting_ns})")
+        }
+        (Some(registered_ns), Some(accepting_ns)) if registered_ns > accepting_ns => {
+            format!("no (registered mono_ns={registered_ns}, http accept mono_ns={accepting_ns})")
+        }
+        (Some(registered_ns), Some(accepting_ns)) => format!(
+            "timestamps equal (registered mono_ns={registered_ns}, http accept mono_ns={accepting_ns})"
+        ),
+        (None, Some(accepting_ns)) => format!(
+            "not recorded (http accept mono_ns={accepting_ns}, sigterm registration missing)"
+        ),
+        (Some(registered_ns), None) => format!(
+            "not recorded (sigterm registration mono_ns={registered_ns}, http accept missing)"
+        ),
+        (None, None) => "not recorded (neither event in child stderr)".to_string(),
+    };
+    format!(
+        "sigterm stream registered before the server accepted HTTP: {whether}\n--- child stderr ---\n{stderr}"
+    )
+}
+
+fn diagnostic_mono_ns(stderr: &str, event: &str) -> Option<u128> {
+    let marker = format!("x0xd: {event} mono_ns=");
+    stderr.lines().find_map(|line| {
+        let rest = line.trim().split_once(&marker)?.1;
+        rest.split_whitespace().next()?.parse().ok()
+    })
 }
