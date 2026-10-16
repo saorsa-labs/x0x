@@ -434,6 +434,96 @@ fn fails_parent_dir_fsync_for_testing(path: &Path) -> bool {
         .any(|armed| armed == path)
 }
 
+/// With the parent-directory fsync seam, replace the renamed bytes so the
+/// caller cannot install them. The hold must stay closed.
+#[cfg(test)]
+static CORRUPT_AFTER_RENAME_FOR_TESTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct CorruptAfterRenameGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_corrupt_after_rename_for_testing(path: &Path) -> CorruptAfterRenameGuard {
+    CORRUPT_AFTER_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+    CorruptAfterRenameGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+fn corrupts_after_rename_for_testing(path: &Path) -> bool {
+    CORRUPT_AFTER_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|armed| armed == path)
+}
+
+#[cfg(test)]
+impl Drop for CorruptAfterRenameGuard {
+    fn drop(&mut self) {
+        let mut armed = CORRUPT_AFTER_RENAME_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|p| *p == self.path) {
+            armed.swap_remove(idx);
+        }
+    }
+}
+
+/// Pause inside a preserving rebuild so a test can observe admission.
+#[cfg(test)]
+static REBUILD_AWAIT_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static REBUILD_AWAIT_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) struct RebuildAwaitGuard;
+
+#[cfg(test)]
+pub(crate) fn arm_rebuild_await_for_testing() -> RebuildAwaitGuard {
+    REBUILD_AWAIT_ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
+    REBUILD_AWAIT_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    RebuildAwaitGuard
+}
+
+#[cfg(test)]
+pub(crate) fn rebuild_await_entered_for_testing() -> bool {
+    REBUILD_AWAIT_ENTERED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn release_rebuild_await_for_testing() {
+    REBUILD_AWAIT_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+impl Drop for RebuildAwaitGuard {
+    fn drop(&mut self) {
+        release_rebuild_await_for_testing();
+    }
+}
+
+#[cfg(test)]
+async fn pause_rebuild_await_for_testing() {
+    if !REBUILD_AWAIT_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    REBUILD_AWAIT_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    while REBUILD_AWAIT_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(test)]
 impl Drop for FailParentDirFsyncGuard {
     fn drop(&mut self) {
@@ -462,6 +552,9 @@ impl Drop for FailParentDirFsyncGuard {
 pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<()> {
     // The guard's own error passes through unchanged, as before #1101.
     let guard = revocation_write_guard(path).await?;
+    let bytes = monotonic_v1_v2_bytes(path, bytes)
+        .await
+        .map_err(durable_write_identity_error)?;
     write_private_bytes_durable_guarded(path, bytes, guard)
         .await
         .map_err(durable_write_identity_error)
@@ -486,7 +579,42 @@ pub async fn write_private_bytes_durable_typed(
     let guard = revocation_write_guard(path)
         .await
         .map_err(guard_refusal_before_rename)?;
+    let bytes = monotonic_v1_v2_bytes(path, bytes).await?;
     write_private_bytes_durable_guarded(path, bytes, guard).await
+}
+
+/// Unite `incoming` with a readable v1 or v2 file already on `path`.
+///
+/// A queued save captured before a rebuild must not replace recovered
+/// records. v3 keeps its own merge writer. A missing live file is written
+/// as `incoming`.
+async fn monotonic_v1_v2_bytes(
+    path: &Path,
+    incoming: Vec<u8>,
+) -> std::result::Result<Vec<u8>, DurableWriteError> {
+    let Some(store) = RevocationStore::at_path(path) else {
+        return Ok(incoming);
+    };
+    if matches!(store, RevocationStore::V3) {
+        return Ok(incoming);
+    }
+    let disk = match read_revocation_store_locked(path, store, true).await {
+        Ok(Some(bytes)) if !bytes.is_empty() => bytes,
+        Ok(_) => return Ok(incoming),
+        Err(error) => {
+            return Err(match error {
+                IdentityError::Storage(io) => DurableWriteError::BeforeRename(io),
+                other => DurableWriteError::BeforeRename(std::io::Error::other(other.to_string())),
+            });
+        }
+    };
+    let mut merged = decode_revocation_bytes(store, &disk)?;
+    unite_revocation_store(
+        store,
+        &mut merged,
+        decode_revocation_bytes(store, &incoming)?,
+    );
+    encode_revocation_store(store, &merged)
 }
 
 async fn clear_revocation_block_async(path: &Path) {
@@ -674,6 +802,8 @@ async fn write_union_or_initial_revocation(
     guard: RevocationWriteGuard,
     remote: bool,
 ) -> std::result::Result<PreservedRevocationWrite, DurableWriteError> {
+    #[cfg(test)]
+    pause_rebuild_await_for_testing().await;
     let live = match read_revocation_store_locked(path, store, true).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -941,6 +1071,9 @@ async fn write_private_bytes_durable_guarded(
     // durable writes to other paths in the same test process.
     #[cfg(test)]
     if fails_parent_dir_fsync_for_testing(path) {
+        if corrupts_after_rename_for_testing(path) {
+            let _ = fs::write(path, b"not-a-revocation-file").await;
+        }
         return Err(DurableWriteError::AfterRename(std::io::Error::other(
             "injected parent-directory fsync failure (test seam)",
         )));

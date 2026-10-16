@@ -3926,22 +3926,111 @@ fn recovery_apply_kind(apply: &CertRecoveryApply) -> u8 {
     }
 }
 
-fn merge_recovery_records(
-    into: &mut Vec<revocation::RevocationRecord>,
-    extra: Vec<revocation::RevocationRecord>,
+fn queued_recovery_records(job: &QueuedCertRecovery) -> Vec<revocation::RevocationRecord> {
+    match &job.apply {
+        CertRecoveryApply::Legacy(batch) => batch.records.clone(),
+        CertRecoveryApply::V2(batch) => batch.records.clone(),
+    }
+}
+
+fn set_queued_recovery_records(
+    job: &mut QueuedCertRecovery,
+    records: Vec<revocation::RevocationRecord>,
 ) {
-    let mut seen: std::collections::HashSet<[u8; 32]> = into
-        .iter()
-        .map(revocation::RevocationRecord::record_hash)
-        .collect();
-    for record in extra {
-        if into.len() >= MAX_COALESCED_RECOVERY_RECORDS {
+    match &mut job.apply {
+        CertRecoveryApply::Legacy(batch) => batch.records = records,
+        CertRecoveryApply::V2(batch) => batch.records = records,
+    }
+}
+
+/// One waiter after record order has admitted each record with its authority.
+struct SelectedRecovery {
+    records: Vec<revocation::RevocationRecord>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+}
+
+/// Keep a record only together with the certificate or fetch binding that
+/// can authorize it. A unit that does not fit is left out of this waiter.
+/// Record order is the order. A later batch is not stored once the record
+/// cap is full.
+fn select_recovery_units(
+    records: Vec<revocation::RevocationRecord>,
+    found: &std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending: &[(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)],
+) -> SelectedRecovery {
+    let mut kept_records = Vec::new();
+    let mut kept_found = std::collections::HashMap::new();
+    let mut kept_pending = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    for record in records {
+        if kept_records.len() >= MAX_COALESCED_RECOVERY_RECORDS {
             break;
         }
-        if seen.insert(record.record_hash()) {
-            into.push(record);
+        if !seen.insert(record.record_hash()) {
+            continue;
+        }
+        match record.needs_certificate_authority() {
+            None => kept_records.push(record),
+            Some(agent) => {
+                let already = kept_found.contains_key(&agent)
+                    || kept_pending.iter().any(|(id, _)| *id == agent);
+                if already {
+                    kept_records.push(record);
+                    continue;
+                }
+                let certs = found.get(&agent).filter(|certs| !certs.is_empty());
+                let binding = pending
+                    .iter()
+                    .find(|(id, _)| *id == agent)
+                    .map(|(_, binding)| *binding);
+                match (certs, binding) {
+                    (Some(certs), _) => {
+                        let add = std::mem::size_of_val(agent.as_bytes())
+                            + certs.iter().map(certificate_metadata_bytes).sum::<usize>();
+                        let fits = kept_found.len() < MAX_COALESCED_RECOVERY_SUBJECTS
+                            && bytes.saturating_add(add) <= MAX_COALESCED_RECOVERY_BYTES;
+                        if !fits {
+                            break;
+                        }
+                        bytes = bytes.saturating_add(add);
+                        kept_found.insert(agent, certs.clone());
+                        kept_records.push(record);
+                    }
+                    (None, Some(binding)) => {
+                        let add = std::mem::size_of::<identity::AgentId>()
+                            + std::mem::size_of::<dm_inbox::AuthenticatedMachineBinding>();
+                        let fits = kept_pending.len() < MAX_COALESCED_RECOVERY_SUBJECTS
+                            && bytes.saturating_add(add) <= MAX_COALESCED_RECOVERY_BYTES;
+                        if !fits {
+                            break;
+                        }
+                        bytes = bytes.saturating_add(add);
+                        kept_pending.push((agent, binding));
+                        kept_records.push(record);
+                    }
+                    (None, None) => {}
+                }
+            }
         }
     }
+    SelectedRecovery {
+        records: kept_records,
+        found: kept_found,
+        pending: kept_pending,
+    }
+}
+
+fn install_selected_recovery(
+    job: &mut QueuedCertRecovery,
+    records: Vec<revocation::RevocationRecord>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+) {
+    set_queued_recovery_records(job, records);
+    job.found = found;
+    job.pending = pending;
 }
 
 fn certificate_metadata_bytes(cert: &identity::AgentCertificate) -> usize {
@@ -3951,6 +4040,7 @@ fn certificate_metadata_bytes(cert: &identity::AgentCertificate) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+#[cfg(test)]
 fn recovery_metadata_bytes(job: &QueuedCertRecovery) -> usize {
     let mut bytes = 0usize;
     for (agent, certs) in &job.found {
@@ -3964,96 +4054,32 @@ fn recovery_metadata_bytes(job: &QueuedCertRecovery) -> usize {
     bytes.saturating_add(job.pending.len().saturating_mul(pending_each))
 }
 
-fn accept_found_within_cap(
-    job: &mut QueuedCertRecovery,
-    agent: identity::AgentId,
-    certs: Vec<identity::AgentCertificate>,
-) {
-    if job.found.contains_key(&agent) || job.found.len() >= MAX_COALESCED_RECOVERY_SUBJECTS {
-        return;
-    }
-    let mut room = MAX_COALESCED_RECOVERY_BYTES.saturating_sub(recovery_metadata_bytes(job));
-    let id_bytes = std::mem::size_of_val(agent.as_bytes());
-    if room < id_bytes {
-        return;
-    }
-    room -= id_bytes;
-    if certs.is_empty() {
-        job.found.insert(agent, Vec::new());
-        return;
-    }
-    let mut kept = Vec::new();
-    for cert in certs {
-        let len = certificate_metadata_bytes(&cert);
-        if len > room {
-            break;
-        }
-        room -= len;
-        kept.push(cert);
-    }
-    // None of the certificates fit. Leave the subject for a later batch.
-    if kept.is_empty() {
-        return;
-    }
-    job.found.insert(agent, kept);
-}
-
-fn accept_pending_within_cap(
-    job: &mut QueuedCertRecovery,
-    item: (identity::AgentId, dm_inbox::AuthenticatedMachineBinding),
-) {
-    if job.pending.iter().any(|(agent, _)| *agent == item.0)
-        || job.pending.len() >= MAX_COALESCED_RECOVERY_SUBJECTS
-    {
-        return;
-    }
-    let extra = std::mem::size_of::<identity::AgentId>()
-        + std::mem::size_of::<dm_inbox::AuthenticatedMachineBinding>();
-    if recovery_metadata_bytes(job).saturating_add(extra) > MAX_COALESCED_RECOVERY_BYTES {
-        return;
-    }
-    job.pending.push(item);
-}
-
-/// Trim one waiter to the record, subject, and byte caps.
+/// Trim one waiter so every kept record still has its authority metadata.
 ///
-/// Records and subjects past the cap are not stored here. A later batch,
-/// after this waiter has started, can carry them again.
+/// Records past the cap, and a record whose certificate or fetch binding
+/// does not fit, are not stored. Repeating the same records keeps the same
+/// prefix. A later batch is not stored once that prefix has filled the cap.
 fn normalize_queued_recovery(job: &mut QueuedCertRecovery) {
-    match &mut job.apply {
-        CertRecoveryApply::Legacy(batch) => {
-            batch.records.truncate(MAX_COALESCED_RECOVERY_RECORDS);
-        }
-        CertRecoveryApply::V2(batch) => {
-            batch.records.truncate(MAX_COALESCED_RECOVERY_RECORDS);
-        }
-    }
-    let found = std::mem::take(&mut job.found);
-    let pending = std::mem::take(&mut job.pending);
-    for (agent, certs) in found {
-        accept_found_within_cap(job, agent, certs);
-    }
-    for item in pending {
-        accept_pending_within_cap(job, item);
-    }
+    let records = queued_recovery_records(job);
+    let selected = select_recovery_units(records, &job.found, &job.pending);
+    install_selected_recovery(job, selected.records, selected.found, selected.pending);
 }
 
 fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecovery) {
+    let mut records = queued_recovery_records(into);
+    records.extend(queued_recovery_records(&extra));
+    let mut found = std::mem::take(&mut into.found);
     for (agent, certs) in extra.found {
-        accept_found_within_cap(into, agent, certs);
+        found.entry(agent).or_insert(certs);
     }
+    let mut pending = std::mem::take(&mut into.pending);
     for item in extra.pending {
-        accept_pending_within_cap(into, item);
-    }
-    match (&mut into.apply, extra.apply) {
-        (CertRecoveryApply::Legacy(dst), CertRecoveryApply::Legacy(src)) => {
-            merge_recovery_records(&mut dst.records, src.records);
+        if !pending.iter().any(|(agent, _)| *agent == item.0) {
+            pending.push(item);
         }
-        (CertRecoveryApply::V2(dst), CertRecoveryApply::V2(src)) => {
-            merge_recovery_records(&mut dst.records, src.records);
-        }
-        _ => {}
     }
+    let selected = select_recovery_units(records, &found, &pending);
+    install_selected_recovery(into, selected.records, selected.found, selected.pending);
 }
 
 fn finish_cert_recovery_task(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>) {
@@ -4140,8 +4166,9 @@ fn spawn_cert_recovery_task(
 /// most [`MAX_COALESCED_RECOVERY_RECORDS`] records, [`MAX_COALESCED_RECOVERY_SUBJECTS`]
 /// found subjects, the same number of pending subjects, and
 /// [`MAX_COALESCED_RECOVERY_BYTES`] of certificate and binding metadata.
-/// The first waiter is trimmed before it is stored. Subjects past the cap
-/// wait for a later batch, after this waiter has started. The eight-fetch
+/// The first waiter is trimmed before it is stored. A record is kept only
+/// with the certificate or fetch binding that authorizes it. A later batch
+/// is not stored once the record cap is full. The eight-fetch
 /// allowance is shared with every other batch. Shutdown joins a live task
 /// before it applies or persists. The task is shielded from the
 /// three-second grace abort so it can finish joining fetch children
@@ -4242,6 +4269,36 @@ fn tracked_recovery_waiter_load_for_testing(
         certs += job.found.values().map(Vec::len).sum::<usize>();
     }
     (records, found, pending, bytes, certs)
+}
+
+/// Records and authority metadata held by every waiting recovery batch.
+#[cfg(test)]
+struct WaitingRecoveryView {
+    records: Vec<revocation::RevocationRecord>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending_agents: Vec<identity::AgentId>,
+}
+
+#[cfg(test)]
+fn tracked_recovery_waiter_view_for_testing(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+) -> Vec<WaitingRecoveryView> {
+    let guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .recovery_wait
+        .iter()
+        .map(|job| WaitingRecoveryView {
+            records: match &job.apply {
+                CertRecoveryApply::Legacy(batch) => batch.records.clone(),
+                CertRecoveryApply::V2(batch) => batch.records.clone(),
+            },
+            found: job.found.clone(),
+            pending_agents: job.pending.iter().map(|(agent, _)| *agent).collect(),
+        })
+        .collect()
 }
 
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
@@ -6038,9 +6095,10 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 /// with every revocation still readable in the quarantine file. A v3
 /// rebuild takes the cross-process lock. A revocation already durable stays.
 /// If the quarantine bytes cannot be read, this snapshot is not installed.
-/// The running carrier stays closed until the operator command. A recovered
-/// revocation is installed into the live set before that carrier opens, so
-/// the next ordinary save still contains it.
+/// Admission stays closed on that refusal, on a failed install, and while
+/// the write is still in progress. A fresh snapshot cannot clear that hold.
+/// A recovered revocation is installed into the live set before admission
+/// opens. An ordinary save cannot replace that file with an older snapshot.
 pub(crate) async fn persist_completed_revocation_rebuild(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -6114,23 +6172,25 @@ pub(crate) async fn persist_completed_revocation_rebuild(
                 tracing::warn!("{name} rebuild failed after the rename: {error}");
                 let disk = tokio::fs::read(&path).await.ok();
                 let mut set = revocation_set.write().await;
-                let install_failed = match disk.as_deref() {
+                set.hold_carrier_until_reconciled(carrier);
+                let installed = match disk.as_deref() {
                     Some(bytes) => {
-                        storage::install_preserved_revocations(&mut set, store, bytes).is_err()
+                        storage::install_preserved_revocations(&mut set, store, bytes).is_ok()
                     }
                     None => false,
                 };
-                if install_failed {
+                if installed {
+                    set.release_reconciled_carrier(carrier);
+                } else {
                     tracing::warn!("{name} rebuild on disk was not reconciled");
                 }
-                set.release_reconciled_carrier(carrier);
             }
             Err(error) => {
                 tracing::warn!("{name} rebuild failed before the rename: {error}");
                 revocation_set
                     .write()
                     .await
-                    .release_reconciled_carrier(carrier);
+                    .hold_carrier_until_reconciled(carrier);
                 retry |= carrier;
             }
         }
@@ -33909,8 +33969,12 @@ mod tests {
                     "pass {pass}: verified {verified} of {count}"
                 );
                 assert!(
-                    !guard.revocation_resync_required(),
-                    "pass {pass}: {count} verified tombstones must open the v2 carrier"
+                    !guard.carrier_resync_pending(revocation::REVOCATION_CARRIER_V2),
+                    "pass {pass}: {count} verified tombstones must accept the v2 snapshot"
+                );
+                assert!(
+                    guard.revocation_resync_required(),
+                    "pass {pass}: the reconcile hold stays until the rebuild installs"
                 );
             }
         }
@@ -34220,9 +34284,9 @@ mod tests {
         }
     }
 
-    /// #1116: ten thousand distinct recovery subjects stay within the waiter
-    /// caps. Records stop at 128, and found and pending each stop at 128.
-    /// A certificate list that exceeds the byte cap is shortened.
+    /// #1116: a waiter keeps at most 128 records. Metadata that no kept
+    /// record needs is not stored. The same records keep the same prefix.
+    /// A later record, and a certificate list that does not fit, stay out.
     #[tokio::test]
     async fn coalesced_recovery_metadata_stays_bounded_1116() {
         fn agent_at(n: u32) -> identity::AgentId {
@@ -34288,13 +34352,18 @@ mod tests {
         let mut signed = Vec::with_capacity(160);
         for stamp in 0..160u64 {
             signed.push(revocation::RevocationRecord {
-                subject: revocation::RevokedSubject::Agent(agent_at(stamp as u32)),
+                subject: revocation::RevokedSubject::Machine(machine_at(stamp as u32)),
                 issuer_public_key: vec![0x11; 32],
                 revoked_at: 1_000 + stamp,
                 reason: None,
                 signature: Vec::new(),
             });
         }
+        let expected: Vec<_> = signed
+            .iter()
+            .take(MAX_COALESCED_RECOVERY_RECORDS)
+            .map(revocation::RevocationRecord::record_hash)
+            .collect();
         let rig = fresh_registry();
         occupy_live_slots(&rig);
         let mut bindings = dm_inbox::AuthenticatedMachineBindingCache::default();
@@ -34316,20 +34385,53 @@ mod tests {
             found,
             pending,
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: signed.clone(),
+                revocation_set: std::sync::Arc::clone(&rig.set),
+                identity_dir: None,
+                owner_trust: rig.owner.clone(),
+            })),
+        );
+        let kept_hashes = |registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>| {
+            tracked_recovery_waiter_view_for_testing(registry)
+                .into_iter()
+                .flat_map(|view| view.records)
+                .map(|record| record.record_hash())
+                .collect::<Vec<_>>()
+        };
+        let (records, found_n, pending_n, bytes, _) =
+            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        assert_eq!(records, 128, "a 160-record waiter keeps 128");
+        assert_eq!(kept_hashes(&rig.registry), expected);
+        assert_eq!(
+            found_n, 0,
+            "found subjects with no kept record are not stored"
+        );
+        assert_eq!(
+            pending_n, 0,
+            "pending subjects with no kept record are not stored"
+        );
+        assert!(
+            bytes <= MAX_COALESCED_RECOVERY_BYTES,
+            "metadata bytes {bytes}"
+        );
+        track_cert_recovery(
+            &rig.registry,
+            rig.shutdown.clone(),
+            std::sync::Arc::clone(&rig.blobs),
+            None,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: signed,
                 revocation_set: std::sync::Arc::clone(&rig.set),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
         );
-        let (records, found_n, pending_n, bytes, _) =
-            tracked_recovery_waiter_load_for_testing(&rig.registry);
-        assert_eq!(records, 128, "a 160-record waiter keeps 128");
-        assert_eq!(found_n, 128, "5_000 found subjects stay at the cap");
-        assert_eq!(pending_n, 128, "5_000 pending subjects stay at the cap");
-        assert!(
-            bytes <= MAX_COALESCED_RECOVERY_BYTES,
-            "metadata bytes {bytes}"
+        assert_eq!(
+            kept_hashes(&rig.registry),
+            expected,
+            "the same snapshot keeps the same prefix"
         );
 
         for n in 0..10_000u32 {
@@ -34358,24 +34460,62 @@ mod tests {
         let (records, found_n, pending_n, bytes, _) =
             tracked_recovery_waiter_load_for_testing(&rig.registry);
         assert_eq!(records, 128);
-        assert_eq!(
-            found_n, 128,
-            "10_000 further found subjects do not grow the waiter"
-        );
-        assert_eq!(
-            pending_n, 128,
-            "10_000 further pending subjects do not grow the waiter"
-        );
-        assert!(found_n < 5_000 && pending_n < 5_000);
+        assert_eq!(kept_hashes(&rig.registry), expected);
+        assert_eq!(found_n, 0, "further found subjects are not stored");
+        assert_eq!(pending_n, 0, "further pending subjects are not stored");
         assert!(bytes <= MAX_COALESCED_RECOVERY_BYTES, "bytes {bytes}");
 
-        let fat = fresh_registry();
-        occupy_live_slots(&fat);
         let user = identity::UserKeypair::generate().expect("user");
         let certified = identity::AgentKeypair::generate().expect("certified agent");
         let cert = identity::AgentCertificate::issue(&user, &certified).expect("cert");
+        let later = revocation::RevocationRecord {
+            subject: revocation::RevokedSubject::Agent(certified.agent_id()),
+            issuer_public_key: vec![0x11; 32],
+            revoked_at: 9_000_000,
+            reason: None,
+            signature: Vec::new(),
+        };
+        let later_hash = later.record_hash();
+        let mut later_found = std::collections::HashMap::new();
+        later_found.insert(certified.agent_id(), vec![cert.clone()]);
+        track_cert_recovery(
+            &rig.registry,
+            rig.shutdown.clone(),
+            std::sync::Arc::clone(&rig.blobs),
+            None,
+            later_found,
+            Vec::new(),
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: vec![later],
+                revocation_set: std::sync::Arc::clone(&rig.set),
+                identity_dir: None,
+                owner_trust: rig.owner.clone(),
+            })),
+        );
+        let (records, found_n, _, _, certs) =
+            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        assert_eq!(records, 128);
+        assert_eq!(found_n, 0);
+        assert_eq!(
+            certs, 0,
+            "a full waiter does not keep the later certificate"
+        );
+        assert!(!kept_hashes(&rig.registry).contains(&later_hash));
+
+        let fat = fresh_registry();
+        occupy_live_slots(&fat);
+        let one = certificate_metadata_bytes(&cert);
+        let copies = (MAX_COALESCED_RECOVERY_BYTES / one.max(1)).saturating_add(2);
+        let fat_agent = agent_at(1);
+        let fat_record = revocation::RevocationRecord {
+            subject: revocation::RevokedSubject::Agent(fat_agent),
+            issuer_public_key: vec![0x11; 32],
+            revoked_at: 9_000_001,
+            reason: None,
+            signature: Vec::new(),
+        };
         let mut fat_found = std::collections::HashMap::new();
-        fat_found.insert(agent_at(1), vec![cert; 200]);
+        fat_found.insert(fat_agent, vec![cert; copies]);
         track_cert_recovery(
             &fat.registry,
             fat.shutdown.clone(),
@@ -34384,20 +34524,23 @@ mod tests {
             fat_found,
             Vec::new(),
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
-                records: Vec::new(),
+                records: vec![fat_record],
                 revocation_set: std::sync::Arc::clone(&fat.set),
                 identity_dir: None,
                 owner_trust: fat.owner.clone(),
             })),
         );
-        let (_, fat_subjects, _, fat_bytes, fat_certs) =
+        let (fat_records, fat_subjects, _, fat_bytes, fat_certs) =
             tracked_recovery_waiter_load_for_testing(&fat.registry);
-        assert_eq!(fat_subjects, 1);
-        assert!(
-            fat_certs < 200,
-            "the byte cap shortens the certificate list"
+        assert_eq!(
+            fat_records, 0,
+            "a certificate list that does not fit defers its record"
         );
-        assert!(fat_certs > 0, "a certificate that fits is kept");
+        assert_eq!(fat_subjects, 0);
+        assert_eq!(
+            fat_certs, 0,
+            "the certificate list is not shortened in place"
+        );
         assert!(
             fat_bytes <= MAX_COALESCED_RECOVERY_BYTES,
             "fat metadata bytes {fat_bytes}"
@@ -34423,35 +34566,169 @@ mod tests {
             }};
         }
         drain_recovery!(rig);
-        rig.blobs.set_recovery_fetch_hold_for_testing(true);
-        occupy_live_slots(&rig);
-        let retry_agent = agent_at(30_000);
-        let mut retry_found = std::collections::HashMap::new();
-        retry_found.insert(retry_agent, Vec::new());
-        track_cert_recovery(
-            &rig.registry,
-            rig.shutdown.clone(),
-            std::sync::Arc::clone(&rig.blobs),
+        drain_recovery!(fat);
+    }
+
+    /// #1116: a recovery record stays with the certificate or fetch binding
+    /// that authorizes it. Map order does not drop a certificate that the
+    /// record order still has room for. Applying the retained certificate
+    /// installs the revocation.
+    #[tokio::test]
+    async fn recovery_record_keeps_its_authority_certificate_1116() {
+        let owner = identity::UserKeypair::generate().expect("owner");
+        let agent_a = identity::AgentKeypair::generate().expect("agent a");
+        let agent_b = identity::AgentKeypair::generate().expect("agent b");
+        let cert = identity::AgentCertificate::issue(&owner, &agent_a).expect("cert");
+        let record_a = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(agent_a.agent_id()),
+            owner.public_key(),
+            owner.secret_key(),
+            1_700_000_000,
             None,
-            retry_found,
-            Vec::new(),
+        )
+        .expect("sign a");
+        let record_b = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(agent_b.agent_id()),
+            owner.public_key(),
+            owner.secret_key(),
+            1_700_000_001,
+            None,
+        )
+        .expect("sign b");
+        let missing = revocation::RevocationRecord {
+            subject: revocation::RevokedSubject::Agent(identity::AgentId([0x44; 32])),
+            issuer_public_key: vec![0x11; 32],
+            revoked_at: 1_700_000_002,
+            reason: None,
+            signature: Vec::new(),
+        };
+        let fat_agent = identity::AgentId([0x45; 32]);
+        let fat_record = revocation::RevocationRecord {
+            subject: revocation::RevokedSubject::Agent(fat_agent),
+            issuer_public_key: vec![0x11; 32],
+            revoked_at: 1_700_000_003,
+            reason: None,
+            signature: Vec::new(),
+        };
+        let one = certificate_metadata_bytes(&cert);
+        let copies = (MAX_COALESCED_RECOVERY_BYTES / one.max(1)).saturating_add(2);
+        let mut found = std::collections::HashMap::new();
+        found.insert(fat_agent, vec![cert.clone(); copies]);
+        found.insert(agent_a.agent_id(), vec![cert.clone(), cert]);
+        let mut bindings = dm_inbox::AuthenticatedMachineBindingCache::default();
+        bindings.record_announcement(
+            agent_b.agent_id(),
+            identity::MachineId([0x66; 32]),
+            1,
+            None,
+            None,
+        );
+        let pending = vec![(
+            agent_b.agent_id(),
+            bindings.peek(&agent_b.agent_id()).expect("binding"),
+        )];
+        let records = vec![
+            record_a.clone(),
+            missing.clone(),
+            record_b.clone(),
+            fat_record.clone(),
+        ];
+        let once = select_recovery_units(records.clone(), &found, &pending);
+        let twice = select_recovery_units(records.clone(), &found, &pending);
+        let hashes = |batch: &[revocation::RevocationRecord]| {
+            batch
+                .iter()
+                .map(revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(&once.records), hashes(&twice.records));
+        assert_eq!(
+            hashes(&once.records),
+            hashes(&[record_a.clone(), record_b.clone()])
+        );
+        assert_eq!(once.found.get(&agent_a.agent_id()).map(Vec::len), Some(2));
+        assert!(!once.found.contains_key(&fat_agent));
+        assert!(hashes(&once.records).contains(&record_a.record_hash()));
+        assert!(!hashes(&once.records).contains(&missing.record_hash()));
+        assert!(!hashes(&once.records).contains(&fat_record.record_hash()));
+        assert_eq!(
+            once.pending
+                .iter()
+                .map(|(agent, _)| *agent)
+                .collect::<Vec<_>>(),
+            vec![agent_b.agent_id()]
+        );
+
+        let retained = once
+            .found
+            .get(&agent_a.agent_id())
+            .and_then(|certs| certs.first())
+            .expect("retained certificate")
+            .clone();
+        let mut applied = revocation::RevocationSet::new();
+        assert!(applied.verify_and_insert(record_a.clone(), None).is_err());
+        assert!(applied
+            .verify_and_insert(record_a.clone(), Some(&retained))
+            .unwrap());
+        assert!(applied.is_agent_revoked(&agent_a.agent_id()));
+
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+            closed: false,
+            handles: Vec::new(),
+            shielded: Vec::new(),
+            recovery_live: 0,
+            recovery_wait: Vec::new(),
+        }));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        for _ in 0..MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+            track_cert_recovery(
+                &registry,
+                shutdown.clone(),
+                std::sync::Arc::clone(&blobs),
+                None,
+                std::collections::HashMap::new(),
+                Vec::new(),
+                CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                    records: Vec::new(),
+                    revocation_set: std::sync::Arc::clone(&set),
+                    identity_dir: None,
+                    owner_trust: owner_trust.clone(),
+                })),
+            );
+        }
+        track_cert_recovery(
+            &registry,
+            shutdown.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found,
+            pending,
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
-                records: Vec::new(),
-                revocation_set: std::sync::Arc::clone(&rig.set),
+                records,
+                revocation_set: std::sync::Arc::clone(&set),
                 identity_dir: None,
-                owner_trust: rig.owner.clone(),
+                owner_trust,
             })),
         );
-        let (_, retry_found_n, retry_pending_n, _, _) =
-            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        let view = tracked_recovery_waiter_view_for_testing(&registry);
+        assert_eq!(view.len(), 1);
+        assert_eq!(hashes(&view[0].records), hashes(&[record_a, record_b]));
         assert_eq!(
-            retry_found_n, 1,
-            "a subject dropped from a full waiter is carried by a later batch"
+            view[0].found.get(&agent_a.agent_id()).map(Vec::len),
+            Some(2)
         );
-        assert_eq!(retry_pending_n, 0);
-
-        drain_recovery!(rig);
-        drain_recovery!(fat);
+        assert!(!view[0].found.contains_key(&fat_agent));
+        assert_eq!(view[0].pending_agents, vec![agent_b.agent_id()]);
+        tokio::task::yield_now().await;
     }
 
     /// #1116: the three-second grace abort must not finish the outer recovery

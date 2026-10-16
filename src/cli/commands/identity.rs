@@ -301,7 +301,7 @@ pub async fn rebuild_revocation_store(
         }
     } else {
         let path = from.context("pass --from <file> or --empty --confirm-empty")?;
-        tokio::fs::read(path)
+        tokio::fs::read(&path)
             .await
             .with_context(|| format!("could not read {}", path.display()))?
     };

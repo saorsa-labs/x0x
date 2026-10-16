@@ -403,7 +403,14 @@ async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
         assert!(!again.is_share_grant_revoked(&lost_grant, &owner.user_id()));
         assert!(!again.is_share_grant_revoked(&unrelated, &owner.user_id()));
     } else {
-        assert!(!set.read().await.revocation_resync_required());
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "an accepted snapshot stays closed until the rebuild installs it"
+        );
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(crate::revocation::REVOCATION_CARRIER_V3));
         assert!(set
             .read()
             .await
