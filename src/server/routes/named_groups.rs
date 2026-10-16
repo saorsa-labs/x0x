@@ -23045,7 +23045,16 @@ async fn pending_self_leave_rekey_for_head(
     let path = self_leave_rekey_outbox_path(state, group_key);
     let file = {
         let _guard = self_leave_outbox_lock().lock().await;
-        read_self_leave_rekey_outbox(&path).await
+        match read_self_leave_rekey_outbox(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::error!(
+                    group_id = %LogHexId::group(group_key),
+                    "self-leave outbox was not read: {error}"
+                );
+                return None;
+            }
+        }
     };
     file.pending.into_iter().find(|event| match event {
         NamedGroupMetadataEvent::MemberRemoved {
@@ -23393,14 +23402,21 @@ fn self_leave_outbox_push_capped(
     }
 }
 
-async fn read_self_leave_rekey_outbox(path: &std::path::Path) -> SelfLeaveOutboxFile {
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return SelfLeaveOutboxFile::default();
+async fn read_self_leave_rekey_outbox(
+    path: &std::path::Path,
+) -> std::io::Result<SelfLeaveOutboxFile> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SelfLeaveOutboxFile::default());
+        }
+        Err(error) => return Err(error),
     };
     if let Ok(file) = serde_json::from_slice::<SelfLeaveOutboxFile>(&bytes) {
-        return file;
+        return Ok(file);
     }
     // Older files are a JSON array of rekey events. Treat them as pending.
+    // Any other bytes stay unread. The caller must not replace them.
     serde_json::from_slice::<Vec<NamedGroupMetadataEvent>>(&bytes)
         .map(|pending| SelfLeaveOutboxFile {
             predecessors: Vec::new(),
@@ -23408,7 +23424,15 @@ async fn read_self_leave_rekey_outbox(path: &std::path::Path) -> SelfLeaveOutbox
             served: Vec::new(),
             committer_snapshots: Vec::new(),
         })
-        .unwrap_or_default()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "self-leave outbox {} is not readable: {error}",
+                    path.display()
+                ),
+            )
+        })
 }
 
 fn self_leave_outbox_drop_snapshot(file: &mut SelfLeaveOutboxFile, key: &str) {
@@ -23556,7 +23580,7 @@ where
 {
     let _guard = self_leave_outbox_lock().lock().await;
     let path = self_leave_rekey_outbox_path(state, group_key);
-    let mut file = read_self_leave_rekey_outbox(&path).await;
+    let mut file = read_self_leave_rekey_outbox(&path).await?;
     mutate(&mut file);
     write_self_leave_rekey_outbox(&path, &file).await
 }
@@ -23582,7 +23606,16 @@ async fn self_leave_committer_snapshot(
     let path = self_leave_rekey_outbox_path(state, group_key);
     let file = {
         let _guard = self_leave_outbox_lock().lock().await;
-        read_self_leave_rekey_outbox(&path).await
+        match read_self_leave_rekey_outbox(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::error!(
+                    group_id = %LogHexId::group(group_key),
+                    "self-leave committer snapshot was not read: {error}"
+                );
+                return None;
+            }
+        }
     };
     let encoded = file
         .committer_snapshots
@@ -23786,7 +23819,16 @@ pub(in crate::server) async fn resume_durable_self_leave_rekeys(state: &Arc<AppS
     for path in paths {
         let snapshot = {
             let _guard = self_leave_outbox_lock().lock().await;
-            read_self_leave_rekey_outbox(&path).await
+            match read_self_leave_rekey_outbox(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        "self-leave outbox was not resumed: {error}"
+                    );
+                    continue;
+                }
+            }
         };
         for event in snapshot.predecessors.iter().chain(snapshot.served.iter()) {
             remember_treekem_membership_event(state, event).await;
@@ -23845,7 +23887,7 @@ async fn update_self_leave_outbox_file(
     mutate: impl FnOnce(&mut SelfLeaveOutboxFile),
 ) -> std::io::Result<()> {
     let _guard = self_leave_outbox_lock().lock().await;
-    let mut file = read_self_leave_rekey_outbox(path).await;
+    let mut file = read_self_leave_rekey_outbox(path).await?;
     mutate(&mut file);
     write_self_leave_rekey_outbox(path, &file).await
 }

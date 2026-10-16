@@ -872,7 +872,7 @@ async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
-    let file = read_self_leave_rekey_outbox(&path).await;
+    let file = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         file.pending.is_empty(),
         "a successful publish must take the rekey off the republish list"
@@ -948,7 +948,7 @@ async fn resume_drops_a_rekey_that_is_not_in_the_stored_chain() -> Result<()> {
         "resume must not publish a commit the stored chain does not hold"
     );
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
-    let file = read_self_leave_rekey_outbox(&path).await;
+    let file = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         file.pending.iter().all(|event| {
             named_group_metadata_event_commit(event)
@@ -1140,7 +1140,7 @@ async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()>
         "the follow-up retry must install the saved commit"
     );
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
-    let saved = read_self_leave_rekey_outbox(&path).await;
+    let saved = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         !saved.predecessors.is_empty(),
         "the predecessor must be durable before the failed rekey write"
@@ -1175,7 +1175,7 @@ async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()>
         epoch_after,
         "a later pass must not seal a second commit for the same leave"
     );
-    let again = read_self_leave_rekey_outbox(&path).await;
+    let again = read_self_leave_rekey_outbox(&path).await?;
     assert_eq!(again.pending.len(), 1, "the unacked rekey stays pending");
     skip_self_leave_rekey_ack(false);
     Ok(())
@@ -1200,7 +1200,7 @@ async fn publish_fault_leaves_rekey_pending(fault: &str) -> Result<()> {
         "the epoch is installed before publish"
     );
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
-    let file = read_self_leave_rekey_outbox(&path).await;
+    let file = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         !file.pending.is_empty(),
         "{fault} must leave the rekey pending"
@@ -1227,7 +1227,7 @@ async fn publish_fault_leaves_rekey_pending(fault: &str) -> Result<()> {
         publish_count(&fixture.state) > before,
         "resume must send a rekey that publish did not accept"
     );
-    let after = read_self_leave_rekey_outbox(&path).await;
+    let after = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         after.pending.is_empty(),
         "a later successful publish must take the rekey off the republish list"
@@ -1273,7 +1273,7 @@ async fn resume_keeps_a_rekey_until_the_membership_lock_shows_it_stored() -> Res
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
-    let mid = read_self_leave_rekey_outbox(&path).await;
+    let mid = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         mid.pending.iter().any(|event| {
             named_group_metadata_event_commit(event)
@@ -1325,7 +1325,7 @@ async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> R
     let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
     #[cfg(unix)]
     assert_eq!(unix_mode(&path), 0o600, "outbox_mode");
-    let file = read_self_leave_rekey_outbox(&path).await;
+    let file = read_self_leave_rekey_outbox(&path).await?;
     assert!(
         file.committer_snapshots.is_empty(),
         "persist must delete the outbox private tree"
@@ -1346,7 +1346,7 @@ async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> R
         .await?;
     #[cfg(unix)]
     assert_eq!(unix_mode(&path), 0o600, "crash-window outbox_mode");
-    let parked = read_self_leave_rekey_outbox(&path).await;
+    let parked = read_self_leave_rekey_outbox(&path).await?;
     assert_eq!(parked.committer_snapshots.len(), 1);
     let saved_tree = base64::engine::general_purpose::STANDARD
         .decode(&parked.committer_snapshots[0].snapshot_b64)?;
@@ -1366,6 +1366,81 @@ async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> R
         "after_wipe_outbox_snapshots"
     );
     skip_self_leave_rekey_ack(false);
+    Ok(())
+}
+
+/// A corrupt or unreadable outbox is not replaced with an empty file.
+/// A missing file is still an empty outbox, so the first save can write it.
+#[tokio::test]
+async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let path = self_leave_rekey_outbox_path(&fixture.state, &fixture.group_id);
+    tokio::fs::create_dir_all(path.parent().expect("outbox parent")).await?;
+    let corrupt = b"not-json-outbox";
+    tokio::fs::write(&path, corrupt).await?;
+    let leave = signed_self_leave(&fixture).await?;
+    let saved = remember_durable_self_leave_rekey(
+        &fixture.state,
+        &fixture.group_id,
+        &leave,
+        Some(b"snapshot-bytes"),
+    )
+    .await;
+    assert!(
+        saved.is_err(),
+        "a corrupt outbox must fail the save: {saved:?}"
+    );
+    assert_eq!(
+        tokio::fs::read(&path).await?,
+        corrupt,
+        "the save must not replace the corrupt outbox"
+    );
+    let updated = update_self_leave_outbox_file(&path, |file| {
+        file.pending.clear();
+        file.committer_snapshots.clear();
+    })
+    .await;
+    assert!(
+        updated.is_err(),
+        "a later mutation must not rewrite a corrupt outbox"
+    );
+    assert_eq!(tokio::fs::read(&path).await?, corrupt);
+    resume_durable_self_leave_rekeys(&fixture.state).await;
+    assert_eq!(
+        tokio::fs::read(&path).await?,
+        corrupt,
+        "resume must leave a corrupt outbox in place"
+    );
+
+    tokio::fs::remove_file(&path).await?;
+    tokio::fs::create_dir(&path).await?;
+    let blocked = remember_durable_self_leave_rekey(
+        &fixture.state,
+        &fixture.group_id,
+        &leave,
+        Some(b"snapshot-bytes"),
+    )
+    .await;
+    assert!(blocked.is_err(), "an unreadable outbox must fail the save");
+    assert!(
+        tokio::fs::metadata(&path).await?.is_dir(),
+        "the unreadable path must stay in place"
+    );
+
+    tokio::fs::remove_dir(&path).await?;
+    let missing = read_self_leave_rekey_outbox(&path).await?;
+    assert!(missing.pending.is_empty());
+    assert!(missing.committer_snapshots.is_empty());
+    remember_durable_self_leave_rekey(
+        &fixture.state,
+        &fixture.group_id,
+        &leave,
+        Some(b"snapshot-bytes"),
+    )
+    .await?;
+    let written = read_self_leave_rekey_outbox(&path).await?;
+    assert_eq!(written.pending.len(), 1);
+    assert_eq!(written.committer_snapshots.len(), 1);
     Ok(())
 }
 
