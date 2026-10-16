@@ -749,14 +749,27 @@ function maybeRefreshSession(){
 function readOwnerToken(){try{return sessionStorage.getItem('x0x_owner_token')||''}catch(e){return ''}}
 let OWNER_TOKEN=readOwnerToken();
 function durableRequired(r){return !!(r&&r._http_status===403&&String(r.error||'').indexOf('durable')!==-1)}
+function forgetRejectedOwnerToken(token,r){
+  if(!token||!r||r._http_status!==401)return false;
+  // An older request must not erase a token entered while it was in flight.
+  if(OWNER_TOKEN===token){
+    OWNER_TOKEN='';
+    try{sessionStorage.removeItem('x0x_owner_token')}catch(e){}
+  }
+  return true;
+}
 async function ownerApi(path,opt){
-  let r=await apiWith(OWNER_TOKEN||SESSION_TOKEN,path,opt);
+  const token=OWNER_TOKEN;
+  let r=await apiWith(token||SESSION_TOKEN,path,opt);
+  if(forgetRejectedOwnerToken(token,r))r=await apiWith(SESSION_TOKEN,path,opt);
   if(durableRequired(r)&&!OWNER_TOKEN){
     const t=prompt("This action requires the durable API token (owner authority).\nPaste it — it is kept only in this tab's sessionStorage:");
     if(t&&t.trim()){
       OWNER_TOKEN=t.trim();
       try{sessionStorage.setItem('x0x_owner_token',OWNER_TOKEN)}catch(e){}
-      r=await apiWith(OWNER_TOKEN,path,opt);
+      const entered=OWNER_TOKEN;
+      r=await apiWith(entered,path,opt);
+      forgetRejectedOwnerToken(entered,r);
     }
   }
   return r;
