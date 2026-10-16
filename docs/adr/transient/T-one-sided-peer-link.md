@@ -8,32 +8,37 @@
 
 ## Context
 
-A MASQUE relay can supersede the live link on one side only (ant-quic#332). The other side still reports the old connection as connected. `GET /health`, `GET /peers` and `GET /status` then read healthy. They do not compare send age and receive age.
+A MASQUE relay can supersede the live link on one side only (ant-quic#332). The other side still reports the old connection as connected. `GET /health`, `GET /peers` and `GET /status` then read healthy.
 
-In eph run `r0481pre-e2e` (x0x `5b90adb`, ant-quic 0.27.60) one direction had `last_sent` at 610 s and the other had `last_received` at 725 s. Every other pair was under 2 s.
+`last_sent_at` and `last_received_at` in ant-quic 0.27.60 count application data only. A healthy peer can be quiet on both directions. An eph run with both ages above 600 s, while other pairs were fresh, is not this rule. Both ages on that peer were stale.
 
-ant-quic owns the connection winner. This decision does not change that crate or the plane gate. Until ant-quic#332 is fixed, x0x detects the one-sided link and makes one bounded re-dial so both sides install one connection.
+ant-quic owns the connection winner. This decision does not change that crate or the plane gate. Until ant-quic#332 is fixed, x0x detects a one-sided link and makes one bounded re-dial.
 
 ## Decision
 
-A connected peer is one-sided when its send age or its receive age is at least 60 s, and another connected peer still has send or receive traffic at most 10 s old. A missing timestamp is not stale and is not flowing traffic. A single quiet peer is not one-sided. A node whose every peer is quiet is not one-sided.
+A connected peer is one-sided only when one direction on that same peer is at least 60 s old and the other direction is at most 10 s old. A missing timestamp is neither. Both directions stale, both missing, or one stale and the other between those bounds, are not one-sided. Fresh traffic on a different peer does not select a quiet peer.
 
-The health refresher reads connection health off the request path. `GET /health` stays a lock-free snapshot read (issue #600). The refresher stores the one-sided count before it waits on a re-dial. When the count is above zero, `GET /health` and `GET /status` are `degraded` and carry a reason. `ok` stays true. `GET /peers` sets `link` to `degraded`. The refresher writes one WARN the first time a peer is one-sided, and again only after that peer recovers and the condition returns.
+The health refresher stores the one-sided peer set, then returns. It does not wait on a re-dial. `GET /health` stays a lock-free snapshot read (issue #600). When the count is above zero, `GET /health` and `GET /status` are `degraded` and carry a reason. `ok` stays true. `GET /peers` reads that stored set and sets `link` to `degraded`. One WARN is written the first time a peer is one-sided, and again only after recovery.
 
-Repair disconnects that peer and dials it once. The attempt has a 3 s bound. A suppressed peer is not dialled. The next attempt waits 60 s. The disconnect is reconnect-eligible, so the proactive scheduler also sees it. The repair and the scheduler share one dial permit. The scheduler holds that permit across the discovery-cache read and both dials. A claim cancels the armed attempt, so the scheduler does not dial. The repair dial is the attempt for the window. Recovery means the peer is connected and neither direction is stale. Recovery clears the warning. The 60 s timestamp stays. A sample that drops the peer because no other peer has fresh traffic is not recovery. That sample keeps the warning and the timestamp. There is no wire change.
+Repair disconnects that peer and dials it once, with a 3 s bound. A suppressed peer is not dialled. The next attempt waits 60 s. The disconnect is reconnect-eligible, so the scheduler also sees it. Both share one dial permit. A claim cancels the scheduler attempt. The permit leaves the map when the repair finishes, or when the peer is gone, unless another holder remains. Recovery means the peer is still connected and is not one-sided. A quiet peer clears the warning and keeps the 60 s timestamp. A sample that omits the peer is not recovery. There is no wire change.
 
 ## Consequences
 
-A monitor that treats `degraded` as a page will see a one-sided link. If ant-quic installs a one-sided winner again, x0x waits 60 s. It does not loop on the health tick.
+A monitor that pages on `degraded` will see a one-sided link. A quiet peer stays up. A repeated one-sided winner waits 60 s. Peer counts stay current while a re-dial waits.
 
 ## Alternatives
 
-Wait for ant-quic#332 and leave health as it is. The daemon stays `healthy` while gossip on that peer is dead.
+Wait for ant-quic#332. The daemon stays `healthy` while one direction is dead.
 
 Re-dial on every health tick. A peer that does not recover is dialled without a bound.
 
-Treat every idle peer as one-sided. A quiet pair is torn down with no evidence that other traffic still flows.
+Flag a peer because a different peer had recent traffic. A quiet peer is then torn down.
+
+Treat every idle peer as one-sided. A quiet pair is torn down.
+
+Probe a quiet peer and disconnect when the probe fails. A probe can drop a healthy quiet peer. This decision does not probe.
 
 ## Validation
 
-A simulation moves the winner on one node. The gate reports that peer. The re-dial runs once. A second pass inside the backoff does not dial. A lone stale age, and a mesh where every peer is stale, stay off the list. An empty or inconclusive sample does not warn again and does not dial. The degraded count is stored before the re-dial wait. A hold that is already active, and a claim during the scheduler cache wait, do not dial. A delayed or discarded simulated frame does not count as received.
+A quiet peer stays up while another peer is fresh. One stale direction and one fresh direction on the same peer is on the list. The re-dial runs once. A second pass inside the backoff does not dial. An empty sample keeps the warning and does not dial. A quiet sample clears the warning and keeps the backoff. The degraded count is stored before the repair task runs. The dial permit does not stay after the repair, or after the peer is gone, unless another holder remains. An active hold, and a claim during the cache wait, do not dial.
+

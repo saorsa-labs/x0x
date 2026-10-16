@@ -522,25 +522,6 @@ impl SimFabric {
         }
     }
 
-    /// #1419 test hook: move the winner on `viewer` only. `other` keeps
-    /// the previous generation. Sends between them are refused until a
-    /// later dial installs one shared generation. No lifecycle event is
-    /// published.
-    pub(crate) fn supersede_one_sided_for_test(
-        &self,
-        viewer: &PeerId,
-        other: &PeerId,
-    ) -> Option<(u64, u64)> {
-        let key = pair(viewer.0, other.0);
-        let mut state = self.lock();
-        let new = state.next_generation;
-        state.next_generation = new.saturating_add(1);
-        let link = state.links.get_mut(&key)?;
-        let old = link.generation_for(viewer.0);
-        link.one_sided = Some((viewer.0, new));
-        Some((old, new))
-    }
-
     /// Record a harness event (barrier, receipt, fault step) in the trace.
     pub(crate) fn mark(&self, text: impl Into<String>) {
         let at = self.now();

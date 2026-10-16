@@ -121,15 +121,7 @@ pub(in crate::server) async fn network_status(
 
 /// GET /peers
 pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let degraded: Vec<[u8; 32]> = match state.agent.network() {
-        Some(network) => network
-            .one_sided_peer_ids()
-            .await
-            .into_iter()
-            .map(|peer| peer.0)
-            .collect(),
-        None => Vec::new(),
-    };
+    let degraded = state.health_snapshot.one_sided_ids();
     match state.agent.peers().await {
         Ok(peer_list) => {
             let entries: Vec<PeerEntry> = peer_list

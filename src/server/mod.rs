@@ -1303,10 +1303,10 @@ pub async fn serve_with_options(
                     .unwrap_or(0);
                 match snapshot_state.agent.network() {
                     Some(network) => {
-                        // #1419: sample off the /health path, store the
-                        // degraded count, then re-dial. The store is inside
-                        // `publish_one_sided_health` and happens before the
-                        // re-dial wait. The handler stays a lock-free
+                        // #1419: sample off the /health path and store the
+                        // degraded set. The repair is spawned and is not
+                        // awaited, so this tick can store peer counts again
+                        // on the next interval. The handler stays a lock-free
                         // snapshot read (#600).
                         routes::status::publish_one_sided_health(
                             network,
@@ -1315,7 +1315,10 @@ pub async fn serve_with_options(
                         )
                         .await;
                     }
-                    None => snapshot_state.health_snapshot.store(peers, 0, 0),
+                    None => {
+                        snapshot_state.health_snapshot.store(peers, 0, 0);
+                        snapshot_state.health_snapshot.clear_one_sided_ids();
+                    }
                 };
             }
         }));

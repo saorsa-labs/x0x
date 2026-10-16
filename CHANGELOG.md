@@ -44,17 +44,21 @@ All notable changes to this project will be documented in this file.
   and withdrawn-group checks still apply.
 
 - **A one-sided peer link shows as degraded, and x0x re-dials it once (#1419).**
-  A connected peer whose send age or receive age is at least 60 s, while
-  another connected peer still has traffic at most 10 s old, is `degraded`
-  on `GET /health` and `GET /status`. `GET /peers` sets that peer's `link`
-  to `degraded`. The health refresher stores that count before it re-dials.
-  It writes one warning and re-dials that peer once (disconnect, then dial),
-  with a 3 s bound and a 60 s backoff. The repair and the scheduler
-  share one dial permit. A claim during the scheduler's cache wait or
-  dial cancels that attempt. The scheduler waits out the same backoff.
-  A sample with no fresh comparison traffic
-  keeps the warning and the backoff. `ok` stays true. No wire change. The
-  plane gate is unchanged. ant-quic#332 remains the transport fix.
+  A connected peer is one-sided when one direction on that same peer is at
+  least 60 s old and the other direction is at most 10 s old.
+  `last_sent_at` and `last_received_at` count application data only. A quiet
+  peer stays up, including when another peer still has traffic. `GET /health`
+  and `GET /status` are `degraded` and carry a reason. `GET /peers` sets
+  `link` to `degraded` from that same stored set. The health refresher stores
+  the set and returns. It does not wait on the re-dial. It writes one warning
+  and re-dials that peer once (disconnect, then dial), with a 3 s bound and a
+  60 s backoff. The repair and the scheduler share one dial permit. The permit
+  is dropped when the repair finishes or the peer is gone, unless another
+  holder still has it. A claim during the scheduler's cache wait or dial
+  cancels that attempt. The scheduler waits out the same backoff. A sample
+  that omits the peer keeps the warning and the backoff. A quiet connected
+  peer clears the warning and keeps the backoff. `ok` stays true. No wire
+  change. The plane gate is unchanged. ant-quic#332 remains the transport fix.
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **The GUI recovers after a saved owner token is rejected (#1417).** An

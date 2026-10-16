@@ -20,9 +20,12 @@ Examples:
 `status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers
 for its whole uptime past a 120 s bootstrap grace (issue #262 — the wedged
 transport signal; `ok` stays `true` because the process itself is alive). A
-degraded response carries a `degraded_reason` string. A connected peer whose
-send or receive age is at least 60 s, while another peer still has traffic
-at most 10 s old, is also `degraded` (issue #1419, a one-sided link). Fleet
+degraded response carries a `degraded_reason` string. A connected peer is
+also `degraded` when one direction on that same peer is at least 60 s old
+and the other direction is at most 10 s old (issue #1419). Those ages are
+application-data ages. A quiet peer, with both directions idle, is not
+degraded. `GET /status` uses the same stored set and the same rule.
+`GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
 that long at zero peers — off by default.
@@ -263,6 +266,13 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #   "warnings": []
 # }
 ```
+
+`status` is `connected` when a send-ready peer exists. It is `degraded` when
+`GET /health` would be degraded. That includes a one-sided link: one
+direction on that peer is at least 60 s old and the other direction is at
+most 10 s old. The reason is appended to `warnings`. A quiet peer, with both
+directions idle, is not degraded. `GET /health`, `GET /status`, and
+`GET /peers` read the one-sided set the health refresher stored.
 
 ## Identity
 
@@ -909,7 +919,7 @@ or an illegal placement; `501` ceremony disabled.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that link is one-sided, #1419) |
+| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old. A quiet peer stays `healthy`. |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |

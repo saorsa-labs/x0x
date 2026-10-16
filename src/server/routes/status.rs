@@ -44,6 +44,9 @@ pub(in crate::server) struct HealthSnapshot {
     /// Connected peers whose link is one-sided (#1419). The refresher
     /// publishes the count. The handler does not walk connection health.
     one_sided_peers: AtomicUsize,
+    /// Peer ids from the same refresher store as `one_sided_peers`.
+    /// `GET /peers` reads this set so its `link` matches `/health`.
+    one_sided_ids: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 impl HealthSnapshot {
@@ -61,6 +64,36 @@ impl HealthSnapshot {
             .store(one_sided_peers, Ordering::Relaxed);
     }
 
+    /// Publish counts and the one-sided peer set from one refresher sample.
+    pub(in crate::server) fn store_one_sided(
+        &self,
+        peers: usize,
+        send_ready_peers: usize,
+        one_sided_ids: &[[u8; 32]],
+    ) {
+        self.store(peers, send_ready_peers, one_sided_ids.len());
+        *self
+            .one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = one_sided_ids.to_vec();
+    }
+
+    /// The refresher's stored one-sided peer ids.
+    pub(in crate::server) fn one_sided_ids(&self) -> Vec<[u8; 32]> {
+        self.one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Clear the stored set when the node has no network.
+    pub(in crate::server) fn clear_one_sided_ids(&self) {
+        self.one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     /// Read the last published counts as `(peers, send_ready_peers, one_sided_peers)`.
     pub(in crate::server) fn load(&self) -> (usize, usize, usize) {
         (
@@ -71,21 +104,22 @@ impl HealthSnapshot {
     }
 }
 
-/// Sample one-sided links, store the snapshot, then re-dial.
+/// Sample one-sided links, store the snapshot, then start a repair task.
 ///
-/// The store runs before [`x0x::network::NetworkNode::repair_one_sided_links`].
-/// A re-dial may wait 3 s, and peers are repaired one at a time. `/health`
-/// must already show degraded while that wait is in progress (#1419).
+/// The store runs before the repair is spawned. A re-dial may wait 3 s per
+/// peer. This function does not wait, so the next refresher tick can store
+/// new peer and send-ready counts (#1419, #600).
 pub(in crate::server) async fn publish_one_sided_health(
-    network: &x0x::network::NetworkNode,
+    network: &Arc<x0x::network::NetworkNode>,
     snapshot: &HealthSnapshot,
     peers: usize,
 ) {
     let samples = network.connected_link_ages().await;
     let one_sided = x0x::network::one_sided_peer_ids_from(&samples);
+    let ids: Vec<[u8; 32]> = one_sided.iter().map(|peer| peer.0).collect();
     let send_ready = network.send_ready_peers().await.len();
-    snapshot.store(peers, send_ready, one_sided.len());
-    network.repair_one_sided_links(&samples).await;
+    snapshot.store_one_sided(peers, send_ready, &ids);
+    network.spawn_one_sided_repair(samples);
 }
 
 /// Generic JSON response wrapper.
@@ -132,7 +166,7 @@ fn one_sided_reason(count: usize) -> String {
         "peer links are"
     };
     format!(
-        "{count} connected {noun} one-sided (send or receive idle > {}s while other peers still exchange traffic)",
+        "{count} connected {noun} one-sided (one direction idle > {}s while the other direction still has traffic)",
         crate::network::ONE_SIDED_STALE.as_secs()
     )
 }
@@ -574,9 +608,11 @@ mod tests {
             port_mapping_enabled: false,
             ..x0x::network::NetworkConfig::default()
         };
-        let a = x0x::network::NetworkNode::new(config(1), None, None)
-            .await
-            .unwrap();
+        let a = Arc::new(
+            x0x::network::NetworkNode::new(config(1), None, None)
+                .await
+                .unwrap(),
+        );
         let b = x0x::network::NetworkNode::new(config(2), None, None)
             .await
             .unwrap();
@@ -591,24 +627,26 @@ mod tests {
             .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 3], 5483)))
             .await
             .unwrap();
+        assert_eq!(peer_c, c.peer_id());
         let a_link = a.sim_link_for_test().expect("sim link");
+        let b_link = b.sim_link_for_test().expect("sim link");
         let c_link = c.sim_link_for_test().expect("sim link");
+        let peer_a = a.peer_id();
         a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
         a_link.send(&peer_c, b"\x7fac").unwrap();
-        c_link.send(&a.peer_id(), b"\x7fca").unwrap();
-        fabric
-            .supersede_one_sided_for_test(&a.peer_id(), &peer_b)
-            .expect("the A-B link exists");
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
         tokio::time::sleep(x0x::network::ONE_SIDED_STALE + Duration::from_secs(10)).await;
-        a_link.send(&peer_c, b"\x7fac2").unwrap();
-        c_link.send(&a.peer_id(), b"\x7fca2").unwrap();
+        b_link.send(&peer_a, b"\x7fba-fresh").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
         a.pause_one_sided_redial_for_test(Duration::from_secs(3));
 
         let snapshot = Arc::new(HealthSnapshot::default());
         let published = Arc::clone(&snapshot);
+        let repair_node = Arc::clone(&a);
         let task = tokio::spawn(async move {
-            super::publish_one_sided_health(&a, &published, 2).await;
-            a
+            super::publish_one_sided_health(&repair_node, &published, 2).await;
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
@@ -616,8 +654,13 @@ mod tests {
             1,
             "the degraded count is stored before the re-dial wait finishes"
         );
+        assert_eq!(
+            snapshot.one_sided_ids(),
+            vec![peer_b.0],
+            "the stored set is the same peer the count names"
+        );
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let a = task.await.unwrap();
+        task.await.unwrap();
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
