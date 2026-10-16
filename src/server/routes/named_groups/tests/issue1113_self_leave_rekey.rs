@@ -3287,3 +3287,220 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
     );
     Ok(())
 }
+
+/// A second self-leave rekey of the same leaver, chained from `parent`.
+/// An update on a restored pre-seal tree makes the TreeKEM commit differ
+/// from the sealed rekey. The signed roster binding names those bytes.
+async fn deliver_conflicting_self_leave_rekey(
+    fixture: &LeaveFixture,
+    parent: &x0x::groups::GroupInfo,
+    pre_seal_snapshot: &[u8],
+    actor_hex: &str,
+) -> Result<bool> {
+    let leaver_hex = hex::encode(fixture.member_id.as_bytes());
+    let kp_b64 = parent
+        .members_v2
+        .get(&leaver_hex)
+        .and_then(current_member_treekem_key_package)
+        .expect("the parent roster still holds the leaver KeyPackage");
+    let kp_bytes = base64::engine::general_purpose::STANDARD.decode(kp_b64)?;
+    let group_id_bytes = hex::decode(&fixture.group_id)?;
+    let seed = super::super::agent_treekem_seed(fixture.state.agent.as_ref(), &group_id_bytes);
+    let mut fork_tree = x0x::mls::TreeKemMlsGroup::restore(
+        pre_seal_snapshot,
+        fixture.state.agent.agent_id(),
+        &seed,
+    )?;
+    fork_tree.update()?;
+    let treekem_commit = fork_tree.remove_member_verified(fixture.member_id, &kp_bytes)?;
+    let treekem_epoch = fork_tree.epoch();
+    let mut sibling = parent.clone();
+    sibling.roster_revision = sibling.roster_revision.saturating_add(1);
+    let revision = sibling.roster_revision;
+    sibling.remove_member(&leaver_hex, Some(actor_hex.to_string()));
+    sibling.secret_epoch = treekem_epoch;
+    sibling.security_binding = Some(treekem_commit_binding(treekem_epoch, &treekem_commit));
+    let commit = sibling.seal_commit(
+        fixture.state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )?;
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: fixture.group_id.clone(),
+        revision,
+        actor: actor_hex.to_string(),
+        agent_id: leaver_hex,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(&treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    let applied = apply_named_group_metadata_event(
+        &fixture.state,
+        event,
+        fixture.state.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    Ok(applied.accepted)
+}
+
+/// A conflicting self-leave rekey arrives on the metadata receive path.
+/// The existing clear lifts the local marker and re-arms the evidence gate.
+/// The next conflicting rekey quarantines the group again. The sealed
+/// epoch stays.
+#[tokio::test]
+async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Result<()> {
+    let fixture = two_member_treekem_group_with_id("cf".repeat(16)).await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let lower_hex = {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_lower_admin(info, admin_id)
+    };
+
+    let event = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, event, fixture.member_id, true, None)
+            .await;
+    assert!(
+        applied.accepted,
+        "roster self-leave must apply before the fork: {applied:?}"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the higher admin must not seal the rekey"
+    );
+    let parent = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        info.remove_member(&lower_hex, Some(lower_hex.clone()));
+    }
+    let pre_seal_snapshot = {
+        let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+        let guard = group.lock().await;
+        guard.to_snapshot_bytes()?
+    };
+    startup_self_leave_rekey(&fixture.state).await;
+    let sealed_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        sealed_epoch > fixture.epoch_before,
+        "startup must seal once no other active member remains; before {}, after {sealed_epoch}",
+        fixture.epoch_before
+    );
+
+    let accepted =
+        deliver_conflicting_self_leave_rekey(&fixture, &parent, &pre_seal_snapshot, &admin_hex)
+            .await?;
+    assert!(
+        !accepted,
+        "the receive path must not adopt the conflicting self-leave rekey"
+    );
+    let quarantined = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    let marker = quarantined
+        .fork_quarantine
+        .as_ref()
+        .expect("the receive-path conflict must set the existing fork quarantine");
+    assert!(
+        marker.no_anchor,
+        "an ordinary TreeKEM group has no owner axis"
+    );
+    assert_eq!(marker.committed_by, admin_hex);
+    assert!(
+        reject_fork_quarantined(&fixture.state, &fixture.group_id, &quarantined).is_some(),
+        "a quarantined group must be refused"
+    );
+
+    let session = clear_group_quarantine(
+        State(Arc::clone(&fixture.state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: false }),
+        Path(fixture.group_id.clone()),
+        Json(ClearQuarantineRequest {
+            force: true,
+            reason: "a session token must not clear".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        session.status(),
+        StatusCode::FORBIDDEN,
+        "a session token must not clear fork quarantine"
+    );
+    {
+        let groups = fixture.state.named_groups.read().await;
+        assert!(
+            groups
+                .get(&fixture.group_id)
+                .expect("group")
+                .is_fork_quarantined(),
+            "a refused session clear must leave the marker"
+        );
+    }
+
+    let response = clear_group_quarantine(
+        State(Arc::clone(&fixture.state)),
+        Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(fixture.group_id.clone()),
+        Json(ClearQuarantineRequest {
+            force: true,
+            reason: "operator verified the canonical head before this local clear".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the durable force clear must lift the local marker: {body}"
+    );
+    let cleared = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    assert!(
+        !cleared.is_fork_quarantined(),
+        "the clear must remove the marker"
+    );
+    assert!(
+        reject_fork_quarantined(&fixture.state, &fixture.group_id, &cleared).is_none(),
+        "the local refusal must lift"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        sealed_epoch,
+        "the clear must leave the sealed epoch in place"
+    );
+
+    let accepted_again =
+        deliver_conflicting_self_leave_rekey(&fixture, &parent, &pre_seal_snapshot, &admin_hex)
+            .await?;
+    assert!(
+        !accepted_again,
+        "the later self-leave rekey must not replace the head"
+    );
+    let again = {
+        let groups = fixture.state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    assert!(
+        again.is_fork_quarantined(),
+        "the clear re-arms the evidence gate, so the next conflict quarantines again"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        sealed_epoch,
+        "the later conflict must also leave the sealed epoch in place"
+    );
+    Ok(())
+}
