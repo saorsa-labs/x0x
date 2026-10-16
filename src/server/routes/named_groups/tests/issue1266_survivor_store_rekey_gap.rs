@@ -544,12 +544,11 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
 
     // The share installs well inside Alice's cooldown. A local read runs the
     // GSS refresh, and the first Current refresh after KeyPending starts the
-    // repair: one request now, and exactly one retry 16 s later. A gap value
-    // can become readable before that retry. Value visibility is not repair
-    // completion. Keep reading so the refresh runs, and take the counters
-    // only after both requests are published and Alice has answered the
-    // retry. That answer is the serve that supplies the dropped record when
-    // the first request was suppressed.
+    // repair: one request now, and exactly one retry 16 s later. Alice's
+    // `requests_answered` increments when she publishes the retry, which can
+    // be before Bob applies it. Do not finish on her counters alone. The
+    // same check must see Bob's two requests and a successful read of the
+    // gap value. If that read is still missing, wait for delivery.
     let delivered =
         apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
             .await;
@@ -562,8 +561,13 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
             .state_sync_snapshot()
             .requests_sent
             .saturating_sub(baseline_requests);
-        if requests >= 2 && served.requests_answered >= 2 && served.rejected_cooldown >= 1 {
+        let counters_ready =
+            requests >= 2 && served.requests_answered >= 2 && served.rejected_cooldown >= 1;
+        if counters_ready && status == StatusCode::OK {
             break (status, body);
+        }
+        if counters_ready {
+            break wait_for_value(&f.state, &topic, "gap", Duration::from_secs(10)).await?;
         }
         if tokio::time::Instant::now() >= repair_deadline {
             break (status, body);
