@@ -983,12 +983,13 @@ enum AuthSub {
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
 #[derive(Subcommand)]
 enum IdentitySub {
-    /// Issue a signed revocation for an agent-id or machine-id keypair.
+    /// Revoke this daemon's agent or an owner-authorized agent–machine binding.
     ///
-    /// The daemon uses its own agent keypair as the issuer.  Self-revocations
-    /// (revoking own agent-id or machine-id) always succeed.  Revoking a
-    /// third-party identity requires that the user keypair previously signed
-    /// an AgentCertificate for the subject.
+    /// With one id, only this daemon's own agent is supported. The daemon
+    /// signs with its agent key; it cannot revoke its machine or another
+    /// agent through this form. For a registered sub-agent, use
+    /// `x0x owner agents revoke <AGENT_ID>`. Both ids plus --move-epoch select
+    /// an owner-signed binding revocation and require the durable API token.
     Revoke {
         /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
