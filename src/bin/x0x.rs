@@ -1008,6 +1008,24 @@ enum IdentitySub {
     },
     /// List all revocation records held by this daemon.
     Revocations,
+    /// Validate a revocation file and install it on the live path.
+    ///
+    /// Stop x0xd first. This does not talk to a running daemon. A remote
+    /// peer cannot invoke it.
+    RebuildRevocationStore {
+        /// Carrier to rebuild: `v1`, `v2`, or `v3`.
+        #[arg(long)]
+        carrier: String,
+        /// Revocation file to validate and install.
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        /// Install a valid empty store. Requires `--confirm-empty`.
+        #[arg(long)]
+        empty: bool,
+        /// Operator evidence that an empty set is complete.
+        #[arg(long)]
+        confirm_empty: bool,
+    },
 }
 
 /// `x0x forward` sub-actions.
@@ -2115,6 +2133,24 @@ async fn run(
                 commands::daemon::autostart(name).await
             };
         }
+        Commands::Identity {
+            sub:
+                IdentitySub::RebuildRevocationStore {
+                    carrier,
+                    from,
+                    empty,
+                    confirm_empty,
+                },
+        } => {
+            return commands::identity::rebuild_revocation_store(
+                name,
+                carrier,
+                from.as_ref().map(std::path::PathBuf::as_path),
+                *empty,
+                *confirm_empty,
+            )
+            .await;
+        }
         Commands::UserId { sub } => match sub {
             UserIdSub::Create {
                 path,
@@ -3151,6 +3187,9 @@ async fn run(
                 .await
             }
             IdentitySub::Revocations => commands::identity::revocations(&client).await,
+            IdentitySub::RebuildRevocationStore { .. } => {
+                anyhow::bail!("command dispatched earlier — dispatch table out of sync")
+            }
         },
         Commands::Forward { sub } => match sub {
             ForwardSub::Add {

@@ -510,6 +510,195 @@ pub(crate) async fn save_rebuilt_revocation_file_typed(
     result
 }
 
+async fn clear_revocation_block_async(path: &Path) {
+    let mut states = revocation_store_states().lock().await;
+    if let Some(state) = states.get_mut(path) {
+        state.unreadable = None;
+        state.last_persist_warning = None;
+        state.archive_failed = false;
+    }
+}
+
+/// Write `snapshot` without erasing a revocation that is already durable.
+///
+/// The caller holds `guard`. A readable live file is decoded and united
+/// with `snapshot`. A missing live file is the initial rebuild: `snapshot`
+/// is written and the quarantine sibling is left in place. Bad bytes that
+/// are still on the live path are not replaced.
+async fn write_union_or_initial_revocation(
+    path: &Path,
+    store: RevocationStore,
+    snapshot: Vec<u8>,
+    guard: RevocationWriteGuard,
+) -> std::result::Result<(), DurableWriteError> {
+    let readable = match read_revocation_store_locked(path, store, true).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if fs::metadata(path).await.is_ok() {
+                return Err(match error {
+                    IdentityError::Storage(io) => DurableWriteError::BeforeRename(io),
+                    other => DurableWriteError::BeforeRename(std::io::Error::other(other)),
+                });
+            }
+            let result = write_private_bytes_durable_guarded(path, snapshot, Some(guard)).await;
+            if result.is_ok() {
+                clear_revocation_block_async(path).await;
+            }
+            return result;
+        }
+    };
+    let bytes = if let Some(disk_bytes) = readable {
+        let mut merged = store.decode(&disk_bytes).map_err(|error| {
+            DurableWriteError::BeforeRename(std::io::Error::other(error.to_string()))
+        })?;
+        let extra = store.decode(&snapshot).map_err(|error| {
+            DurableWriteError::BeforeRename(std::io::Error::other(error.to_string()))
+        })?;
+        match store {
+            RevocationStore::V1 => {
+                for record in extra.all_records() {
+                    let _ = merged.verify_and_insert(record, None);
+                }
+            }
+            RevocationStore::V2 => {
+                for record in extra.binding_records() {
+                    let _ = merged.verify_and_insert(record, None);
+                }
+            }
+            RevocationStore::V3 => {
+                merged.merge_v3(extra);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                if now != 0 {
+                    merged.expire_records_older_than(crate::SHARE_GRANT_REVOCATIONS_TTL_SECS, now);
+                }
+            }
+        }
+        match store {
+            RevocationStore::V1 => merged.to_bytes(),
+            RevocationStore::V2 => merged.to_bytes_v2(),
+            RevocationStore::V3 => merged.to_bytes_v3(),
+        }
+        .map_err(|error| {
+            DurableWriteError::BeforeRename(std::io::Error::other(error.to_string()))
+        })?
+    } else {
+        snapshot
+    };
+    let result = write_private_bytes_durable_guarded(path, bytes, Some(guard)).await;
+    if result.is_ok() {
+        clear_revocation_block_async(path).await;
+    }
+    result
+}
+
+/// Rebuild `revocations-v3.bin` without dropping a newer durable revocation.
+///
+/// Takes the same locks as the ordinary v3 writer: the in-process mutex,
+/// then the OS lock, then the per-path mutex. Under those locks it re-reads
+/// the live file and unions it with `snapshot`. A revocation already on
+/// disk stays. When quarantine has removed the live file, this is the
+/// initial rebuild and `snapshot` may be written. The quarantine file stays.
+pub(crate) async fn rebuild_v3_preserving_durable(
+    path: &Path,
+    snapshot: Vec<u8>,
+) -> std::result::Result<(), DurableWriteError> {
+    let _in_process = crate::SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(DurableWriteError::BeforeRename)?;
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let _cross_process = crate::file_lock::lock_exclusive_with_retry(
+        Path::new(&lock_path),
+        std::time::Duration::from_millis(20),
+        crate::SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT,
+        || {},
+    )
+    .await
+    .map_err(DurableWriteError::BeforeRename)?;
+    let guard = lock_revocation_path(path).await;
+    write_union_or_initial_revocation(path, RevocationStore::V3, snapshot, guard).await
+}
+
+/// What [`install_operator_revocation_carrier`] wrote.
+#[derive(Debug)]
+pub struct OperatorRevocationWrite {
+    /// Live file name, such as `revocations-v3.bin`.
+    pub file_name: String,
+    /// The installed candidate had no records, and the live file had none either.
+    pub empty_store: bool,
+    /// A readable live file was united with the candidate. Its records stayed.
+    pub kept_durable_records: bool,
+}
+
+/// Validate `bytes` and install them as one revocation carrier (#1116).
+///
+/// This is the operator command. A remote peer cannot call it. An empty
+/// candidate is installed only when `confirm_empty` is set. A readable
+/// live file is united with the candidate, so a newer durable revocation
+/// stays. A zero-byte candidate is rejected. The quarantine file is not
+/// deleted.
+///
+/// # Errors
+/// The carrier name, the bytes, or the durable write failed. An empty
+/// candidate without `confirm_empty` is an error.
+pub async fn install_operator_revocation_carrier(
+    identity_dir: &Path,
+    carrier: &str,
+    bytes: Vec<u8>,
+    confirm_empty: bool,
+) -> Result<OperatorRevocationWrite> {
+    let (file_name, store) = match carrier {
+        "v1" => ("revocations.bin", RevocationStore::V1),
+        "v2" => ("revocations-v2.bin", RevocationStore::V2),
+        "v3" => ("revocations-v3.bin", RevocationStore::V3),
+        _ => {
+            return Err(IdentityError::Serialization(
+                "carrier must be v1, v2, or v3".to_string(),
+            ));
+        }
+    };
+    if bytes.is_empty() || store.validate(&bytes).is_err() {
+        return Err(IdentityError::Serialization(
+            "revocation file did not validate".to_string(),
+        ));
+    }
+    let decoded = store.decode(&bytes)?;
+    if decoded.is_empty() && !confirm_empty {
+        return Err(IdentityError::Serialization(
+            "an empty revocation store needs --confirm-empty".to_string(),
+        ));
+    }
+    let path = identity_dir.join(file_name);
+    let kept_durable_records = match fs::read(&path).await {
+        Ok(live) if !live.is_empty() && store.validate(&live).is_ok() => true,
+        _ => false,
+    };
+    if matches!(store, RevocationStore::V3) {
+        rebuild_v3_preserving_durable(&path, bytes)
+            .await
+            .map_err(durable_write_identity_error)?;
+    } else {
+        let guard = lock_revocation_path(&path).await;
+        write_union_or_initial_revocation(&path, store, bytes, guard)
+            .await
+            .map_err(durable_write_identity_error)?;
+    }
+    Ok(OperatorRevocationWrite {
+        file_name: file_name.to_string(),
+        empty_store: decoded.is_empty() && !kept_durable_records,
+        kept_durable_records,
+    })
+}
+
 pub(crate) async fn write_revocation_bytes_durable(
     bytes: Vec<u8>,
     guard: RevocationWriteGuard,
@@ -1624,6 +1813,55 @@ mod tests {
             found.push(entry.path());
         }
         found
+    }
+
+    /// #1116: the operator command validates, rejects an unconfirmed empty
+    /// store, and does not delete the quarantine file.
+    #[tokio::test]
+    async fn operator_rebuild_validates_and_reopens_with_confirm_1116() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("revocations-v3.bin");
+        tokio::fs::write(&path, b"corrupt-v3").await.unwrap();
+        let loaded = read_revocation_store(&path, RevocationStore::V3, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.revocation_resync_required());
+        let quarantine = quarantine_files(dir.path(), "revocations-v3.bin").await;
+        assert_eq!(quarantine.len(), 1);
+        let kept = std::fs::read(&quarantine[0]).unwrap();
+
+        let empty = RevocationSet::new().to_bytes_v3().unwrap();
+        assert!(
+            install_operator_revocation_carrier(dir.path(), "v3", empty.clone(), false)
+                .await
+                .is_err(),
+            "an empty store needs confirmation"
+        );
+        assert!(
+            install_operator_revocation_carrier(dir.path(), "v3", Vec::new(), true)
+                .await
+                .is_err(),
+            "zero bytes do not validate"
+        );
+        let still = read_revocation_store(&path, RevocationStore::V3, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(still.revocation_resync_required());
+
+        let wrote = install_operator_revocation_carrier(dir.path(), "v3", empty, true)
+            .await
+            .expect("confirmed empty install");
+        assert!(wrote.empty_store);
+        assert!(!wrote.kept_durable_records);
+        let opened = read_revocation_store(&path, RevocationStore::V3, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!opened.revocation_resync_required());
+        assert_eq!(std::fs::read(&quarantine[0]).unwrap(), kept);
+        assert!(tokio::fs::read(&path).await.unwrap().len() > 1);
     }
 
     /// #1116 / ADR 0085 rule 4: a fail-closed load must not authorize

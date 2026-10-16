@@ -237,13 +237,15 @@ All notable changes to this project will be documented in this file.
   `revocation_resync_required` and include the same sentence in `warnings`.
   The first status read also sends one `status` event on `/events`. If the
   archive fails, the sentence says the live path still holds the bad bytes.
-  Until the group resyncs that carrier, membership fails closed. A member
+  Until that carrier is reopened, membership fails closed. A member
   whose non-revocation is not verified is treated as revoked. The hold is
   not a revocation record, so admission, invite accept, join approval,
   join-artifact and key delivery, streams, and grant sends are withheld.
   They are not purged. Identity, machine, and user announcements still
   arrive, so a certificate can verify an issuer revocation or a binding
-  tombstone. Other pubsub, DM, and direct messages stay withheld.
+  tombstone. Other pubsub, DM, and direct messages are dropped. They are
+  not queued for later delivery. A new send after the flag clears can
+  succeed. Messages already stored stay stored.
   One peer does not open a carrier. The node's own publish does not open
   it. An empty snapshot does not open it. A snapshot that omits a
   revocation this node has already verified does not open it. Two free
@@ -252,16 +254,26 @@ All notable changes to this project will be documented in this file.
   authority is a machine enrolled to the local owner, or an Active owner
   or admin in the local journal for a group this node belongs to. An
   explicit revocation of that agent, its machine, or that binding rejects
-  the sender. The resync hold does not. Otherwise the carrier stays closed
-  until an operator rebuild. x0xd then writes that carrier to the live path
-  and leaves the quarantine file in place. A rebuild that fails before the
+  the sender. The resync hold does not. A trusted snapshot can still omit
+  a revocation that was lost with the bad file. That sender rule is not
+  proof the lost set was complete. Otherwise the carrier stays closed
+  until an operator rebuild. Stop x0xd and run
+  `x0x identity rebuild-revocation-store --carrier v3 --from <file>`.
+  An empty store also needs `--empty --confirm-empty`. The command
+  validates the file, unites it with a readable live file, and leaves the
+  quarantine file in place. A remote peer cannot run it. A zero-byte file
+  is rejected. A v3 rebuild takes the cross-process lock, re-reads the
+  live file, and keeps every unexpired revocation already durable.
+  A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
   failure after the rename is not queued again. When the discovery cache
   has no subject certificate, every distinct cached blob is used. The
   eight-fetch budget applies only to a miss, and only while a carrier
   is waiting for resync. Those fetches share one blob deadline and run
   outside the listener loop. Overlapping batches share that eight-fetch
-  allowance. A digest already being fetched is not fetched again. A batch
+  allowance. At most four recovery tasks run at once. Further batches
+  coalesce, and completed task handles are reaped. A digest already
+  being fetched is not fetched again. A batch
   subscribes for a free slot and checks that allowance again before it
   waits. Agent shutdown joins this recovery, including its fetch tasks,
   before it releases their slots or applies and persists the batch.

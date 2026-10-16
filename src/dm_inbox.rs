@@ -1667,11 +1667,12 @@ impl InboxPipeline {
         {
             let revoked = self.revocation_set.read().await;
             if revoked.revocation_resync_required() {
+                // Drop the frame. Do not queue it for delivery after resync.
                 tracing::info!(
                     target: "dm.trace",
                     stage = "inbound_revocation_resync_withheld",
                     sender = %hex::encode(envelope.sender_agent_id),
-                    "DM withheld until revocation resync"
+                    "DM dropped during revocation resync"
                 );
                 return;
             }

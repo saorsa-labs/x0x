@@ -2382,6 +2382,71 @@ mod tests {
         assert!(again.is_agent_revoked(&revoked));
     }
 
+    /// #1116: a delayed v3 rebuild must not erase a newer durable revocation.
+    #[tokio::test]
+    async fn stale_v3_rebuild_keeps_a_newer_durable_revocation_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations-v3.bin");
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = 1_700_000_000_u64;
+        let older_id = [0x11_u8; 32];
+        let newer_id = [0x22_u8; 32];
+        let older = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: older_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+        let newer = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: newer_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now + 10,
+            None,
+        )
+        .unwrap();
+
+        let mut stale = RevocationSet::new();
+        assert!(stale.verify_and_insert(older, None).unwrap());
+        stale.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let stale = std::sync::Arc::new(tokio::sync::RwLock::new(stale));
+        crate::persist_completed_revocation_rebuild(&stale, Some(dir.path())).await;
+        assert!(path.is_file(), "the first rebuild writes the live file");
+
+        let mut grown = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(grown.verify_and_insert(newer, None).unwrap());
+        let grown = std::sync::Arc::new(tokio::sync::RwLock::new(grown));
+        crate::persist_share_grant_revocations_durable(&grown, Some(dir.path()))
+            .await
+            .unwrap();
+
+        stale
+            .write()
+            .await
+            .requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        crate::persist_completed_revocation_rebuild(&stale, Some(dir.path())).await;
+
+        let loaded = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            loaded.is_share_grant_revoked(&older_id, &owner.user_id()),
+            "the stale snapshot's revocation stays"
+        );
+        assert!(
+            loaded.is_share_grant_revoked(&newer_id, &owner.user_id()),
+            "a newer durable revocation survives the late rebuild"
+        );
+    }
+
     #[tokio::test]
     async fn structural_validation_keeps_signature_checks_on_load_1116() {
         let owner = crate::identity::UserKeypair::generate().unwrap();

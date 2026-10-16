@@ -276,16 +276,30 @@ A missing file means no revocations are known yet. Membership stays open. A file
 
 `GET /status` and `x0x status` then set `revocation_resync_required` to true. `warnings` contains one sentence. The first status read also sends one `status` event on `/events`. Startup writes the same sentence as an error log line. If x0xd cannot move the bad bytes, the sentence says the live path still holds them. Membership still stays closed.
 
-While the flag is true, x0xd withholds group admission, invite accept, join approval, key delivery, ordinary pubsub, direct messages, DMs, streams, and share-grant sends. It does not delete those items. Revocation topics still flow. Identity, machine, and user announcements still flow, so a later revocation can be checked against a certificate.
+While the flag is true, x0xd drops ordinary pubsub frames, direct messages, and DMs. It does not queue them for delivery after resync. A new send after the flag clears can succeed. Messages already stored stay stored. x0xd also withholds group admission, invite accept, join approval, key delivery, streams, and share-grant sends. It does not purge stored items. Revocation topics still flow. Identity, machine, and user announcements still flow, so a later revocation can be checked against a certificate.
 
-The flag clears for one file only when a trusted authority has published a snapshot for that file and every record in the snapshot has verified. A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal for a group this node belongs to. Two free agent keys are not enough. The node's own publish is not enough. An empty snapshot is not enough. A snapshot that leaves out a revocation this node already holds does not clear the flag. Otherwise the carrier stays closed until you rebuild it by hand. After a trusted resync, x0xd writes the rebuilt file to the live path. It does not write an incomplete snapshot. The quarantine file stays. Restart x0xd and read `/status` again. `revocation_resync_required` must be false, and the revoked subjects must still be revoked.
+The flag clears for one file when a trusted authority has published a snapshot for that file and every record in the snapshot has verified. A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal for a group this node belongs to. Two free agent keys are not enough. The node's own publish is not enough. An empty snapshot is not enough. A snapshot that leaves out a revocation this node already holds does not clear the flag. A trusted snapshot can still omit a revocation that was lost with the bad file. Enrollment or an Active owner or admin is the sender rule. It is not proof that the lost set was complete.
 
-You can also rebuild a carrier by hand:
+When no peer has a persisted file for that carrier, stop x0xd and validate a file before you install it. A remote peer cannot run this command.
 
-1. Copy a readable revocation file from another machine that already has the revoked subjects you need.
-2. Check that the copy decodes before you install it. A zero-byte file is quarantined again.
-3. Put that file on the live path, beside the quarantine file. Do not delete the quarantine file. Do not rename it onto the live path unless you have confirmed the bytes decode.
-4. Restart x0xd. The running process does not reload the file until restart.
-5. Read `GET /status`. `revocation_resync_required` is false only when every corrupt carrier has a readable live file or a verified resync.
+To install a file you already checked:
 
-Do not delete a quarantine file to clear the flag. Deleting it drops the only local copy of the bad bytes and can admit a member whose revocation was in that file.
+```bash
+x0x identity rebuild-revocation-store --carrier v3 --from /path/to/revocations-v3.bin
+```
+
+For a named instance:
+
+```bash
+x0x --name <instance> identity rebuild-revocation-store --carrier v3 --from /path/to/revocations-v3.bin
+```
+
+Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. The quarantine file stays. A zero-byte file is rejected.
+
+When you have independent evidence that the set is complete and empty, and no peer has a persisted file:
+
+```bash
+x0x identity rebuild-revocation-store --carrier v3 --empty --confirm-empty
+```
+
+`--confirm-empty` is required for an empty store. The command does not treat a zero-byte file, a deleted quarantine file, or an unconfirmed empty file as recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.

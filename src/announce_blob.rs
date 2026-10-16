@@ -296,6 +296,19 @@ pub struct AnnounceBlobCache {
     diagnostics: AnnounceBlobDiagnosticCounters,
 }
 
+/// Drops by releasing the synchronous recovery-fetch section.
+#[cfg(test)]
+pub(crate) struct RecoverySyncReleaseGuard {
+    cache: std::sync::Arc<AnnounceBlobCache>,
+}
+
+#[cfg(test)]
+impl Drop for RecoverySyncReleaseGuard {
+    fn drop(&mut self) {
+        self.cache.release_recovery_sync_section_for_testing();
+    }
+}
+
 impl AnnounceBlobCache {
     /// Create a cache with optional disk persistence at `disk_path`.
     pub fn new(disk_path: Option<PathBuf>) -> Self {
@@ -647,19 +660,37 @@ impl AnnounceBlobCache {
     /// Block until [`Self::release_recovery_sync_section_for_testing`].
     ///
     /// This does not await. A task abort cannot stop it before it returns.
+    /// The wait is bounded so a missed release cannot hang process teardown.
     #[cfg(test)]
     pub(crate) fn block_in_recovery_sync_section_for_testing(&self) {
         self.recovery_sync_entered.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
         let mut guard = self
             .recovery_sync_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while !self.recovery_sync_release.load(Ordering::SeqCst) {
+            if started.elapsed() >= std::time::Duration::from_secs(30) {
+                break;
+            }
             let (next, _) = self
                 .recovery_sync_cvar
                 .wait_timeout(guard, std::time::Duration::from_millis(50))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = next;
+        }
+    }
+
+    /// Release the synchronous fetch section when this guard drops.
+    ///
+    /// An assertion that panics before the explicit release still wakes
+    /// the child, so Tokio teardown does not wait out the condvar.
+    #[cfg(test)]
+    pub(crate) fn recovery_sync_release_guard_for_testing(
+        self: &std::sync::Arc<Self>,
+    ) -> RecoverySyncReleaseGuard {
+        RecoverySyncReleaseGuard {
+            cache: std::sync::Arc::clone(self),
         }
     }
 

@@ -179,8 +179,8 @@ pub struct PubSubStats {
     pub incoming_sender_refused: AtomicU64,
     /// Millis since the unix epoch of the last sender-refusal debug log.
     sender_refusal_logged_at_ms: AtomicU64,
-    /// Messages withheld until a revocation resync (#1116). Not a decode
-    /// failure: the frame was valid and will be delivered after the hold.
+    /// Messages dropped during a revocation resync (#1116). Not a decode
+    /// failure: the frame was valid. It is not queued for later delivery.
     pub incoming_withheld: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
@@ -219,7 +219,7 @@ pub struct PubSubStatsSnapshot {
     pub incoming_decode_failed: u64,
     /// Verified payloads dropped because the sender is revoked or Blocked.
     pub incoming_sender_refused: u64,
-    /// Messages withheld until a revocation resync (#1116).
+    /// Messages dropped during a revocation resync (#1116). Not queued.
     pub incoming_withheld: u64,
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
@@ -1178,9 +1178,9 @@ async fn forward_plumtree_payload(
             count_refused_deliveries(env.stats, env.sub_topic, &sender, recipients.len() as u64);
         }
         DeliveryVerdict::Withheld => {
-            // #1116: a valid frame stays off the subscriber channel until
-            // resync. Count it with the other per-recipient decisions so
-            // the in-flight balance still closes.
+            // #1116: a valid frame is dropped. It is not queued for delivery
+            // after resync. Count it with the other per-recipient decisions
+            // so the in-flight balance still closes.
             count_withheld_deliveries(env.stats, env.sub_topic, recipients.len() as u64);
         }
     }
@@ -1196,7 +1196,7 @@ fn count_withheld_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64)
         .fetch_add(waiting, Ordering::Relaxed);
     tracing::debug!(
         topic = %sub_topic,
-        "[4/6 pubsub] payload withheld until revocation resync"
+        "[4/6 pubsub] payload dropped during revocation resync"
     );
 }
 
@@ -4142,8 +4142,8 @@ enum DeliveryVerdict {
     Rejected,
     /// Revoked or Blocked. Counted as `incoming_sender_refused`.
     Refused(AgentId),
-    /// Valid frame held back until revocation resync (#1116).
-    /// Counted as `incoming_withheld`.
+    /// Valid frame dropped during revocation resync (#1116).
+    /// Not queued. Counted as `incoming_withheld`.
     Withheld,
 }
 

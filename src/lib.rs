@@ -921,6 +921,15 @@ struct TrackedTasks {
     /// drops the `JoinSet` and releases reservations while a child can
     /// still be inside a synchronous section.
     shielded: Vec<tokio::task::JoinHandle<()>>,
+    /// Certificate-recovery batches that have been spawned and not yet finished.
+    recovery_live: usize,
+    /// One coalesced batch per carrier kind, waiting for a live slot.
+    recovery_wait: Vec<QueuedCertRecovery>,
+}
+
+fn reap_finished_tracked(guard: &mut TrackedTasks) {
+    guard.handles.retain(|handle| !handle.is_finished());
+    guard.shielded.retain(|handle| !handle.is_finished());
 }
 
 fn spawn_tracked_on<F>(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>, fut: F)
@@ -950,7 +959,9 @@ fn push_tracked<F>(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    reap_finished_tracked(&mut guard);
     if guard.closed {
+        drop(guard);
         return;
     }
     let handle = tokio::spawn(fut);
@@ -2763,6 +2774,16 @@ fn subject_certs_with_provenance(
 /// Blob-cache hits do not spend this budget (#1116).
 const MAX_CERT_RECOVERY_SUBJECTS: usize = 8;
 
+/// At most this many certificate-recovery tasks run at once during resync.
+///
+/// Further batches coalesce into one waiting batch per carrier. Completed
+/// task handles are removed from the registry. A live task stays until it
+/// finishes, including through the shutdown drain.
+const MAX_CONCURRENT_CERT_RECOVERY_TASKS: usize = 4;
+
+/// Records retained in one coalesced waiting recovery batch.
+const MAX_COALESCED_RECOVERY_RECORDS: usize = 128;
+
 /// Subjects still missing a certificate, with the announced binding that
 /// names each digest. One entry per subject. Built while the caller holds
 /// the discovery locks. Cache hits and fetches run after those locks drop.
@@ -3867,23 +3888,115 @@ impl Drop for RecoveryFetchChildGuard {
     }
 }
 
-/// Run one resync batch on the agent's tracked-task registry.
-///
-/// The eight-fetch allowance is shared with every other batch. Shutdown
-/// joins this task before it applies or persists. The task is shielded
-/// from the three-second grace abort so it can finish joining fetch
-/// children before their reservations are released and before their
-/// `JoinSet` is dropped.
-fn track_cert_recovery(
-    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+/// One certificate-recovery batch, running or waiting for a live slot.
+struct QueuedCertRecovery {
     shutdown: tokio_util::sync::CancellationToken,
     cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
     pubsub: Option<std::sync::Arc<crate::gossip::PubSubManager>>,
     found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
     apply: CertRecoveryApply,
+}
+
+/// Releases one live recovery slot when the batch task ends, then starts
+/// a coalesced waiter. Shutdown sees `closed` and does not start another.
+struct RecoveryLiveGuard {
+    registry: std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+}
+
+impl Drop for RecoveryLiveGuard {
+    fn drop(&mut self) {
+        finish_cert_recovery_task(&self.registry);
+    }
+}
+
+fn recovery_apply_kind(apply: &CertRecoveryApply) -> u8 {
+    match apply {
+        CertRecoveryApply::Legacy(_) => 0,
+        CertRecoveryApply::V2(_) => 1,
+    }
+}
+
+fn merge_recovery_records(
+    into: &mut Vec<revocation::RevocationRecord>,
+    extra: Vec<revocation::RevocationRecord>,
 ) {
+    let mut seen: std::collections::HashSet<[u8; 32]> = into
+        .iter()
+        .map(revocation::RevocationRecord::record_hash)
+        .collect();
+    for record in extra {
+        if into.len() >= MAX_COALESCED_RECOVERY_RECORDS {
+            break;
+        }
+        if seen.insert(record.record_hash()) {
+            into.push(record);
+        }
+    }
+}
+
+fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecovery) {
+    for (agent, certs) in extra.found {
+        into.found.entry(agent).or_insert(certs);
+    }
+    let mut pending_ids: std::collections::HashSet<identity::AgentId> =
+        into.pending.iter().map(|(agent, _)| *agent).collect();
+    for item in extra.pending {
+        if pending_ids.insert(item.0) {
+            into.pending.push(item);
+        }
+    }
+    match (&mut into.apply, extra.apply) {
+        (CertRecoveryApply::Legacy(dst), CertRecoveryApply::Legacy(src)) => {
+            merge_recovery_records(&mut dst.records, src.records);
+        }
+        (CertRecoveryApply::V2(dst), CertRecoveryApply::V2(src)) => {
+            merge_recovery_records(&mut dst.records, src.records);
+        }
+        _ => {}
+    }
+}
+
+fn finish_cert_recovery_task(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>) {
+    let next = {
+        let mut guard = match registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.recovery_live = guard.recovery_live.saturating_sub(1);
+        reap_finished_tracked(&mut guard);
+        if guard.closed || guard.recovery_live >= MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+            None
+        } else {
+            let job = guard.recovery_wait.pop();
+            if job.is_some() {
+                guard.recovery_live += 1;
+            }
+            job
+        }
+    };
+    if let Some(job) = next {
+        spawn_cert_recovery_task(registry, job);
+    }
+}
+
+fn spawn_cert_recovery_task(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+    job: QueuedCertRecovery,
+) {
+    let live = RecoveryLiveGuard {
+        registry: std::sync::Arc::clone(registry),
+    };
+    let QueuedCertRecovery {
+        shutdown,
+        cache,
+        pubsub,
+        found,
+        pending,
+        apply,
+    } = job;
     spawn_tracked_shielded_on(registry, async move {
+        let _live = live;
         #[cfg(test)]
         let _finished = RecoveryFinishedGuard(std::sync::Arc::clone(&cache));
         let fetched =
@@ -3919,6 +4032,82 @@ fn track_cert_recovery(
             }
         }
     });
+}
+
+/// Run one resync batch on the agent's tracked-task registry.
+///
+/// At most [`MAX_CONCURRENT_CERT_RECOVERY_TASKS`] batches run. A later
+/// batch of the same kind coalesces into one waiter. The eight-fetch
+/// allowance is shared with every other batch. Shutdown joins a live task
+/// before it applies or persists. The task is shielded from the
+/// three-second grace abort so it can finish joining fetch children
+/// before their reservations are released and before their `JoinSet` is
+/// dropped.
+fn track_cert_recovery(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: Option<std::sync::Arc<crate::gossip::PubSubManager>>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+    apply: CertRecoveryApply,
+) {
+    let job = QueuedCertRecovery {
+        shutdown,
+        cache,
+        pubsub,
+        found,
+        pending,
+        apply,
+    };
+    let mut guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.closed {
+        return;
+    }
+    reap_finished_tracked(&mut guard);
+    let kind = recovery_apply_kind(&job.apply);
+    if let Some(waiting) = guard
+        .recovery_wait
+        .iter_mut()
+        .find(|waiting| recovery_apply_kind(&waiting.apply) == kind)
+    {
+        coalesce_cert_recovery(waiting, job);
+        return;
+    }
+    if guard.recovery_live >= MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+        guard.recovery_wait.push(job);
+        return;
+    }
+    guard.recovery_live += 1;
+    drop(guard);
+    spawn_cert_recovery_task(registry, job);
+}
+
+#[cfg(test)]
+fn tracked_recovery_state_for_testing(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+) -> (usize, usize, usize) {
+    let guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    (
+        guard.recovery_live,
+        guard.recovery_wait.len(),
+        guard.shielded.len(),
+    )
+}
+
+#[cfg(test)]
+fn reap_tracked_for_testing(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>) {
+    let mut guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reap_finished_tracked(&mut guard);
 }
 
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
@@ -5707,14 +5896,14 @@ fn raw_dm_history_record(
 /// File (in the identity dir) holding ADR-0070 share-grant revocations.
 pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 
-/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
-/// record's owner-key authority, insert, and persist `revocations-v3.bin`
-/// when anything was new. Records of any other subject are ignored here —
-/// they have their own carriers.
 /// After a trusted authority opens a carrier, write that live file (#1116).
 ///
 /// The quarantine sibling is left in place. A hold that is still open is
 /// not written, so a restart cannot treat a partial set as a rebuild.
+/// A v3 rebuild takes the cross-process lock, re-reads the live file, and
+/// unions it with this snapshot. A revocation already durable on disk
+/// stays. The first rebuild after quarantine, when the live file is gone,
+/// may write this snapshot.
 pub(crate) async fn persist_completed_revocation_rebuild(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -5756,7 +5945,12 @@ pub(crate) async fn persist_completed_revocation_rebuild(
             retry |= carrier;
             continue;
         };
-        match storage::save_rebuilt_revocation_file_typed(&dir.join(name), bytes).await {
+        let write = if carrier == revocation::REVOCATION_CARRIER_V3 {
+            storage::rebuild_v3_preserving_durable(&dir.join(name), bytes).await
+        } else {
+            storage::save_rebuilt_revocation_file_typed(&dir.join(name), bytes).await
+        };
+        match write {
             Ok(()) => {}
             Err(error) if error.crossed_rename() => {
                 tracing::warn!("{name} rebuild failed after the rename: {error}");
@@ -5772,6 +5966,10 @@ pub(crate) async fn persist_completed_revocation_rebuild(
     }
 }
 
+/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
+/// record's owner-key authority, insert, and persist `revocations-v3.bin`
+/// when anything was new. Records of any other subject are ignored here —
+/// they have their own carriers.
 pub(crate) async fn ingest_share_grant_revocations(
     owner_trust: &owner_trust::OwnerTrust,
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
@@ -17784,7 +17982,7 @@ impl Agent {
                             stage = "recv",
                             sender_prefix = %network::hex_prefix(&sender.0, 4),
                             outcome = "withhold_revocation_resync",
-                            "direct message withheld until revocation resync"
+                            "direct message dropped during revocation resync"
                         );
                         drop(revoked);
                         continue;
@@ -21429,6 +21627,8 @@ impl AgentBuilder {
                 closed: false,
                 handles: Vec::new(),
                 shielded: Vec::new(),
+                recovery_live: 0,
+                recovery_wait: Vec::new(),
             })),
             peer_relay,
             relay_candidates,
@@ -23081,8 +23281,9 @@ impl Agent {
 /// tokens swept by one [`Agent::shutdown`] and the exact tracked-task
 /// handles that caller took, and is the ONLY completer of those tokens —
 /// the non-cancelled r3 ordering, verbatim: one bounded grace budget
-/// across ALL handles (abort + join the stragglers on timeout), then —
-/// and only then — complete the retirements, then cancel `done` so the
+/// for the ordinary handles (abort + join those stragglers on timeout),
+/// then join the shielded tasks without aborting them, and only then
+/// complete the retirements, then cancel `done` so the
 /// leader, every follower, and every replacement caller parked in the
 /// custody observation resumes.
 ///
@@ -33762,6 +33963,89 @@ mod tests {
         );
     }
 
+    /// #1116: recovery batches stay within the live cap, overflow coalesces,
+    /// and completed handles do not accumulate.
+    #[tokio::test]
+    async fn recovery_batches_stay_bounded_and_reap_completed_handles_1116() {
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+            closed: false,
+            handles: Vec::new(),
+            shielded: Vec::new(),
+            recovery_live: 0,
+            recovery_wait: Vec::new(),
+        }));
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let owner = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        let mut bindings = dm_inbox::AuthenticatedMachineBindingCache::default();
+        let agent = identity::AgentId([0x41; 32]);
+        let machine = identity::MachineId([0x42; 32]);
+        bindings.record_announcement(agent, machine, 1, Some([0x43; 32]), None);
+        let pending = vec![(agent, bindings.peek(&agent).expect("binding"))];
+        let burst = MAX_CONCURRENT_CERT_RECOVERY_TASKS + 6;
+        for _ in 0..burst {
+            track_cert_recovery(
+                &registry,
+                shutdown.clone(),
+                std::sync::Arc::clone(&blobs),
+                None,
+                std::collections::HashMap::new(),
+                pending.clone(),
+                CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                    records: Vec::new(),
+                    revocation_set: std::sync::Arc::clone(&set),
+                    identity_dir: None,
+                    owner_trust: owner.clone(),
+                })),
+            );
+        }
+        let (live, waiting, _) = tracked_recovery_state_for_testing(&registry);
+        assert!(
+            live <= MAX_CONCURRENT_CERT_RECOVERY_TASKS,
+            "live recovery batches {live}"
+        );
+        assert!(
+            waiting >= 1,
+            "batches past the cap must coalesce, waiting {waiting}"
+        );
+        assert!(
+            waiting <= 2,
+            "coalesced waiters stay bounded, waiting {waiting}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if blobs.recovery_hold_entered_for_testing() >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a live batch did not reach the fetch hold"
+            );
+            tokio::task::yield_now().await;
+        }
+        blobs.set_recovery_fetch_hold_for_testing(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            reap_tracked_for_testing(&registry);
+            let (live, waiting, shielded) = tracked_recovery_state_for_testing(&registry);
+            if live == 0 && waiting == 0 && shielded <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live {live}, waiting {waiting}, shielded handles {shielded}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// #1116: the three-second grace abort must not finish the outer recovery
     /// task, release its reservation, or drop the fetch child while that
     /// child is still inside a synchronous section.
@@ -33769,6 +34053,7 @@ mod tests {
     async fn grace_abort_does_not_drop_a_sync_fetch_child_1116() {
         let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(1, 0).await;
         blobs.set_recovery_fetch_sync_hold_for_testing(true);
+        let release_on_unwind = blobs.recovery_sync_release_guard_for_testing();
         let discovery = std::collections::HashMap::new();
         let sources = cold_sources(&discovery, &announced);
         let ids = [subjects[0].agent_id];
@@ -33852,7 +34137,7 @@ mod tests {
             !shutdown_done.load(std::sync::atomic::Ordering::SeqCst),
             "shutdown finished while the synchronous child was still running"
         );
-        blobs.release_recovery_sync_section_for_testing();
+        drop(release_on_unwind);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let inflight = blobs.recovery_in_flight_len_for_testing();
