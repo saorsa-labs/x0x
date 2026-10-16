@@ -127,6 +127,19 @@ filter = "test(direct_send_with_require_ack_round_trips_to_live_peer) | test(=te
 test-group = "quic-localhost"
 threads-required = 4
 
+# Coverage Gate on 13df90fc refused this one loopback selector in 0.441s
+# (`recovery-response admission refused`) and the same selector passed when
+# run alone. The fixture admission is true in both phases. The seam's
+# non-blocking reads refuse on contention and report that same string.
+# Group placement plus a scheduler reservation keeps this selector off the
+# parallel coverage pile. Admission checks, the refusal siblings, and the
+# exactly-once counts stay as they are. This is not a retry and not a
+# wider deadline.
+[[profile.default.overrides]]
+filter = "test(s8a_r5_g13_real_pinned_exchange_is_admitted_once_and_delivered_once)"
+test-group = "quic-localhost"
+threads-required = 4
+
 # ADR 0030 slice 3: gossip_plane_isolation was already in the serial group
 # (see the block below) and still failed a full-parallel run, at the first
 # `connect_addr`, in 2.4 s versus its normal ~12.4 s, with every dial

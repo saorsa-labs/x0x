@@ -3076,7 +3076,11 @@ async fn transport_seen(state: &AppState, recipient: &str, kind: &str) -> bool {
 /// Make the authority resolve `recipient` to its REAL machine through the
 /// announce/discovery cache, as it would for an announced peer (the same
 /// ingest a verified identity announcement takes).
-async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
+///
+/// `announced_at` is the binding's newest-wins stamp. `0` is older than any
+/// live announcement, so it cannot replace one. A positive loopback exchange
+/// passes the current time so the seed is the binding the seam re-reads.
+async fn pin_recipient_machine_at(authority: &AppState, recipient: &AppState, announced_at: u64) {
     let agent_id = recipient.agent.agent_id();
     authority
         .agent
@@ -3086,7 +3090,7 @@ async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
             user_id: None,
             self_name: None,
             addresses: Vec::new(),
-            announced_at: 0,
+            announced_at,
             last_seen: 0,
             machine_public_key: Vec::new(),
             nat_type: None,
@@ -3101,6 +3105,40 @@ async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
             cert_digest: None,
         })
         .await;
+}
+
+async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
+    pin_recipient_machine_at(authority, recipient, 0).await;
+}
+
+/// The positive G13 exchange must not send while its pin is older than a
+/// live announcement from connect. Re-seed at the current time and wait
+/// until that binding names `recipient`'s machine. A miss stops before the
+/// counted send, so the exactly-once admission counts stay at zero.
+async fn require_fresh_pinned_recipient(
+    authority: &AppState,
+    recipient: &AppState,
+) -> anyhow::Result<()> {
+    let want = recipient.agent.machine_id();
+    let agent_id = recipient.agent.agent_id();
+    let deadline = tokio::time::Instant::now() + x0x::dm::PINNED_RESOLUTION_WAIT;
+    loop {
+        pin_recipient_machine_at(authority, recipient, unix_secs_now()).await;
+        let names_recipient = authority
+            .agent
+            .pinned_binding_now(&agent_id)
+            .await
+            .is_some_and(|binding| binding.machine == want);
+        if names_recipient {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the pinned recipient binding did not name the recipient machine before the exchange"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Self-revoke `owner`'s MACHINE (not its agent) in the authority's
@@ -4185,6 +4223,7 @@ async fn bob_receives(
 async fn s8a_r5_g13_real_pinned_exchange_is_admitted_once_and_delivered_once() -> anyhow::Result<()>
 {
     let pair = transport_pair("once").await?;
+    require_fresh_pinned_recipient(&pair.alice, &pair.bob).await?;
     let mut rx = pair.bob.agent.subscribe_direct();
     let (pre, seam) = (Arc::default(), Arc::default());
     let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
