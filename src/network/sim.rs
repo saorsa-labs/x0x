@@ -548,7 +548,7 @@ impl SimFabric {
         self.lock()
             .links
             .get(&pair(a.0, b.0))
-            .and_then(|link| link.one_sided.map(|(who, generation)| (who, generation)))
+            .and_then(|link| link.one_sided)
     }
 
     /// Record a harness event (barrier, receipt, fault step) in the trace.
