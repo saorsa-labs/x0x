@@ -29048,6 +29048,8 @@ pub(in crate::server) async fn secure_group_reseal(
 /// key, this MUST fail. Used by `tests/e2e_named_groups.sh` section 2c to
 /// prove recipient-confidentiality: an observer (different daemon, different
 /// KEM keypair) cannot recover the group secret from a captured envelope.
+/// Requires the durable owner token because a successful open returns the
+/// raw group secret. Session and rider credentials are refused before parsing.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct OpenEnvelopeRequest {
     group_id: String,
@@ -29060,12 +29062,16 @@ pub(in crate::server) struct OpenEnvelopeRequest {
 
 pub(in crate::server) async fn secure_open_envelope_adversarial(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<OpenEnvelopeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(resp) = durable_owner_or_forbid(&actor, "opening a secure envelope") {
+        return resp;
+    }
     // #1166 S2: the withdrawn-record conflict gate (a withdrawn record
     // with no live same-stable-keyed alias → 409) runs in the
-    // group-access core under this same read lock. No actor or
-    // membership gate exists on this surface, before or after.
+    // group-access core under this same read lock, after the owner check.
+    // No additional group-membership gate applies to this diagnostic.
     {
         let groups = state.named_groups.read().await;
         if let Err(resp) = crate::server::group_access::admit_open_envelope(&groups, &req.group_id)
@@ -49060,6 +49066,7 @@ pub(in crate::server) mod tests {
         let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
         let (status, body) = secure_open_envelope_adversarial(
             State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(OpenEnvelopeRequest {
                 group_id: group_id.to_string(),
                 recipient,
@@ -52196,6 +52203,7 @@ pub(in crate::server) mod tests {
 
         let (status, body) = secure_open_envelope_adversarial(
             State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(OpenEnvelopeRequest {
                 group_id: stable_group_id.to_string(),
                 recipient,

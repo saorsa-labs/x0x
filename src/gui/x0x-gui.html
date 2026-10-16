@@ -4641,7 +4641,7 @@ async function adminOpenEnvelope(){
   let body;
   try{body=JSON.parse(document.getElementById('admin-envelope').value||'{}')}
   catch(e){adminOut('admin-env-out',null,'Invalid JSON');return}
-  const r=await api('/groups/secure/open-envelope',{method:'POST',body:JSON.stringify(body)});
+  const r=await ownerApi('/groups/secure/open-envelope',{method:'POST',body:JSON.stringify(body)});
   adminOut('admin-env-out',r);
 }
 

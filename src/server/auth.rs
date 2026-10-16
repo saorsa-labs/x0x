@@ -376,6 +376,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // #1228: opening an envelope exposes a raw group secret.
+                    | "/groups/secure/open-envelope"
                     // ADR 0116 §4: the runtime history trim.
                     | "/history/retain"
             ) || is_two_segment_action(path, "delegate")

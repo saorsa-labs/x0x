@@ -188,10 +188,11 @@ pub(in crate::server) enum AccessLevel {
     /// session marker visibility — is local policy, not principal
     /// identity.
     PublicRead,
-    /// No actor-based gate on a write surface; remaining gates are local
-    /// policy or data checks, not principal identity — the write-side
-    /// member of the no-actor class (S2's `open-envelope`, S3's request
-    /// create). #1228 labels request cancel [`AccessLevel::SessionBearer`]
+    /// No actor-based gate in this write admission check; remaining gates
+    /// are local policy or data checks, not principal identity (S3's request
+    /// create). The `open-envelope` data check also returns this level, but
+    /// its caller must first enforce the separate durable-owner guard.
+    /// #1228 labels request cancel [`AccessLevel::SessionBearer`]
     /// and `quarantine/clear` plus `/mls/groups*` [`AccessLevel::OwnerDurable`].
     /// Display-name is [`AccessLevel::JoinSelf`] (C-1228-1).
     PublicWrite,
@@ -1013,9 +1014,10 @@ pub(in crate::server) fn admit_secure_endpoint<'a>(
 
 /// `POST /groups/secure/open-envelope` admission: the withdrawn-record
 /// conflict (a withdrawn record with no live same-stable-keyed alias →
-/// 409) on the BODY's `group_id` — this surface never had an actor or
-/// membership gate, and an unknown group fails OPEN to the crypto (the
-/// envelope itself refuses). Body of the conflict comes from the
+/// 409) on the BODY's `group_id`. The handler first enforces durable-owner
+/// authority (#1228). This data check adds no membership requirement:
+/// an unknown group proceeds to the envelope's cryptographic checks.
+/// Body of the conflict comes from the
 /// canonical `open_envelope_withdrawn_group_conflict`.
 pub(in crate::server) fn admit_open_envelope(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
@@ -2735,10 +2737,9 @@ mod tests {
         assert_eq!(access.acting_hex(), "aa".repeat(32));
     }
 
-    /// `POST /groups/secure/open-envelope`: no actor gate at all — an
-    /// unknown group fails OPEN to the crypto (the envelope itself
-    /// refuses), and only the withdrawn-record conflict (no live keyed
-    /// alias) rejects.
+    /// Data admission beneath the `open-envelope` durable-owner guard:
+    /// an unknown group proceeds to crypto, and only the withdrawn-record
+    /// conflict (no live keyed alias) rejects at this layer.
     #[test]
     fn open_envelope_admission_reproduces_the_inline_decisions() {
         let mut groups = HashMap::new();

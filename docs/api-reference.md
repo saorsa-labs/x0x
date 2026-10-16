@@ -1300,8 +1300,21 @@ token. A session token is refused before the body is read.
 | POST | `/groups/:id/secure/encrypt` | `x0x group secure-encrypt <group_id>` | Encrypt content with the group's shared secret (member-only) |
 | POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |
 | POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
-| POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
+| POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Open a `SecureShareDelivered` envelope with this daemon's KEM key. Requires the durable owner API token; session and rider credentials receive typed `403` before JSON parsing |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
+
+### `POST /groups/secure/open-envelope` — owner envelope diagnostic
+
+This production diagnostic requires the durable owner API token. A valid
+browser session or rider credential receives a typed `403` before the request
+body is parsed. Missing or invalid credentials still receive `401`. The handler
+also checks durable-owner authority before it uses the envelope or daemon key.
+The GUI diagnostic uses its owner-token prompt for this request.
+
+An owner credential authorizes an attempt; it does not make an invalid envelope
+valid. Existing envelope decoding, recipient-key checks and withdrawn-group
+refusals still apply. This operation does not grant membership, select a new
+recipient, install a group secret, or establish historical-key entitlement.
 
 ### `POST /groups/:id/stores` — group store
 
