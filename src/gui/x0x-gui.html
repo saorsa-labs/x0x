@@ -4367,7 +4367,7 @@ async function mlsDecryptSelected(){
   const epoch=parseInt(document.getElementById('mls-epoch').value||'0',10);
   const r=await ownerApi('/mls/groups/'+encodeURIComponent(selectedMlsGroup)+'/decrypt',{method:'POST',body:JSON.stringify({ciphertext,epoch})});
   const result=document.getElementById('mls-crypto-result');
-  if(r&&r.payload){
+  if(r&&r.ok===true&&typeof r.payload==='string'){
     let text=r.payload;
     try{text=u8decode(r.payload)}catch(e){}
     document.getElementById('mls-plain').value=text;
@@ -4672,7 +4672,7 @@ async function adminSecureDecrypt(){
   try{body=JSON.parse(document.getElementById('admin-se-cipher').value||'{}')}
   catch(e){adminOut('admin-env-out',null,'Ciphertext JSON invalid');return}
   const r=await api('/groups/'+encodeURIComponent(gid)+'/secure/decrypt',{method:'POST',body:JSON.stringify(body)});
-  if(r&&r.payload_b64){
+  if(r&&r.ok===true&&typeof r.payload_b64==='string'){
     let text=r.payload_b64;
     try{text=u8decode(r.payload_b64)}catch(e){}
     document.getElementById('admin-se-plain').value=text;

@@ -47,6 +47,10 @@ All notable changes to this project will be documented in this file.
   replacement is not retained, and an older response cannot erase a newer
   token. Successful requests and other failures are not retried.
 
+- **The GUI displays successful empty decrypt results (#1414).** MLS and
+  Secure decrypt accept an empty payload string and clear the old plaintext.
+  Failed responses and missing or non-string payloads do not replace it.
+
 - **Stored reads and backfill hide a revoked or Blocked author (#1229).**
   The row stays in the store and in the cache. A later read serves it again
   when that author is allowed. There is no wire change and no stored-format
