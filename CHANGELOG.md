@@ -26,6 +26,10 @@ All notable changes to this project will be documented in this file.
   comments now distinguish it from sub-agent and agent–machine binding
   revocation. Runtime behavior is unchanged; the remaining #1108 work stays open.
 
+- **GroupCard refusal details remain visible at debug level (#1224).**
+  While the warning cooldown is active, each rejected signature still logs
+  its group, refusal count and error at debug level.
+
 - **Unsigned or unverifiable GroupCards are refused (#1224).** Discovery, shard, contact, and metadata ingress drop a card whose signature does not verify, before either cache is written. `GET /groups/discover` and `GET /groups/cards/:id` reject a card with an empty signature or authority key and do not run ML-DSA under the cache lock. `GET /health` publishes `unsigned_group_cards_refused`.
 
 - **Stored reads and backfill hide a revoked or Blocked author (#1229).**
