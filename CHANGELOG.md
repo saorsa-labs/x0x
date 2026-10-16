@@ -101,6 +101,21 @@ All notable changes to this project will be documented in this file.
     `GET /diagnostics/gossip` (`stats`). The log is debug, once per 30
     seconds. The decode-failure counter stays unchanged.
 
+### Added
+
+- **Live WebSocket `message` frames can carry `transport_msg_id` (#869).**
+  A completed plain delivery copies a validated gossip `MessageHeader.msg_id`
+  onto the live frame as 64 lowercase hex characters. The key is absent, not
+  null, when that metadata is missing. Recovery omits the id. A cancelled
+  producer omits the id. A frame that fails verification omits the id. A
+  receiver change omits the id and still delivers the payload. A cached or
+  forged frame does not stamp another call's payload. A payload replay does
+  not label another delivery. History backfill omits the field. A key-cache
+  v3 frame omits the id. Peers on 0.47 and 0.48 use that frame, so the key
+  is usually absent. x0x does not derive the id from the payload. The field
+  is not `HistoryRecord.msg_id` and not the ADR 0029 application id (`msg_id`
+  on `mention` frames). David exempted the field from an ADR (D243).
+
 ### Security
 
 - **rustls 0.23.46 in Cargo.lock.** The lockfile moves rustls from 0.23.45 to 0.23.46. This closes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349. ant-quic stays 0.27.60. No Cargo.toml change and no version bump.
