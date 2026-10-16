@@ -3121,6 +3121,154 @@ async fn cancelled_startup_backoff_can_be_scheduled_again() -> Result<()> {
     Ok(())
 }
 
+/// Production shutdown drains a sleeping startup backoff. After that fence,
+/// advancing past the interval does not ask, seal, or arm a successor.
+#[tokio::test]
+async fn shutdown_drains_sleeping_startup_backoff() -> Result<()> {
+    let fixture = arm_startup_pair(&"e6".repeat(16)).await?;
+    let sends_before = self_leave_startup_send_count(&fixture.state, &fixture.group_id);
+    let epoch_before = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert_eq!(sends_before, 2);
+    assert_eq!(epoch_before, fixture.epoch_before);
+    assert_ne!(backoff_owner(&fixture.state), 0);
+    yield_for(std::time::Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    crate::server::drain_server_tasks(&fixture.state, Vec::new()).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1_500),
+        "the sleeping backoff must leave on the shutdown signal, before the grace abort; elapsed {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        backoff_owner(&fixture.state),
+        0,
+        "shutdown must release this daemon's backoff token"
+    );
+    assert!(
+        fixture.state.detached_admission_closed(),
+        "shutdown must close detached admission"
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    yield_for(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
+        sends_before,
+        "advancing past the backoff after shutdown must not ask"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        epoch_before,
+        "advancing past the backoff after shutdown must not seal"
+    );
+    assert_eq!(
+        backoff_owner(&fixture.state),
+        0,
+        "shutdown must not leave a successor backoff"
+    );
+    Ok(())
+}
+
+/// A join-task retry parked inside the durable named-groups write is an
+/// admitted seal. Shutdown aborts that caller and still finishes the write.
+/// After the fence, the interval does not ask, seal again, or arm a successor.
+#[tokio::test]
+async fn shutdown_finishes_paused_startup_seal_without_a_successor() -> Result<()> {
+    use super::issue1269_shutdown_apply_boundary::{leftover_temp_files, wait_reached};
+
+    let fixture = arm_startup_pair(&"e7".repeat(16)).await?;
+    let head_before = saved_head(&fixture.state, &fixture.group_id).await;
+    let path = fixture.state.named_groups_path.clone();
+    let pause = atomic_write_test_seam::arm(&path);
+    let caller_state = Arc::clone(&fixture.state);
+    let caller = tokio::spawn(async move {
+        retry_startup_self_leave_catchup(&caller_state).await;
+    });
+    assert!(
+        wait_reached(&pause).await,
+        "the third retry must park inside the durable named-groups write"
+    );
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
+        3,
+        "the send is reserved before the durable write"
+    );
+    assert_eq!(
+        saved_head(&fixture.state, &fixture.group_id).await,
+        head_before,
+        "the new head must not be installed while the write is parked"
+    );
+
+    let drain_state = Arc::clone(&fixture.state);
+    let drain = tokio::spawn(async move {
+        crate::server::drain_server_tasks(&drain_state, vec![caller]).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    assert!(
+        !drain.is_finished(),
+        "the drain must wait for the admitted seal past the abort grace"
+    );
+    pause.release();
+    tokio::time::timeout(std::time::Duration::from_secs(15), drain)
+        .await
+        .expect("the drain must finish the admitted seal")?;
+    let head_after = saved_head(&fixture.state, &fixture.group_id).await;
+    assert_ne!(
+        head_after, head_before,
+        "the admitted seal must install the new head"
+    );
+    assert!(
+        std::fs::read_to_string(&path).is_ok_and(|json| json.contains(&head_after)),
+        "the admitted seal must rename the durable named-groups file"
+    );
+    assert!(
+        leftover_temp_files(&path).is_empty(),
+        "the admitted seal must not leave a temp file"
+    );
+    let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+    assert!(
+        epoch_after > fixture.epoch_before,
+        "the admitted seal must advance the epoch"
+    );
+    let sends_after = self_leave_startup_send_count(&fixture.state, &fixture.group_id);
+    assert_eq!(sends_after, 3);
+    assert_eq!(backoff_owner(&fixture.state), 0);
+    assert!(fixture.state.detached_admission_closed());
+    assert!(
+        fixture
+            .state
+            .shielded_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none(),
+        "shutdown must close shielded admission"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    yield_for(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        self_leave_startup_send_count(&fixture.state, &fixture.group_id),
+        sends_after,
+        "advancing past the backoff after shutdown must not ask"
+    );
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        epoch_after,
+        "advancing past the backoff after shutdown must not seal again"
+    );
+    assert_eq!(
+        saved_head(&fixture.state, &fixture.group_id).await,
+        head_after
+    );
+    assert_eq!(
+        backoff_owner(&fixture.state),
+        0,
+        "shutdown must not leave a successor backoff"
+    );
+    Ok(())
+}
+
 /// Designated admin A and ordinary member B share one roster and one group
 /// id, with distinct identities and storage. B's terminal page for a later
 /// admin-signed head must not clear A's hold on the earlier head.

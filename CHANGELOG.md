@@ -258,7 +258,9 @@ All notable changes to this project will be documented in this file.
   A peer added on a later pass still receives the asks that remain. The
   backoff continues until every current peer has spent its three sends.
   Each daemon owns that task. Cancelling it releases the ownership, so
-  another daemon in the same process keeps its own timer. Each daemon's
+  another daemon in the same process keeps its own timer. Shutdown drains
+  that task and closes admission. A seal the retry has already admitted
+  stays in the shielded registry, so the drain does not abort it. Each daemon's
   startup obligation is its own. Another daemon's matching head does not
   clear this daemon's hold.
   An empty page, a truncated page, a missing hash, and a KeyPackage reply do

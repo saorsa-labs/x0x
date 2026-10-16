@@ -24402,8 +24402,8 @@ pub(in crate::server) async fn startup_self_leave_rekey(state: &Arc<AppState>) {
 ///
 /// The token is per daemon. A second `AppState` has its own token, so this
 /// task cannot keep that daemon from scheduling. Drop clears the token only
-/// when this task still owns it, which covers runtime cancellation. A
-/// successor that already took the token is left alone.
+/// when this task still owns it, which covers runtime cancellation and the
+/// shutdown drain. A successor that already took the token is left alone.
 struct StartupBackoffOwner {
     state: Arc<AppState>,
     token: u64,
@@ -24433,15 +24433,29 @@ fn try_arm_startup_catchup_backoff(state: &AppState) -> Option<u64> {
         .map(|_| token)
 }
 
+/// Shutdown has closed this daemon's backoff.
+///
+/// The drain cancels `shutdown_started` before it takes `detached_tasks`.
+/// Either signal refuses another ask and another successor.
+fn startup_catchup_backoff_stopped(state: &AppState) -> bool {
+    state.shutdown_started.is_cancelled() || state.detached_admission_closed()
+}
+
 /// Later sends after the first startup attempt.
 ///
 /// One task for this daemon sleeps, then asks again, while any of its
 /// current peers still has an attempt left. A peer added on a later pass
 /// keeps the attempts that remain. There is no second global cap. The
 /// per-peer bound ends the wait. The first action is the sleep, so arming
-/// the task does not send immediately. Cancelling the task releases this
-/// daemon's token so a later schedule can start again.
+/// the task does not send immediately. The task is in `detached_tasks`.
+/// Shutdown cancels it and joins it. A durable seal it has already admitted
+/// stays in the shielded registry. Cancelling the task without closing
+/// admission releases this daemon's token, so a later schedule can start
+/// again.
 fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
+    if startup_catchup_backoff_stopped(&state) {
+        return;
+    }
     let Some(token) = try_arm_startup_catchup_backoff(&state) else {
         return;
     };
@@ -24450,11 +24464,21 @@ fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
         token,
         armed: true,
     };
-    let task = tokio::spawn(async move {
+    let Some(abort) = state.spawn_detached_with_abort(async move {
         let mut owner = owner;
         loop {
-            tokio::time::sleep(SELF_LEAVE_STARTUP_CATCHUP_BACKOFF).await;
+            tokio::select! {
+                biased;
+                () = owner.state.shutdown_started.cancelled() => break,
+                () = tokio::time::sleep(SELF_LEAVE_STARTUP_CATCHUP_BACKOFF) => {}
+            }
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
             retry_startup_self_leave_catchup(&owner.state).await;
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
             if startup_backoff_still_needed(&owner.state).await {
                 continue;
             }
@@ -24467,7 +24491,13 @@ fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
                 .compare_exchange(owner.token, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
             owner.armed = false;
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
             if released && startup_backoff_still_needed(&owner.state).await {
+                if startup_catchup_backoff_stopped(&owner.state) {
+                    break;
+                }
                 if let Some(token) = try_arm_startup_catchup_backoff(&owner.state) {
                     owner.token = token;
                     owner.armed = true;
@@ -24476,17 +24506,21 @@ fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
             }
             break;
         }
-    });
+    }) else {
+        // Admission closed before the spawn. The unrun future drops the
+        // owner, which releases the token this schedule just took.
+        return;
+    };
     #[cfg(test)]
     {
-        let abort = task.abort_handle();
         let mut slot = state
             .startup_catchup_backoff_abort
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *slot = Some(abort);
     }
-    drop(task);
+    #[cfg(not(test))]
+    drop(abort);
 }
 
 /// True when a current startup plan still has a peer under the send bound.
@@ -24506,12 +24540,24 @@ async fn startup_backoff_still_needed(state: &AppState) -> bool {
 /// A peer that still has a send remaining is asked. A peer that has spent
 /// its three sends is not. When a peer still blocks and the backoff task
 /// is not running, this schedules it. When no peer still blocks, the
-/// following rekey may seal.
+/// following rekey may seal. The rekey runs in the shielded registry. The
+/// join task and the backoff task can both be aborted. An admitted seal
+/// still finishes. Closed admission does not start the seal and does not
+/// arm another backoff.
 pub(in crate::server) async fn retry_startup_self_leave_catchup(state: &Arc<AppState>) {
     let plans = startup_self_leave_plans(state).await;
     install_startup_self_leave_gates(state, &plans);
     send_startup_self_leave_catchup(state, &plans).await;
-    rekey_outstanding_treekem_self_leaves(state).await;
+    let seal_state = Arc::clone(state);
+    if state
+        .run_shielded(async move {
+            rekey_outstanding_treekem_self_leaves(&seal_state).await;
+        })
+        .await
+        .is_none()
+    {
+        return;
+    }
     if plans
         .iter()
         .any(|plan| self_leave_startup_open(state, &plan.group_key))

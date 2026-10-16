@@ -1351,8 +1351,10 @@ pub(super) struct AppState {
     /// cancellation, and only when it still holds that token. A second
     /// daemon has its own token, so one task cannot block the other.
     pub(super) startup_catchup_backoff_owner: std::sync::atomic::AtomicU64,
-    /// Abort handle for the backoff task above. Tests cancel it and then
-    /// check that a new task can take the token. Dropping the handle does
+    /// Abort handle for the backoff task above. Tests cancel it without
+    /// closing admission, then check that a new task can take the token.
+    /// Production shutdown does not use this handle. The task lives in
+    /// `detached_tasks`, and the drain joins it. Dropping the handle does
     /// not abort the task.
     #[cfg(test)]
     pub(super) startup_catchup_backoff_abort: StdMutex<Option<tokio::task::AbortHandle>>,
