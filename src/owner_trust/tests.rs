@@ -294,7 +294,8 @@ async fn enrolled_machine_is_revocation_snapshot_authority_1116() {
 
 /// #1116: a revoked enrolled machine must not reopen a corrupt v3 carrier
 /// by publishing an unrelated grant. The signed agent id is the source.
-/// A relay peer id is not. The non-revoked twin writes the live file.
+/// A relay peer id is not. The enrolled machine still opens the in-memory
+/// carrier. Unreadable quarantine bytes block the shorter remote file.
 async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
     let (owner, fixture) = Fixture::same_owner().await;
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -408,8 +409,11 @@ async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
             .await
             .is_share_grant_revoked(&unrelated, &owner.user_id()));
         crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
-        assert!(path.is_file(), "the enrolled source rebuilds the live file");
-        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        assert!(
+            !path.is_file(),
+            "unreadable quarantine bytes block the shorter remote set"
+        );
+        assert_ne!(set.write().await.take_rebuild_pending(), 0);
         let again = crate::storage::read_revocation_store(
             &path,
             crate::storage::RevocationStore::V3,
@@ -417,9 +421,9 @@ async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
         )
         .await
         .expect("reload")
-        .expect("live file");
-        assert!(!again.revocation_resync_required());
-        assert!(again.is_share_grant_revoked(&unrelated, &owner.user_id()));
+        .expect("still quarantined");
+        assert!(again.revocation_resync_required());
+        assert!(!again.is_share_grant_revoked(&unrelated, &owner.user_id()));
         assert!(!again.is_share_grant_revoked(&lost_grant, &owner.user_id()));
     }
 }

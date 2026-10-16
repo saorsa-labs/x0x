@@ -262,8 +262,14 @@ All notable changes to this project will be documented in this file.
   An empty store also needs `--empty --confirm-empty`. The command
   validates the file, unites it with a readable live file, and leaves the
   quarantine file in place. A remote peer cannot run it. A zero-byte file
-  is rejected. A v3 rebuild takes the cross-process lock, re-reads the
-  live file, and keeps every unexpired revocation already durable.
+  is rejected. A rebuild re-reads the live file under the carrier lock
+  and unites it with revocations still readable in the quarantine file. A
+  v3 rebuild takes the cross-process lock. A snapshot cannot drop a
+  revocation the quarantine file still contains. If those bytes cannot be
+  read, the remote snapshot is not installed. The carrier stays closed
+  until the operator command. The command unites a readable quarantine
+  file as well, and still installs a validated file when those bytes
+  cannot be read.
   A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
   failure after the rename is not queued again. When the discovery cache

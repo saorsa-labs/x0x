@@ -280,6 +280,8 @@ While the flag is true, x0xd drops ordinary pubsub frames, direct messages, and 
 
 The flag clears for one file when a trusted authority has published a snapshot for that file and every record in the snapshot has verified. A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal for a group this node belongs to. Two free agent keys are not enough. The node's own publish is not enough. An empty snapshot is not enough. A snapshot that leaves out a revocation this node already holds does not clear the flag. A trusted snapshot can still omit a revocation that was lost with the bad file. Enrollment or an Active owner or admin is the sender rule. It is not proof that the lost set was complete.
 
+A remote rebuild unites revocations it can still read from the quarantine file. A snapshot cannot drop one of those revocations. If those bytes cannot be read, x0xd does not install the snapshot. The carrier stays closed until the operator command below.
+
 When no peer has a persisted file for that carrier, stop x0xd and validate a file before you install it. A remote peer cannot run this command.
 
 To install a file you already checked:
@@ -294,7 +296,7 @@ For a named instance:
 x0x --name <instance> identity rebuild-revocation-store --carrier v3 --from /path/to/revocations-v3.bin
 ```
 
-Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. The quarantine file stays. A zero-byte file is rejected.
+Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. When the quarantine file can be read, the command unites those revocations too. Unreadable quarantine bytes do not block the command. The quarantine file stays. A zero-byte file is rejected.
 
 When you have independent evidence that the set is complete and empty, and no peer has a persisted file:
 

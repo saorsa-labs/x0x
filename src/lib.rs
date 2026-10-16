@@ -5900,10 +5900,11 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 ///
 /// The quarantine sibling is left in place. A hold that is still open is
 /// not written, so a restart cannot treat a partial set as a rebuild.
-/// A v3 rebuild takes the cross-process lock, re-reads the live file, and
-/// unions it with this snapshot. A revocation already durable on disk
-/// stays. The first rebuild after quarantine, when the live file is gone,
-/// may write this snapshot.
+/// The rebuild re-reads the live file and unites it with this snapshot and
+/// with every revocation still readable in the quarantine file. A v3
+/// rebuild takes the cross-process lock. A revocation already durable stays.
+/// If the quarantine bytes cannot be read, this snapshot is not installed.
+/// The carrier stays closed until the operator command.
 pub(crate) async fn persist_completed_revocation_rebuild(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -5935,21 +5936,22 @@ pub(crate) async fn persist_completed_revocation_rebuild(
         if pending & carrier == 0 {
             continue;
         }
-        let name = match carrier {
-            revocation::REVOCATION_CARRIER_V1 => "revocations.bin",
-            revocation::REVOCATION_CARRIER_V2 => "revocations-v2.bin",
-            _ => SHARE_GRANT_REVOCATIONS_FILE,
+        let (name, store) = match carrier {
+            revocation::REVOCATION_CARRIER_V1 => ("revocations.bin", storage::RevocationStore::V1),
+            revocation::REVOCATION_CARRIER_V2 => {
+                ("revocations-v2.bin", storage::RevocationStore::V2)
+            }
+            _ => (SHARE_GRANT_REVOCATIONS_FILE, storage::RevocationStore::V3),
         };
         let Ok(bytes) = bytes else {
             tracing::warn!("{name} rebuild could not be encoded");
             retry |= carrier;
             continue;
         };
-        let write = if carrier == revocation::REVOCATION_CARRIER_V3 {
-            storage::rebuild_v3_preserving_durable(&dir.join(name), bytes).await
-        } else {
-            storage::save_rebuilt_revocation_file_typed(&dir.join(name), bytes).await
-        };
+        let write =
+            storage::rebuild_carrier_preserving_durable(&dir.join(name), store, bytes, true)
+                .await
+                .map(|_kept| ());
         match write {
             Ok(()) => {}
             Err(error) if error.crossed_rename() => {

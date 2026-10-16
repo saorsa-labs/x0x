@@ -2176,11 +2176,11 @@ mod tests {
         assert!(!again.is_agent_revoked(&lost.agent_id()));
     }
 
-    /// #1116: a trusted authority writes the live file and leaves the
-    /// quarantine bytes in place. The next load is open and still has
-    /// the revoked subject.
+    /// #1116: a trusted authority opens the in-memory carrier. Unreadable
+    /// quarantine bytes stay in place, and the shorter snapshot is not
+    /// installed. The next load stays closed until the operator command.
     #[tokio::test]
-    async fn verified_resync_rebuilds_the_live_file_1116() {
+    async fn unreadable_quarantine_blocks_the_shorter_rebuild_1116() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("revocations.bin");
         let garbage = b"truncated-looking-but-garbage";
@@ -2258,10 +2258,15 @@ mod tests {
         assert!(!set.read().await.revocation_resync_required());
         let pending = set.write().await.take_rebuild_pending();
         assert_eq!(pending, REVOCATION_CARRIER_V1);
-        let bytes = set.read().await.to_bytes().unwrap();
-        crate::storage::save_rebuilt_revocation_file(&path, bytes)
+        set.write()
             .await
-            .expect("rebuilt live file");
+            .requeue_rebuild_pending(REVOCATION_CARRIER_V1);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(
+            !path.is_file(),
+            "unreadable quarantine bytes block the shorter remote set"
+        );
+        assert_ne!(set.write().await.take_rebuild_pending(), 0);
         assert_eq!(std::fs::read(&quarantine).unwrap(), quarantined_bytes);
         let again = crate::storage::read_revocation_store(
             &path,
@@ -2271,8 +2276,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(!again.revocation_resync_required());
-        assert!(again.is_agent_revoked(&revoked.agent_id()));
+        assert!(again.revocation_resync_required());
+        assert!(!again.is_agent_revoked(&revoked.agent_id()));
     }
 
     /// Open a quarantined v1 carrier from one trusted sender and return the
@@ -2284,18 +2289,6 @@ mod tests {
         crate::identity::AgentId,
     ) {
         let path = dir.join("revocations.bin");
-        tokio::fs::write(&path, b"truncated-looking-but-garbage")
-            .await
-            .unwrap();
-        let loaded = crate::storage::read_revocation_store(
-            &path,
-            crate::storage::RevocationStore::V1,
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(loaded.revocation_resync_required());
         let revoked = crate::identity::AgentKeypair::generate().unwrap();
         let record = RevocationRecord::sign(
             RevokedSubject::Agent(revoked.agent_id()),
@@ -2305,6 +2298,36 @@ mod tests {
             None,
         )
         .unwrap();
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(record.clone(), None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        let quarantine = std::fs::read_dir(dir)
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("revocations.bin.quarantined-")
+                    .then(|| entry.path())
+            })
+            .expect("quarantine file");
+        assert!(
+            RevocationSet::from_bytes(&std::fs::read(quarantine).unwrap())
+                .unwrap()
+                .is_agent_revoked(&revoked.agent_id()),
+            "trailing bytes quarantine still decodes the revocation"
+        );
         let payload = bincode::serialize(&vec![record.clone()]).unwrap();
         let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
         let authority = AgentId([0x22; 32]);
@@ -2445,6 +2468,159 @@ mod tests {
             loaded.is_share_grant_revoked(&newer_id, &owner.user_id()),
             "a newer durable revocation survives the late rebuild"
         );
+    }
+
+    /// #1116: the first rebuild unites a revocation that the quarantine file
+    /// still contains. A shorter snapshot must not drop it. Unreadable
+    /// quarantine bytes are not replaced by that snapshot.
+    #[tokio::test]
+    async fn quarantine_file_revocation_survives_shorter_rebuild_1116() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = 1_700_000_000_u64;
+        let kept_id = [0x31_u8; 32];
+        let snapshot_id = [0x32_u8; 32];
+        let kept = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: kept_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: snapshot_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations-v3.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept, None).unwrap());
+        let mut stored = seeded.to_bytes_v3().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        assert!(!path.is_file(), "quarantine removes the live file");
+        let quarantine = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("revocations-v3.bin.quarantined-")
+                    .then(|| entry.path())
+            })
+            .expect("quarantine file");
+        let quarantined = std::fs::read(&quarantine).unwrap();
+        assert!(
+            RevocationSet::from_bytes_v3(&quarantined)
+                .unwrap()
+                .is_share_grant_revoked(&kept_id, &owner.user_id()),
+            "the quarantine file still contains R"
+        );
+
+        let mut snapshot = RevocationSet::new();
+        assert!(snapshot
+            .verify_and_insert(snapshot_record.clone(), None)
+            .unwrap());
+        snapshot.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let snapshot = std::sync::Arc::new(tokio::sync::RwLock::new(snapshot));
+        crate::persist_completed_revocation_rebuild(&snapshot, Some(dir.path())).await;
+        assert!(
+            path.is_file(),
+            "a readable quarantine file is united into the rebuild"
+        );
+        assert_eq!(snapshot.write().await.take_rebuild_pending(), 0);
+        let united = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            united.is_share_grant_revoked(&kept_id, &owner.user_id()),
+            "R is still revoked after the rebuild"
+        );
+        assert!(
+            united.is_share_grant_revoked(&snapshot_id, &owner.user_id()),
+            "the snapshot revocation stays"
+        );
+        assert_eq!(std::fs::read(&quarantine).unwrap(), quarantined);
+
+        let operator_dir = tempfile::tempdir().unwrap();
+        let operator_path = operator_dir.path().join("revocations-v3.bin");
+        tokio::fs::write(&operator_path, &stored).await.unwrap();
+        let operator_loaded = crate::storage::read_revocation_store(
+            &operator_path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(operator_loaded.revocation_resync_required());
+        let candidate = {
+            let mut only_snapshot = RevocationSet::new();
+            assert!(only_snapshot
+                .verify_and_insert(snapshot_record.clone(), None)
+                .unwrap());
+            only_snapshot.to_bytes_v3().unwrap()
+        };
+        let wrote = crate::storage::install_operator_revocation_carrier(
+            operator_dir.path(),
+            "v3",
+            candidate,
+            false,
+        )
+        .await
+        .expect("operator install");
+        assert!(wrote.kept_durable_records);
+        assert!(!wrote.empty_store);
+        let operator_live =
+            RevocationSet::from_bytes_v3(&std::fs::read(&operator_path).unwrap()).unwrap();
+        assert!(operator_live.is_share_grant_revoked(&kept_id, &owner.user_id()));
+        assert!(operator_live.is_share_grant_revoked(&snapshot_id, &owner.user_id()));
+
+        let blocked = tempfile::tempdir().unwrap();
+        let blocked_path = blocked.path().join("revocations-v3.bin");
+        tokio::fs::write(&blocked_path, b"not-a-v3-file")
+            .await
+            .unwrap();
+        let blocked_load = crate::storage::read_revocation_store(
+            &blocked_path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(blocked_load.revocation_resync_required());
+        assert!(!blocked_path.is_file());
+        let mut shorter = RevocationSet::new();
+        assert!(shorter.verify_and_insert(snapshot_record, None).unwrap());
+        shorter.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let shorter = std::sync::Arc::new(tokio::sync::RwLock::new(shorter));
+        crate::persist_completed_revocation_rebuild(&shorter, Some(blocked.path())).await;
+        assert!(
+            !blocked_path.is_file(),
+            "unreadable quarantine bytes block the shorter remote set"
+        );
+        assert_ne!(shorter.write().await.take_rebuild_pending(), 0);
     }
 
     #[tokio::test]
