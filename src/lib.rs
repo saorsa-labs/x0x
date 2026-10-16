@@ -4037,7 +4037,17 @@ fn keep_matching_issuer_certificates(
     IssuerCertKeep::Kept
 }
 
-/// `false` when the fetch binding does not fit. The caller then stops.
+fn same_pending_route(
+    agent: identity::AgentId,
+    digest: Option<[u8; 32]>,
+    other: &(identity::AgentId, dm_inbox::AuthenticatedMachineBinding),
+) -> bool {
+    other.0 == agent && other.1.cert_digest == digest
+}
+
+/// `false` when a new certificate-digest route does not fit. The caller
+/// then stops. Identical `(agent, digest)` routes are stored once.
+/// Distinct digests for one agent each keep their captured binding.
 fn keep_pending_recovery_subject(
     record: revocation::RevocationRecord,
     agent: identity::AgentId,
@@ -4046,34 +4056,52 @@ fn keep_pending_recovery_subject(
     kept_pending: &mut Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
     bytes: &mut usize,
 ) -> bool {
-    if kept_pending.iter().any(|(id, _)| *id == agent) {
-        kept_records.push(record);
+    let mut missing = Vec::new();
+    let mut saw_agent = false;
+    for (id, binding) in pending {
+        if *id != agent {
+            continue;
+        }
+        saw_agent = true;
+        let digest = binding.cert_digest;
+        let already_kept = kept_pending
+            .iter()
+            .any(|kept| same_pending_route(agent, digest, kept));
+        let already_missing = missing
+            .iter()
+            .any(|kept: &dm_inbox::AuthenticatedMachineBinding| kept.cert_digest == digest);
+        if already_kept || already_missing {
+            continue;
+        }
+        missing.push(*binding);
+    }
+    if missing.is_empty() {
+        if saw_agent {
+            kept_records.push(record);
+        }
         return true;
     }
-    let Some(binding) = pending
-        .iter()
-        .find(|(id, _)| *id == agent)
-        .map(|(_, binding)| *binding)
-    else {
-        return true;
-    };
-    let add = std::mem::size_of::<identity::AgentId>()
+    let each = std::mem::size_of::<identity::AgentId>()
         + std::mem::size_of::<dm_inbox::AuthenticatedMachineBinding>();
-    let fits = kept_pending.len() < MAX_COALESCED_RECOVERY_SUBJECTS
+    let add = each.saturating_mul(missing.len());
+    let fits = kept_pending.len().saturating_add(missing.len()) <= MAX_COALESCED_RECOVERY_SUBJECTS
         && bytes.saturating_add(add) <= MAX_COALESCED_RECOVERY_BYTES;
     if !fits {
         return false;
     }
     *bytes = bytes.saturating_add(add);
-    kept_pending.push((agent, binding));
+    for binding in missing {
+        kept_pending.push((agent, binding));
+    }
     kept_records.push(record);
     true
 }
 
 /// Keep a record only together with the issuer certificate or fetch binding
 /// that can authorize it. A known certificate and a pending fetch for
-/// another issuer of the same agent both stay. A certificate for a
-/// different issuer does not admit the record by itself. A unit that does
+/// another issuer of the same agent both stay. Each distinct pending
+/// certificate digest for one agent keeps its own route. A certificate
+/// for a different issuer does not admit the record by itself. A unit that does
 /// not fit is left out of this waiter. Record order is the order. A later
 /// batch is not stored once the record cap is full.
 fn select_recovery_units(
@@ -4212,7 +4240,11 @@ fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecove
     merge_certificate_choices(&mut found, extra.found);
     let mut pending = std::mem::take(&mut into.pending);
     for item in extra.pending {
-        if !pending.iter().any(|(agent, _)| *agent == item.0) {
+        let digest = item.1.cert_digest;
+        if !pending
+            .iter()
+            .any(|kept| same_pending_route(item.0, digest, kept))
+        {
             pending.push(item);
         }
     }
@@ -4307,9 +4339,10 @@ fn spawn_cert_recovery_task(
 /// The first waiter is trimmed before it is stored. A record is kept only
 /// with the certificate or fetch binding that authorizes it. A known
 /// certificate and a pending fetch for another issuer of the same agent
-/// both stay. A later batch merges any new issuer certificate for an
-/// agent the waiter already knows. A fetched certificate is added to
-/// those known certificates. Duplicate certificates are not stored
+/// both stay. Each distinct pending certificate digest for one agent
+/// keeps its own route. A later batch merges any new issuer certificate
+/// for an agent the waiter already knows. A fetched certificate is added
+/// to those known certificates. Duplicate certificates are not stored
 /// twice. A later batch is not stored once the record cap is full. The eight-fetch
 /// allowance is shared with every other batch. Shutdown joins a live task
 /// before it applies or persists. The task is shielded from the
@@ -4419,6 +4452,7 @@ struct WaitingRecoveryView {
     records: Vec<revocation::RevocationRecord>,
     found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     pending_agents: Vec<identity::AgentId>,
+    pending_digests: Vec<(identity::AgentId, Option<[u8; 32]>)>,
 }
 
 #[cfg(test)]
@@ -4439,6 +4473,11 @@ fn tracked_recovery_waiter_view_for_testing(
             },
             found: job.found.clone(),
             pending_agents: job.pending.iter().map(|(agent, _)| *agent).collect(),
+            pending_digests: job
+                .pending
+                .iter()
+                .map(|(agent, binding)| (*agent, binding.cert_digest))
+                .collect(),
         })
         .collect()
 }
@@ -35320,6 +35359,246 @@ mod tests {
                 "both {both}, live {live}, waiting {waiting}, shielded {shielded}"
             );
             tokio::task::yield_now().await;
+        }
+    }
+
+    struct PendingIssuerRoute {
+        machine: identity::MachineId,
+        record: revocation::RevocationRecord,
+        binding: dm_inbox::AuthenticatedMachineBinding,
+        cert: identity::AgentCertificate,
+        digest: [u8; 32],
+    }
+
+    /// Queue two pending issuer routes for one agent, in `a_first` order,
+    /// and apply both binding tombstones after both digests are recovered.
+    async fn apply_two_pending_issuer_routes(
+        a_first: bool,
+        agent_id: identity::AgentId,
+        route_a: &PendingIssuerRoute,
+        route_b: &PendingIssuerRoute,
+    ) {
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+            closed: false,
+            handles: Vec::new(),
+            shielded: Vec::new(),
+            recovery_live: 0,
+            recovery_wait: Vec::new(),
+        }));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        let queue =
+            |records: Vec<revocation::RevocationRecord>,
+             pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>| {
+                track_cert_recovery(
+                    &registry,
+                    shutdown.clone(),
+                    std::sync::Arc::clone(&blobs),
+                    None,
+                    std::collections::HashMap::new(),
+                    pending,
+                    CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                        records,
+                        revocation_set: std::sync::Arc::clone(&set),
+                        identity_dir: None,
+                        owner_trust: owner_trust.clone(),
+                    })),
+                );
+            };
+        for _ in 0..MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+            queue(Vec::new(), Vec::new());
+        }
+        let first = if a_first { route_a } else { route_b };
+        let second = if a_first { route_b } else { route_a };
+        queue(vec![first.record.clone()], vec![(agent_id, first.binding)]);
+        queue(
+            vec![second.record.clone()],
+            vec![(agent_id, second.binding)],
+        );
+        let view = tracked_recovery_waiter_view_for_testing(&registry);
+        assert_eq!(view.len(), 1, "a_first {a_first}: one waiter");
+        let hashes = view[0]
+            .records
+            .iter()
+            .map(revocation::RevocationRecord::record_hash)
+            .collect::<Vec<_>>();
+        assert!(hashes.contains(&route_a.record.record_hash()));
+        assert!(hashes.contains(&route_b.record.record_hash()));
+        let digests = view[0]
+            .pending_digests
+            .iter()
+            .filter(|(id, _)| *id == agent_id)
+            .map(|(_, digest)| *digest)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            digests.len(),
+            2,
+            "a_first {a_first}: each issuer digest keeps a route"
+        );
+        assert!(digests.contains(&Some(route_a.digest)));
+        assert!(digests.contains(&Some(route_b.digest)));
+        let (records, _, pending_n, bytes, _) = tracked_recovery_waiter_load_for_testing(&registry);
+        assert!(records <= MAX_COALESCED_RECOVERY_RECORDS);
+        assert!(pending_n <= MAX_COALESCED_RECOVERY_SUBJECTS);
+        assert!(bytes <= MAX_COALESCED_RECOVERY_BYTES, "bytes {bytes}");
+
+        let entered = blobs.recovery_hold_entered_for_testing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if blobs.recovery_hold_entered_for_testing() >= entered + 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a_first {a_first}: the coalesced fetch did not reach the hold"
+            );
+            tokio::task::yield_now().await;
+        }
+        insert_subject_blob(
+            &blobs,
+            &CachedBindingSubject {
+                agent_id,
+                record: route_a.record.clone(),
+                cert: route_a.cert.clone(),
+                digest: route_a.digest,
+            },
+        )
+        .await;
+        insert_subject_blob(
+            &blobs,
+            &CachedBindingSubject {
+                agent_id,
+                record: route_b.record.clone(),
+                cert: route_b.cert.clone(),
+                digest: route_b.digest,
+            },
+        )
+        .await;
+        blobs.set_recovery_fetch_hold_for_testing(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let applied = set.read().await;
+            let both = applied.is_binding_revoked(&agent_id, &route_a.machine)
+                && applied.is_binding_revoked(&agent_id, &route_b.machine);
+            drop(applied);
+            reap_tracked_for_testing(&registry);
+            let (live, waiting, shielded) = tracked_recovery_state_for_testing(&registry);
+            if both && live == 0 && waiting == 0 && shielded <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a_first {a_first}: both {both}, live {live}, waiting {waiting}, shielded {shielded}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// #1116: two pending certificate digests for one agent each keep a
+    /// route. Either arrival order recovers both issuer certificates and
+    /// applies both binding tombstones. The same digest is stored once.
+    #[tokio::test]
+    async fn two_pending_issuer_digests_apply_both_bindings_1116() {
+        let issuer_a = identity::UserKeypair::generate().expect("issuer a");
+        let issuer_b = identity::UserKeypair::generate().expect("issuer b");
+        let agent = identity::AgentKeypair::generate().expect("agent");
+        let cert_a = identity::AgentCertificate::issue(&issuer_a, &agent).expect("cert a");
+        let cert_b = identity::AgentCertificate::issue(&issuer_b, &agent).expect("cert b");
+        let digest_a = identity_authority::certificate_digest(&cert_a);
+        let digest_b = identity_authority::certificate_digest(&cert_b);
+        let now = Agent::unix_timestamp_secs();
+        let machine_1 = identity::MachineId([0x81; 32]);
+        let machine_2 = identity::MachineId([0x82; 32]);
+        let record_m1 = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                agent: agent.agent_id(),
+                machine: machine_1,
+                move_epoch: 1,
+            }),
+            issuer_a.public_key(),
+            issuer_a.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign m1");
+        let record_m2 = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                agent: agent.agent_id(),
+                machine: machine_2,
+                move_epoch: 2,
+            }),
+            issuer_b.public_key(),
+            issuer_b.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign m2");
+        let mut announcements = dm_inbox::AuthenticatedMachineBindingCache::default();
+        announcements.record_announcement(
+            agent.agent_id(),
+            machine_1,
+            1,
+            Some(digest_a),
+            cert_a.not_after(),
+        );
+        let binding_a = announcements.peek(&agent.agent_id()).expect("binding a");
+        announcements.record_announcement(
+            agent.agent_id(),
+            machine_2,
+            2,
+            Some(digest_b),
+            cert_b.not_after(),
+        );
+        let binding_b = announcements.peek(&agent.agent_id()).expect("binding b");
+        assert_ne!(binding_a.cert_digest, binding_b.cert_digest);
+        let identical = select_recovery_units(
+            vec![record_m1.clone(), record_m2.clone()],
+            &std::collections::HashMap::new(),
+            &[(agent.agent_id(), binding_a), (agent.agent_id(), binding_a)],
+        );
+        assert_eq!(
+            identical.pending.len(),
+            1,
+            "the same certificate digest is one route"
+        );
+        assert_eq!(identical.pending[0].1.cert_digest, Some(digest_a));
+        let forward = select_recovery_units(
+            vec![record_m1.clone(), record_m2.clone()],
+            &std::collections::HashMap::new(),
+            &[(agent.agent_id(), binding_a), (agent.agent_id(), binding_b)],
+        );
+        let reverse = select_recovery_units(
+            vec![record_m2.clone(), record_m1.clone()],
+            &std::collections::HashMap::new(),
+            &[(agent.agent_id(), binding_b), (agent.agent_id(), binding_a)],
+        );
+        assert_eq!(forward.pending.len(), 2);
+        assert_eq!(reverse.pending.len(), 2);
+
+        let route_a = PendingIssuerRoute {
+            machine: machine_1,
+            record: record_m1,
+            binding: binding_a,
+            cert: cert_a,
+            digest: digest_a,
+        };
+        let route_b = PendingIssuerRoute {
+            machine: machine_2,
+            record: record_m2,
+            binding: binding_b,
+            cert: cert_b,
+            digest: digest_b,
+        };
+        for a_first in [true, false] {
+            apply_two_pending_issuer_routes(a_first, agent.agent_id(), &route_a, &route_b).await;
         }
     }
 
