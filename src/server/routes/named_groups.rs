@@ -23038,7 +23038,7 @@ fn hash_only_removed_members(
 
 enum PendingSelfLeaveRekey {
     /// A saved commit extends this head.
-    Saved(NamedGroupMetadataEvent),
+    Saved(Box<NamedGroupMetadataEvent>),
     /// The file is missing, or it holds no commit for this head.
     Absent,
     /// The file is present and was not read. Do not author a new commit.
@@ -23082,7 +23082,9 @@ async fn pending_self_leave_rekey_for_head(
             }
             _ => false,
         })
-        .map_or(PendingSelfLeaveRekey::Absent, PendingSelfLeaveRekey::Saved)
+        .map_or(PendingSelfLeaveRekey::Absent, |event| {
+            PendingSelfLeaveRekey::Saved(Box::new(event))
+        })
 }
 
 async fn install_saved_self_leave_rekey(
@@ -24174,7 +24176,7 @@ async fn commit_treekem_self_leave_rekey_from(
     };
     match pending_self_leave_rekey_for_head(state, group_key, &leaver_hex, &info.state_hash).await {
         PendingSelfLeaveRekey::Saved(saved) => {
-            return install_saved_self_leave_rekey(state, group_key, &info, &mut guard, saved)
+            return install_saved_self_leave_rekey(state, group_key, &info, &mut guard, *saved)
                 .await;
         }
         PendingSelfLeaveRekey::Unreadable => {
