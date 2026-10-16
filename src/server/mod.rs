@@ -1301,11 +1301,25 @@ pub async fn serve_with_options(
                     .await
                     .map(|p| p.len())
                     .unwrap_or(0);
-                let send_ready = match snapshot_state.agent.network() {
-                    Some(network) => network.send_ready_peers().await.len(),
-                    None => 0,
+                match snapshot_state.agent.network() {
+                    Some(network) => {
+                        // #1419: sample off the /health path and store the
+                        // degraded set. The repair is spawned and is not
+                        // awaited, so this tick can store peer counts again
+                        // on the next interval. The handler stays a lock-free
+                        // snapshot read (#600).
+                        routes::status::publish_one_sided_health(
+                            network,
+                            &snapshot_state.health_snapshot,
+                            peers,
+                        )
+                        .await;
+                    }
+                    None => {
+                        snapshot_state.health_snapshot.store(peers, 0, 0);
+                        snapshot_state.health_snapshot.clear_one_sided_ids();
+                    }
                 };
-                snapshot_state.health_snapshot.store(peers, send_ready);
             }
         }));
     }

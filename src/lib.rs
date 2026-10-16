@@ -18733,6 +18733,21 @@ static RECONNECT_PHASE2_DIALS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Test-only observation of scheduler Phase 1 discovery-cache dials (#1419).
+/// Keyed by peer id, like [`RECONNECT_PHASE2_DIALS`].
+#[cfg(test)]
+static RECONNECT_PHASE1_DIALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Test-only count of scheduler attempts that reached the discovery-cache
+/// read (#1419). A repair claim during that read must not be followed by a
+/// Phase 1 or Phase 2 dial.
+#[cfg(test)]
+static RECONNECT_CACHE_WAITS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Schedule a bounded, backoff reconnect for a peer that just disconnected.
 ///
 /// This closes the gap identified in the post-restart transport failure: when a
@@ -18805,6 +18820,22 @@ fn schedule_reconnect(
         );
 
         'attempts: for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
+            // A one-sided repair disconnects with Transport, which reaches
+            // this scheduler. That repair already dialled (or is dialling).
+            // Wait out its backoff before this ladder's first dial so the
+            // 1 s retry does not ignore the 60 s bound (#1419).
+            if let Some(hold) = network.one_sided_repair_backoff_remaining(peer_id_bytes) {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    hold_secs = hold.as_secs(),
+                    "reconnect waiting out one-sided repair backoff",
+                );
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    _ = tokio::time::sleep(hold) => {}
+                }
+            }
             // Wait with cancellation before each attempt. Apply bounded jitter
             // so peers that disconnected together do not redial in lockstep.
             tokio::select! {
@@ -18840,6 +18871,39 @@ fn schedule_reconnect(
                 break;
             }
 
+            // A repair may have claimed the backoff during the wait above.
+            // Do not dial inside that window. The next attempt waits it out.
+            if network
+                .one_sided_repair_backoff_remaining(peer_id_bytes)
+                .is_some()
+            {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect skipped: one-sided repair owns the backoff",
+                );
+                continue;
+            }
+
+            // Shared dial permit (#1419). Held from before the discovery-cache
+            // read until both dials finish or the repair claims. The repair
+            // takes the same permit for its re-dial, so the two cannot both
+            // proceed. A claim cancels `attempt`; this task then drops the
+            // permit without a candidate or fallback call.
+            let permit = tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                guard = network.one_sided_dial_gate(peer_id).lock_owned() => guard,
+            };
+            if network
+                .one_sided_repair_backoff_remaining(peer_id_bytes)
+                .is_some()
+            {
+                drop(permit);
+                continue;
+            }
+            let attempt_cancel = network.arm_one_sided_scheduler_attempt(&peer_id);
+
             // Refresh discovery-cache candidate addresses on EVERY attempt
             // (not a one-time snapshot). These include LAN/loopback addresses
             // when allow_local_scope is active (same-host scenario). A named
@@ -18851,13 +18915,54 @@ fn schedule_reconnect(
             // named restart on a new port). Candidates are tried MRU-first
             // so a just-seen live addr is dialed before stale NAT mappings
             // each burn RECONNECT_CANDIDATE_DIAL_TIMEOUT (issue #308).
-            let candidate_addrs = {
-                let cache = machine_cache.read().await;
-                cache
-                    .get(&machine_id)
-                    .map(|m| reconnect_candidate_addrs(&m.addresses))
-                    .unwrap_or_default()
+            #[cfg(test)]
+            {
+                if let Ok(mut waits) = RECONNECT_CACHE_WAITS.lock() {
+                    *waits.entry(peer_id_bytes).or_insert(0) += 1;
+                }
+            }
+            let read = machine_cache.read();
+            tokio::pin!(read);
+            let candidate_addrs = tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => {
+                    drop(permit);
+                    break 'attempts;
+                }
+                _ = attempt_cancel.cancelled() => None,
+                cache = &mut read => {
+                    Some(
+                        cache
+                            .get(&machine_id)
+                            .map(|m| reconnect_candidate_addrs(&m.addresses))
+                            .unwrap_or_default(),
+                    )
+                }
             };
+            let Some(candidate_addrs) = candidate_addrs else {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect skipped: one-sided repair claimed during the cache wait",
+                );
+                drop(permit);
+                continue;
+            };
+            if attempt_cancel.is_cancelled()
+                || network
+                    .one_sided_repair_backoff_remaining(peer_id_bytes)
+                    .is_some()
+            {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %prefix,
+                    attempt,
+                    "reconnect skipped: one-sided repair owns the dial permit",
+                );
+                drop(permit);
+                continue;
+            }
 
             tracing::info!(
                 target: "x0x::connect",
@@ -18871,6 +18976,7 @@ fn schedule_reconnect(
             let mut connected = false;
 
             // Phase 1: discovery-cache addresses (LAN/loopback for same-host).
+            let mut repair_claimed = false;
             for addr in &candidate_addrs {
                 // Final suppression gate immediately before the dial: closes the
                 // TOCTOU window left open by the awaits above (and by prior dials
@@ -18884,12 +18990,37 @@ fn schedule_reconnect(
                     );
                     break 'attempts;
                 }
-                match tokio::time::timeout(
-                    RECONNECT_CANDIDATE_DIAL_TIMEOUT,
-                    network.connect_peer_with_addrs(peer_id, vec![*addr]),
-                )
-                .await
+                // The permit is held. A claim during this attempt cancels it.
+                // Do not start the candidate dial, and do not fall through to
+                // the bootstrap-cache dial. Dropping `permit` lets the repair
+                // take the same slot.
+                if attempt_cancel.is_cancelled()
+                    || network
+                        .one_sided_repair_backoff_remaining(peer_id_bytes)
+                        .is_some()
                 {
+                    repair_claimed = true;
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    if let Ok(mut phase1_dials) = RECONNECT_PHASE1_DIALS.lock() {
+                        *phase1_dials.entry(peer_id_bytes).or_insert(0) += 1;
+                    }
+                }
+                let dial_result = tokio::select! {
+                    biased;
+                    _ = attempt_cancel.cancelled() => None,
+                    result = tokio::time::timeout(
+                        RECONNECT_CANDIDATE_DIAL_TIMEOUT,
+                        network.connect_peer_with_addrs(peer_id, vec![*addr]),
+                    ) => Some(result),
+                };
+                let Some(dial_result) = dial_result else {
+                    repair_claimed = true;
+                    break;
+                };
+                match dial_result {
                     Ok(Ok((_, connected_peer))) if connected_peer == peer_id => {
                         tracing::info!(
                             target: "x0x::connect",
@@ -18932,6 +19063,10 @@ fn schedule_reconnect(
 
             // Phase 2: bootstrap-cache fallback (public addresses for remote
             // peers that may have NAT-stable endpoints).
+            if repair_claimed {
+                drop(permit);
+                continue;
+            }
             if !connected {
                 // Final suppression gate before the fallback dial (see Phase 1).
                 if network.is_reconnect_suppressed(peer_id_bytes) {
@@ -18963,13 +19098,32 @@ fn schedule_reconnect(
                     );
                     break 'attempts;
                 }
+                // A claim during Phase 1 or during the connected check owns
+                // the permit. Do not start the fallback dial.
+                if attempt_cancel.is_cancelled()
+                    || network
+                        .one_sided_repair_backoff_remaining(peer_id_bytes)
+                        .is_some()
+                {
+                    drop(permit);
+                    continue;
+                }
                 #[cfg(test)]
                 {
                     if let Ok(mut phase2_dials) = RECONNECT_PHASE2_DIALS.lock() {
                         *phase2_dials.entry(peer_id_bytes).or_insert(0) += 1;
                     }
                 }
-                match network.connect_cached_peer(peer_id).await {
+                let phase2_result = tokio::select! {
+                    biased;
+                    _ = attempt_cancel.cancelled() => None,
+                    result = network.connect_cached_peer(peer_id) => Some(result),
+                };
+                let Some(phase2_result) = phase2_result else {
+                    drop(permit);
+                    continue;
+                };
+                match phase2_result {
                     Ok(_) => {
                         tracing::info!(
                             target: "x0x::connect",

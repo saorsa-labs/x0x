@@ -31,7 +31,7 @@ pub(in crate::server) const HEALTH_SNAPSHOT_REFRESH_SECS: u64 = 5;
 /// storm the liveness probe was measuring lock contention, exceeded its 3 s
 /// budget, and aborted a perfectly live process 5–12×/hour on mainnet.
 ///
-/// The handler now reads these two atomics and nothing else: O(1), lock-free,
+/// The handler now reads these atomics and nothing else: O(1), lock-free,
 /// and independent of the peer table. The traversal moved to a background
 /// refresher task in `serve_with_options` (`src/server/mod.rs`), where blocking
 /// is survivable. Response shape is unchanged —
@@ -41,23 +41,85 @@ pub(in crate::server) const HEALTH_SNAPSHOT_REFRESH_SECS: u64 = 5;
 pub(in crate::server) struct HealthSnapshot {
     peers: AtomicUsize,
     send_ready_peers: AtomicUsize,
+    /// Connected peers whose link is one-sided (#1419). The refresher
+    /// publishes the count. The handler does not walk connection health.
+    one_sided_peers: AtomicUsize,
+    /// Peer ids from the same refresher store as `one_sided_peers`.
+    /// `GET /peers` reads this set so its `link` matches `/health`.
+    one_sided_ids: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 impl HealthSnapshot {
-    /// Publish a freshly measured pair of counts.
-    pub(in crate::server) fn store(&self, peers: usize, send_ready_peers: usize) {
+    /// Publish a freshly measured set of counts.
+    pub(in crate::server) fn store(
+        &self,
+        peers: usize,
+        send_ready_peers: usize,
+        one_sided_peers: usize,
+    ) {
         self.peers.store(peers, Ordering::Relaxed);
         self.send_ready_peers
             .store(send_ready_peers, Ordering::Relaxed);
+        self.one_sided_peers
+            .store(one_sided_peers, Ordering::Relaxed);
     }
 
-    /// Read the last published counts as `(peers, send_ready_peers)`.
-    pub(in crate::server) fn load(&self) -> (usize, usize) {
+    /// Publish counts and the one-sided peer set from one refresher sample.
+    pub(in crate::server) fn store_one_sided(
+        &self,
+        peers: usize,
+        send_ready_peers: usize,
+        one_sided_ids: &[[u8; 32]],
+    ) {
+        self.store(peers, send_ready_peers, one_sided_ids.len());
+        *self
+            .one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = one_sided_ids.to_vec();
+    }
+
+    /// The refresher's stored one-sided peer ids.
+    pub(in crate::server) fn one_sided_ids(&self) -> Vec<[u8; 32]> {
+        self.one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Clear the stored set when the node has no network.
+    pub(in crate::server) fn clear_one_sided_ids(&self) {
+        self.one_sided_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Read the last published counts as `(peers, send_ready_peers, one_sided_peers)`.
+    pub(in crate::server) fn load(&self) -> (usize, usize, usize) {
         (
             self.peers.load(Ordering::Relaxed),
             self.send_ready_peers.load(Ordering::Relaxed),
+            self.one_sided_peers.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Sample one-sided links, store the snapshot, then start a repair task.
+///
+/// The store runs before the repair is spawned. A re-dial may wait 3 s per
+/// peer. This function does not wait, so the next refresher tick can store
+/// new peer and send-ready counts (#1419, #600).
+pub(in crate::server) async fn publish_one_sided_health(
+    network: &Arc<x0x::network::NetworkNode>,
+    snapshot: &HealthSnapshot,
+    peers: usize,
+) {
+    let samples = network.connected_link_ages().await;
+    let one_sided = x0x::network::one_sided_peer_ids_from(&samples);
+    let ids: Vec<[u8; 32]> = one_sided.iter().map(|peer| peer.0).collect();
+    let send_ready = network.send_ready_peers().await.len();
+    snapshot.store_one_sided(peers, send_ready, &ids);
+    network.spawn_one_sided_repair(samples);
 }
 
 /// Generic JSON response wrapper.
@@ -97,11 +159,27 @@ pub(in crate::server) struct HealthData {
 /// 6+ hours (wedged transport, silent socket) while fleet monitoring read
 /// `healthy` and stayed quiet. `ok` remains `true` (the process is alive and
 /// serving); `status: "degraded"` is the monitorable signal.
+fn one_sided_reason(count: usize) -> String {
+    let noun = if count == 1 {
+        "peer link is"
+    } else {
+        "peer links are"
+    };
+    format!(
+        "{count} connected {noun} one-sided (one direction idle > {}s while the other direction still has traffic)",
+        crate::network::ONE_SIDED_STALE.as_secs()
+    )
+}
+
 fn classify_health(
     peers: usize,
     send_ready_peers: usize,
     uptime_secs: u64,
+    one_sided_peers: usize,
 ) -> (&'static str, Option<String>) {
+    if one_sided_peers > 0 {
+        return ("degraded", Some(one_sided_reason(one_sided_peers)));
+    }
     if peers == 0 && uptime_secs >= CONNECTIVITY_GRACE_SECS {
         (
             "degraded",
@@ -131,8 +209,10 @@ fn classify_runtime_status(
     send_ready_peers: usize,
     uptime_secs: u64,
     has_warnings: bool,
+    one_sided_peers: usize,
 ) -> (&'static str, Option<String>) {
-    let (health, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
+    let (health, degraded_reason) =
+        classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers);
     if has_warnings || health == "degraded" {
         ("degraded", degraded_reason)
     } else if send_ready_peers > 0 {
@@ -170,9 +250,10 @@ pub(in crate::server) struct StatusData {
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
-    let (peers, send_ready_peers) = state.health_snapshot.load();
+    let (peers, send_ready_peers, one_sided_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
-    let (status, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
+    let (status, degraded_reason) =
+        classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers);
 
     Json(ApiResponse {
         ok: true,
@@ -255,8 +336,14 @@ pub(in crate::server) async fn status(
         }
     }
 
-    let (connectivity, degraded_reason) =
-        classify_runtime_status(peers, send_ready_peers, uptime_secs, !warnings.is_empty());
+    let one_sided_peers = state.health_snapshot.load().2;
+    let (connectivity, degraded_reason) = classify_runtime_status(
+        peers,
+        send_ready_peers,
+        uptime_secs,
+        !warnings.is_empty(),
+        one_sided_peers,
+    );
     if let Some(reason) = degraded_reason {
         warnings.push(reason);
     }
@@ -330,6 +417,7 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{classify_health, classify_runtime_status, HealthSnapshot};
+    use crate as x0x;
 
     /// The `health` handler's own source, for the structural guard below.
     /// Matches the `include_str!`-of-route-source convention in
@@ -384,11 +472,15 @@ mod tests {
     #[test]
     fn health_snapshot_round_trips_both_counts() {
         let snapshot = HealthSnapshot::default();
-        assert_eq!(snapshot.load(), (0, 0), "unprimed snapshot reads as zero");
-        snapshot.store(17, 3);
-        assert_eq!(snapshot.load(), (17, 3));
-        snapshot.store(0, 0);
-        assert_eq!(snapshot.load(), (0, 0), "a drop to zero must be visible");
+        assert_eq!(
+            snapshot.load(),
+            (0, 0, 0),
+            "unprimed snapshot reads as zero"
+        );
+        snapshot.store(17, 3, 1);
+        assert_eq!(snapshot.load(), (17, 3, 1));
+        snapshot.store(0, 0, 0);
+        assert_eq!(snapshot.load(), (0, 0, 0), "a drop to zero must be visible");
     }
 
     /// WHY (issue #262): a wedged-transport daemon — up for hours, zero
@@ -396,7 +488,7 @@ mod tests {
     /// That exact state hid the NYC prod bootstrap outage for 6+ hours.
     #[test]
     fn zero_peers_past_grace_is_degraded() {
-        let (status, reason) = classify_health(0, 0, 121);
+        let (status, reason) = classify_health(0, 0, 121, 0);
         assert_eq!(status, "degraded");
         assert!(reason.is_some(), "degraded must carry a reason");
     }
@@ -405,7 +497,7 @@ mod tests {
     /// flagging a freshly started daemon would page on every restart.
     #[test]
     fn zero_peers_within_grace_is_still_healthy() {
-        let (status, reason) = classify_health(0, 0, 30);
+        let (status, reason) = classify_health(0, 0, 30, 0);
         assert_eq!(status, "healthy");
         assert!(reason.is_none());
     }
@@ -413,7 +505,7 @@ mod tests {
     /// Any live peer means the transport works — healthy regardless of age.
     #[test]
     fn connected_daemon_is_healthy() {
-        let (status, reason) = classify_health(1, 1, 999_999);
+        let (status, reason) = classify_health(1, 1, 999_999, 0);
         assert_eq!(status, "healthy");
         assert!(reason.is_none());
     }
@@ -423,7 +515,7 @@ mod tests {
     /// `/health` reported healthy.
     #[test]
     fn outer_peers_without_transport_winner_are_degraded() {
-        let (status, reason) = classify_health(17, 0, 2_400);
+        let (status, reason) = classify_health(17, 0, 2_400, 0);
         assert_eq!(status, "degraded");
         assert!(
             reason
@@ -437,7 +529,7 @@ mod tests {
     /// at least one routable transport winner remains.
     #[test]
     fn at_least_one_transport_winner_is_healthy() {
-        let (status, reason) = classify_health(17, 1, 2_400);
+        let (status, reason) = classify_health(17, 1, 2_400, 0);
         assert_eq!(status, "healthy");
         assert!(reason.is_none());
     }
@@ -446,29 +538,131 @@ mod tests {
     /// `/health` classifies as degraded.
     #[test]
     fn runtime_status_degrades_without_a_transport_winner() {
-        let (status, reason) = classify_runtime_status(17, 0, 2_400, false);
+        let (status, reason) = classify_runtime_status(17, 0, 2_400, false, 0);
         assert_eq!(status, "degraded");
         assert!(reason.is_some());
     }
 
     #[test]
     fn runtime_status_connects_only_with_a_send_ready_peer() {
-        let (status, reason) = classify_runtime_status(17, 1, 2_400, false);
+        let (status, reason) = classify_runtime_status(17, 1, 2_400, false, 0);
         assert_eq!(status, "connected");
         assert!(reason.is_none());
     }
 
     #[test]
     fn runtime_status_is_connecting_during_transport_grace() {
-        let (status, reason) = classify_runtime_status(17, 0, 30, false);
+        let (status, reason) = classify_runtime_status(17, 0, 30, false, 0);
         assert_eq!(status, "connecting");
         assert!(reason.is_none());
     }
 
     #[test]
     fn runtime_status_preserves_isolated_state_before_degraded_grace() {
-        let (status, reason) = classify_runtime_status(0, 0, 60, false);
+        let (status, reason) = classify_runtime_status(0, 0, 60, false, 0);
         assert_eq!(status, "isolated");
         assert!(reason.is_none());
+    }
+
+    /// #1419: a mesh that still has send-ready peers is degraded when one
+    /// of those links is one-sided. `ok` stays true at the handler; this
+    /// is the status the fleet monitor reads.
+    #[test]
+    fn one_sided_link_is_degraded_while_peers_remain() {
+        let (status, reason) = classify_health(4, 4, 2_400, 1);
+        assert_eq!(status, "degraded");
+        let reason = reason.expect("one-sided degradation carries a reason");
+        assert!(
+            reason.contains("one-sided"),
+            "reason must name the one-sided link: {reason}"
+        );
+        assert!(
+            reason.contains("60s"),
+            "reason must name the idle bound: {reason}"
+        );
+    }
+
+    #[test]
+    fn runtime_status_degrades_on_a_one_sided_link() {
+        let (status, reason) = classify_runtime_status(4, 4, 2_400, false, 1);
+        assert_eq!(status, "degraded");
+        assert!(reason.is_some());
+    }
+
+    /// #1419: the degraded count is visible while a slow re-dial is still
+    /// waiting. Publishing after the repair would leave `/health` healthy
+    /// for up to 3 s per peer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn one_sided_health_is_published_before_the_redial_wait() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let plane = "issue1419-publish";
+        let fabric = x0x::network::sim::SimFabric::new(1419);
+        x0x::network::sim::register(plane, &fabric);
+        let config = |host: u8| x0x::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        };
+        let a = Arc::new(
+            x0x::network::NetworkNode::new(config(1), None, None)
+                .await
+                .unwrap(),
+        );
+        let b = x0x::network::NetworkNode::new(config(2), None, None)
+            .await
+            .unwrap();
+        let c = x0x::network::NetworkNode::new(config(3), None, None)
+            .await
+            .unwrap();
+        let peer_b = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_c, c.peer_id());
+        let a_link = a.sim_link_for_test().expect("sim link");
+        let b_link = b.sim_link_for_test().expect("sim link");
+        let c_link = c.sim_link_for_test().expect("sim link");
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(x0x::network::ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        b_link.send(&peer_a, b"\x7fba-fresh").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        a.pause_one_sided_redial_for_test(Duration::from_secs(3));
+
+        let snapshot = Arc::new(HealthSnapshot::default());
+        let published = Arc::clone(&snapshot);
+        let repair_node = Arc::clone(&a);
+        let task = tokio::spawn(async move {
+            super::publish_one_sided_health(&repair_node, &published, 2).await;
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            snapshot.load().2,
+            1,
+            "the degraded count is stored before the re-dial wait finishes"
+        );
+        assert_eq!(
+            snapshot.one_sided_ids(),
+            vec![peer_b.0],
+            "the stored set is the same peer the count names"
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        task.await.unwrap();
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
     }
 }
