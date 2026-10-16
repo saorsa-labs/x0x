@@ -542,12 +542,38 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     let (status, body) = get_value(&f.state, &topic, "gap").await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
 
-    // The share installs well inside Alice's cooldown.
+    // The share installs well inside Alice's cooldown. The repair publishes
+    // one request now and exactly one retry 16 s later, after every holder's
+    // response cooldown. A gap value can become readable before that retry
+    // (a cached delta can land once the key exists). Value visibility is not
+    // repair completion. Read the counters only after both requests are
+    // published and Alice has answered the retry, which is the serve that
+    // supplies the dropped record when the first request was suppressed.
     let delivered =
         apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
             .await;
     assert!(!delivered.should_exit);
-    let (status, body) = wait_for_value(&f.state, &topic, "gap", Duration::from_secs(40)).await?;
+    let requests = wait_for_count(
+        || {
+            bob.state_sync_snapshot()
+                .requests_sent
+                .saturating_sub(baseline_requests)
+        },
+        2,
+        Duration::from_secs(40),
+    )
+    .await;
+    let answered = wait_for_count(
+        || alice.sync.state_sync_snapshot().requests_answered,
+        2,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        answered, 2,
+        "the retry must be served before the record is checked; requests so far {requests}"
+    );
+    let (status, body) = get_value(&f.state, &topic, "gap").await?;
     let served = alice.sync.state_sync_snapshot();
     let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
     assert_eq!(
@@ -565,6 +591,12 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     );
     assert_eq!(requests, 2, "one repair request plus exactly one retry");
     assert_eq!(served.requests_answered, 2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        bob.state_sync_snapshot().requests_sent - baseline_requests,
+        2,
+        "the repair is capped at two requests"
+    );
     alice.sync.cancel_sync();
     Ok(())
 }
