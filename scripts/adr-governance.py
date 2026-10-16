@@ -42,6 +42,8 @@ Enforces:
   ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
   One exception (David, 15 Oct 2026, D280): pull request 1401 may change
   ``docs/adr/transient/T-installed-catchup-admin-consent.md`` in place.
+  One exception (David, 16 Oct 2026): pull request 1337 may change
+  ``docs/adr/transient/T-self-leave-rekey-committer.md`` in place.
   The number is ``GITHUB_PR_NUMBER``, set from
   ``github.event.pull_request.number``. Any other file or number stays frozen.
 """
@@ -654,6 +656,10 @@ TRANSIENT_SUPPORT = {"docs/adr/transient/README.md"}
 # The number comes from the Actions event, not from a file in the checkout.
 _D280_ACCEPTED_TRANSIENT = "docs/adr/transient/T-installed-catchup-admin-consent.md"
 _D280_PULL_REQUEST = "1401"
+# David, 16 Oct 2026. One Accepted file, one pull request.
+# The number comes from the Actions event, not from a file in the checkout.
+_PR1337_ACCEPTED_TRANSIENT = "docs/adr/transient/T-self-leave-rekey-committer.md"
+_PR1337_PULL_REQUEST = "1337"
 
 
 def d280_in_place_edit_allowed(name: str) -> bool:
@@ -669,6 +675,21 @@ def d280_in_place_edit_allowed(name: str) -> bool:
         return False
     number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
     return number == _D280_PULL_REQUEST
+
+
+def pr1337_in_place_edit_allowed(name: str) -> bool:
+    """Whether this Accepted transient may change in place.
+
+    True only when *name* is the self-leave committer record and
+    ``GITHUB_PR_NUMBER`` is ``1337``. David accepted that claim
+    correction on 16 Oct 2026. A missing number, any other number, and
+    any other path stay immutable. Deletion is not an in-place edit;
+    the caller still rejects a missing file.
+    """
+    if name != _PR1337_ACCEPTED_TRANSIENT:
+        return False
+    number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
+    return number == _PR1337_PULL_REQUEST
 
 
 def _transient_shape_errors(path: str, text: str) -> list[str]:
@@ -798,7 +819,9 @@ def transient_record_errors(base: str | None, changed: list[str]) -> list[str]:
             errors.append(move_error)
             continue
         if head_text is None or head_text != snapshot_text:
-            if head_text is not None and d280_in_place_edit_allowed(name):
+            if head_text is not None and (
+                d280_in_place_edit_allowed(name) or pr1337_in_place_edit_allowed(name)
+            ):
                 continue
             errors.append(
                 f"{name}: Accepted transient records are immutable. "

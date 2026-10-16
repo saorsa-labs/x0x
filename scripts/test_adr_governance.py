@@ -2364,6 +2364,40 @@ Use option 2.
             rc == 0 and "ADR governance passed" in out,
         ))
 
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-self-leave-rekey-committer.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1338"})
+        results.append(check(
+            "PR 1337: a different pull request cannot edit the Accepted committer record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-other-accepted.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: pull request 1337 cannot edit a different Accepted record",
+            rc == 1
+            and "Accepted transient records are immutable" in out
+            and "docs/adr/transient/T-other-accepted.md" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _edit_accepted(work, "docs/adr/transient/T-self-leave-rekey-committer.md")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1337"})
+        results.append(check(
+            "PR 1337: pull request 1337 may edit the Accepted committer record in place",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0
