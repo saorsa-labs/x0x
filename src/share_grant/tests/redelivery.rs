@@ -1108,9 +1108,9 @@ async fn v3_merge_applies_the_gc_horizon() {
 /// `revocations-v3.bin`, or a restart forgets it and the outbox could
 /// redeliver the grant. Functional half: the v3 writer persists a record
 /// inserted the way the legacy handlers insert it, and it survives a reload
-/// while the legacy encodings drop it. Wiring half: both legacy handlers
-/// call the v3 writer (they are inline in the gossip listener and cannot be
-/// driven without a network, so this half is a source check).
+/// while the legacy encodings drop it. Wiring half: each legacy listener
+/// reaches its apply helper, and that helper calls the v3 writer. The
+/// handlers cannot be driven without a network, so this half is a source check.
 #[tokio::test]
 async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
     let world = World::new().await;
@@ -1134,14 +1134,28 @@ async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
     assert!(reload_v3(&path).is_share_grant_revoked(&grant.grant_id, &grant.owner));
 
     let lib = include_str!("../../lib.rs");
-    for (arm, next) in [
+    // The v1/v2 listener arms call these helpers (directly on a cache hit,
+    // and through `track_cert_recovery` when a fetch is still required).
+    // The helpers own the v3 write.
+    let track = rust_fn_body(lib, "fn track_cert_recovery(");
+    assert!(
+        track.contains("apply_legacy_revocation_records("),
+        "tracked recovery must apply a v1 batch through apply_legacy_revocation_records"
+    );
+    assert!(
+        track.contains("apply_v2_revocation_records("),
+        "tracked recovery must apply a v2 batch through apply_v2_revocation_records"
+    );
+    for (arm, next, helper) in [
         (
             "DiscoveryMessage::Revocation(msg) => {",
             "DiscoveryMessage::RevocationV2(msg) => {",
+            "apply_legacy_revocation_records(",
         ),
         (
             "DiscoveryMessage::RevocationV2(msg) => {",
             "DiscoveryMessage::RevocationV3(msg) => {",
+            "apply_v2_revocation_records(",
         ),
     ] {
         let body = lib
@@ -1149,11 +1163,43 @@ async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
             .nth(1)
             .and_then(|rest| rest.split(next).next())
             .unwrap_or_default();
+        assert!(body.contains(helper), "{arm} must apply through {helper}");
         assert!(
-            body.contains("persist_share_grant_revocations("),
-            "{arm} must persist share-grant revocations to v3"
+            body.contains("track_cert_recovery("),
+            "{arm} must send a fetch batch through track_cert_recovery"
+        );
+        let helper_body = rust_fn_body(lib, &format!("async fn {helper}"));
+        assert!(
+            helper_body.contains("persist_share_grant_revocations("),
+            "{helper} must persist share-grant revocations to v3"
         );
     }
+}
+
+/// The body of the first `signature` in `lib`, including its braces.
+/// Format-string braces in these handlers are balanced, so the depth count
+/// ends at the function's closing brace.
+fn rust_fn_body<'a>(lib: &'a str, signature: &str) -> &'a str {
+    let Some(rest) = lib.split(signature).nth(1) else {
+        return "";
+    };
+    let Some(open) = rest.find('{') else {
+        return "";
+    };
+    let mut depth = 0;
+    for (index, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[open..=open + index];
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
 }
 
 /// WHY (review P1, fail loud): if `revocations-v3.bin` cannot be written
