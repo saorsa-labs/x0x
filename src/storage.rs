@@ -362,6 +362,17 @@ impl DurableWriteError {
         matches!(self, Self::AfterRename(_))
     }
 
+    /// A remote rebuild refused because a quarantine sibling could not be read.
+    ///
+    /// The live file was not replaced. Callers keep that carrier closed.
+    #[must_use]
+    pub(crate) fn quarantine_unreadable(&self) -> bool {
+        let Self::BeforeRename(error) = self else {
+            return false;
+        };
+        error.to_string().contains(QUARANTINE_UNREADABLE_REBUILD)
+    }
+
     /// Prefix the carried message with `path` context without changing
     /// which half failed (the variant is the contract; the message is for
     /// logs).
@@ -610,6 +621,42 @@ fn encode_revocation_store(
     .map_err(|error| DurableWriteError::BeforeRename(std::io::Error::other(error.to_string())))
 }
 
+/// Remote rebuild refusal when a quarantine sibling cannot be decoded.
+const QUARANTINE_UNREADABLE_REBUILD: &str = "quarantine revocation bytes could not be read";
+
+/// Bytes written by a preserving rebuild.
+pub(crate) struct PreservedRevocationWrite {
+    /// A live file or a quarantine sibling contributed records.
+    pub kept_durable_records: bool,
+    /// The bytes now on the live path.
+    pub bytes: Vec<u8>,
+}
+
+/// Copy `bytes` into the running set.
+///
+/// v1 and v2 re-verify each record with the certificate the file retained.
+/// v3 copies the decoded records. The caller holds the set and decides
+/// when the carrier may open.
+pub(crate) fn install_preserved_revocations(
+    set: &mut RevocationSet,
+    store: RevocationStore,
+    bytes: &[u8],
+) -> std::result::Result<(), DurableWriteError> {
+    let mut decoded = decode_revocation_bytes(store, bytes)?;
+    match store {
+        RevocationStore::V1 | RevocationStore::V2 => {
+            for (record, cert) in decoded.take_records_where(|_, _| true) {
+                set.verify_and_insert(record, cert.as_ref())
+                    .map_err(|error| {
+                        DurableWriteError::BeforeRename(std::io::Error::other(error.to_string()))
+                    })?;
+            }
+        }
+        RevocationStore::V3 => set.merge_v3(decoded),
+    }
+    Ok(())
+}
+
 /// Write `snapshot` without erasing a revocation that is already durable.
 ///
 /// The caller holds `guard`. A readable live file is decoded and united
@@ -626,7 +673,7 @@ async fn write_union_or_initial_revocation(
     snapshot: Vec<u8>,
     guard: RevocationWriteGuard,
     remote: bool,
-) -> std::result::Result<bool, DurableWriteError> {
+) -> std::result::Result<PreservedRevocationWrite, DurableWriteError> {
     let live = match read_revocation_store_locked(path, store, true).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -642,7 +689,7 @@ async fn write_union_or_initial_revocation(
     let quarantine = quarantine_sibling_records(path, store).await;
     if remote && quarantine.unreadable {
         return Err(DurableWriteError::BeforeRename(std::io::Error::other(
-            "quarantine revocation bytes could not be read",
+            QUARANTINE_UNREADABLE_REBUILD,
         )));
     }
     let kept_durable_records =
@@ -665,11 +712,14 @@ async fn write_union_or_initial_revocation(
         expire_merged_v3(store, &mut merged);
         encode_revocation_store(store, &merged)?
     };
-    let result = write_private_bytes_durable_guarded(path, bytes, Some(guard)).await;
+    let result = write_private_bytes_durable_guarded(path, bytes.clone(), Some(guard)).await;
     if result.is_ok() {
         clear_revocation_block_async(path).await;
     }
-    result.map(|()| kept_durable_records)
+    result.map(|()| PreservedRevocationWrite {
+        kept_durable_records,
+        bytes,
+    })
 }
 
 /// Rebuild one carrier without dropping a revocation the quarantine file
@@ -679,14 +729,13 @@ async fn write_union_or_initial_revocation(
 /// v1 and v2 take the per-path mutex. Under that lock the live file and
 /// every readable quarantine sibling are united with `snapshot`. When
 /// `remote` is set and a quarantine sibling cannot be read, `snapshot` is
-/// not installed. The `bool` is true when a live file or a quarantine
-/// sibling contributed records.
+/// not installed. The returned bytes are the file now on the live path.
 pub(crate) async fn rebuild_carrier_preserving_durable(
     path: &Path,
     store: RevocationStore,
     snapshot: Vec<u8>,
     remote: bool,
-) -> std::result::Result<bool, DurableWriteError> {
+) -> std::result::Result<PreservedRevocationWrite, DurableWriteError> {
     if matches!(store, RevocationStore::V3) {
         return rebuild_v3_preserving_durable(path, snapshot, remote).await;
     }
@@ -706,7 +755,7 @@ pub(crate) async fn rebuild_v3_preserving_durable(
     path: &Path,
     snapshot: Vec<u8>,
     remote: bool,
-) -> std::result::Result<bool, DurableWriteError> {
+) -> std::result::Result<PreservedRevocationWrite, DurableWriteError> {
     let _in_process = crate::SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
     if let Some(parent) = path
         .parent()
@@ -782,13 +831,13 @@ pub async fn install_operator_revocation_carrier(
         ));
     }
     let path = identity_dir.join(file_name);
-    let kept_durable_records = rebuild_carrier_preserving_durable(&path, store, bytes, false)
+    let preserved = rebuild_carrier_preserving_durable(&path, store, bytes, false)
         .await
         .map_err(durable_write_identity_error)?;
     Ok(OperatorRevocationWrite {
         file_name: file_name.to_string(),
-        empty_store: decoded.is_empty() && !kept_durable_records,
-        kept_durable_records,
+        empty_store: decoded.is_empty() && !preserved.kept_durable_records,
+        kept_durable_records: preserved.kept_durable_records,
     })
 }
 

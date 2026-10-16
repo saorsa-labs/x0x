@@ -300,7 +300,7 @@ pub async fn rebuild_revocation_store(
             other => bail!("carrier must be v1, v2, or v3, not {other}"),
         }
     } else {
-        let path = from.expect("from is present when empty is false");
+        let path = from.context("pass --from <file> or --empty --confirm-empty")?;
         tokio::fs::read(path)
             .await
             .with_context(|| format!("could not read {}", path.display()))?

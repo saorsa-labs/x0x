@@ -413,6 +413,14 @@ async fn corrupt_v3_from_enrolled_source(revoke_machine: bool) {
             !path.is_file(),
             "unreadable quarantine bytes block the shorter remote set"
         );
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "unreadable quarantine keeps the running carrier closed"
+        );
+        assert!(set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
         assert_ne!(set.write().await.take_rebuild_pending(), 0);
         let again = crate::storage::read_revocation_store(
             &path,

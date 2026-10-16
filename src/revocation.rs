@@ -718,11 +718,32 @@ impl RevocationSet {
 
     /// Put carrier bits back after a rebuild that failed before the rename.
     ///
-    /// The in-memory carrier stays open. The next retry writes the same
-    /// bytes. A failure after the rename must not call this: the live file
-    /// is already in place.
+    /// This does not close the carrier. A retry of a readable quarantine
+    /// writes the same bytes. A failure after the rename must not call
+    /// this: the live file is already in place. An unreadable quarantine
+    /// is closed by [`Self::hold_carrier_until_reconciled`].
     pub(crate) fn requeue_rebuild_pending(&mut self, carriers: u8) {
         self.rebuild_pending |= carriers;
+    }
+
+    /// Close one carrier until its durable records are in this set.
+    ///
+    /// A snapshot may already have opened the carrier. The rebuild holds
+    /// it again until those records, including a revocation recovered from
+    /// the quarantine file, are enforced here. A stale snapshot candidate
+    /// cannot open it during that install.
+    pub(crate) fn hold_carrier_until_reconciled(&mut self, carrier: u8) {
+        let Some(index) = carrier_index(carrier) else {
+            return;
+        };
+        self.resync_carriers |= carrier;
+        self.resync_candidates[index].clear();
+        self.status_event_pending = true;
+    }
+
+    /// Open one carrier after its durable records are in this set.
+    pub(crate) fn release_reconciled_carrier(&mut self, carrier: u8) {
+        self.resync_carriers &= !carrier;
     }
 
     /// Empty set that closes membership for one carrier (#1116).
@@ -2266,6 +2287,14 @@ mod tests {
             !path.is_file(),
             "unreadable quarantine bytes block the shorter remote set"
         );
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "unreadable quarantine keeps the running carrier closed"
+        );
+        assert!(set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
         assert_ne!(set.write().await.take_rebuild_pending(), 0);
         assert_eq!(std::fs::read(&quarantine).unwrap(), quarantined_bytes);
         let again = crate::storage::read_revocation_store(
@@ -2621,6 +2650,133 @@ mod tests {
             "unreadable quarantine bytes block the shorter remote set"
         );
         assert_ne!(shorter.write().await.take_rebuild_pending(), 0);
+        assert!(
+            shorter.read().await.revocation_resync_required(),
+            "unreadable quarantine keeps the running carrier closed"
+        );
+    }
+
+    /// #1116: quarantine file R is a machine revocation the snapshot omits.
+    /// The running set enforces R before the carrier opens. The next
+    /// ordinary save of that set still contains R.
+    #[tokio::test]
+    async fn recovered_machine_revocation_is_enforced_through_the_next_save_1116() {
+        let kept = crate::identity::MachineKeypair::generate().unwrap();
+        let snapshot_machine = crate::identity::MachineKeypair::generate().unwrap();
+        let later = crate::identity::MachineKeypair::generate().unwrap();
+        let kept_record = RevocationRecord::sign(
+            RevokedSubject::Machine(kept.machine_id()),
+            kept.public_key(),
+            kept.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::Machine(snapshot_machine.machine_id()),
+            snapshot_machine.public_key(),
+            snapshot_machine.secret_key(),
+            1_001,
+            None,
+        )
+        .unwrap();
+        let later_record = RevocationRecord::sign(
+            RevokedSubject::Machine(later.machine_id()),
+            later.public_key(),
+            later.secret_key(),
+            1_002,
+            None,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept_record.clone(), None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        assert!(!path.is_file());
+
+        let payload = bincode::serialize(&vec![snapshot_record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(snapshot_record, None)
+            .unwrap());
+        assert!(!set.read().await.revocation_resync_required());
+        assert!(set
+            .read()
+            .await
+            .is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(
+            !set.read().await.is_machine_revoked(&kept.machine_id()),
+            "the snapshot alone does not enforce the quarantined machine"
+        );
+
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the readable quarantine file is united");
+        assert!(
+            set.read().await.is_machine_revoked(&kept.machine_id()),
+            "recovered R is enforced in the live set"
+        );
+        assert!(set
+            .read()
+            .await
+            .is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(!set.read().await.revocation_resync_required());
+        assert!(!set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let united = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(united.is_machine_revoked(&kept.machine_id()));
+        assert!(united.is_machine_revoked(&snapshot_machine.machine_id()));
+
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(later_record, None)
+            .unwrap());
+        {
+            let live = set.read().await;
+            crate::storage::save_revocation_set(&live, Some(dir.path()))
+                .await
+                .unwrap();
+        }
+        let saved = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved.is_machine_revoked(&kept.machine_id()),
+            "the next ordinary save keeps recovered R"
+        );
+        assert!(saved.is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(saved.is_machine_revoked(&later.machine_id()));
+        assert!(set.read().await.is_machine_revoked(&kept.machine_id()));
     }
 
     #[tokio::test]

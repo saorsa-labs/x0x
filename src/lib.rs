@@ -2784,6 +2784,15 @@ const MAX_CONCURRENT_CERT_RECOVERY_TASKS: usize = 4;
 /// Records retained in one coalesced waiting recovery batch.
 const MAX_COALESCED_RECOVERY_RECORDS: usize = 128;
 
+/// Distinct found subjects, and distinct pending subjects, kept on one waiter.
+///
+/// A subject past this cap is not stored. After the waiter starts, a later
+/// batch can carry that subject again.
+const MAX_COALESCED_RECOVERY_SUBJECTS: usize = 128;
+
+/// Certificate and binding bytes kept with one waiting recovery batch.
+const MAX_COALESCED_RECOVERY_BYTES: usize = 1024 * 1024;
+
 /// Subjects still missing a certificate, with the announced binding that
 /// names each digest. One entry per subject. Built while the caller holds
 /// the discovery locks. Cache hits and fetches run after those locks drop.
@@ -3935,16 +3944,106 @@ fn merge_recovery_records(
     }
 }
 
+fn certificate_metadata_bytes(cert: &identity::AgentCertificate) -> usize {
+    bincode::serialized_size(cert)
+        .ok()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn recovery_metadata_bytes(job: &QueuedCertRecovery) -> usize {
+    let mut bytes = 0usize;
+    for (agent, certs) in &job.found {
+        bytes = bytes.saturating_add(std::mem::size_of_val(agent.as_bytes()));
+        for cert in certs {
+            bytes = bytes.saturating_add(certificate_metadata_bytes(cert));
+        }
+    }
+    let pending_each = std::mem::size_of::<identity::AgentId>()
+        + std::mem::size_of::<dm_inbox::AuthenticatedMachineBinding>();
+    bytes.saturating_add(job.pending.len().saturating_mul(pending_each))
+}
+
+fn accept_found_within_cap(
+    job: &mut QueuedCertRecovery,
+    agent: identity::AgentId,
+    certs: Vec<identity::AgentCertificate>,
+) {
+    if job.found.contains_key(&agent) || job.found.len() >= MAX_COALESCED_RECOVERY_SUBJECTS {
+        return;
+    }
+    let mut room = MAX_COALESCED_RECOVERY_BYTES.saturating_sub(recovery_metadata_bytes(job));
+    let id_bytes = std::mem::size_of_val(agent.as_bytes());
+    if room < id_bytes {
+        return;
+    }
+    room -= id_bytes;
+    if certs.is_empty() {
+        job.found.insert(agent, Vec::new());
+        return;
+    }
+    let mut kept = Vec::new();
+    for cert in certs {
+        let len = certificate_metadata_bytes(&cert);
+        if len > room {
+            break;
+        }
+        room -= len;
+        kept.push(cert);
+    }
+    // None of the certificates fit. Leave the subject for a later batch.
+    if kept.is_empty() {
+        return;
+    }
+    job.found.insert(agent, kept);
+}
+
+fn accept_pending_within_cap(
+    job: &mut QueuedCertRecovery,
+    item: (identity::AgentId, dm_inbox::AuthenticatedMachineBinding),
+) {
+    if job.pending.iter().any(|(agent, _)| *agent == item.0)
+        || job.pending.len() >= MAX_COALESCED_RECOVERY_SUBJECTS
+    {
+        return;
+    }
+    let extra = std::mem::size_of::<identity::AgentId>()
+        + std::mem::size_of::<dm_inbox::AuthenticatedMachineBinding>();
+    if recovery_metadata_bytes(job).saturating_add(extra) > MAX_COALESCED_RECOVERY_BYTES {
+        return;
+    }
+    job.pending.push(item);
+}
+
+/// Trim one waiter to the record, subject, and byte caps.
+///
+/// Records and subjects past the cap are not stored here. A later batch,
+/// after this waiter has started, can carry them again.
+fn normalize_queued_recovery(job: &mut QueuedCertRecovery) {
+    match &mut job.apply {
+        CertRecoveryApply::Legacy(batch) => {
+            batch.records.truncate(MAX_COALESCED_RECOVERY_RECORDS);
+        }
+        CertRecoveryApply::V2(batch) => {
+            batch.records.truncate(MAX_COALESCED_RECOVERY_RECORDS);
+        }
+    }
+    let found = std::mem::take(&mut job.found);
+    let pending = std::mem::take(&mut job.pending);
+    for (agent, certs) in found {
+        accept_found_within_cap(job, agent, certs);
+    }
+    for item in pending {
+        accept_pending_within_cap(job, item);
+    }
+}
+
 fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecovery) {
     for (agent, certs) in extra.found {
-        into.found.entry(agent).or_insert(certs);
+        accept_found_within_cap(into, agent, certs);
     }
-    let mut pending_ids: std::collections::HashSet<identity::AgentId> =
-        into.pending.iter().map(|(agent, _)| *agent).collect();
     for item in extra.pending {
-        if pending_ids.insert(item.0) {
-            into.pending.push(item);
-        }
+        accept_pending_within_cap(into, item);
     }
     match (&mut into.apply, extra.apply) {
         (CertRecoveryApply::Legacy(dst), CertRecoveryApply::Legacy(src)) => {
@@ -4037,7 +4136,12 @@ fn spawn_cert_recovery_task(
 /// Run one resync batch on the agent's tracked-task registry.
 ///
 /// At most [`MAX_CONCURRENT_CERT_RECOVERY_TASKS`] batches run. A later
-/// batch of the same kind coalesces into one waiter. The eight-fetch
+/// batch of the same kind coalesces into one waiter. That waiter keeps at
+/// most [`MAX_COALESCED_RECOVERY_RECORDS`] records, [`MAX_COALESCED_RECOVERY_SUBJECTS`]
+/// found subjects, the same number of pending subjects, and
+/// [`MAX_COALESCED_RECOVERY_BYTES`] of certificate and binding metadata.
+/// The first waiter is trimmed before it is stored. Subjects past the cap
+/// wait for a later batch, after this waiter has started. The eight-fetch
 /// allowance is shared with every other batch. Shutdown joins a live task
 /// before it applies or persists. The task is shielded from the
 /// three-second grace abort so it can finish joining fetch children
@@ -4078,6 +4182,8 @@ fn track_cert_recovery(
         return;
     }
     if guard.recovery_live >= MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+        let mut job = job;
+        normalize_queued_recovery(&mut job);
         guard.recovery_wait.push(job);
         return;
     }
@@ -4108,6 +4214,34 @@ fn reap_tracked_for_testing(registry: &std::sync::Arc<std::sync::Mutex<TrackedTa
         Err(poisoned) => poisoned.into_inner(),
     };
     reap_finished_tracked(&mut guard);
+}
+
+/// Records, found subjects, pending subjects, metadata bytes, and found certificates
+/// held by every waiting recovery batch.
+#[cfg(test)]
+fn tracked_recovery_waiter_load_for_testing(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+) -> (usize, usize, usize, usize, usize) {
+    let guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut records = 0usize;
+    let mut found = 0usize;
+    let mut pending = 0usize;
+    let mut bytes = 0usize;
+    let mut certs = 0usize;
+    for job in &guard.recovery_wait {
+        records += match &job.apply {
+            CertRecoveryApply::Legacy(batch) => batch.records.len(),
+            CertRecoveryApply::V2(batch) => batch.records.len(),
+        };
+        found += job.found.len();
+        pending += job.pending.len();
+        bytes = bytes.saturating_add(recovery_metadata_bytes(job));
+        certs += job.found.values().map(Vec::len).sum::<usize>();
+    }
+    (records, found, pending, bytes, certs)
 }
 
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
@@ -5904,7 +6038,9 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 /// with every revocation still readable in the quarantine file. A v3
 /// rebuild takes the cross-process lock. A revocation already durable stays.
 /// If the quarantine bytes cannot be read, this snapshot is not installed.
-/// The carrier stays closed until the operator command.
+/// The running carrier stays closed until the operator command. A recovered
+/// revocation is installed into the live set before that carrier opens, so
+/// the next ordinary save still contains it.
 pub(crate) async fn persist_completed_revocation_rebuild(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -5948,17 +6084,53 @@ pub(crate) async fn persist_completed_revocation_rebuild(
             retry |= carrier;
             continue;
         };
-        let write =
-            storage::rebuild_carrier_preserving_durable(&dir.join(name), store, bytes, true)
-                .await
-                .map(|_kept| ());
+        revocation_set
+            .write()
+            .await
+            .hold_carrier_until_reconciled(carrier);
+        let path = dir.join(name);
+        let write = storage::rebuild_carrier_preserving_durable(&path, store, bytes, true).await;
         match write {
-            Ok(()) => {}
+            Ok(preserved) => {
+                let mut set = revocation_set.write().await;
+                set.hold_carrier_until_reconciled(carrier);
+                match storage::install_preserved_revocations(&mut set, store, &preserved.bytes) {
+                    Ok(()) => set.release_reconciled_carrier(carrier),
+                    Err(error) => {
+                        tracing::warn!("{name} rebuild was not reconciled: {error}");
+                        retry |= carrier;
+                    }
+                }
+            }
+            Err(error) if error.quarantine_unreadable() => {
+                tracing::warn!("{name} rebuild kept the carrier closed: {error}");
+                revocation_set
+                    .write()
+                    .await
+                    .hold_carrier_until_reconciled(carrier);
+                retry |= carrier;
+            }
             Err(error) if error.crossed_rename() => {
                 tracing::warn!("{name} rebuild failed after the rename: {error}");
+                let disk = tokio::fs::read(&path).await.ok();
+                let mut set = revocation_set.write().await;
+                let install_failed = match disk.as_deref() {
+                    Some(bytes) => {
+                        storage::install_preserved_revocations(&mut set, store, bytes).is_err()
+                    }
+                    None => false,
+                };
+                if install_failed {
+                    tracing::warn!("{name} rebuild on disk was not reconciled");
+                }
+                set.release_reconciled_carrier(carrier);
             }
             Err(error) => {
                 tracing::warn!("{name} rebuild failed before the rename: {error}");
+                revocation_set
+                    .write()
+                    .await
+                    .release_reconciled_carrier(carrier);
                 retry |= carrier;
             }
         }
@@ -34046,6 +34218,240 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// #1116: ten thousand distinct recovery subjects stay within the waiter
+    /// caps. Records stop at 128, and found and pending each stop at 128.
+    /// A certificate list that exceeds the byte cap is shortened.
+    #[tokio::test]
+    async fn coalesced_recovery_metadata_stays_bounded_1116() {
+        fn agent_at(n: u32) -> identity::AgentId {
+            let mut raw = [0u8; 32];
+            raw[..4].copy_from_slice(&n.to_le_bytes());
+            identity::AgentId(raw)
+        }
+        fn machine_at(n: u32) -> identity::MachineId {
+            let mut raw = [0u8; 32];
+            raw[..4].copy_from_slice(&n.to_le_bytes());
+            identity::MachineId(raw)
+        }
+        struct RecoveryRig {
+            registry: std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+            blobs: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+            shutdown: tokio_util::sync::CancellationToken,
+            set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+            owner: owner_trust::OwnerTrust,
+        }
+        fn fresh_registry() -> RecoveryRig {
+            let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+            blobs.set_recovery_fetch_hold_for_testing(true);
+            RecoveryRig {
+                registry: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+                    closed: false,
+                    handles: Vec::new(),
+                    shielded: Vec::new(),
+                    recovery_live: 0,
+                    recovery_wait: Vec::new(),
+                })),
+                blobs,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                set: std::sync::Arc::new(
+                    tokio::sync::RwLock::new(revocation::RevocationSet::new()),
+                ),
+                owner: owner_trust::OwnerTrust::new(
+                    None,
+                    std::sync::Arc::new(tokio::sync::RwLock::new(
+                        dm_inbox::AuthenticatedMachineBindingCache::default(),
+                    )),
+                ),
+            }
+        }
+        fn occupy_live_slots(rig: &RecoveryRig) {
+            for _ in 0..MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+                track_cert_recovery(
+                    &rig.registry,
+                    rig.shutdown.clone(),
+                    std::sync::Arc::clone(&rig.blobs),
+                    None,
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                        records: Vec::new(),
+                        revocation_set: std::sync::Arc::clone(&rig.set),
+                        identity_dir: None,
+                        owner_trust: rig.owner.clone(),
+                    })),
+                );
+            }
+        }
+
+        let mut signed = Vec::with_capacity(160);
+        for stamp in 0..160u64 {
+            signed.push(revocation::RevocationRecord {
+                subject: revocation::RevokedSubject::Agent(agent_at(stamp as u32)),
+                issuer_public_key: vec![0x11; 32],
+                revoked_at: 1_000 + stamp,
+                reason: None,
+                signature: Vec::new(),
+            });
+        }
+        let rig = fresh_registry();
+        occupy_live_slots(&rig);
+        let mut bindings = dm_inbox::AuthenticatedMachineBindingCache::default();
+        for n in 0..5_000u32 {
+            bindings.record_announcement(agent_at(n), machine_at(n), 1, None, None);
+        }
+        let mut found = std::collections::HashMap::new();
+        for n in 0..5_000u32 {
+            found.insert(agent_at(10_000 + n), Vec::new());
+        }
+        let pending: Vec<_> = (0..5_000u32)
+            .map(|n| (agent_at(n), bindings.peek(&agent_at(n)).expect("binding")))
+            .collect();
+        track_cert_recovery(
+            &rig.registry,
+            rig.shutdown.clone(),
+            std::sync::Arc::clone(&rig.blobs),
+            None,
+            found,
+            pending,
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: signed,
+                revocation_set: std::sync::Arc::clone(&rig.set),
+                identity_dir: None,
+                owner_trust: rig.owner.clone(),
+            })),
+        );
+        let (records, found_n, pending_n, bytes, _) =
+            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        assert_eq!(records, 128, "a 160-record waiter keeps 128");
+        assert_eq!(found_n, 128, "5_000 found subjects stay at the cap");
+        assert_eq!(pending_n, 128, "5_000 pending subjects stay at the cap");
+        assert!(
+            bytes <= MAX_COALESCED_RECOVERY_BYTES,
+            "metadata bytes {bytes}"
+        );
+
+        for n in 0..10_000u32 {
+            let mut one_found = std::collections::HashMap::new();
+            one_found.insert(agent_at(30_000 + n), Vec::new());
+            let pending_agent = agent_at(40_000 + n);
+            bindings.record_announcement(pending_agent, machine_at(n % 5_000), 1, None, None);
+            track_cert_recovery(
+                &rig.registry,
+                rig.shutdown.clone(),
+                std::sync::Arc::clone(&rig.blobs),
+                None,
+                one_found,
+                vec![(
+                    pending_agent,
+                    bindings.peek(&pending_agent).expect("binding"),
+                )],
+                CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                    records: Vec::new(),
+                    revocation_set: std::sync::Arc::clone(&rig.set),
+                    identity_dir: None,
+                    owner_trust: rig.owner.clone(),
+                })),
+            );
+        }
+        let (records, found_n, pending_n, bytes, _) =
+            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        assert_eq!(records, 128);
+        assert_eq!(
+            found_n, 128,
+            "10_000 further found subjects do not grow the waiter"
+        );
+        assert_eq!(
+            pending_n, 128,
+            "10_000 further pending subjects do not grow the waiter"
+        );
+        assert!(found_n < 5_000 && pending_n < 5_000);
+        assert!(bytes <= MAX_COALESCED_RECOVERY_BYTES, "bytes {bytes}");
+
+        let fat = fresh_registry();
+        occupy_live_slots(&fat);
+        let user = identity::UserKeypair::generate().expect("user");
+        let certified = identity::AgentKeypair::generate().expect("certified agent");
+        let cert = identity::AgentCertificate::issue(&user, &certified).expect("cert");
+        let mut fat_found = std::collections::HashMap::new();
+        fat_found.insert(agent_at(1), vec![cert; 200]);
+        track_cert_recovery(
+            &fat.registry,
+            fat.shutdown.clone(),
+            std::sync::Arc::clone(&fat.blobs),
+            None,
+            fat_found,
+            Vec::new(),
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: Vec::new(),
+                revocation_set: std::sync::Arc::clone(&fat.set),
+                identity_dir: None,
+                owner_trust: fat.owner.clone(),
+            })),
+        );
+        let (_, fat_subjects, _, fat_bytes, fat_certs) =
+            tracked_recovery_waiter_load_for_testing(&fat.registry);
+        assert_eq!(fat_subjects, 1);
+        assert!(
+            fat_certs < 200,
+            "the byte cap shortens the certificate list"
+        );
+        assert!(fat_certs > 0, "a certificate that fits is kept");
+        assert!(
+            fat_bytes <= MAX_COALESCED_RECOVERY_BYTES,
+            "fat metadata bytes {fat_bytes}"
+        );
+
+        macro_rules! drain_recovery {
+            ($rig:expr) => {{
+                $rig.blobs.set_recovery_fetch_hold_for_testing(false);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    reap_tracked_for_testing(&$rig.registry);
+                    let (live, waiting, shielded) =
+                        tracked_recovery_state_for_testing(&$rig.registry);
+                    if live == 0 && waiting == 0 && shielded <= 1 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "live {live}, waiting {waiting}, shielded handles {shielded}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }};
+        }
+        drain_recovery!(rig);
+        rig.blobs.set_recovery_fetch_hold_for_testing(true);
+        occupy_live_slots(&rig);
+        let retry_agent = agent_at(30_000);
+        let mut retry_found = std::collections::HashMap::new();
+        retry_found.insert(retry_agent, Vec::new());
+        track_cert_recovery(
+            &rig.registry,
+            rig.shutdown.clone(),
+            std::sync::Arc::clone(&rig.blobs),
+            None,
+            retry_found,
+            Vec::new(),
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records: Vec::new(),
+                revocation_set: std::sync::Arc::clone(&rig.set),
+                identity_dir: None,
+                owner_trust: rig.owner.clone(),
+            })),
+        );
+        let (_, retry_found_n, retry_pending_n, _, _) =
+            tracked_recovery_waiter_load_for_testing(&rig.registry);
+        assert_eq!(
+            retry_found_n, 1,
+            "a subject dropped from a full waiter is carried by a later batch"
+        );
+        assert_eq!(retry_pending_n, 0);
+
+        drain_recovery!(rig);
+        drain_recovery!(fat);
     }
 
     /// #1116: the three-second grace abort must not finish the outer recovery

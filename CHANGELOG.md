@@ -269,7 +269,13 @@ All notable changes to this project will be documented in this file.
   read, the remote snapshot is not installed. The carrier stays closed
   until the operator command. The command unites a readable quarantine
   file as well, and still installs a validated file when those bytes
-  cannot be read.
+  cannot be read. The running carrier stays closed until that operator
+  command. A recovered revocation is enforced in the live set before the
+  carrier opens, and the next ordinary save keeps it. A waiting
+  certificate-recovery batch keeps at most 128 records, 128 found
+  subjects, 128 pending subjects, and 1 MiB of that metadata. The first
+  waiting batch is trimmed the same way. Subjects past that cap are
+  carried by a later batch.
   A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
   failure after the rename is not queued again. When the discovery cache

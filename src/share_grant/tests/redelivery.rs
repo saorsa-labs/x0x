@@ -1136,14 +1136,20 @@ async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
     let lib = include_str!("../../lib.rs");
     // The v1/v2 listener arms call these helpers (directly on a cache hit,
     // and through `track_cert_recovery` when a fetch is still required).
-    // The helpers own the v3 write.
+    // `track_cert_recovery` queues that batch. `spawn_cert_recovery_task`
+    // applies it. The helpers own the v3 write.
     let track = rust_fn_body(lib, "fn track_cert_recovery(");
     assert!(
-        track.contains("apply_legacy_revocation_records("),
+        track.contains("spawn_cert_recovery_task("),
+        "tracked recovery must start the batch that applies records"
+    );
+    let spawned = rust_fn_body(lib, "fn spawn_cert_recovery_task(");
+    assert!(
+        spawned.contains("apply_legacy_revocation_records("),
         "tracked recovery must apply a v1 batch through apply_legacy_revocation_records"
     );
     assert!(
-        track.contains("apply_v2_revocation_records("),
+        spawned.contains("apply_v2_revocation_records("),
         "tracked recovery must apply a v2 batch through apply_v2_revocation_records"
     );
     for (arm, next, helper) in [
