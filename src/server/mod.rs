@@ -1225,6 +1225,11 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
+        startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
+        startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(test)]
+        startup_catchup_backoff_abort: std::sync::Mutex::new(None),
         #[cfg(test)]
         named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         #[cfg(test)]
@@ -1681,10 +1686,12 @@ pub async fn serve_with_options(
     bg_tasks.push(tokio::spawn(async move {
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
+    let join_rekey_state = Arc::clone(&state);
     bg_tasks.push(tokio::spawn(async move {
         match join_agent.join_network().await {
             Ok(()) => {
                 tracing::info!("Network joined");
+                routes::named_groups::retry_startup_self_leave_catchup(&join_rekey_state).await;
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");
@@ -2134,6 +2141,9 @@ pub async fn serve_with_options(
     // and gossip channels is safe. #1238: each group's events apply in a
     // bounded lane of their own, in arrival order, so one slow apply (a
     // Welcome fetch) does not hold the events of the other groups.
+    // Install startup self-leave gates before this listener can schedule a
+    // rekey. `startup_self_leave_rekey` clears the hold after the gates exist.
+    routes::named_groups::self_leave_startup_hold_for_gate_install(&state);
     bg_tasks.push(tokio::spawn(run_direct_metadata_listener(
         Arc::clone(&state),
         state.agent.subscribe_direct(),
@@ -2141,8 +2151,8 @@ pub async fn serve_with_options(
 
     // ADR 0014 / ADR 0016: a self-leave that landed while this daemon was
     // offline still has the leaver's ratchet leaf. The lowest active admin
-    // commits that removal after a short quiet window, so the first catch-up
-    // round can fill the TreeKEM queue before a new commit. The pass persists,
+    // commits that removal only after each other active member reports the
+    // same saved head, when one of them can still be ahead. The pass persists,
     // so it runs shielded (#1269): shutdown must not abort it between the
     // journal commit and the publish.
     {
@@ -3031,7 +3041,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
     // delta direct deliveries, the outgoing file-chunk streams, and since
-    // #1288 the WebSocket session loop and its writer and forwarders) and the
+    // #1288 the WebSocket session loop and its writer and forwarders, and the
+    // startup self-leave catch-up backoff) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and
     // its exclusive `history.db` connection, alive after the supervisor

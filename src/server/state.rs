@@ -25,7 +25,7 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
-use super::routes::named_groups::RequesterOfferObligation;
+use super::routes::named_groups::{RequesterOfferObligation, StartupCatchupObligation};
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
@@ -1336,6 +1336,28 @@ pub(super) struct AppState {
             std::sync::Arc<tokio::sync::Notify>,
         )>,
     >,
+    /// This daemon's startup catch-up obligations, keyed by a group id
+    /// this state reserved. A second daemon with the same group id has
+    /// its own map, so that daemon's matching head does not clear this
+    /// hold. Dropping the state drops the map.
+    pub(super) startup_catchup_obligations: StdMutex<HashMap<String, StartupCatchupObligation>>,
+    /// True after this daemon has installed its startup self-leave gates.
+    /// It starts true, so a test that never takes the hold can seal.
+    /// Production sets it false before the direct metadata listener and
+    /// true after the gates exist. A second daemon has its own flag.
+    pub(super) startup_catchup_gates_ready: AtomicBool,
+    /// Token of this daemon's startup catch-up backoff task. Zero means no
+    /// task owns the state. The task clears the token on exit and on
+    /// cancellation, and only when it still holds that token. A second
+    /// daemon has its own token, so one task cannot block the other.
+    pub(super) startup_catchup_backoff_owner: std::sync::atomic::AtomicU64,
+    /// Abort handle for the backoff task above. Tests cancel it without
+    /// closing admission, then check that a new task can take the token.
+    /// Production shutdown does not use this handle. The task lives in
+    /// `detached_tasks`, and the drain joins it. Dropping the handle does
+    /// not abort the task.
+    #[cfg(test)]
+    pub(super) startup_catchup_backoff_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     /// Per-instance named-group transport observations. These remain on the
     /// exact `AppState` whose route emitted them so parallel tests cannot
     /// clear or append another instance's evidence (#759 item 4).
@@ -1478,6 +1500,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// returns an error. Tests that want the success arm set this. Production
     /// leaves it false and uses the transport result.
     pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
+    /// #1113 startup catch-up: tests that want a page send to count as
+    /// delivered set this. Production builds omit the recorders.
+    pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// Pages `handle_treekem_catchup_request` built, including a cold log.
+    pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]

@@ -1295,6 +1295,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
+    /// Saved membership head of the responder. Absent on a KeyPackage reply
+    /// and on an old peer. A startup self-leave seal trusts this only when
+    /// it equals the local head after the page is applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    responder_state_hash: Option<String>,
 }
 
 /// Authenticated direct-channel bootstrap for a newly-added member of a
@@ -11109,6 +11114,7 @@ async fn member_keyed_treekem_catchup_response(
         group_id: request.group_id.clone(),
         events: event.into_iter().collect(),
         truncated: false,
+        responder_state_hash: None,
     })
 }
 
@@ -11125,7 +11131,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, log_keys) = {
+    let (authorized, log_keys, saved_head) = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -11142,9 +11148,13 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (info.has_active_member(&sender_hex), keys)
+            (
+                info.has_active_member(&sender_hex),
+                keys,
+                info.state_hash.clone(),
+            )
         } else {
-            (false, vec![request.group_id.clone()])
+            (false, vec![request.group_id.clone()], String::new())
         }
     };
     let target_of_cached_add = {
@@ -11217,6 +11227,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
+        responder_state_hash: Some(saved_head),
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -11225,6 +11236,10 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
+        recorded.push(payload.clone());
+    }
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload, direct_message_send_config())
@@ -11358,6 +11373,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         return;
     };
     let was_truncated = response.truncated;
+    let reported_head = response.responder_state_hash.clone();
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
     let key_package_shaped = !events.is_empty()
@@ -11497,17 +11513,31 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     } else if self_leave_key_package_reply(&fence_ids, &sender_hex, key_package_shaped) {
         // A KeyPackage reply carries no proof that a membership page stream
-        // reached its head. Leave every open page stream fenced.
-    } else if self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex) {
-        // This peer's last page. Close only this peer. Another open stream
-        // still refuses the seal.
-        self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, false);
-        schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
-    } else if !self_leave_rekey_fence_any_open(&fence_ids) {
-        // No known page is outstanding. A node that does not know it is
-        // behind may still seal. That consequence is Accepted in
-        // T-self-leave-rekey-committer.
-        schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
+        // reached its head. Leave every open page stream fenced. It also
+        // does not prove the startup catch-up head.
+    } else {
+        // Record this peer even when another peer's page stream is open.
+        // The aggregate fence still decides whether this pass may seal.
+        self_leave_startup_note_verified_head(
+            state,
+            &fence_ids,
+            &sender_hex,
+            reported_head.as_deref(),
+        )
+        .await;
+        let peer_open = self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex);
+        let any_open = self_leave_rekey_fence_any_open(&fence_ids);
+        if peer_open {
+            // This peer's last page. Close only this peer.
+            self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, false);
+        }
+        if peer_open || !any_open {
+            // No known page is outstanding, or this page closed one.
+            // Another open stream still refuses the seal. A node that
+            // does not know it is behind may still seal. That consequence
+            // is Accepted in T-self-leave-rekey-committer.
+            schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
+        }
     }
 }
 
@@ -11588,6 +11618,20 @@ async fn request_treekem_catchup_page(
     group_id: &str,
     peer: &AgentId,
 ) -> bool {
+    #[cfg(test)]
+    {
+        detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+        if state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
+                recorded.push(group_id.as_bytes().to_vec());
+            }
+            return true;
+        }
+    }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (from_revision, from_epoch, current_state_hash) = {
         let groups = state.named_groups.read().await;
@@ -22744,10 +22788,6 @@ fn self_leave_rekey_batch_held() -> bool {
     SELF_LEAVE_REKEY_BATCH.try_with(|_| ()).is_ok()
 }
 
-/// Quiet window before the startup rekey. In-flight catch-up responses can
-/// fill the TreeKEM queue during this wait. This is not a periodic timer.
-const SELF_LEAVE_REKEY_STARTUP_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
-
 const SELF_LEAVE_REKEY_LOG_CAP: usize = 128;
 
 fn self_leave_rekey_logs(
@@ -22847,6 +22887,299 @@ fn self_leave_rekey_fence_catchup_peer(group_ids: &[String], peer: &str, open: b
             guard.remove(group_id);
         }
     }
+}
+
+/// How many catch-up sends one peer may receive for one startup obligation.
+/// The bound is per peer, so a fourth peer is still asked. A failed send
+/// does not seal. Attempts that remain are used when that peer is asked
+/// again, including after the network join and after
+/// [`SELF_LEAVE_STARTUP_CATCHUP_BACKOFF`].
+const SELF_LEAVE_STARTUP_CATCHUP_SENDS: u32 = 3;
+
+/// Delay before a startup catch-up send that the first pass did not use.
+/// The sleep does not seal. Each peer's send bound still applies.
+const SELF_LEAVE_STARTUP_CATCHUP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct StartupCatchupPeer {
+    sends: u32,
+    satisfied: bool,
+}
+
+pub(in crate::server) struct StartupCatchupObligation {
+    aliases: Vec<String>,
+    peers: HashMap<String, StartupCatchupPeer>,
+}
+
+fn startup_peer_still_blocks(peer: &StartupCatchupPeer) -> bool {
+    !peer.satisfied && peer.sends < SELF_LEAVE_STARTUP_CATCHUP_SENDS
+}
+
+fn self_leave_startup_obligations(
+    state: &AppState,
+) -> std::sync::MutexGuard<'_, HashMap<String, StartupCatchupObligation>> {
+    state
+        .startup_catchup_obligations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn next_startup_backoff_token() -> u64 {
+    use std::sync::OnceLock;
+    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    let next = NEXT.get_or_init(|| AtomicU64::new(1));
+    loop {
+        let token = next.fetch_add(1, Ordering::SeqCst);
+        if token != 0 {
+            return token;
+        }
+    }
+}
+
+/// Block this daemon's live self-leave seals until
+/// [`startup_self_leave_rekey`] has installed every startup obligation.
+/// The hold belongs to `state`. Tests leave it ready.
+pub(in crate::server) fn self_leave_startup_hold_for_gate_install(state: &AppState) {
+    state
+        .startup_catchup_gates_ready
+        .store(false, Ordering::SeqCst);
+}
+
+fn self_leave_startup_mark_ready(state: &AppState) {
+    state
+        .startup_catchup_gates_ready
+        .store(true, Ordering::SeqCst);
+}
+
+fn self_leave_startup_gates_ready(state: &AppState) -> bool {
+    state.startup_catchup_gates_ready.load(Ordering::SeqCst)
+}
+
+fn self_leave_startup_open(state: &AppState, group_id: &str) -> bool {
+    let guard = self_leave_startup_obligations(state);
+    guard.values().any(|obligation| {
+        obligation.aliases.iter().any(|alias| alias == group_id)
+            && obligation.peers.values().any(startup_peer_still_blocks)
+    })
+}
+
+fn self_leave_startup_require(state: &AppState, group_ids: &[String], peers: &[String]) {
+    if peers.is_empty() || group_ids.is_empty() {
+        return;
+    }
+    let mut guard = self_leave_startup_obligations(state);
+    let key = group_ids[0].clone();
+    let obligation = guard.entry(key).or_insert(StartupCatchupObligation {
+        aliases: Vec::new(),
+        peers: HashMap::new(),
+    });
+    for group_id in group_ids {
+        if !obligation.aliases.iter().any(|alias| alias == group_id) {
+            obligation.aliases.push(group_id.clone());
+        }
+    }
+    for peer in peers {
+        obligation
+            .peers
+            .entry(peer.clone())
+            .or_insert(StartupCatchupPeer {
+                sends: 0,
+                satisfied: false,
+            });
+    }
+    // A peer who left the authenticated roster cannot be asked or satisfied.
+    // Peers who remain keep the sends already spent and the satisfied bit.
+    obligation
+        .peers
+        .retain(|peer, _| peers.iter().any(|keep| keep == peer));
+}
+
+fn self_leave_startup_drop_inactive(
+    state: &AppState,
+    group_ids: &[String],
+    active_peers: &[String],
+) {
+    let mut guard = self_leave_startup_obligations(state);
+    for obligation in guard.values_mut() {
+        if !obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
+        {
+            continue;
+        }
+        obligation
+            .peers
+            .retain(|peer, _| active_peers.iter().any(|keep| keep == peer));
+    }
+}
+
+fn self_leave_startup_satisfy_peer(state: &AppState, group_ids: &[String], peer: &str) {
+    let mut guard = self_leave_startup_obligations(state);
+    let keys: Vec<String> = guard
+        .iter()
+        .filter(|(_, obligation)| {
+            obligation
+                .aliases
+                .iter()
+                .any(|alias| group_ids.iter().any(|id| id == alias))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        if let Some(obligation) = guard.get_mut(&key) {
+            if let Some(row) = obligation.peers.get_mut(peer) {
+                row.satisfied = true;
+            }
+        }
+    }
+}
+
+fn self_leave_startup_retire(state: &AppState, group_ids: &[String]) {
+    let mut guard = self_leave_startup_obligations(state);
+    guard.retain(|_, obligation| {
+        !obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
+    });
+}
+
+/// Spend one send before the request is awaited. A failed send still spends
+/// the attempt. Overlapping passes cannot both pass the check.
+fn self_leave_startup_reserve_send(state: &AppState, group_ids: &[String], peer: &str) -> bool {
+    let mut guard = self_leave_startup_obligations(state);
+    let mut reserved = false;
+    for obligation in guard.values_mut() {
+        if !obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
+        {
+            continue;
+        }
+        if let Some(row) = obligation.peers.get_mut(peer) {
+            if startup_peer_still_blocks(row) {
+                row.sends = row.sends.saturating_add(1);
+                reserved = true;
+            }
+        }
+    }
+    reserved
+}
+
+fn self_leave_startup_sends_remaining(state: &AppState, group_ids: &[String]) -> bool {
+    let guard = self_leave_startup_obligations(state);
+    guard.values().any(|obligation| {
+        obligation
+            .aliases
+            .iter()
+            .any(|alias| group_ids.iter().any(|id| id == alias))
+            && obligation.peers.values().any(startup_peer_still_blocks)
+    })
+}
+
+#[cfg(test)]
+pub(in crate::server) fn self_leave_startup_send_count(state: &AppState, group_id: &str) -> u32 {
+    let guard = self_leave_startup_obligations(state);
+    guard
+        .values()
+        .find(|obligation| obligation.aliases.iter().any(|alias| alias == group_id))
+        .map(|obligation| obligation.peers.values().map(|peer| peer.sends).sum())
+        .unwrap_or(0)
+}
+
+/// True while a startup catch-up obligation still blocks a seal.
+///
+/// No other active member can hold a later head. That roster fact retires
+/// the obligation. The gates-not-ready hold does not retire anything.
+fn self_leave_startup_blocks(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    group_key: &str,
+) -> bool {
+    if !self_leave_startup_gates_ready(state) {
+        return true;
+    }
+    let stable = info.stable_group_id();
+    let active: Vec<String> = info
+        .active_members()
+        .map(|member| member.agent_id.clone())
+        .collect();
+    self_leave_startup_drop_inactive(
+        state,
+        &[
+            group_key.to_string(),
+            stable.to_string(),
+            info.mls_group_id.clone(),
+        ],
+        &active,
+    );
+    if !self_leave_startup_open(state, group_key) && !self_leave_startup_open(state, stable) {
+        return false;
+    }
+    // The designated committer is one active member. Zero others means
+    // this daemon is alone and no peer can hold a later head.
+    if info.active_members().count() <= 1 {
+        self_leave_startup_retire(
+            state,
+            &[
+                group_key.to_string(),
+                stable.to_string(),
+                info.mls_group_id.clone(),
+            ],
+        );
+        return false;
+    }
+    true
+}
+
+pub(in crate::server) async fn self_leave_startup_withholds_ciphertext(
+    state: &AppState,
+    group_id_hex: &str,
+    guard: &x0x::mls::TreeKemMlsGroup,
+) -> bool {
+    let groups = state.named_groups.read().await;
+    let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) else {
+        return false;
+    };
+    if !self_leave_startup_open(state, key)
+        && !self_leave_startup_open(state, info.stable_group_id())
+    {
+        return false;
+    }
+    removed_member_has_live_leaf(info, guard)
+}
+
+async fn self_leave_startup_note_verified_head(
+    state: &AppState,
+    group_ids: &[String],
+    peer: &str,
+    reported: Option<&str>,
+) {
+    let Some(reported) = reported else {
+        return;
+    };
+    let matches = {
+        let groups = state.named_groups.read().await;
+        group_ids.iter().any(|id| {
+            groups
+                .get(id)
+                .or_else(|| {
+                    groups.values().find(|info| {
+                        info.stable_group_id() == id.as_str() || info.mls_group_id == *id
+                    })
+                })
+                .is_some_and(|info| info.state_hash == reported)
+        })
+    };
+    if !matches {
+        tracing::info!(
+            peer = %LogHexId::agent(peer),
+            "startup catch-up page head does not match the local saved head"
+        );
+        return;
+    }
+    self_leave_startup_satisfy_peer(state, group_ids, peer);
 }
 
 fn self_leave_rekey_fence_peer_open(group_ids: &[String], peer: &str) -> bool {
@@ -23197,6 +23530,7 @@ async fn install_saved_self_leave_rekey(
     if self_leave_rekey_batch_held()
         || self_leave_rekey_fence_open(group_key)
         || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_startup_blocks(state, info, group_key)
         || !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await
         || !self_leave_candidate_extends_stored_head(state, group_key, info).await
     {
@@ -23925,13 +24259,311 @@ async fn update_self_leave_outbox_file(
     write_self_leave_rekey_outbox(path, &file).await
 }
 
-/// Startup pass. Wait once so the first catch-up round can queue events,
-/// reload removal commits that survived a crash, then seal what is still
-/// outstanding. Shielded by the caller.
+struct StartupSelfLeavePlan {
+    group_key: String,
+    ids: [String; 3],
+    /// Other active members. Any of them can hold a later head.
+    peers: Vec<AgentId>,
+    /// A Removed member still has a ratchet leaf. A historical row does not.
+    live_removed_leaf: bool,
+}
+
+fn removed_member_has_live_leaf(
+    info: &x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> bool {
+    let tracked = info.members_v2.values().any(|member| {
+        member.state == x0x::groups::GroupMemberState::Removed
+            && parse_agent_id_hex(&member.agent_id)
+                .ok()
+                .is_some_and(|agent_id| group.tracks_member(&agent_id))
+    });
+    tracked || tree_has_leaf_outside_active_roster(info, group)
+}
+
+/// TreeKEM groups where this daemon is the designated committer and a
+/// Removed member is still on the roster. Sorted by group key so the
+/// first send is deterministic.
+async fn startup_self_leave_plans(state: &AppState) -> Vec<StartupSelfLeavePlan> {
+    let local = state.agent.agent_id();
+    let snapshots: Vec<(String, x0x::groups::GroupInfo)> = {
+        let groups = state.named_groups.read().await;
+        let mut rows: Vec<_> = groups
+            .iter()
+            .filter(|(_, info)| {
+                !info.withdrawn && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+            })
+            .map(|(key, info)| (key.clone(), info.clone()))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    };
+    let mut plans = Vec::new();
+    for (key, info) in snapshots {
+        let removed = info
+            .members_v2
+            .values()
+            .any(|member| member.state == x0x::groups::GroupMemberState::Removed);
+        if !removed {
+            continue;
+        }
+        let Some(designated) = lowest_active_admin_id(state, &info) else {
+            continue;
+        };
+        if designated != local {
+            continue;
+        }
+        let live_removed_leaf = {
+            let map = state.treekem_groups.read().await;
+            if let Some(group) = map.get(&key).cloned() {
+                drop(map);
+                let guard = group.lock().await;
+                removed_member_has_live_leaf(&info, &guard)
+            } else {
+                false
+            }
+        };
+        let peers = info
+            .active_members()
+            .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+            .filter(|agent_id| *agent_id != local)
+            .collect();
+        plans.push(StartupSelfLeavePlan {
+            ids: [
+                key.clone(),
+                info.mls_group_id.clone(),
+                info.stable_group_id().to_string(),
+            ],
+            group_key: key,
+            peers,
+            live_removed_leaf,
+        });
+    }
+    plans
+}
+
+fn install_startup_self_leave_gates(state: &AppState, plans: &[StartupSelfLeavePlan]) {
+    for plan in plans {
+        if !plan.live_removed_leaf || plan.peers.is_empty() {
+            continue;
+        }
+        let peers: Vec<String> = plan
+            .peers
+            .iter()
+            .map(|peer| hex::encode(peer.as_bytes()))
+            .collect();
+        self_leave_startup_require(state, &plan.ids, &peers);
+    }
+}
+
+async fn send_startup_self_leave_catchup(state: &Arc<AppState>, plans: &[StartupSelfLeavePlan]) {
+    for plan in plans {
+        if !self_leave_startup_open(state, &plan.group_key) {
+            continue;
+        }
+        if !self_leave_startup_sends_remaining(state, &plan.ids) {
+            continue;
+        }
+        for peer in &plan.peers {
+            let peer_hex = hex::encode(peer.as_bytes());
+            if !self_leave_startup_reserve_send(state, &plan.ids, &peer_hex) {
+                continue;
+            }
+            let _sent = request_treekem_catchup_page(state, &plan.group_key, peer).await;
+        }
+    }
+}
+
+/// Startup pass. Install every catch-up obligation before resume or any
+/// send, then seal only what is not waiting on a verified head.
+///
+/// A live removed leaf plus another active member starts the wait. The
+/// page must carry that peer's saved head and that head must match. A
+/// timed wait is not that signal. When no other active member remains,
+/// no peer can hold a later head, so the pass seals. Shielded by the caller.
 pub(in crate::server) async fn startup_self_leave_rekey(state: &Arc<AppState>) {
-    tokio::time::sleep(SELF_LEAVE_REKEY_STARTUP_QUIET).await;
+    let plans = startup_self_leave_plans(state).await;
+    install_startup_self_leave_gates(state, &plans);
+    self_leave_startup_mark_ready(state);
     resume_durable_self_leave_rekeys(state).await;
-    rekey_outstanding_treekem_self_leaves(state).await;
+    send_startup_self_leave_catchup(state, &plans).await;
+    if plans
+        .iter()
+        .any(|plan| self_leave_startup_open(state, &plan.group_key))
+    {
+        schedule_startup_catchup_backoff(Arc::clone(state));
+    }
+    if !plans.is_empty() {
+        rekey_outstanding_treekem_self_leaves(state).await;
+    }
+}
+
+/// Releases this state's backoff token when the task ends or is cancelled.
+///
+/// The token is per daemon. A second `AppState` has its own token, so this
+/// task cannot keep that daemon from scheduling. Drop clears the token only
+/// when this task still owns it, which covers runtime cancellation and the
+/// shutdown drain. A successor that already took the token is left alone.
+struct StartupBackoffOwner {
+    state: Arc<AppState>,
+    token: u64,
+    armed: bool,
+}
+
+impl Drop for StartupBackoffOwner {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.state.startup_catchup_backoff_owner.compare_exchange(
+            self.token,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+fn try_arm_startup_catchup_backoff(state: &AppState) -> Option<u64> {
+    let token = next_startup_backoff_token();
+    state
+        .startup_catchup_backoff_owner
+        .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| token)
+}
+
+/// Shutdown has closed this daemon's backoff.
+///
+/// The drain cancels `shutdown_started` before it takes `detached_tasks`.
+/// Either signal refuses another ask and another successor.
+fn startup_catchup_backoff_stopped(state: &AppState) -> bool {
+    state.shutdown_started.is_cancelled() || state.detached_admission_closed()
+}
+
+/// Later sends after the first startup attempt.
+///
+/// One task for this daemon sleeps, then asks again, while any of its
+/// current peers still has an attempt left. A peer added on a later pass
+/// keeps the attempts that remain. There is no second global cap. The
+/// per-peer bound ends the wait. The first action is the sleep, so arming
+/// the task does not send immediately. The task is in `detached_tasks`.
+/// Shutdown cancels it and joins it. A durable seal it has already admitted
+/// stays in the shielded registry. Cancelling the task without closing
+/// admission releases this daemon's token, so a later schedule can start
+/// again.
+fn schedule_startup_catchup_backoff(state: Arc<AppState>) {
+    if startup_catchup_backoff_stopped(&state) {
+        return;
+    }
+    let Some(token) = try_arm_startup_catchup_backoff(&state) else {
+        return;
+    };
+    let owner = StartupBackoffOwner {
+        state: Arc::clone(&state),
+        token,
+        armed: true,
+    };
+    let Some(abort) = state.spawn_detached_with_abort(async move {
+        let mut owner = owner;
+        loop {
+            tokio::select! {
+                biased;
+                () = owner.state.shutdown_started.cancelled() => break,
+                () = tokio::time::sleep(SELF_LEAVE_STARTUP_CATCHUP_BACKOFF) => {}
+            }
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
+            retry_startup_self_leave_catchup(&owner.state).await;
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
+            if startup_backoff_still_needed(&owner.state).await {
+                continue;
+            }
+            // Give the token back, then look again. A peer who joined in
+            // that window must not lose the attempts that remain. Drop must
+            // not clear a token a successor already took.
+            let released = owner
+                .state
+                .startup_catchup_backoff_owner
+                .compare_exchange(owner.token, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            owner.armed = false;
+            if startup_catchup_backoff_stopped(&owner.state) {
+                break;
+            }
+            if released && startup_backoff_still_needed(&owner.state).await {
+                if startup_catchup_backoff_stopped(&owner.state) {
+                    break;
+                }
+                if let Some(token) = try_arm_startup_catchup_backoff(&owner.state) {
+                    owner.token = token;
+                    owner.armed = true;
+                    continue;
+                }
+            }
+            break;
+        }
+    }) else {
+        // Admission closed before the spawn. The unrun future drops the
+        // owner, which releases the token this schedule just took.
+        return;
+    };
+    #[cfg(test)]
+    {
+        let mut slot = state
+            .startup_catchup_backoff_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(abort);
+    }
+    #[cfg(not(test))]
+    drop(abort);
+}
+
+/// True when a current startup plan still has a peer under the send bound.
+///
+/// The roster is reconciled first. A peer who left does not keep the task
+/// alive. A peer who joined is enrolled at zero sends and does keep it alive.
+async fn startup_backoff_still_needed(state: &AppState) -> bool {
+    let plans = startup_self_leave_plans(state).await;
+    install_startup_self_leave_gates(state, &plans);
+    plans
+        .iter()
+        .any(|plan| self_leave_startup_open(state, &plan.group_key))
+}
+
+/// Ask again after reconnect, and ask a peer that was not in the first set.
+///
+/// A peer that still has a send remaining is asked. A peer that has spent
+/// its three sends is not. When a peer still blocks and the backoff task
+/// is not running, this schedules it. When no peer still blocks, the
+/// following rekey may seal. The rekey runs in the shielded registry. The
+/// join task and the backoff task can both be aborted. An admitted seal
+/// still finishes. Closed admission does not start the seal and does not
+/// arm another backoff.
+pub(in crate::server) async fn retry_startup_self_leave_catchup(state: &Arc<AppState>) {
+    let plans = startup_self_leave_plans(state).await;
+    install_startup_self_leave_gates(state, &plans);
+    send_startup_self_leave_catchup(state, &plans).await;
+    let seal_state = Arc::clone(state);
+    if state
+        .run_shielded(async move {
+            rekey_outstanding_treekem_self_leaves(&seal_state).await;
+        })
+        .await
+        .is_none()
+    {
+        return;
+    }
+    if plans
+        .iter()
+        .any(|plan| self_leave_startup_open(state, &plan.group_key))
+    {
+        schedule_startup_catchup_backoff(Arc::clone(state));
+    }
 }
 
 /// How many roster-removed leaves one pass will commit.
@@ -24054,6 +24686,7 @@ async fn commit_treekem_self_leave_rekey_from(
     if self_leave_rekey_batch_held()
         || self_leave_rekey_fence_open(group_key)
         || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_startup_blocks(state, &info, group_key)
     {
         return SelfLeaveRekeyStep::Deferred;
     }
@@ -24276,6 +24909,7 @@ async fn commit_treekem_self_leave_rekey_from(
     if self_leave_rekey_batch_held()
         || self_leave_rekey_fence_open(group_key)
         || self_leave_rekey_fence_open(info.stable_group_id())
+        || self_leave_startup_blocks(state, &info, group_key)
         || !self_leave_rekey_queue_clear(state, group_key, info.stable_group_id()).await
         || !self_leave_candidate_extends_stored_head(state, group_key, &info).await
     {
@@ -30492,6 +31126,12 @@ async fn treekem_group_encrypt_for_actor(
     .await
     {
         return resp;
+    }
+    if self_leave_startup_withholds_ciphertext(state, group_id_hex, &guard).await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "self-leave exclusion is not complete; ciphertext is withheld",
+        );
     }
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,
@@ -44355,6 +44995,10 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             owner_sync,
+            startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
+            startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
+            startup_catchup_backoff_owner: AtomicU64::new(0),
+            startup_catchup_backoff_abort: std::sync::Mutex::new(None),
             named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(test)]
             named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),
@@ -56981,6 +57625,7 @@ pub(in crate::server) mod tests {
             group_id: "aa".to_string(),
             events: Vec::new(),
             truncated: false,
+            responder_state_hash: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -60028,6 +60673,7 @@ pub(in crate::server) mod tests {
             group_id: fixture.stable_group_id.clone(),
             events: vec![fixture.event.clone()],
             truncated: false,
+            responder_state_hash: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())

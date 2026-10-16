@@ -249,6 +249,38 @@ All notable changes to this project will be documented in this file.
   `treekem:epoch=<n>:commit=<blake3>`. A v0.48 receiver rebuilds
   `treekem:epoch=<n>`, gets `StateHashMismatch`, and leaves a group that
   contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
+- **The designated admin finishes TreeKEM catch-up before a startup self-leave rekey.**
+  Startup no longer waits 250 ms and then seals. When a removed member still
+  has a live leaf and another active member remains, the lowest active admin
+  asks each of those members for catch-up. Each peer may be asked three
+  times. A fourth peer is still asked.   A later retry, including the network
+  join and a 30 second backoff, asks a peer that still has a send remaining.
+  A peer added on a later pass still receives the asks that remain. The
+  backoff continues until every current peer has spent its three sends.
+  Each daemon owns that task. Cancelling it releases the ownership, so
+  another daemon in the same process keeps its own timer. Shutdown drains
+  that task and closes admission. A seal the retry has already admitted
+  stays in the shielded registry, so the drain does not abort it. Each daemon's
+  startup obligation is its own. Another daemon's matching head does not
+  clear this daemon's hold.
+  An empty page, a truncated page, a missing hash, and a KeyPackage reply do
+  not clear that peer. When every asked peer has reported the saved head or
+  has spent its three sends, the wait ends and the designated admin may seal.
+  While a peer still has a send remaining, new TreeKEM ciphertext is withheld
+  on REST encrypt and on the group-store protector. A peer who leaves the
+  roster is dropped, and a survivor keeps the sends already spent. A terminal
+  matching head is recorded while another peer's page stream is open. The
+  send is reserved before the request is awaited. When no other active member
+  remains, startup seals. Historical Removed rows with no live leaf do not
+  start the wait. `T-self-leave-catchup-before-seal` (Proposed, slot A07).
+- **A self-leave fork uses the existing local quarantine clear.**
+  A stale self-leave rekey can sign a second child of the same parent and
+  set the ADR 0064 / ADR 0066 marker. The clear is local to this node. It
+  re-arms the evidence gate, so the next conflicting commit quarantines the
+  group again. An ordinary group (`no_anchor`) needs `force` and a reason
+  on `POST /groups/:id/quarantine/clear`, and the durable API token. The
+  clear does not roll the sealed TreeKEM epoch back.
+  `T-self-leave-fork-quarantine-clear` (Proposed, slot A14).
 
 ## [v0.48.0] - 2026-10-13
 
