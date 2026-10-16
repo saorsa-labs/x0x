@@ -372,23 +372,29 @@ fn watch_join_requests(
     Ok((Watcher(task), seen))
 }
 
-/// The transport that carried each received request, by trace position:
-/// `direct` when a direct-lane J->A join `fetch_request` frame was
-/// delivered after the previous received request and before this one,
-/// otherwise the gossip DM inbox. A frame and its hand-off can share a
-/// virtual instant, so this compares positions, never timestamps.
-fn request_transports(received: &[RequestSeen], direct_frames: &[usize]) -> Vec<&'static str> {
-    let mut frames = direct_frames.iter().copied().peekable();
-    received
-        .iter()
-        .map(|seen| {
-            let mut via = "dm_inbox";
-            while frames.next_if(|frame| *frame < seen.position).is_some() {
-                via = "direct";
-            }
-            via
-        })
-        .collect()
+/// Report the two observations without assigning a transport to a receipt.
+/// The watcher can drain several requests after several direct deliveries.
+/// Trace order alone cannot pair a frame with a request, and a missing
+/// direct delivery does not prove that the request used the gossip inbox.
+fn request_delivery_detail(
+    received: &[RequestSeen],
+    direct_frames: &[usize],
+    join_position: usize,
+) -> String {
+    let first = received
+        .first()
+        .filter(|seen| seen.position > join_position);
+    format!(
+        "{} join fetch_requests from J for this group naming J reached A's DM layer after \
+         the join call (trace #{join_position}); {} matching direct frame deliveries at \
+         trace positions {direct_frames:?}; transport per request is unknown (no message-identity \
+         correlation); first request at trace #{} ({:?}us, verified={})",
+        received.len(),
+        direct_frames.len(),
+        first.map_or("none".to_string(), |seen| seen.position.to_string()),
+        first.map(|seen| seen.at.as_micros()),
+        first.is_some_and(|seen| seen.verified),
+    )
 }
 
 async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> Result<()> {
@@ -495,8 +501,6 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
         })
         .map(|(_, position)| position)
         .collect();
-    let transports = request_transports(&received, &direct_frames);
-    let via_direct = transports.iter().filter(|via| **via == "direct").count();
     let first = received
         .first()
         .filter(|seen| seen.position > join_position);
@@ -504,17 +508,7 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
     receipt.request_delivered(
         "j_join_fetch_request_reached_a",
         first.is_some(),
-        format!(
-            "{} join fetch_requests from J for this group naming J reached A's DM layer after \
-             the join call (trace #{join_position}): {via_direct} via direct frames, {} via the \
-             gossip DM inbox; first at trace #{} ({:?}us, via {}, verified={})",
-            received.len(),
-            received.len().saturating_sub(via_direct),
-            first.map_or("none".to_string(), |seen| seen.position.to_string()),
-            first_request.map(|t| t.as_micros()),
-            transports.first().copied().unwrap_or("none"),
-            first.is_some_and(|seen| seen.verified),
-        ),
+        request_delivery_detail(&received, &direct_frames, join_position),
         at(sim),
     );
     if !admitted {
@@ -623,27 +617,55 @@ async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
     Ok(())
 }
 
-/// The request stage's transport attribution compares trace positions: a
-/// direct frame delivered before a receipt (and after the previous one)
-/// carried it; a receipt with no such frame came over the gossip DM inbox.
+/// Two direct frames can arrive before the watcher drains either request.
+/// Consuming both frames for the first receipt falsely labels the second
+/// receipt as gossip delivery (#1245).
 #[test]
-fn w3h_1143_request_transport_follows_trace_position() {
+fn w3h_1143_request_receipt_does_not_assign_batched_frames_to_transports() {
     let seen = |position| RequestSeen {
         position,
         at: Duration::ZERO,
         verified: true,
     };
-    let received = [seen(10), seen(20), seen(30)];
-    assert_eq!(
-        request_transports(&received, &[5, 25]),
-        ["direct", "dm_inbox", "direct"]
+    let received = [seen(10), seen(20)];
+    let detail = request_delivery_detail(&received, &[5, 6], 1);
+    assert!(detail.contains("2 join fetch_requests"), "{detail}");
+    assert!(
+        detail.contains("2 matching direct frame deliveries"),
+        "{detail}"
     );
-    assert_eq!(
-        request_transports(&received, &[]),
-        ["dm_inbox", "dm_inbox", "dm_inbox"]
+    assert!(detail.contains("trace positions [5, 6]"), "{detail}");
+    assert!(
+        detail.contains("transport per request is unknown"),
+        "{detail}"
     );
-    // A frame delivered after the last receipt carried none of them.
-    assert_eq!(request_transports(&received[..1], &[11]), ["dm_inbox"]);
+    assert!(!detail.contains("via"), "{detail}");
+    assert!(!detail.contains("dm_inbox"), "{detail}");
+}
+
+/// Absence of a matching direct frame is not evidence of gossip delivery.
+#[test]
+fn w3h_1143_request_receipt_without_direct_frames_keeps_transport_unknown() {
+    let received = [RequestSeen {
+        position: 10,
+        at: Duration::ZERO,
+        verified: true,
+    }];
+    let detail = request_delivery_detail(&received, &[], 1);
+    assert!(detail.contains("1 join fetch_requests"), "{detail}");
+    assert!(
+        detail.contains("0 matching direct frame deliveries"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("transport per request is unknown"),
+        "{detail}"
+    );
+    assert!(!detail.contains("dm_inbox"), "{detail}");
+}
+
+#[test]
+fn w3h_1143_request_filter_matches_group_and_joiner() {
     let joiner = AgentId([7; 32]);
     let body = json!({
         "type": "fetch_request",
