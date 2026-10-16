@@ -915,10 +915,35 @@ pub struct Agent {
 struct TrackedTasks {
     closed: bool,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Joined to completion. The shutdown grace does not abort these.
+    ///
+    /// A cert-recovery batch owns its fetch children. Aborting that batch
+    /// drops the `JoinSet` and releases reservations while a child can
+    /// still be inside a synchronous section.
+    shielded: Vec<tokio::task::JoinHandle<()>>,
 }
 
 fn spawn_tracked_on<F>(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>, fut: F)
 where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    push_tracked(registry, fut, false);
+}
+
+/// Register `fut` where shutdown joins it and the grace abort does not
+/// cancel it.
+fn spawn_tracked_shielded_on<F>(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    push_tracked(registry, fut, true);
+}
+
+fn push_tracked<F>(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+    fut: F,
+    shielded: bool,
+) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let mut guard = match registry.lock() {
@@ -928,7 +953,12 @@ where
     if guard.closed {
         return;
     }
-    guard.handles.push(tokio::spawn(fut));
+    let handle = tokio::spawn(fut);
+    if shielded {
+        guard.shielded.push(handle);
+    } else {
+        guard.handles.push(handle);
+    }
 }
 
 /// #765 r4 test instruments for `Agent::shutdown` — counters the shutdown
@@ -951,6 +981,9 @@ struct ShutdownTestInstrument {
     in_body: std::sync::atomic::AtomicUsize,
     max_in_body: std::sync::atomic::AtomicUsize,
     drain_observers: std::sync::atomic::AtomicUsize,
+    /// Times the three-second grace abort ran. A shielded drain is still
+    /// joined after this.
+    grace_aborts: std::sync::atomic::AtomicUsize,
     progressed: tokio::sync::Notify,
 }
 
@@ -971,6 +1004,17 @@ impl ShutdownTestInstrument {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 >= n
             {
+                return;
+            }
+            progressed.await;
+        }
+    }
+
+    /// Wait until the grace abort has run at least `n` times.
+    async fn wait_grace_aborts(&self, n: usize) {
+        loop {
+            let progressed = self.progressed.notified();
+            if self.grace_aborts.load(std::sync::atomic::Ordering::SeqCst) >= n {
                 return;
             }
             progressed.await;
@@ -3168,6 +3212,14 @@ fn spawn_reserved_fetch(
         #[cfg(test)]
         let _child_finished = RecoveryFetchChildGuard(std::sync::Arc::clone(&cache));
         #[cfg(test)]
+        if cache.recovery_fetch_sync_hold_for_testing() {
+            // Synchronous on purpose. Abort does not interrupt this section.
+            cache.block_in_recovery_sync_section_for_testing();
+            if shutdown.is_cancelled() {
+                return (job.subject, job.announced, job.digest, None);
+            }
+        }
+        #[cfg(test)]
         if cache.recovery_fetch_hold_for_testing() {
             tokio::select! {
                 biased;
@@ -3237,7 +3289,10 @@ async fn absorb_finished_followers(
 /// Abort the fetch children and wait until each one has stopped.
 ///
 /// `settle` keeps a finished certificate and records a real miss. Shutdown
-/// passes `false`: a cancelled child is not a failed digest.
+/// passes `false`: a cancelled child is not a failed digest. The caller
+/// finishes this join before the flight guard releases reservations and
+/// before `pending` is dropped. The shutdown grace does not abort that
+/// caller.
 async fn join_fetch_children(
     pending: &mut tokio::task::JoinSet<FetchedSubjectCert>,
     found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
@@ -3539,7 +3594,7 @@ async fn finish_subject_cert_recovery(
 fn recovery_fetch_held(cache: &announce_blob::AnnounceBlobCache) -> bool {
     #[cfg(test)]
     {
-        cache.recovery_fetch_hold_for_testing()
+        cache.recovery_fetch_hold_for_testing() || cache.recovery_fetch_sync_hold_for_testing()
     }
     #[cfg(not(test))]
     {
@@ -3815,7 +3870,10 @@ impl Drop for RecoveryFetchChildGuard {
 /// Run one resync batch on the agent's tracked-task registry.
 ///
 /// The eight-fetch allowance is shared with every other batch. Shutdown
-/// joins this task before it applies or persists.
+/// joins this task before it applies or persists. The task is shielded
+/// from the three-second grace abort so it can finish joining fetch
+/// children before their reservations are released and before their
+/// `JoinSet` is dropped.
 fn track_cert_recovery(
     registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -3825,7 +3883,7 @@ fn track_cert_recovery(
     pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
     apply: CertRecoveryApply,
 ) {
-    spawn_tracked_on(registry, async move {
+    spawn_tracked_shielded_on(registry, async move {
         #[cfg(test)]
         let _finished = RecoveryFinishedGuard(std::sync::Arc::clone(&cache));
         let fetched =
@@ -8425,17 +8483,22 @@ impl Agent {
         let kv_retirements = self.sweep_kv_snapshot_registry();
 
         // 4. Drain the tracked-task registry: mark closed (so any in-flight
-        //    spawn_tracked is refused), take the handles, grace-await them all
-        //    under a SINGLE bounded budget (not per-task — keeps shutdown
-        //    prompt), then abort+await any straggler. A cancelled/aborted task
-        //    yields Err(JoinError); that is expected, never unwrap it.
-        let handles = {
+        //    spawn_tracked is refused), take the handles, grace-await the
+        //    abortable set under a SINGLE bounded budget (not per-task —
+        //    keeps shutdown prompt), then abort+await any straggler.
+        //    Shielded tasks are joined too, and the grace abort does not
+        //    cancel them. A cancelled/aborted task yields Err(JoinError);
+        //    that is expected, never unwrap it.
+        let (handles, shielded) = {
             let mut guard = match self.tracked_tasks.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard.closed = true;
-            std::mem::take(&mut guard.handles)
+            (
+                std::mem::take(&mut guard.handles),
+                std::mem::take(&mut guard.shielded),
+            )
         };
 
         // 4b. #765 r4: hand the retirement tokens and the EXACT taken
@@ -8452,7 +8515,7 @@ impl Agent {
         //     now, and this custody must outlive the caller that created
         //     it. The completion signal parks in the shared cell so every
         //     later or concurrent shutdown observes the same drain.
-        if !kv_retirements.is_empty() || !handles.is_empty() {
+        if !kv_retirements.is_empty() || !handles.is_empty() || !shielded.is_empty() {
             let done = tokio_util::sync::CancellationToken::new();
             let custody_done = done.clone();
             {
@@ -8469,6 +8532,9 @@ impl Agent {
                 custody_done,
                 kv_retirements,
                 handles,
+                shielded,
+                #[cfg(test)]
+                std::sync::Arc::clone(&self.shutdown_test),
             ));
         }
 
@@ -21362,6 +21428,7 @@ impl AgentBuilder {
             tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
                 closed: false,
                 handles: Vec::new(),
+                shielded: Vec::new(),
             })),
             peer_relay,
             relay_candidates,
@@ -23031,15 +23098,22 @@ async fn kv_shutdown_drain_task(
     done: tokio_util::sync::CancellationToken,
     retirements: Vec<kv::snapshot_fence::RetirementToken>,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    shielded: Vec<tokio::task::JoinHandle<()>>,
+    #[cfg(test)] grace_abort: std::sync::Arc<ShutdownTestInstrument>,
 ) {
+    // Created before the grace select so the cert-recovery drain stays
+    // owned here. Aborting the outer batch would drop its child JoinSet
+    // and release reservations while a synchronous child is still running.
+    let shielded_join = futures::future::join_all(shielded);
+    tokio::pin!(shielded_join);
     if !handles.is_empty() {
-        // Grace-await all tracked tasks under a SINGLE bounded budget
+        // Grace-await abortable tracked tasks under a SINGLE bounded budget
         // (not per-task — keeps shutdown prompt regardless of task
         // count). On timeout, abort the stragglers and await the aborts
         // so none outlives the drain. The select! keeps the JoinHandles
         // owned by this task so the post-abort join can still observe
         // each task's terminal JoinError (cancelled tasks → Err — never
-        // unwrapped).
+        // unwrapped). Shielded tasks are not in this set.
         let abort_handles: Vec<tokio::task::AbortHandle> =
             handles.iter().map(|h| h.abort_handle()).collect();
         let mut join = futures::future::join_all(handles);
@@ -23049,6 +23123,8 @@ async fn kv_shutdown_drain_task(
                 tracing::warn!(
                     "Agent background tasks did not stop within grace; aborting stragglers"
                 );
+                #[cfg(test)]
+                ShutdownTestInstrument::bump(&grace_abort.grace_aborts, &grace_abort.progressed);
                 for handle in &abort_handles {
                     handle.abort();
                 }
@@ -23056,6 +23132,9 @@ async fn kv_shutdown_drain_task(
             }
         }
     }
+    // Join the shielded drain after the grace abort, without aborting it.
+    // Reservations stay held until that drain has joined its children.
+    let _shielded: Vec<Result<(), tokio::task::JoinError>> = shielded_join.await;
     for retirement in retirements {
         retirement.complete();
     }
@@ -33579,7 +33658,10 @@ mod tests {
             .build()
             .await
             .expect("agent");
-        let baseline = agent.tracked_tasks.lock().expect("tracked").handles.len();
+        let baseline = {
+            let registry = agent.tracked_tasks.lock().expect("tracked");
+            registry.handles.len() + registry.shielded.len()
+        };
         let plan = plan_subject_cert_recovery(&sources, ids.iter().copied());
         let (found_v1, pending_v1) = partition_subject_cert_plan(plan, &blobs).await;
         let plan = plan_subject_cert_recovery(&sources, ids.iter().copied());
@@ -33642,7 +33724,10 @@ mod tests {
                 "digest fetched {fetches} times while another batch held it"
             );
         }
-        let registered = agent.tracked_tasks.lock().expect("tracked").handles.len();
+        let registered = {
+            let registry = agent.tracked_tasks.lock().expect("tracked");
+            registry.handles.len() + registry.shielded.len()
+        };
         assert_eq!(
             registered,
             baseline + 2,
@@ -33672,8 +33757,127 @@ mod tests {
         let registry = agent.tracked_tasks.lock().expect("tracked");
         assert!(registry.closed, "shutdown must close the task registry");
         assert!(
-            registry.handles.is_empty(),
+            registry.handles.is_empty() && registry.shielded.is_empty(),
             "shutdown must join the recovery tasks"
+        );
+    }
+
+    /// #1116: the three-second grace abort must not finish the outer recovery
+    /// task, release its reservation, or drop the fetch child while that
+    /// child is still inside a synchronous section.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn grace_abort_does_not_drop_a_sync_fetch_child_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(1, 0).await;
+        blobs.set_recovery_fetch_sync_hold_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let ids = [subjects[0].agent_id];
+        let records = vec![subjects[0].record.clone()];
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        spawn_tracked_on(&agent.tracked_tasks, std::future::pending::<()>());
+        let plan = plan_subject_cert_recovery(&sources, ids);
+        let (found, pending) = partition_subject_cert_plan(plan, &blobs).await;
+        assert_eq!(pending.len(), 1, "the subject must be a miss");
+        let identity_dir = Some(dir.path().to_path_buf());
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found,
+            pending,
+            CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
+                records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir,
+                owner_trust: agent.owner_trust.clone(),
+                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
+                machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
+            })),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let entered = blobs.recovery_sync_entered_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            if entered == 1 && inflight == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "entered {entered}, in flight {inflight}"
+            );
+            tokio::task::yield_now().await;
+        }
+        let grace = std::sync::Arc::clone(&agent.shutdown_test);
+        let tracked = std::sync::Arc::clone(&agent.tracked_tasks);
+        let shutdown_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag = std::sync::Arc::clone(&shutdown_done);
+        let grace_before = grace.grace_aborts.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            agent.shutdown().await;
+            drop(agent);
+            done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            grace.wait_grace_aborts(grace_before + 1),
+        )
+        .await
+        .expect("the grace abort did not run");
+        assert_eq!(
+            blobs.recovery_in_flight_len_for_testing(),
+            1,
+            "the grace abort released the reservation while the child was still synchronous"
+        );
+        assert_eq!(
+            blobs.recovery_tasks_finished_for_testing(),
+            0,
+            "the grace abort finished the outer recovery task during the child drain"
+        );
+        assert_eq!(
+            blobs.recovery_fetch_children_finished_for_testing(),
+            0,
+            "the synchronous child ended before it was released"
+        );
+        assert!(
+            !shutdown_done.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown finished while the synchronous child was still running"
+        );
+        blobs.release_recovery_sync_section_for_testing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let children = blobs.recovery_fetch_children_finished_for_testing();
+            let finished = blobs.recovery_tasks_finished_for_testing();
+            let done = shutdown_done.load(std::sync::atomic::Ordering::SeqCst);
+            if inflight == 0 && children == 1 && finished == 1 && done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "in flight {inflight}, children {children}, outer {finished}, shutdown {done}"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            blobs.recovery_apply_count_for_testing(),
+            0,
+            "shutdown applied a batch"
+        );
+        let registry = tracked.lock().expect("tracked");
+        assert!(registry.closed, "shutdown must close the task registry");
+        assert!(
+            registry.handles.is_empty() && registry.shielded.is_empty(),
+            "shutdown must join the recovery task"
         );
     }
 

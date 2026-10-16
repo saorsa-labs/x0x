@@ -266,6 +266,20 @@ pub struct AnnounceBlobCache {
     /// Fetch children that have stopped, including ones that were aborted.
     #[cfg(test)]
     recovery_fetch_children_finished: AtomicUsize,
+    /// When set, a reserved fetch blocks in a synchronous section until release.
+    ///
+    /// An abort does not interrupt that section. Shutdown must join the
+    /// child before it drops the reservation.
+    #[cfg(test)]
+    recovery_fetch_sync_hold: AtomicBool,
+    #[cfg(test)]
+    recovery_sync_entered: AtomicUsize,
+    #[cfg(test)]
+    recovery_sync_release: AtomicBool,
+    #[cfg(test)]
+    recovery_sync_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    recovery_sync_cvar: std::sync::Condvar,
     /// When set, a batch waits once after it claims slots and before it
     /// subscribes for a free slot.
     #[cfg(test)]
@@ -314,6 +328,16 @@ impl AnnounceBlobCache {
             recovery_tasks_finished: AtomicUsize::new(0),
             #[cfg(test)]
             recovery_fetch_children_finished: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_fetch_sync_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_sync_entered: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_sync_release: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_sync_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            recovery_sync_cvar: std::sync::Condvar::new(),
             #[cfg(test)]
             recovery_pre_wait_hold: AtomicBool::new(false),
             #[cfg(test)]
@@ -600,6 +624,55 @@ impl AnnounceBlobCache {
     #[cfg(test)]
     pub(crate) fn recovery_fetch_children_finished_for_testing(&self) -> usize {
         self.recovery_fetch_children_finished.load(Ordering::SeqCst)
+    }
+
+    /// Park a reserved fetch inside a synchronous section until release.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_fetch_sync_hold_for_testing(&self, hold: bool) {
+        self.recovery_fetch_sync_hold.store(hold, Ordering::SeqCst);
+    }
+
+    /// Whether a reserved fetch should block synchronously.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_sync_hold_for_testing(&self) -> bool {
+        self.recovery_fetch_sync_hold.load(Ordering::SeqCst)
+    }
+
+    /// Fetches that have entered the synchronous section.
+    #[cfg(test)]
+    pub(crate) fn recovery_sync_entered_for_testing(&self) -> usize {
+        self.recovery_sync_entered.load(Ordering::SeqCst)
+    }
+
+    /// Block until [`Self::release_recovery_sync_section_for_testing`].
+    ///
+    /// This does not await. A task abort cannot stop it before it returns.
+    #[cfg(test)]
+    pub(crate) fn block_in_recovery_sync_section_for_testing(&self) {
+        self.recovery_sync_entered.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self
+            .recovery_sync_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.recovery_sync_release.load(Ordering::SeqCst) {
+            let (next, _) = self
+                .recovery_sync_cvar
+                .wait_timeout(guard, std::time::Duration::from_millis(50))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+        }
+    }
+
+    /// Let every synchronous fetch section return.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_sync_section_for_testing(&self) {
+        self.recovery_sync_release.store(true, Ordering::SeqCst);
+        self.recovery_fetch_sync_hold.store(false, Ordering::SeqCst);
+        let _guard = self
+            .recovery_sync_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recovery_sync_cvar.notify_all();
     }
 
     /// Hold each batch once, after its claim and before its first slot wait.
