@@ -49,8 +49,9 @@ All notable changes to this project will be documented in this file.
   `last_sent_at` and `last_received_at` count application data only. A quiet
   peer stays up, including when another peer still has traffic. `GET /health`
   and `GET /status` are `degraded` and carry a reason. `GET /peers` sets
-  `link` to `degraded` from that same stored set. The health refresher stores
-  the set and returns. It does not wait on the re-dial. It writes one warning
+  `link` to `degraded` from that same stored set.   The health refresher stores
+  the set and returns. It does not wait on the re-dial. Shutdown aborts that
+  repair task and joins it. Cancellation clears the in-flight flag. It writes one warning
   and re-dials that peer once (disconnect, then dial), with a 3 s bound and a
   60 s backoff. The repair and the scheduler share one dial permit. The permit
   is dropped when the repair finishes or the peer is gone, unless another

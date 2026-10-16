@@ -2204,6 +2204,10 @@ pub struct NetworkNode {
     /// True while a repair task is already running off the health refresher.
     /// The refresher still stores peer counts on every tick.
     one_sided_repair_inflight: Arc<AtomicBool>,
+    /// The repair task shutdown must abort and join (#1419). The refresher
+    /// does not await it. The slot and `shutdown_state.started` share this
+    /// lock so a spawn cannot land after teardown has taken the handle.
+    one_sided_repair_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// How many one-sided re-dials this node has started.
     #[cfg(test)]
     one_sided_redials: Arc<std::sync::atomic::AtomicU32>,
@@ -2382,6 +2386,15 @@ fn dial_abandoned(origin: &'static str) -> NetworkError {
 #[cfg(test)]
 pub(crate) static ACCEPT_NONE_PROBE: std::sync::Mutex<Option<[u8; 32]>> =
     std::sync::Mutex::new(None);
+
+/// Clears the in-flight flag when the repair task ends, including cancel.
+struct OneSidedRepairInflightGuard(Arc<AtomicBool>);
+
+impl Drop for OneSidedRepairInflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 impl NetworkNode {
     /// Create a new network node with the given configuration.
@@ -2633,6 +2646,7 @@ impl NetworkNode {
             one_sided_repairs: Arc::new(Mutex::new(HashMap::new())),
             one_sided_dial_gate: Arc::new(Mutex::new(HashMap::new())),
             one_sided_repair_inflight: Arc::new(AtomicBool::new(false)),
+            one_sided_repair_task: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             one_sided_redials: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
@@ -3003,11 +3017,19 @@ impl NetworkNode {
         self.prune_gone_one_sided_dial_gates(samples);
     }
 
-    /// Start one repair task if none is running.
+    /// Start one repair task if none is running and teardown has not started.
     ///
     /// The caller stores health counts before this returns. A repair that
-    /// waits up to 3 s per peer does not delay the next count.
+    /// waits up to 3 s per peer does not delay the next count. Shutdown
+    /// aborts and joins the task. Cancellation clears the in-flight flag.
     pub(crate) fn spawn_one_sided_repair(self: &Arc<Self>, samples: Vec<LinkAgeSample>) {
+        let mut slot = match self.one_sided_repair_task.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.shutdown_state.started.load(Ordering::Acquire) {
+            return;
+        }
         if self
             .one_sided_repair_inflight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3015,13 +3037,23 @@ impl NetworkNode {
         {
             return;
         }
-        let network = Arc::clone(self);
-        tokio::spawn(async move {
-            network.repair_one_sided_links(&samples).await;
-            network
-                .one_sided_repair_inflight
+        if self.shutdown_state.started.load(Ordering::Acquire) {
+            self.one_sided_repair_inflight
                 .store(false, Ordering::Release);
-        });
+            return;
+        }
+        let network = Arc::clone(self);
+        let inflight = Arc::clone(&self.one_sided_repair_inflight);
+        *slot = Some(tokio::spawn(async move {
+            let _guard = OneSidedRepairInflightGuard(inflight);
+            network.repair_one_sided_links(&samples).await;
+        }));
+    }
+
+    /// Whether a one-sided repair task is still marked in flight.
+    #[cfg(test)]
+    pub(crate) fn one_sided_repair_is_inflight(&self) -> bool {
+        self.one_sided_repair_inflight.load(Ordering::Acquire)
     }
 
     /// The sim link, so a server test can age traffic without a socket.
@@ -4914,6 +4946,7 @@ impl NetworkNode {
     pub async fn try_shutdown(&self) -> NetworkResult<()> {
         let node = Arc::clone(&self.node);
         let background_tasks = Arc::clone(&self.background_tasks);
+        let one_sided_repair_task = Arc::clone(&self.one_sided_repair_task);
         let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
         #[cfg(test)]
         let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
@@ -4921,6 +4954,14 @@ impl NetworkNode {
         let registry_clear_pause = Arc::clone(&self.registry_clear_pause_for_test);
         self.shutdown_state
             .run(async move {
+                let repair = match one_sided_repair_task.lock() {
+                    Ok(mut slot) => slot.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                if let Some(handle) = repair {
+                    handle.abort();
+                    let _ = handle.await;
+                }
                 let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
                     Ok(mut tasks) => tasks.drain(..).collect(),
                     Err(poisoned) => poisoned.into_inner().drain(..).collect(),
@@ -9268,6 +9309,65 @@ mod tests {
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: shutdown aborts the repair task and joins it. Cancellation
+    /// clears the in-flight flag, and a later spawn does not start work.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_shutdown_aborts_and_joins_the_repair() {
+        let plane = "issue1419-shutdown";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let node = Arc::new(
+            NetworkNode::new(
+                NetworkConfig {
+                    bind_addr: Some(SocketAddr::from(([198, 18, 0, 1], 5483))),
+                    network_id: Some(plane.to_string()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..NetworkConfig::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        node.pause_one_sided_redial_for_test(Duration::from_secs(30));
+        let samples = vec![LinkAgeSample {
+            peer: test_ant_peer(2),
+            age: LinkTrafficAge {
+                sent_ago: Some(Duration::from_secs(90)),
+                received_ago: Some(Duration::from_secs(1)),
+            },
+        }];
+        node.spawn_one_sided_repair(samples.clone());
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            node.one_sided_repair_is_inflight(),
+            "the paused repair stays in flight until shutdown"
+        );
+
+        node.try_shutdown().await.unwrap();
+        assert!(
+            !node.one_sided_repair_is_inflight(),
+            "cancelling the repair clears the in-flight flag"
+        );
+        assert_eq!(
+            node.one_sided_redials.load(Ordering::Relaxed),
+            0,
+            "shutdown joins the repair before its dial"
+        );
+
+        node.spawn_one_sided_repair(samples);
+        tokio::task::yield_now().await;
+        assert!(
+            !node.one_sided_repair_is_inflight(),
+            "a spawn after shutdown does not start a repair"
+        );
+        assert_eq!(node.one_sided_redials.load(Ordering::Relaxed), 0);
     }
 
     fn reconnect_observation(
