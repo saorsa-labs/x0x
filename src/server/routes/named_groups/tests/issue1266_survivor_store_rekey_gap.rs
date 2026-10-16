@@ -542,38 +542,34 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     let (status, body) = get_value(&f.state, &topic, "gap").await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
 
-    // The share installs well inside Alice's cooldown. The repair publishes
-    // one request now and exactly one retry 16 s later, after every holder's
-    // response cooldown. A gap value can become readable before that retry
-    // (a cached delta can land once the key exists). Value visibility is not
-    // repair completion. Read the counters only after both requests are
-    // published and Alice has answered the retry, which is the serve that
-    // supplies the dropped record when the first request was suppressed.
+    // The share installs well inside Alice's cooldown. A local read runs the
+    // GSS refresh, and the first Current refresh after KeyPending starts the
+    // repair: one request now, and exactly one retry 16 s later. A gap value
+    // can become readable before that retry. Value visibility is not repair
+    // completion. Keep reading so the refresh runs, and take the counters
+    // only after both requests are published and Alice has answered the
+    // retry. That answer is the serve that supplies the dropped record when
+    // the first request was suppressed.
     let delivered =
         apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
             .await;
     assert!(!delivered.should_exit);
-    let requests = wait_for_count(
-        || {
-            bob.state_sync_snapshot()
-                .requests_sent
-                .saturating_sub(baseline_requests)
-        },
-        2,
-        Duration::from_secs(40),
-    )
-    .await;
-    let answered = wait_for_count(
-        || alice.sync.state_sync_snapshot().requests_answered,
-        2,
-        Duration::from_secs(10),
-    )
-    .await;
-    assert_eq!(
-        answered, 2,
-        "the retry must be served before the record is checked; requests so far {requests}"
-    );
-    let (status, body) = get_value(&f.state, &topic, "gap").await?;
+    let repair_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let (status, body) = loop {
+        let (status, body) = get_value(&f.state, &topic, "gap").await?;
+        let served = alice.sync.state_sync_snapshot();
+        let requests = bob
+            .state_sync_snapshot()
+            .requests_sent
+            .saturating_sub(baseline_requests);
+        if requests >= 2 && served.requests_answered >= 2 && served.rejected_cooldown >= 1 {
+            break (status, body);
+        }
+        if tokio::time::Instant::now() >= repair_deadline {
+            break (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let served = alice.sync.state_sync_snapshot();
     let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
     assert_eq!(
