@@ -228,6 +228,93 @@ All notable changes to this project will be documented in this file.
   - Self-removal retires the matching attempt before the apply
     returns. A re-invite on that process does not wait for the join
     poll's next tick.
+- **A corrupt revocation store is quarantined and x0xd keeps running (#1116).**
+  A present revocation file that cannot be decoded is moved to
+  `<file>.quarantined-<unix-ms>` (a taken name gets `-<seq>`). The live path
+  no longer holds those bytes. x0xd starts and keeps running. The next start
+  sees the quarantine name, does not read that payload, and stays closed.
+  Startup writes one error log line. `GET /status` and `x0x status` set
+  `revocation_resync_required` and include the same sentence in `warnings`.
+  The first status read also sends one `status` event on `/events`. If the
+  archive fails, the sentence says the live path still holds the bad bytes.
+  Until that carrier is reopened, membership fails closed. A member
+  whose non-revocation is not verified is treated as revoked. The hold is
+  not a revocation record, so admission, invite accept, join approval,
+  join-artifact and key delivery, streams, and grant sends are withheld.
+  They are not purged. Identity, machine, and user announcements still
+  arrive, so a certificate can verify an issuer revocation or a binding
+  tombstone. Other pubsub, DM, and direct messages are dropped. They are
+  not queued for later delivery. A new send after the flag clears can
+  succeed. Messages already stored stay stored.
+  One peer does not open a carrier. The node's own publish does not open
+  it. An empty snapshot does not open it. A snapshot that omits a
+  revocation this node has already verified does not open it. Two free
+  agent keys do not open it. A carrier opens only when the snapshot comes
+  from a trusted authority and every record in it has verified. A trusted
+  authority is a machine enrolled to the local owner, or an Active owner
+  or admin in the local journal for a group this node belongs to. An
+  explicit revocation of that agent, its machine, or that binding rejects
+  the sender. The resync hold does not. A trusted snapshot can still omit
+  a revocation that was lost with the bad file. That sender rule is not
+  proof the lost set was complete. Otherwise the carrier stays closed
+  until an operator rebuild. Stop x0xd and run
+  `x0x identity rebuild-revocation-store --carrier v3 --from <file>`.
+  An empty store also needs `--empty --confirm-empty`. The command
+  validates the file, unites it with a readable live file, and leaves the
+  quarantine file in place. A remote peer cannot run it. A zero-byte file
+  is rejected. A rebuild re-reads the live file under the carrier lock
+  and unites it with revocations still readable in the quarantine file. A
+  v3 rebuild takes the cross-process lock. A snapshot cannot drop a
+  revocation the quarantine file still contains. If those bytes cannot be
+  read, the remote snapshot is not installed. The carrier stays closed
+  until the operator command. The command unites a readable quarantine
+  file as well, and still installs a validated file when those bytes
+  cannot be read. The running carrier stays closed until that operator
+  command. A later trusted snapshot does not clear that hold, and a
+  failed rebuild does not clear it. A recovered revocation is enforced
+  in the live set before the carrier opens. A save queued before the
+  rebuild cannot replace that file with the older snapshot. A waiting
+  certificate-recovery batch keeps at most 128 records and 1 MiB of
+  certificate and fetch metadata. A record is kept only with its
+  certificate or fetch binding. A later issuer certificate for the same
+  agent stays with its tombstone. A pending fetch for another issuer of
+  that agent stays beside the known certificate. Each distinct pending
+  certificate digest for that agent keeps its own route. A fetched certificate
+  is added to those known certificates. A pending route may be replaced
+  by a matching issuer certificate. A later batch that would drop an
+  admitted record, or a route that still has no certificate, is not stored.
+  The first waiting batch is trimmed the
+  same way. A later batch is not stored once the record cap is full.
+  A rebuild that fails before the
+  rename stays pending, and the next call writes those same bytes. A
+  failure after the rename is not queued again. When the discovery cache
+  has no subject certificate, every distinct cached blob is used. The
+  eight-fetch budget applies only to a miss, and only while a carrier
+  is waiting for resync. Those fetches share one blob deadline and run
+  outside the listener loop. Overlapping batches share that eight-fetch
+  allowance. At most four recovery tasks run at once. Further batches
+  coalesce, and completed task handles are reaped. A digest already
+  being fetched is not fetched again. A batch
+  subscribes for a free slot and checks that allowance again before it
+  waits. Agent shutdown joins this recovery, including its fetch tasks,
+  before it releases their slots or applies and persists the batch.
+  A failed digest is not fetched again until
+  its backoff has elapsed. Each miss list keeps its own
+  place. A shorter list does not move that place. When the table is full,
+  the oldest list is set aside under its own index, so a new list can
+  save its place and the older list does not start again at its first
+  subject. When that saved index is dropped, a later visit still moves
+  on to later subjects. The live table and the set-aside table each stay
+  at 64 lists. An incomplete snapshot
+  is not written, so a restart cannot admit a revoked agent from it. The
+  next start loads the live file. Placing a
+  readable file on the live path is a rebuild for the next start. It does
+  not change the set of a process that is already running. Do not delete
+  the quarantine file. Do not replace it with a zero-byte file. v1 and v2
+  revocation writes fsync the file and its directory. Accepted transient
+  record: `docs/adr/transient/T-revocation-store-corrupt.md` (slot A03, not
+  folded). Sender rule, Proposed:
+  `docs/adr/transient/T-revocation-snapshot-authority.md` (slot A02, not folded).
 
 - **A TreeKEM self-leave removes the leaver from the ratchet tree (#1113).**
   The roster removal left the leaf in place, so the leaver could derive later

@@ -266,6 +266,80 @@ pub async fn revocations(client: &DaemonClient) -> Result<()> {
     client.run_get("/identity/revocations").await
 }
 
+/// `x0x identity rebuild-revocation-store`
+///
+/// Validates a revocation file and installs it. Does not contact a running
+/// daemon. Stop x0xd before this command.
+pub async fn rebuild_revocation_store(
+    instance: Option<&str>,
+    carrier: &str,
+    from: Option<&std::path::Path>,
+    empty: bool,
+    confirm_empty: bool,
+) -> Result<()> {
+    if empty == from.is_some() {
+        bail!("pass either --from <file> or --empty --confirm-empty");
+    }
+    if empty && !confirm_empty {
+        bail!(
+            "--empty needs --confirm-empty. That flag is the operator's evidence that the set is complete"
+        );
+    }
+    let bytes = if empty {
+        let set = crate::revocation::RevocationSet::new();
+        match carrier {
+            "v1" => set
+                .to_bytes()
+                .context("could not encode an empty v1 store")?,
+            "v2" => set
+                .to_bytes_v2()
+                .context("could not encode an empty v2 store")?,
+            "v3" => set
+                .to_bytes_v3()
+                .context("could not encode an empty v3 store")?,
+            other => bail!("carrier must be v1, v2, or v3, not {other}"),
+        }
+    } else {
+        let path = from.context("pass --from <file> or --empty --confirm-empty")?;
+        tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("could not read {}", path.display()))?
+    };
+    let dir = match instance {
+        Some(name) => crate::storage::x0x_instance_dir(name).with_context(|| {
+            format!("could not resolve identity directory for instance '{name}'")
+        })?,
+        None => crate::storage::x0x_home_dir()
+            .context("could not determine default identity directory")?,
+    };
+    if !dir.is_dir() {
+        bail!("identity directory {} does not exist", dir.display());
+    }
+    let wrote =
+        crate::storage::install_operator_revocation_carrier(&dir, carrier, bytes, confirm_empty)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if wrote.empty_store {
+        println!(
+            "Validated and installed an empty {} in {}.",
+            wrote.file_name,
+            dir.display()
+        );
+        println!("The operator confirmed that this empty set is complete.");
+    } else {
+        println!(
+            "Validated and installed {} in {}.",
+            wrote.file_name,
+            dir.display()
+        );
+    }
+    if wrote.kept_durable_records {
+        println!("Revocations already durable in that file were kept.");
+    }
+    println!("The quarantine file was left in place. Start x0xd again.");
+    Ok(())
+}
+
 /// Resolve the payload for `sign`/`verify` from `--file <PATH>` (with `-`
 /// meaning stdin) or `--payload-b64 <BASE64>`, returning base64 bytes.
 fn payload_b64_from_args(file: Option<&str>, payload_b64: Option<&str>) -> Result<String> {

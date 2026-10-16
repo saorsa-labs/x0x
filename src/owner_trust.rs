@@ -422,10 +422,69 @@ impl OwnerTrust {
         let Some(devices) = self.device_store() else {
             return false;
         };
-        if revocation_set.read().await.is_machine_revoked(machine_id) {
-            return false;
+        {
+            let revoked = revocation_set.read().await;
+            if revoked.revocation_resync_required() || revoked.is_machine_revoked(machine_id) {
+                return false;
+            }
         }
         devices.is_enrolled(machine_id, &owner).await
+    }
+
+    /// Whether an explicit revocation record bars `sender` from reopening a
+    /// corrupt carrier (#1116).
+    ///
+    /// The unknown-carrier hold does not count. A record for the agent, the
+    /// authenticated machine, or that binding does. A busy binding lock
+    /// fails closed.
+    pub(crate) fn snapshot_sender_explicitly_revoked(
+        &self,
+        sender: &AgentId,
+        revoked: &RevocationSet,
+    ) -> bool {
+        if revoked.is_agent_revoked(sender) {
+            return true;
+        }
+        let Ok(bindings) = self.bindings.try_read() else {
+            return true;
+        };
+        let Some(machine) = bindings.peek(sender).map(|binding| binding.machine_id) else {
+            return false;
+        };
+        drop(bindings);
+        revoked.is_machine_revoked(&machine) || revoked.is_binding_revoked(sender, &machine)
+    }
+
+    /// Whether `sender` may reopen a corrupt revocation carrier because its
+    /// authenticated machine is enrolled to the local owner (#1116).
+    ///
+    /// The resync hold does not hide the owner's other machine. An explicit
+    /// revocation of the agent, that machine, or the binding does. A busy
+    /// lock, a missing binding, a missing owner, or an enrollment that is
+    /// not current returns false.
+    pub(crate) fn try_enrolled_snapshot_authority(
+        &self,
+        sender: &AgentId,
+        revoked: &RevocationSet,
+    ) -> bool {
+        if self.snapshot_sender_explicitly_revoked(sender, revoked) {
+            return false;
+        }
+        let Some(owner) = self.local_owner else {
+            return false;
+        };
+        let Some(devices) = self.device_store() else {
+            return false;
+        };
+        let Ok(bindings) = self.bindings.try_read() else {
+            return false;
+        };
+        let Some(machine) = bindings.peek(sender).map(|binding| binding.machine_id) else {
+            return false;
+        };
+        drop(bindings);
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        devices.try_evidence_enrolled(&machine, &owner, now_ms) == Some(true)
     }
 
     /// Whether `(agent_id, machine_id)` is owner-trusted (module docs, 1–5).

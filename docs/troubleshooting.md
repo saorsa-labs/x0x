@@ -263,3 +263,45 @@ Two cases can keep a group in this state:
 - **A power loss reverted a change that had not reached disk.** If a group change was in place but not yet durable, and the next change's journal replaced the earlier journal, the restart cannot repair that group. The group then stays unavailable. Share the group again from a member that still has it.
 
 Do not delete `<gid>.journal` or `<gid>.snap` files by hand. Check the daemon log for the storage error (a failed fsync, a full disk, or an I/O error) and fix the disk first.
+
+## 8) Membership stays closed after a bad revocation file [working]
+
+x0xd stores revocations in three files under the identity directory:
+
+- `revocations.bin` (agents and machines)
+- `revocations-v2.bin` (binding tombstones)
+- `revocations-v3.bin` (share-grant revocations)
+
+A missing file means no revocations are known yet. Membership stays open. A file that is present but cannot be decoded is different. That includes a zero-byte file and a truncated file. x0xd moves those bytes to `<file>.quarantined-<unix-ms>`. A taken name gets `-<seq>`. x0xd keeps running.
+
+`GET /status` and `x0x status` then set `revocation_resync_required` to true. `warnings` contains one sentence. The first status read also sends one `status` event on `/events`. Startup writes the same sentence as an error log line. If x0xd cannot move the bad bytes, the sentence says the live path still holds them. Membership still stays closed.
+
+While the flag is true, x0xd drops ordinary pubsub frames, direct messages, and DMs. It does not queue them for delivery after resync. A new send after the flag clears can succeed. Messages already stored stay stored. x0xd also withholds group admission, invite accept, join approval, key delivery, streams, and share-grant sends. It does not purge stored items. Revocation topics still flow. Identity, machine, and user announcements still flow, so a later revocation can be checked against a certificate.
+
+The flag clears for one file when a trusted authority has published a snapshot for that file and every record in the snapshot has verified. A trusted authority is a machine enrolled to the local owner, or an Active owner or admin in the local journal for a group this node belongs to. Two free agent keys are not enough. The node's own publish is not enough. An empty snapshot is not enough. A snapshot that leaves out a revocation this node already holds does not clear the flag. A trusted snapshot can still omit a revocation that was lost with the bad file. Enrollment or an Active owner or admin is the sender rule. It is not proof that the lost set was complete.
+
+A remote rebuild unites revocations it can still read from the quarantine file. A snapshot cannot drop one of those revocations. If those bytes cannot be read, x0xd does not install the snapshot. The carrier stays closed until the operator command below. That hold also stays on the running daemon. A later trusted snapshot does not clear it, and a failed rebuild does not clear it. A revocation recovered from the quarantine file is enforced before the carrier opens. A save queued before that rebuild cannot replace the file with the older snapshot. A waiting recovery record is kept only with its certificate or fetch binding. A later issuer certificate for the same agent stays with its tombstone. A pending fetch for another issuer of that agent stays beside the known certificate. Each distinct pending certificate digest for that agent keeps its own route. A fetched certificate is added to those known certificates. A pending route may be replaced by a matching issuer certificate. A later batch that would drop an admitted record, or a route that still has no certificate, is not stored.
+
+When no peer has a persisted file for that carrier, stop x0xd and validate a file before you install it. A remote peer cannot run this command.
+
+To install a file you already checked:
+
+```bash
+x0x identity rebuild-revocation-store --carrier v3 --from /path/to/revocations-v3.bin
+```
+
+For a named instance:
+
+```bash
+x0x --name <instance> identity rebuild-revocation-store --carrier v3 --from /path/to/revocations-v3.bin
+```
+
+Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. When the quarantine file can be read, the command unites those revocations too. Unreadable quarantine bytes do not block the command. The quarantine file stays. A zero-byte file is rejected.
+
+When you have independent evidence that the set is complete and empty, and no peer has a persisted file:
+
+```bash
+x0x identity rebuild-revocation-store --carrier v3 --empty --confirm-empty
+```
+
+`--confirm-empty` is required for an empty store. The command does not treat a zero-byte file, a deleted quarantine file, or an unconfirmed empty file as recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.

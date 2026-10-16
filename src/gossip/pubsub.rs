@@ -179,6 +179,9 @@ pub struct PubSubStats {
     pub incoming_sender_refused: AtomicU64,
     /// Millis since the unix epoch of the last sender-refusal debug log.
     sender_refusal_logged_at_ms: AtomicU64,
+    /// Messages dropped during a revocation resync (#1116). Not a decode
+    /// failure: the frame was valid. It is not queued for later delivery.
+    pub incoming_withheld: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
     /// Subscriber channel was full and got dropped to isolate the dispatcher
@@ -216,6 +219,8 @@ pub struct PubSubStatsSnapshot {
     pub incoming_decode_failed: u64,
     /// Verified payloads dropped because the sender is revoked or Blocked.
     pub incoming_sender_refused: u64,
+    /// Messages dropped during a revocation resync (#1116). Not queued.
+    pub incoming_withheld: u64,
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
@@ -225,9 +230,9 @@ pub struct PubSubStatsSnapshot {
     /// Local publishes whose eager-peer fan-out was zero.
     pub publish_zero_fanout: u64,
     /// `incoming_total - incoming_decoded - incoming_decode_failed -
-    /// incoming_sender_refused` — messages that entered the pipeline but did
-    /// not reach a decision yet (usually 0, non-zero means a worker panicked
-    /// or the decode task is blocked).
+    /// incoming_sender_refused - incoming_withheld` — messages that entered
+    /// the pipeline but did not reach a decision yet (usually 0, non-zero
+    /// means a worker panicked or the decode task is blocked).
     pub in_flight_decode: i64,
     /// `incoming_decoded - delivered_to_subscriber - subscriber_channel_closed`
     /// — messages decoded but never handed off (drop signal).
@@ -247,6 +252,7 @@ impl PubSubStats {
         let incoming_decoded = self.incoming_decoded.load(Ordering::Relaxed);
         let incoming_decode_failed = self.incoming_decode_failed.load(Ordering::Relaxed);
         let incoming_sender_refused = self.incoming_sender_refused.load(Ordering::Relaxed);
+        let incoming_withheld = self.incoming_withheld.load(Ordering::Relaxed);
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
@@ -255,7 +261,8 @@ impl PubSubStats {
         let in_flight_decode = incoming_total as i64
             - incoming_decoded as i64
             - incoming_decode_failed as i64
-            - incoming_sender_refused as i64;
+            - incoming_sender_refused as i64
+            - incoming_withheld as i64;
         let decode_to_delivery_drops = incoming_decoded as i64
             - delivered_to_subscriber as i64
             - subscriber_channel_closed as i64;
@@ -266,6 +273,7 @@ impl PubSubStats {
             incoming_decoded,
             incoming_decode_failed,
             incoming_sender_refused,
+            incoming_withheld,
             delivered_to_subscriber,
             slow_subscriber_dropped,
             subscriber_channel_closed,
@@ -879,6 +887,9 @@ struct OwnerSetup {
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     stats: Arc<PubSubStats>,
     sub_topic: String,
+    /// This node's agent, captured at subscribe. A snapshot this node
+    /// published must not arm its own carrier (#1116).
+    local_agent: Option<AgentId>,
 }
 
 impl Drop for OwnerSetup {
@@ -902,6 +913,7 @@ impl Drop for OwnerSetup {
         let group_identity = Arc::clone(&self.group_identity);
         let stats = Arc::clone(&self.stats);
         let sub_topic = self.sub_topic.clone();
+        let local_agent = self.local_agent;
         // The owner task is gone. Joiners already on the slot still need
         // a reader. `subscribe_ready` runs only when this task did not
         // install one.
@@ -926,6 +938,7 @@ impl Drop for OwnerSetup {
                 revocation_set,
                 group_identity,
                 sub_topic,
+                local_agent,
                 stamped_rx,
             )
             .await;
@@ -955,6 +968,7 @@ async fn run_delivery_forwarder(
     revocation_set: Arc<std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>>,
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     sub_topic: String,
+    local_agent: Option<AgentId>,
     mut stamped_rx: mpsc::UnboundedReceiver<StampedDelivery>,
 ) {
     #[cfg(test)]
@@ -965,6 +979,7 @@ async fn run_delivery_forwarder(
         revocation_set: &revocation_set,
         group_identity: &group_identity,
         sub_topic: &sub_topic,
+        local_agent,
     };
     loop {
         if !slot.alive.load(Ordering::Acquire) {
@@ -1114,6 +1129,7 @@ struct ForwardEnv<'a> {
     revocation_set: &'a std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>,
     group_identity: &'a std::sync::OnceLock<GroupIdentityContext>,
     sub_topic: &'a str,
+    local_agent: Option<AgentId>,
 }
 
 async fn forward_plumtree_payload(
@@ -1140,6 +1156,18 @@ async fn forward_plumtree_payload(
     let revocation = installed.or(from_builder);
     match decode_for_delivery(encoded_payload, env.contacts.get(), revocation).await {
         DeliveryVerdict::Delivered(message) => {
+            // #1116: a carrier snapshot is armed from the set delivery just
+            // read, before the frame is copied to subscribers.
+            if let Some(set) = revocation {
+                crate::revocation::arm_incoming_revocation_snapshot(
+                    set,
+                    &message.topic,
+                    &message.payload,
+                    message.sender.as_ref(),
+                    env.local_agent.as_ref(),
+                )
+                .await;
+            }
             let notification = PubSubNotification::with_transport_id(message, transport_msg_id);
             deliver_copied_notification(slot, env.stats, env.sub_topic, &notification, &recipients);
         }
@@ -1149,7 +1177,27 @@ async fn forward_plumtree_payload(
         DeliveryVerdict::Refused(sender) => {
             count_refused_deliveries(env.stats, env.sub_topic, &sender, recipients.len() as u64);
         }
+        DeliveryVerdict::Withheld => {
+            // #1116: a valid frame is dropped. It is not queued for delivery
+            // after resync. Count it with the other per-recipient decisions
+            // so the in-flight balance still closes.
+            count_withheld_deliveries(env.stats, env.sub_topic, recipients.len() as u64);
+        }
     }
+}
+
+fn count_withheld_deliveries(stats: &PubSubStats, sub_topic: &str, waiting: u64) {
+    if waiting == 0 {
+        return;
+    }
+    stats.incoming_total.fetch_add(waiting, Ordering::Relaxed);
+    stats
+        .incoming_withheld
+        .fetch_add(waiting, Ordering::Relaxed);
+    tracing::debug!(
+        topic = %sub_topic,
+        "[4/6 pubsub] payload dropped during revocation resync"
+    );
 }
 
 fn count_refused_deliveries(stats: &PubSubStats, sub_topic: &str, sender: &AgentId, waiting: u64) {
@@ -2932,6 +2980,7 @@ impl PubSubManager {
             let contacts = Arc::clone(&self.contacts);
             let revocation_set = Arc::clone(&self.revocation_set);
             let group_identity = Arc::clone(&self.group_identity);
+            let local_agent = self.signing.as_ref().map(|ctx| ctx.agent_id);
             let mut setup = OwnerSetup {
                 deliveries: Arc::clone(&self.topic_deliveries),
                 topic_id,
@@ -2944,6 +2993,7 @@ impl PubSubManager {
                 group_identity: Arc::clone(&group_identity),
                 stats: Arc::clone(&self.stats),
                 sub_topic: topic.clone(),
+                local_agent,
             };
             // A joiner can attach to the slot while this task is still
             // inside `subscribe_ready` only if it already holds a sender.
@@ -2978,6 +3028,7 @@ impl PubSubManager {
                     revocation_set,
                     group_identity,
                     sub_topic,
+                    local_agent,
                     stamped_rx,
                 )
                 .await;
@@ -4091,6 +4142,9 @@ enum DeliveryVerdict {
     Rejected,
     /// Revoked or Blocked. Counted as `incoming_sender_refused`.
     Refused(AgentId),
+    /// Valid frame dropped during revocation resync (#1116).
+    /// Not queued. Counted as `incoming_withheld`.
+    Withheld,
 }
 
 impl DeliveryVerdict {
@@ -4098,7 +4152,7 @@ impl DeliveryVerdict {
     fn into_message(self) -> Option<PubSubMessage> {
         match self {
             Self::Delivered(message) => Some(message),
-            Self::Rejected | Self::Refused(_) => None,
+            Self::Rejected | Self::Refused(_) | Self::Withheld => None,
         }
     }
 }
@@ -4165,8 +4219,22 @@ async fn decode_for_delivery(
     // gossiped revocation reaches delivery only once the eviction loop has
     // set trust = Blocked (a race reopens it).
     if let Some(rev_set) = revocation_set {
-        if rev_set.read().await.is_agent_revoked(&sender) {
+        let set = rev_set.read().await;
+        if set.is_agent_revoked(&sender) {
             return DeliveryVerdict::Refused(sender);
+        }
+        // #1116: while a revocation carrier is unverified, withhold ordinary
+        // topics. Revocation carriers and certificate announcements still
+        // flow. This is not a stored revocation and is not a decode failure.
+        if set.revocation_resync_required()
+            && !crate::revocation::is_revocation_recovery_topic(&message.topic)
+        {
+            tracing::debug!(
+                "Withholding payload from {} until revocation resync ({})",
+                sender,
+                message.topic
+            );
+            return DeliveryVerdict::Withheld;
         }
     }
 

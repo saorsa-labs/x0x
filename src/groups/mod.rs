@@ -2855,6 +2855,29 @@ impl GroupInfo {
     }
 }
 
+/// Whether `sender_hex` may reopen a corrupt revocation carrier (#1116).
+///
+/// The sender must be an Active owner or admin. The local agent must be
+/// Active in that same group. A withdrawn group does not qualify. A
+/// moderator, member, guest, outsider, or inactive seat does not qualify.
+pub(crate) fn sender_is_active_group_authority<'a>(
+    groups: impl IntoIterator<Item = &'a GroupInfo>,
+    local_agent_hex: &str,
+    sender_hex: &str,
+) -> bool {
+    groups.into_iter().any(|group| {
+        !group.withdrawn
+            && group
+                .members_v2
+                .get(local_agent_hex)
+                .is_some_and(GroupMember::is_active)
+            && group
+                .members_v2
+                .get(sender_hex)
+                .is_some_and(|member| member.is_active() && member.role.at_least(GroupRole::Admin))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2877,6 +2900,57 @@ mod tests {
         assert!(admin.is_active());
         assert_eq!(info.policy, GroupPolicy::default());
         assert_eq!(info.active_member_count(), 1);
+    }
+
+    #[test]
+    fn active_owner_or_admin_is_revocation_snapshot_authority_1116() {
+        let mut group = GroupInfo::new(
+            "Revocation".to_string(),
+            String::new(),
+            agent(1),
+            "aabb".repeat(8),
+        );
+        let local = hex::encode([1u8; 32]);
+        let admin = hex::encode([2u8; 32]);
+        let member = hex::encode([3u8; 32]);
+        let outsider = hex::encode([4u8; 32]);
+        let owner = hex::encode([5u8; 32]);
+        let moderator = hex::encode([6u8; 32]);
+        group.add_member(admin.clone(), GroupRole::Admin, None, None);
+        group.add_member(member.clone(), GroupRole::Member, None, None);
+        group.add_member(moderator.clone(), GroupRole::Moderator, None, None);
+        group.members_v2.insert(
+            owner.clone(),
+            GroupMember::new_owner(owner.clone(), None, 0),
+        );
+
+        assert!(sender_is_active_group_authority([&group], &local, &admin));
+        assert!(sender_is_active_group_authority([&group], &local, &local));
+        assert!(sender_is_active_group_authority([&group], &local, &owner));
+        assert!(!sender_is_active_group_authority([&group], &local, &member));
+        assert!(!sender_is_active_group_authority(
+            [&group],
+            &local,
+            &moderator
+        ));
+        assert!(!sender_is_active_group_authority(
+            [&group],
+            &local,
+            &outsider
+        ));
+        assert!(!sender_is_active_group_authority(
+            [&group],
+            &outsider,
+            &admin
+        ));
+
+        group.members_v2.get_mut(&admin).expect("admin").state = GroupMemberState::Removed;
+        assert!(!sender_is_active_group_authority([&group], &local, &admin));
+        group.members_v2.get_mut(&admin).expect("admin").state = GroupMemberState::Active;
+
+        group.withdrawn = true;
+        assert!(!sender_is_active_group_authority([&group], &local, &admin));
+        assert!(!sender_is_active_group_authority([&group], &local, &owner));
     }
 
     #[test]

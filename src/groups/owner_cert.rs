@@ -311,6 +311,10 @@ impl OwnerCertEvidence {
 pub enum OwnerCertFailure {
     /// The agent is in the local ADR-0018 revocation set.
     Revoked,
+    /// A revocation carrier is still unverified (#1116). This is not a
+    /// stored revocation. Callers withhold and may retry. They must not
+    /// evict the seat.
+    RevocationResync,
     /// No certificate could be resolved for the agent (announce blob not
     /// fetched yet, or the agent never held one).
     NoCertificate,
@@ -328,6 +332,7 @@ impl std::fmt::Display for OwnerCertFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
             Self::Revoked => "agent is revoked (ADR-0018)",
+            Self::RevocationResync => "revocation state is not verified yet",
             Self::NoCertificate => "no agent certificate resolved",
             Self::InvalidSignature => "certificate signature invalid",
             Self::NotChainedToOwner => "certificate does not chain to the group owner",

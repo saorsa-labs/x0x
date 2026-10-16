@@ -3,6 +3,7 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
+use super::super::sse::SseEvent;
 use super::super::state::AppState;
 use crate as x0x;
 use axum::extract::State;
@@ -235,6 +236,8 @@ pub(in crate::server) struct StatusData {
     agent_id: String,
     peers: usize,
     send_ready_peers: usize,
+    /// True while a corrupt revocation store still waits for a group resync.
+    revocation_resync_required: bool,
     warnings: Vec<String>,
 }
 
@@ -336,6 +339,26 @@ pub(in crate::server) async fn status(
         }
     }
 
+    let (revocation_resync_required, revocation_warning) = {
+        let revocations = state.agent.revocation_set();
+        let mut revocations = revocations.write().await;
+        if let Some(message) = revocations.take_revocation_status_event() {
+            let _ = state.broadcast_tx.send(SseEvent {
+                event_type: "status".to_string(),
+                data: serde_json::json!({
+                    "revocation_resync_required": true,
+                    "message": message,
+                }),
+            });
+        }
+        let required = revocations.revocation_resync_required();
+        let sentence = revocations.revocation_status_sentence().to_string();
+        (required, sentence)
+    };
+    if revocation_resync_required {
+        warnings.push(revocation_warning);
+    }
+
     let one_sided_peers = state.health_snapshot.load().2;
     let (connectivity, degraded_reason) = classify_runtime_status(
         peers,
@@ -359,6 +382,7 @@ pub(in crate::server) async fn status(
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             peers,
             send_ready_peers,
+            revocation_resync_required,
             warnings,
         },
     })

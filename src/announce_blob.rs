@@ -23,8 +23,12 @@
 //! Disk persistence: bincode file under the daemon data dir, loaded at
 //! startup, saved on insert. Bounded at `BLOB_CACHE_MAX_ENTRIES` (LRU).
 
-use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -188,6 +192,38 @@ struct LruEntry {
     access_counter: u64,
 }
 
+/// Place of each certificate-recovery miss list (#1116).
+///
+/// `cursors` holds at most 64 lists whose next subject is not the first.
+/// When that table is full, the oldest list moves to `retained` with its
+/// own index. A later list does not write over that index. `retained` is
+/// also at most 64 lists; the oldest retained list is the one dropped.
+/// `discards` counts those drops. `unsaved_service` moves the next window
+/// of a list whose index was dropped, so that list does not stay on its
+/// first subjects.
+#[derive(Debug, Default)]
+pub(crate) struct CertRecoveryAttempts {
+    pub(crate) cursors: HashMap<u64, u64>,
+    pub(crate) cursor_order: VecDeque<u64>,
+    pub(crate) retained: HashMap<u64, u64>,
+    pub(crate) retained_order: VecDeque<u64>,
+    pub(crate) discards: u64,
+    pub(crate) unsaved_service: u64,
+    /// Digests whose fetch failed. A later cursor step skips one until
+    /// its backoff has elapsed.
+    pub(crate) failed_digests: HashMap<[u8; 32], std::time::Instant>,
+    /// Digests reserved by a fetch that has not finished. Every overlapping
+    /// batch shares this set, and it stays at most eight. A second batch
+    /// waits on the notify instead of fetching that digest again.
+    pub(crate) in_flight: HashMap<[u8; 32], std::sync::Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    pub(crate) attempted: HashSet<identity::AgentId>,
+    #[cfg(test)]
+    pub(crate) fetch_calls: HashMap<[u8; 32], u32>,
+    #[cfg(test)]
+    pub(crate) publish_topics: Vec<&'static str>,
+}
+
 /// The blob cache: in-memory `HashMap` + optional disk persistence.
 pub struct AnnounceBlobCache {
     blobs: tokio::sync::RwLock<HashMap<[u8; 32], Arc<CachedBlob>>>,
@@ -198,8 +234,79 @@ pub struct AnnounceBlobCache {
     stats_misses: AtomicU64,
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
+    /// Next index of each revocation miss list. v1 and v2 share it. A
+    /// shorter list does not move a longer list. A full table sets the
+    /// oldest list aside under its own index. A dropped index still
+    /// reaches later subjects on a later visit. A network fetch runs
+    /// only while a carrier is waiting for resync. Overlapping batches
+    /// share one eight-fetch allowance (#1116).
+    cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
+    /// Wakes a batch waiting for a shared fetch slot.
+    budget_notify: std::sync::Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    bounded_fetch_fails: AtomicBool,
+    /// When set, a recovery fetch records its two topics and does not
+    /// publish them.
+    #[cfg(test)]
+    recovery_publish_probe: AtomicBool,
+    /// When set, a reserved fetch waits until release or shutdown.
+    #[cfg(test)]
+    recovery_fetch_hold: AtomicBool,
+    #[cfg(test)]
+    recovery_hold_release: tokio::sync::Notify,
+    /// Reserved fetches that have subscribed for the hold release.
+    #[cfg(test)]
+    recovery_hold_entered: AtomicUsize,
+    #[cfg(test)]
+    recovery_parked: AtomicUsize,
+    #[cfg(test)]
+    recovery_apply_entered: AtomicUsize,
+    #[cfg(test)]
+    recovery_tasks_finished: AtomicUsize,
+    /// Fetch children that have stopped, including ones that were aborted.
+    #[cfg(test)]
+    recovery_fetch_children_finished: AtomicUsize,
+    /// When set, a reserved fetch blocks in a synchronous section until release.
+    ///
+    /// An abort does not interrupt that section. Shutdown must join the
+    /// child before it drops the reservation.
+    #[cfg(test)]
+    recovery_fetch_sync_hold: AtomicBool,
+    #[cfg(test)]
+    recovery_sync_entered: AtomicUsize,
+    #[cfg(test)]
+    recovery_sync_release: AtomicBool,
+    #[cfg(test)]
+    recovery_sync_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    recovery_sync_cvar: std::sync::Condvar,
+    /// When set, a batch waits once after it claims slots and before it
+    /// subscribes for a free slot.
+    #[cfg(test)]
+    recovery_pre_wait_hold: AtomicBool,
+    #[cfg(test)]
+    recovery_pre_wait_arrived: AtomicUsize,
+    /// Wakes the first batch paused before its slot wait.
+    #[cfg(test)]
+    recovery_pre_wait_release: tokio::sync::Notify,
+    /// Wakes every later batch paused before its slot wait.
+    #[cfg(test)]
+    recovery_pre_wait_release_rest: tokio::sync::Notify,
     #[cfg(test)]
     diagnostics: AnnounceBlobDiagnosticCounters,
+}
+
+/// Drops by releasing the synchronous recovery-fetch section.
+#[cfg(test)]
+pub(crate) struct RecoverySyncReleaseGuard {
+    cache: std::sync::Arc<AnnounceBlobCache>,
+}
+
+#[cfg(test)]
+impl Drop for RecoverySyncReleaseGuard {
+    fn drop(&mut self) {
+        self.cache.release_recovery_sync_section_for_testing();
+    }
 }
 
 impl AnnounceBlobCache {
@@ -214,6 +321,44 @@ impl AnnounceBlobCache {
             stats_misses: AtomicU64::new(0),
             stats_fetches_ok: AtomicU64::new(0),
             stats_fetches_failed: AtomicU64::new(0),
+            cert_recovery_attempts: std::sync::Mutex::new(CertRecoveryAttempts::default()),
+            budget_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            bounded_fetch_fails: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_publish_probe: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_fetch_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_hold_release: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            recovery_hold_entered: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_parked: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_apply_entered: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_tasks_finished: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_fetch_children_finished: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_fetch_sync_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_sync_entered: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_sync_release: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_sync_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            recovery_sync_cvar: std::sync::Condvar::new(),
+            #[cfg(test)]
+            recovery_pre_wait_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_pre_wait_arrived: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_pre_wait_release: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            recovery_pre_wait_release_rest: tokio::sync::Notify::new(),
             #[cfg(test)]
             diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
@@ -310,6 +455,7 @@ impl AnnounceBlobCache {
         let digest = *digest;
         let agent_id = *agent_id;
         let machine_id = *machine_id;
+        // The revocation recovery path waits. This announce path does not.
         #[cfg(test)]
         self.diagnostics
             .fetches_spawned
@@ -338,6 +484,318 @@ impl AnnounceBlobCache {
             }
         });
         None
+    }
+
+    /// Wakes batches waiting for a shared fetch slot.
+    pub(crate) fn budget_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.budget_notify)
+    }
+
+    /// The shared v1 and v2 record of certificate-fetch attempts.
+    pub(crate) fn lock_cert_recovery_attempts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, CertRecoveryAttempts> {
+        self.cert_recovery_attempts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Test fetches return no blob and do not open a network request.
+    #[cfg(test)]
+    pub(crate) fn set_bounded_fetch_fails_for_testing(&self, fail: bool) {
+        self.bounded_fetch_fails.store(fail, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::set_bounded_fetch_fails_for_testing`] is set.
+    #[cfg(test)]
+    pub(crate) fn bounded_fetch_fails_for_testing(&self) -> bool {
+        self.bounded_fetch_fails.load(Ordering::Relaxed)
+    }
+
+    /// Whether recovery has already spent a fetch on `subject`.
+    #[cfg(test)]
+    pub(crate) fn cert_recovery_was_attempted_for_testing(
+        &self,
+        subject: &identity::AgentId,
+    ) -> bool {
+        self.lock_cert_recovery_attempts()
+            .attempted
+            .contains(subject)
+    }
+
+    /// Record the blob and identity topics instead of publishing them.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_publish_probe_for_testing(&self, enabled: bool) {
+        self.recovery_publish_probe
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether a recovery fetch should record topics and skip the network.
+    #[cfg(test)]
+    pub(crate) fn recovery_publish_probe_for_testing(&self) -> bool {
+        self.recovery_publish_probe.load(Ordering::Relaxed)
+    }
+
+    /// Topics a recovery fetch recorded. Empty when no fetch ran.
+    #[cfg(test)]
+    pub(crate) fn recovery_publish_topics_for_testing(&self) -> Vec<&'static str> {
+        self.lock_cert_recovery_attempts().publish_topics.clone()
+    }
+
+    /// How many times recovery has fetched `digest`.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_count_for_testing(&self, digest: &[u8; 32]) -> u32 {
+        self.lock_cert_recovery_attempts()
+            .fetch_calls
+            .get(digest)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Park a reserved fetch until the hold is cleared or shutdown cancels it.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_fetch_hold_for_testing(&self, hold: bool) {
+        self.recovery_fetch_hold.store(hold, Ordering::SeqCst);
+        if !hold {
+            self.recovery_hold_release.notify_waiters();
+        }
+    }
+
+    /// Whether reserved fetches should wait instead of publishing.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_hold_for_testing(&self) -> bool {
+        self.recovery_fetch_hold.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the hold is released. Shutdown is the caller's other arm.
+    ///
+    /// The notification future is created before the arrival count changes,
+    /// so a release after that count is visible is not lost.
+    #[cfg(test)]
+    pub(crate) async fn wait_recovery_hold_release_for_testing(&self) {
+        let wait = self.recovery_hold_release.notified();
+        self.recovery_hold_entered.fetch_add(1, Ordering::SeqCst);
+        wait.await;
+    }
+
+    /// Reserved fetches waiting for the hold to clear.
+    #[cfg(test)]
+    pub(crate) fn recovery_hold_entered_for_testing(&self) -> usize {
+        self.recovery_hold_entered.load(Ordering::SeqCst)
+    }
+
+    /// How many digests are reserved by an in-flight fetch.
+    #[cfg(test)]
+    pub(crate) fn recovery_in_flight_len_for_testing(&self) -> usize {
+        self.lock_cert_recovery_attempts().in_flight.len()
+    }
+
+    /// One batch has reserved what it can and is waiting.
+    #[cfg(test)]
+    pub(crate) fn note_recovery_parked_for_testing(&self) {
+        self.recovery_parked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Batches that have reached the shared wait.
+    #[cfg(test)]
+    pub(crate) fn recovery_parked_for_testing(&self) -> usize {
+        self.recovery_parked.load(Ordering::SeqCst)
+    }
+
+    /// Recovery passed the shutdown check and entered apply.
+    #[cfg(test)]
+    pub(crate) fn note_recovery_apply_for_testing(&self) {
+        self.recovery_apply_entered.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many recovery batches entered apply.
+    #[cfg(test)]
+    pub(crate) fn recovery_apply_count_for_testing(&self) -> usize {
+        self.recovery_apply_entered.load(Ordering::SeqCst)
+    }
+
+    /// A tracked recovery task returned, including a cancelled one.
+    #[cfg(test)]
+    pub(crate) fn note_recovery_task_finished_for_testing(&self) {
+        self.recovery_tasks_finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Tracked recovery tasks that have returned.
+    #[cfg(test)]
+    pub(crate) fn recovery_tasks_finished_for_testing(&self) -> usize {
+        self.recovery_tasks_finished.load(Ordering::SeqCst)
+    }
+
+    /// A fetch child has stopped. The child task records this itself.
+    #[cfg(test)]
+    pub(crate) fn note_recovery_fetch_child_finished_for_testing(&self) {
+        self.recovery_fetch_children_finished
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Fetch children that have stopped.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_children_finished_for_testing(&self) -> usize {
+        self.recovery_fetch_children_finished.load(Ordering::SeqCst)
+    }
+
+    /// Park a reserved fetch inside a synchronous section until release.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_fetch_sync_hold_for_testing(&self, hold: bool) {
+        self.recovery_fetch_sync_hold.store(hold, Ordering::SeqCst);
+    }
+
+    /// Whether a reserved fetch should block synchronously.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_sync_hold_for_testing(&self) -> bool {
+        self.recovery_fetch_sync_hold.load(Ordering::SeqCst)
+    }
+
+    /// Fetches that have entered the synchronous section.
+    #[cfg(test)]
+    pub(crate) fn recovery_sync_entered_for_testing(&self) -> usize {
+        self.recovery_sync_entered.load(Ordering::SeqCst)
+    }
+
+    /// Block until [`Self::release_recovery_sync_section_for_testing`].
+    ///
+    /// This does not await. A task abort cannot stop it before it returns.
+    /// The wait is bounded so a missed release cannot hang process teardown.
+    #[cfg(test)]
+    pub(crate) fn block_in_recovery_sync_section_for_testing(&self) {
+        self.recovery_sync_entered.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut guard = self
+            .recovery_sync_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.recovery_sync_release.load(Ordering::SeqCst) {
+            if started.elapsed() >= std::time::Duration::from_secs(30) {
+                break;
+            }
+            let (next, _) = self
+                .recovery_sync_cvar
+                .wait_timeout(guard, std::time::Duration::from_millis(50))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+        }
+    }
+
+    /// Release the synchronous fetch section when this guard drops.
+    ///
+    /// An assertion that panics before the explicit release still wakes
+    /// the child, so Tokio teardown does not wait out the condvar.
+    #[cfg(test)]
+    pub(crate) fn recovery_sync_release_guard_for_testing(
+        self: &std::sync::Arc<Self>,
+    ) -> RecoverySyncReleaseGuard {
+        RecoverySyncReleaseGuard {
+            cache: std::sync::Arc::clone(self),
+        }
+    }
+
+    /// Let every synchronous fetch section return.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_sync_section_for_testing(&self) {
+        self.recovery_sync_release.store(true, Ordering::SeqCst);
+        self.recovery_fetch_sync_hold.store(false, Ordering::SeqCst);
+        let _guard = self
+            .recovery_sync_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recovery_sync_cvar.notify_all();
+    }
+
+    /// Hold each batch once, after its claim and before its first slot wait.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_pre_wait_hold_for_testing(&self, hold: bool) {
+        self.recovery_pre_wait_hold.store(hold, Ordering::SeqCst);
+        if !hold {
+            self.recovery_pre_wait_release.notify_waiters();
+            self.recovery_pre_wait_release_rest.notify_waiters();
+        }
+    }
+
+    /// Let every paused batch after the first leave the pre-wait gate.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_pre_wait_rest_for_testing(&self) {
+        self.recovery_pre_wait_release_rest.notify_waiters();
+    }
+
+    /// Whether the next recovery batch should pause before its first wait.
+    #[cfg(test)]
+    pub(crate) fn recovery_pre_wait_hold_for_testing(&self) -> bool {
+        self.recovery_pre_wait_hold.load(Ordering::SeqCst)
+    }
+
+    /// Batches paused before their first slot wait.
+    #[cfg(test)]
+    pub(crate) fn recovery_pre_wait_arrived_for_testing(&self) -> usize {
+        self.recovery_pre_wait_arrived.load(Ordering::SeqCst)
+    }
+
+    /// Subscribe for this batch's pre-wait release, then record that it is paused.
+    ///
+    /// The first batch waits on its own notification. Later batches wait on
+    /// another, so a test can let one proceed while the other stays parked.
+    #[cfg(test)]
+    pub(crate) async fn arrive_and_wait_recovery_pre_wait_for_testing(&self) {
+        let wait_first = self.recovery_pre_wait_release.notified();
+        let wait_rest = self.recovery_pre_wait_release_rest.notified();
+        let arrived = self
+            .recovery_pre_wait_arrived
+            .fetch_add(1, Ordering::SeqCst);
+        if arrived == 0 {
+            wait_first.await;
+        } else {
+            wait_rest.await;
+        }
+    }
+
+    /// Drop one shared reservation and wake slot waiters.
+    #[cfg(test)]
+    pub(crate) fn release_recovery_reservation_for_testing(&self, digest: &[u8; 32]) {
+        let notify = self.lock_cert_recovery_attempts().in_flight.remove(digest);
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+            self.budget_notify.notify_waiters();
+        }
+    }
+
+    /// One verified fetch for a revocation subject, bounded by the blob
+    /// deadline (#1116).
+    ///
+    /// A cache hit returns at once. A miss waits for
+    /// [`fetch_and_verify`] and caches only a verified blob. One attempt.
+    pub(crate) async fn fetch_bounded(
+        &self,
+        pubsub: &Arc<PubSubManager>,
+        digest: &[u8; 32],
+        agent_id: &identity::AgentId,
+        machine_id: &identity::MachineId,
+    ) -> Option<Arc<CachedBlob>> {
+        if let Some(hit) = self.get(digest).await {
+            return Some(hit);
+        }
+        match fetch_and_verify(pubsub, self, digest, agent_id, machine_id).await {
+            Ok(blob) => {
+                self.stats_fetches_ok.fetch_add(1, Ordering::Relaxed);
+                let digest = blob.digest;
+                self.insert_verified(blob).await;
+                self.get(&digest).await
+            }
+            Err(reason) => {
+                self.stats_fetches_failed.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    target: "announce.blob",
+                    digest = %hex::encode(digest),
+                    agent = %hex::encode(agent_id.0),
+                    %reason,
+                    "revocation subject certificate fetch failed"
+                );
+                None
+            }
+        }
     }
 
     /// Serve a blob request from our own current announcement state only.

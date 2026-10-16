@@ -1108,9 +1108,9 @@ async fn v3_merge_applies_the_gc_horizon() {
 /// `revocations-v3.bin`, or a restart forgets it and the outbox could
 /// redeliver the grant. Functional half: the v3 writer persists a record
 /// inserted the way the legacy handlers insert it, and it survives a reload
-/// while the legacy encodings drop it. Wiring half: both legacy handlers
-/// call the v3 writer (they are inline in the gossip listener and cannot be
-/// driven without a network, so this half is a source check).
+/// while the legacy encodings drop it. Wiring half: each legacy listener
+/// reaches its apply helper, and that helper calls the v3 writer. The
+/// handlers cannot be driven without a network, so this half is a source check.
 #[tokio::test]
 async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
     let world = World::new().await;
@@ -1134,14 +1134,34 @@ async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
     assert!(reload_v3(&path).is_share_grant_revoked(&grant.grant_id, &grant.owner));
 
     let lib = include_str!("../../lib.rs");
-    for (arm, next) in [
+    // The v1/v2 listener arms call these helpers (directly on a cache hit,
+    // and through `track_cert_recovery` when a fetch is still required).
+    // `track_cert_recovery` queues that batch. `spawn_cert_recovery_task`
+    // applies it. The helpers own the v3 write.
+    let track = rust_fn_body(lib, "fn track_cert_recovery(");
+    assert!(
+        track.contains("spawn_cert_recovery_task("),
+        "tracked recovery must start the batch that applies records"
+    );
+    let spawned = rust_fn_body(lib, "fn spawn_cert_recovery_task(");
+    assert!(
+        spawned.contains("apply_legacy_revocation_records("),
+        "tracked recovery must apply a v1 batch through apply_legacy_revocation_records"
+    );
+    assert!(
+        spawned.contains("apply_v2_revocation_records("),
+        "tracked recovery must apply a v2 batch through apply_v2_revocation_records"
+    );
+    for (arm, next, helper) in [
         (
             "DiscoveryMessage::Revocation(msg) => {",
             "DiscoveryMessage::RevocationV2(msg) => {",
+            "apply_legacy_revocation_records(",
         ),
         (
             "DiscoveryMessage::RevocationV2(msg) => {",
             "DiscoveryMessage::RevocationV3(msg) => {",
+            "apply_v2_revocation_records(",
         ),
     ] {
         let body = lib
@@ -1149,11 +1169,43 @@ async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
             .nth(1)
             .and_then(|rest| rest.split(next).next())
             .unwrap_or_default();
+        assert!(body.contains(helper), "{arm} must apply through {helper}");
         assert!(
-            body.contains("persist_share_grant_revocations("),
-            "{arm} must persist share-grant revocations to v3"
+            body.contains("track_cert_recovery("),
+            "{arm} must send a fetch batch through track_cert_recovery"
+        );
+        let helper_body = rust_fn_body(lib, &format!("async fn {helper}"));
+        assert!(
+            helper_body.contains("persist_share_grant_revocations("),
+            "{helper} must persist share-grant revocations to v3"
         );
     }
+}
+
+/// The body of the first `signature` in `lib`, including its braces.
+/// Format-string braces in these handlers are balanced, so the depth count
+/// ends at the function's closing brace.
+fn rust_fn_body<'a>(lib: &'a str, signature: &str) -> &'a str {
+    let Some(rest) = lib.split(signature).nth(1) else {
+        return "";
+    };
+    let Some(open) = rest.find('{') else {
+        return "";
+    };
+    let mut depth = 0;
+    for (index, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[open..=open + index];
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
 }
 
 /// WHY (review P1, fail loud): if `revocations-v3.bin` cannot be written
@@ -1641,4 +1693,40 @@ async fn reconnect_nudge_includes_already_due_entries() {
     // A peer with nothing queued is still not nudged.
     assert!(!outbox.nudge(&[AgentId([0x42; 32])], later));
     assert!(outbox.notified().now_or_never().is_none());
+}
+
+/// WHY (#1116): a revocation-store hold must not send a queued grant and
+/// must not delete it. Delivery resumes after the hold clears.
+#[tokio::test]
+async fn revocation_resync_hold_keeps_queued_grant_delivery() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(0x44, 3_600);
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
+    *world.revocations.write().await = crate::revocation::RevocationSet::quarantined_carrier(
+        crate::revocation::REVOCATION_CARRIER_V3,
+    );
+    let due = world.now + retry_delay_secs(0);
+    let held = outbox
+        .step(due, &world.revocations, |recipient, payload, request_id| {
+            receiver.send(recipient, payload, request_id)
+        })
+        .await;
+    assert_eq!(held.dropped, 0, "the hold is not a revocation");
+    assert_eq!(held.delivered, 0, "the hold does not send");
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(outbox.len(), 1, "the queued grant stays");
+    *world.revocations.write().await = crate::revocation::RevocationSet::new();
+    let resumed = outbox
+        .step(due, &world.revocations, |recipient, payload, request_id| {
+            receiver.send(recipient, payload, request_id)
+        })
+        .await;
+    assert_eq!(resumed.delivered, 1, "{resumed:?}");
+    assert!(outbox.is_empty());
 }

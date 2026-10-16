@@ -26,6 +26,7 @@
 //! bytes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ant_quic::crypto::raw_public_keys::pqc::{
     sign_with_ml_dsa, verify_with_ml_dsa, MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
@@ -508,6 +509,164 @@ pub struct RevocationSet {
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
     change_generation: u64,
+    /// Carriers whose files were present but could not be decoded (#1116).
+    /// Bits: v1 = 1, v2 = 2, v3 = 4. Not serialized. Membership stays
+    /// closed until each pending carrier is resynced from the group.
+    /// The four `is_*_revoked` predicates stay record-only, so this state
+    /// is not proof that a grant, binding or subject was revoked.
+    resync_carriers: u8,
+    /// Carriers whose snapshot is accepted but whose recovered records are
+    /// not yet in this set (#1116). A fresh snapshot cannot clear this.
+    /// It stays set when the rebuild fails. Not serialized.
+    reconcile_carriers: u8,
+    /// Remote snapshots offered for a waiting carrier. Index 0 is v1, 1 is
+    /// v2, 2 is v3. The key is the sending agent. Ordinary ingestion does
+    /// not write this map and does not open the carrier.
+    resync_candidates: [HashMap<AgentId, HashSet<[u8; 32]>>; 3],
+    /// Carriers whose verified resync has not been written to the live path.
+    rebuild_pending: u8,
+    /// Set when the quarantine rename failed. Status then says the live
+    /// path still holds the bad bytes.
+    status_override: Option<&'static str>,
+    /// `GET /status` emits the revocation status event once per hold.
+    status_event_pending: bool,
+    /// Sender check for a waiting carrier. Absent means no snapshot opens.
+    snapshot_authority: Option<SnapshotAuthority>,
+}
+
+/// v1 `revocations.bin` / `x0x.revocation.v1`.
+pub(crate) const REVOCATION_CARRIER_V1: u8 = 1;
+/// v2 `revocations-v2.bin` / `x0x.revocation.v2`.
+pub(crate) const REVOCATION_CARRIER_V2: u8 = 2;
+/// v3 `revocations-v3.bin` / `x0x.revocation.v3`.
+pub(crate) const REVOCATION_CARRIER_V3: u8 = 4;
+
+/// Text for the log line and the API/CLI status event (#1116).
+pub const REVOCATION_RESYNC_STATUS: &str = "A revocation store could not be decoded. x0xd archived the bad bytes and kept running. Membership stays closed until the group resyncs revocations. A member whose non-revocation is not verified is revoked.";
+
+/// Status text when the bad bytes could not be moved off the live path.
+pub const REVOCATION_ARCHIVE_FAILED: &str = "A revocation store could not be decoded. x0xd could not archive the bad bytes. The live path still holds them. Membership stays closed until the group resyncs revocations. A member whose non-revocation is not verified is revoked.";
+
+/// Who may reopen a waiting revocation carrier (#1116).
+///
+/// A free agent key is not enough. The daemon installs this check from
+/// owner enrollment and the local group journal. Tests install a predicate.
+type SnapshotAuthorityCheck = dyn Fn(&AgentId, &RevocationSet) -> bool + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct SnapshotAuthority(Arc<SnapshotAuthorityCheck>);
+
+impl std::fmt::Debug for SnapshotAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SnapshotAuthority")
+    }
+}
+
+impl SnapshotAuthority {
+    pub(crate) fn new(
+        check: impl Fn(&AgentId, &RevocationSet) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+
+    fn allows(&self, sender: &AgentId, set: &RevocationSet) -> bool {
+        (self.0)(sender, set)
+    }
+}
+
+fn carrier_index(carrier: u8) -> Option<usize> {
+    match carrier {
+        REVOCATION_CARRIER_V1 => Some(0),
+        REVOCATION_CARRIER_V2 => Some(1),
+        REVOCATION_CARRIER_V3 => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether `topic` carries revocation records that must still be delivered
+/// while membership is closed (#1116).
+#[must_use]
+pub(crate) fn is_revocation_carrier_topic(topic: &str) -> bool {
+    matches!(
+        topic,
+        crate::REVOCATION_TOPIC | crate::REVOCATION_V2_TOPIC | crate::REVOCATION_V3_TOPIC
+    )
+}
+
+/// Topics that may flow while membership is closed (#1116).
+///
+/// Revocation carriers rebuild the set. Identity, machine and user
+/// announcements carry the certificates an issuer revocation or a binding
+/// tombstone needs. The v3 blob topic carries a certificate fetch for
+/// that rebuild. Other topics stay withheld.
+#[must_use]
+pub(crate) fn is_revocation_recovery_topic(topic: &str) -> bool {
+    is_revocation_carrier_topic(topic)
+        || matches!(
+            topic,
+            crate::IDENTITY_ANNOUNCE_TOPIC
+                | crate::MACHINE_ANNOUNCE_TOPIC
+                | crate::USER_ANNOUNCE_TOPIC
+                | crate::MACHINE_ANNOUNCE_V3_TOPIC
+                | crate::ANNOUNCE_BLOB_V2_TOPIC
+                | crate::announce_blob::ANNOUNCE_BLOB_TOPIC
+        )
+        || topic.starts_with("x0x.identity.shard.v2.")
+        || topic.starts_with("x0x.machine.shard.v2.")
+        || topic.starts_with("x0x.user.shard.v2.")
+}
+
+fn subject_carrier(subject: &RevokedSubject) -> Option<u8> {
+    Some(match subject {
+        RevokedSubject::Agent(_) | RevokedSubject::Machine(_) => REVOCATION_CARRIER_V1,
+        RevokedSubject::AgentMachineBinding(_) => REVOCATION_CARRIER_V2,
+        RevokedSubject::ShareGrant(_) => REVOCATION_CARRIER_V3,
+    })
+}
+
+/// Record one remote carrier snapshot (#1116).
+///
+/// A topic that is not a revocation carrier is ignored. A carrier that is
+/// not waiting is ignored, so a healthy daemon does not take the write
+/// lock. An empty or undecodable payload does not open membership. A
+/// message from `local_agent`, or a message with no sender, is not a
+/// group snapshot. Recording the snapshot does not insert records and
+/// does not by itself open the carrier.
+pub(crate) async fn arm_incoming_revocation_snapshot(
+    set: &std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
+    topic: &str,
+    payload: &[u8],
+    sender: Option<&crate::identity::AgentId>,
+    local_agent: Option<&crate::identity::AgentId>,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    if local_agent.is_some_and(|local| local == sender) {
+        return;
+    }
+    let carrier = match topic {
+        crate::REVOCATION_TOPIC => REVOCATION_CARRIER_V1,
+        crate::REVOCATION_V2_TOPIC => REVOCATION_CARRIER_V2,
+        crate::REVOCATION_V3_TOPIC => REVOCATION_CARRIER_V3,
+        _ => return,
+    };
+    if !set.read().await.carrier_resync_pending(carrier) {
+        return;
+    }
+    let Ok(records) = bincode::deserialize::<Vec<RevocationRecord>>(payload) else {
+        return;
+    };
+    let trusted = {
+        let guard = set.read().await;
+        guard
+            .snapshot_authority
+            .as_ref()
+            .is_some_and(|authority| authority.allows(sender, &guard))
+    };
+    set.write()
+        .await
+        .observe_remote_carrier_snapshot(carrier, sender, &records, trusted);
 }
 
 impl RevocationSet {
@@ -515,6 +674,271 @@ impl RevocationSet {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A revocation file was present but could not be decoded (#1116).
+    ///
+    /// Membership stays closed until a trusted authority publishes a
+    /// verified snapshot for each pending carrier and the rebuild has
+    /// installed the recovered records. A later snapshot does not clear
+    /// that second hold, and a failed rebuild leaves it set. Two free
+    /// agent keys are not that authority. This is not a revocation
+    /// record. [`Self::is_agent_revoked`] and the other record predicates
+    /// stay false for subjects that are not in the set.
+    #[must_use]
+    pub fn revocation_resync_required(&self) -> bool {
+        self.admission_closed()
+    }
+
+    fn admission_closed(&self) -> bool {
+        self.resync_carriers != 0 || self.reconcile_carriers != 0
+    }
+
+    /// Operator sentence for the log line, `warnings`, and the status event.
+    #[must_use]
+    pub fn revocation_status_sentence(&self) -> &'static str {
+        self.status_override.unwrap_or(REVOCATION_RESYNC_STATUS)
+    }
+
+    /// One-shot status event for `GET /status` and the `/events` stream.
+    ///
+    /// Returns the operator text once while a resync is still required.
+    #[must_use]
+    pub fn take_revocation_status_event(&mut self) -> Option<&'static str> {
+        if !self.admission_closed() || !self.status_event_pending {
+            return None;
+        }
+        self.status_event_pending = false;
+        Some(self.revocation_status_sentence())
+    }
+
+    /// The quarantine rename failed. Later status reads say so.
+    pub(crate) fn note_archive_failed(&mut self) {
+        self.status_override = Some(REVOCATION_ARCHIVE_FAILED);
+    }
+
+    /// Carriers that just opened and still need a live-file rebuild.
+    ///
+    /// The caller writes those bytes and leaves the quarantine file in place.
+    pub(crate) fn take_rebuild_pending(&mut self) -> u8 {
+        let pending = self.rebuild_pending;
+        self.rebuild_pending = 0;
+        pending
+    }
+
+    /// Put carrier bits back after a rebuild that failed before the rename.
+    ///
+    /// This does not close the carrier. A retry of a readable quarantine
+    /// writes the same bytes. A failure after the rename must not call
+    /// this: the live file is already in place. An unreadable quarantine
+    /// is closed by [`Self::hold_carrier_until_reconciled`].
+    pub(crate) fn requeue_rebuild_pending(&mut self, carriers: u8) {
+        self.rebuild_pending |= carriers;
+    }
+
+    /// Close one carrier until its durable records are in this set.
+    ///
+    /// This is not the snapshot-resync bit. A later trusted snapshot cannot
+    /// clear it. The rebuild holds it from the moment the snapshot would
+    /// otherwise open admission, and a failed rebuild leaves it set.
+    pub(crate) fn hold_carrier_until_reconciled(&mut self, carrier: u8) {
+        let Some(index) = carrier_index(carrier) else {
+            return;
+        };
+        self.reconcile_carriers |= carrier;
+        self.resync_candidates[index].clear();
+        self.status_event_pending = true;
+    }
+
+    /// Open one carrier after its durable records are in this set.
+    ///
+    /// A missing install, a read failure, or any rebuild error must not
+    /// call this.
+    pub(crate) fn release_reconciled_carrier(&mut self, carrier: u8) {
+        self.reconcile_carriers &= !carrier;
+    }
+
+    /// Empty set that closes membership for one carrier (#1116).
+    ///
+    /// A missing file stays [`Self::new`].
+    pub(crate) fn quarantined_carrier(carrier: u8) -> Self {
+        Self {
+            resync_carriers: carrier,
+            status_event_pending: carrier != 0,
+            ..Self::new()
+        }
+    }
+
+    /// Whether this carrier still waits for a group snapshot (#1116).
+    #[must_use]
+    pub(crate) fn carrier_resync_pending(&self, carrier: u8) -> bool {
+        self.resync_carriers & carrier != 0
+    }
+
+    /// Install the check that names a trusted snapshot sender (#1116).
+    ///
+    /// A missing check leaves every carrier closed. The daemon installs
+    /// enrollment and the local group journal. An operator rebuild does
+    /// not use this check.
+    pub(crate) fn set_snapshot_authority(&mut self, authority: SnapshotAuthority) {
+        self.snapshot_authority = Some(authority);
+    }
+
+    /// Remember one remote sender's carrier snapshot (#1116).
+    ///
+    /// This does not insert records. An untrusted sender, an empty
+    /// snapshot, a record from another carrier, or a snapshot that omits
+    /// a revocation already in the set is ignored. The carrier opens only
+    /// when a trusted authority has offered a snapshot whose records have
+    /// all verified and match the records already in the set.
+    pub(crate) fn observe_remote_carrier_snapshot(
+        &mut self,
+        carrier: u8,
+        sender: &AgentId,
+        records: &[RevocationRecord],
+        trusted_authority: bool,
+    ) {
+        if !trusted_authority || self.resync_carriers & carrier == 0 || records.is_empty() {
+            return;
+        }
+        let Some(index) = carrier_index(carrier) else {
+            return;
+        };
+        if records
+            .iter()
+            .any(|record| subject_carrier(&record.subject) != Some(carrier))
+        {
+            return;
+        }
+        let hashes: HashSet<[u8; 32]> = records.iter().map(RevocationRecord::record_hash).collect();
+        let known = self.known_carrier_hashes(carrier);
+        if !hashes.is_superset(&known) {
+            return;
+        }
+        self.resync_candidates[index].insert(*sender, hashes);
+        self.try_complete_carrier(carrier);
+    }
+
+    /// Insert a fully verified snapshot without treating it as group proof.
+    ///
+    /// An empty snapshot leaves membership closed. If any record fails
+    /// verification, nothing is inserted and no carrier opens. Inserting
+    /// records is not proof that the group snapshot is complete. A carrier
+    /// opens only when a trusted authority offers one verified snapshot.
+    /// Binding tombstones and issuer revocations need the subject
+    /// certificate; pass it through
+    /// [`Self::apply_group_revocation_resync_with_certs`].
+    pub fn apply_group_revocation_resync(
+        &mut self,
+        records: impl IntoIterator<Item = RevocationRecord>,
+        now_unix: u64,
+    ) -> bool {
+        self.apply_group_revocation_resync_with_certs(records, &HashMap::new(), now_unix)
+    }
+
+    /// [`Self::apply_group_revocation_resync`] with subject certificates.
+    ///
+    /// `certs` is keyed by the subject agent. A binding tombstone or an
+    /// issuer revocation without its certificate fails the snapshot, and
+    /// the hold stays closed.
+    pub fn apply_group_revocation_resync_with_certs(
+        &mut self,
+        records: impl IntoIterator<Item = RevocationRecord>,
+        certs: &HashMap<AgentId, AgentCertificate>,
+        now_unix: u64,
+    ) -> bool {
+        if self.resync_carriers == 0 {
+            return false;
+        }
+        let records: Vec<RevocationRecord> = records.into_iter().collect();
+        if records.is_empty() {
+            return false;
+        }
+        let mut parsed = Vec::with_capacity(records.len());
+        for record in records {
+            if subject_carrier(&record.subject).is_none() {
+                return false;
+            }
+            let cert = record
+                .needs_certificate_authority()
+                .and_then(|agent| certs.get(&agent));
+            if !record.revoked_at_is_credible(now_unix) || record.verify_authority(cert).is_err() {
+                return false;
+            }
+            parsed.push(record);
+        }
+        for record in parsed {
+            let cert = record
+                .needs_certificate_authority()
+                .and_then(|agent| certs.get(&agent));
+            let _ = self.verify_and_insert_at(record, cert, now_unix);
+        }
+        // The snapshot is accepted when its resync bit clears. Admission
+        // stays closed until the rebuild releases the reconcile hold.
+        self.resync_carriers == 0
+    }
+
+    fn known_carrier_hashes(&self, carrier: u8) -> HashSet<[u8; 32]> {
+        self.records_by_hash
+            .iter()
+            .filter(|(_, persisted)| subject_carrier(&persisted.record.subject) == Some(carrier))
+            .map(|(hash, _)| *hash)
+            .collect()
+    }
+
+    fn try_complete_carrier(&mut self, carrier: u8) {
+        if self.resync_carriers & carrier == 0 {
+            return;
+        }
+        let Some(index) = carrier_index(carrier) else {
+            return;
+        };
+        let known = self.known_carrier_hashes(carrier);
+        if known.is_empty() {
+            return;
+        }
+        let agreed = self.resync_candidates[index]
+            .values()
+            .any(|hashes| hashes == &known);
+        if !agreed {
+            return;
+        }
+        // Close admission before the resync bit drops, so a member is
+        // never admitted against a snapshot that has not been installed.
+        self.reconcile_carriers |= carrier;
+        self.status_event_pending = true;
+        self.resync_carriers &= !carrier;
+        self.resync_candidates[index].clear();
+        self.rebuild_pending |= carrier;
+    }
+
+    /// Whether `id` must be refused as a member.
+    ///
+    /// True when `id` has a revocation record, or when a revocation carrier
+    /// is still waiting for a group resync. In the second case the daemon
+    /// cannot verify that the member is not revoked, so the member is
+    /// revoked for admission. This does not write a revocation record.
+    #[must_use]
+    pub fn member_treated_as_revoked(&self, id: &AgentId) -> bool {
+        self.admission_closed() || self.revoked_agents.contains(id)
+    }
+
+    fn absorb_quarantine(&mut self, other: &Self) {
+        if other.resync_carriers == 0 {
+            return;
+        }
+        self.resync_carriers |= other.resync_carriers;
+        self.status_event_pending = true;
+        if self.status_override.is_none() {
+            self.status_override = other.status_override;
+        }
+    }
+
+    fn note_resynced_record(&mut self, subject: &RevokedSubject, _hash: [u8; 32]) {
+        let Some(carrier) = subject_carrier(subject) else {
+            return;
+        };
+        self.try_complete_carrier(carrier);
     }
 
     /// Whether an agent id is revoked.
@@ -532,6 +956,7 @@ impl RevocationSet {
     /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
     /// **B**): the grow-only union of bundle `retired_bindings` and ad-hoc
     /// v2 tombstones.
+    ///
     #[must_use]
     pub fn is_binding_revoked(&self, agent: &AgentId, machine: &MachineId) -> bool {
         let key = (*agent, *machine);
@@ -541,6 +966,7 @@ impl RevocationSet {
     /// Whether the share grant `grant_id` signed by `owner` is revoked
     /// (ADR-0070 §2). A revocation by any other owner for the same id does
     /// not match.
+    ///
     #[must_use]
     pub fn is_share_grant_revoked(&self, grant_id: &[u8; 32], owner: &UserId) -> bool {
         self.revoked_share_grants.contains_key(&(*grant_id, *owner))
@@ -630,15 +1056,19 @@ impl RevocationSet {
         record.verify_authority(subject_cert)?;
         // Retain the certificate only when it was actually needed to prove
         // authority (issuer-revocation). Self-revocations re-verify without it.
+        let subject = record.subject.clone();
+        let hash = record.record_hash();
         let retained_cert = if record.is_self_revocation() {
             None
         } else {
             subject_cert.cloned()
         };
-        Ok(self.insert_verified(PersistedRevocation {
+        let inserted = self.insert_verified(PersistedRevocation {
             record,
             subject_cert: retained_cert,
-        }))
+        });
+        self.note_resynced_record(&subject, hash);
+        Ok(inserted)
     }
 
     /// ADR 0115 §5: [`verify_and_insert`](Self::verify_and_insert) for a
@@ -1042,7 +1472,11 @@ impl RevocationSet {
     }
 
     /// Merge a decoded v3 set into this one (grow-only union).
+    ///
+    /// A quarantined source keeps those carriers closed. A readable source
+    /// does not clear a carrier that is still waiting for a group resync.
     pub fn merge_v3(&mut self, other: Self) {
+        self.absorb_quarantine(&other);
         let mut changed = false;
         for (key, expiry) in other.revoked_share_grants {
             let entry = self.revoked_share_grants.entry(key).or_insert(0);
@@ -1065,7 +1499,11 @@ impl RevocationSet {
     }
 
     /// Merge a decoded v2 set into this one (grow-only union).
+    ///
+    /// A quarantined source keeps those carriers closed. A readable source
+    /// does not clear a carrier that is still waiting for a group resync.
     pub fn merge_v2(&mut self, other: Self) {
+        self.absorb_quarantine(&other);
         for ((agent, machine), epoch) in other.binding_epochs {
             let key = (agent, machine);
             let entry = self.binding_epochs.entry(key).or_insert(0);
@@ -1159,21 +1597,1509 @@ mod tests {
             assert!(RevocationSet::validate_persisted_bytes(&garbage, magic).is_err());
             let path = dir.path().join(name);
             tokio::fs::write(&path, &garbage).await.unwrap();
-            let unreadable = crate::storage::read_revocation_store(&path, store, false)
+            let loaded = crate::storage::read_revocation_store(&path, store, false)
                 .await
-                .expect_err("trailing bytes make the store unreadable");
-            assert!(crate::storage::revocation_persistence_is_blocked(
-                &unreadable
-            ));
+                .expect("a present file returns a set");
+            let loaded = loaded.expect("the file exists");
+            assert!(
+                loaded.revocation_resync_required(),
+                "trailing bytes keep {name} membership closed"
+            );
+            assert!(loaded.is_empty(), "{name} contributes no records");
             let outcome = crate::storage::save_private_bytes_to(&path, valid).await;
-            assert_eq!(
-                tokio::fs::read(&path).await.unwrap(),
-                garbage,
-                "persist must preserve a valid body with trailing garbage"
+            assert_ne!(
+                tokio::fs::read(&path).await.ok().as_deref(),
+                Some(garbage.as_slice()),
+                "persist must move trailing garbage off the live path"
             );
             let refused = outcome.expect_err("trailing bytes block overwrite");
             assert!(crate::storage::revocation_persistence_is_blocked(&refused));
         }
+    }
+
+    /// #1116: the hold is in memory only. A readable merge does not clear
+    /// it, and encoding still writes verified records alone.
+    #[test]
+    fn unreadable_store_stays_local_and_merge_keeps_it_1116() {
+        let agent = AgentId([0x11; 32]);
+        let machine = MachineId([0x22; 32]);
+        let grant = [0x33; 32];
+        let owner = UserId([0x44; 32]);
+        let closed = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+        assert!(closed.is_empty());
+        assert!(closed.revocation_resync_required());
+        assert!(closed.member_treated_as_revoked(&agent));
+        assert!(!closed.is_agent_revoked(&agent));
+        assert!(!closed.is_machine_revoked(&machine));
+        assert!(!closed.is_binding_revoked(&agent, &machine));
+        assert!(!closed.is_share_grant_revoked(&grant, &owner));
+        assert!(closed.max_revoked_binding_epoch(&agent).is_none());
+        assert_eq!(closed.generation(), 0);
+        assert_eq!(
+            closed.to_bytes().unwrap(),
+            RevocationSet::new().to_bytes().unwrap()
+        );
+        assert_eq!(
+            closed.to_bytes_v2().unwrap(),
+            RevocationSet::new().to_bytes_v2().unwrap()
+        );
+        assert_eq!(
+            closed.to_bytes_v3().unwrap(),
+            RevocationSet::new().to_bytes_v3().unwrap()
+        );
+        let decoded = RevocationSet::from_bytes(&closed.to_bytes().unwrap()).unwrap();
+        assert!(!decoded.revocation_resync_required());
+        assert!(!decoded.member_treated_as_revoked(&agent));
+
+        let mut held = RevocationSet::new();
+        let generation = held.generation();
+        held.merge_v2(RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V2));
+        assert!(held.revocation_resync_required());
+        assert!(held.member_treated_as_revoked(&agent));
+        assert_eq!(held.generation(), generation);
+        held.merge_v2(RevocationSet::new());
+        assert!(
+            held.revocation_resync_required(),
+            "a readable v2 merge does not clear the hold"
+        );
+
+        let mut held = RevocationSet::new();
+        held.merge_v3(RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V3));
+        assert!(held.member_treated_as_revoked(&agent));
+        assert!(!held.is_share_grant_revoked(&grant, &owner));
+        held.merge_v3(RevocationSet::new());
+        assert!(
+            held.revocation_resync_required(),
+            "a readable v3 merge does not clear the hold"
+        );
+
+        assert!(
+            !held.apply_group_revocation_resync(Vec::new(), 1_000),
+            "an empty snapshot must not re-admit members"
+        );
+        assert!(held.member_treated_as_revoked(&agent));
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let forger = crate::identity::AgentKeypair::generate().unwrap();
+        let forged = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            forger.public_key(),
+            forger.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !held.apply_group_revocation_resync(vec![record.clone(), forged], 1_000),
+            "a snapshot with one failed record must not open membership"
+        );
+        assert!(held.revocation_resync_required());
+        assert!(
+            !held.apply_group_revocation_resync(vec![record], 1_000),
+            "a v1 record must not open a waiting v3 carrier"
+        );
+        assert!(held.revocation_resync_required());
+        assert!(held.member_treated_as_revoked(&agent));
+        let owner_keys = crate::identity::UserKeypair::generate().unwrap();
+        let grant_id = [0x33; 32];
+        let grant = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id,
+                owner: owner_keys.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner_keys.public_key(),
+            owner_keys.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !held.apply_group_revocation_resync(vec![grant.clone()], 1_000),
+            "inserting one verified record is not a group snapshot"
+        );
+        assert!(held.revocation_resync_required());
+        assert!(held.is_share_grant_revoked(&grant_id, &owner_keys.user_id()));
+        let peer_a = AgentId([0xA1; 32]);
+        let peer_b = AgentId([0xB2; 32]);
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_a,
+            std::slice::from_ref(&grant),
+            false,
+        );
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_b,
+            std::slice::from_ref(&grant),
+            false,
+        );
+        assert!(
+            held.revocation_resync_required(),
+            "two free keys do not open the carrier"
+        );
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_a,
+            std::slice::from_ref(&grant),
+            true,
+        );
+        assert!(
+            !held.carrier_resync_pending(REVOCATION_CARRIER_V3),
+            "a trusted snapshot accepts the carrier"
+        );
+        assert!(
+            held.revocation_resync_required(),
+            "a trusted snapshot does not open admission"
+        );
+        assert!(
+            held.member_treated_as_revoked(&agent),
+            "a stranger stays withheld until reconciliation releases"
+        );
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_a,
+            std::slice::from_ref(&grant),
+            true,
+        );
+        held.observe_remote_carrier_snapshot(
+            REVOCATION_CARRIER_V3,
+            &peer_b,
+            std::slice::from_ref(&grant),
+            false,
+        );
+        assert!(
+            held.revocation_resync_required(),
+            "a second snapshot does not clear the reconcile hold"
+        );
+        assert!(held.member_treated_as_revoked(&agent));
+        held.release_reconciled_carrier(REVOCATION_CARRIER_V3);
+        assert!(!held.revocation_resync_required());
+        assert!(
+            !held.member_treated_as_revoked(&agent),
+            "a stranger is admissible after reconciliation releases"
+        );
+    }
+
+    /// #1116: each corrupt carrier stays closed until its own snapshot
+    /// verifies. An empty payload, a local revocation, and one finished
+    /// carrier do not re-admit the other carriers.
+    #[tokio::test]
+    async fn membership_stays_closed_until_each_carrier_resyncs_1116() {
+        let stranger = AgentId([0xAB; 32]);
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&vec![record.clone()]).unwrap();
+        let empty = bincode::serialize(&Vec::<RevocationRecord>::new()).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1 | REVOCATION_CARRIER_V2),
+        ));
+        let admin = AgentId([0xA5; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == admin
+            }));
+
+        let peer_a = AgentId([0xA1; 32]);
+        let peer_b = AgentId([0xB2; 32]);
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &empty,
+            Some(&peer_a),
+            None,
+        )
+        .await;
+        arm_incoming_revocation_snapshot(&set, "x0x.other", &payload, Some(&peer_a), None).await;
+        assert!(set.read().await.member_treated_as_revoked(&stranger));
+
+        let local = crate::identity::AgentKeypair::generate().unwrap();
+        let local_record = RevocationRecord::sign(
+            RevokedSubject::Agent(local.agent_id()),
+            local.public_key(),
+            local.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let local_for_snapshot = local_record.clone();
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(local_record, None)
+            .unwrap());
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a local revocation is not a group snapshot"
+        );
+
+        let full_payload = bincode::serialize(&vec![record.clone(), local_for_snapshot]).unwrap();
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&peer_a),
+            None,
+        )
+        .await;
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "one free peer's verified record does not open v1"
+        );
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&peer_b),
+            None,
+        )
+        .await;
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "two free keys do not open v1"
+        );
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&admin),
+            None,
+        )
+        .await;
+        {
+            let guard = set.read().await;
+            assert!(guard.revocation_resync_required(), "v2 is still unknown");
+            assert!(guard.member_treated_as_revoked(&stranger));
+            assert!(guard.member_treated_as_revoked(&revoked.agent_id()));
+            assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V1));
+            assert!(guard.carrier_resync_pending(REVOCATION_CARRIER_V2));
+        }
+
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let bound = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &bound).unwrap();
+        let binding = RevocationRecord::sign(
+            RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                agent: bound.agent_id(),
+                machine: MachineId([0x55; 32]),
+                move_epoch: 1,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let binding_payload = bincode::serialize(&vec![binding.clone()]).unwrap();
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_V2_TOPIC,
+            &binding_payload,
+            Some(&peer_a),
+            None,
+        )
+        .await;
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_V2_TOPIC,
+            &binding_payload,
+            Some(&peer_b),
+            None,
+        )
+        .await;
+        assert!(
+            !set.write()
+                .await
+                .apply_group_revocation_resync(vec![binding.clone()], 1_000),
+            "a binding tombstone without its certificate does not verify"
+        );
+        assert!(set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V2));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_V2_TOPIC,
+            &binding_payload,
+            Some(&admin),
+            None,
+        )
+        .await;
+        let mut certs = std::collections::HashMap::new();
+        certs.insert(bound.agent_id(), cert);
+        assert!(set.write().await.apply_group_revocation_resync_with_certs(
+            vec![binding],
+            &certs,
+            1_000
+        ));
+        {
+            let guard = set.read().await;
+            assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V1));
+            assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V2));
+            assert!(
+                guard.revocation_resync_required(),
+                "accepted snapshots stay closed until reconciliation releases"
+            );
+            assert!(guard.member_treated_as_revoked(&revoked.agent_id()));
+            assert!(
+                guard.member_treated_as_revoked(&stranger),
+                "a stranger stays refused until reconciliation releases"
+            );
+        }
+        {
+            let mut guard = set.write().await;
+            guard.release_reconciled_carrier(REVOCATION_CARRIER_V1);
+            guard.release_reconciled_carrier(REVOCATION_CARRIER_V2);
+        }
+        let guard = set.read().await;
+        assert!(!guard.revocation_resync_required());
+        assert!(guard.member_treated_as_revoked(&revoked.agent_id()));
+        assert!(!guard.member_treated_as_revoked(&stranger));
+    }
+
+    /// #1116: the node's own publish is not a group snapshot, and a record
+    /// that belongs to another carrier does not open the waiting one.
+    #[tokio::test]
+    async fn own_publish_and_wrong_carrier_keep_the_hold_1116() {
+        let local = crate::identity::AgentKeypair::generate().unwrap();
+        let local_record = RevocationRecord::sign(
+            RevokedSubject::Agent(local.agent_id()),
+            local.public_key(),
+            local.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&vec![local_record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1 | REVOCATION_CARRIER_V3),
+        ));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&local.agent_id()),
+            Some(&local.agent_id()),
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "the node's own publish must not open the carrier"
+        );
+
+        set.write()
+            .await
+            .verify_and_insert(local_record, None)
+            .unwrap();
+        let other = AgentId([0xC3; 32]);
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_V3_TOPIC,
+            &payload,
+            Some(&other),
+            None,
+        )
+        .await;
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V3),
+            "a v1 record on the v3 topic must not open v3"
+        );
+        assert!(set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+    }
+
+    /// #1116: one peer, including the revoked agent, cannot open a carrier.
+    /// A snapshot that omits a known revocation cannot open it either.
+    #[tokio::test]
+    async fn partial_snapshot_omitting_known_revocation_keeps_the_hold_1116() {
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let throwaway = crate::identity::AgentKeypair::generate().unwrap();
+        let unrelated = RevocationRecord::sign(
+            RevokedSubject::Agent(throwaway.agent_id()),
+            throwaway.public_key(),
+            throwaway.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let unrelated_payload = bincode::serialize(&vec![unrelated.clone()]).unwrap();
+        let full_payload = bincode::serialize(&vec![record.clone(), unrelated.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1),
+        ));
+        let attacker = throwaway.agent_id();
+        let peer = AgentId([0xD4; 32]);
+
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &unrelated_payload,
+            Some(&attacker),
+            None,
+        )
+        .await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(unrelated.clone(), None)
+            .unwrap());
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "one peer's record does not open the carrier"
+        );
+        assert!(
+            set.read()
+                .await
+                .member_treated_as_revoked(&revoked.agent_id()),
+            "the lost subject stays withheld"
+        );
+
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(record.clone(), None)
+            .unwrap());
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &unrelated_payload,
+            Some(&attacker),
+            None,
+        )
+        .await;
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &unrelated_payload,
+            Some(&peer),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a snapshot that omits a known revocation does not open the carrier"
+        );
+
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&attacker),
+            None,
+        )
+        .await;
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&peer),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "two free keys must not open the carrier, even with a full snapshot"
+        );
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == attacker
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &unrelated_payload,
+            Some(&attacker),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a trusted snapshot that omits a known revocation stays closed"
+        );
+        let admin = AgentId([0xE5; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == admin
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &full_payload,
+            Some(&admin),
+            None,
+        )
+        .await;
+        {
+            let guard = set.read().await;
+            assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V1));
+            assert!(
+                guard.revocation_resync_required(),
+                "a complete trusted snapshot does not open admission"
+            );
+            assert!(guard.is_agent_revoked(&revoked.agent_id()));
+            assert!(guard.member_treated_as_revoked(&AgentId([0xEE; 32])));
+        }
+        set.write()
+            .await
+            .release_reconciled_carrier(REVOCATION_CARRIER_V1);
+        let guard = set.read().await;
+        assert!(!guard.revocation_resync_required());
+        assert!(guard.is_agent_revoked(&revoked.agent_id()));
+        assert!(!guard.member_treated_as_revoked(&AgentId([0xEE; 32])));
+    }
+
+    #[test]
+    fn recovery_topics_include_certificate_announcements_1116() {
+        assert!(is_revocation_recovery_topic(crate::REVOCATION_TOPIC));
+        assert!(is_revocation_recovery_topic(crate::IDENTITY_ANNOUNCE_TOPIC));
+        assert!(is_revocation_recovery_topic("x0x.identity.shard.v2.7"));
+        assert!(is_revocation_recovery_topic(
+            crate::MACHINE_ANNOUNCE_V3_TOPIC
+        ));
+        assert!(is_revocation_recovery_topic(
+            crate::announce_blob::ANNOUNCE_BLOB_TOPIC
+        ));
+        assert!(is_revocation_recovery_topic("x0x.user.shard.v2.9"));
+        assert!(!is_revocation_recovery_topic("x0x.groups.public.example"));
+        assert!(!is_revocation_recovery_topic("x0x/dm/v1/bus"));
+    }
+
+    /// #1116: two free keys that agree on a short snapshot do not write it.
+    /// A restart must still withhold the subject that was never in that
+    /// snapshot.
+    #[tokio::test]
+    async fn untrusted_free_keys_keep_incomplete_carrier_closed_across_restart_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        tokio::fs::write(&path, b"not-a-revocation-file")
+            .await
+            .unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+
+        let lost = crate::identity::AgentKeypair::generate().unwrap();
+        let throwaway = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(throwaway.agent_id()),
+            throwaway.public_key(),
+            throwaway.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&vec![record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let free_a = AgentId([0x41; 32]);
+        let free_b = AgentId([0x42; 32]);
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&free_a),
+            None,
+        )
+        .await;
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&free_b),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "two free agent keys must not open an incomplete carrier"
+        );
+        assert!(set.read().await.member_treated_as_revoked(&lost.agent_id()));
+        let pending = set.write().await.take_rebuild_pending();
+        assert_eq!(
+            pending, 0,
+            "an untrusted incomplete snapshot is not a rebuild"
+        );
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            again.revocation_resync_required(),
+            "restart must not load the incomplete set as a rebuild"
+        );
+        assert!(again.member_treated_as_revoked(&lost.agent_id()));
+        assert!(!again.is_agent_revoked(&lost.agent_id()));
+    }
+
+    /// #1116: a trusted authority opens the in-memory carrier. Unreadable
+    /// quarantine bytes stay in place, and the shorter snapshot is not
+    /// installed. The next load stays closed until the operator command.
+    #[tokio::test]
+    async fn unreadable_quarantine_blocks_the_shorter_rebuild_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let garbage = b"truncated-looking-but-garbage";
+        tokio::fs::write(&path, garbage).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        let quarantine = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("revocations.bin.quarantined-")
+                    .then(|| entry.path())
+            })
+            .expect("quarantine file");
+        let quarantined_bytes = std::fs::read(&quarantine).unwrap();
+
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&vec![record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let free_a = AgentId([0x11; 32]);
+        let free_b = AgentId([0x21; 32]);
+        let authority = AgentId([0x22; 32]);
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&free_a),
+            None,
+        )
+        .await;
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        assert!(set.read().await.revocation_resync_required());
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&free_b),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "two free keys do not rebuild the live file"
+        );
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "an accepted snapshot stays closed until the rebuild installs it"
+        );
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+        let pending = set.write().await.take_rebuild_pending();
+        assert_eq!(pending, REVOCATION_CARRIER_V1);
+        set.write()
+            .await
+            .requeue_rebuild_pending(REVOCATION_CARRIER_V1);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(
+            !path.is_file(),
+            "unreadable quarantine bytes block the shorter remote set"
+        );
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "unreadable quarantine keeps the running carrier closed"
+        );
+        assert!(set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
+        assert_ne!(set.write().await.take_rebuild_pending(), 0);
+        assert_eq!(std::fs::read(&quarantine).unwrap(), quarantined_bytes);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(again.revocation_resync_required());
+        assert!(!again.is_agent_revoked(&revoked.agent_id()));
+    }
+
+    /// Open a quarantined v1 carrier from one trusted sender and return the
+    /// set plus the revoked agent. No live file is written yet.
+    async fn open_v1_carrier_for_rebuild(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
+        crate::identity::AgentId,
+    ) {
+        let path = dir.join("revocations.bin");
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            revoked.public_key(),
+            revoked.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(record.clone(), None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        let quarantine = std::fs::read_dir(dir)
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("revocations.bin.quarantined-")
+                    .then(|| entry.path())
+            })
+            .expect("quarantine file");
+        assert!(
+            RevocationSet::from_bytes(&std::fs::read(quarantine).unwrap())
+                .unwrap()
+                .is_agent_revoked(&revoked.agent_id()),
+            "trailing bytes quarantine still decodes the revocation"
+        );
+        let payload = bincode::serialize(&vec![record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "the snapshot is accepted and admission stays closed until the rebuild"
+        );
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+        (set, revoked.agent_id())
+    }
+
+    /// #1116: a before-rename failure keeps the pending bit. Removing the
+    /// fault and calling the helper again writes the same bytes. No new
+    /// revocation is required.
+    #[tokio::test]
+    async fn rebuild_pending_retries_after_before_rename_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let (set, revoked) = open_v1_carrier_for_rebuild(dir.path()).await;
+        let records_before = set.read().await.len();
+        tokio::fs::create_dir(&path).await.unwrap();
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_dir(), "the before-rename fault leaves no live file");
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a before-rename failure keeps admission closed"
+        );
+        assert!(set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
+        assert_eq!(set.read().await.len(), records_before);
+        tokio::fs::remove_dir(&path).await.unwrap();
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the retry writes the live file");
+        assert!(!set.read().await.revocation_resync_required());
+        assert_eq!(set.read().await.len(), records_before);
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!again.revocation_resync_required());
+        assert!(again.is_agent_revoked(&revoked));
+    }
+
+    /// #1116: a failure after the rename leaves the new bytes in place and
+    /// does not queue another rebuild.
+    #[tokio::test]
+    async fn rebuild_after_rename_is_not_requeued_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let (set, revoked) = open_v1_carrier_for_rebuild(dir.path()).await;
+        let _guard = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the rename already published the live file");
+        assert!(!set.read().await.revocation_resync_required());
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let again = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!again.revocation_resync_required());
+        assert!(again.is_agent_revoked(&revoked));
+    }
+
+    /// #1116: a failure after the rename that leaves bytes the node cannot
+    /// install keeps admission closed and does not queue another rebuild.
+    #[tokio::test]
+    async fn rebuild_after_rename_failure_keeps_the_hold_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let (set, _revoked) = open_v1_carrier_for_rebuild(dir.path()).await;
+        let _fsync = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+        let _corrupt = crate::storage::arm_corrupt_after_rename_for_testing(&path);
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"not-a-revocation-file");
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a failed reconciliation keeps admission closed"
+        );
+        assert!(set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+    }
+
+    /// #1116: admission stays closed while the rebuild is still in storage.
+    /// A fresh trusted snapshot and an untrusted snapshot do not clear it.
+    #[tokio::test]
+    async fn rebuild_await_keeps_admission_closed_1116() {
+        let kept = crate::identity::MachineKeypair::generate().unwrap();
+        let snapshot_machine = crate::identity::MachineKeypair::generate().unwrap();
+        let kept_record = RevocationRecord::sign(
+            RevokedSubject::Machine(kept.machine_id()),
+            kept.public_key(),
+            kept.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::Machine(snapshot_machine.machine_id()),
+            snapshot_machine.public_key(),
+            snapshot_machine.secret_key(),
+            1_001,
+            None,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept_record, None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = bincode::serialize(&vec![snapshot_record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        let stranger = AgentId([0xEE; 32]);
+        let untrusted = AgentId([0x33; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(snapshot_record, None)
+            .unwrap());
+        assert!(set.read().await.revocation_resync_required());
+        assert!(!set.read().await.is_machine_revoked(&kept.machine_id()));
+        assert!(set.read().await.member_treated_as_revoked(&stranger));
+
+        let _await_guard = crate::storage::arm_rebuild_await_for_testing();
+        let set_task = std::sync::Arc::clone(&set);
+        let dir_path = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            crate::persist_completed_revocation_rebuild(&set_task, Some(&dir_path)).await;
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::storage::rebuild_await_entered_for_testing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rebuild did not reach storage"
+            );
+            tokio::task::yield_now().await;
+        }
+        let fresh = set.read().await.all_records();
+        let fresh_payload = bincode::serialize(&fresh).unwrap();
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &fresh_payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        {
+            let mut guard = set.write().await;
+            guard.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &authority, &fresh, true);
+            guard.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &untrusted, &fresh, false);
+        }
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "a snapshot during the storage await does not open admission"
+        );
+        assert!(set.read().await.member_treated_as_revoked(&stranger));
+        assert!(!set.read().await.is_machine_revoked(&kept.machine_id()));
+        crate::storage::release_rebuild_await_for_testing();
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("rebuild await")
+            .expect("rebuild task");
+        assert!(path.is_file());
+        assert!(set.read().await.is_machine_revoked(&kept.machine_id()));
+        assert!(set
+            .read()
+            .await
+            .is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(!set.read().await.revocation_resync_required());
+        assert!(!set.read().await.member_treated_as_revoked(&stranger));
+    }
+
+    /// #1116: an ordinary save captured before the rebuild must not replace
+    /// the rebuilt file. The captured bytes are S. Disk after the rebuild
+    /// is R and S. The late save still leaves both.
+    #[tokio::test]
+    async fn queued_save_cannot_drop_a_rebuilt_revocation_1116() {
+        let kept = crate::identity::MachineKeypair::generate().unwrap();
+        let snapshot_machine = crate::identity::MachineKeypair::generate().unwrap();
+        let kept_record = RevocationRecord::sign(
+            RevokedSubject::Machine(kept.machine_id()),
+            kept.public_key(),
+            kept.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::Machine(snapshot_machine.machine_id()),
+            snapshot_machine.public_key(),
+            snapshot_machine.secret_key(),
+            1_001,
+            None,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept_record, None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = bincode::serialize(&vec![snapshot_record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(snapshot_record, None)
+            .unwrap());
+        let captured = set.read().await.to_bytes().unwrap();
+        let captured_set = RevocationSet::from_bytes(&captured).unwrap();
+        assert!(
+            !captured_set.is_machine_revoked(&kept.machine_id()),
+            "the queued save is S and does not yet contain R"
+        );
+        assert!(captured_set.is_machine_revoked(&snapshot_machine.machine_id()));
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        let rebuilt = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(rebuilt.is_machine_revoked(&kept.machine_id()));
+        assert!(rebuilt.is_machine_revoked(&snapshot_machine.machine_id()));
+        crate::storage::save_revocation_set_bytes(captured, Some(dir.path()))
+            .await
+            .unwrap();
+        let saved = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved.is_machine_revoked(&kept.machine_id()),
+            "a queued save of S must not drop recovered R"
+        );
+        assert!(saved.is_machine_revoked(&snapshot_machine.machine_id()));
+    }
+
+    /// #1116: a delayed v3 rebuild must not erase a newer durable revocation.
+    #[tokio::test]
+    async fn stale_v3_rebuild_keeps_a_newer_durable_revocation_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations-v3.bin");
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = 1_700_000_000_u64;
+        let older_id = [0x11_u8; 32];
+        let newer_id = [0x22_u8; 32];
+        let older = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: older_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+        let newer = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: newer_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now + 10,
+            None,
+        )
+        .unwrap();
+
+        let mut stale = RevocationSet::new();
+        assert!(stale.verify_and_insert(older, None).unwrap());
+        stale.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let stale = std::sync::Arc::new(tokio::sync::RwLock::new(stale));
+        crate::persist_completed_revocation_rebuild(&stale, Some(dir.path())).await;
+        assert!(path.is_file(), "the first rebuild writes the live file");
+
+        let mut grown = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(grown.verify_and_insert(newer, None).unwrap());
+        let grown = std::sync::Arc::new(tokio::sync::RwLock::new(grown));
+        crate::persist_share_grant_revocations_durable(&grown, Some(dir.path()))
+            .await
+            .unwrap();
+
+        stale
+            .write()
+            .await
+            .requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        crate::persist_completed_revocation_rebuild(&stale, Some(dir.path())).await;
+
+        let loaded = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            loaded.is_share_grant_revoked(&older_id, &owner.user_id()),
+            "the stale snapshot's revocation stays"
+        );
+        assert!(
+            loaded.is_share_grant_revoked(&newer_id, &owner.user_id()),
+            "a newer durable revocation survives the late rebuild"
+        );
+    }
+
+    /// #1116: the first rebuild unites a revocation that the quarantine file
+    /// still contains. A shorter snapshot must not drop it. Unreadable
+    /// quarantine bytes are not replaced by that snapshot.
+    #[tokio::test]
+    async fn quarantine_file_revocation_survives_shorter_rebuild_1116() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = 1_700_000_000_u64;
+        let kept_id = [0x31_u8; 32];
+        let snapshot_id = [0x32_u8; 32];
+        let kept = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: kept_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::ShareGrant(ShareGrantRevocation {
+                grant_id: snapshot_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            }),
+            owner.public_key(),
+            owner.secret_key(),
+            now,
+            None,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations-v3.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept, None).unwrap());
+        let mut stored = seeded.to_bytes_v3().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        assert!(!path.is_file(), "quarantine removes the live file");
+        let quarantine = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("revocations-v3.bin.quarantined-")
+                    .then(|| entry.path())
+            })
+            .expect("quarantine file");
+        let quarantined = std::fs::read(&quarantine).unwrap();
+        assert!(
+            RevocationSet::from_bytes_v3(&quarantined)
+                .unwrap()
+                .is_share_grant_revoked(&kept_id, &owner.user_id()),
+            "the quarantine file still contains R"
+        );
+
+        let mut snapshot = RevocationSet::new();
+        assert!(snapshot
+            .verify_and_insert(snapshot_record.clone(), None)
+            .unwrap());
+        snapshot.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let snapshot = std::sync::Arc::new(tokio::sync::RwLock::new(snapshot));
+        crate::persist_completed_revocation_rebuild(&snapshot, Some(dir.path())).await;
+        assert!(
+            path.is_file(),
+            "a readable quarantine file is united into the rebuild"
+        );
+        assert_eq!(snapshot.write().await.take_rebuild_pending(), 0);
+        let united = RevocationSet::from_bytes_v3(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            united.is_share_grant_revoked(&kept_id, &owner.user_id()),
+            "R is still revoked after the rebuild"
+        );
+        assert!(
+            united.is_share_grant_revoked(&snapshot_id, &owner.user_id()),
+            "the snapshot revocation stays"
+        );
+        assert_eq!(std::fs::read(&quarantine).unwrap(), quarantined);
+
+        let operator_dir = tempfile::tempdir().unwrap();
+        let operator_path = operator_dir.path().join("revocations-v3.bin");
+        tokio::fs::write(&operator_path, &stored).await.unwrap();
+        let operator_loaded = crate::storage::read_revocation_store(
+            &operator_path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(operator_loaded.revocation_resync_required());
+        let candidate = {
+            let mut only_snapshot = RevocationSet::new();
+            assert!(only_snapshot
+                .verify_and_insert(snapshot_record.clone(), None)
+                .unwrap());
+            only_snapshot.to_bytes_v3().unwrap()
+        };
+        let wrote = crate::storage::install_operator_revocation_carrier(
+            operator_dir.path(),
+            "v3",
+            candidate,
+            false,
+        )
+        .await
+        .expect("operator install");
+        assert!(wrote.kept_durable_records);
+        assert!(!wrote.empty_store);
+        let operator_live =
+            RevocationSet::from_bytes_v3(&std::fs::read(&operator_path).unwrap()).unwrap();
+        assert!(operator_live.is_share_grant_revoked(&kept_id, &owner.user_id()));
+        assert!(operator_live.is_share_grant_revoked(&snapshot_id, &owner.user_id()));
+
+        let blocked = tempfile::tempdir().unwrap();
+        let blocked_path = blocked.path().join("revocations-v3.bin");
+        tokio::fs::write(&blocked_path, b"not-a-v3-file")
+            .await
+            .unwrap();
+        let blocked_load = crate::storage::read_revocation_store(
+            &blocked_path,
+            crate::storage::RevocationStore::V3,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(blocked_load.revocation_resync_required());
+        assert!(!blocked_path.is_file());
+        let mut shorter = RevocationSet::new();
+        assert!(shorter.verify_and_insert(snapshot_record, None).unwrap());
+        shorter.requeue_rebuild_pending(REVOCATION_CARRIER_V3);
+        let shorter = std::sync::Arc::new(tokio::sync::RwLock::new(shorter));
+        crate::persist_completed_revocation_rebuild(&shorter, Some(blocked.path())).await;
+        assert!(
+            !blocked_path.is_file(),
+            "unreadable quarantine bytes block the shorter remote set"
+        );
+        assert_ne!(shorter.write().await.take_rebuild_pending(), 0);
+        assert!(
+            shorter.read().await.revocation_resync_required(),
+            "unreadable quarantine keeps the running carrier closed"
+        );
+    }
+
+    /// #1116: quarantine file R is a machine revocation the snapshot omits.
+    /// The running set enforces R before the carrier opens. The next
+    /// ordinary save of that set still contains R.
+    #[tokio::test]
+    async fn recovered_machine_revocation_is_enforced_through_the_next_save_1116() {
+        let kept = crate::identity::MachineKeypair::generate().unwrap();
+        let snapshot_machine = crate::identity::MachineKeypair::generate().unwrap();
+        let later = crate::identity::MachineKeypair::generate().unwrap();
+        let kept_record = RevocationRecord::sign(
+            RevokedSubject::Machine(kept.machine_id()),
+            kept.public_key(),
+            kept.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        let snapshot_record = RevocationRecord::sign(
+            RevokedSubject::Machine(snapshot_machine.machine_id()),
+            snapshot_machine.public_key(),
+            snapshot_machine.secret_key(),
+            1_001,
+            None,
+        )
+        .unwrap();
+        let later_record = RevocationRecord::sign(
+            RevokedSubject::Machine(later.machine_id()),
+            later.public_key(),
+            later.secret_key(),
+            1_002,
+            None,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.bin");
+        let mut seeded = RevocationSet::new();
+        assert!(seeded.verify_and_insert(kept_record.clone(), None).unwrap());
+        let mut stored = seeded.to_bytes().unwrap();
+        stored.extend_from_slice(b"trailing");
+        tokio::fs::write(&path, &stored).await.unwrap();
+        let loaded = crate::storage::read_revocation_store(
+            &path,
+            crate::storage::RevocationStore::V1,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(loaded.revocation_resync_required());
+        assert!(!path.is_file());
+
+        let payload = bincode::serialize(&vec![snapshot_record.clone()]).unwrap();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+        let authority = AgentId([0x22; 32]);
+        set.write()
+            .await
+            .set_snapshot_authority(SnapshotAuthority::new(move |sender, _revoked| {
+                *sender == authority
+            }));
+        arm_incoming_revocation_snapshot(
+            &set,
+            crate::REVOCATION_TOPIC,
+            &payload,
+            Some(&authority),
+            None,
+        )
+        .await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(snapshot_record, None)
+            .unwrap());
+        assert!(
+            set.read().await.revocation_resync_required(),
+            "admission stays closed until the rebuild installs recovered R"
+        );
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+        assert!(set
+            .read()
+            .await
+            .is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(
+            !set.read().await.is_machine_revoked(&kept.machine_id()),
+            "the snapshot alone does not enforce the quarantined machine"
+        );
+
+        crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+        assert!(path.is_file(), "the readable quarantine file is united");
+        assert!(
+            set.read().await.is_machine_revoked(&kept.machine_id()),
+            "recovered R is enforced in the live set"
+        );
+        assert!(set
+            .read()
+            .await
+            .is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(!set.read().await.revocation_resync_required());
+        assert!(!set
+            .read()
+            .await
+            .member_treated_as_revoked(&AgentId([0xEE; 32])));
+        assert_eq!(set.write().await.take_rebuild_pending(), 0);
+        let united = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(united.is_machine_revoked(&kept.machine_id()));
+        assert!(united.is_machine_revoked(&snapshot_machine.machine_id()));
+
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(later_record, None)
+            .unwrap());
+        {
+            let live = set.read().await;
+            crate::storage::save_revocation_set(&live, Some(dir.path()))
+                .await
+                .unwrap();
+        }
+        let saved = RevocationSet::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved.is_machine_revoked(&kept.machine_id()),
+            "the next ordinary save keeps recovered R"
+        );
+        assert!(saved.is_machine_revoked(&snapshot_machine.machine_id()));
+        assert!(saved.is_machine_revoked(&later.machine_id()));
+        assert!(set.read().await.is_machine_revoked(&kept.machine_id()));
     }
 
     #[tokio::test]

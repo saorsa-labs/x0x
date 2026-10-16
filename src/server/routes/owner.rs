@@ -805,7 +805,11 @@ mod revocation_persistence_tests {
             .list()
             .iter()
             .any(|record| { record.token_id == token.token_id && record.revoked_at.is_some() }));
-        assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable v1");
+        assert_ne!(
+            tokio::fs::read(&path).await.ok().as_deref(),
+            Some(b"unreadable v1".as_slice()),
+            "the live path no longer holds the corrupt payload"
+        );
         state.agent.shutdown().await;
     }
 }

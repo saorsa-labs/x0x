@@ -2319,7 +2319,10 @@ async fn inbound_session_admissible(
     owner: &UserId,
 ) -> bool {
     // Cheap-first: the device-map miss costs no signature verification.
-    store.is_enrolled(peer, owner).await && !revocation_set.read().await.is_machine_revoked(peer)
+    store.is_enrolled(peer, owner).await && {
+        let revoked = revocation_set.read().await;
+        !revoked.revocation_resync_required() && !revoked.is_machine_revoked(peer)
+    }
 }
 
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for

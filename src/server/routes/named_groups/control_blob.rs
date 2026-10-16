@@ -890,7 +890,7 @@ pub(in crate::server) async fn handle_control_blob_message(
     let revoked = {
         let revocation_set = state.agent.revocation_set();
         let guard = revocation_set.read().await;
-        guard.is_agent_revoked(sender)
+        guard.is_agent_revoked(sender) || guard.revocation_resync_required()
     };
     if revoked {
         return;
