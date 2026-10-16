@@ -583,11 +583,12 @@ pub async fn write_private_bytes_durable_typed(
     write_private_bytes_durable_guarded(path, bytes, guard).await
 }
 
-/// Unite `incoming` with a readable v1 or v2 file already on `path`.
+/// Unite `incoming` with verified records in a readable v1 or v2 file.
 ///
 /// A queued save captured before a rebuild must not replace recovered
-/// records. v3 keeps its own merge writer. A missing live file is written
-/// as `incoming`.
+/// records. A file whose records all fail verification has nothing to
+/// preserve, so the write keeps `incoming` byte for byte. v3 keeps its
+/// own merge writer. A missing live file is written as `incoming`.
 async fn monotonic_v1_v2_bytes(
     path: &Path,
     incoming: Vec<u8>,
@@ -608,12 +609,13 @@ async fn monotonic_v1_v2_bytes(
             });
         }
     };
-    let mut merged = decode_revocation_bytes(store, &disk)?;
-    unite_revocation_store(
-        store,
-        &mut merged,
-        decode_revocation_bytes(store, &incoming)?,
-    );
+    let disk_set = decode_revocation_bytes(store, &disk)?;
+    let incoming_set = decode_revocation_bytes(store, &incoming)?;
+    if disk_set.is_empty() {
+        return Ok(incoming);
+    }
+    let mut merged = disk_set;
+    unite_revocation_store(store, &mut merged, incoming_set);
     encode_revocation_store(store, &merged)
 }
 

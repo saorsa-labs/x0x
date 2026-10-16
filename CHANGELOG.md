@@ -276,7 +276,8 @@ All notable changes to this project will be documented in this file.
   rebuild cannot replace that file with the older snapshot. A waiting
   certificate-recovery batch keeps at most 128 records and 1 MiB of
   certificate and fetch metadata. A record is kept only with its
-  certificate or fetch binding. The first waiting batch is trimmed the
+  certificate or fetch binding. A later issuer certificate for the same
+  agent stays with its tombstone. The first waiting batch is trimmed the
   same way. A later batch is not stored once the record cap is full.
   A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
