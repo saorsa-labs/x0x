@@ -298,10 +298,10 @@ x0x --name <instance> identity rebuild-revocation-store --carrier v3 --from /pat
 
 Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. When the quarantine file can be read, the command unites those revocations too. Unreadable quarantine bytes do not block the command. The quarantine file stays. A zero-byte file is rejected.
 
-When you have independent evidence that the set is complete and empty, and no peer has a persisted file:
+A node whose true revocation set is empty can reopen only with `x0x identity rebuild-revocation-store --empty --confirm-empty`. That path is deliberate. Pass `--carrier v1`, `--carrier v2`, or `--carrier v3` for the closed file. Stop x0xd first. A remote empty snapshot does not reopen the node.
 
 ```bash
 x0x identity rebuild-revocation-store --carrier v3 --empty --confirm-empty
 ```
 
-`--confirm-empty` is required for an empty store. The command does not treat a zero-byte file, a deleted quarantine file, or an unconfirmed empty file as recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.
+`--confirm-empty` is required. A zero-byte file, a deleted quarantine file, or `--empty` without `--confirm-empty` is not recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.

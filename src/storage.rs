@@ -1817,12 +1817,63 @@ impl Drop for FailRevocationArchiveGuard {
     }
 }
 
+/// Publish `bytes` at `dest` with a sibling temp file and rename.
+///
+/// This is the temp-file half of the private-file writer, without the
+/// revocation-store guard. A crash during the write leaves `dest` unchanged.
+async fn publish_bytes_via_temp(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = dest.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid path: missing file name",
+        )
+    })?;
+    let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique
+    ));
+    if let Err(err) = fs::write(&tmp_path, bytes).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        let mut perms = match fs::metadata(&tmp_path).await {
+            Ok(metadata) => metadata.permissions(),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(err);
+            }
+        };
+        perms.set_mode(0o600);
+        if let Err(err) = fs::set_permissions(&tmp_path, perms).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err);
+        }
+    }
+    if let Err(err) = fs::rename(&tmp_path, dest).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Move corrupt revocation bytes to `<name>.quarantined-<unix-ms>`.
 ///
 /// Returns whether the live path no longer holds the payload. An existing
 /// quarantine file with the same bytes is kept and the live path is removed.
-/// Startup (`persist_attempt == false`) logs the operator message. A failed
-/// archive logs that the bytes are still on the live path.
+/// When that rename fails, the bytes are published with the same temp file
+/// and rename as other private writes, then the live path is removed. A
+/// crash during the copy leaves the quarantine name unchanged. Startup
+/// (`persist_attempt == false`) logs the operator message. A failed archive
+/// logs that the bytes are still on the live path.
 async fn archive_corrupt_revocation_bytes(
     path: &Path,
     bytes: &[u8],
@@ -1891,7 +1942,10 @@ async fn archive_corrupt_revocation_bytes(
             dest = parent.join(format!("{prefix}{millis}-{seq}"));
         }
         if let Err(rename_error) = tokio::fs::rename(path, &dest).await {
-            if tokio::fs::write(&dest, bytes).await.is_err() {
+            // A direct write can leave a short quarantine file after a crash.
+            // Publish the full bytes with a temp file and rename, then remove
+            // the live path.
+            if publish_bytes_via_temp(&dest, bytes).await.is_err() {
                 tracing::error!(
                     path = %path.display(),
                     error = %rename_error,
@@ -2090,6 +2144,50 @@ mod tests {
             found.push(entry.path());
         }
         found
+    }
+
+    /// The rename fallback must publish the quarantine file whole. A missing
+    /// live path forces that copy. The direct write used to leave `dest`
+    /// visible before the bytes were complete.
+    #[tokio::test]
+    async fn fallback_quarantine_copy_publishes_whole_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let bytes = b"corrupt-bytes-must-land-whole";
+        let archived = archive_corrupt_revocation_bytes(&path, bytes, true).await;
+        assert!(
+            archived,
+            "a failed rename still archives when the copy completes"
+        );
+        assert!(
+            tokio::fs::read(&path).await.is_err(),
+            "the live path does not hold the payload"
+        );
+        let quarantine = quarantine_files(dir.path(), REVOCATION_FILE).await;
+        assert_eq!(quarantine.len(), 1, "one quarantine file");
+        assert_eq!(
+            std::fs::read(&quarantine[0]).expect("quarantine bytes"),
+            bytes,
+            "the quarantine file holds the full payload"
+        );
+        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read dir");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp"),
+                "no temp debris: {}",
+                name.to_string_lossy()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&quarantine[0])
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "quarantine copy is private");
+        }
     }
 
     /// #1116: the operator command validates, rejects an unconfirmed empty

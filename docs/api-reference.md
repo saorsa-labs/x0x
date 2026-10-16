@@ -263,6 +263,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #   "agent_id": "8a3f...",
 #   "peers": 4,
 #   "send_ready_peers": 4,
+#   "revocation_resync_required": false,
 #   "warnings": []
 # }
 ```
@@ -274,7 +275,10 @@ most 10 s old. The reason is appended to `warnings`. A quiet peer, with both
 directions idle, is not degraded. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
-`revocation_resync_required` is false on a healthy node. It is true when a revocation file was present but could not be decoded. `warnings` then contains the same sentence as the startup error log. The first `GET /status` after that also sends one `status` event on `/events`. While the flag is true, group admission and key delivery are withheld, and ordinary pubsub frames and DMs are dropped. They are not queued for later delivery. See `docs/troubleshooting.md` section 8. The operator command is `x0x identity rebuild-revocation-store --carrier v3 --from <file>`. An empty store also needs `--empty --confirm-empty`. A remote snapshot is not installed when the quarantine file cannot be read. The running carrier stays closed, and a recovered revocation is enforced before it opens. A later trusted snapshot does not clear that hold, and a failed rebuild does not clear it. A save queued before the rebuild cannot replace the file with the older snapshot. A waiting recovery record is kept only with its certificate or fetch binding. A later issuer certificate for the same agent stays with its tombstone. A pending fetch for another issuer of that agent stays beside the known certificate. Each distinct pending certificate digest for that agent keeps its own route. A fetched certificate is added to those known certificates. A pending route may be replaced by a matching issuer certificate. A later batch that would drop an admitted record, or a route that still has no certificate, is not stored. Do not delete the quarantine file. A zero-byte file is not a repair.
+`revocation_resync_required` is false on a healthy node. It is true when a
+revocation file was present but could not be decoded. `warnings` then
+contains the same sentence as the startup error log. See
+`docs/troubleshooting.md` section 8.
 
 ## Identity
 
