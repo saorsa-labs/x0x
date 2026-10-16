@@ -258,7 +258,10 @@ All notable changes to this project will be documented in this file.
   rename stays pending, and the next call writes those same bytes. A
   failure after the rename is not queued again. When the discovery cache
   has no subject certificate, every distinct cached blob is used. The
-  eight-fetch budget applies only to a miss. Each miss list keeps its own
+  eight-fetch budget applies only to a miss, and only while a carrier
+  is waiting for resync. Those fetches share one blob deadline and run
+  outside the listener loop. A failed digest is not fetched again until
+  its backoff has elapsed. Each miss list keeps its own
   place. A shorter list does not move that place. When the table is full,
   the oldest list is set aside under its own index, so a new list can
   save its place and the older list does not start again at its first

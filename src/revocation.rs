@@ -593,7 +593,8 @@ pub(crate) fn is_revocation_carrier_topic(topic: &str) -> bool {
 ///
 /// Revocation carriers rebuild the set. Identity, machine and user
 /// announcements carry the certificates an issuer revocation or a binding
-/// tombstone needs. Other topics stay withheld.
+/// tombstone needs. The v3 blob topic carries a certificate fetch for
+/// that rebuild. Other topics stay withheld.
 #[must_use]
 pub(crate) fn is_revocation_recovery_topic(topic: &str) -> bool {
     is_revocation_carrier_topic(topic)
@@ -604,6 +605,7 @@ pub(crate) fn is_revocation_recovery_topic(topic: &str) -> bool {
                 | crate::USER_ANNOUNCE_TOPIC
                 | crate::MACHINE_ANNOUNCE_V3_TOPIC
                 | crate::ANNOUNCE_BLOB_V2_TOPIC
+                | crate::announce_blob::ANNOUNCE_BLOB_TOPIC
         )
         || topic.starts_with("x0x.identity.shard.v2.")
         || topic.starts_with("x0x.machine.shard.v2.")
@@ -2088,6 +2090,9 @@ mod tests {
         assert!(is_revocation_recovery_topic("x0x.identity.shard.v2.7"));
         assert!(is_revocation_recovery_topic(
             crate::MACHINE_ANNOUNCE_V3_TOPIC
+        ));
+        assert!(is_revocation_recovery_topic(
+            crate::announce_blob::ANNOUNCE_BLOB_TOPIC
         ));
         assert!(is_revocation_recovery_topic("x0x.user.shard.v2.9"));
         assert!(!is_revocation_recovery_topic("x0x.groups.public.example"));

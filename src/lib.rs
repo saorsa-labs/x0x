@@ -2931,20 +2931,67 @@ fn provenanced_blob_cert(
     identity_authority::has_authenticated_provenance(&cert, Some(announced)).then_some(cert)
 }
 
-/// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
-/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch. Each miss
-/// list keeps its own place. A full table sets the oldest list aside
-/// under its own index. A dropped index still reaches later subjects on
-/// a later visit (#1116).
-async fn finish_subject_cert_recovery(
+/// How long a failed certificate digest stays out of the next cursor step.
+const CERT_RECOVERY_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound on remembered failed digests. Expired entries are dropped first.
+const MAX_CERT_RECOVERY_FAILURES: usize = 128;
+
+/// A network fetch is allowed only while a carrier is waiting for resync
+/// and this batch still has a miss (#1116).
+fn revocation_batch_may_fetch(resync_required: bool, pending_fetches: usize) -> bool {
+    resync_required && pending_fetches > 0
+}
+
+fn recovery_digest_ready(
+    progress: &mut announce_blob::CertRecoveryAttempts,
+    digest: &[u8; 32],
+) -> bool {
+    match progress.failed_digests.get(digest).copied() {
+        Some(until) if std::time::Instant::now() < until => false,
+        Some(_) => {
+            progress.failed_digests.remove(digest);
+            true
+        }
+        None => true,
+    }
+}
+
+fn remember_failed_recovery_digest(
+    progress: &mut announce_blob::CertRecoveryAttempts,
+    digest: [u8; 32],
+) {
+    let until = std::time::Instant::now() + CERT_RECOVERY_FAIL_BACKOFF;
+    if progress.failed_digests.len() >= MAX_CERT_RECOVERY_FAILURES
+        && !progress.failed_digests.contains_key(&digest)
+    {
+        let now = std::time::Instant::now();
+        progress
+            .failed_digests
+            .retain(|_, deadline| *deadline > now);
+        if progress.failed_digests.len() >= MAX_CERT_RECOVERY_FAILURES {
+            let oldest = progress
+                .failed_digests
+                .iter()
+                .min_by_key(|(_, deadline)| *deadline)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                progress.failed_digests.remove(&oldest);
+            }
+        }
+    }
+    progress.failed_digests.insert(digest, until);
+}
+
+/// Split a plan into cache hits and misses. This does not publish.
+async fn partition_subject_cert_plan(
     mut plan: CertRecoveryPlan,
-    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
-    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
-) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
-    let Some(cache) = blob_cache else {
-        return plan.found;
-    };
-    let mut misses = Vec::new();
+    cache: &announce_blob::AnnounceBlobCache,
+) -> (
+    std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+) {
+    let mut pending = Vec::new();
     for (subject, announced) in plan.fetches {
         let Some(digest) = announced.cert_digest else {
             continue;
@@ -2955,11 +3002,25 @@ async fn finish_subject_cert_recovery(
                 continue;
             }
         }
-        misses.push((subject, announced));
+        pending.push((subject, announced));
     }
+    (plan.found, pending)
+}
+
+/// Fetch the budgeted misses together, under one blob deadline.
+///
+/// A digest that failed recently is not fetched again. The eight-fetch
+/// cap still applies to the selection.
+async fn fetch_subject_cert_misses(
+    mut found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    misses: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+    cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
     let fail_fetches = cert_recovery_fetches_fail(cache);
-    if pubsub.is_none() && !fail_fetches {
-        return plan.found;
+    let probe = recovery_publish_probe(cache);
+    if pubsub.is_none() && !fail_fetches && !probe {
+        return found;
     }
     let budgeted = {
         let mut attempts = cache.lock_cert_recovery_attempts();
@@ -2977,30 +3038,152 @@ async fn finish_subject_cert_recovery(
         }
         budgeted
     };
-    if budgeted.is_empty() {
+    let jobs = {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        let mut jobs = Vec::new();
+        for (subject, announced) in budgeted {
+            let Some(digest) = announced.cert_digest else {
+                continue;
+            };
+            if !recovery_digest_ready(&mut attempts, &digest) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                *attempts.fetch_calls.entry(digest).or_default() += 1;
+                if probe {
+                    attempts
+                        .publish_topics
+                        .push(announce_blob::ANNOUNCE_BLOB_TOPIC);
+                    attempts.publish_topics.push(crate::IDENTITY_ANNOUNCE_TOPIC);
+                }
+            }
+            jobs.push((subject, announced, digest));
+        }
+        if fail_fetches || probe {
+            for (_, _, digest) in &jobs {
+                remember_failed_recovery_digest(&mut attempts, *digest);
+            }
+        }
+        jobs
+    };
+    if jobs.is_empty() || fail_fetches || probe {
+        return found;
+    }
+    let Some(pubsub) = pubsub else {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        for (_, _, digest) in jobs {
+            remember_failed_recovery_digest(&mut attempts, digest);
+        }
+        return found;
+    };
+    let mut unresolved = std::collections::HashSet::new();
+    let mut pending = tokio::task::JoinSet::new();
+    for (subject, announced, digest) in jobs {
+        unresolved.insert(digest);
+        let cache = std::sync::Arc::clone(cache);
+        let pubsub = std::sync::Arc::clone(pubsub);
+        pending.spawn(async move {
+            let blob = cache
+                .fetch_bounded(&pubsub, &digest, &subject, &announced.machine_id)
+                .await;
+            (subject, announced, digest, blob)
+        });
+    }
+    let sleep = tokio::time::sleep(std::time::Duration::from_secs(
+        announce_blob::BLOB_FETCH_TIMEOUT_SECS,
+    ));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            joined = pending.join_next() => {
+                if !keep_fetched_subject_cert(joined, &mut found, &mut unresolved) {
+                    break;
+                }
+            }
+            () = &mut sleep => {
+                pending.abort_all();
+                while let Some(joined) = pending.try_join_next() {
+                    if !keep_fetched_subject_cert(Some(joined), &mut found, &mut unresolved) {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if !unresolved.is_empty() {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        for digest in unresolved {
+            remember_failed_recovery_digest(&mut attempts, digest);
+        }
+    }
+    found
+}
+
+type FetchedSubjectCert = (
+    identity::AgentId,
+    dm_inbox::AuthenticatedMachineBinding,
+    [u8; 32],
+    Option<std::sync::Arc<announce_blob::CachedBlob>>,
+);
+
+/// Keep a certificate that finished before the batch deadline. `false`
+/// means the set is empty.
+fn keep_fetched_subject_cert(
+    joined: Option<Result<FetchedSubjectCert, tokio::task::JoinError>>,
+    found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    unresolved: &mut std::collections::HashSet<[u8; 32]>,
+) -> bool {
+    match joined {
+        Some(Ok((subject, announced, digest, blob))) => {
+            if let Some(blob) = blob {
+                if let Some(cert) = provenanced_blob_cert(&blob, &subject, announced) {
+                    found.insert(subject, vec![cert]);
+                    unresolved.remove(&digest);
+                }
+            }
+            true
+        }
+        Some(Err(_)) => true,
+        None => false,
+    }
+}
+
+/// Finish [`plan_subject_cert_recovery`]. Every blob-cache hit is kept.
+/// At most [`MAX_CERT_RECOVERY_SUBJECTS`] misses start a fetch, and only
+/// when `allow_network` is set. Callers set that only while a carrier is
+/// waiting for resync. Fetches for one batch share one blob deadline. A
+/// failed digest waits out its backoff (#1116).
+#[cfg(test)]
+async fn finish_subject_cert_recovery(
+    plan: CertRecoveryPlan,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
+    allow_network: bool,
+) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    let Some(cache) = blob_cache else {
         return plan.found;
+    };
+    let (found, pending) = partition_subject_cert_plan(plan, cache).await;
+    if !revocation_batch_may_fetch(allow_network, pending.len()) {
+        return found;
     }
-    for (subject, announced) in budgeted {
-        let Some(digest) = announced.cert_digest else {
-            continue;
-        };
-        if fail_fetches {
-            continue;
-        }
-        let Some(pubsub) = pubsub else {
-            continue;
-        };
-        let Some(blob) = cache
-            .fetch_bounded(pubsub, &digest, &subject, &announced.machine_id)
-            .await
-        else {
-            continue;
-        };
-        if let Some(cert) = provenanced_blob_cert(&blob, &subject, announced) {
-            plan.found.insert(subject, vec![cert]);
-        }
+    fetch_subject_cert_misses(found, pending, cache, pubsub).await
+}
+
+/// The test hook records the two recovery topics and does not publish.
+fn recovery_publish_probe(cache: &announce_blob::AnnounceBlobCache) -> bool {
+    #[cfg(test)]
+    {
+        cache.recovery_publish_probe_for_testing()
     }
-    plan.found
+    #[cfg(not(test))]
+    {
+        let _ = cache;
+        false
+    }
 }
 
 /// The test hook spends the fetch budget and then returns no blob.
@@ -3031,7 +3214,175 @@ async fn recover_subject_certs(
     subjects: impl IntoIterator<Item = identity::AgentId>,
 ) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
     let plan = plan_subject_cert_recovery(sources, subjects);
-    finish_subject_cert_recovery(plan, blob_cache, pubsub).await
+    let allow_network = pubsub.is_some()
+        || blob_cache.is_some_and(|cache| {
+            cert_recovery_fetches_fail(cache) || recovery_publish_probe(cache)
+        });
+    finish_subject_cert_recovery(plan, blob_cache, pubsub, allow_network).await
+}
+
+/// Apply one v1 revocation batch after subject certificates are known.
+#[allow(clippy::too_many_arguments)]
+async fn apply_legacy_revocation_records(
+    records: Vec<revocation::RevocationRecord>,
+    subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    identity_dir: Option<std::path::PathBuf>,
+    owner_trust: &owner_trust::OwnerTrust,
+    contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    discovery_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    machine_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+) {
+    let mut newly_inserted = Vec::new();
+    {
+        let _share_grant_barrier = owner_trust
+            .share_grant_revocation_barrier(&records, revocation_set)
+            .await;
+        let mut set = revocation_set.write().await;
+        for record in records {
+            if set.contains_hash(&record.record_hash()) {
+                continue;
+            }
+            let subject_cert = match &record.subject {
+                revocation::RevokedSubject::Agent(agent_id) => {
+                    pick_subject_cert(subject_certs.get(agent_id), &record)
+                }
+                _ => None,
+            };
+            match set.verify_and_insert_at(
+                record.clone(),
+                subject_cert,
+                Agent::unix_timestamp_secs(),
+            ) {
+                Ok(true) => newly_inserted.push(record),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("revocation record rejected: {e}");
+                }
+            }
+        }
+    }
+    if newly_inserted
+        .iter()
+        .any(|record| matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)))
+    {
+        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+    }
+    if !newly_inserted.is_empty() {
+        let persisted_bytes = revocation_set.read().await.to_bytes();
+        let id_dir = identity_dir.clone();
+        tokio::spawn(async move {
+            match persisted_bytes {
+                Ok(bytes) => {
+                    if let Err(e) =
+                        storage::save_revocation_set_bytes(bytes, id_dir.as_deref()).await
+                    {
+                        if !storage::revocation_persistence_is_blocked(&e) {
+                            tracing::warn!("failed to persist revocation set: {e}");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("failed to encode revocation set for persistence: {e}"),
+            }
+        });
+        for record in newly_inserted {
+            match &record.subject {
+                revocation::RevokedSubject::Agent(agent_id) => {
+                    if let Some(entry) = discovery_cache.write().await.remove(agent_id) {
+                        machine_cache.write().await.remove(&entry.machine_id);
+                    }
+                    let mut cs = contact_store.write().await;
+                    cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    tracing::info!(
+                        agent = %hex::encode(agent_id.as_bytes()),
+                        "evicted revoked agent (received via gossip)"
+                    );
+                }
+                revocation::RevokedSubject::Machine(machine_id) => {
+                    machine_cache.write().await.remove(machine_id);
+                    discovery_cache
+                        .write()
+                        .await
+                        .retain(|_, agent| agent.machine_id != *machine_id);
+                    tracing::info!(
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        "evicted revoked machine (received via gossip)"
+                    );
+                }
+                revocation::RevokedSubject::ShareGrant(_) => {}
+                revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                    tracing::info!(
+                        agent = %hex::encode(binding.agent.as_bytes()),
+                        machine = %hex::encode(binding.machine.as_bytes()),
+                        move_epoch = binding.move_epoch,
+                        "binding tombstone received via gossip — pairing retired"
+                    );
+                }
+            }
+        }
+    }
+    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
+}
+
+/// Apply one v2 revocation batch after subject certificates are known.
+async fn apply_v2_revocation_records(
+    records: Vec<revocation::RevocationRecord>,
+    subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    identity_dir: Option<std::path::PathBuf>,
+    owner_trust: &owner_trust::OwnerTrust,
+) {
+    let mut inserted = false;
+    let mut share_grant_inserted = false;
+    {
+        let _share_grant_barrier = owner_trust
+            .share_grant_revocation_barrier(&records, revocation_set)
+            .await;
+        let mut set = revocation_set.write().await;
+        for record in records {
+            if set.contains_hash(&record.record_hash()) {
+                continue;
+            }
+            let subject_cert = match &record.subject {
+                revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                    pick_subject_cert(subject_certs.get(&binding.agent), &record)
+                }
+                _ => None,
+            };
+            let is_share_grant =
+                matches!(record.subject, revocation::RevokedSubject::ShareGrant(_));
+            match set.verify_and_insert_at(record, subject_cert, Agent::unix_timestamp_secs()) {
+                Ok(true) => {
+                    inserted = true;
+                    share_grant_inserted |= is_share_grant;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("v2 binding revocation rejected: {e}");
+                }
+            }
+        }
+    }
+    if share_grant_inserted {
+        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+    }
+    if inserted {
+        let persisted = revocation_set.read().await.to_bytes_v2();
+        let id_dir = identity_dir.clone();
+        tokio::spawn(async move {
+            if let Ok(bytes) = persisted {
+                if let Some(dir) = id_dir {
+                    let _ = storage::save_private_bytes_to(&dir.join("revocations-v2.bin"), bytes)
+                        .await;
+                }
+            }
+        });
+    }
+    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
 }
 
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
@@ -12005,166 +12356,73 @@ impl Agent {
                                     continue;
                                 }
                             };
-                        let mut newly_inserted = Vec::new();
-                        // Resolve subject certificates from the discovery cache
-                        // so gossiped issuer-revocations (a user un-vouching a
-                        // certified agent) can be authority-verified on receipt
-                        // (issue #191). `verify_authority` for an issuer-
-                        // revocation requires the subject cert; self/machine
-                        // revocations need none. A cert not in the local cache
-                        // means the issuer-revocation is rejected fail-closed
-                        // — the cert must have been announced first (EP1).
-                        // Built before taking the revocation-set write lock so
-                        // no two identity locks are held at once.
-                        let subject_certs = {
-                            let journal =
-                                load_journal_certs(journal_path_for_listener.as_deref()).await;
-                            let plan = {
-                                let announced = announced_machine_bindings.read().await;
-                                let cache = cache.read().await;
-                                plan_subject_cert_recovery(
-                                    &ProvenanceSources {
-                                        cache: &cache,
-                                        announced: &announced,
-                                        evidence: Some(&evidence_for_listener),
-                                        local_user: own_user_id,
-                                        journal: &journal,
-                                    },
-                                    records.iter().filter_map(
-                                        revocation::RevocationRecord::needs_certificate_authority,
-                                    ),
-                                )
-                            };
-                            finish_subject_cert_recovery(
-                                plan,
-                                Some(&announce_blob_cache),
-                                Some(&blob_pubsub),
+                        // Resolve subject certificates before the revocation
+                        // write lock. A network fetch runs only while this
+                        // node is waiting for resync, and then outside this
+                        // loop (#1116).
+                        let journal =
+                            load_journal_certs(journal_path_for_listener.as_deref()).await;
+                        let plan = {
+                            let announced = announced_machine_bindings.read().await;
+                            let discovery = cache.read().await;
+                            plan_subject_cert_recovery(
+                                &ProvenanceSources {
+                                    cache: &discovery,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
                             )
-                            .await
                         };
-                        {
-                            let _share_grant_barrier = owner_trust_for_listener
-                                .share_grant_revocation_barrier(&records, &revocation_set)
+                        let resync = revocation_set.read().await.revocation_resync_required();
+                        let (found, pending) =
+                            partition_subject_cert_plan(plan, &announce_blob_cache).await;
+                        if revocation_batch_may_fetch(resync, pending.len()) {
+                            let revocation_set = revocation_set.clone();
+                            let identity_dir = identity_dir_for_listener.clone();
+                            let owner_trust = owner_trust_for_listener.clone();
+                            let contact_store = contact_store_for_evict.clone();
+                            let discovery_cache = cache.clone();
+                            let machine_cache = machine_cache.clone();
+                            let blob_cache = announce_blob_cache.clone();
+                            let pubsub = blob_pubsub.clone();
+                            tokio::spawn(async move {
+                                let subject_certs = fetch_subject_cert_misses(
+                                    found,
+                                    pending,
+                                    &blob_cache,
+                                    Some(&pubsub),
+                                )
                                 .await;
-                            let mut set = revocation_set.write().await;
-                            for record in records {
-                                if set.contains_hash(&record.record_hash()) {
-                                    continue; // already known — skip re-verification
-                                }
-                                let subject_cert = match &record.subject {
-                                    revocation::RevokedSubject::Agent(agent_id) => {
-                                        pick_subject_cert(subject_certs.get(agent_id), &record)
-                                    }
-                                    _ => None,
-                                };
-                                match set.verify_and_insert_at(
-                                    record.clone(),
-                                    subject_cert,
-                                    Agent::unix_timestamp_secs(),
-                                ) {
-                                    Ok(true) => newly_inserted.push(record),
-                                    Ok(false) => {} // dup
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            "revocation record rejected: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // #926 r3: the legacy v1 file filters share-grant
-                        // records out; one that arrived on this carrier must
-                        // reach `revocations-v3.bin` or a restart forgets it.
-                        if newly_inserted.iter().any(|record| {
-                            matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
-                        }) {
-                            persist_share_grant_revocations(
+                                apply_legacy_revocation_records(
+                                    records,
+                                    subject_certs,
+                                    &revocation_set,
+                                    identity_dir,
+                                    &owner_trust,
+                                    &contact_store,
+                                    &discovery_cache,
+                                    &machine_cache,
+                                )
+                                .await;
+                            });
+                        } else {
+                            apply_legacy_revocation_records(
+                                records,
+                                found,
                                 &revocation_set,
-                                identity_dir_for_listener.as_deref(),
+                                identity_dir_for_listener.clone(),
+                                &owner_trust_for_listener,
+                                &contact_store_for_evict,
+                                &cache,
+                                &machine_cache,
                             )
                             .await;
                         }
-                        if !newly_inserted.is_empty() {
-                            // Persist asynchronously — best-effort; if it fails
-                            // the revocation is still enforced in memory for this
-                            // run. Snapshot the live set's encoded bytes under a
-                            // brief read lock (issuer-revocations carry their
-                            // authorizing cert in PersistedRevocation, which the
-                            // encoder preserves); the disk write runs off-lock.
-                            // The previous rebuild re-inserted records with
-                            // `None` cert, silently dropping every issuer-
-                            // revocation on save (issue #191).
-                            let persisted_bytes = revocation_set.read().await.to_bytes();
-                            let id_dir = identity_dir_for_listener.clone();
-                            tokio::spawn(async move {
-                                match persisted_bytes {
-                                    Ok(bytes) => {
-                                        if let Err(e) = storage::save_revocation_set_bytes(
-                                            bytes,
-                                            id_dir.as_deref(),
-                                        )
-                                        .await
-                                        {
-                                            if !storage::revocation_persistence_is_blocked(&e) {
-                                                tracing::warn!(
-                                                    "failed to persist revocation set: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => tracing::warn!(
-                                        "failed to encode revocation set for persistence: {e}"
-                                    ),
-                                }
-                            });
-                            // Evict revoked subjects from discovery caches.
-                            for record in newly_inserted {
-                                match &record.subject {
-                                    revocation::RevokedSubject::Agent(agent_id) => {
-                                        if let Some(entry) = cache.write().await.remove(agent_id) {
-                                            machine_cache.write().await.remove(&entry.machine_id);
-                                        }
-                                        let mut cs = contact_store_for_evict.write().await;
-                                        cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
-                                        tracing::info!(
-                                            agent = %hex::encode(agent_id.as_bytes()),
-                                            "evicted revoked agent (received via gossip)"
-                                        );
-                                    }
-                                    revocation::RevokedSubject::Machine(machine_id) => {
-                                        machine_cache.write().await.remove(machine_id);
-                                        cache.write().await.retain(|_, a| a.machine_id != *machine_id);
-                                        tracing::info!(
-                                            machine = %hex::encode(machine_id.as_bytes()),
-                                            "evicted revoked machine (received via gossip)"
-                                        );
-                                    }
-                                    // A share-grant record on v1 is never
-                                    // republished there (allowlist); grants
-                                    // are denied at evaluation time.
-                                    revocation::RevokedSubject::ShareGrant(_) => {}
-                                    // Binding tombstones evict nothing (§7):
-                                    // the pairing dies at the B/P gates.
-                                    revocation::RevokedSubject::AgentMachineBinding(
-                                        binding,
-                                    ) => {
-                                        tracing::info!(
-                                            agent = %hex::encode(binding.agent.as_bytes()),
-                                            machine = %hex::encode(
-                                                binding.machine.as_bytes()
-                                            ),
-                                            move_epoch = binding.move_epoch,
-                                            "binding tombstone received via gossip — pairing retired"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        persist_completed_revocation_rebuild(
-                            &revocation_set,
-                            identity_dir_for_listener.as_deref(),
-                        )
-                        .await;
                         continue;
                     }
                     // ADR-0043 §2.1: V3 machine announce — verify both
@@ -12230,100 +12488,60 @@ impl Agent {
                         else {
                             continue;
                         };
-                        let subject_certs = {
-                            let journal =
-                                load_journal_certs(journal_path_for_listener.as_deref()).await;
-                            let plan = {
-                                let announced = announced_machine_bindings.read().await;
-                                let cache = cache.read().await;
-                                plan_subject_cert_recovery(
-                                    &ProvenanceSources {
-                                        cache: &cache,
-                                        announced: &announced,
-                                        evidence: Some(&evidence_for_listener),
-                                        local_user: own_user_id,
-                                        journal: &journal,
-                                    },
-                                    records.iter().filter_map(
-                                        revocation::RevocationRecord::needs_certificate_authority,
-                                    ),
-                                )
-                            };
-                            finish_subject_cert_recovery(
-                                plan,
-                                Some(&announce_blob_cache),
-                                Some(&blob_pubsub),
+                        let journal =
+                            load_journal_certs(journal_path_for_listener.as_deref()).await;
+                        let plan = {
+                            let announced = announced_machine_bindings.read().await;
+                            let discovery = cache.read().await;
+                            plan_subject_cert_recovery(
+                                &ProvenanceSources {
+                                    cache: &discovery,
+                                    announced: &announced,
+                                    evidence: Some(&evidence_for_listener),
+                                    local_user: own_user_id,
+                                    journal: &journal,
+                                },
+                                records.iter().filter_map(
+                                    revocation::RevocationRecord::needs_certificate_authority,
+                                ),
                             )
-                            .await
                         };
-                        let mut inserted = false;
-                        let mut share_grant_inserted = false;
-                        {
-                            let _share_grant_barrier = owner_trust_for_listener
-                                .share_grant_revocation_barrier(&records, &revocation_set)
+                        let resync = revocation_set.read().await.revocation_resync_required();
+                        let (found, pending) =
+                            partition_subject_cert_plan(plan, &announce_blob_cache).await;
+                        if revocation_batch_may_fetch(resync, pending.len()) {
+                            let revocation_set = revocation_set.clone();
+                            let identity_dir = identity_dir_for_listener.clone();
+                            let owner_trust = owner_trust_for_listener.clone();
+                            let blob_cache = announce_blob_cache.clone();
+                            let pubsub = blob_pubsub.clone();
+                            tokio::spawn(async move {
+                                let subject_certs = fetch_subject_cert_misses(
+                                    found,
+                                    pending,
+                                    &blob_cache,
+                                    Some(&pubsub),
+                                )
                                 .await;
-                            let mut set = revocation_set.write().await;
-                            for record in records {
-                                if set.contains_hash(&record.record_hash()) {
-                                    continue;
-                                }
-                                let subject_cert = match &record.subject {
-                                    revocation::RevokedSubject::AgentMachineBinding(binding) => {
-                                        pick_subject_cert(subject_certs.get(&binding.agent), &record)
-                                    }
-                                    _ => None,
-                                };
-                                let is_share_grant = matches!(
-                                    record.subject,
-                                    revocation::RevokedSubject::ShareGrant(_)
-                                );
-                                match set.verify_and_insert_at(
-                                    record,
-                                    subject_cert,
-                                    Agent::unix_timestamp_secs(),
-                                ) {
-                                    Ok(true) => {
-                                        inserted = true;
-                                        share_grant_inserted |= is_share_grant;
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            "v2 binding revocation rejected: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // #926 r3: the v2 file filters share-grant records
-                        // out; persist them in v3 so a restart keeps them.
-                        if share_grant_inserted {
-                            persist_share_grant_revocations(
+                                apply_v2_revocation_records(
+                                    records,
+                                    subject_certs,
+                                    &revocation_set,
+                                    identity_dir,
+                                    &owner_trust,
+                                )
+                                .await;
+                            });
+                        } else {
+                            apply_v2_revocation_records(
+                                records,
+                                found,
                                 &revocation_set,
-                                identity_dir_for_listener.as_deref(),
+                                identity_dir_for_listener.clone(),
+                                &owner_trust_for_listener,
                             )
                             .await;
                         }
-                        if inserted {
-                            let persisted = revocation_set.read().await.to_bytes_v2();
-                            let id_dir = identity_dir_for_listener.clone();
-                            tokio::spawn(async move {
-                                if let Ok(bytes) = persisted {
-                                    if let Some(dir) = id_dir {
-                                        let _ = storage::save_private_bytes_to(
-                                            &dir.join("revocations-v2.bin"),
-                                            bytes,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            });
-                        }
-                        persist_completed_revocation_rebuild(
-                            &revocation_set,
-                            identity_dir_for_listener.as_deref(),
-                        )
-                        .await;
                         continue;
                     }
                     // ADR-0070: share-grant revocations on the v3 carrier.
@@ -32812,6 +33030,78 @@ mod tests {
             "the later cache hit is not stuck behind the first eight"
         );
         assert!(second.contains_key(&ninth));
+    }
+
+    /// #1116: a healthy node does not publish blob or identity announces
+    /// for an incoming batch of never-served certificate digests. A failed
+    /// digest is not fetched again on the next cursor step.
+    #[tokio::test]
+    async fn resync_gate_skips_unpublished_cert_fetches_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(8, 0).await;
+        blobs.set_recovery_publish_probe_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let ids: Vec<_> = subjects.iter().map(|subject| subject.agent_id).collect();
+        let healthy = revocation::RevocationSet::new();
+        assert!(!healthy.revocation_resync_required());
+        let plan = plan_subject_cert_recovery(&sources, ids.iter().copied());
+        let found = finish_subject_cert_recovery(
+            plan,
+            Some(&blobs),
+            None,
+            revocation_batch_may_fetch(healthy.revocation_resync_required(), ids.len()),
+        )
+        .await;
+        assert!(
+            found.is_empty(),
+            "a healthy node must not invent certificates for never-served digests"
+        );
+        assert!(
+            blobs.recovery_publish_topics_for_testing().is_empty(),
+            "a healthy node published {:?}",
+            blobs.recovery_publish_topics_for_testing()
+        );
+        for subject in &subjects {
+            assert_eq!(
+                blobs.recovery_fetch_count_for_testing(&subject.digest),
+                0,
+                "a healthy node fetched a never-served digest"
+            );
+        }
+
+        let waiting =
+            revocation::RevocationSet::quarantined_carrier(revocation::REVOCATION_CARRIER_V2);
+        assert!(waiting.revocation_resync_required());
+        let digest = subjects[0].digest;
+        let plan = plan_subject_cert_recovery(&sources, [subjects[0].agent_id]);
+        let _ = finish_subject_cert_recovery(
+            plan,
+            Some(&blobs),
+            None,
+            revocation_batch_may_fetch(waiting.revocation_resync_required(), 1),
+        )
+        .await;
+        let topics = blobs.recovery_publish_topics_for_testing();
+        assert!(
+            topics.contains(&announce_blob::ANNOUNCE_BLOB_TOPIC),
+            "a resync fetch must name the blob topic: {topics:?}"
+        );
+        assert!(
+            topics.contains(&IDENTITY_ANNOUNCE_TOPIC),
+            "a resync fetch must name the identity topic: {topics:?}"
+        );
+        assert_eq!(blobs.recovery_fetch_count_for_testing(&digest), 1);
+        let plan = plan_subject_cert_recovery(&sources, [subjects[0].agent_id]);
+        let _ = finish_subject_cert_recovery(plan, Some(&blobs), None, true).await;
+        assert_eq!(
+            blobs.recovery_fetch_count_for_testing(&digest),
+            1,
+            "the next cursor step fetched a failed digest again"
+        );
+        assert_eq!(
+            blobs.recovery_publish_topics_for_testing().len(),
+            topics.len()
+        );
     }
 
     #[test]

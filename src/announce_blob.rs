@@ -209,8 +209,15 @@ pub(crate) struct CertRecoveryAttempts {
     pub(crate) retained_order: VecDeque<u64>,
     pub(crate) discards: u64,
     pub(crate) unsaved_service: u64,
+    /// Digests whose fetch failed. A later cursor step skips one until
+    /// its backoff has elapsed.
+    pub(crate) failed_digests: HashMap<[u8; 32], std::time::Instant>,
     #[cfg(test)]
     pub(crate) attempted: HashSet<identity::AgentId>,
+    #[cfg(test)]
+    pub(crate) fetch_calls: HashMap<[u8; 32], u32>,
+    #[cfg(test)]
+    pub(crate) publish_topics: Vec<&'static str>,
 }
 
 /// The blob cache: in-memory `HashMap` + optional disk persistence.
@@ -226,10 +233,15 @@ pub struct AnnounceBlobCache {
     /// Next index of each revocation miss list. v1 and v2 share it. A
     /// shorter list does not move a longer list. A full table sets the
     /// oldest list aside under its own index. A dropped index still
-    /// reaches later subjects on a later visit (#1116).
+    /// reaches later subjects on a later visit. A network fetch runs
+    /// only while a carrier is waiting for resync (#1116).
     cert_recovery_attempts: std::sync::Mutex<CertRecoveryAttempts>,
     #[cfg(test)]
     bounded_fetch_fails: AtomicBool,
+    /// When set, a recovery fetch records its two topics and does not
+    /// publish them.
+    #[cfg(test)]
+    recovery_publish_probe: AtomicBool,
     #[cfg(test)]
     diagnostics: AnnounceBlobDiagnosticCounters,
 }
@@ -249,6 +261,8 @@ impl AnnounceBlobCache {
             cert_recovery_attempts: std::sync::Mutex::new(CertRecoveryAttempts::default()),
             #[cfg(test)]
             bounded_fetch_fails: AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_publish_probe: AtomicBool::new(false),
             #[cfg(test)]
             diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
@@ -406,6 +420,35 @@ impl AnnounceBlobCache {
         self.lock_cert_recovery_attempts()
             .attempted
             .contains(subject)
+    }
+
+    /// Record the blob and identity topics instead of publishing them.
+    #[cfg(test)]
+    pub(crate) fn set_recovery_publish_probe_for_testing(&self, enabled: bool) {
+        self.recovery_publish_probe
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether a recovery fetch should record topics and skip the network.
+    #[cfg(test)]
+    pub(crate) fn recovery_publish_probe_for_testing(&self) -> bool {
+        self.recovery_publish_probe.load(Ordering::Relaxed)
+    }
+
+    /// Topics a recovery fetch recorded. Empty when no fetch ran.
+    #[cfg(test)]
+    pub(crate) fn recovery_publish_topics_for_testing(&self) -> Vec<&'static str> {
+        self.lock_cert_recovery_attempts().publish_topics.clone()
+    }
+
+    /// How many times recovery has fetched `digest`.
+    #[cfg(test)]
+    pub(crate) fn recovery_fetch_count_for_testing(&self, digest: &[u8; 32]) -> u32 {
+        self.lock_cert_recovery_attempts()
+            .fetch_calls
+            .get(digest)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// One verified fetch for a revocation subject, bounded by the blob
