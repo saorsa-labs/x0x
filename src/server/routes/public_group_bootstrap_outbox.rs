@@ -1227,6 +1227,28 @@ pub(in crate::server) fn spawn_public_group_bootstrap_delivery(state: &Arc<AppSt
 // Receiving side
 // ---------------------------------------------------------------------------
 
+/// D272: catch-up consent from the local roster, not from the snapshot.
+///
+/// The sender is an active admin on the installed group, and that sender
+/// signed the snapshot's single retained head. A new install does not use
+/// this predicate. Apply still checks the one-revision link.
+fn installed_catchup_admin_consent(
+    local: &x0x::groups::GroupInfo,
+    snapshot: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+) -> bool {
+    let active_admin = local
+        .caller_role(sender_hex)
+        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
+    if !active_admin {
+        return false;
+    }
+    let Some(retained) = snapshot.commit_log.last() else {
+        return false;
+    };
+    snapshot.commit_log.len() == 1 && retained.commit.committed_by == sender_hex
+}
+
 /// Validate and install a signed-public bootstrap received over the
 /// authenticated direct channel. Existing local state is never overwritten;
 /// normal metadata commits remain the only update path after bootstrap.
@@ -1263,16 +1285,29 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     //
     // ADR-0070 §2: a current `GroupInvite` ShareGrant for this agent is the
     // one other consent — the owner said this grantee may add the shared
-    // agent to groups. Blocked still wins (the grant evaluation refuses a
-    // Blocked sender), and the grant pairs only on the authenticated
-    // binding of the transport machine. It never touches Home admission
+    // agent to groups. The grant pairs only on the authenticated binding
+    // of the transport machine. It never touches Home admission
     // (`GroupAdmission::OwnerCertified`).
-    let known_contact = {
+    //
+    // Blocked still wins. Grant evaluation refuses a Blocked sender, and
+    // the check below refuses one before the D272 consent branch. The
+    // listener can queue a frame after ingress, so the block may land
+    // while that frame waits.
+    //
+    // D272: an already installed group may take the catch-up branch from an
+    // active local admin who signed the single retained head. That consent
+    // does not seed a new group, and it does not ACK a duplicate frontier.
+    let (known_contact, sender_blocked) = {
         let contacts = state.contacts.read().await;
-        contacts.trust_level(&sender).rank() >= crate::contacts::TrustLevel::Known.rank()
+        (
+            contacts.trust_level(&sender).rank() >= crate::contacts::TrustLevel::Known.rank(),
+            contacts.is_blocked(&sender),
+        )
     };
-    if !known_contact {
-        let granted = match sender_machine {
+    let contact_or_grant = if known_contact {
+        true
+    } else {
+        match sender_machine {
             Some(machine) => {
                 state
                     .agent
@@ -1281,8 +1316,25 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
                     .group_invite
             }
             None => false,
+        }
+    };
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group = *bootstrap.group;
+    if sender_blocked {
+        tracing::debug!(
+            sender = %LogHexId::agent(&sender_hex),
+            "ignoring public-group bootstrap from a blocked sender"
+        );
+        return Err("public-group bootstrap sender is not a known contact".to_string());
+    }
+    if !contact_or_grant {
+        let catchup_consent = {
+            let groups = state.named_groups.read().await;
+            crate::server::resolve_group_entry_locked(&groups, group.stable_group_id()).is_some_and(
+                |(_, installed)| installed_catchup_admin_consent(installed, &group, &sender_hex),
+            )
         };
-        if !granted {
+        if !catchup_consent {
             tracing::debug!(
                 sender = %LogHexId::agent(&sender_hex),
                 "ignoring public-group bootstrap from unknown or blocked sender"
@@ -1290,8 +1342,6 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
             return Err("public-group bootstrap sender is not a known contact".to_string());
         }
     }
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let group = *bootstrap.group;
     let revoked_snapshot_members = {
         let set = state.agent.revocation_set();
         let revoked = set.read().await;
@@ -1346,10 +1396,18 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         // the inbound snapshot's stable id, or the frontier comparison below
         // reads "new group" and the install proceeds against the wrong record.
         match crate::server::resolve_group_entry_locked(&groups, &group_id).map(|(_, info)| info) {
-            Some(installed) => {
-                Some((installed.state_revision, installed.state_hash.clone()) == frontier)
-            }
+            Some(installed) => Some((
+                (installed.state_revision, installed.state_hash.clone()) == frontier,
+                installed_catchup_admin_consent(installed, &group, &sender_hex),
+            )),
             None => {
+                if !contact_or_grant {
+                    tracing::debug!(
+                        sender = %LogHexId::agent(&sender_hex),
+                        "ignoring public-group bootstrap from unknown or blocked sender"
+                    );
+                    return Err("public-group bootstrap sender is not a known contact".to_string());
+                }
                 if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
                     tracing::warn!(
                         sender = %LogHexId::agent(&sender_hex),
@@ -1362,7 +1420,7 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         }
     };
 
-    if let Some(frontier_matches) = installed_frontier_matches {
+    if let Some((frontier_matches, admin_consent)) = installed_frontier_matches {
         // Bootstrap seeds a group; it never overwrites one. Reporting the
         // installed frontier honestly is what keeps the sender's outbox
         // correct: only an exact match may discharge its obligation, and a
@@ -1372,7 +1430,16 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
         if !frontier_matches {
             // A new install still refuses a foreign frontier. An installed
             // member who is exactly one signed commit behind may take this
-            // head when the sender is the admin who signed it.
+            // head when the sender is the admin who signed it. D272 lets
+            // that admin through without a Known contact or a share grant.
+            // The apply checks still have to pass.
+            if !contact_or_grant && !admin_consent {
+                tracing::debug!(
+                    sender = %LogHexId::agent(&sender_hex),
+                    "ignoring public-group bootstrap from unknown or blocked sender"
+                );
+                return Err("public-group bootstrap sender is not a known contact".to_string());
+            }
             let caught_up = persist_named_groups_mutation(state, |groups| {
                 let Some((key, info)) =
                     crate::server::resolve_group_entry_locked(groups, &group_id)
@@ -1420,6 +1487,16 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
                 return Err("public-group bootstrap catch-up was not directory-durable".to_string());
             }
             return Err("public-group bootstrap frontier is not the installed one".to_string());
+        }
+        // D272 consent covers the catch-up branch only. An exact frontier
+        // still needs a Known contact or a GroupInvite grant before this
+        // node ACKs it.
+        if !contact_or_grant {
+            tracing::debug!(
+                sender = %LogHexId::agent(&sender_hex),
+                "ignoring duplicate public-group bootstrap from unknown or blocked sender"
+            );
+            return Err("public-group bootstrap sender is not a known contact".to_string());
         }
         // `Duplicate` certifies that a durable record already exists, so it may
         // not be answered off the in-memory roster alone. A previous write that

@@ -21,16 +21,17 @@
 //!   obtains N+1 and both stores then report `requests_received` greater
 //!   than the post-restart baseline. GREEN.
 //! - invite-only: M joined by invite and the test sets no contact and no
-//!   share grant. The consent gate is unchanged. The receipt records
-//!   whether that member obtains N+1.
+//!   share grant. O is an active admin on M's installed roster and signed
+//!   the retained head, so D272 catch-up consent applies. M obtains N+1.
+//!   GREEN. A new install still uses the Known-contact or grant gate.
 //!
 //! Disconnecting `install_public_kv_revision_catchup` from public-store
 //! open leaves the candidate with no snapshot to deliver, so its request
 //! stage fails and the run is INFRA rather than GREEN.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
-//! reruns of these two cases on the existing W3-H gate. This module does
-//! not add a workflow that loops CI.
+//! reruns on the existing W3-H gate. This module does not add a workflow
+//! that loops CI.
 
 #![cfg(test)]
 
@@ -258,19 +259,42 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     if arm == Arm::InviteOnly {
         let agent =
             super::super::parse_agent_id_hex(&o_hex).map_err(|error| anyhow::anyhow!(error))?;
-        let trust = {
+        let machine = sim.ids("O")?.1;
+        let (trust, grant_access_empty, stored_group_invite) = {
             let state = sim.state("M")?;
-            let contacts = state.contacts.read().await;
-            contacts.trust_level(&agent)
+            let trust = {
+                let contacts = state.contacts.read().await;
+                contacts.trust_level(&agent)
+            };
+            let access = state.agent.share_grant_access(&agent, &machine).await;
+            let stored_group_invite = state.agent.share_grant_store().is_some_and(|store| {
+                [
+                    crate::share_grant::GrantRole::Issued,
+                    crate::share_grant::GrantRole::Received,
+                ]
+                .into_iter()
+                .any(|role| {
+                    store.grants(role).into_iter().any(|grant| {
+                        grant
+                            .caps
+                            .contains(&crate::share_grant::ShareCap::GroupInvite)
+                    })
+                })
+            });
+            (trust, access.is_empty(), stored_group_invite)
         };
+        let no_known_contact = trust == crate::contacts::TrustLevel::Unknown;
+        let no_grant = grant_access_empty && !stored_group_invite;
         ensure!(
-            trust == crate::contacts::TrustLevel::Unknown,
-            "INFRA: the invite join recorded O as {trust}"
+            no_known_contact && no_grant,
+            "INFRA: invite-only arm recorded O as {trust}, grant_access_empty={grant_access_empty}, stored_group_invite={stored_group_invite}"
         );
         receipt.evidence(
             "invite_join_sets_no_known_contact_and_no_grant",
-            true,
-            "M's trust in O is unknown; the test set no contact and no share grant".to_string(),
+            no_known_contact && no_grant,
+            format!(
+                "trust={trust}; grant_access_empty={grant_access_empty}; stored_group_invite={stored_group_invite}"
+            ),
             at(sim),
         );
     } else {
@@ -404,11 +428,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 && o_rev == n + 1
                 && o_received > base_o_received
                 && m_received > base_m_received;
-            if arm == Arm::ProductionPath {
+            if arm == Arm::ProductionPath || arm == Arm::InviteOnly {
                 return caught_up;
-            }
-            if arm == Arm::InviteOnly && caught_up {
-                return true;
             }
             // Skew observed and still not caught up: the rest of the bound
             // is held below, so a late snapshot would still be visible.
@@ -427,7 +448,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("catch-up bound")?;
-    if arm != Arm::ProductionPath {
+    if arm == Arm::SnapshotDropped {
         let rest = CATCHUP.saturating_sub(sim.fabric().now().saturating_sub(bound_start));
         if !rest.is_zero() {
             sim.within(
@@ -573,12 +594,12 @@ async fn w3h_1105_restarted_replica_obtains_n_plus_one_snapshot() -> Result<()> 
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1105_invite_only_restart_has_no_catchup_consent() -> Result<()> {
+async fn w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin() -> Result<()> {
     expect(
-        "w3h_1105_invite_only_restart_has_no_catchup_consent",
+        "w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin",
         0x1105_0003,
         Arm::InviteOnly,
-        Verdict::Red,
+        Verdict::Green,
     )
     .await
 }

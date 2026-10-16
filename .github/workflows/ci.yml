@@ -461,8 +461,9 @@ jobs:
       # receipt complete); the per-case distinct-trace counts are printed
       # (`W3H-TRACES`) and do not fail the job.
       # D30 restart-cold row for #1105: w3h_1105_red_baseline_restarted_replica_stays_at_n
-      # (RED) and w3h_1105_restarted_replica_obtains_n_plus_one_snapshot (GREEN).
-      # This is the existing 20-rerun gate, not a separate workflow.
+      # (RED), w3h_1105_restarted_replica_obtains_n_plus_one_snapshot (GREEN),
+      # and w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin
+      # (GREEN, D272). This is the existing 20-rerun gate, not a separate workflow.
       - name: W3-H gate (verdict-stable reruns, D196)
         run: >-
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
@@ -506,6 +507,8 @@ jobs:
           --expect w3h_1105_red_baseline_restarted_replica_stays_at_n=RED
           --require w3h_1105_restarted_replica_obtains_n_plus_one_snapshot
           --expect w3h_1105_restarted_replica_obtains_n_plus_one_snapshot=GREEN
+          --require w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin
+          --expect w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin=GREEN
           --require w3h_1191_attempt_exit
           --expect w3h_1191_attempt_exit=GREEN
 

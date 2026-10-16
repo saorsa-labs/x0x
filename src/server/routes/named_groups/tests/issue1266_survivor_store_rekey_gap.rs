@@ -542,12 +542,38 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     let (status, body) = get_value(&f.state, &topic, "gap").await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "dropped in the gap: {body}");
 
-    // The share installs well inside Alice's cooldown.
+    // The share installs well inside Alice's cooldown. A local read runs the
+    // GSS refresh, and the first Current refresh after KeyPending starts the
+    // repair: one request now, and exactly one retry 16 s later. Alice's
+    // `requests_answered` increments when she publishes the retry, which can
+    // be before Bob applies it. Do not finish on her counters alone. The
+    // same check must see Bob's two requests and a successful read of the
+    // gap value. If that read is still missing, wait for delivery.
     let delivered =
         apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
             .await;
     assert!(!delivered.should_exit);
-    let (status, body) = wait_for_value(&f.state, &topic, "gap", Duration::from_secs(40)).await?;
+    let repair_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let (status, body) = loop {
+        let (status, body) = get_value(&f.state, &topic, "gap").await?;
+        let served = alice.sync.state_sync_snapshot();
+        let requests = bob
+            .state_sync_snapshot()
+            .requests_sent
+            .saturating_sub(baseline_requests);
+        let counters_ready =
+            requests >= 2 && served.requests_answered >= 2 && served.rejected_cooldown >= 1;
+        if counters_ready && status == StatusCode::OK {
+            break (status, body);
+        }
+        if counters_ready {
+            break wait_for_value(&f.state, &topic, "gap", Duration::from_secs(10)).await?;
+        }
+        if tokio::time::Instant::now() >= repair_deadline {
+            break (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let served = alice.sync.state_sync_snapshot();
     let requests = bob.state_sync_snapshot().requests_sent - baseline_requests;
     assert_eq!(
@@ -565,6 +591,12 @@ async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> 
     );
     assert_eq!(requests, 2, "one repair request plus exactly one retry");
     assert_eq!(served.requests_answered, 2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        bob.state_sync_snapshot().requests_sent - baseline_requests,
+        2,
+        "the repair is capped at two requests"
+    );
     alice.sync.cancel_sync();
     Ok(())
 }
