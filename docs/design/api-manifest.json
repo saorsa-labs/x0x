@@ -254,7 +254,7 @@
     {
       "category": "identity",
       "cli_name": "identity revoke",
-      "description": "Issue a signed revocation for an agent-id or machine-id keypair",
+      "description": "Revoke the daemon's own agent or an owner-authorized agent-machine binding",
       "method": "POST",
       "path": "/identity/revoke",
       "request": {

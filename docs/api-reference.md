@@ -275,8 +275,30 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form, which the CLI reaches via `--move-epoch`) |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
 | GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
+
+### Key revocation
+
+The one-id form of `POST /identity/revoke` signs with the daemon's agent key
+and supplies no subject certificate. It supports `agent_id` set to this
+daemon's own agent. It cannot issue machine-signed or user-authority
+revocations: revoking this daemon's machine or another agent through this
+form returns `403`. Loading an owner key or an agent certificate does not
+change the signer used by this form. This limitation is tracked in
+[#1108](https://github.com/saorsa-labs/x0x/issues/1108).
+
+To revoke a registered sub-agent, use `DELETE /owner/agents/:id` (CLI:
+`x0x owner agents revoke <AGENT_ID>`). That separate route requires the
+durable API token, the loaded owner key and the sub-agent's retained
+certificate in the owner's journal.
+
+Both `agent_id` and `machine_id` plus `move_epoch` select the separate
+owner-signed binding form. It requires the durable API token and a subject
+certificate. It revokes that agent–machine binding, not the machine key.
+After the selected form's token check, neither id, malformed ids, or both ids
+without `move_epoch` return `400`. The binding form rejects a session token
+with `403` before these field checks.
 
 ### Announce request body
 
@@ -855,8 +877,8 @@ hex each) **plus** `move_epoch` (u64, orders the tombstone against placement
 records). CLI (all three flags together):
 `x0x identity revoke --agent-id <hex> --machine-id <hex> --move-epoch <N>`.
 Durable-owner only — a session token answers `403`; a missing
-`move_epoch` answers `400`. The one-id forms remain the agent/machine
-self- or user-authority revocations.
+`move_epoch` answers `400`. The one-id form supports only this daemon's
+own agent; see [Key revocation](#key-revocation).
 
 Revoking the daemon's OWN agent binding (#797) resolves the certificate
 from the identity dir (`agent.cert`) when it was issued by the loaded

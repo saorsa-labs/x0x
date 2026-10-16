@@ -228,10 +228,11 @@ pub async fn verify(
 
 /// `x0x identity revoke` — POST /identity/revoke
 ///
-/// Issues a signed revocation for an agent-id or machine-id keypair.  The
-/// daemon uses its own agent keypair as the issuer; self-revocations always
-/// succeed.  Revoking a third-party identity requires that the daemon's user
-/// keypair previously signed an `AgentCertificate` for the subject.
+/// The one-id form supports revoking the daemon's own agent. The daemon signs
+/// with its agent key and supplies no subject certificate, so this form cannot
+/// issue machine-signed or user-authority revocations. Use `x0x owner agents
+/// revoke` for a registered sub-agent. Both ids plus `move_epoch` select the
+/// separate owner-signed binding form, which requires the durable API token.
 pub async fn revoke(
     client: &DaemonClient,
     agent_id: Option<&str>,

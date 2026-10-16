@@ -350,7 +350,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/identity/revoke",
         cli_name: "identity revoke",
-        description: "Issue a signed revocation for an agent-id or machine-id keypair",
+        description: "Revoke the daemon's own agent or an owner-authorized agent-machine binding",
         category: "identity",
         request: RequestSpec::Fields(&[RequestField::body("agent_id", false), RequestField::body("machine_id", false), RequestField::body("move_epoch", false), RequestField::body("reason", false)]),
     },

@@ -1481,10 +1481,11 @@ pub(in crate::server) struct ServiceEntryData {
 /// POST /identity/revoke — request body.
 ///
 /// The caller identifies the subject to revoke and provides an optional reason.
-/// The daemon uses its own agent keypair as the issuer.  Self-revocation
-/// (revoking own agent-id or own machine-id) always succeeds.  Revoking a
-/// third-party subject requires that a user keypair previously signed an
-/// `AgentCertificate` for that subject (user-authority revocation).
+/// The one-id form uses the daemon's agent keypair and supplies no subject
+/// certificate. It supports revoking the daemon's own agent; it cannot issue
+/// machine-signed or user-authority revocations. For a registered sub-agent,
+/// use `DELETE /owner/agents/:id`. The both-id binding form uses the owner key
+/// and requires the durable API token, a subject certificate and `move_epoch`.
 #[derive(Debug, Clone, Deserialize)]
 pub(in crate::server) struct RevokeRequest {
     /// Which subject to revoke. Exactly one field must be present for
@@ -1503,9 +1504,10 @@ pub(in crate::server) struct RevokeRequest {
 /// POST /identity/revoke — issue and publish a signed revocation.
 ///
 /// Returns `200 OK` with the serialised revocation record on success.
-/// Returns `400` if neither or both subject fields are set, or if the
-/// hex-encoded id is malformed.  Returns `403` if the issuer lacks authority
-/// to revoke the requested subject.
+/// After the selected form's token check, returns `400` if neither subject
+/// field is set, an id is malformed, or both fields are set without
+/// `move_epoch`. Returns `403` if the issuer lacks authority. The binding form
+/// rejects a non-durable token with `403` before these field checks.
 pub(in crate::server) async fn identity_revoke(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
