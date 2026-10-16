@@ -229,7 +229,10 @@ All notable changes to this project will be documented in this file.
   and when the group wipe runs. A corrupt or unreadable outbox is left in
   place, and the rekey waits. Only a missing file is an empty outbox. A
   failed or timed-out publish leaves the removal pending. Other admins hold
-  off. This adds no new wire message.
+  off. A self-leave rekey sets `security_binding` to
+  `treekem:epoch=<n>:commit=<blake3>`. A v0.48 receiver rebuilds
+  `treekem:epoch=<n>`, gets `StateHashMismatch`, and leaves a group that
+  contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
 
 ## [v0.48.0] - 2026-10-13
 

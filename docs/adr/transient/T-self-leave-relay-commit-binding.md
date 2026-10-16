@@ -1,6 +1,6 @@
 # T-self-leave-relay-commit-binding: authenticate a relayed TreeKEM commit
 
-- **Status:** Proposed
+- **Status:** Accepted (David, 16 Oct 2026, slot A15, PR #1337).
 - **Date:** 2026-10-15
 - **Target slot:** A15
 - **Decision owners:** David Irvine

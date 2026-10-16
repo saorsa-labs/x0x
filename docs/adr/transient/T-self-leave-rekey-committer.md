@@ -9,7 +9,7 @@
 - **Superseded by:** none
 - **Related:** issue #1113; ADR 0014; ADR 0016 decision 6; ADR 0016 decision 7; PR #1337
 
-This record is Proposed. It does not change Accepted ADR bytes and adds no wire field.
+This record is Proposed. It does not change Accepted ADR bytes. A self-leave rekey sets `security_binding` to `treekem:epoch=<n>:commit=<blake3>`. A v0.48 receiver rebuilds `treekem:epoch=<n>`, gets `StateHashMismatch`, and leaves a group that contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
 
 ## Context
 

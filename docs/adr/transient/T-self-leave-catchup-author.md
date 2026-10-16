@@ -1,6 +1,6 @@
 # T-self-leave-catchup-author: who may deliver a signed self-leave
 
-- **Status:** Proposed
+- **Status:** Accepted (David, 16 Oct 2026, slot A09, PR #1337).
 - **Date:** 2026-10-14
 - **Target slot:** A09
 - **Decision owners:** David Irvine
