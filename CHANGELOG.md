@@ -260,7 +260,10 @@ All notable changes to this project will be documented in this file.
   has no subject certificate, every distinct cached blob is used. The
   eight-fetch budget applies only to a miss, and only while a carrier
   is waiting for resync. Those fetches share one blob deadline and run
-  outside the listener loop. A failed digest is not fetched again until
+  outside the listener loop. Overlapping batches share that eight-fetch
+  allowance. A digest already being fetched is not fetched again. Agent
+  shutdown joins this recovery before it applies or persists the batch.
+  A failed digest is not fetched again until
   its backoff has elapsed. Each miss list keeps its own
   place. A shorter list does not move that place. When the table is full,
   the oldest list is set aside under its own index, so a new list can

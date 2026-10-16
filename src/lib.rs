@@ -917,6 +917,20 @@ struct TrackedTasks {
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+fn spawn_tracked_on<F>(registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.closed {
+        return;
+    }
+    guard.handles.push(tokio::spawn(fut));
+}
+
 /// #765 r4 test instruments for `Agent::shutdown` — counters the shutdown
 /// regressions read instead of trusting task scheduling:
 /// - `entered` (cumulative): futures that polled into `shutdown` at all.
@@ -3007,20 +3021,237 @@ async fn partition_subject_cert_plan(
     (plan.found, pending)
 }
 
+type FetchedSubjectCert = (
+    identity::AgentId,
+    dm_inbox::AuthenticatedMachineBinding,
+    [u8; 32],
+    Option<std::sync::Arc<announce_blob::CachedBlob>>,
+);
+
+struct SubjectCertFetch {
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    /// Shutdown won. The caller must not apply or persist.
+    stopped: bool,
+}
+
+struct ReservedRecoveryFetch {
+    subject: identity::AgentId,
+    announced: dm_inbox::AuthenticatedMachineBinding,
+    digest: [u8; 32],
+}
+
+struct RecoveryClaim {
+    start: Vec<ReservedRecoveryFetch>,
+    follow: Vec<(ReservedRecoveryFetch, std::sync::Arc<tokio::sync::Notify>)>,
+    later: Vec<ReservedRecoveryFetch>,
+}
+
+/// Reserve digests under the shared eight-fetch allowance. A digest already
+/// in flight is followed, not fetched again.
+fn claim_recovery_fetches(
+    attempts: &mut announce_blob::CertRecoveryAttempts,
+    jobs: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+) -> RecoveryClaim {
+    let mut start = Vec::new();
+    let mut follow = Vec::new();
+    let mut later = Vec::new();
+    for (subject, announced) in jobs {
+        let Some(digest) = announced.cert_digest else {
+            continue;
+        };
+        if !recovery_digest_ready(attempts, &digest) {
+            continue;
+        }
+        if let Some(notify) = attempts.in_flight.get(&digest).cloned() {
+            follow.push((
+                ReservedRecoveryFetch {
+                    subject,
+                    announced,
+                    digest,
+                },
+                notify,
+            ));
+            continue;
+        }
+        if attempts.in_flight.len() >= MAX_CERT_RECOVERY_SUBJECTS {
+            later.push(ReservedRecoveryFetch {
+                subject,
+                announced,
+                digest,
+            });
+            continue;
+        }
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        attempts.in_flight.insert(digest, notify);
+        #[cfg(test)]
+        {
+            *attempts.fetch_calls.entry(digest).or_default() += 1;
+        }
+        start.push(ReservedRecoveryFetch {
+            subject,
+            announced,
+            digest,
+        });
+    }
+    RecoveryClaim {
+        start,
+        follow,
+        later,
+    }
+}
+
+fn release_reserved_digests(cache: &announce_blob::AnnounceBlobCache, digests: &[[u8; 32]]) {
+    let notifies: Vec<_> = {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        digests
+            .iter()
+            .filter_map(|digest| attempts.in_flight.remove(digest))
+            .collect()
+    };
+    for notify in notifies {
+        notify.notify_waiters();
+    }
+    if !digests.is_empty() {
+        cache.budget_notify().notify_waiters();
+    }
+}
+
+struct RecoveryFlightGuard {
+    cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    digests: Vec<[u8; 32]>,
+}
+
+impl RecoveryFlightGuard {
+    fn release_one(&mut self, digest: &[u8; 32]) {
+        self.digests.retain(|item| item != digest);
+        release_reserved_digests(&self.cache, std::slice::from_ref(digest));
+    }
+}
+
+impl Drop for RecoveryFlightGuard {
+    fn drop(&mut self) {
+        if self.digests.is_empty() {
+            return;
+        }
+        let digests = std::mem::take(&mut self.digests);
+        release_reserved_digests(&self.cache, &digests);
+    }
+}
+
+fn settle_reserved_fetch(
+    guard: &mut RecoveryFlightGuard,
+    cache: &announce_blob::AnnounceBlobCache,
+    digest: [u8; 32],
+    got_cert: bool,
+) {
+    if !got_cert {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        remember_failed_recovery_digest(&mut attempts, digest);
+    }
+    guard.release_one(&digest);
+}
+
+fn spawn_reserved_fetch(
+    pending: &mut tokio::task::JoinSet<FetchedSubjectCert>,
+    cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: &Option<std::sync::Arc<crate::gossip::PubSubManager>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    job: ReservedRecoveryFetch,
+) {
+    let cache = std::sync::Arc::clone(cache);
+    let pubsub = pubsub.clone();
+    #[cfg(test)]
+    let shutdown = shutdown.clone();
+    #[cfg(not(test))]
+    let _ = shutdown;
+    pending.spawn(async move {
+        #[cfg(test)]
+        if cache.recovery_fetch_hold_for_testing() {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    return (job.subject, job.announced, job.digest, None);
+                }
+                () = cache.wait_recovery_hold_release_for_testing() => {}
+            }
+            if shutdown.is_cancelled() {
+                return (job.subject, job.announced, job.digest, None);
+            }
+        }
+        let blob = match &pubsub {
+            Some(pubsub) => {
+                cache
+                    .fetch_bounded(pubsub, &job.digest, &job.subject, &job.announced.machine_id)
+                    .await
+            }
+            None => None,
+        };
+        (job.subject, job.announced, job.digest, blob)
+    });
+}
+
+fn take_fetched_cert(
+    found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    unresolved: &mut std::collections::HashSet<[u8; 32]>,
+    guard: &mut RecoveryFlightGuard,
+    cache: &announce_blob::AnnounceBlobCache,
+    joined: FetchedSubjectCert,
+) {
+    let (subject, announced, digest, blob) = joined;
+    let got_cert = blob.and_then(|blob| provenanced_blob_cert(&blob, &subject, announced));
+    let got = if let Some(cert) = got_cert {
+        found.insert(subject, vec![cert]);
+        true
+    } else {
+        false
+    };
+    unresolved.remove(&digest);
+    settle_reserved_fetch(guard, cache, digest, got);
+}
+
+async fn absorb_finished_followers(
+    cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    follow: &mut Vec<(ReservedRecoveryFetch, std::sync::Arc<tokio::sync::Notify>)>,
+) {
+    let pending = std::mem::take(follow);
+    for (job, notify) in pending {
+        let still = cache
+            .lock_cert_recovery_attempts()
+            .in_flight
+            .contains_key(&job.digest);
+        if still {
+            follow.push((job, notify));
+            continue;
+        }
+        if let Some(blob) = cache.get(&job.digest).await {
+            if let Some(cert) = provenanced_blob_cert(&blob, &job.subject, job.announced) {
+                found.insert(job.subject, vec![cert]);
+            }
+        }
+    }
+}
+
 /// Fetch the budgeted misses together, under one blob deadline.
 ///
-/// A digest that failed recently is not fetched again. The eight-fetch
-/// cap still applies to the selection.
+/// A digest that failed recently is not fetched again. Overlapping batches
+/// share the eight-fetch allowance and reserve each digest before the
+/// request. `stopped` means shutdown won and the caller must not apply.
 async fn fetch_subject_cert_misses(
-    mut found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     misses: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
     cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
     pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
-) -> std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>> {
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> SubjectCertFetch {
     let fail_fetches = cert_recovery_fetches_fail(cache);
     let probe = recovery_publish_probe(cache);
-    if pubsub.is_none() && !fail_fetches && !probe {
-        return found;
+    let held = recovery_fetch_held(cache);
+    if pubsub.is_none() && !fail_fetches && !probe && !held {
+        return SubjectCertFetch {
+            found,
+            stopped: false,
+        };
     }
     let budgeted = {
         let mut attempts = cache.lock_cert_recovery_attempts();
@@ -3038,10 +3269,9 @@ async fn fetch_subject_cert_misses(
         }
         budgeted
     };
-    let jobs = {
+    if fail_fetches || probe {
         let mut attempts = cache.lock_cert_recovery_attempts();
-        let mut jobs = Vec::new();
-        for (subject, announced) in budgeted {
+        for (_subject, announced) in budgeted {
             let Some(digest) = announced.cert_digest else {
                 continue;
             };
@@ -3058,60 +3288,113 @@ async fn fetch_subject_cert_misses(
                     attempts.publish_topics.push(crate::IDENTITY_ANNOUNCE_TOPIC);
                 }
             }
-            jobs.push((subject, announced, digest));
-        }
-        if fail_fetches || probe {
-            for (_, _, digest) in &jobs {
-                remember_failed_recovery_digest(&mut attempts, *digest);
-            }
-        }
-        jobs
-    };
-    if jobs.is_empty() || fail_fetches || probe {
-        return found;
-    }
-    let Some(pubsub) = pubsub else {
-        let mut attempts = cache.lock_cert_recovery_attempts();
-        for (_, _, digest) in jobs {
             remember_failed_recovery_digest(&mut attempts, digest);
         }
-        return found;
+        return SubjectCertFetch {
+            found,
+            stopped: false,
+        };
+    }
+    let claim = {
+        let mut attempts = cache.lock_cert_recovery_attempts();
+        claim_recovery_fetches(&mut attempts, budgeted)
     };
+    if claim.start.is_empty() && claim.follow.is_empty() && claim.later.is_empty() {
+        return SubjectCertFetch {
+            found,
+            stopped: false,
+        };
+    }
+    drive_shared_cert_fetches(found, cache, pubsub, shutdown, claim).await
+}
+
+async fn drive_shared_cert_fetches(
+    mut found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: Option<&std::sync::Arc<crate::gossip::PubSubManager>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    mut claim: RecoveryClaim,
+) -> SubjectCertFetch {
+    let pubsub = pubsub.cloned();
     let mut unresolved = std::collections::HashSet::new();
     let mut pending = tokio::task::JoinSet::new();
-    for (subject, announced, digest) in jobs {
-        unresolved.insert(digest);
-        let cache = std::sync::Arc::clone(cache);
-        let pubsub = std::sync::Arc::clone(pubsub);
-        pending.spawn(async move {
-            let blob = cache
-                .fetch_bounded(&pubsub, &digest, &subject, &announced.machine_id)
-                .await;
-            (subject, announced, digest, blob)
-        });
+    let mut flight = RecoveryFlightGuard {
+        cache: std::sync::Arc::clone(cache),
+        digests: claim.start.iter().map(|job| job.digest).collect(),
+    };
+    for job in std::mem::take(&mut claim.start) {
+        unresolved.insert(job.digest);
+        spawn_reserved_fetch(&mut pending, cache, &pubsub, shutdown, job);
     }
+    #[cfg(test)]
+    cache.note_recovery_parked_for_testing();
     let sleep = tokio::time::sleep(std::time::Duration::from_secs(
         announce_blob::BLOB_FETCH_TIMEOUT_SECS,
     ));
     tokio::pin!(sleep);
     loop {
+        absorb_finished_followers(cache, &mut found, &mut claim.follow).await;
+        if shutdown.is_cancelled() {
+            pending.abort_all();
+            return SubjectCertFetch {
+                found,
+                stopped: true,
+            };
+        }
+        if claim.later.is_empty() && claim.follow.is_empty() && pending.is_empty() {
+            break;
+        }
+        let budget = cache.budget_notify();
+        let budget_wait = budget.notified();
+        tokio::pin!(budget_wait);
+        let waiting_for_slot = !claim.later.is_empty() || !claim.follow.is_empty();
         tokio::select! {
             biased;
-            joined = pending.join_next() => {
-                if !keep_fetched_subject_cert(joined, &mut found, &mut unresolved) {
-                    break;
-                }
+            () = shutdown.cancelled() => {
+                pending.abort_all();
+                return SubjectCertFetch { found, stopped: true };
             }
             () = &mut sleep => {
                 pending.abort_all();
-                while let Some(joined) = pending.try_join_next() {
-                    if !keep_fetched_subject_cert(Some(joined), &mut found, &mut unresolved) {
-                        break;
-                    }
+                while let Some(Ok(joined)) = pending.try_join_next() {
+                    take_fetched_cert(&mut found, &mut unresolved, &mut flight, cache, joined);
                 }
                 break;
             }
+            joined = pending.join_next(), if !pending.is_empty() => {
+                if let Some(Ok(joined)) = joined {
+                    take_fetched_cert(&mut found, &mut unresolved, &mut flight, cache, joined);
+                }
+            }
+            _ = &mut budget_wait, if waiting_for_slot => {
+                if claim.later.is_empty() {
+                    continue;
+                }
+                let more = {
+                    let mut attempts = cache.lock_cert_recovery_attempts();
+                    let jobs = std::mem::take(&mut claim.later)
+                        .into_iter()
+                        .map(|job| (job.subject, job.announced))
+                        .collect();
+                    claim_recovery_fetches(&mut attempts, jobs)
+                };
+                for job in more.start {
+                    flight.digests.push(job.digest);
+                    unresolved.insert(job.digest);
+                    spawn_reserved_fetch(&mut pending, cache, &pubsub, shutdown, job);
+                }
+                claim.follow.extend(more.follow);
+                claim.later = more.later;
+            }
         }
+    }
+    absorb_finished_followers(cache, &mut found, &mut claim.follow).await;
+    if shutdown.is_cancelled() {
+        pending.abort_all();
+        return SubjectCertFetch {
+            found,
+            stopped: true,
+        };
     }
     if !unresolved.is_empty() {
         let mut attempts = cache.lock_cert_recovery_attempts();
@@ -3119,35 +3402,9 @@ async fn fetch_subject_cert_misses(
             remember_failed_recovery_digest(&mut attempts, digest);
         }
     }
-    found
-}
-
-type FetchedSubjectCert = (
-    identity::AgentId,
-    dm_inbox::AuthenticatedMachineBinding,
-    [u8; 32],
-    Option<std::sync::Arc<announce_blob::CachedBlob>>,
-);
-
-/// Keep a certificate that finished before the batch deadline. `false`
-/// means the set is empty.
-fn keep_fetched_subject_cert(
-    joined: Option<Result<FetchedSubjectCert, tokio::task::JoinError>>,
-    found: &mut std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
-    unresolved: &mut std::collections::HashSet<[u8; 32]>,
-) -> bool {
-    match joined {
-        Some(Ok((subject, announced, digest, blob))) => {
-            if let Some(blob) = blob {
-                if let Some(cert) = provenanced_blob_cert(&blob, &subject, announced) {
-                    found.insert(subject, vec![cert]);
-                    unresolved.remove(&digest);
-                }
-            }
-            true
-        }
-        Some(Err(_)) => true,
-        None => false,
+    SubjectCertFetch {
+        found,
+        stopped: false,
     }
 }
 
@@ -3170,7 +3427,23 @@ async fn finish_subject_cert_recovery(
     if !revocation_batch_may_fetch(allow_network, pending.len()) {
         return found;
     }
-    fetch_subject_cert_misses(found, pending, cache, pubsub).await
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    fetch_subject_cert_misses(found, pending, cache, pubsub, &shutdown)
+        .await
+        .found
+}
+
+/// The test hook parks a reserved fetch until release or shutdown.
+fn recovery_fetch_held(cache: &announce_blob::AnnounceBlobCache) -> bool {
+    #[cfg(test)]
+    {
+        cache.recovery_fetch_hold_for_testing()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cache;
+        false
+    }
 }
 
 /// The test hook records the two recovery topics and does not publish.
@@ -3216,7 +3489,9 @@ async fn recover_subject_certs(
     let plan = plan_subject_cert_recovery(sources, subjects);
     let allow_network = pubsub.is_some()
         || blob_cache.is_some_and(|cache| {
-            cert_recovery_fetches_fail(cache) || recovery_publish_probe(cache)
+            cert_recovery_fetches_fail(cache)
+                || recovery_publish_probe(cache)
+                || recovery_fetch_held(cache)
         });
     finish_subject_cert_recovery(plan, blob_cache, pubsub, allow_network).await
 }
@@ -3383,6 +3658,93 @@ async fn apply_v2_revocation_records(
         });
     }
     persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
+}
+
+struct LegacyCertRecovery {
+    records: Vec<revocation::RevocationRecord>,
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    identity_dir: Option<std::path::PathBuf>,
+    owner_trust: owner_trust::OwnerTrust,
+    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    machine_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+}
+
+struct V2CertRecovery {
+    records: Vec<revocation::RevocationRecord>,
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    identity_dir: Option<std::path::PathBuf>,
+    owner_trust: owner_trust::OwnerTrust,
+}
+
+enum CertRecoveryApply {
+    Legacy(Box<LegacyCertRecovery>),
+    V2(Box<V2CertRecovery>),
+}
+
+#[cfg(test)]
+struct RecoveryFinishedGuard(std::sync::Arc<announce_blob::AnnounceBlobCache>);
+
+#[cfg(test)]
+impl Drop for RecoveryFinishedGuard {
+    fn drop(&mut self) {
+        self.0.note_recovery_task_finished_for_testing();
+    }
+}
+
+/// Run one resync batch on the agent's tracked-task registry.
+///
+/// The eight-fetch allowance is shared with every other batch. Shutdown
+/// joins this task before it applies or persists.
+fn track_cert_recovery(
+    registry: &std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    pubsub: Option<std::sync::Arc<crate::gossip::PubSubManager>>,
+    found: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    pending: Vec<(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)>,
+    apply: CertRecoveryApply,
+) {
+    spawn_tracked_on(registry, async move {
+        #[cfg(test)]
+        let _finished = RecoveryFinishedGuard(std::sync::Arc::clone(&cache));
+        let fetched =
+            fetch_subject_cert_misses(found, pending, &cache, pubsub.as_ref(), &shutdown).await;
+        if fetched.stopped || shutdown.is_cancelled() {
+            return;
+        }
+        #[cfg(test)]
+        cache.note_recovery_apply_for_testing();
+        match apply {
+            CertRecoveryApply::Legacy(batch) => {
+                apply_legacy_revocation_records(
+                    batch.records,
+                    fetched.found,
+                    &batch.revocation_set,
+                    batch.identity_dir,
+                    &batch.owner_trust,
+                    &batch.contact_store,
+                    &batch.discovery_cache,
+                    &batch.machine_cache,
+                )
+                .await;
+            }
+            CertRecoveryApply::V2(batch) => {
+                apply_v2_revocation_records(
+                    batch.records,
+                    fetched.found,
+                    &batch.revocation_set,
+                    batch.identity_dir,
+                    &batch.owner_trust,
+                )
+                .await;
+            }
+        }
+    });
 }
 
 /// ADR 0115 §3: [`subject_certs_with_provenance`] for every subject.
@@ -7812,14 +8174,7 @@ impl Agent {
     {
         // Lock held only to inspect `closed` and push the handle; no await
         // happens under it (Rule: keep the std::Mutex hold trivially short).
-        let mut guard = match self.tracked_tasks.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.closed {
-            return;
-        }
-        guard.handles.push(tokio::spawn(fut));
+        spawn_tracked_on(&self.tracked_tasks, fut);
     }
 
     /// The token `begin_shutdown`/`shutdown` cancel first. Crate tasks that
@@ -12037,6 +12392,7 @@ impl Agent {
         let evidence_capture_store = std::sync::Arc::clone(&self.capability_store);
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
         let token = self.shutdown_token.clone();
+        let tracked_tasks = std::sync::Arc::clone(&self.tracked_tasks);
         // Subscribe to revocation records so they are applied on receipt.
         let mut sub_revocation = runtime
             .pubsub()
@@ -12382,34 +12738,23 @@ impl Agent {
                         let (found, pending) =
                             partition_subject_cert_plan(plan, &announce_blob_cache).await;
                         if revocation_batch_may_fetch(resync, pending.len()) {
-                            let revocation_set = revocation_set.clone();
-                            let identity_dir = identity_dir_for_listener.clone();
-                            let owner_trust = owner_trust_for_listener.clone();
-                            let contact_store = contact_store_for_evict.clone();
-                            let discovery_cache = cache.clone();
-                            let machine_cache = machine_cache.clone();
-                            let blob_cache = announce_blob_cache.clone();
-                            let pubsub = blob_pubsub.clone();
-                            tokio::spawn(async move {
-                                let subject_certs = fetch_subject_cert_misses(
-                                    found,
-                                    pending,
-                                    &blob_cache,
-                                    Some(&pubsub),
-                                )
-                                .await;
-                                apply_legacy_revocation_records(
+                            track_cert_recovery(
+                                &tracked_tasks,
+                                token.clone(),
+                                announce_blob_cache.clone(),
+                                Some(blob_pubsub.clone()),
+                                found,
+                                pending,
+                                CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                                     records,
-                                    subject_certs,
-                                    &revocation_set,
-                                    identity_dir,
-                                    &owner_trust,
-                                    &contact_store,
-                                    &discovery_cache,
-                                    &machine_cache,
-                                )
-                                .await;
-                            });
+                                    revocation_set: revocation_set.clone(),
+                                    identity_dir: identity_dir_for_listener.clone(),
+                                    owner_trust: owner_trust_for_listener.clone(),
+                                    contact_store: contact_store_for_evict.clone(),
+                                    discovery_cache: cache.clone(),
+                                    machine_cache: machine_cache.clone(),
+                                })),
+                            );
                         } else {
                             apply_legacy_revocation_records(
                                 records,
@@ -12510,28 +12855,20 @@ impl Agent {
                         let (found, pending) =
                             partition_subject_cert_plan(plan, &announce_blob_cache).await;
                         if revocation_batch_may_fetch(resync, pending.len()) {
-                            let revocation_set = revocation_set.clone();
-                            let identity_dir = identity_dir_for_listener.clone();
-                            let owner_trust = owner_trust_for_listener.clone();
-                            let blob_cache = announce_blob_cache.clone();
-                            let pubsub = blob_pubsub.clone();
-                            tokio::spawn(async move {
-                                let subject_certs = fetch_subject_cert_misses(
-                                    found,
-                                    pending,
-                                    &blob_cache,
-                                    Some(&pubsub),
-                                )
-                                .await;
-                                apply_v2_revocation_records(
+                            track_cert_recovery(
+                                &tracked_tasks,
+                                token.clone(),
+                                announce_blob_cache.clone(),
+                                Some(blob_pubsub.clone()),
+                                found,
+                                pending,
+                                CertRecoveryApply::V2(Box::new(V2CertRecovery {
                                     records,
-                                    subject_certs,
-                                    &revocation_set,
-                                    identity_dir,
-                                    &owner_trust,
-                                )
-                                .await;
-                            });
+                                    revocation_set: revocation_set.clone(),
+                                    identity_dir: identity_dir_for_listener.clone(),
+                                    owner_trust: owner_trust_for_listener.clone(),
+                                })),
+                            );
                         } else {
                             apply_v2_revocation_records(
                                 records,
@@ -33101,6 +33438,121 @@ mod tests {
         assert_eq!(
             blobs.recovery_publish_topics_for_testing().len(),
             topics.len()
+        );
+    }
+
+    /// #1116: overlapping v1 and v2 batches share one eight-fetch allowance
+    /// and reserve each digest once. Shutdown joins that work before apply.
+    #[tokio::test]
+    async fn overlapping_recovery_shares_the_allowance_and_shutdown_joins_1116() {
+        let (_user, announced, blobs, subjects, _now) = cache_binding_subjects(12, 0).await;
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        let discovery = std::collections::HashMap::new();
+        let sources = cold_sources(&discovery, &announced);
+        let ids: Vec<_> = subjects.iter().map(|subject| subject.agent_id).collect();
+        let records: Vec<_> = subjects
+            .iter()
+            .map(|subject| subject.record.clone())
+            .collect();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let baseline = agent.tracked_tasks.lock().expect("tracked").handles.len();
+        let plan = plan_subject_cert_recovery(&sources, ids.iter().copied());
+        let (found_v1, pending_v1) = partition_subject_cert_plan(plan, &blobs).await;
+        let plan = plan_subject_cert_recovery(&sources, ids.iter().copied());
+        let (found_v2, pending_v2) = partition_subject_cert_plan(plan, &blobs).await;
+        assert_eq!(pending_v1.len(), 12, "v1 batch must be all misses");
+        assert_eq!(pending_v2.len(), 12, "v2 batch must be all misses");
+        let identity_dir = Some(dir.path().to_path_buf());
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_v1,
+            pending_v1,
+            CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
+                records: records.clone(),
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir: identity_dir.clone(),
+                owner_trust: agent.owner_trust.clone(),
+                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
+                machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
+            })),
+        );
+        track_cert_recovery(
+            &agent.tracked_tasks,
+            agent.shutdown_token.clone(),
+            std::sync::Arc::clone(&blobs),
+            None,
+            found_v2,
+            pending_v2,
+            CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                records,
+                revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                identity_dir,
+                owner_trust: agent.owner_trust.clone(),
+            })),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let parked = blobs.recovery_parked_for_testing();
+            let inflight = blobs.recovery_in_flight_len_for_testing();
+            let fetches: u32 = subjects
+                .iter()
+                .map(|subject| blobs.recovery_fetch_count_for_testing(&subject.digest))
+                .sum();
+            if parked >= 2 && inflight == MAX_CERT_RECOVERY_SUBJECTS && fetches == 8 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parked {parked}, in flight {inflight}, fetches {fetches}"
+            );
+            tokio::task::yield_now().await;
+        }
+        for subject in &subjects {
+            let fetches = blobs.recovery_fetch_count_for_testing(&subject.digest);
+            assert!(
+                fetches <= 1,
+                "digest fetched {fetches} times while another batch held it"
+            );
+        }
+        let registered = agent.tracked_tasks.lock().expect("tracked").handles.len();
+        assert_eq!(
+            registered,
+            baseline + 2,
+            "both batches must be tracked for shutdown"
+        );
+        agent.shutdown().await;
+        assert_eq!(
+            blobs.recovery_apply_count_for_testing(),
+            0,
+            "shutdown applied a batch"
+        );
+        assert_eq!(
+            blobs.recovery_tasks_finished_for_testing(),
+            2,
+            "shutdown left a recovery task running"
+        );
+        assert_eq!(
+            blobs.recovery_in_flight_len_for_testing(),
+            0,
+            "shutdown left a digest reserved"
+        );
+        let registry = agent.tracked_tasks.lock().expect("tracked");
+        assert!(registry.closed, "shutdown must close the task registry");
+        assert!(
+            registry.handles.is_empty(),
+            "shutdown must join the recovery tasks"
         );
     }
 
