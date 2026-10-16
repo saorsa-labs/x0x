@@ -4233,12 +4233,54 @@ fn merge_certificate_choices(
     }
 }
 
+fn selection_drops_admitted(
+    old_records: &[revocation::RevocationRecord],
+    old_found: &std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
+    old_pending: &[(identity::AgentId, dm_inbox::AuthenticatedMachineBinding)],
+    selected: &SelectedRecovery,
+) -> bool {
+    let kept_hashes: std::collections::HashSet<[u8; 32]> = selected
+        .records
+        .iter()
+        .map(revocation::RevocationRecord::record_hash)
+        .collect();
+    if old_records
+        .iter()
+        .any(|record| !kept_hashes.contains(&record.record_hash()))
+    {
+        return true;
+    }
+    for (agent, certs) in old_found {
+        if certs.is_empty() {
+            continue;
+        }
+        let Some(kept) = selected.found.get(agent) else {
+            return true;
+        };
+        if certs
+            .iter()
+            .any(|cert| !kept.iter().any(|have| have == cert))
+        {
+            return true;
+        }
+    }
+    old_pending.iter().any(|old| {
+        !selected
+            .pending
+            .iter()
+            .any(|kept| same_pending_route(old.0, old.1.cert_digest, kept))
+    })
+}
+
 fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecovery) {
-    let mut records = queued_recovery_records(into);
+    let old_records = queued_recovery_records(into);
+    let old_found = into.found.clone();
+    let old_pending = into.pending.clone();
+    let mut records = old_records.clone();
     records.extend(queued_recovery_records(&extra));
-    let mut found = std::mem::take(&mut into.found);
+    let mut found = old_found.clone();
     merge_certificate_choices(&mut found, extra.found);
-    let mut pending = std::mem::take(&mut into.pending);
+    let mut pending = old_pending.clone();
     for item in extra.pending {
         let digest = item.1.cert_digest;
         if !pending
@@ -4249,6 +4291,9 @@ fn coalesce_cert_recovery(into: &mut QueuedCertRecovery, extra: QueuedCertRecove
         }
     }
     let selected = select_recovery_units(records, &found, &pending);
+    if selection_drops_admitted(&old_records, &old_found, &old_pending, &selected) {
+        return;
+    }
     install_selected_recovery(into, selected.records, selected.found, selected.pending);
 }
 
@@ -4343,7 +4388,8 @@ fn spawn_cert_recovery_task(
 /// keeps its own route. A later batch merges any new issuer certificate
 /// for an agent the waiter already knows. A fetched certificate is added
 /// to those known certificates. Duplicate certificates are not stored
-/// twice. A later batch is not stored once the record cap is full. The eight-fetch
+/// twice. A later batch is not stored once the record cap is full. A
+/// batch that would drop an admitted record or route is not stored. The eight-fetch
 /// allowance is shared with every other batch. Shutdown joins a live task
 /// before it applies or persists. The task is shielded from the
 /// three-second grace abort so it can finish joining fetch children
@@ -35600,6 +35646,323 @@ mod tests {
         for a_first in [true, false] {
             apply_two_pending_issuer_routes(a_first, agent.agent_id(), &route_a, &route_b).await;
         }
+    }
+
+    fn digest_n(n: u32) -> [u8; 32] {
+        let mut raw = [0x5Au8; 32];
+        raw[..4].copy_from_slice(&n.to_le_bytes());
+        raw
+    }
+
+    fn machine_n(n: u32) -> identity::MachineId {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&n.to_le_bytes());
+        identity::MachineId(raw)
+    }
+
+    fn capture_binding(
+        cache: &mut dm_inbox::AuthenticatedMachineBindingCache,
+        agent: identity::AgentId,
+        at: u64,
+        digest: [u8; 32],
+    ) -> dm_inbox::AuthenticatedMachineBinding {
+        cache.record_announcement(agent, machine_n(at as u32), at, Some(digest), None);
+        cache.peek(&agent).expect("captured binding")
+    }
+
+    fn dummy_binding_record(
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        stamp: u64,
+    ) -> revocation::RevocationRecord {
+        revocation::RevocationRecord {
+            subject: revocation::RevokedSubject::AgentMachineBinding(
+                revocation::AgentMachineBinding {
+                    agent,
+                    machine,
+                    move_epoch: stamp,
+                },
+            ),
+            issuer_public_key: vec![0x11; 32],
+            revoked_at: stamp,
+            reason: None,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Queue `admitted` then one overflowing route. Identical record hashes
+    /// stay one record. Every distinct admitted digest stays. After the hold
+    /// releases, the signed tombstones in `apply` are revoked.
+    async fn overflow_keeps_admitted_routes(
+        agent_id: identity::AgentId,
+        admitted: Vec<(
+            revocation::RevocationRecord,
+            dm_inbox::AuthenticatedMachineBinding,
+        )>,
+        overflow: (
+            revocation::RevocationRecord,
+            dm_inbox::AuthenticatedMachineBinding,
+        ),
+        absent_digest: [u8; 32],
+        apply: Vec<CachedBindingSubject>,
+    ) {
+        let mut seen_records = std::collections::HashSet::new();
+        let mut expect_records = 0usize;
+        let mut seen_digests = std::collections::HashSet::new();
+        let mut expect_digests = Vec::new();
+        for (record, binding) in &admitted {
+            if seen_records.insert(record.record_hash()) {
+                expect_records += 1;
+            }
+            if seen_digests.insert(binding.cert_digest) {
+                expect_digests.push(binding.cert_digest);
+            }
+        }
+        let expect_routes = expect_digests.len();
+        let blobs = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+        blobs.set_recovery_fetch_hold_for_testing(true);
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
+            closed: false,
+            handles: Vec::new(),
+            shielded: Vec::new(),
+            recovery_live: 0,
+            recovery_wait: Vec::new(),
+        }));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        let queue = |record: revocation::RevocationRecord,
+                     binding: dm_inbox::AuthenticatedMachineBinding| {
+            track_cert_recovery(
+                &registry,
+                shutdown.clone(),
+                std::sync::Arc::clone(&blobs),
+                None,
+                std::collections::HashMap::new(),
+                vec![(agent_id, binding)],
+                CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                    records: vec![record],
+                    revocation_set: std::sync::Arc::clone(&set),
+                    identity_dir: None,
+                    owner_trust: owner_trust.clone(),
+                })),
+            );
+        };
+        for _ in 0..MAX_CONCURRENT_CERT_RECOVERY_TASKS {
+            track_cert_recovery(
+                &registry,
+                shutdown.clone(),
+                std::sync::Arc::clone(&blobs),
+                None,
+                std::collections::HashMap::new(),
+                Vec::new(),
+                CertRecoveryApply::V2(Box::new(V2CertRecovery {
+                    records: Vec::new(),
+                    revocation_set: std::sync::Arc::clone(&set),
+                    identity_dir: None,
+                    owner_trust: owner_trust.clone(),
+                })),
+            );
+        }
+        for (record, binding) in admitted {
+            queue(record, binding);
+        }
+        queue(overflow.0, overflow.1);
+        let view = tracked_recovery_waiter_view_for_testing(&registry);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].records.len(), expect_records);
+        let digests = view[0]
+            .pending_digests
+            .iter()
+            .filter(|(id, _)| *id == agent_id)
+            .map(|(_, digest)| *digest)
+            .collect::<Vec<_>>();
+        assert_eq!(digests.len(), expect_routes);
+        for digest in &expect_digests {
+            assert!(digests.contains(digest));
+        }
+        assert!(!digests.contains(&Some(absent_digest)));
+        let (records, _, pending_n, bytes, _) = tracked_recovery_waiter_load_for_testing(&registry);
+        assert_eq!(records, expect_records);
+        assert_eq!(pending_n, expect_routes);
+        assert!(records <= MAX_COALESCED_RECOVERY_RECORDS);
+        assert!(pending_n <= MAX_COALESCED_RECOVERY_SUBJECTS);
+        assert!(bytes <= MAX_COALESCED_RECOVERY_BYTES, "bytes {bytes}");
+
+        let entered = blobs.recovery_hold_entered_for_testing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if blobs.recovery_hold_entered_for_testing() > entered {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the admitted fetch did not reach the hold"
+            );
+            tokio::task::yield_now().await;
+        }
+        for subject in &apply {
+            insert_subject_blob(&blobs, subject).await;
+        }
+        blobs.set_recovery_fetch_hold_for_testing(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let guard = set.read().await;
+            let revoked = apply.iter().all(|subject| match &subject.record.subject {
+                revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                    guard.is_binding_revoked(&binding.agent, &binding.machine)
+                }
+                _ => false,
+            });
+            drop(guard);
+            reap_tracked_for_testing(&registry);
+            let (live, waiting, shielded) = tracked_recovery_state_for_testing(&registry);
+            if revoked && live == 0 && waiting == 0 && shielded <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revoked {revoked}, live {live}, waiting {waiting}, shielded {shielded}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// #1116: one more pending route does not erase a waiter that already
+    /// holds its records and routes. A full record list and a single
+    /// repeated record both keep the admitted prefix, and the signed
+    /// tombstones in that prefix apply.
+    #[tokio::test]
+    async fn overflowing_route_keeps_the_admitted_waiter_1116() {
+        let issuer_a = identity::UserKeypair::generate().expect("issuer a");
+        let issuer_b = identity::UserKeypair::generate().expect("issuer b");
+        let agent = identity::AgentKeypair::generate().expect("agent");
+        let cert_a = identity::AgentCertificate::issue(&issuer_a, &agent).expect("cert a");
+        let cert_b = identity::AgentCertificate::issue(&issuer_b, &agent).expect("cert b");
+        let digest_a = identity_authority::certificate_digest(&cert_a);
+        let digest_b = identity_authority::certificate_digest(&cert_b);
+        let now = Agent::unix_timestamp_secs();
+        let machine_1 = identity::MachineId([0x91; 32]);
+        let machine_2 = identity::MachineId([0x92; 32]);
+        let record_m1 = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                agent: agent.agent_id(),
+                machine: machine_1,
+                move_epoch: 1,
+            }),
+            issuer_a.public_key(),
+            issuer_a.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign m1");
+        let record_m2 = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                agent: agent.agent_id(),
+                machine: machine_2,
+                move_epoch: 2,
+            }),
+            issuer_b.public_key(),
+            issuer_b.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign m2");
+        let mut announcements = dm_inbox::AuthenticatedMachineBindingCache::default();
+        let binding_a = capture_binding(&mut announcements, agent.agent_id(), 1, digest_a);
+        let binding_b = capture_binding(&mut announcements, agent.agent_id(), 2, digest_b);
+
+        let mut full = vec![
+            (record_m1.clone(), binding_a),
+            (record_m2.clone(), binding_b),
+        ];
+        for n in 0..MAX_COALESCED_RECOVERY_RECORDS - 2 {
+            let n = u32::try_from(n).expect("record index");
+            let stamp = 10 + u64::from(n);
+            let digest = digest_n(n);
+            full.push((
+                dummy_binding_record(agent.agent_id(), machine_n(n.saturating_add(3)), stamp),
+                capture_binding(
+                    &mut announcements,
+                    agent.agent_id(),
+                    100 + u64::from(n),
+                    digest,
+                ),
+            ));
+        }
+        let full_overflow_digest = digest_n(10_000);
+        overflow_keeps_admitted_routes(
+            agent.agent_id(),
+            full,
+            (
+                dummy_binding_record(agent.agent_id(), machine_n(9_000), 9_000),
+                capture_binding(
+                    &mut announcements,
+                    agent.agent_id(),
+                    9_000,
+                    full_overflow_digest,
+                ),
+            ),
+            full_overflow_digest,
+            vec![
+                CachedBindingSubject {
+                    agent_id: agent.agent_id(),
+                    record: record_m1.clone(),
+                    cert: cert_a.clone(),
+                    digest: digest_a,
+                },
+                CachedBindingSubject {
+                    agent_id: agent.agent_id(),
+                    record: record_m2.clone(),
+                    cert: cert_b,
+                    digest: digest_b,
+                },
+            ],
+        )
+        .await;
+
+        let mut repeated = Vec::with_capacity(MAX_COALESCED_RECOVERY_SUBJECTS);
+        repeated.push((record_m1.clone(), binding_a));
+        for n in 1..MAX_COALESCED_RECOVERY_SUBJECTS {
+            let n = u32::try_from(n).expect("route index");
+            let digest = digest_n(20_000 + n);
+            repeated.push((
+                record_m1.clone(),
+                capture_binding(
+                    &mut announcements,
+                    agent.agent_id(),
+                    20_000 + u64::from(n),
+                    digest,
+                ),
+            ));
+        }
+        let repeated_overflow_digest = digest_n(40_000);
+        overflow_keeps_admitted_routes(
+            agent.agent_id(),
+            repeated,
+            (
+                record_m1.clone(),
+                capture_binding(
+                    &mut announcements,
+                    agent.agent_id(),
+                    40_000,
+                    repeated_overflow_digest,
+                ),
+            ),
+            repeated_overflow_digest,
+            vec![CachedBindingSubject {
+                agent_id: agent.agent_id(),
+                record: record_m1,
+                cert: cert_a,
+                digest: digest_a,
+            }],
+        )
+        .await;
     }
 
     /// #1116: the three-second grace abort must not finish the outer recovery

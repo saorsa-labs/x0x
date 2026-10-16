@@ -280,7 +280,8 @@ All notable changes to this project will be documented in this file.
   agent stays with its tombstone. A pending fetch for another issuer of
   that agent stays beside the known certificate. Each distinct pending
   certificate digest for that agent keeps its own route. A fetched certificate
-  is added to those known certificates. The first waiting batch is trimmed the
+  is added to those known certificates. A later batch that would drop an
+  admitted record or route is not stored. The first waiting batch is trimmed the
   same way. A later batch is not stored once the record cap is full.
   A rebuild that fails before the
   rename stays pending, and the next call writes those same bytes. A
