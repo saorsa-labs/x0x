@@ -1243,6 +1243,8 @@ fn deliver_copied_notification(
                 stats
                     .delivered_to_subscriber
                     .fetch_add(1, Ordering::Relaxed);
+                // Local subscriber deliveries are Eager payloads (#1170).
+                crate::gossip::per_kind::per_kind_counters().record_delivered(MessageKind::Eager);
                 index += 1;
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3270,6 +3272,8 @@ impl PubSubManager {
         match self.publish_plumtree_and_pump(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                // Local publish onto the mesh is an Eager wire frame (#1170).
+                crate::gossip::per_kind::per_kind_counters().record_published(MessageKind::Eager);
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
                 #[cfg(test)]
@@ -3318,6 +3322,8 @@ impl PubSubManager {
                     self.stats
                         .delivered_to_subscriber
                         .fetch_add(1, Ordering::Relaxed);
+                    crate::gossip::per_kind::per_kind_counters()
+                        .record_delivered(MessageKind::Eager);
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3394,7 +3400,12 @@ impl PubSubManager {
         // the other receive workers (ADR 0009). A completed plain delivery
         // stamps one exclusive payload when it is the sole producer.
         // Recovery, cancellation, a replay, and a failed verification drain
-        // with the id absent. This path does not snapshot stage stats.
+        // with the id absent.
+        //
+        // #1170: sample the outer verify stage around dispatch so we can
+        // attribute verify CPU to the inspected MessageKind without a
+        // saorsa-gossip API bump (Cargo.toml is fenced on this issue).
+        let verify_before = self.plumtree.stage_stats().verify;
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
@@ -3417,6 +3428,20 @@ impl PubSubManager {
         } else {
             self.dispatch_inbound(peer, session, data).await
         };
+        let verify_after = self.plumtree.stage_stats().verify;
+        if verify_after.count > verify_before.count {
+            if let Some(kind) = inspected.as_ref().map(|header| header.kind) {
+                let elapsed_ns = verify_after.total_ns.saturating_sub(verify_before.total_ns);
+                let signature_error = dispatch_result.as_ref().err().is_some_and(|e| {
+                    crate::gossip::per_kind::is_signature_verify_error(&e.to_string())
+                });
+                crate::gossip::per_kind::per_kind_counters().record_verify_delta(
+                    kind,
+                    elapsed_ns,
+                    signature_error,
+                );
+            }
+        }
         if let Err(e) = dispatch_result {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",

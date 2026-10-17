@@ -1980,13 +1980,16 @@ async fn forward_gossip_payload(
         // structural topic inspection only runs for already-eligible frames,
         // and a frame whose header will not inspect falls back to the
         // pre-#810 Normal treatment (review item 3).
+        let peeked_kind = saorsa_gossip_pubsub::peek_message_kind(&message.data);
         if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
-            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
-                .is_some_and(is_pubsub_shed_eligible)
+            && peeked_kind.is_some_and(is_pubsub_shed_eligible)
             && !is_critical_pubsub_control(&message.data, topic_priority)
         {
             let depth = channel_depth(tx);
             diagnostics.record_shed_priority(stream_type, depth, max);
+            if let Some(kind) = peeked_kind {
+                crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+            }
             if channel_drop_warn_limiter().should_emit(
                 channel_pressure_key(channel_name, Some(stream_type)),
                 Instant::now(),
@@ -2006,11 +2009,17 @@ async fn forward_gossip_payload(
         return match tx.try_send(message) {
             Ok(()) => {
                 diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
+                if let Some(kind) = peeked_kind {
+                    crate::gossip::per_kind::per_kind_counters().record_bus_dispatched(kind);
+                }
                 Ok(ForwardGossipOutcome::Enqueued)
             }
             Err(mpsc::error::TrySendError::Full(_message)) => {
                 let depth = channel_depth(tx);
                 diagnostics.record_dropped_full(peer_id, stream_type, depth, max);
+                if let Some(kind) = peeked_kind {
+                    crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+                }
                 if channel_drop_warn_limiter().should_emit(
                     channel_pressure_key(channel_name, Some(stream_type)),
                     Instant::now(),

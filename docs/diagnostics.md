@@ -180,6 +180,29 @@ counts capability adverts and digest extensions that were dropped by the
 freshness pre-check (#674) without an ML-DSA-65 verify because the store
 already held state at least as new.
 
+## Per-kind efficiency counters (#1170 / Track E M1)
+
+`GET /diagnostics/gossip` exposes `per_kind` for the four efficiency signals
+per PlumTree `MessageKind`:
+
+| Field | Meaning |
+|---|---|
+| `since_ts` | Unix milliseconds when the current rolling window started. |
+| `window_secs` | Window length (default 60). After the window elapses, counters reset and `since_ts` advances; the meter keeps accepting observations. |
+| `kinds.<kind>.verify_ok` / `verify_err` | Outer-frame ML-DSA verify observations attributed to that kind (`count` and `total_ns`). |
+| `kinds.<kind>.bus_dispatched` / `bus_dropped` | Recv-pump PubSub forward enqueue vs shed/full drop for that kind. |
+| `kinds.<kind>.delivered` | Local subscriber hand-offs (Eager payloads). |
+| `kinds.<kind>.published` | Local mesh publishes (Eager wire frames). |
+| `health.cpu_pressure_kinds` | Kinds whose share of verify `total_ns` exceeds `cpu_share_threshold` (default 0.40). |
+| `health.bus_pressure_kinds` | Kinds whose share of `bus_dispatched + bus_dropped` exceeds `bus_share_threshold` (default 0.40). |
+
+Kind keys match `inbound_by_topic` / `outbound_by_kind`. Untouched kinds are
+omitted. Rates use Δcount / Δtime against `since_ts` within one window; do not
+cross a reset. Outer verify ok/err uses the saorsa-gossip verify-stage delta
+around `handle_incoming` plus signature-failure errors; soft verify failures on
+non-pubsub kinds that return `Ok` may appear under `verify_ok` until a native
+per-kind meter lands upstream (Cargo bump fenced).
+
 ## Soak instrumentation (#288)
 
 All fields below are on `GET /diagnostics/gossip`. Every counter is cumulative
