@@ -594,33 +594,55 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      # The coverage compile died with "No space left on device" before any
+      # later cleanup could run (jobs 117343704258, 117354063249, 117363548428).
+      # Preinstalled SDKs are not inputs. Removing them is the headroom.
+      - name: Free preinstalled runner disk
+        run: |
+          echo "=== disk before freeing preinstalled tools ==="
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/vcpkg \
+            /opt/az \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/share/boost \
+            || true
+          sudo apt-get clean || true
+          echo "=== disk after freeing preinstalled tools ==="
+          df -h
+
       - name: Record disk before dependency restore
         run: |
           echo "=== disk before dependency restore ==="
           df -h
           du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
 
-      # Exact Rust 1.95.0 and lockfile namespace. coverage-v1 does not match
-      # the old target-coverage- prefix. No restore-keys: a broader target
-      # restore puts another dependency graph on the runner, and the rebuild
-      # fills the disk (job 117354063249).
+      # Exact Rust 1.95.0 and lockfile namespace. coverage-v2 does not match
+      # coverage-v1 or the old target-coverage- prefix. No restore-keys: a
+      # broader restore puts another dependency graph on the runner, and the
+      # rebuild fills the disk (job 117354063249). The instrumented target is
+      # not cached. Main's clean build already leaves no room to archive it
+      # (run 39011430228, zstd error 70 on the target cache save).
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-rust-1.95.0-coverage-v1-registry-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-rust-1.95.0-coverage-v2-registry-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Cache cargo index
         uses: actions/cache@v5
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-rust-1.95.0-coverage-v1-git-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-1.95.0-coverage-v1-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-rust-1.95.0-coverage-v2-git-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Record disk after dependency restore
         run: |
@@ -644,6 +666,25 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Upload before the compile. A worker that dies in the gate keeps this
+      # artifact; the job log does not survive a full disk.
+      - name: Publish coverage preflight
+        run: |
+          mkdir -p "$RUNNER_TEMP/coverage-preflight"
+          {
+            echo "=== coverage preflight ==="
+            df -h
+            df -P /
+            du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
+          } | tee "$RUNNER_TEMP/coverage-preflight/disk.txt"
+
+      - name: Upload coverage preflight
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-preflight
+          path: ${{ runner.temp }}/coverage-preflight/disk.txt
+          if-no-files-found: error
 
       - name: Run line coverage gate
         # Filter timing-flaky binaries from the coverage run only — they
@@ -683,6 +724,26 @@ jobs:
           source "$RUNNER_TEMP/coverage-env.sh"
           # Incremental objects are retained build output, not coverage data.
           export CARGO_INCREMENTAL=0
+          # Full debuginfo is retained object size, not line data. Workspace
+          # members keep line tables so the 65.7 line floor still maps.
+          # Dependencies are not workspace members; they keep no debuginfo.
+          # This file is runner-local. It is not a committed Cargo config.
+          mkdir -p .cargo
+          {
+            echo '[profile.dev]'
+            echo 'debug = "line-tables-only"'
+            echo 'incremental = false'
+            echo
+            echo '[profile.dev.package."*"]'
+            echo 'debug = false'
+            echo
+            echo '[profile.test]'
+            echo 'debug = "line-tables-only"'
+            echo 'incremental = false'
+            echo
+            echo '[profile.test.package."*"]'
+            echo 'debug = false'
+          } > .cargo/config.toml
           cargo llvm-cov clean --workspace
           disk_snapshot "before coverage compilation"
           # #607: --no-fail-fast + exit capture. A red test must not abort
