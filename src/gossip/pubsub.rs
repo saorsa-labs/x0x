@@ -9916,6 +9916,14 @@ mod tests {
     /// Signed V2/V3 controls prove the same subscribed/unsubscribed paths work.
     #[tokio::test]
     async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
+        // Match SG's existing anti-entropy wire enum. A digest may contain
+        // retained dedupe IDs; it must never cause refused bytes to be served.
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        enum AntiEntropyPayload {
+            Digest { msg_ids: Vec<[u8; 32]> },
+            Response { missing_ids: Vec<[u8; 32]> },
+        }
+
         for consumed in [false, true] {
             let manager = PubSubManager::new_with_participation(
                 test_node().await,
@@ -9973,7 +9981,41 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(kind_meter(&manager, "eager"), (0, 0));
             assert_eq!(kind_meter(&manager, "ihave"), (0, 0));
-            assert!(drain_sends(&manager).is_empty());
+            // SG's jittered anti-entropy timer can fire during this wait.
+            // The cache retains refused IDs for dedupe, so an ID-only digest
+            // is permitted. Reject every other frame, including EAGER/IHAVE.
+            for (peer, bytes) in drain_sends(&manager) {
+                let frame: saorsa_gossip_pubsub::GossipMessage =
+                    postcard::from_bytes(&bytes).expect("recorded frame");
+                assert_eq!(peer, recipient);
+                assert_eq!(frame.header.topic, topic_id);
+                assert_eq!(frame.header.kind, MessageKind::AntiEntropy);
+                let digest: AntiEntropyPayload =
+                    postcard::from_bytes(frame.payload.as_ref().expect("digest payload"))
+                        .expect("anti-entropy payload");
+                let AntiEntropyPayload::Digest { msg_ids } = digest else {
+                    panic!("unexpected anti-entropy response");
+                };
+                assert!(!msg_ids.is_empty());
+                assert!(msg_ids
+                    .iter()
+                    .all(|id| *id == rejected_id || *id == rewrapped_id));
+            }
+
+            let empty_digest = slice1_signed_frame(
+                MessageKind::AntiEntropy,
+                topic_id,
+                postcard::to_stdvec(&AntiEntropyPayload::Digest { msg_ids: vec![] })
+                    .unwrap()
+                    .into(),
+                [0; 32],
+            );
+            // An empty remote digest asks us to serve everything it lacks.
+            // Both refused IDs must remain unservable on this repair path.
+            manager
+                .handle_incoming(recipient, None, empty_digest.clone())
+                .await;
+            assert_eq!(eager_outbound_attempt_msgs(&manager), 0);
 
             let rejected_request = slice1_signed_frame(
                 MessageKind::IWant,
@@ -10062,6 +10104,16 @@ mod tests {
                     assert_eq!(delivered.sender, Some(author.agent_id));
                     assert!(delivered.verified);
                 }
+            }
+            // Positive anti-entropy control: both signed versions are still
+            // served, while the two refused IDs remain excluded.
+            let before = eager_outbound_attempt_msgs(&manager);
+            manager.handle_incoming(recipient, None, empty_digest).await;
+            assert_eq!(eager_outbound_attempt_msgs(&manager) - before, 2);
+            for id in [[0x62; 32], [0x63; 32]] {
+                let sent = await_eager_settled_for_msg(&manager, id, 1).await;
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].0, recipient);
             }
             assert_eq!(
                 manager.relay_fanout_diagnostics()["unsigned_inner_v1_dropped"],
