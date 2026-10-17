@@ -136,8 +136,10 @@ CDEL()  { curl_body DELETE "$CT" "$CA$1"; }
 # still on its way to the approver. The allowlist is the one in
 # tests/named_group_d4_apply.rs (is_allowlisted_transient_412): status 412,
 # "ok": false and an exact "error" string. Retry only those, for at most 30 s.
-# Any other answer returns at once. APPROVE prints
-# {"http_status": N, "body": <body>} so approve_ok can require HTTP 200.
+# Any other answer returns at once. A non-zero curl exit (timeout, incomplete
+# transfer) is a transport failure: it is never retried and never passes.
+# APPROVE prints {"curl_exit": E, "http_status": N, "body": <body>} so
+# approve_ok can require curl exit 0 and HTTP 200.
 D4_RETRY_NO_CLOCK="predecessor obligation has no durable first-observation time"
 D4_RETRY_NOT_RECEIVED="predecessor obligation not found — JoinRequestCreated not yet received"
 is_transient_approval_412() {
@@ -151,12 +153,13 @@ ok=isinstance(d,dict) and d.get("ok") is False and d.get("error") in (sys.argv[2
 sys.exit(0 if ok else 1)' "$2" "$D4_RETRY_NO_CLOCK" "$D4_RETRY_NOT_RECEIVED"
 }
 APPROVE() {
-  local path=$1 deadline=$((SECONDS + 30)) out status body
+  local path=$1 deadline=$((SECONDS + 30)) out rc status body
   while :; do
+    rc=0
     out=$(curl -s -m 10 -w '\n%{http_code}' -X POST -H "Authorization: Bearer $AT" \
-      -H "Content-Type: application/json" -d '{}' "$AA$path" 2>/dev/null) || true
+      -H "Content-Type: application/json" -d '{}' "$AA$path" 2>/dev/null) || rc=$?
     status=${out##*$'\n'}; body=${out%$'\n'*}
-    if [ "$SECONDS" -lt "$deadline" ] && is_transient_approval_412 "$status" "$body"; then
+    if [ "$rc" -eq 0 ] && [ "$SECONDS" -lt "$deadline" ] && is_transient_approval_412 "$status" "$body"; then
       sleep 0.25
       continue
     fi
@@ -169,16 +172,17 @@ try:
     b=json.loads(sys.argv[2])
 except Exception:
     b=sys.argv[2]
-print(json.dumps({"http_status":s,"body":b}))' "$status" "$body"
+print(json.dumps({"curl_exit":int(sys.argv[3]),"http_status":s,"body":b}))' "$status" "$body" "$rc"
     return
   done
 }
-# Success needs HTTP 200 and "ok": true in the body. Anything else fails.
+# Success needs curl exit 0, HTTP 200 and "ok": true in the body. Anything
+# else fails.
 approve_ok() {
   python3 -c 'import sys,json
 d=json.loads(sys.argv[1])
 b=d.get("body")
-sys.exit(0 if d.get("http_status")==200 and isinstance(b,dict) and b.get("ok") is True else 1)' "$1" 2>/dev/null
+sys.exit(0 if d.get("curl_exit")==0 and d.get("http_status")==200 and isinstance(b,dict) and b.get("ok") is True else 1)' "$1" 2>/dev/null
 }
 
 B_STATUS()  { curl_status "${1:-GET}" "$BT" "$BA${2}" "${3:-}"; }

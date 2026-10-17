@@ -52,11 +52,14 @@ Apu(){ request_json "PUT" "$AT" "$AA$1" "$2"; }
 Apa(){ request_json "PATCH" "$AT" "$AA$1" "$2"; }
 Ad() { request_json "DELETE" "$AT" "$AA$1"; }
 
-# Status-preserving DELETE: sets HTTP_STATUS and HTTP_BODY (no subshell), so a
-# check can tell one specific refusal from any other failure.
+# Status-preserving DELETE: sets HTTP_CURL_EXIT, HTTP_STATUS and HTTP_BODY (no
+# subshell), so a check can tell one specific refusal from any other failure.
+# A non-zero curl exit (timeout, incomplete transfer) is a transport failure:
+# the checks below reject it whatever HTTP status or body curl printed.
 http_delete() {
     local token="$1" url="$2" out
-    out=$(curl -sS -m 10 -w '\n%{http_code}' -X DELETE -H "Authorization: Bearer $token" "$url" 2>/dev/null) || true
+    HTTP_CURL_EXIT=0
+    out=$(curl -sS -m 10 -w '\n%{http_code}' -X DELETE -H "Authorization: Bearer $token" "$url" 2>/dev/null) || HTTP_CURL_EXIT=$?
     HTTP_STATUS=${out##*$'\n'}; HTTP_BODY=${out%$'\n'*}
     [ -n "$HTTP_STATUS" ] || HTTP_STATUS=000
 }
@@ -64,6 +67,7 @@ http_delete() {
 # (src/groups/mod.rs LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR): 409, exact error.
 LAST_ADMIN_LEAVE_ERROR="a group must always have at least one admin; make another member an admin before leaving"
 is_last_admin_leave_refusal() {
+    [ "$HTTP_CURL_EXIT" = "0" ] || return 1
     [ "$HTTP_STATUS" = "409" ] || return 1
     python3 -c 'import sys,json
 try:
@@ -74,6 +78,7 @@ sys.exit(0 if isinstance(d,dict) and d.get("error")==sys.argv[2] else 1)' "$HTTP
 }
 # A leave succeeded: HTTP 200 and "ok": true.
 is_leave_ok() {
+    [ "$HTTP_CURL_EXIT" = "0" ] || return 1
     [ "$HTTP_STATUS" = "200" ] || return 1
     python3 -c 'import sys,json
 try:
@@ -328,9 +333,9 @@ R=$(A /groups); check_contains "list groups" "$R" "E2E Test Group"
         done
         check_true "bob holds an active seat on alice's roster" "$([ "$SEAT" = "yes" ] && echo true || echo false)" "bob not active on alice"
         http_delete "$AT" "$AA/groups/$NG"
-        check_true "sole admin cannot leave while bob is a member (exact 409)" "$(is_last_admin_leave_refusal && echo true || echo false)" "HTTP $HTTP_STATUS: $HTTP_BODY"
+        check_true "sole admin cannot leave while bob is a member (exact 409)" "$(is_last_admin_leave_refusal && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
         http_delete "$BT" "$BA/groups/$BNG"
-        check_true "bob leaves group" "$(is_leave_ok && echo true || echo false)" "HTTP $HTTP_STATUS: $HTTP_BODY"
+        check_true "bob leaves group" "$(is_leave_ok && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
         LEAVE_DEADLINE=$((SECONDS + 30))
         while :; do
             http_delete "$AT" "$AA/groups/$NG"
@@ -343,7 +348,7 @@ R=$(A /groups); check_contains "list groups" "$R" "E2E Test Group"
     else
         http_delete "$AT" "$AA/groups/$NG"
     fi
-    check_true "leave group" "$(is_leave_ok && echo true || echo false)" "HTTP $HTTP_STATUS: $HTTP_BODY"
+    check_true "leave group" "$(is_leave_ok && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
