@@ -35,6 +35,9 @@ const TOTAL_ALLOCATION_CAP: usize = 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_INTERVAL: Duration = Duration::from_secs(60);
 const MACHINE_CAP: usize = 4096;
+// Generations per machine that keep their own Hello attempt record. A
+// follower needs two (its own winner and the arbiter's); four gives margin.
+const HELLO_ATTEMPT_CAP: usize = 4;
 const RESET_CHARGE: usize = 16;
 const HELLO: u8 = 1;
 const LOOKUP: u8 = 2;
@@ -106,6 +109,45 @@ impl Window {
         self.total += n;
     }
 }
+/// The connection generations of one machine that already attempted Hello
+/// (ADR 0089: one try per connection).
+///
+/// Budget: `HELLO_ATTEMPT_CAP` slots inline in each `MachineBudget`. It
+/// never allocates and never grows. When the slots are full, the lowest
+/// generation goes into `floor`, and every generation at or below the floor
+/// counts as attempted. So a forgotten entry fails closed. A new connection
+/// gets a new, higher generation, so the floor does not block it.
+#[derive(Default)]
+struct HelloAttempts {
+    // Each filled slot is above `floor`.
+    recent: [Option<u64>; HELLO_ATTEMPT_CAP],
+    floor: Option<u64>,
+}
+impl HelloAttempts {
+    fn contains(&self, generation: u64) -> bool {
+        self.floor.is_some_and(|floor| generation <= floor)
+            || self.recent.contains(&Some(generation))
+    }
+    fn insert(&mut self, generation: u64) {
+        if self.contains(generation) {
+            return;
+        }
+        if let Some(slot) = self.recent.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(generation);
+            return;
+        }
+        // All slots are full. Keep the higher generations in the slots and
+        // move the lowest one into the floor.
+        if let Some(lowest) = self.recent.iter_mut().min() {
+            if *lowest < Some(generation) {
+                self.floor = *lowest;
+                *lowest = Some(generation);
+            } else {
+                self.floor = Some(generation);
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct MachineBudget {
     open: usize,
@@ -116,23 +158,42 @@ struct MachineBudget {
     hello_out: Option<Instant>,
     attempted: bool,
     hello_generation: Option<u64>,
+    hello_attempts: HelloAttempts,
+    // The highest generation seen. Only the reply gate reads it.
+    hello_highest: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
 }
 impl MachineBudget {
-    // Generation IDs are allocated in increasing order, but ant-quic can
-    // promote an older superseded connection back to Live. Keep a high-water
-    // mark: that promotion fails closed for Hello until a newer generation
-    // arrives. A delayed job must not re-arm a previously used connection.
+    // Generation IDs are allocated in increasing order, but ant-quic can make
+    // an older connection Live again. It can promote a superseded connection
+    // back, and from 0.27.58 (#313 Part 2, ADR-017) the follower end of a
+    // pair adopts the arbiter's winner, which can be older (#1346). So the
+    // marker follows the connection that the caller saw as Live, in both
+    // directions. `hello_attempts` keeps the generations that already
+    // attempted Hello. Those never re-arm, so a delayed job cannot re-arm a
+    // previously used connection. Returns true when the marker moved.
     fn observe_hello_generation(&mut self, generation: u64) -> bool {
-        if self.hello_generation.is_some_and(|old| old > generation) {
+        if self
+            .hello_highest
+            .is_none_or(|highest| highest < generation)
+        {
+            self.hello_highest = Some(generation);
+        }
+        if self.hello_generation == Some(generation) {
             return false;
         }
-        if self.hello_generation != Some(generation) {
-            self.attempted = false;
-            self.hello_generation = Some(generation);
-        }
+        self.hello_generation = Some(generation);
+        self.attempted = self.hello_attempts.contains(generation);
         true
+    }
+    // The same rule, read-only.
+    fn hello_attempted(&self, generation: u64) -> bool {
+        if self.hello_generation == Some(generation) {
+            self.attempted
+        } else {
+            self.hello_attempts.contains(generation)
+        }
     }
 }
 #[derive(Default)]
@@ -193,6 +254,9 @@ pub(crate) struct Limits {
     state: Mutex<State>,
     #[cfg(test)]
     hello_open_pause: Mutex<Option<Arc<HelloOpenPause>>>,
+    // #1346: pause an inbound Hello after verification, before the reply gate.
+    #[cfg(test)]
+    hello_reply_pause: Mutex<Option<Arc<HelloOpenPause>>>,
     allocations: Arc<tokio::sync::Semaphore>,
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
@@ -216,6 +280,8 @@ impl Default for Limits {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             hello_open_pause: Mutex::new(None),
+            #[cfg(test)]
+            hello_reply_pause: Mutex::new(None),
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
@@ -387,8 +453,7 @@ impl Limits {
             return false;
         };
         state.machines.get(&machine).is_none_or(|m| {
-            m.hello_generation
-                .is_none_or(|old| old < generation || (old == generation && !m.attempted))
+            !m.hello_attempted(generation)
                 && m.hello_out
                     .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
         })
@@ -397,11 +462,32 @@ impl Limits {
     fn begin_hello(&self, machine: MachineId, related: bool) -> bool {
         self.begin_hello_on_connection(machine, related, None)
     }
+    // Outbound Hello on a stream this node opened. The caller proves the
+    // connection: the generation is Live before and after the open.
     fn begin_hello_on_connection(
         &self,
         machine: MachineId,
         related: bool,
         generation: Option<u64>,
+    ) -> bool {
+        self.begin_hello_attempt(machine, related, generation, false)
+    }
+    // A Hello reply on an accepted stream (#1346 R2). ant-quic 0.27.57 and
+    // 0.27.58 accept_bi do not say which connection carried the stream, and
+    // a superseded connection stays open. So the reply cannot prove that
+    // `generation` (the Live one) carries it. It charges `generation` only
+    // when no higher generation was seen: then the answer is the same as
+    // before #1346 for every stream. A lower Live winner gets its Hello from
+    // the outbound paths, which prove the connection.
+    fn begin_hello_reply(&self, machine: MachineId, related: bool, generation: u64) -> bool {
+        self.begin_hello_attempt(machine, related, Some(generation), true)
+    }
+    fn begin_hello_attempt(
+        &self,
+        machine: MachineId,
+        related: bool,
+        generation: Option<u64>,
+        reply: bool,
     ) -> bool {
         if !related {
             return false;
@@ -416,8 +502,12 @@ impl Limits {
         // Requests and replies consume the same generation marker under the
         // same lock as the machine rate gate. A remote close need not emit a
         // local PeerDisconnected event. Keep hello_out across replacements.
-        if generation.is_some_and(|id| !m.observe_hello_generation(id)) {
-            return false;
+        // A generation that already attempted Hello stays consumed (#1346).
+        if let Some(id) = generation {
+            m.observe_hello_generation(id);
+            if reply && m.hello_highest.is_some_and(|highest| highest > id) {
+                return false;
+            }
         }
         if m.attempted
             || m.hello_out
@@ -429,6 +519,9 @@ impl Limits {
         // schedules a retry. Reconnect clears only this connection marker.
         m.attempted = true;
         m.hello_out = Some(now);
+        if let Some(id) = generation {
+            m.hello_attempts.insert(id);
+        }
         true
     }
     fn hello_connection(&self, machine: MachineId, generation: u64) {
@@ -436,6 +529,9 @@ impl Limits {
             if let Some(m) = s.machines.get_mut(&machine) {
                 // Each readiness pass keeps tracked live markers out of idle eviction.
                 m.touched = Some(Instant::now());
+                // The marker follows the Live connection in both directions.
+                // Only a newer generation drops the certificate continuation,
+                // as before #1346.
                 let replaced = m.hello_generation.is_none_or(|old| old < generation);
                 if m.observe_hello_generation(generation) && replaced {
                     m.certificate = None;
@@ -448,8 +544,9 @@ impl Limits {
             if let Some(m) = s.machines.get_mut(&machine) {
                 // Events carry no generation. A delayed disconnect must not
                 // release the current connection's attempt or machine cooldown.
-                // While retained, only a newer generation re-arms the marker;
-                // an idle entry can be evicted after its cooldown.
+                // While retained, only a generation that never attempted
+                // Hello re-arms the marker; an idle entry can be evicted
+                // after its cooldown.
                 m.certificate = None;
             }
         }
@@ -854,6 +951,13 @@ impl Context {
         };
         let lease = Arc::new(lease);
         let machine = stream.peer();
+        // The Live connection when the request is taken (#1346 R2). A Hello
+        // reply needs the same Live connection when it is built.
+        let accepted = self
+            .network
+            .try_connection_generation(&ant_quic::PeerId(machine.0))
+            .ok()
+            .flatten();
         let (mut send, mut recv) = stream.into_split();
         let result = tokio::time::timeout_at(lease.deadline, async {
             let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
@@ -974,6 +1078,10 @@ impl Context {
                             &self.runtime.wire_limits.counters.evidence_hello_refused,
                         );
                     })?;
+                    #[cfg(test)]
+                    if kind == HELLO {
+                        self.pause_hello_reply().await;
+                    }
                     if kind == CERTIFICATE {
                         return write_message(
                             &mut send,
@@ -1002,7 +1110,7 @@ impl Context {
                     if !crate::dm_capability_service::advert_is_publishable(
                         &self.capabilities.borrow(),
                     ) || self
-                        .begin_hello_current(machine, self.related(machine).await)
+                        .begin_hello_current(machine, self.related(machine).await, accepted)
                         .is_none()
                     {
                         let body = codec().serialize(&have_peer).map_err(io::Error::other)?;
@@ -1030,7 +1138,16 @@ impl Context {
             tracing::debug!(?machine, "evidence stream refused/reset");
         }
     }
-    fn begin_hello_current(&self, machine: MachineId, related: bool) -> Option<u64> {
+    // The reply goes back on the accepted stream. ant-quic does not say which
+    // connection carried it (#1346 R2), so this fails closed (ACK only) when
+    // the Live connection changed since the request was taken, or when it is
+    // unreadable. begin_hello_reply adds the generation rule.
+    fn begin_hello_current(
+        &self,
+        machine: MachineId,
+        related: bool,
+        accepted: Option<u64>,
+    ) -> Option<u64> {
         let Ok(Some(generation)) = self
             .network
             .try_connection_generation(&ant_quic::PeerId(machine.0))
@@ -1044,10 +1161,18 @@ impl Context {
             );
             return None;
         };
+        if accepted != Some(generation) {
+            tracing::debug!(
+                %machine,
+                outcome = "hello_reply_connection_changed",
+                "evidence Hello reply skipped"
+            );
+            return None;
+        }
         if !self
             .runtime
             .wire_limits
-            .begin_hello_on_connection(machine, related, Some(generation))
+            .begin_hello_reply(machine, related, generation)
         {
             tracing::debug!(
                 %machine,
@@ -1069,6 +1194,21 @@ impl Context {
             .unwrap()
             .clone();
         if let Some(pause) = pause.filter(|p| p.after_open == after_open) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_hello_reply(&self) {
+        let pause = self
+            .runtime
+            .wire_limits
+            .hello_reply_pause
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(pause) = pause {
             pause.reached.notify_one();
             pause.resume.notified().await;
         }

@@ -254,6 +254,24 @@ impl Fixture {
         hello: &Hello,
         denial: Option<Denial>,
     ) -> Outcome {
+        match self.exchange_response(protocol, hello, denial, || {}).await {
+            Err(outcome) => outcome,
+            Ok((_, Ok((ACK | HELLO, _)))) => Outcome::HelloVerified,
+            Ok((_, Err(_))) => Outcome::HelloRefused,
+            Ok((_, other)) => panic!("unexpected Hello response: {other:?}"),
+        }
+    }
+
+    /// The raw reply, with the Sim connection generation of the stream that
+    /// carried the request and its reply. `Err` is an outcome before accept.
+    /// `before_accept` runs after A sends its request, before B takes it.
+    async fn exchange_response(
+        &mut self,
+        protocol: StreamProtocol,
+        hello: &Hello,
+        denial: Option<Denial>,
+        before_accept: impl FnOnce(),
+    ) -> Result<(Option<u64>, io::Result<(u8, Vec<u8>)>), Outcome> {
         let body = codec().serialize(hello).unwrap();
         let (mut send, mut reply) = tokio::time::timeout(
             Duration::from_secs(10),
@@ -265,6 +283,7 @@ impl Fixture {
         .await
         .expect("open timeout")
         .expect("open stream");
+        let carried = send.sim_generation();
         // Raw transport is deliberate: EvidenceV1 does not use the public
         // application opener's outbound trust gate (see Context::exchange).
         send.write_u8(protocol.as_u8()).await.unwrap();
@@ -277,6 +296,7 @@ impl Fixture {
         )
         .await
         .unwrap();
+        before_accept();
         let (peer, send, recv) = tokio::time::timeout(
             Duration::from_secs(10),
             self.responder.network().unwrap().accept_bi(),
@@ -298,7 +318,7 @@ impl Fixture {
         )
         .await
         else {
-            return Outcome::BeforePrefixRefused;
+            return Err(Outcome::BeforePrefixRefused);
         };
         if let Some(denial) = denial {
             self.deny(denial).await;
@@ -323,10 +343,10 @@ impl Fixture {
             "neither selected protocol may leak into the default channel",
         );
         if self.app_acceptor.next().now_or_never().flatten().is_some() {
-            return Outcome::ApplicationDelivered;
+            return Err(Outcome::ApplicationDelivered);
         }
         let Some(stream) = self.evidence_acceptor.next().now_or_never().flatten() else {
-            return Outcome::ProtocolRefused;
+            return Err(Outcome::ProtocolRefused);
         };
         assert!(stream.evidence_lease.is_some(), "bounded admission lease");
         Arc::clone(&self.context).accept(stream).await;
@@ -336,11 +356,7 @@ impl Fixture {
         )
         .await
         .expect("Hello must be answered or reset, not left pending");
-        match response {
-            Ok((ACK | HELLO, _)) => Outcome::HelloVerified,
-            Err(_) => Outcome::HelloRefused,
-            other => panic!("unexpected Hello response: {other:?}"),
-        }
+        Ok((carried, response))
     }
 
     async fn shutdown(&self) {
@@ -1261,6 +1277,12 @@ impl Fixture {
     }
 
     async fn s1b_read_hello(&self, reply: S1bReply) {
+        let _ = self.s1b_read_hello_on(reply).await;
+    }
+
+    /// As `s1b_read_hello`; returns the Sim connection generation that
+    /// carried the Hello.
+    async fn s1b_read_hello_on(&self, reply: S1bReply) -> Option<u64> {
         let (peer, mut send, mut recv) = tokio::time::timeout(
             Duration::from_secs(8),
             self.initiator.network().unwrap().accept_bi(),
@@ -1268,6 +1290,7 @@ impl Fixture {
         .await
         .expect("new connection must receive a Hello")
         .unwrap();
+        let carried = send.sim_generation();
         assert_eq!(peer.0, self.responder.machine_id().0);
         assert_eq!(
             recv.read_u8().await.unwrap(),
@@ -1295,6 +1318,7 @@ impl Fixture {
                     .unwrap();
             }
         }
+        carried
     }
 
     async fn s1b_first_attempt(&self, reply: S1bReply) {
@@ -1603,11 +1627,15 @@ async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
     f.shutdown().await;
 }
 
+// Before #1346 a high-water mark closed every older generation. Now only a
+// generation that already attempted Hello stays closed when ant-quic makes
+// it Live again. An older Live winner with no attempt re-arms once (the
+// issue1346_* tests below).
 #[test]
-fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget() {
+fn issue1207_s1b_promoted_used_generation_fails_closed_without_spending_budget() {
     let limits = Limits::default();
     let machine = MachineId([19; 32]);
-    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
     let aged = Instant::now() - HELLO_INTERVAL;
     limits
         .state
@@ -1617,17 +1645,319 @@ fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget(
         .get_mut(&machine)
         .unwrap()
         .hello_out = Some(aged);
+    // A newer generation is seen, then the used generation 1 is Live again.
+    limits.hello_connection(machine, 2);
     limits.hello_connection(machine, 1);
+    assert!(!limits.hello_pending(machine));
     assert!(!limits.hello_candidate(machine, 1));
     assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
     {
         let state = limits.state.lock().unwrap();
         let budget = &state.machines[&machine];
-        assert_eq!(budget.hello_generation, Some(2));
+        assert_eq!(budget.hello_generation, Some(1));
         assert!(budget.attempted);
         assert_eq!(budget.hello_out, Some(aged));
     }
     assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+}
+
+// #1346: from ant-quic 0.27.58 (#313 Part 2, ADR-017), the follower end of a
+// pair (the lower PeerId) makes the arbiter's winner its own winner. That
+// winner can have a lower generation than one the follower already saw.
+// Pure budget tests: no sockets, no daemon, no disk.
+fn issue1346_age_hello_gate(limits: &Limits, machine: MachineId) {
+    let aged = Instant::now() - HELLO_INTERVAL;
+    let mut state = limits.state.lock().unwrap();
+    let budget = state.machines.get_mut(&machine).unwrap();
+    budget.hello_out = Some(aged);
+    budget.hello_in = Some(aged);
+}
+
+// R2: step 3 was first written as a reply. A reply cannot prove which
+// connection carried A's Hello (the R2 tests below), and B already saw
+// generation 2, so the reply is ACK only and spends nothing. B's one Hello on
+// the winner goes out on the readiness pass, which proves its connection.
+#[test]
+fn issue1346_red_follower_sends_once_on_lower_generation_winner() {
+    let limits = Arc::new(Limits::default());
+    let machine = MachineId([46; 32]);
+    let mut connections = ReadyConnections::new(1);
+    let jobs = WireJobs::default();
+    assert!(connections.insert(machine));
+    // 1. B sees generation 2 for A. A job for A holds the budget entry, so
+    //    the readiness pass records generation 2. No Hello goes out on it.
+    let job = limits.pin_machine(machine).unwrap();
+    connections.generation(machine, 2, &jobs, &limits);
+    // 2. B follows A's winner. Generation 1 is now B's Live connection. The
+    //    generation-2 job ends before it opens a stream.
+    connections.generation(machine, 1, &jobs, &limits);
+    drop(job);
+    assert!(
+        limits.hello_pending(machine),
+        "the readiness pass must re-arm the Live winner"
+    );
+    assert!(limits.hello_candidate(machine, 1));
+    // 3. A's Hello on generation 1 reaches B. The reply cannot prove its
+    //    connection, and generation 2 was seen: ACK only, nothing spent.
+    assert!(limits.request(machine, true));
+    assert!(!limits.begin_hello_reply(machine, true, 1));
+    assert!(limits.hello_pending(machine));
+    assert!(limits.hello_candidate(machine, 1));
+    //    The readiness pass sends B's Hello on the Live winner, once.
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(1)),
+        "B must send its Hello on the Live winner"
+    );
+    // 4. A second Hello on generation 1, after the attempt, must not re-arm
+    //    it. This holds also after the 60 s machine gates expire.
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(limits.request(machine, true));
+    assert!(!limits.begin_hello_reply(machine, true, 1));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    assert!(!limits.hello_candidate(machine, 1));
+    connections.generation(machine, 1, &jobs, &limits);
+    assert!(!limits.hello_pending(machine));
+}
+
+#[test]
+fn issue1346_r2_reply_gate_charges_only_the_highest_generation_seen() {
+    let limits = Limits::default();
+    let machine = MachineId([49; 32]);
+    // No generation seen yet (#1346 default config): a reply on the Live
+    // winner carries Hello.
+    assert!(limits.begin_hello_reply(machine, true, 1));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_reply(machine, true, 1), "one try");
+    // A newer connection is the highest generation seen: one reply.
+    assert!(limits.begin_hello_reply(machine, true, 2));
+    issue1346_age_hello_gate(&limits, machine);
+    // A lower Live winner with no attempt: the reply spends nothing, and
+    // the proved outbound path still has its one attempt.
+    limits.hello_connection(machine, 3);
+    limits.hello_connection(machine, 0);
+    assert!(!limits.begin_hello_reply(machine, true, 0));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(!budget.hello_attempted(0));
+        assert_eq!(budget.hello_highest, Some(3));
+        assert!(budget
+            .hello_out
+            .is_some_and(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL));
+    }
+    assert!(limits.begin_hello_on_connection(machine, true, Some(0)));
+    issue1346_age_hello_gate(&limits, machine);
+    // The highest generation, never attempted, still gets one reply.
+    assert!(limits.begin_hello_reply(machine, true, 3));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_reply(machine, true, 3));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(3)));
+    // An unrelated machine never gets a reply.
+    assert!(!limits.begin_hello_reply(MachineId([50; 32]), false, 1));
+}
+
+#[test]
+fn issue1346_red_follower_own_hello_then_one_attempt_on_lower_winner() {
+    let limits = Limits::default();
+    let machine = MachineId([47; 32]);
+    // B sends its on-connect Hello on generation 2, its own winner.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    // B follows A's winner, generation 1. The 60 s machine gate is shared by
+    // all connections of one machine, so it still holds.
+    limits.hello_connection(machine, 1);
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(1)),
+        "the machine gate is shared across connections"
+    );
+    issue1346_age_hello_gate(&limits, machine);
+    // Generation 1 never attempted Hello: it gets exactly one attempt.
+    assert!(limits.hello_pending(machine));
+    assert!(limits.hello_candidate(machine, 1));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
+    issue1346_age_hello_gate(&limits, machine);
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    // Generation 2 already attempted Hello. If ant-quic makes it Live
+    // again, a readiness pass, a delayed job or a reply cannot re-arm it.
+    limits.hello_connection(machine, 2);
+    assert!(!limits.hello_pending(machine));
+    assert!(!limits.hello_candidate(machine, 2));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(2)));
+    // A new connection still gets one attempt.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+}
+
+#[test]
+fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
+    let limits = Limits::default();
+    let machine = MachineId([48; 32]);
+    for generation in 1..=6 {
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+        issue1346_age_hello_gate(&limits, machine);
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let attempts = &state.machines[&machine].hello_attempts;
+        assert_eq!(attempts.recent.iter().flatten().count(), HELLO_ATTEMPT_CAP);
+        assert_eq!(
+            attempts.floor,
+            Some(2),
+            "the lowest entries moved to the floor"
+        );
+    }
+    // Every used generation stays closed, in a slot or under the floor.
+    for generation in 1..=6 {
+        limits.hello_connection(machine, generation);
+        assert!(!limits.hello_pending(machine), "generation {generation}");
+        assert!(!limits.hello_candidate(machine, generation));
+        assert!(!limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    // A forgotten older generation fails closed, also with no attempt.
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(0)));
+    // The refusals spent no budget. A new connection gets one attempt.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(7)));
+
+    // A full record and a generation below every slot: only the floor moves.
+    let mut attempts = HelloAttempts::default();
+    for generation in [40, 30, 20, 10, 5] {
+        attempts.insert(generation);
+    }
+    assert_eq!(attempts.floor, Some(5));
+    assert_eq!(attempts.recent.iter().flatten().count(), HELLO_ATTEMPT_CAP);
+    assert!(attempts.contains(4) && attempts.contains(10) && !attempts.contains(15));
+    assert_eq!(
+        std::mem::size_of::<HelloAttempts>(),
+        std::mem::size_of::<Option<u64>>() * (HELLO_ATTEMPT_CAP + 1),
+        "inline, fixed size: no heap growth"
+    );
+}
+
+// #1346 R2 (Codex P2 on #1349): ant-quic does not say which connection
+// carried an accepted stream. A reply goes back on that stream, so the reply
+// gate must not charge another connection. Sim transport: in-process, no
+// sockets. The Sim models ant-quic 0.27.58 retirement and follow: a
+// superseded connection stays open and its streams still carry bytes.
+#[derive(Clone, Copy, Debug)]
+enum LiveChange {
+    // The follower adopts the arbiter's older winner (the Codex sequence).
+    FollowOlder,
+    // A newer connection becomes Live.
+    SupersedeNewer,
+    // The follow lands after A opened its stream, before B takes the
+    // request. B sees the same Live connection at accept and at reply.
+    FollowBeforeAccept,
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_follow_during_verification_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::FollowOlder).await;
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_supersede_during_verification_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::SupersedeNewer).await;
+}
+
+#[tokio::test]
+async fn issue1346_r2_red_follow_before_accept_never_charges_another_connection() {
+    issue1346_r2_live_change_during_verification(LiveChange::FollowBeforeAccept).await;
+}
+
+async fn issue1346_r2_live_change_during_verification(change: LiveChange) {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    let fabric = Arc::clone(f._fabric.as_ref().unwrap());
+    let machine = f.initiator.machine_id();
+    let a = ant_quic::PeerId(machine.0);
+    let b = ant_quic::PeerId(f.responder.machine_id().0);
+    let older = f.s1b_generation();
+    // Follow*: generation `used` is Live and `older` stays open.
+    let used = match change {
+        LiveChange::FollowOlder | LiveChange::FollowBeforeAccept => {
+            fabric.supersede_link(&a, &b).unwrap()
+        }
+        LiveChange::SupersedeNewer => older,
+    };
+    assert_eq!(f.s1b_generation(), used);
+    // 1. B sends its Hello on the Live connection `used`.
+    f.publish_ready();
+    let ((), carried) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello_on(S1bReply::Ack),
+    );
+    assert_eq!(carried, Some(used));
+    assert_eq!(f.sent(), 1);
+    // 2. More than 60 s later, A's Hello reaches B on `used`.
+    f.s1b_expire_rate_gate();
+    let pause = Arc::new(HelloOpenPause::default());
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_reply_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    // 3. While B verifies it (or, FollowBeforeAccept, before B takes it),
+    //    the Live connection changes. `used` stays open.
+    let before_accept = || {
+        if matches!(change, LiveChange::FollowBeforeAccept) {
+            assert!(fabric.follow_link(&a, &b, older));
+        }
+    };
+    let live_change = async {
+        tokio::time::timeout(DEADLINE, pause.reached.notified())
+            .await
+            .expect("the inbound Hello must reach the reply gate");
+        let winner = match change {
+            LiveChange::FollowOlder => {
+                assert!(fabric.follow_link(&a, &b, older));
+                older
+            }
+            LiveChange::SupersedeNewer => fabric.supersede_link(&a, &b).unwrap(),
+            LiveChange::FollowBeforeAccept => older,
+        };
+        pause.resume.notify_one();
+        winner
+    };
+    let hello = f.hello();
+    let (response, winner) = tokio::join!(
+        f.exchange_response(StreamProtocol::EvidenceV1, &hello, None, before_accept),
+        live_change,
+    );
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_reply_pause
+        .lock()
+        .unwrap() = None;
+    let (carried, reply) = response.expect("the Hello stream must be accepted");
+    assert_ne!(winner, used);
+    assert_eq!(f.s1b_generation(), winner);
+    // 4–5. The reply goes back on the stream that carried A's Hello, on
+    // `used`. B already sent Hello on `used`: the reply must be ACK only.
+    assert_eq!(carried, Some(used), "{change:?}");
+    let (kind, _) = reply.expect("the reply must arrive");
+    assert_eq!(
+        kind, ACK,
+        "{change:?}: no second Hello on generation {used}"
+    );
+    assert_eq!(f.sent(), 1);
+    // The winner's allowance is not consumed by a reply it did not carry.
+    assert!(
+        !f.context.runtime.wire_limits.state.lock().unwrap().machines[&machine]
+            .hello_attempted(winner),
+        "{change:?}: generation {winner} must stay armed"
+    );
+    // After the gate, B's own Hello goes out once, on the winner.
+    f.s1b_expire_rate_gate();
+    let ((), carried) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello_on(S1bReply::Ack),
+    );
+    assert_eq!(carried, Some(winner), "{change:?}");
+    assert_eq!(f.sent(), 2);
+    f.s1b_expire_rate_gate();
+    Arc::clone(&f.context).connect(machine, None, None).await;
+    f.s1b_no_more_hellos().await;
+    assert_eq!(f.sent(), 2);
+    f.shutdown().await;
 }
 
 #[test]
@@ -1682,7 +2012,7 @@ fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budget
     assert!(!limits.begin_hello_on_connection(machine(6), true, Some(100)));
     assert!(!limits.request(machine(4), true), "inbound gate retained");
     assert!(!limits.begin_hello_on_connection(machine(3), true, Some(101)));
-    // Eviction forgets the old high-water marker. One new attempt is allowed,
+    // Eviction forgets the old attempt record. One new attempt is allowed,
     // but the shared 60-second gate still blocks even a newer generation.
     assert!(limits.begin_hello_on_connection(machine(7), true, Some(1)));
     assert!(!limits.begin_hello_on_connection(machine(7), true, Some(2)));
