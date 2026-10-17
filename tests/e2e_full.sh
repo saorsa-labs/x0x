@@ -18,6 +18,7 @@ b64d() { echo "$1" | base64 -d 2>/dev/null; }
 check_json()     { local n="$1" r="$2" k="$3"; TOTAL=$((TOTAL+1)); if echo "$r"|python3 -c "import sys,json;d=json.load(sys.stdin);assert '$k' in d" 2>/dev/null;then PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";else FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — no key '$k' in: $(echo "$r"|head -c200)";fi; }
 check_contains() { local n="$1" r="$2" e="$3"; TOTAL=$((TOTAL+1)); if echo "$r"|grep -qi "$e";then PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";else FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — want '$e' in: $(echo "$r"|head -c250)";fi; }
 check_ok()       { local n="$1" r="$2"; TOTAL=$((TOTAL+1)); if echo "$r"|grep -q '"ok":true\|"ok": true';then PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";elif echo "$r"|grep -q '"error"';then FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — $(echo "$r"|head -c250)";else PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";fi; }
+check_true()     { local n="$1" v="$2" d="${3:-}"; TOTAL=$((TOTAL+1)); if [ "$v" = "true" ];then PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";else FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — $(echo "$d"|head -c250)";fi; }
 check_not_error() { local n="$1" r="$2"; TOTAL=$((TOTAL+1)); if echo "$r"|grep -q '"error":"curl_failed"';then FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — curl_failed (non-2xx)";elif echo "$r"|grep -q '"ok":false';then FAIL=$((FAIL+1));echo -e "  ${RED}FAIL${NC} $n — $(echo "$r"|head -c250)";else PASS=$((PASS+1));echo -e "  ${GREEN}PASS${NC} $n";fi; }
 
 request_json() {
@@ -50,6 +51,52 @@ Bp() { if [ "$#" -ge 2 ]; then request_json "POST" "$BT" "$BA$1" "$2"; else requ
 Apu(){ request_json "PUT" "$AT" "$AA$1" "$2"; }
 Apa(){ request_json "PATCH" "$AT" "$AA$1" "$2"; }
 Ad() { request_json "DELETE" "$AT" "$AA$1"; }
+
+# Status-preserving DELETE: sets HTTP_CURL_EXIT, HTTP_STATUS and HTTP_BODY (no
+# subshell), so a check can tell one specific refusal from any other failure.
+# A non-zero curl exit (timeout, incomplete transfer) is a transport failure:
+# the checks below reject it whatever HTTP status or body curl printed.
+http_delete() {
+    local token="$1" url="$2" out
+    HTTP_CURL_EXIT=0
+    out=$(curl -sS -m 10 -w '\n%{http_code}' -X DELETE -H "Authorization: Bearer $token" "$url" 2>/dev/null) || HTTP_CURL_EXIT=$?
+    HTTP_STATUS=${out##*$'\n'}; HTTP_BODY=${out%$'\n'*}
+    [ -n "$HTTP_STATUS" ] || HTTP_STATUS=000
+}
+# Exact ADR-0016 §3 last-admin self-leave refusal
+# (src/groups/mod.rs LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR): 409, exact error.
+LAST_ADMIN_LEAVE_ERROR="a group must always have at least one admin; make another member an admin before leaving"
+is_last_admin_leave_refusal() {
+    [ "$HTTP_CURL_EXIT" = "0" ] || return 1
+    [ "$HTTP_STATUS" = "409" ] || return 1
+    python3 -c 'import sys,json
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d,dict) and d.get("error")==sys.argv[2] else 1)' "$HTTP_BODY" "$LAST_ADMIN_LEAVE_ERROR"
+}
+# A leave succeeded: HTTP 200 and "ok": true.
+is_leave_ok() {
+    [ "$HTTP_CURL_EXIT" = "0" ] || return 1
+    [ "$HTTP_STATUS" = "200" ] || return 1
+    python3 -c 'import sys,json
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d,dict) and d.get("ok") is True else 1)' "$HTTP_BODY"
+}
+# Prints yes when the members body (stdin) holds agent $1 with state active.
+member_is_active() {
+    python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("no"); sys.exit()
+ms=d.get("members",[]) if isinstance(d,dict) else []
+print("yes" if any(isinstance(m,dict) and m.get("agent_id")==sys.argv[1] and m.get("state")=="active" for m in ms) else "no")' "$1"
+}
 
 # Verbose versions for debugging failures
 Apv() { if [ "$#" -ge 2 ]; then curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d "$2" "$AA$1" 2>/dev/null; else curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $AT" -H "Content-Type: application/json" -d '{}' "$AA$1" 2>/dev/null; fi; }
@@ -258,13 +305,50 @@ R=$(A /groups); check_contains "list groups" "$R" "E2E Test Group"
     INVITE=$(echo "$R"|python3 -c "import sys,json;print(json.load(sys.stdin).get('invite_link',''))" 2>/dev/null||echo "")
     [ -n "$INVITE" ] && {
         R=$(Bp /groups/join "{\"invite\":\"$INVITE\"}"); check_not_error "bob joins via invite" "$R"
+        BNG=$(echo "$R"|python3 -c "import sys,json;print(json.load(sys.stdin).get('group_id',''))" 2>/dev/null||echo "")
     }
 
     # Display name — field is "name" not "display_name"
     R=$(Apu "/groups/$NG/display-name" '{"name":"Alice the Admin"}'); check_ok "set display name" "$R"
 
-    # Leave group
-    R=$(Ad "/groups/$NG"); check_not_error "leave group" "$R"
+    # Leave group. Alice is the only admin, so while bob is a member her leave
+    # is refused with the exact 409 (ADR-0016 §3; a sole member's leave
+    # deletes the group). Bob's join answers pending_authority_commit, so his
+    # leave is valid only once his own daemon holds his active seat. Bob
+    # leaves; alice retries only that exact 409 until her roster has applied
+    # bob's departure, and the final leave must be HTTP 200 with "ok": true.
+    if [ -n "${BNG:-}" ]; then
+        SEAT=no
+        for _ in $(seq 1 30); do
+            SEAT=$(B "/groups/$BNG/members" | member_is_active "$BID")
+            [ "$SEAT" = "yes" ] && break
+            sleep 1
+        done
+        check_true "bob holds an active seat on his own daemon" "$([ "$SEAT" = "yes" ] && echo true || echo false)" "bob not active on bob"
+        SEAT=no
+        for _ in $(seq 1 30); do
+            SEAT=$(A "/groups/$NG/members" | member_is_active "$BID")
+            [ "$SEAT" = "yes" ] && break
+            sleep 1
+        done
+        check_true "bob holds an active seat on alice's roster" "$([ "$SEAT" = "yes" ] && echo true || echo false)" "bob not active on alice"
+        http_delete "$AT" "$AA/groups/$NG"
+        check_true "sole admin cannot leave while bob is a member (exact 409)" "$(is_last_admin_leave_refusal && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
+        http_delete "$BT" "$BA/groups/$BNG"
+        check_true "bob leaves group" "$(is_leave_ok && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
+        LEAVE_DEADLINE=$((SECONDS + 30))
+        while :; do
+            http_delete "$AT" "$AA/groups/$NG"
+            if is_last_admin_leave_refusal && [ "$SECONDS" -lt "$LEAVE_DEADLINE" ]; then
+                sleep 1
+                continue
+            fi
+            break
+        done
+    else
+        http_delete "$AT" "$AA/groups/$NG"
+    fi
+    check_true "leave group" "$(is_leave_ok && echo true || echo false)" "curl exit $HTTP_CURL_EXIT, HTTP $HTTP_STATUS: $HTTP_BODY"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -81,6 +81,36 @@ bob_text() {
 
 jq_field() { echo "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$2',''))" 2>/dev/null || echo ""; }
 
+# Run the CLI as alice or bob and keep exit code, stdout and stderr apart
+# (CLI_RC, CLI_OUT, CLI_ERR), so a check can tell one refusal from any other
+# failure. The CLI prints a non-2xx answer as one stderr line
+# "error: <error> (HTTP <status>)" and exits 1.
+cli_capture() {
+    local who="$1" port tok errf; shift
+    case "$who" in alice) port=19101 ;; bob) port=19102 ;; *) return 2 ;; esac
+    tok=$(cat "/tmp/x0x-cli-$who/api-token" 2>/dev/null || true)
+    errf=$(mktemp)
+    CLI_RC=0
+    CLI_OUT=$(X0X_API_TOKEN="$tok" "$X0X" --json --api "http://127.0.0.1:$port" "$@" 2>"$errf") || CLI_RC=$?
+    CLI_ERR=$(cat "$errf"); rm -f "$errf"
+}
+# Exact ADR-0016 §3 last-admin self-leave refusal
+# (src/groups/mod.rs LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR) as the CLI prints it.
+LAST_ADMIN_LEAVE_REFUSAL="error: a group must always have at least one admin; make another member an admin before leaving (HTTP 409)"
+is_last_admin_leave_refusal() {
+    [ "$CLI_RC" = "1" ] && [ -z "$CLI_OUT" ] && [ "$(printf '%s\n' "$CLI_ERR" | tail -n 1)" = "$LAST_ADMIN_LEAVE_REFUSAL" ]
+}
+# Prints yes when the members body (stdin) holds agent $1 with state active.
+member_is_active() {
+    python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("no"); sys.exit()
+ms=d.get("members",[]) if isinstance(d,dict) else []
+print("yes" if any(isinstance(m,dict) and m.get("agent_id")==sys.argv[1] and m.get("state")=="active" for m in ms) else "no")' "$1"
+}
+
 # ── Cleanup ──────────────────────────────────────────────────────────────
 cleanup() {
     echo ""
@@ -369,6 +399,7 @@ print(json.dumps(d))
 
         # Bob joins via invite
         R=$(bob group join "$INVITE_LINK" --display-name "Bob"); check_not_error "bob joins via invite" "$R"
+        BOB_NG_ID=$(jq_field "$R" "group_id")
     else
         skip "invite link validation" "no invite_link returned"
         skip "bob joins via invite" "no invite_link returned"
@@ -424,8 +455,44 @@ print(d.get('agent_id',''))
     # Set display name
     R=$(alice group set-name "$NG_ID" "Alice the Admin"); check_not_error "set display name" "$R"
 
-    # Leave group
-    R=$(alice group leave "$NG_ID"); check_not_error "alice leaves group" "$R"
+    # Leave group. Alice is the only admin, so while bob is a member her leave
+    # is refused with the exact 409 (ADR-0016 §3; a sole member's leave
+    # deletes the group). Bob's join answers pending_authority_commit, so his
+    # leave is valid only once his own daemon holds his active seat. Bob
+    # leaves; alice retries only that exact 409 until her roster has applied
+    # bob's departure, and the final leave must exit 0 with no error body.
+    if [ -n "${BOB_NG_ID:-}" ]; then
+        SEAT=no
+        for _ in $(seq 1 30); do
+            SEAT=$(bob group members "$BOB_NG_ID" | member_is_active "$BOB_AID")
+            [ "$SEAT" = "yes" ] && break
+            sleep 1
+        done
+        check "bob holds an active seat on his own daemon" "$([ "$SEAT" = "yes" ] && echo true || echo false)"
+        SEAT=no
+        for _ in $(seq 1 30); do
+            SEAT=$(alice group members "$NG_ID" | member_is_active "$BOB_AID")
+            [ "$SEAT" = "yes" ] && break
+            sleep 1
+        done
+        check "bob holds an active seat on alice's roster" "$([ "$SEAT" = "yes" ] && echo true || echo false)"
+        cli_capture alice group leave "$NG_ID"
+        check "sole admin cannot leave while bob is a member (exact 409)" "$(is_last_admin_leave_refusal && echo true || echo false)"
+        R=$(bob group leave "$BOB_NG_ID"); check_not_error "bob leaves group" "$R"
+        LEAVE_DEADLINE=$((SECONDS + 30))
+        while :; do
+            cli_capture alice group leave "$NG_ID"
+            if is_last_admin_leave_refusal && [ "$SECONDS" -lt "$LEAVE_DEADLINE" ]; then
+                sleep 1
+                continue
+            fi
+            break
+        done
+    else
+        cli_capture alice group leave "$NG_ID"
+    fi
+    if [ "$CLI_RC" = "0" ]; then R=$CLI_OUT; else R='{"error":"cli_failed"}'; fi
+    check_not_error "alice leaves group" "$R"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
