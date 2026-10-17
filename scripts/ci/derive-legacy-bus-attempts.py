@@ -27,13 +27,15 @@ KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
 CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-# crates.io 0.5.89: compared with 0.5.88, pubsub changes only payload replay
-# refusal state/handling and tests. Outbound meters, wire_bytes_for_peer and
-# key_cache CONTROL_DOMAIN retain the reviewed accounting semantics.
-# Refused replays can change attempt counts without changing the meter.
-REGISTRY_PUBSUB_VERSION = "0.5.89"
+# crates.io 0.5.90: pubsub sources are byte-identical to 0.5.89 (0.5.90 only
+# moves the ant-quic pin to =0.27.61). Compared with 0.5.88, 0.5.89 changed
+# only payload replay refusal state/handling and tests. Outbound meters,
+# wire_bytes_for_peer and key_cache CONTROL_DOMAIN retain the reviewed
+# accounting semantics. Refused replays can change attempt counts without
+# changing the meter.
+REGISTRY_PUBSUB_VERSION = "0.5.90"
 REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-REGISTRY_PUBSUB_SHA = "f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6"
+REGISTRY_PUBSUB_SHA = "ae450e28dd005cd606e006815fde51e515c6c0dc671a94e5fc044e35228320b0"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
 # SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
@@ -89,7 +91,7 @@ def validate_source_premise(cargo_bytes, rust_bytes):
     manifest = tomllib.loads(cargo_bytes.decode())
     pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
     patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
-    # Registry 0.5.89 is the current package; the historical git producers
+    # Registry 0.5.90 is the current package; the historical git producers
     # remain at 0.5.85 and require an exact reviewed patch revision.
     if patch is None:
         require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
