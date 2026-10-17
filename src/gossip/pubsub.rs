@@ -2558,6 +2558,7 @@ impl PubSubManager {
         serde_json::json!({
             "topics": self.relay_fanout.registered_topics(),
             "forward_msgs": self.relay_fanout.forward_msgs(),
+            "unsigned_inner_v1_dropped": self.relay_fanout.unsigned_inner_v1_dropped(),
             "lazy_msgs": stages.validator.lazy_forward,
             "withheld_eager_peers": stages.lazy_ihave_withheld_peers,
             "lazy_msgs_by_topic": lazy_by_topic,
@@ -4789,7 +4790,7 @@ pub(crate) mod test_support {
 
     /// A valid outer PlumTree V2 EAGER frame (payload hash sealed, header
     /// signed by a fresh ML-DSA key) carrying `inner`. sg's RejectV1 policy
-    /// accepts it, so whatever `inner` holds reaches `decode_for_delivery`.
+    /// accepts it, so `inner` reaches the inner-envelope policy gates.
     pub(crate) fn outer_v2_frame(topic: TopicId, inner: Bytes, msg_id: [u8; 32]) -> Bytes {
         let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("ml-dsa key");
         let mut header = MessageHeader {
@@ -9907,6 +9908,164 @@ mod tests {
                 .expect("outer V2 control must be delivered")
                 .expect("subscription open");
             assert_eq!(delivered.payload, Bytes::from("modern"), "{reason}");
+        }
+    }
+
+    /// #1226: refuse an unsigned inner envelope before either eager forwarding
+    /// or lazy advertisement. A later IWANT must not retrieve the rejected ID.
+    /// Signed V2/V3 controls prove the same subscribed/unsubscribed paths work.
+    #[tokio::test]
+    async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
+        for consumed in [false, true] {
+            let manager = PubSubManager::new_with_participation(
+                test_node().await,
+                test_signing(),
+                None,
+                ParticipationMode::Full,
+                "operator_relay",
+            )
+            .expect("relay manager");
+            let topic = "issue1226-inner-v1";
+            let topic_id = TopicId::from_entity(topic.as_bytes());
+            let from = PeerId::new([0x26; 32]);
+            let recipient = PeerId::new([0x27; 32]);
+            *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+                peers: vec![recipient],
+                sends: Vec::new(),
+            });
+            let mut sub = if consumed {
+                Some(manager.subscribe(topic.to_string()).await)
+            } else {
+                None
+            };
+            manager
+                .set_topic_peers_for_test(topic_id, vec![recipient])
+                .await;
+            let outer_key = outer_signing_key();
+            let rejected_id = [0x61; 32];
+            let rewrapped_id = [0x64; 32];
+            let unsigned = encode_v1(topic, &Bytes::from("unsigned-v1")).expect("inner V1");
+            let rejected = signed_outer_frame_with_id(
+                &outer_key,
+                topic_id,
+                unsigned.clone(),
+                true,
+                rejected_id,
+            );
+            manager.handle_incoming(from, None, rejected.clone()).await;
+            // A duplicate is suppressed by sg's cache, not counted twice.
+            manager.handle_incoming(from, None, rejected).await;
+            // A new outer ID with identical rejected bytes must not bypass the
+            // validator via SG's payload replay cache (saorsa-gossip #116).
+            manager
+                .handle_incoming(
+                    from,
+                    None,
+                    signed_outer_frame_with_id(&outer_key, topic_id, unsigned, true, rewrapped_id),
+                )
+                .await;
+            assert_eq!(manager.stage_stats().validator.dropped, 2);
+            assert_eq!(
+                manager.relay_fanout_diagnostics()["unsigned_inner_v1_dropped"],
+                2
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(kind_meter(&manager, "eager"), (0, 0));
+            assert_eq!(kind_meter(&manager, "ihave"), (0, 0));
+            assert!(drain_sends(&manager).is_empty());
+
+            let rejected_request = slice1_signed_frame(
+                MessageKind::IWant,
+                topic_id,
+                postcard::to_stdvec(&vec![rejected_id, rewrapped_id])
+                    .unwrap()
+                    .into(),
+                [0; 32],
+            );
+            manager
+                .handle_incoming(recipient, None, rejected_request)
+                .await;
+            assert_eq!(eager_outbound_attempt_msgs(&manager), 0);
+
+            let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+            for (version, id) in [
+                (SignedVersion::V2, [0x62; 32]),
+                (SignedVersion::V3, [0x63; 32]),
+            ] {
+                let payload = Bytes::from("signed-control");
+                let signed_bytes = version
+                    .signing_payload(author.agent_id.as_bytes(), topic.as_bytes(), &payload)
+                    .expect("signing payload");
+                let signature = author.sign(&signed_bytes).expect("inner signature");
+                let inner = encode_signed(
+                    version,
+                    &author.agent_id,
+                    &author.public_key_bytes,
+                    &signature,
+                    topic,
+                    &payload,
+                )
+                .expect("signed inner");
+                let before = eager_outbound_attempt_msgs(&manager);
+                manager
+                    .handle_incoming(
+                        from,
+                        None,
+                        signed_outer_frame_with_id(&outer_key, topic_id, inner.clone(), true, id),
+                    )
+                    .await;
+                if !consumed {
+                    assert_eq!(eager_outbound_attempt_msgs(&manager), before);
+                    // Wait for the real IHAVE flush, then request the announced ID.
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let announced = drain_sends(&manager).iter().any(|(_, bytes)| {
+                                let frame: saorsa_gossip_pubsub::GossipMessage =
+                                    postcard::from_bytes(bytes).expect("recorded frame");
+                                frame.header.kind == MessageKind::IHave
+                                    && frame.payload.as_ref().is_some_and(|body| {
+                                        postcard::from_bytes::<Vec<[u8; 32]>>(body)
+                                            .expect("IHAVE IDs")
+                                            .contains(&id)
+                                    })
+                            });
+                            if announced {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("signed control must be advertised");
+                    let request = slice1_signed_frame(
+                        MessageKind::IWant,
+                        topic_id,
+                        postcard::to_stdvec(&vec![id]).unwrap().into(),
+                        [0; 32],
+                    );
+                    manager.handle_incoming(recipient, None, request).await;
+                }
+                let attempts = (eager_outbound_attempt_msgs(&manager) - before) as usize;
+                assert_eq!(attempts, 1, "signed control must be forwarded or served");
+                let sent = await_eager_settled_for_msg(&manager, id, attempts).await;
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].0, recipient);
+                assert_eq!(sent[0].1.payload.as_ref(), Some(&inner));
+                drain_sends(&manager);
+                if let Some(sub) = sub.as_mut() {
+                    let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                        .await
+                        .expect("signed control delivered")
+                        .expect("subscription open");
+                    assert_eq!(delivered.payload, payload);
+                    assert_eq!(delivered.sender, Some(author.agent_id));
+                    assert!(delivered.verified);
+                }
+            }
+            assert_eq!(
+                manager.relay_fanout_diagnostics()["unsigned_inner_v1_dropped"],
+                2
+            );
         }
     }
 

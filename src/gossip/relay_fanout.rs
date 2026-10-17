@@ -13,6 +13,9 @@
 //! This module owns the x0x side of that verdict, as one composite
 //! per-topic validator:
 //!
+//! 0. **Unsigned inner V1 is refused** (#1226) before content or fan-out
+//!    decisions. The outer signature proves the forwarding machine, not
+//!    an x0x author. Drop also prevents IHAVE, IWANT and anti-entropy serving.
 //! 1. **Base (content) validators first** — the storm-control classifiers
 //!    (`crate::storm_control`). Their `Drop`/`DeliverOnly` verdicts always
 //!    win: fan-out policy must never *widen* suppression, and a
@@ -34,7 +37,7 @@
 //!    `leaf_egress_*_bytes_per_sec` "0 disables" convention.
 //!
 //! Bootstraps keep `Full` participation, so the relay role and ADR-0034
-//! hold; this changes *how* relays forward (lazy first), not *whether*.
+//! hold for signed traffic. Unsigned inner V1 is refused before relaying.
 
 use saorsa_gossip_pubsub::{TopicValidator, ValidationAction};
 use saorsa_gossip_types::TopicId;
@@ -172,6 +175,19 @@ pub(crate) struct RelayFanout {
     /// non-default verdicts (`validator.lazy_forward` / `dropped` /
     /// `deliver_only`), so the eager side of the split lives here.
     forward_msgs: AtomicU64,
+    /// Structurally valid unsigned inner V1 messages refused by this validator.
+    unsigned_inner_v1_dropped: AtomicU64,
+}
+
+/// Match the unsigned branch of `decode_auto` without allocating or copying
+/// the application payload. Signed/unknown prefixes never fall back to V1.
+fn is_unsigned_inner_v1(payload: &[u8]) -> bool {
+    let [high @ (0 | 1), low, rest @ ..] = payload else {
+        return false;
+    };
+    let topic_len = usize::from(u16::from_be_bytes([*high, *low]));
+    rest.get(..topic_len)
+        .is_some_and(|topic| std::str::from_utf8(topic).is_ok())
 }
 
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -191,6 +207,7 @@ impl RelayFanout {
             budget: RwLock::new(super::config::default_relay_fanout_budget()),
             subscribed_topic_ids,
             forward_msgs: AtomicU64::new(0),
+            unsigned_inner_v1_dropped: AtomicU64::new(0),
         })
     }
 
@@ -338,10 +355,24 @@ impl RelayFanout {
         self.forward_msgs.load(Ordering::Relaxed)
     }
 
+    /// Refused unsigned inner V1 envelopes since this manager started.
+    pub(crate) fn unsigned_inner_v1_dropped(&self) -> u64 {
+        self.unsigned_inner_v1_dropped.load(Ordering::Relaxed)
+    }
+
     /// The composite verdict for one admitted inbound message. Ordering is
-    /// load-bearing: content suppression wins, then C2 (unconsumed ⇒ lazy),
-    /// then C3 (budgeted eager for consumed topics).
+    /// load-bearing: refuse unsigned V1, then apply content suppression, C2
+    /// (unconsumed ⇒ lazy), and C3 (budgeted eager for consumed topics).
     fn verdict(&self, topic: &TopicId, payload: &[u8]) -> ValidationAction {
+        // #1226: the machine's valid outer signature cannot authorize an
+        // unsigned author payload. SG applies this composite after outer
+        // verification, including key-cache replay, and marks Drop entries
+        // never-serveable before any delivery, IHAVE or EAGER forwarding.
+        if is_unsigned_inner_v1(payload) {
+            self.unsigned_inner_v1_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return ValidationAction::Drop;
+        }
         // 1. Content validators first; never widen Drop/DeliverOnly.
         let base = read_unpoisoned(&self.base).get(topic).cloned();
         if let Some(validator) = base {
@@ -431,6 +462,60 @@ mod tests {
                 .push(("clear", topic));
         }
     }
+
+    #[test]
+    fn issue1226_unsigned_inner_v1_drops_before_base_and_fanout() {
+        let subscribed = subscriber_set();
+        let fanout = RelayFanout::new(Arc::clone(&subscribed));
+        let topic = TopicId::new([26; 32]);
+        let base_calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::clone(&base_calls);
+        fanout.register_base(
+            topic,
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                ValidationAction::ForwardAndDeliver
+            }),
+        );
+        for consumed in [false, true] {
+            if consumed {
+                write_unpoisoned(&subscribed).insert(topic);
+            }
+            assert_eq!(
+                fanout.verdict(&topic, b"\0\x01tdata"),
+                ValidationAction::Drop
+            );
+            assert_eq!(fanout.verdict(&topic, b"\0\0"), ValidationAction::Drop);
+        }
+        assert_eq!(fanout.unsigned_inner_v1_dropped(), 4);
+        assert_eq!(base_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fanout.forward_msgs(), 0);
+        assert!(read_unpoisoned(&fanout.buckets).is_empty());
+        for signed_prefix in [2, 3] {
+            assert_eq!(
+                fanout.verdict(&topic, &[signed_prefix, 0]),
+                ValidationAction::ForwardAndDeliver
+            );
+        }
+        assert_eq!(fanout.unsigned_inner_v1_dropped(), 4);
+    }
+
+    #[test]
+    fn issue1226_unsigned_classifier_keeps_version_and_shape_boundaries() {
+        assert!(is_unsigned_inner_v1(b"\0\x02\xc3\xa9payload"));
+        let mut longest = vec![1, 255];
+        longest.extend(vec![b'x'; 511]);
+        assert!(is_unsigned_inner_v1(&longest));
+        for malformed in [&b""[..], &b"\0"[..], &b"\0\x02t"[..], &b"\0\x01\xff"[..]] {
+            assert!(!is_unsigned_inner_v1(malformed));
+        }
+        for prefix in 2..=255 {
+            let mut bytes = vec![prefix, 0];
+            bytes.extend(vec![b'x'; usize::from(prefix) * 256]);
+            assert!(!is_unsigned_inner_v1(&bytes));
+        }
+    }
+
     #[test]
     fn c2_unconsumed_topic_is_always_lazy_even_with_budget() {
         // Why (#674 C2): a relay with zero local subscribers on a topic has
