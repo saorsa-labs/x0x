@@ -33,6 +33,9 @@ jobs:
         run: |
           python3 -B scripts/ci/test_nextest_load_attribution.py -v
           python3 scripts/ci/check-nextest-load-attribution.py
+          # #1283: parser and workflow controls; the groups job runs the live
+          # nextest controls (X0X_MESH_GROUP_LIVE=1) where binaries exist.
+          python3 -B scripts/ci/test_nextest_mesh_serialization.py -v
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
