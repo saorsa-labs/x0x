@@ -2227,6 +2227,9 @@ pub struct NetworkNode {
     /// churning an LRU eviction, or ignoring an operator teardown. See
     /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
+    /// Per-node, per-peer interlock for the real suppressed-inbound close.
+    #[cfg(test)]
+    suppressed_inbound_probe: Arc<Mutex<Option<SuppressedInboundProbe>>>,
     /// Gossip-plane bookkeeping per connected peer (issue #206). Populated
     /// only when `config.network_id` is `Some`: peers start
     /// [`PlanePeerState::Pending`] and are promoted to
@@ -2285,6 +2288,27 @@ type RegistryClearPause = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
+
+/// The test owns the release sender: a panic drops it and unblocks the
+/// accept loop. Only the first close for the named peer consumes the pause.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SuppressedInboundClosePause {
+    pub reached: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+    pub closed: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Observe the actual suppression branch and an exact frame dropped by
+/// the receiver. This never injects a connection, event, or receive result.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SuppressedInboundProbe {
+    pub peer: AntPeerId,
+    pub close: Option<SuppressedInboundClosePause>,
+    pub frame: Bytes,
+    pub dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 #[derive(Clone, Debug)]
 enum NetworkShutdownOutcome {
@@ -2654,6 +2678,8 @@ impl NetworkNode {
             #[cfg(test)]
             one_sided_redial_pause: Arc::new(Mutex::new(Duration::ZERO)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            suppressed_inbound_probe: Arc::new(Mutex::new(None)),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             plane_lifecycle,
@@ -4308,6 +4334,11 @@ impl NetworkNode {
         reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_suppressed_inbound_for_test(&self, probe: SuppressedInboundProbe) {
+        *self.suppressed_inbound_probe.lock().unwrap() = Some(probe);
+    }
+
     /// Gossip-plane admission verdict for a peer (issue #292, invariant A).
     ///
     /// This is the single predicate gossip-affecting consumers must consult;
@@ -5757,6 +5788,20 @@ impl NetworkNode {
                                 peer_id_prefix = %hex_prefix(&peer_id.0, 4),
                                 "dropping gossip frame from reconnect-suppressed peer (issue #292)"
                             );
+                            #[cfg(test)]
+                            if let Some(probe) = plane_node
+                                .suppressed_inbound_probe
+                                .lock()
+                                .unwrap()
+                                .as_mut()
+                                .filter(|probe| {
+                                    probe.peer == peer_id && probe.frame.as_ref() == data.as_slice()
+                                })
+                            {
+                                if let Some(dropped) = probe.dropped.take() {
+                                    let _ = dropped.send(());
+                                }
+                            }
                             continue;
                         }
 
@@ -5911,6 +5956,8 @@ impl NetworkNode {
         let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
+        #[cfg(test)]
+        let suppressed_inbound_probe = Arc::clone(&self.suppressed_inbound_probe);
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -5989,7 +6036,13 @@ impl NetworkNode {
                             reconnect_suppressions.as_ref(),
                             peer_conn.peer_id.0,
                         ) {
-                            close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                            close_suppressed_inbound(
+                                node_ref,
+                                &peer_conn.peer_id,
+                                #[cfg(test)]
+                                &suppressed_inbound_probe,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -6007,7 +6060,13 @@ impl NetworkNode {
                                 reconnect_suppressions.as_ref(),
                                 peer_conn.peer_id.0,
                             ) {
-                                close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                                close_suppressed_inbound(
+                                    node_ref,
+                                    &peer_conn.peer_id,
+                                    #[cfg(test)]
+                                    &suppressed_inbound_probe,
+                                )
+                                .await;
                                 continue;
                             }
                             cache
@@ -6017,7 +6076,13 @@ impl NetworkNode {
                                 reconnect_suppressions.as_ref(),
                                 peer_conn.peer_id.0,
                             ) {
-                                close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                                close_suppressed_inbound(
+                                    node_ref,
+                                    &peer_conn.peer_id,
+                                    #[cfg(test)]
+                                    &suppressed_inbound_probe,
+                                )
+                                .await;
                                 continue;
                             }
                             cache.record_success(&peer_conn.peer_id, 0).await;
@@ -6031,7 +6096,13 @@ impl NetworkNode {
                             peer_conn.peer_id.0,
                             addr,
                         ) else {
-                            close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                            close_suppressed_inbound(
+                                node_ref,
+                                &peer_conn.peer_id,
+                                #[cfg(test)]
+                                &suppressed_inbound_probe,
+                            )
+                            .await;
                             continue;
                         };
                         if !evicted.is_empty() {
@@ -7408,14 +7479,38 @@ fn reconnect_suppression_is_live_locked(
 ///
 /// Never calls [`NetworkNode::suppress_reconnect`]: a refused accept must
 /// not refresh an existing tombstone (invariant F).
-async fn close_suppressed_inbound(node: &LinkNode, peer_id: &AntPeerId) {
+async fn close_suppressed_inbound(
+    node: &LinkNode,
+    peer_id: &AntPeerId,
+    #[cfg(test)] probe: &Mutex<Option<SuppressedInboundProbe>>,
+) {
+    #[cfg(test)]
+    let pause = probe
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|probe| probe.peer == *peer_id)
+        .and_then(|probe| probe.close.take());
+    #[cfg(test)]
+    let closed = if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+        Some(pause.closed)
+    } else {
+        None
+    };
     tracing::warn!(
         target: "x0x::connect",
         origin = "accept",
         peer_id_prefix = %hex_prefix(&peer_id.0, 4),
         "accept closed: inbound connection from reconnect-suppressed peer (issue #292)"
     );
-    if let Err(e) = node.disconnect(peer_id).await {
+    let result = node.disconnect(peer_id).await;
+    #[cfg(test)]
+    if let Some(closed) = closed {
+        let _ = closed.send(result.is_ok());
+    }
+    if let Err(e) = result {
         debug!(
             "disconnect of suppressed inbound peer {:?} failed: {}",
             peer_id, e
