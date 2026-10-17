@@ -287,11 +287,18 @@ jobs:
           path: ${{ runner.temp }}/issue321-history-point/safe/custody-receipt.json
           if-no-files-found: error
 
+      # #1283: nextest itself must place the acceptance cases in the
+      # quic-localhost serial group. The live controls prove the check
+      # rejects configs that drop them. Listing only; no test body runs.
+      - name: 'Check issue #321 delegation cases are serialised (#1283)'
+        if: always()
+        run: X0X_MESH_GROUP_LIVE=1 python3 -B scripts/ci/test_nextest_mesh_serialization.py -v
       - name: 'Run issue #321 delegation and cold-wake acceptance'
         if: always()
         run: |
           set -euo pipefail
           test -x target/debug/x0xd
+          filter="$(python3 -B scripts/ci/check-nextest-mesh-group.py --print-filter)"
           root="$RUNNER_TEMP/issue321-delegation"
           mkdir -p "$root"
           sha256sum target/debug/x0xd > "$root/x0xd.sha256"
@@ -300,7 +307,7 @@ jobs:
             bash scripts/ci/nextest-isolated.sh --all-features \
               --test delegation_spaces -- \
               --run-ignored ignored-only \
-              -E 'test(=delegation_survives_restart_via_history) | test(=delegation_carrier_verified_history_survives_receiver_restart) | test(=delegated_child_cold_wake_rehydrates_carrier_and_sends_as)' \
+              -E "$filter" \
               > "$root/command.log" 2>&1
           status=$?
           set -e

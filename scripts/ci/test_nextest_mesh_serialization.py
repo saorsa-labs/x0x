@@ -1,776 +1,294 @@
 #!/usr/bin/env python3
-"""#1283: daemon-mesh tests stay in the quic-localhost serial group.
+"""#1283: the daemon-mesh acceptance cases stay in the quic-localhost group.
 
-The groups job's issue #321 acceptance selector runs three daemon-mesh tests
-from `delegation_spaces` in one nextest invocation. nextest runs each test as
-its own process, so the binary's in-process suite lock cannot serialise them;
-without a `quic-localhost` group assignment all three pairs form
-simultaneously inside the single loopback network namespace the isolated
-runtime grants the invocation. Run 37898362740 (issue #1283) lost two of
-those three meshes. This test pins the assignment so the serialization cannot
-be silently dropped.
+`check-nextest-mesh-group.py` asks nextest itself (`show-config test-groups`)
+which test-group each issue #321 acceptance case runs in. It does not
+re-implement filterset or glob semantics: an earlier Python evaluator used
+`fnmatch`, which differs from nextest's globset matcher, and passed
+`binary(delegation_spaces) & not test(#[^x]*)` although nextest moves all
+three cases out of the group (#1283 review).
 
-The guard validates the EFFECTIVE assignment of every TEST, not the file
-text and not the binary as a whole:
+Two layers:
 
-* It reads `profile.default.overrides` with a real TOML parser (tomllib), so
-  comments are ignored and every valid spelling of a header or key counts,
-  exactly as for nextest; invalid TOML fails closed. The acceptance step runs
-  the default profile (no `--profile`), so no other profile's overrides are
-  consulted.
-* It enumerates the test functions in `tests/delegation_spaces.rs` and
-  evaluates each override filter against each test's real identity (package,
-  binary, binary id, kind and test name). `test(...)` predicates are
-  evaluated with nextest's name matchers, so a filter such as
-  `binary(delegation_spaces) & not test(delegation_)` is seen to drop the
-  acceptance cases.
-* It applies nextest's per-setting precedence: for each test, the first
-  override that matches the test AND configures `test-group` supplies the
-  group. An override without `test-group` (say, timeout only) is ignored for
-  that setting, exactly as nextest ignores it.
-
-Substring checks are not enough: a commented-out `test-group` line still
-contains the string "quic-localhost", and a negated `not binary(...)` filter
-still contains `binary(...)` (#1283 review). The negative controls at the
-bottom of this file reject those mutations and the test-name variants of
-them; the positive controls prove that valid configurations still pass.
+* Parser and workflow controls run everywhere (the Format Check job). They
+  prove the strict output parser fails closed and that the acceptance step
+  builds its `-E` selector from the checker, so the checked and the run
+  selector cannot diverge.
+* Live controls run where the test binaries are built (the groups job sets
+  `X0X_MESH_GROUP_LIVE=1`). nextest evaluates the real config and mutated
+  configs; each negative control is a config that nextest itself reports
+  outside the serial group, and the check must reject it. With the variable
+  set, a missing cargo-nextest is an error, not a skip.
 """
 
 from __future__ import annotations
 
-import fnmatch
-import re
-import tomllib
+import importlib.util
+import os
+import shutil
+import sys
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location(
+    "nextest_mesh_group",
+    Path(__file__).with_name("check-nextest-mesh-group.py"),
+)
+assert SPEC is not None and SPEC.loader is not None
+CHECK = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = CHECK  # dataclasses resolve their module by name
+SPEC.loader.exec_module(CHECK)
+
 CONFIG = ROOT / ".config" / "nextest.toml"
 INTEGRATION_WORKFLOW = ROOT / ".github" / "workflows" / "integration.yml"
+LIVE = os.environ.get("X0X_MESH_GROUP_LIVE") == "1"
 
-PACKAGE = "x0x"
+# nextest 0.9.126 output for the real config (captured, #1283 round 3).
+SERIALISED = """\
+group: membership-cluster (max threads = 2)
+    (no matches)
+group: quic-localhost (max threads = 1)
+  * override for default profile with filter 'binary(delegation_spaces)':
+      x0x::delegation_spaces:
+          delegated_child_cold_wake_rehydrates_carrier_and_sends_as
+          delegation_carrier_verified_history_survives_receiver_restart
+          delegation_survives_restart_via_history
+group: @global
+    (no matches)
+"""
 
-# Daemon-mesh integration-test binaries that a CI selector runs with more
-# than one test per nextest invocation. Single-test selectors gain nothing
-# from the group, so they are deliberately absent.
-SERIALIZED_MESH_BINARIES = ("delegation_spaces",)
+# nextest output for `binary(delegation_spaces) & not test(#[^x]*)`.
+DROPPED = """\
+group: membership-cluster (max threads = 2)
+    (no matches)
+group: quic-localhost (max threads = 1)
+    (no matches)
+group: @global
+  * from default settings:
+      x0x::delegation_spaces:
+          delegated_child_cold_wake_rehydrates_carrier_and_sends_as
+          delegation_carrier_verified_history_survives_receiver_restart
+          delegation_survives_restart_via_history
+"""
 
-# The issue #321 acceptance cases (`.github/workflows/integration.yml`, the
-# "delegation and cold-wake acceptance" step). They must exist in the binary
-# and in the workflow selector, so a rename cannot leave this guard checking
-# names that no longer run.
-ACCEPTANCE_CASES = (
-    "delegation_survives_restart_via_history",
-    "delegation_carrier_verified_history_survives_receiver_restart",
-    "delegated_child_cold_wake_rehydrates_carrier_and_sends_as",
+DELEGATION_OVERRIDE = (
+    '[[profile.default.overrides]]\n'
+    'filter = "binary(delegation_spaces)"\n'
+    'test-group = "quic-localhost"\n'
 )
 
-OVERRIDES_HEADER = "[[profile.default.overrides]]"
 
-
-class ConfigError(Exception):
-    """The nextest config cannot be validated as written (fail closed)."""
-
-
-@dataclass(frozen=True)
-class Override:
-    filter: str
-    test_group: str | None
-
-
-@dataclass(frozen=True)
-class CaseId:
-    """The identity nextest filters see for one test."""
-
-    package: str
-    binary: str
-    kind: str
-    name: str
-
-    @property
-    def binary_id(self) -> str:
-        return f"{self.package}::{self.binary}"
-
-
-def load_config(text: str) -> dict:
-    """Parse the config with a real TOML parser, as nextest does.
-
-    Line matching misread valid TOML: a header with a trailing comment
-    (`[[profile.default.overrides]] # note`), extra spaces inside the
-    brackets, or a dotted-key or inline-array form all define overrides that
-    nextest applies, but a line matcher skips them (#1283 review). tomllib
-    reads every form, ignores comments exactly as nextest does, and rejects
-    the invalid TOML nextest would reject.
-    """
-    try:
-        return tomllib.loads(text)
-    except tomllib.TOMLDecodeError as err:
-        raise ConfigError(f"invalid TOML: {err}") from err
-
-
-def parse_overrides(text: str) -> list[Override]:
-    """The `profile.default.overrides` array, in file order.
-
-    The acceptance step runs the default profile (no `--profile`), so no
-    other profile's overrides are consulted. Every override must carry a
-    `filter` string; a `platform` key makes the match host-dependent, which
-    this guard does not model. Both fail closed via ConfigError.
-    """
-    profile = load_config(text).get("profile", {}).get("default", {})
-    raw = profile.get("overrides", [])
-    if not isinstance(raw, list):
-        raise ConfigError("profile.default.overrides is not an array of tables")
-    overrides: list[Override] = []
-    for index, entry in enumerate(raw):
-        if not isinstance(entry, dict):
-            raise ConfigError(f"override #{index} is not a table")
-        if "platform" in entry:
-            raise ConfigError(
-                f"override #{index} sets `platform`; the guard cannot evaluate "
-                "host-dependent overrides"
-            )
-        filter_ = entry.get("filter")
-        if not isinstance(filter_, str):
-            raise ConfigError(f"override #{index} has no filter string")
-        group = entry.get("test-group")
-        if group is not None and not isinstance(group, str):
-            raise ConfigError(f"override #{index} has a non-string test-group")
-        overrides.append(Override(filter=filter_, test_group=group))
-    return overrides
-
-
-# --- filterset evaluation -------------------------------------------------
-
-# Default matcher per predicate (nextest filterset reference, "Default
-# matchers"): contains for test(), glob for the binary and package
-# predicates, equality for kind().
-_DEFAULT_MATCHER = {
-    "test": "~",
-    "binary": "#",
-    "binary_id": "#",
-    "package": "#",
-    "kind": "=",
-}
-
-_SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "/": "/", ")": ")", ",": ","}
-
-
-def _unescape(raw: str, expression: str) -> str:
-    out: list[str] = []
-    i = 0
-    while i < len(raw):
-        char = raw[i]
-        if char != "\\":
-            out.append(char)
-            i += 1
-            continue
-        if i + 1 >= len(raw):
-            raise ConfigError(f"dangling escape in filter {expression!r}")
-        nxt = raw[i + 1]
-        if nxt in _SIMPLE_ESCAPES:
-            out.append(_SIMPLE_ESCAPES[nxt])
-            i += 2
-            continue
-        match = re.match(r"u\{([0-9a-fA-F]{1,6})\}", raw[i + 1 :])
-        if match is None:
-            raise ConfigError(f"invalid escape \\{nxt} in filter {expression!r}")
-        out.append(chr(int(match.group(1), 16)))
-        i += 1 + match.end()
-    return "".join(out)
-
-
-def _matches(kind: str, pattern: str, value: str, expression: str) -> bool:
-    if kind == "=":
-        return value == pattern
-    if kind == "~":
-        return pattern in value
-    if kind == "/":
-        try:
-            return re.search(pattern, value) is not None
-        except re.error as err:
-            raise ConfigError(f"bad regex {pattern!r} in filter {expression!r}") from err
-    if kind == "#":
-        if "{" in pattern or "**" in pattern:
-            # globset alternation and recursive wildcards have no faithful
-            # fnmatch equivalent: fail closed rather than guess.
-            raise ConfigError(f"unsupported glob {pattern!r} in filter {expression!r}")
-        return fnmatch.fnmatchcase(value, pattern)
-    raise ConfigError(f"unknown matcher {kind!r} in filter {expression!r}")
-
-
-_OPERATOR_WORDS = {"not": "not", "and": "and", "or": "or"}
-_OPERATOR_CHARS = {"!": "not", "&": "and", "-": "and_not", "|": "or", "+": "or"}
-
-
-def _tokenize(expression: str) -> list[tuple[str, str]]:
-    """Split a filterset into tokens.
-
-    Token kinds: `pred` (value `name\\0matcher\\0pattern`), `not`, `and`,
-    `and_not` (the `-` difference operator), `or`, `(`, `)`.
-    """
-    tokens: list[tuple[str, str]] = []
-    pos = 0
-    n = len(expression)
-    while pos < n:
-        char = expression[pos]
-        if char.isspace():
-            pos += 1
-            continue
-        if char in "()":
-            tokens.append((char, char))
-            pos += 1
-            continue
-        if char in _OPERATOR_CHARS:
-            tokens.append((_OPERATOR_CHARS[char], char))
-            pos += 1
-            continue
-        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", expression[pos:])
-        if match is None:
-            raise ConfigError(
-                f"unexpected {char!r} at offset {pos} in filter {expression!r}"
-            )
-        word = match.group(0)
-        pos += len(word)
-        if word in _OPERATOR_WORDS:
-            tokens.append((_OPERATOR_WORDS[word], word))
-            continue
-        # A predicate: name(...) with its argument read raw. A regex
-        # argument may itself contain `)` (e.g. `/(^|::)w3h_/`), so it is
-        # scanned to its closing unescaped `/`.
-        while pos < n and expression[pos].isspace():
-            pos += 1
-        if pos >= n or expression[pos] != "(":
-            raise ConfigError(
-                f"expected '(' after {word!r} at offset {pos} in filter {expression!r}"
-            )
-        pos += 1
-        while pos < n and expression[pos].isspace():
-            pos += 1
-        if pos < n and expression[pos] == "/":
-            end = pos + 1
-            while end < n and expression[end] != "/":
-                end += 2 if expression[end] == "\\" else 1
-            if end >= n:
-                raise ConfigError(f"unterminated regex in filter {expression!r}")
-            matcher, pattern = "/", expression[pos + 1 : end].replace("\\/", "/")
-            pos = end + 1
-            while pos < n and expression[pos].isspace():
-                pos += 1
-            if pos >= n or expression[pos] != ")":
-                raise ConfigError(f"expected ')' after regex in filter {expression!r}")
-            pos += 1
-        else:
-            end = pos
-            while end < n and expression[end] != ")":
-                end += 2 if expression[end] == "\\" else 1
-            if end >= n:
-                raise ConfigError(f"unterminated argument in filter {expression!r}")
-            raw = expression[pos:end].strip()
-            pos = end + 1
-            matcher = ""
-            if raw[:1] in ("=", "~", "#"):
-                matcher, raw = raw[0], raw[1:]
-            pattern = _unescape(raw, expression)
-        tokens.append(("pred", f"{word}\0{matcher}\0{pattern}"))
-    return tokens
-
-
-def evaluate_filter(expression: str, test: CaseId) -> bool:
-    """Evaluate a nextest filterset against one test.
-
-    Grammar, tightest first (nextest filterset reference): `()`, then
-    `not`/`!`, then `and`/`&`/`-`, then `or`/`|`/`+`; each level binds left
-    to right. Predicates: `all()`, `none()`, `test()`, `binary()`,
-    `binary_id()`, `package()`, `kind()`, with the `=`, `~`, `/regex/` and
-    `#glob` matchers and nextest's per-predicate default matcher. Anything
-    else (`deps()`, `rdeps()`, `platform()`, `default()`, ...) raises
-    ConfigError so the guard fails closed and gets taught the new syntax.
-    """
-    tokens = _tokenize(expression)
-    pos = 0
-
-    def peek() -> str | None:
-        return tokens[pos][0] if pos < len(tokens) else None
-
-    def advance() -> tuple[str, str]:
-        nonlocal pos
-        if pos >= len(tokens):
-            raise ConfigError(f"unexpected end of filter {expression!r}")
-        token = tokens[pos]
-        pos += 1
-        return token
-
-    def predicate(value: str) -> bool:
-        name, matcher, pattern = value.split("\0")
-        if name == "all":
-            if matcher or pattern:
-                raise ConfigError(f"all() takes no argument in filter {expression!r}")
-            return True
-        if name == "none":
-            if matcher or pattern:
-                raise ConfigError(f"none() takes no argument in filter {expression!r}")
-            return False
-        if name not in _DEFAULT_MATCHER:
-            raise ConfigError(f"unsupported predicate {name!r} in filter {expression!r}")
-        if not pattern and matcher != "=":
-            raise ConfigError(f"empty argument to {name}() in filter {expression!r}")
-        subject = {
-            "test": test.name,
-            "binary": test.binary,
-            "binary_id": test.binary_id,
-            "package": test.package,
-            "kind": test.kind,
-        }[name]
-        return _matches(matcher or _DEFAULT_MATCHER[name], pattern, subject, expression)
-
-    def unary() -> bool:
-        kind, value = advance()
-        if kind == "not":
-            return not unary()
-        if kind == "(":
-            result = or_expr()
-            closing, _ = advance()
-            if closing != ")":
-                raise ConfigError(f"expected ')' in filter {expression!r}")
-            return result
-        if kind == "pred":
-            return predicate(value)
-        raise ConfigError(f"unexpected {value!r} in filter {expression!r}")
-
-    def and_expr() -> bool:
-        value = unary()
-        while peek() in ("and", "and_not"):
-            op, _ = advance()
-            rhs = unary()
-            value = value and rhs if op == "and" else value and not rhs
-        return value
-
-    def or_expr() -> bool:
-        value = and_expr()
-        while peek() == "or":
-            advance()
-            rhs = and_expr()
-            value = value or rhs
-        return value
-
-    if not tokens:
-        raise ConfigError("empty filter expression")
-    result = or_expr()
-    if pos != len(tokens):
-        raise ConfigError(f"trailing input {tokens[pos][1]!r} in filter {expression!r}")
-    return result
-
-
-# --- effective assignment -------------------------------------------------
-
-
-def binary_tests(binary: str) -> list[str]:
-    """Test function names in `tests/<binary>.rs` (top-level, as nextest names them)."""
-    source = (ROOT / "tests" / f"{binary}.rs").read_text(encoding="utf-8")
-    names = re.findall(
-        r"#\[(?:tokio::)?test(?:\([^)]*\))?\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+(\w+)",
-        source,
-    )
-    if not names:
-        raise ConfigError(f"no test functions found in tests/{binary}.rs")
-    return names
-
-
-def effective_test_group(text: str, test: CaseId) -> str | None:
-    """The test-group nextest would apply to `test`, or None.
-
-    Per-setting precedence: the first override that matches the test AND
-    configures `test-group` wins. A matching override that does not set
-    `test-group` is ignored for this setting.
-    """
-    for override in parse_overrides(text):
-        if override.test_group is not None and evaluate_filter(override.filter, test):
-            return override.test_group
-    return None
-
-
-def assert_serialized_in_quic_localhost(
-    text: str, binary: str, tests: list[str] | None = None
-) -> None:
-    for name in tests if tests is not None else binary_tests(binary):
-        test = CaseId(PACKAGE, binary, "test", name)
-        group = effective_test_group(text, test)
-        if group != "quic-localhost":
-            raise AssertionError(
-                f".config/nextest.toml must run {binary}::{name} in the "
-                f"quic-localhost test-group (#1283); the effective group is "
-                f"{group!r}. The daemon-mesh selector would otherwise run its "
-                "pairs concurrently in one loopback namespace."
-            )
-
-
-def group_max_threads(text: str, group: str) -> object:
-    """`max-threads` of `[test-groups.<group>]` as nextest reads it, else None."""
-    return load_config(text).get("test-groups", {}).get(group, {}).get("max-threads")
-
-
-def _config_text() -> str:
-    return CONFIG.read_text(encoding="utf-8")
-
-
-def _line_parses_to(line: str, expected: dict) -> bool:
-    try:
-        return tomllib.loads(line) == expected
-    except tomllib.TOMLDecodeError:
-        return False
-
-
-def _override_lines(text: str, override: Override) -> tuple[int, int, int | None]:
-    """(header, filter, test-group) line indices of `override` in `text`.
-
-    Used only to build text mutations for the controls below; the guard
-    itself never reads lines. The filter line is found by its parsed value,
-    so it must be unique in the file.
-    """
-    lines = text.splitlines()
-    hits = [
-        i for i, line in enumerate(lines) if _line_parses_to(line, {"filter": override.filter})
-    ]
-    if len(hits) != 1:
-        raise AssertionError(f"filter {override.filter!r} is not on exactly one line")
-    filter_line = hits[0]
-    header = filter_line
-    while not lines[header].lstrip().startswith("["):
-        header -= 1
-    group_line = None
-    for i in range(filter_line + 1, len(lines)):
-        if lines[i].lstrip().startswith("["):
-            break
-        if override.test_group is not None and _line_parses_to(
-            lines[i], {"test-group": override.test_group}
-        ):
-            group_line = i
-            break
-    return header, filter_line, group_line
-
-
-def _ds(name: str = "delegation_survives_restart_via_history") -> CaseId:
-    return CaseId(PACKAGE, "delegation_spaces", "test", name)
-
-
-def _group_override(text: str, test: CaseId) -> Override:
-    for override in parse_overrides(text):
-        if override.test_group is not None and evaluate_filter(override.filter, test):
-            return override
-    raise AssertionError(f"no test-group override matches {test} in the config")
-
-
-def _insert_before_first_override(text: str, block: list[str]) -> str:
-    lines = text.splitlines()
-    first = next(i for i, line in enumerate(lines) if line.strip() == OVERRIDES_HEADER)
-    return "\n".join(lines[:first] + block + [""] + lines[first:])
-
-
-class FilterEvaluation(unittest.TestCase):
-    def test_binary_predicate_matches_only_the_named_binary(self) -> None:
-        self.assertTrue(evaluate_filter("binary(delegation_spaces)", _ds()))
-        self.assertFalse(evaluate_filter("binary(other)", _ds()))
-
-    def test_negated_binary_does_not_match(self) -> None:
-        self.assertFalse(evaluate_filter("not binary(delegation_spaces)", _ds()))
-        self.assertFalse(evaluate_filter("!binary(delegation_spaces)", _ds()))
-
-    def test_or_with_a_word_operator_parses(self) -> None:
-        # Codex review: the old lookahead consumed `or` and failed.
-        self.assertTrue(evaluate_filter("binary(other) or binary(delegation_spaces)", _ds()))
-        self.assertTrue(evaluate_filter("binary(other) + binary(delegation_spaces)", _ds()))
-
-    def test_and_binds_tighter_than_or(self) -> None:
-        # Codex review: the right operand of `|` must be a full and-chain.
-        self.assertTrue(
-            evaluate_filter("binary(delegation_spaces) | binary(other) & binary(no)", _ds())
+def check_text(text: str) -> None:
+    CHECK.check_assignment(CHECK.parse_show_test_groups(text))
+
+
+class Parser(unittest.TestCase):
+    def test_serialised_output_passes(self) -> None:
+        check_text(SERIALISED)
+
+    def test_cases_in_the_default_group_are_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECK.CheckError, "@global"):
+            check_text(DROPPED)
+
+    def test_cases_in_another_group_are_rejected(self) -> None:
+        moved = SERIALISED.replace(
+            "group: membership-cluster (max threads = 2)\n    (no matches)\n", ""
+        ).replace("group: quic-localhost", "group: membership-cluster")
+        with self.assertRaisesRegex(CHECK.CheckError, "membership-cluster"):
+            check_text(moved + "group: quic-localhost (max threads = 1)\n    (no matches)\n")
+
+    def test_one_case_split_out_is_rejected(self) -> None:
+        split = SERIALISED.replace(
+            "          delegation_survives_restart_via_history\n"
+            "group: @global\n    (no matches)\n",
+            "group: @global\n  * from default settings:\n"
+            "      x0x::delegation_spaces:\n"
+            "          delegation_survives_restart_via_history\n",
         )
-        self.assertFalse(
-            evaluate_filter("binary(other) | binary(delegation_spaces) & binary(no)", _ds())
+        with self.assertRaisesRegex(CHECK.CheckError, "delegation_survives_restart_via_history"):
+            check_text(split)
+
+    def test_parallel_group_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECK.CheckError, "max threads"):
+            check_text(SERIALISED.replace("quic-localhost (max threads = 1)", "quic-localhost (max threads = 2)"))
+
+    def test_missing_or_extra_selected_cases_are_rejected(self) -> None:
+        missing = SERIALISED.replace("          delegation_survives_restart_via_history\n", "")
+        with self.assertRaisesRegex(CHECK.CheckError, "missing"):
+            check_text(missing)
+        extra = SERIALISED.replace(
+            "          delegation_survives_restart_via_history\n",
+            "          delegation_survives_restart_via_history\n          another_mesh_test\n",
         )
-        self.assertTrue(
-            evaluate_filter("binary(no) & binary(other) | binary(delegation_spaces)", _ds())
-        )
-        self.assertFalse(
-            evaluate_filter("(binary(other) | binary(delegation_spaces)) & binary(no)", _ds())
-        )
+        with self.assertRaisesRegex(CHECK.CheckError, "unexpected"):
+            check_text(extra)
 
-    def test_not_binds_tighter_than_and_and_or(self) -> None:
-        self.assertTrue(evaluate_filter("not binary(other) | binary(no)", _ds()))
-        self.assertTrue(
-            evaluate_filter("not binary(other) & binary(delegation_spaces)", _ds())
-        )
-        self.assertFalse(evaluate_filter("not (binary(other) | binary(delegation_spaces))", _ds()))
-
-    def test_difference_operator(self) -> None:
-        self.assertTrue(evaluate_filter("binary(delegation_spaces) - test(=nope)", _ds()))
-        self.assertFalse(evaluate_filter("binary(delegation_spaces) - test(delegation_)", _ds()))
-        # Left-to-right within the and-level.
-        self.assertFalse(
-            evaluate_filter("binary(delegation_spaces) - test(delegation_) & all()", _ds())
-        )
-
-    def test_test_predicate_matchers(self) -> None:
-        test = _ds()
-        self.assertTrue(evaluate_filter("test(survives_restart)", test))  # contains
-        self.assertTrue(evaluate_filter("test(~survives_restart)", test))
-        self.assertFalse(evaluate_filter("test(=survives_restart)", test))
-        self.assertTrue(evaluate_filter(f"test(={test.name})", test))
-        self.assertTrue(evaluate_filter("test(/^delegation_/)", test))
-        self.assertTrue(evaluate_filter("test(/(^|::)delegation_/)", test))  # ')' in regex
-        self.assertFalse(evaluate_filter("test(/^d4_/)", test))
-        self.assertTrue(evaluate_filter("test(#delegation_*)", test))
-        self.assertFalse(evaluate_filter("test(#survives*)", test))
-
-    def test_binary_default_matcher_is_glob(self) -> None:
-        self.assertTrue(evaluate_filter("binary(delegation_*)", _ds()))
-        self.assertFalse(evaluate_filter("binary(delegation)", _ds()))
-        self.assertTrue(evaluate_filter("binary_id(x0x::delegation_spaces)", _ds()))
-        self.assertTrue(evaluate_filter("package(x0x) & kind(test)", _ds()))
-
-    def test_every_live_override_filter_parses(self) -> None:
-        for override in parse_overrides(_config_text()):
-            with self.subTest(filter=override.filter):
-                evaluate_filter(override.filter, _ds())
-
-    def test_unsupported_or_malformed_filters_fail_closed(self) -> None:
+    def test_unknown_line_shapes_fail_closed(self) -> None:
         for bad in (
-            "deps(x)",
-            "platform(host)",
-            "binary(delegation_spaces",
-            "binary)",
-            "binary(a) |",
-            "binary(a) binary(b)",
-            "(binary(a)",
-            "test(/unterminated)",
-            "binary({a,b})",
+            SERIALISED.replace("group: @global", "Group: @global"),
+            SERIALISED.replace("  * override for", "  - override for"),
+            SERIALISED.replace("      x0x::delegation_spaces:", "     x0x::delegation_spaces:"),
+            SERIALISED + "warning: something new\n",
             "",
         ):
-            with self.subTest(bad=bad):
-                with self.assertRaises(ConfigError):
-                    evaluate_filter(bad, _ds())
+            with self.assertRaises(CHECK.CheckError):
+                check_text(bad)
 
-
-class EffectiveAssignment(unittest.TestCase):
-    def test_acceptance_cases_exist_in_binary_and_workflow(self) -> None:
-        names = binary_tests("delegation_spaces")
-        workflow = INTEGRATION_WORKFLOW.read_text(encoding="utf-8")
-        for case in ACCEPTANCE_CASES:
-            with self.subTest(case=case):
-                self.assertIn(case, names)
-                self.assertIn(f"test(={case})", workflow)
-
-    def test_every_mesh_test_is_effectively_in_the_quic_localhost_group(self) -> None:
-        text = _config_text()
-        for binary in SERIALIZED_MESH_BINARIES:
-            with self.subTest(binary=binary):
-                assert_serialized_in_quic_localhost(text, binary)
-
-    def test_quic_localhost_group_still_serialises(self) -> None:
-        # The group only serialises while `max-threads = 1` is live TOML; a
-        # commented `# max-threads = 1` must read as absent.
-        self.assertEqual(group_max_threads(_config_text(), "quic-localhost"), 1)
-
-    def test_commented_max_threads_reads_as_absent(self) -> None:
-        text = "[test-groups.quic-localhost]\n# max-threads = 1\n"
-        self.assertIsNone(group_max_threads(text, "quic-localhost"))
-
-    def test_override_without_an_active_filter_is_a_config_error(self) -> None:
-        text = (
-            f"{OVERRIDES_HEADER}\n"
-            "# filter = 'binary(delegation_spaces)'\n"
-            'test-group = "quic-localhost"\n'
+    def test_tests_without_a_source_line_fail_closed(self) -> None:
+        bare = SERIALISED.replace(
+            "  * override for default profile with filter 'binary(delegation_spaces)':\n", ""
         )
-        with self.assertRaises(ConfigError):
-            effective_test_group(text, _ds())
+        with self.assertRaises(CHECK.CheckError):
+            check_text(bare)
 
 
-class NegativeControls(unittest.TestCase):
-    """In-memory mutations that must be rejected (#1283 reviews)."""
+class Workflow(unittest.TestCase):
+    """The acceptance step runs the selector the checker checks."""
 
-    def test_commented_out_group_assignment_is_rejected(self) -> None:
-        text = _config_text()
-        _, _, group_line = _override_lines(text, _group_override(text, _ds()))
-        assert group_line is not None
-        lines = text.splitlines()
-        lines[group_line] = "# " + lines[group_line]
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
+    def setUp(self) -> None:
+        text = INTEGRATION_WORKFLOW.read_text(encoding="utf-8")
+        blocks = text.split("\n      - name: ")
+        self.names = [b.split("\n", 1)[0].strip("'") for b in blocks]
+        self.blocks = dict(zip(self.names, blocks))
+        self.acceptance = "Run issue #321 delegation and cold-wake acceptance"
+        self.check = "Check issue #321 delegation cases are serialised (#1283)"
+
+    def test_acceptance_step_reads_its_filter_from_the_checker(self) -> None:
+        step = self.blocks[self.acceptance]
+        self.assertIn(
+            'filter="$(python3 -B scripts/ci/check-nextest-mesh-group.py --print-filter)"',
+            step,
+        )
+        self.assertIn("-E \"$filter\"", step)
+        self.assertNotIn("test(=", step)
+        for arg in ("--all-features", f"--test {CHECK.BINARY}", "--run-ignored ignored-only"):
+            self.assertIn(arg, step)
+        self.assertEqual(
+            CHECK.SELECTION_ARGS,
+            ("--all-features", "--test", CHECK.BINARY, "--run-ignored", "ignored-only"),
+        )
+
+    def test_live_check_runs_before_the_acceptance_step(self) -> None:
+        step = self.blocks[self.check]
+        self.assertIn("if: always()", step)
+        self.assertIn(
+            "X0X_MESH_GROUP_LIVE=1 python3 -B scripts/ci/test_nextest_mesh_serialization.py -v",
+            step,
+        )
+        self.assertEqual(self.names.index(self.check) + 1, self.names.index(self.acceptance))
+
+    def test_filter_names_every_case_exactly(self) -> None:
+        self.assertEqual(
+            CHECK.acceptance_filter(),
+            " | ".join(f"test(={name})" for name in CHECK.ACCEPTANCE_CASES),
+        )
+
+
+@unittest.skipUnless(LIVE, "set X0X_MESH_GROUP_LIVE=1 where test binaries are built")
+class Live(unittest.TestCase):
+    """nextest evaluates the real and mutated configs; the check must agree."""
+
+    def setUp(self) -> None:
+        if shutil.which("cargo-nextest") is None:
+            self.fail("X0X_MESH_GROUP_LIVE=1 but cargo-nextest is not installed")
+        self.config = CONFIG.read_text(encoding="utf-8")
+        self.assertEqual(self.config.count(DELEGATION_OVERRIDE), 1)
+        self.scratch = ROOT / "target" / "mesh-group-controls"
+        self.scratch.mkdir(parents=True, exist_ok=True)
+
+    def run_with(self, label: str, text: str | None) -> dict:
+        config = None
+        if text is not None:
+            config = self.scratch / f"{label}.toml"
+            config.write_text(text, encoding="utf-8")
+        return CHECK.parse_show_test_groups(CHECK.show_test_groups(config))
+
+    def mutated(self, override: str) -> str:
+        return self.config.replace(DELEGATION_OVERRIDE, override)
+
+    def assert_rejected(self, label: str, text: str) -> None:
+        # nextest must accept the mutated config and its output must parse;
+        # only the assignment check may reject it. A nextest error or an
+        # unparsable output is a test error, never a passing control.
+        groups = self.run_with(label, text)
+        with self.assertRaises(CHECK.CheckError, msg=label):
+            CHECK.check_assignment(groups)
+
+    def test_real_config_serialises_every_case(self) -> None:
+        CHECK.check_assignment(self.run_with("real", None))
+
+    def test_glob_that_drops_every_case_is_rejected(self) -> None:
+        # The #1283 round-3 counterexample: fnmatch read this as keeping the
+        # cases; nextest's globset drops all three.
+        self.assert_rejected(
+            "glob-drop",
+            self.mutated(
+                DELEGATION_OVERRIDE.replace(
+                    '"binary(delegation_spaces)"',
+                    '"binary(delegation_spaces) & not test(#[^x]*)"',
+                )
+            ),
+        )
+
+    def test_commented_out_group_is_rejected(self) -> None:
+        self.assert_rejected(
+            "commented-group",
+            self.mutated(DELEGATION_OVERRIDE.replace("test-group", "# test-group")),
+        )
 
     def test_negated_filter_is_rejected(self) -> None:
-        text = _config_text()
-        override = _group_override(text, _ds())
-        _, filter_line, _ = _override_lines(text, override)
-        lines = text.splitlines()
-        lines[filter_line] = f'filter = "not ({override.filter})"'
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
-
-    def test_test_predicate_that_drops_the_acceptance_cases_is_rejected(self) -> None:
-        # Codex review: `binary(delegation_spaces) & not test(delegation_)`
-        # keeps the binary in the filter but removes two acceptance cases.
-        text = _config_text()
-        _, filter_line, _ = _override_lines(text, _group_override(text, _ds()))
-        lines = text.splitlines()
-        lines[filter_line] = (
-            'filter = "binary(delegation_spaces) & not test(delegation_)"'
+        self.assert_rejected(
+            "negated",
+            self.mutated(
+                DELEGATION_OVERRIDE.replace(
+                    '"binary(delegation_spaces)"', '"not binary(delegation_spaces)"'
+                )
+            ),
         )
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
 
-    def test_difference_that_drops_one_acceptance_case_is_rejected(self) -> None:
-        text = _config_text()
-        _, filter_line, _ = _override_lines(text, _group_override(text, _ds()))
-        lines = text.splitlines()
-        lines[filter_line] = (
-            'filter = "binary(delegation_spaces) - '
-            'test(=delegated_child_cold_wake_rehydrates_carrier_and_sends_as)"'
+    def test_test_name_filter_dropping_one_case_is_rejected(self) -> None:
+        self.assert_rejected(
+            "drop-one",
+            self.mutated(
+                DELEGATION_OVERRIDE.replace(
+                    '"binary(delegation_spaces)"',
+                    '"binary(delegation_spaces) - test(=delegation_survives_restart_via_history)"',
+                )
+            ),
         )
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
 
     def test_retargeted_group_is_rejected(self) -> None:
-        text = _config_text()
-        _, _, group_line = _override_lines(text, _group_override(text, _ds()))
-        assert group_line is not None
-        lines = text.splitlines()
-        lines[group_line] = 'test-group = "membership-cluster"'
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
-
-    def test_earlier_test_name_override_reassigning_acceptance_cases_is_rejected(
-        self,
-    ) -> None:
-        # Codex review: an earlier test-name override with its own
-        # test-group wins for those tests, though the binary block is intact.
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                OVERRIDES_HEADER,
-                "filter = \"test(=delegation_survives_restart_via_history) | "
-                "test(=delegation_carrier_verified_history_survives_receiver_restart)\"",
-                'test-group = "membership-cluster"',
-            ],
+        self.assert_rejected(
+            "retargeted",
+            self.mutated(DELEGATION_OVERRIDE.replace('"quic-localhost"', '"membership-cluster"')),
         )
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost(text, "delegation_spaces")
 
-    def test_earlier_contains_match_reassigning_one_case_is_rejected(self) -> None:
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                OVERRIDES_HEADER,
-                'filter = "test(cold_wake)"',
-                'test-group = "membership-cluster"',
-            ],
+    def test_earlier_override_reassigning_one_case_is_rejected(self) -> None:
+        earlier = (
+            '[[profile.default.overrides]]\n'
+            'filter = "test(/carrier_verified/)"\n'
+            'test-group = "membership-cluster"\n\n'
         )
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost(text, "delegation_spaces")
+        self.assert_rejected("earlier", self.mutated(earlier + DELEGATION_OVERRIDE))
 
-    def test_commented_out_override_header_is_not_config(self) -> None:
-        text = _config_text()
-        header, _, _ = _override_lines(text, _group_override(text, _ds()))
-        lines = text.splitlines()
-        # Comment out the block's header: the override stops existing for
-        # nextest, and its keys leak into the previous block as duplicates —
-        # invalid TOML — so the guard must reject the file either way
-        # (AssertionError or ConfigError).
-        lines[header] = "# " + lines[header]
-        with self.assertRaises((AssertionError, ConfigError)):
-            assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
-
-    def test_earlier_override_whose_header_has_a_trailing_comment_is_rejected(
-        self,
-    ) -> None:
-        # Codex review (3a0cd6b): `[[profile.default.overrides]] # note` is a
-        # valid header. nextest applies this earlier override first; the old
-        # line matcher skipped the block and stayed green.
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                f"{OVERRIDES_HEADER} # moved for a soak",
-                'filter = "binary(delegation_spaces)"',
-                'test-group = "membership-cluster"',
-            ],
+    def test_parallel_group_is_rejected(self) -> None:
+        text = self.config.replace(
+            "[test-groups.quic-localhost]\nmax-threads = 1\n",
+            "[test-groups.quic-localhost]\nmax-threads = 2\n",
         )
-        self.assertEqual(
-            effective_test_group(text, _ds()),
-            "membership-cluster",
+        self.assertNotEqual(text, self.config)
+        self.assert_rejected("parallel", text)
+
+    def test_earlier_timeout_only_override_keeps_the_group(self) -> None:
+        # Positive control: nextest resolves each setting separately, so an
+        # earlier override without test-group does not erase the group.
+        earlier = (
+            '[[profile.default.overrides]]\n'
+            'filter = "binary(delegation_spaces)"\n'
+            'slow-timeout = "120s"\n\n'
         )
-        with self.assertRaises(AssertionError):
-            assert_serialized_in_quic_localhost(text, "delegation_spaces")
-
-    def test_earlier_override_in_other_valid_header_spellings_is_rejected(
-        self,
-    ) -> None:
-        # The same mutation in other spellings TOML accepts and a line
-        # matcher would miss: inner spaces, quoted keys, an inline comment
-        # after a key.
-        for header in (
-            "[[ profile.default.overrides ]]",
-            "[[profile . default . overrides]]",
-            '[["profile".default."overrides"]]',
-            "\t[[profile.default.overrides]]\t# tabbed",
-        ):
-            with self.subTest(header=header):
-                text = _insert_before_first_override(
-                    _config_text(),
-                    [
-                        header,
-                        'filter = "binary(delegation_spaces)"  # all of them',
-                        "test-group = 'membership-cluster'",
-                    ],
-                )
-                with self.assertRaises(AssertionError):
-                    assert_serialized_in_quic_localhost(text, "delegation_spaces")
-
-    def test_invalid_toml_fails_closed(self) -> None:
-        # A file nextest cannot parse must not read as a passing config.
-        text = _config_text() + "\n[test-groups.quic-localhost]\nmax-threads = 1\n"
-        with self.assertRaises(ConfigError):
-            assert_serialized_in_quic_localhost(text, "delegation_spaces")
-
-
-class PositiveControls(unittest.TestCase):
-    """Valid configurations the guard must keep accepting (#1283 review)."""
-
-    def test_earlier_timeout_only_override_does_not_erase_the_group(self) -> None:
-        # Codex review: nextest resolves precedence per setting. An earlier
-        # override that only sets a timeout is ignored for test-group, so the
-        # later #1283 assignment still applies.
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                OVERRIDES_HEADER,
-                'filter = "binary(delegation_spaces)"',
-                'slow-timeout = { period = "120s", terminate-after = 8 }',
-            ],
-        )
-        assert_serialized_in_quic_localhost(text, "delegation_spaces")
-
-    def test_earlier_override_assigning_the_same_group_passes(self) -> None:
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                OVERRIDES_HEADER,
-                'filter = "test(=delegation_survives_restart_via_history)"',
-                'test-group = "quic-localhost"',
-                "threads-required = 2",
-            ],
-        )
-        assert_serialized_in_quic_localhost(text, "delegation_spaces")
-
-    def test_unrelated_earlier_reassignment_passes(self) -> None:
-        text = _insert_before_first_override(
-            _config_text(),
-            [
-                OVERRIDES_HEADER,
-                'filter = "binary(other) | test(=unrelated_case) & binary(delegation_spaces)"',
-                'test-group = "membership-cluster"',
-            ],
-        )
-        assert_serialized_in_quic_localhost(text, "delegation_spaces")
+        CHECK.check_assignment(self.run_with("timeout-only", self.mutated(earlier + DELEGATION_OVERRIDE)))
 
 
 if __name__ == "__main__":

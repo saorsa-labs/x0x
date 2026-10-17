@@ -947,15 +947,19 @@ async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvide
     evidence
 }
 
-/// Classify a mesh that never formed (#1283), claiming only what the
-/// collected evidence supports: the listener port and the registered-peer
-/// counts. `/peers` and `connections.connected_peers` read the same ant-quic
-/// registered-peer set, so these counts say who registers whom and nothing
-/// about transport handshakes or gossip-plane admission. `connections.active`
-/// is not consulted: in the pinned ant-quic it cannot separate a live
-/// transport from a stale record, so transport state stays UNKNOWN in every
-/// classification. Daemons that did not answer are carried as unknown — a
-/// missing response must not be read as a zero count.
+/// Classify a mesh that never formed (#1283) from the diagnostics snapshot
+/// alone. Every statement is a current observation: a snapshot taken after
+/// the 30s poll gave up cannot show what happened earlier, so no
+/// classification claims that registration "never happened". The listener
+/// port and the registered-peer counts are the only inputs. `/peers` and
+/// `connections.connected_peers` read the same ant-quic registered-peer set,
+/// so these counts say who registers whom now and nothing about transport
+/// handshakes or gossip-plane admission. `connections.active` is not
+/// consulted: in the pinned ant-quic it cannot separate a live transport from
+/// a stale record, so transport state stays UNKNOWN in every classification.
+/// If any daemon's count is unknown (no diagnostics answer), the result is
+/// INCONCLUSIVE: the unanswered daemon may register peers, so no pattern
+/// across the mesh can be stated.
 fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> String {
     /// Join names, or `none` when the list is empty.
     fn listed(names: &[&str]) -> String {
@@ -965,64 +969,75 @@ fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> Str
             names.join(", ")
         }
     }
+    fn registers(n: u64) -> String {
+        format!("registers {n} peer{}", if n == 1 { "" } else { "s" })
+    }
 
     if let Some(mismatch) = evidence
         .iter()
         .find(|e| e.local_addr.is_some() && !e.listener_on_reserved_port())
     {
         return format!(
-            "a QUIC listener is NOT on its reserved port — peers dial a dead port ({} bound {})",
+            "a QUIC listener is NOT on its reserved port at snapshot time — peers that \
+             dial the reserved port reach no listener ({} bound {})",
             mismatch.name,
             mismatch.local_addr.as_deref().unwrap_or("?"),
         );
     }
     let Some(failing_ev) = evidence.iter().find(|e| e.name == failing) else {
-        return format!("no diagnostics evidence for {failing}");
+        return format!("INCONCLUSIVE — no diagnostics evidence for {failing}");
     };
     let unknown: Vec<&str> = evidence
         .iter()
         .filter(|e| e.registered_peers.is_none())
         .map(|e| e.name.as_str())
         .collect();
-    let note = if unknown.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " No diagnostics answer (counts unknown): {}.",
-            unknown.join(", ")
-        )
-    };
+    if !unknown.is_empty() {
+        let observed: Vec<String> = evidence
+            .iter()
+            .filter_map(|e| {
+                e.registered_peers
+                    .map(|n| format!("{} {}", e.name, registers(n)))
+            })
+            .collect();
+        return format!(
+            "INCONCLUSIVE — registered-peer counts are unknown for {} (no diagnostics \
+             answer at snapshot time), and an unanswered daemon may register peers, so \
+             no mesh-wide pattern is claimed. Snapshot observations: {}. Transport state \
+             is unknown",
+            unknown.join(", "),
+            if observed.is_empty() {
+                "none".to_owned()
+            } else {
+                observed.join("; ")
+            },
+        );
+    }
     let peers_registered: Vec<&str> = evidence
         .iter()
         .filter(|e| e.name != failing && e.registered_peers.is_some_and(|n| n > 0))
         .map(|e| e.name.as_str())
         .collect();
-    let registered = |n: u64| format!("registers {n} peer{}", if n == 1 { "" } else { "s" });
     match failing_ev.registered_peers {
-        // The failing daemon is gone or wedged; its counts are unknown and
-        // must not be read as zero connections.
-        None => format!(
-            "the failing daemon did not answer the diagnostics API — dead or wedged \
-             when the mesh was declared disconnected; peers that register peers: \
-             {}.{note}",
-            listed(&peers_registered),
-        ),
-        Some(0) if peers_registered.is_empty() => format!(
-            "no daemon registers a peer — peer registration never happened anywhere in \
-             the mesh; transport state is unknown (the ant-quic counters cannot show \
-             it).{note}"
-        ),
+        // Unreachable: every count is known past the INCONCLUSIVE return.
+        None => format!("INCONCLUSIVE — no registered-peer count for {failing}"),
+        Some(0) if peers_registered.is_empty() => {
+            "at snapshot time no daemon registers a peer. This is the current state only: \
+             it does not show whether a registration existed earlier; transport state is \
+             unknown (the ant-quic counters cannot show it)"
+                .to_owned()
+        }
         Some(0) => format!(
-            "the failing daemon registers no peer while {} register peers — \
-             registration is one-sided; transport state is unknown (the ant-quic \
-             counters cannot show it).{note}",
+            "at snapshot time the failing daemon registers no peer while {} register \
+             peers — the current registrations are one-sided; transport state is unknown \
+             (the ant-quic counters cannot show it)",
             listed(&peers_registered),
         ),
-        // Any remaining case has the failing daemon registering peers: /peers
-        // reads that same registry, so its own poll raced its own late
-        // registration. That is evidence about this daemon only — another
-        // daemon may still register nothing or not answer (#1283 review), so
-        // the classification never claims the mesh completed.
+        // The failing daemon now registers peers. /peers reads that same
+        // registry, so the registry changed after the poll's last read. That
+        // is evidence about this daemon only — another daemon may still
+        // register nothing (#1283 review), so the classification never
+        // claims the mesh completed.
         Some(n) => {
             let disconnected: Vec<&str> = evidence
                 .iter()
@@ -1032,13 +1047,16 @@ fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> Str
             let others = if disconnected.is_empty() {
                 String::new()
             } else {
-                format!(" Still registering no peer: {}.", listed(&disconnected))
+                format!(
+                    "; at snapshot time still registering no peer: {}",
+                    listed(&disconnected)
+                )
             };
             format!(
-                "the failing daemon now {} — /peers reads that same registry, so its 30s \
-                 poll raced its own registration after the last read. This shows only \
-                 that daemon's recovery, not a complete mesh.{others}{note}",
-                registered(n),
+                "at snapshot time the failing daemon {} — /peers reads that same registry, \
+                 so its 30s poll raced a registry change after the last read. This shows \
+                 only that daemon's current state, not a complete mesh{others}",
+                registers(n),
             )
         }
     }
@@ -1394,12 +1412,23 @@ mod mesh_failure_evidence_tests {
     }
 
     #[test]
-    fn dark_pair_classifies_as_no_registration_with_transport_unknown() {
+    fn dark_pair_reports_current_absence_only_with_transport_unknown() {
+        // #1283 review (8de6edd): all-zero snapshots show the current state
+        // only; they cannot establish that registration never happened.
         let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(0));
         let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(0), Some(0));
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
         assert!(
-            classification.contains("registration never happened"),
+            classification.contains("at snapshot time no daemon registers a peer"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("current state only"),
+            "got {classification}"
+        );
+        assert!(!classification.contains("never"), "got {classification}");
+        assert!(
+            !classification.contains("INCONCLUSIVE"),
             "got {classification}"
         );
         assert!(
@@ -1431,7 +1460,7 @@ mod mesh_failure_evidence_tests {
     }
 
     #[test]
-    fn unreachable_failing_daemon_is_unknown_not_zero_and_no_race_claim() {
+    fn unreachable_failing_daemon_is_inconclusive_not_zero_and_no_race_claim() {
         // The #1283 review case: a missing response must not become "zero
         // connections", and the surviving counts must not be read as a
         // completed mesh the poll merely raced.
@@ -1440,14 +1469,22 @@ mod mesh_failure_evidence_tests {
         let carol = evidence("pair-carol-7", 6222, Some("[::]:6222"), Some(1), Some(1));
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
         assert!(
-            classification.contains("did not answer"),
+            classification.starts_with("INCONCLUSIVE"),
             "got {classification}"
         );
         assert!(
-            classification.contains("counts unknown"),
+            classification.contains("counts are unknown for pair-alice-7 (no diagnostics answer"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("pair-bob-7 registers 1 peer; pair-carol-7 registers 1 peer"),
             "got {classification}"
         );
         assert!(!classification.contains("raced"), "got {classification}");
+        assert!(
+            !classification.contains("one-sided"),
+            "got {classification}"
+        );
     }
 
     #[test]
@@ -1460,7 +1497,7 @@ mod mesh_failure_evidence_tests {
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
         assert!(classification.contains("raced"), "got {classification}");
         assert!(
-            !classification.contains("Still registering no peer"),
+            !classification.contains("still registering no peer"),
             "got {classification}"
         );
         assert!(
@@ -1521,11 +1558,11 @@ mod mesh_failure_evidence_tests {
         let carol = evidence("pair-carol-7", 6222, Some("[::]:6222"), Some(0), Some(0));
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
         assert!(
-            classification.contains("only that daemon's recovery"),
+            classification.contains("only that daemon's current state"),
             "got {classification}"
         );
         assert!(
-            classification.contains("Still registering no peer: pair-carol-7."),
+            classification.contains("still registering no peer: pair-carol-7"),
             "got {classification}"
         );
         assert!(
@@ -1539,23 +1576,29 @@ mod mesh_failure_evidence_tests {
     }
 
     #[test]
-    fn recovered_failing_daemon_with_an_unanswered_peer_is_not_a_complete_mesh() {
-        // #1283 review (3a0cd6b): counts [1, 1, unknown]. carol did not
-        // answer, so the mesh is unverified — never "completed".
+    fn recovered_failing_daemon_with_an_unanswered_peer_is_inconclusive() {
+        // #1283 review (3a0cd6b, 8de6edd): counts [1, 1, unknown]. carol did
+        // not answer, so the mesh is unverified — never "completed", and no
+        // diagnosis is drawn from the known counts.
         let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(1), Some(1));
         let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
         let carol = MeshFailureEvidence::unreachable("pair-carol-7", 6222);
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
         assert!(
-            classification.contains("only that daemon's recovery"),
+            classification.starts_with("INCONCLUSIVE"),
             "got {classification}"
         );
         assert!(
-            classification.contains("counts unknown): pair-carol-7."),
+            classification.contains("counts are unknown for pair-carol-7"),
             "got {classification}"
         );
         assert!(
-            !classification.contains("Still registering no peer"),
+            classification.contains("pair-alice-7 registers 1 peer; pair-bob-7 registers 1 peer"),
+            "got {classification}"
+        );
+        assert!(!classification.contains("raced"), "got {classification}");
+        assert!(
+            !classification.contains("still registering no peer"),
             "got {classification}"
         );
         assert!(
@@ -1564,6 +1607,51 @@ mod mesh_failure_evidence_tests {
         );
         assert!(
             !classification.contains("mesh that completed"),
+            "got {classification}"
+        );
+    }
+
+    #[test]
+    fn zero_and_unknown_counts_are_inconclusive_not_a_dark_mesh() {
+        // #1283 review (8de6edd): counts [0, unknown]. The unanswered daemon
+        // may register peers, so neither "no daemon registers a peer" nor any
+        // historical claim may follow. Both orders are checked.
+        for failing_first in [true, false] {
+            let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(0));
+            let bob = MeshFailureEvidence::unreachable("pair-bob-7", 5111);
+            let nodes = if failing_first {
+                [alice, bob]
+            } else {
+                [bob, alice]
+            };
+            let classification = classify_mesh_failure("pair-alice-7", &nodes);
+            assert!(
+                classification.starts_with("INCONCLUSIVE"),
+                "got {classification}"
+            );
+            assert!(
+                classification.contains("counts are unknown for pair-bob-7"),
+                "got {classification}"
+            );
+            assert!(
+                classification.contains("Snapshot observations: pair-alice-7 registers 0 peers."),
+                "got {classification}"
+            );
+            for forbidden in ["no daemon registers", "never", "one-sided", "raced"] {
+                assert!(
+                    !classification.contains(forbidden),
+                    "{forbidden:?} in {classification}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_failing_evidence_is_inconclusive() {
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(0), Some(0));
+        let classification = classify_mesh_failure("pair-alice-7", &[bob]);
+        assert!(
+            classification.starts_with("INCONCLUSIVE"),
             "got {classification}"
         );
     }
