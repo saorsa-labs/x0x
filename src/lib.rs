@@ -21905,7 +21905,7 @@ impl AgentBuilder {
             let runtime = gossip::GossipRuntime::new(
                 self.gossip_config.unwrap_or_default(),
                 std::sync::Arc::clone(net),
-                Some(signing_ctx),
+                signing_ctx,
             )
             .await
             .map_err(|e| {

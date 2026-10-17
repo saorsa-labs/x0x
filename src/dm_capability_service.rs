@@ -1369,9 +1369,8 @@ mod tests {
         let agent_id = kp.agent_id();
         let machine_id = MachineId([9u8; 32]);
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         // Subscribe BEFORE spawning so we observe the advert the publisher
         // actually places on the wire.
         let mut sub = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
@@ -1427,7 +1426,7 @@ mod tests {
         let agent_p = kp_p.agent_id();
 
         let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing_p))).expect("pubsub"),
+            PubSubManager::new(make_node().await, Arc::clone(&signing_p)).expect("pubsub"),
         );
         let store = Arc::new(CapabilityStore::new());
 
@@ -1550,9 +1549,8 @@ mod tests {
         let self_agent = kp.agent_id();
         let self_machine = MachineId([0x44; 32]);
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let store = Arc::new(CapabilityStore::new());
         let (_caps_tx, caps_rx) =
             tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCC; 1184]));
@@ -1603,9 +1601,8 @@ mod tests {
         let signing = Arc::new(SigningContext::from_keypair(&kp));
         let self_agent = kp.agent_id();
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let store = Arc::new(CapabilityStore::new());
         let (_caps_tx, caps_rx) =
             tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCD; 1184]));
@@ -1651,9 +1648,8 @@ mod tests {
         let signing = Arc::new(SigningContext::from_keypair(&kp));
         let self_agent = kp.agent_id();
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let store = Arc::new(CapabilityStore::new());
         let (_caps_tx, caps_rx) =
             tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCE; 1184]));
@@ -1755,9 +1751,8 @@ mod tests {
         let signing = Arc::new(SigningContext::from_keypair(&kp));
         let self_agent = kp.agent_id();
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let store = Arc::new(CapabilityStore::new());
         let (_caps_tx, caps_rx) =
             tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCF; 1184]));
@@ -1898,7 +1893,7 @@ mod tests {
         // with a verified sender of A — the same authenticated boundary the
         // real subscriber enforces.
         let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing_a))).expect("pubsub"),
+            PubSubManager::new(make_node().await, Arc::clone(&signing_a)).expect("pubsub"),
         );
 
         // B: a second agent's view of A, with the shortened cache TTL.
@@ -2015,7 +2010,8 @@ mod tests {
     async fn service_abort_terminates_background_tasks() {
         let kp = AgentKeypair::generate().expect("keygen");
         let signing = Arc::new(SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let store = Arc::new(CapabilityStore::new());
         let (_tx, caps_rx) = tokio::sync::watch::channel(DmCapabilities::pending());
 
@@ -2062,9 +2058,8 @@ mod tests {
         let agent_id = kp.agent_id();
         let machine_id = MachineId([0x61; 32]);
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let mut ext_sub = pubsub
             .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
             .await;
@@ -2111,9 +2106,8 @@ mod tests {
         let mut caps = DmCapabilities::v2_durable_gossip_ready(vec![0x63; 1184]);
         caps.digest_support = false;
 
-        let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
-        );
+        let pubsub =
+            Arc::new(PubSubManager::new(make_node().await, Arc::clone(&signing)).expect("pubsub"));
         let mut ext_sub = pubsub
             .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
             .await;
@@ -2153,7 +2147,7 @@ mod tests {
         let peer_machine = MachineId([0x71; 32]);
 
         let pubsub = Arc::new(
-            PubSubManager::new(make_node().await, Some(Arc::clone(&signing_p))).expect("pubsub"),
+            PubSubManager::new(make_node().await, Arc::clone(&signing_p)).expect("pubsub"),
         );
         let store = Arc::new(CapabilityStore::new());
         let self_agent = AgentId([99u8; 32]);

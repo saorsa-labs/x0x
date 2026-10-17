@@ -5594,7 +5594,10 @@ mod tests {
     /// `owner = agent(1)` and `local_peer_id = peer(1)`.
     async fn make_sync(topic: &str, policy: AccessPolicy) -> KvStoreSync {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub"),
+        );
         let store =
             KvStore::new(store_id(1), "Test".to_string(), agent(1), policy).expect("kv store");
         KvStoreSync::new(store, pubsub, topic.to_string(), peer(1), Some(agent(1)))
@@ -5625,10 +5628,8 @@ mod tests {
     /// A fresh pubsub signer. Production pubsub always signs, and since #1114
     /// nothing unsigned is delivered, so a fixture whose test reads the topic
     /// (or relies on a started sync's own listener) must sign.
-    fn test_signing() -> Option<Arc<crate::gossip::SigningContext>> {
-        Some(Arc::new(crate::gossip::SigningContext::from_keypair(
-            &crate::identity::AgentKeypair::generate().expect("pubsub signer"),
-        )))
+    fn test_signing() -> Arc<crate::gossip::SigningContext> {
+        crate::gossip::pubsub::test_support::signing_context()
     }
 
     #[tokio::test]
@@ -8176,7 +8177,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
             .expect("kv store");
         let sync = KvStoreSync::new(store, pubsub, "store/E".to_string(), peer(1), Some(owner))
@@ -8245,7 +8246,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
             .expect("kv store");
         let sync = KvStoreSync::new(
@@ -10162,7 +10163,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         // Anchored owner is NOT the pub/sub signer, so the signer's control
         // messages are a remote peer's, not our own echo.
         let mut store = KvStore::new(
@@ -11188,7 +11189,10 @@ mod tests {
         // context or author signing material must REFUSE TO START — the
         // only alternative would be a plaintext-capable sync window.
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub"),
+        );
         let kp = AgentKeypair::generate().expect("kp");
         let a = kp.agent_id();
         let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
@@ -11778,7 +11782,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-238-restored-late-owner";
 
         // Snapshot-restored replica: non-empty, owner OFFLINE.
@@ -11873,7 +11877,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-238-deleted-to-empty";
 
         // Owner: EMPTY store carrying an owner-signed checkpoint over the
@@ -12001,7 +12005,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-238-missed-delta";
 
         // Owner holds k_old AND k_new (k_new written while the replica was
@@ -12100,7 +12104,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-238-zombie";
 
         // Empty replica anchored on the (offline) owner — exactly what the
@@ -12293,7 +12297,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-lost-broadcast";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12434,7 +12438,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-prune-stale";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12550,7 +12554,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-empty-silence";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12616,7 +12620,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-v1-compat";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12707,7 +12711,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-tampered";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12809,7 +12813,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-recreate";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -12918,7 +12922,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner_id = kp.agent_id();
         let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, ctx).expect("pubsub"));
         let topic = "kv-240-allowlisted";
         let writer = agent(7);
 
@@ -13160,7 +13164,7 @@ mod tests {
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = kp.agent_id();
         let signing = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
-        let pubsub = Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, signing).expect("pubsub"));
         let topic = "kv-stale-checkpoint-prune";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
         let mut origin = KvStore::new(store_id(1), "S".into(), owner, AccessPolicy::Signed)

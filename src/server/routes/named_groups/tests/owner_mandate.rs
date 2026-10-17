@@ -3049,8 +3049,13 @@ pub(super) async fn stage_live_group_task_list(
             .await
             .expect("loopback node"),
     );
-    let pubsub =
-        std::sync::Arc::new(crate::gossip::PubSubManager::new(node, None).expect("pubsub"));
+    let pubsub = std::sync::Arc::new(
+        crate::gossip::PubSubManager::new(
+            node,
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .expect("pubsub"),
+    );
     let list_id_str = format!("x0x.group.{group_spelling}.symphony.{list_suffix}");
     let tid = x0x::crdt::TaskListId::new([id_seed; 32]);
     let list = x0x::crdt::TaskList::new(

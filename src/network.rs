@@ -10685,9 +10685,13 @@ mod pressure_tests {
 
         // The real wiring: GossipRuntime::new constructs PubSubManager and
         // installs the registry-backed resolver into the shared slot.
-        let runtime = GossipRuntime::new(GossipConfig::default(), Arc::new(network), None)
-            .await
-            .expect("gossip runtime");
+        let runtime = GossipRuntime::new(
+            GossipConfig::default(),
+            Arc::new(network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("gossip runtime");
         assert!(
             Arc::ptr_eq(&pump_handle, &runtime_network_slot(&runtime)),
             "the pump's captured handle IS the slot the runtime filled"

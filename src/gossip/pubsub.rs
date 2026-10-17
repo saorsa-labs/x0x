@@ -6,7 +6,7 @@
 //!
 //! Three wire formats coexist during the transition period:
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned;
-//!   decoded but never delivered to a subscriber (charter I3, #1114)
+//!   decoded but never published or delivered to a subscriber (#1114, #1225)
 //! - **V3** (Signed KV pairing): same fields as V2, with signed topic length
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
@@ -1445,7 +1445,7 @@ impl Drop for Subscription {
 ///
 /// ```text
 /// Publisher → PubSubManager.publish()
-///     ├─> Sign with ML-DSA-65 (if signing context present)
+///     ├─> Sign with ML-DSA-65
 ///     └─> Publish encoded payload via PlumTree (saorsa-gossip-pubsub)
 ///
 /// Peer message → PubSubManager.handle_incoming()
@@ -1496,7 +1496,7 @@ pub struct PubSubManager {
     topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
     next_subscription_generation: AtomicU64,
     /// Signing context for authenticating published messages.
-    signing: Option<Arc<SigningContext>>,
+    signing: Arc<SigningContext>,
     /// Contact store for trust-based message filtering.
     /// Set via `set_contacts()` after construction. Shared with each
     /// subscriber task so delivery reads the store when a payload arrives,
@@ -1711,7 +1711,7 @@ impl std::fmt::Debug for PubSubManager {
         f.debug_struct("PubSubManager")
             .field("network", &self.network)
             .field("topic_count", &"<dynamic>")
-            .field("signing_enabled", &self.signing.is_some())
+            .field("signing_enabled", &true)
             .finish_non_exhaustive()
     }
 }
@@ -2208,24 +2208,40 @@ impl PubSubManager {
     /// # Arguments
     ///
     /// * `network` - The network node (implements GossipTransport)
-    /// * `signing` - Optional signing context for message authentication.
-    ///   When `None`, messages are published unsigned (v1 format), which no
-    ///   x0x subscriber delivers (#1114).
+    /// * `signing` - Required signing context for message authentication.
+    ///   Every network publish carries a signed V2 or V3 inner envelope.
     ///
     /// # Returns
     ///
-    /// A new `PubSubManager` instance
-    pub fn new(
-        network: Arc<NetworkNode>,
-        signing: Option<Arc<SigningContext>>,
-    ) -> NetworkResult<Self> {
+    /// A new `PubSubManager` instance.
+    ///
+    /// An absent signing context is a compile-time error (#1225):
+    ///
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use x0x::{gossip::PubSubManager, network::NetworkNode};
+    /// # fn without_signer(network: Arc<NetworkNode>) {
+    /// let _ = PubSubManager::new(network, None);
+    /// # }
+    /// ```
+    pub fn new(network: Arc<NetworkNode>, signing: Arc<SigningContext>) -> NetworkResult<Self> {
         Self::new_with_oracle(network, signing, None)
     }
 
     /// Same as [`Self::new_with_oracle`] with an explicit participation mode.
+    ///
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use x0x::{gossip::{PubSubManager, ParticipationMode}, network::NetworkNode};
+    /// # fn without_signer(network: Arc<NetworkNode>) {
+    /// let _ = PubSubManager::new_with_participation(
+    ///     network, None, None, ParticipationMode::Leaf, "test",
+    /// );
+    /// # }
+    /// ```
     pub fn new_with_participation(
         network: Arc<NetworkNode>,
-        signing: Option<Arc<SigningContext>>,
+        signing: Arc<SigningContext>,
         oracle: Option<Arc<dyn PeerHealthOracle>>,
         participation: ParticipationMode,
         participation_reason: impl Into<String>,
@@ -2246,9 +2262,17 @@ impl PubSubManager {
     /// from the runtime to thread the existing HyParView SWIM detector
     /// into pub-sub. Use [`Self::new`] only when running pub-sub in
     /// isolation (tests, single-binary tools).
+    ///
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use x0x::{gossip::PubSubManager, network::NetworkNode};
+    /// # fn without_signer(network: Arc<NetworkNode>) {
+    /// let _ = PubSubManager::new_with_oracle(network, None, None);
+    /// # }
+    /// ```
     pub fn new_with_oracle(
         network: Arc<NetworkNode>,
-        signing: Option<Arc<SigningContext>>,
+        signing: Arc<SigningContext>,
         oracle: Option<Arc<dyn PeerHealthOracle>>,
     ) -> NetworkResult<Self> {
         let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(network.as_ref());
@@ -2980,7 +3004,7 @@ impl PubSubManager {
             let contacts = Arc::clone(&self.contacts);
             let revocation_set = Arc::clone(&self.revocation_set);
             let group_identity = Arc::clone(&self.group_identity);
-            let local_agent = self.signing.as_ref().map(|ctx| ctx.agent_id);
+            let local_agent = Some(self.signing.agent_id);
             let mut setup = OwnerSetup {
                 deliveries: Arc::clone(&self.topic_deliveries),
                 topic_id,
@@ -3063,9 +3087,8 @@ impl PubSubManager {
 
     /// Publish a message to a topic.
     ///
-    /// When a signing context is present, the message is signed with
-    /// ML-DSA-65 and encoded in v2 format. Otherwise, v1 (unsigned), which no
-    /// x0x subscriber delivers (#1114).
+    /// Network messages are signed with ML-DSA-65 and encoded in V2 format.
+    /// `local:` topics stay on this daemon and do not produce wire frames.
     ///
     /// # Errors
     ///
@@ -3101,13 +3124,12 @@ impl PubSubManager {
         Ok(outcome.observed_fanout())
     }
 
-    /// Publish to a topic and return the signed V2 envelope bytes when
-    /// signing is enabled.
+    /// Publish to a topic and return the signed V2 envelope bytes.
     ///
     /// ADR 0028: the authority relays the requester-authored predecessor
     /// envelope unchanged to active witnesses. The caller needs the exact V2
     /// wire bytes (including the requester's ML-DSA-65 signature) to offer to
-    /// the authority for relay. Returns `None` for v1 (unsigned) publishes.
+    /// the authority for relay. Returns `None` only for `local:` topics.
     pub async fn publish_and_get_envelope(
         &self,
         topic: String,
@@ -3148,7 +3170,7 @@ impl PubSubManager {
     }
 
     /// Publish to a topic with an explicit transport `TopicId`, returning the
-    /// signed V2 envelope bytes when signing is enabled.
+    /// signed V2 envelope bytes (`None` only for `local:` topics).
     ///
     /// The signed x0x payload still embeds `topic`; only the underlying
     /// PlumTree topic id is supplied by the caller.
@@ -3175,9 +3197,9 @@ impl PubSubManager {
         topic: String,
         payload: Bytes,
     ) -> NetworkResult<Bytes> {
-        if self.signing.is_none() || is_local_topic(&topic) {
+        if is_local_topic(&topic) {
             return Err(NetworkError::SerializationError(
-                "Signed KV V3 requires signing and a network topic".to_string(),
+                "Signed KV V3 requires a network topic".to_string(),
             ));
         }
         let topic_id = TopicId::from_entity(topic.as_bytes());
@@ -3187,7 +3209,7 @@ impl PubSubManager {
             .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
     }
 
-    /// Publish and return both the signed envelope (when signing) and the
+    /// Publish and return both the signed network envelope and the
     /// eager-peer fan-out count from PlumTree `publish_local`.
     async fn publish_topic_id_with_fanout_and_envelope(
         &self,
@@ -3214,34 +3236,28 @@ impl PubSubManager {
         #[cfg(test)]
         self.network.sim_note_publish(&topic, &payload);
 
-        let (encoded, envelope_bytes) = if let Some(ref ctx) = self.signing {
-            let result = version
-                .signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload)
-                .and_then(|signing_payload| ctx.sign(&signing_payload))
-                .and_then(|signature| {
-                    encode_signed(
-                        version,
-                        &ctx.agent_id,
-                        &ctx.public_key_bytes,
-                        &signature,
-                        &topic,
-                        &payload,
-                    )
-                });
-            match result {
-                Ok(encoded) => {
-                    let envelope = Bytes::clone(&encoded);
-                    (encoded, Some(envelope))
-                }
-                Err(err) => {
-                    self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
-                    return Err(err);
-                }
+        let ctx = &self.signing;
+        let result = version
+            .signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload)
+            .and_then(|signing_payload| ctx.sign(&signing_payload))
+            .and_then(|signature| {
+                encode_signed(
+                    version,
+                    &ctx.agent_id,
+                    &ctx.public_key_bytes,
+                    &signature,
+                    &topic,
+                    &payload,
+                )
+            });
+        let encoded = match result {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
             }
-        } else {
-            let encoded = encode_v1(&topic, &payload)?;
-            (encoded, None)
         };
+        let envelope_bytes = Some(Bytes::clone(&encoded));
 
         self.register_dynamic_topic_priority(&topic, topic_id);
         // Classification linearizes here. A roster commit overlapping this
@@ -3283,11 +3299,8 @@ impl PubSubManager {
         let message = PubSubMessage {
             topic: topic.clone(),
             payload,
-            sender: self.signing.as_ref().map(|ctx| ctx.agent_id),
-            sender_public_key: self
-                .signing
-                .as_ref()
-                .map(|ctx| ctx.public_key_bytes.clone()),
+            sender: Some(self.signing.agent_id),
+            sender_public_key: Some(self.signing.public_key_bytes.clone()),
             // Local publishes come from a bearer-token-authenticated
             // API caller on this daemon — trusted by construction.
             verified: true,
@@ -4440,6 +4453,7 @@ fn register_x0x_topic_priorities(
 /// Encode a v1 (unsigned) pub/sub message.
 ///
 /// Format: `[topic_len: u16_be | topic_bytes | payload]`
+#[cfg(test)]
 fn encode_v1(topic: &str, payload: &Bytes) -> NetworkResult<Bytes> {
     let topic_bytes = topic.as_bytes();
     let topic_len = u16::try_from(topic_bytes.len())
@@ -4766,6 +4780,13 @@ fn verify_signature(
 pub(crate) mod test_support {
     use super::*;
 
+    /// A fresh author identity for a manager that does not need a fixed signer.
+    pub(crate) fn signing_context() -> Arc<SigningContext> {
+        Arc::new(SigningContext::from_keypair(
+            &crate::identity::AgentKeypair::generate().expect("pubsub signer"),
+        ))
+    }
+
     /// An unsigned inner V1 payload — the #1114 attack shape.
     pub(crate) fn unsigned_inner_v1(topic: &str, payload: &Bytes) -> Bytes {
         encode_v1(topic, payload).expect("encode inner v1")
@@ -4826,10 +4847,8 @@ mod tests {
     /// A fresh signing context. Production managers always sign, and since
     /// #1114 nothing unsigned is delivered, so a fixture whose test relies on
     /// delivery (or on its absence) must sign.
-    fn test_signing() -> Option<Arc<SigningContext>> {
-        Some(Arc::new(SigningContext::from_keypair(
-            &AgentKeypair::generate().expect("keygen"),
-        )))
+    fn test_signing() -> Arc<SigningContext> {
+        test_support::signing_context()
     }
 
     /// A signed inner payload from a fresh remote author (#1114 fixtures).
@@ -5492,7 +5511,7 @@ mod tests {
     async fn diagnostics_report_the_effective_policy_not_the_requested_one() {
         let mut manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "byte_policy_test",
@@ -5511,7 +5530,8 @@ mod tests {
         assert_eq!(budget["byte_policy_requested"], "shed_normal");
         assert!(budget["leaf_egress"].is_object(), "sg snapshot is reported");
 
-        let mut leaf = PubSubManager::new(test_node().await, None).expect("manager");
+        let mut leaf = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         leaf.configure_egress(&GossipConfig::default())
             .await
             .expect("default budget");
@@ -6687,7 +6707,8 @@ mod tests {
             peers: Vec::new(),
             sends: Vec::new(),
         });
-        let receiver = PubSubManager::new(test_node().await, None).expect("receiver");
+        let receiver = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("receiver");
         let receiver_peer =
             saorsa_gossip_transport::GossipTransport::local_peer_id(receiver.transport.as_ref());
         let publisher_peer =
@@ -6753,7 +6774,7 @@ mod tests {
     async fn anonymous_authenticated_group_member_is_eager_without_discovery_certificate() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "anonymous_group_member",
@@ -6789,7 +6810,7 @@ mod tests {
     async fn metadata_and_state_sync_subscribed_before_roster_are_reclassified() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "group_topic_mapping_before_roster",
@@ -6852,7 +6873,7 @@ mod tests {
     async fn roster_change_refreshes_only_affected_group_topics() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "scoped_roster_refresh",
@@ -6913,7 +6934,7 @@ mod tests {
     async fn group_roster_change_replaces_preference_and_rendezvous_is_stable() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "group_roster_change",
@@ -6984,7 +7005,7 @@ mod tests {
     async fn group_preference_requires_authenticated_binding_and_current_pairing() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "group_roster_identity",
@@ -7139,7 +7160,8 @@ mod tests {
 
     #[tokio::test]
     async fn group_topic_classification_clears_on_drop_unsubscribe_and_withdrawal() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let group_id = "ac".repeat(32);
         let name = format!("x0x/group/{group_id}/kv/{}", "bd".repeat(32));
         let topic = TopicId::from_entity(name.as_bytes());
@@ -7369,7 +7391,8 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_topics_do_not_wait_for_a_busy_preference_shard() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let busy = TopicId::new([1; 32]);
         let other = TopicId::new([2; 32]);
         assert!(!std::ptr::eq(
@@ -7434,7 +7457,7 @@ mod tests {
         let manager = Arc::new(
             PubSubManager::new_with_participation(
                 test_node().await,
-                None,
+                test_support::signing_context(),
                 None,
                 ParticipationMode::Full,
                 "metadata_move",
@@ -7503,7 +7526,10 @@ mod tests {
 
     #[tokio::test]
     async fn publish_only_registration_cannot_escape_roster_reconciliation() {
-        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        let manager = Arc::new(
+            PubSubManager::new(test_node().await, test_support::signing_context())
+                .expect("manager"),
+        );
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: Vec::new(),
             sends: Vec::new(),
@@ -8418,15 +8444,10 @@ mod tests {
     #[tokio::test]
     async fn v3_publisher_requires_signing_and_emits_verifiable_envelope() {
         let node = test_node().await;
-        let unsigned = PubSubManager::new(Arc::clone(&node), None).expect("manager");
-        assert!(unsigned
-            .publish_signed_kv_v3("T".to_string(), Bytes::new())
-            .await
-            .is_err());
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = PubSubManager::new(node, Some(Arc::clone(&ctx))).expect("manager");
+        let manager = PubSubManager::new(node, Arc::clone(&ctx)).expect("manager");
         // Preparation must not implicitly migrate even a Signed KV topic name.
         for topic in ["ordinary", "T", "T/state-sync"] {
             let envelope = manager
@@ -8491,13 +8512,13 @@ mod tests {
     #[tokio::test]
     async fn test_pubsub_creation() {
         let node = test_node().await;
-        let _manager = PubSubManager::new(node, None).expect("manager");
+        let _manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
     }
 
     #[tokio::test]
     async fn test_subscribe_to_topic() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let sub = manager.subscribe("test-topic".to_string()).await;
         assert_eq!(sub.topic(), "test-topic");
     }
@@ -8562,7 +8583,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_subscription_ends_forwarding_task_on_quiet_topic() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let before = manager.stats().subscriber_task_ended;
 
         let sub = manager
@@ -8598,21 +8619,22 @@ mod tests {
         );
     }
 
-    /// #1114: an unsigned manager still publishes inner V1, but no subscriber
-    /// delivers it, its own included. The decode counter proves the message
-    /// reached `decode_for_delivery` and was dropped there rather than lost
-    /// on the way; `test_publish_local_delivery_signed` is the positive
-    /// control.
+    /// #1114: injected inner V1 is refused by the local delivery path. Public
+    /// publishers cannot emit it (#1225). The decode counter proves the payload
+    /// reached the guard; `test_publish_local_delivery_signed` is the control.
     #[tokio::test]
-    async fn test_publish_local_unsigned_is_not_delivered() {
+    async fn test_injected_local_unsigned_is_not_delivered() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let mut sub = manager.subscribe("chat".to_string()).await;
 
         manager
-            .publish("chat".to_string(), Bytes::from("hello"))
+            .publish_plumtree_and_pump(
+                TopicId::from_entity(b"chat"),
+                encode_v1("chat", &Bytes::from("hello")).expect("unsigned fixture"),
+            )
             .await
-            .expect("Publish failed");
+            .expect("injected publish");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while manager.stats().incoming_decode_failed == 0 {
@@ -8639,7 +8661,7 @@ mod tests {
         let node = test_node().await;
         let kp = AgentKeypair::generate().expect("keygen");
         let ctx = Arc::new(SigningContext::from_keypair(&kp));
-        let manager = PubSubManager::new(node, Some(ctx.clone())).expect("manager");
+        let manager = PubSubManager::new(node, ctx.clone()).expect("manager");
 
         let mut sub = manager.subscribe("chat".to_string()).await;
 
@@ -8676,7 +8698,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_no_subscribers() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         assert!(manager
             .publish("empty".to_string(), Bytes::from("nothing"))
             .await
@@ -8706,7 +8728,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_count() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
 
         assert_eq!(manager.subscription_count().await, 0);
         let _sub_t1 = manager.subscribe("t1".to_string()).await;
@@ -8727,7 +8749,7 @@ mod tests {
         let node = test_node().await;
         let manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Leaf,
             "default_leaf",
@@ -8766,7 +8788,7 @@ mod tests {
         let node = test_node().await;
         let manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "operator_relay",
@@ -8866,7 +8888,7 @@ mod tests {
         let node = test_node().await;
         let manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Leaf,
             "default_leaf",
@@ -8944,7 +8966,7 @@ mod tests {
         let node = test_node().await;
         let manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "operator_relay",
@@ -9016,13 +9038,14 @@ mod tests {
             PubSubManager::new(test_node().await, test_signing()).expect("publisher manager");
         let relay = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "operator_relay",
         )
         .expect("relay manager");
-        let subscriber = PubSubManager::new(test_node().await, None).expect("subscriber manager");
+        let subscriber = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("subscriber manager");
 
         let pub_peer =
             saorsa_gossip_transport::GossipTransport::local_peer_id(publisher.transport.as_ref());
@@ -9163,10 +9186,10 @@ mod tests {
         let signing = Arc::new(SigningContext::from_keypair(
             &crate::identity::AgentKeypair::generate().unwrap(),
         ));
-        let b = PubSubManager::new(node_b, Some(Arc::clone(&signing))).expect("publisher manager");
+        let b = PubSubManager::new(node_b, Arc::clone(&signing)).expect("publisher manager");
         let a = PubSubManager::new_with_participation(
             node_a,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "operator_relay",
@@ -9228,7 +9251,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_invalid() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let _sub = manager.subscribe("test".to_string()).await;
 
         let peer = PeerId::new([1; 32]);
@@ -9312,7 +9335,7 @@ mod tests {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = PubSubManager::new(node, Some(Arc::clone(&ctx))).expect("manager");
+        let manager = PubSubManager::new(node, Arc::clone(&ctx)).expect("manager");
         let topic = "dedup-identical";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
@@ -9513,7 +9536,7 @@ mod tests {
     #[tokio::test]
     async fn publish_with_fanout_is_zero_when_eager_set_is_empty() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let fan_out = manager
             .publish_with_fanout("empty-eager".to_string(), Bytes::from("nobody"))
             .await
@@ -9681,17 +9704,22 @@ mod tests {
     #[tokio::test]
     async fn adr014_constructors_install_reject_v1() {
         let node = test_node().await;
-        let plain = PubSubManager::new(Arc::clone(&node), None).expect("new");
+        let plain =
+            PubSubManager::new(Arc::clone(&node), test_support::signing_context()).expect("new");
         assert_eq!(plain.outer_signature_policy(), "reject_v1");
         assert_eq!(plain.outer_v1_receipts(), 0);
 
-        let with_oracle =
-            PubSubManager::new_with_oracle(Arc::clone(&node), None, None).expect("new_with_oracle");
+        let with_oracle = PubSubManager::new_with_oracle(
+            Arc::clone(&node),
+            test_support::signing_context(),
+            None,
+        )
+        .expect("new_with_oracle");
         assert_eq!(with_oracle.outer_signature_policy(), "reject_v1");
 
         let leaf = PubSubManager::new_with_participation(
             Arc::clone(&node),
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Leaf,
             "default_leaf",
@@ -9701,7 +9729,7 @@ mod tests {
 
         let full = PubSubManager::new_with_participation(
             node,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "operator_relay",
@@ -9713,7 +9741,7 @@ mod tests {
     #[tokio::test]
     async fn adr014_valid_outer_v1_eager_is_rejected_and_receipted() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let topic = "adr014-v1-reject";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
@@ -9762,7 +9790,7 @@ mod tests {
     #[tokio::test]
     async fn adr014_outer_v2_positive_and_tampered_negative() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_support::signing_context()).expect("manager");
         let topic = "adr014-v2-ok";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
@@ -9824,11 +9852,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adr014_publish_with_signing_context_emits_outer_v2() {
+    async fn signed_publish_emits_verified_inner_v2_and_outer_v2() {
         let node = test_node().await;
         let kp = AgentKeypair::generate().expect("agent key");
         let ctx = Arc::new(SigningContext::from_keypair(&kp));
-        let manager = PubSubManager::new(Arc::clone(&node), Some(ctx)).expect("manager");
+        let manager = PubSubManager::new(Arc::clone(&node), ctx).expect("manager");
         // #774: every publish re-applies the connected plane as topic
         // membership, so the eager peer must be on the (recorded) plane —
         // a seeded but unconnected peer is correctly removed.
@@ -9859,6 +9887,91 @@ mod tests {
         let expected = blake3::hash(payload.as_ref());
         let sealed = msg.header.payload_hash.expect("V2 payload_hash");
         assert_eq!(&sealed[..], expected.as_bytes());
+        assert_eq!(
+            payload[0], VERSION_V2,
+            "#1225: network publishes never emit inner V1"
+        );
+        let decoded = decode_v2(payload).expect("signed inner V2");
+        assert!(decoded.verified);
+        assert_eq!(decoded.sender, Some(kp.agent_id()));
+        assert_eq!(decoded.topic, topic);
+        assert_eq!(decoded.payload, Bytes::from("signed-modern"));
+    }
+
+    /// A broken signer must refuse every network entrypoint before PlumTree.
+    /// This protects against reintroducing an unsigned error fallback (#1225).
+    #[tokio::test]
+    async fn signing_failure_never_emits_or_delivers_unsigned_fallback() {
+        let mut signing = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        signing.secret_key_bytes.clear();
+        let manager = PubSubManager::new(test_node().await, Arc::new(signing)).expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([42; 32])],
+            sends: Vec::new(),
+        });
+        let topic = "issue1225-broken-signer".to_string();
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.clone()).await;
+        drain_sends(&manager);
+        let payload = Bytes::from_static(b"must-not-escape");
+        let failures = [
+            manager.publish(topic.clone(), payload.clone()).await,
+            manager
+                .publish_with_fanout(topic.clone(), payload.clone())
+                .await
+                .map(|_| ()),
+            manager
+                .publish_and_get_envelope(topic.clone(), payload.clone())
+                .await
+                .map(|_| ()),
+            manager
+                .publish_topic_id(topic.clone(), topic_id, payload.clone())
+                .await,
+            manager
+                .publish_topic_id_with_envelope(topic.clone(), topic_id, payload.clone())
+                .await
+                .map(|_| ()),
+            manager
+                .publish_signed_kv_v3(topic, payload)
+                .await
+                .map(|_| ()),
+        ];
+        for result in failures {
+            assert!(matches!(result, Err(NetworkError::SerializationError(_))));
+        }
+        assert_eq!(manager.stats().publish_failed, 6);
+        assert_eq!(manager.stats().publish_total, 0);
+        assert_eq!(manager.stats().incoming_total, 0);
+        assert!(drain_sends(&manager).is_empty());
+        assert!(tokio::time::timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn required_signer_keeps_local_topics_off_wire() {
+        let signing = test_signing();
+        let manager = PubSubManager::new(test_node().await, Arc::clone(&signing)).expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([42; 32])],
+            sends: Vec::new(),
+        });
+        let topic = "local:issue1225".to_string();
+        let mut sub = manager.subscribe(topic.clone()).await;
+        let envelope = manager
+            .publish_and_get_envelope(topic, Bytes::from_static(b"local"))
+            .await
+            .expect("local publish");
+        assert!(envelope.is_none());
+        let message = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("local delivery")
+            .expect("message");
+        assert_eq!(message.sender, Some(signing.agent_id));
+        assert_eq!(message.payload, Bytes::from_static(b"local"));
+        assert!(message.verified);
+        assert!(message.raw_envelope.is_none());
+        assert!(drain_sends(&manager).is_empty());
     }
 
     #[tokio::test]
@@ -9870,8 +9983,14 @@ mod tests {
             (ParticipationMode::Full, "operator_relay"),
         ] {
             let node = test_node().await;
-            let manager = PubSubManager::new_with_participation(node, None, None, mode, reason)
-                .expect("manager");
+            let manager = PubSubManager::new_with_participation(
+                node,
+                test_support::signing_context(),
+                None,
+                mode,
+                reason,
+            )
+            .expect("manager");
             assert_eq!(manager.outer_signature_policy(), "reject_v1");
             let topic = format!("adr014-refuse-{reason}");
             let topic_id = TopicId::from_entity(topic.as_bytes());
@@ -9924,7 +10043,8 @@ mod tests {
     /// signed one, and nothing else may follow.
     #[tokio::test]
     async fn issue1114_signed_outer_frame_with_unsigned_inner_v1_is_not_delivered() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let topic = "issue1114-inner-v1";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
@@ -10058,7 +10178,8 @@ mod tests {
     /// delivers a sender who is in neither store.
     #[tokio::test]
     async fn issue1230_subscribe_before_stores_drops_revoked_and_blocked() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let topic = "issue1230-late-stores";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
@@ -10714,7 +10835,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn two_subscriptions_on_one_topic_see_the_same_transport_id() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let mut first = manager.subscribe("issue869".to_string()).await;
         let mut second = manager.subscribe("issue869".to_string()).await;
         let peer = PeerId::new([7; 32]);
@@ -10747,7 +10869,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn second_valid_frame_with_the_same_payload_does_not_relabel_the_delivery() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let mut first = manager.subscribe("issue869".to_string()).await;
         let mut second = manager.subscribe("issue869".to_string()).await;
         let peer = PeerId::new([9; 32]);
@@ -10808,7 +10931,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn unvalidated_frame_is_not_given_a_transport_id() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let mut sub = manager.subscribe("issue869".to_string()).await;
         let peer = PeerId::new([4; 32]);
         let (frame, _id) = eager_frame(b"one", [0x44; 32]);
@@ -10841,7 +10965,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = PubSubManager::new(test_node().await, Some(ctx)).expect("manager");
+        let manager = PubSubManager::new(test_node().await, ctx).expect("manager");
         let topic = "issue869-before-subscribe";
         let mut first = manager.subscribe(topic.to_string()).await;
         manager
@@ -10875,7 +10999,7 @@ mod issue869 {
     async fn full_relay_without_local_subscribers_skips_transport_claim() {
         let manager = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_support::signing_context(),
             None,
             ParticipationMode::Full,
             "relay",
@@ -10900,7 +11024,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn quiet_unsubscribe_stops_the_forwarder() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let sub = manager.subscribe("issue869-quiet".to_string()).await;
         let slot = Arc::clone(
             sub.topic_delivery
@@ -11060,7 +11185,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn quiet_key_cache_recovery_delivers_without_another_pump() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let topic_name = "issue869-recover";
         let mut sub = manager.subscribe(topic_name.to_string()).await;
         let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("author"));
@@ -11129,7 +11255,10 @@ mod issue869 {
 
     #[tokio::test]
     async fn invalid_duplicate_does_not_stamp_a_recovered_delivery() {
-        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        let manager = Arc::new(
+            PubSubManager::new(test_node().await, test_support::signing_context())
+                .expect("manager"),
+        );
         let mut sub = manager.subscribe("issue869".to_string()).await;
         let peer = PeerId::new([9; 32]);
         let (frame_b, id_b) = eager_frame(b"bee", [0x22; 32]);
@@ -11220,7 +11349,10 @@ mod issue869 {
 
     #[tokio::test]
     async fn cancelled_inbound_dispatch_still_delivers_the_admitted_frame() {
-        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        let manager = Arc::new(
+            PubSubManager::new(test_node().await, test_support::signing_context())
+                .expect("manager"),
+        );
         let mut sub = manager.subscribe("issue869".to_string()).await;
         let (frame, id) = eager_frame(b"kept", [0x11; 32]);
         let reads_before = manager.admitted_transport_id_reads.load(Ordering::Relaxed);
@@ -11268,7 +11400,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         let topic = "issue869-cancel-publish";
         let mut sub = manager.subscribe(topic.to_string()).await;
         let (entered, _release) = arm_pause(&manager.after_producer_pause);
@@ -11300,7 +11432,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: vec![PeerId::new([3; 32])],
             sends: Vec::new(),
@@ -11382,7 +11514,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: vec![PeerId::new([3; 32])],
             sends: Vec::new(),
@@ -11477,7 +11609,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         let topic = "issue869-replace-receiver";
         let original = manager.subscribe(topic.to_string()).await;
         let (entered, release) = arm_pause(&manager.before_admission_pause);
@@ -11516,7 +11648,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         let topic = "issue869-replace-cancel";
         let original = manager.subscribe(topic.to_string()).await;
         let (before_entered, before_release) = arm_pause(&manager.before_admission_pause);
@@ -11562,7 +11694,7 @@ mod issue869 {
         let manager = Arc::new(
             PubSubManager::new_with_participation(
                 test_node().await,
-                Some(ctx),
+                ctx,
                 None,
                 ParticipationMode::Full,
                 "relay",
@@ -11651,7 +11783,7 @@ mod issue869 {
         let manager = Arc::new(
             PubSubManager::new_with_participation(
                 test_node().await,
-                Some(ctx),
+                ctx,
                 None,
                 ParticipationMode::Full,
                 "relay",
@@ -11731,7 +11863,7 @@ mod issue869 {
         let ctx = Arc::new(SigningContext::from_keypair(
             &AgentKeypair::generate().expect("keygen"),
         ));
-        let manager = Arc::new(PubSubManager::new(test_node().await, Some(ctx)).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(test_node().await, ctx).expect("manager"));
         let topic = "issue869-owner-cancel";
         let (entered, _release) = arm_pause(&manager.after_claim_pause);
         let owner = {
@@ -11773,7 +11905,8 @@ mod issue869 {
 
     #[tokio::test]
     async fn authenticated_v3_delivery_omits_the_header_id() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
         let topic_name = "issue869-v3-session";
         let mut sub = manager.subscribe(topic_name.to_string()).await;
         let header_id = [0xab; 32];

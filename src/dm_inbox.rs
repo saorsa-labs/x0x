@@ -2896,11 +2896,10 @@ mod tests {
                 .expect("network node"),
         );
         // Production shape: the pubsub signs with the same agent key the
-        // pipeline signs ACK envelopes with. Since #1114 an unsigned manager's
-        // publishes reach no subscriber, which the ACK-route tests read back.
+        // pipeline signs ACK envelopes with. The ACK-route tests read back
+        // publications through the same verified sender path.
         let signing = Arc::new(SigningContext::from_keypair(&recipient));
-        let pubsub =
-            Arc::new(PubSubManager::new(node, Some(Arc::clone(&signing))).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(node, Arc::clone(&signing)).expect("pubsub"));
         let authenticated_machine_bindings =
             Arc::new(RwLock::new(AuthenticatedMachineBindingCache::default()));
         if let Some(machine_id) = authenticated_machine {
@@ -2983,10 +2982,11 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let signing = Arc::new(SigningContext::from_keypair(&recipient));
+        let pubsub = Arc::new(PubSubManager::new(node, Arc::clone(&signing)).expect("pubsub"));
         let service = DmInboxService::spawn_with_hedge_options(
             Arc::clone(&pubsub),
-            Arc::new(SigningContext::from_keypair(&recipient)),
+            signing,
             self_agent_id,
             MachineId([0xEE; 32]),
             Arc::new(MachineKeypair::generate().expect("machine keygen")),
@@ -3803,7 +3803,9 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = PubSubManager::new(node, None).expect("pubsub");
+        let pubsub =
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub");
         let self_id = AgentId([0xA1; 32]);
         let peer = AgentId([0xB2; 32]);
         let self_inbox = dm_inbox_topic(&self_id);
@@ -3874,7 +3876,10 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub"),
+        );
         let peer = AgentId([0xC4; 32]);
         let peer_inbox_topic_id = dm_inbox_topic(&peer);
         let peer_inbox_name = DmInboxService::inbox_topic_name(&peer);
@@ -3916,7 +3921,9 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = PubSubManager::new(node, None).expect("pubsub");
+        let pubsub =
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub");
         let self_id = AgentId([0xC3; 32]);
         let peer = AgentId([0xD4; 32]);
         let peer_name = DmInboxService::inbox_topic_name(&peer);
@@ -5580,9 +5587,8 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub =
-            PubSubManager::new(node, Some(Arc::new(SigningContext::from_keypair(&signer))))
-                .expect("signed pubsub");
+        let pubsub = PubSubManager::new(node, Arc::new(SigningContext::from_keypair(&signer)))
+            .expect("signed pubsub");
         let event = serde_json::json!({
             "event": "join_request_created",
             "group_id": "g",

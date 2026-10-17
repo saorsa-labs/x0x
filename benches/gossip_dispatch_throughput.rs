@@ -6,20 +6,11 @@ use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use x0x::gossip::PubSubManager;
+use x0x::gossip::{ParticipationMode, PubSubManager, SigningContext};
+use x0x::identity::AgentKeypair;
 use x0x::network::{NetworkConfig, NetworkNode};
 
 const BATCH_SIZE: usize = 256;
-
-fn encode_v1_payload(topic: &str, payload: &[u8]) -> Bytes {
-    let topic_bytes = topic.as_bytes();
-    let mut buf = Vec::with_capacity(2 + topic_bytes.len() + payload.len());
-    let topic_len = u16::try_from(topic_bytes.len()).expect("bench topic fits u16");
-    buf.extend_from_slice(&topic_len.to_be_bytes());
-    buf.extend_from_slice(topic_bytes);
-    buf.extend_from_slice(payload);
-    Bytes::from(buf)
-}
 
 fn peer(byte: u8) -> PeerId {
     PeerId::new([byte; 32])
@@ -35,11 +26,10 @@ fn message_id(sequence: u64) -> [u8; 32] {
 fn build_eager_wire(
     signing_key: &MlDsaKeyPair,
     topic_id: TopicId,
-    topic: &str,
+    payload: Bytes,
     sequence: u64,
 ) -> Bytes {
-    let payload = encode_v1_payload(topic, format!("bench-message-{sequence}").as_bytes());
-    let header = MessageHeader {
+    let mut header = MessageHeader {
         version: 1,
         topic: topic_id,
         msg_id: message_id(sequence),
@@ -48,6 +38,7 @@ fn build_eager_wire(
         ttl: 10,
         payload_hash: None,
     };
+    header.seal_payload_hash(Some(payload.as_ref()));
     let header_bytes = postcard::to_stdvec(&header).expect("bench header serializes");
     let signature = signing_key.sign(&header_bytes).expect("bench header signs");
     let message = GossipMessage {
@@ -59,7 +50,7 @@ fn build_eager_wire(
     Bytes::from(postcard::to_stdvec(&message).expect("bench message serializes"))
 }
 
-fn make_manager(rt: &Runtime) -> Arc<PubSubManager> {
+fn make_manager(rt: &Runtime, participation: ParticipationMode) -> Arc<PubSubManager> {
     rt.block_on(async {
         let network = NetworkNode::new(
             NetworkConfig {
@@ -74,18 +65,52 @@ fn make_manager(rt: &Runtime) -> Arc<PubSubManager> {
         )
         .await
         .expect("bench network starts");
-        Arc::new(PubSubManager::new(Arc::new(network), None).expect("bench pubsub manager starts"))
+        let signing = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("bench author key generates"),
+        ));
+        Arc::new(
+            PubSubManager::new_with_participation(
+                Arc::new(network),
+                signing,
+                None,
+                participation,
+                "benchmark",
+            )
+            .expect("bench pubsub manager starts"),
+        )
     })
 }
 
 fn bench_handle_incoming(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime starts");
-    let manager = make_manager(&rt);
+    // Full participation reaches the relay ingress path without a local subscriber.
+    // A Leaf would refuse every frame before dispatch.
+    let manager = make_manager(&rt, ParticipationMode::Full);
+    let publisher = make_manager(&rt, ParticipationMode::Leaf);
     let signing_key = MlDsaKeyPair::generate().expect("bench signing key generates");
     let topic = "bench/gossip-dispatch";
     let topic_id = TopicId::from_entity(topic.as_bytes());
     let from = peer(7);
     let sequence = AtomicU64::new(1);
+
+    // Fail before timing if fixtures only exercise an ingress refusal.
+    let probe = rt
+        .block_on(
+            publisher
+                .publish_and_get_envelope(topic.to_string(), Bytes::from_static(b"dispatch-probe")),
+        )
+        .expect("probe signs")
+        .expect("probe envelope");
+    rt.block_on(manager.handle_incoming(
+        from,
+        None,
+        build_eager_wire(&signing_key, topic_id, probe, 0),
+    ));
+    assert_eq!(
+        manager.stage_stats().validator.lazy_forward,
+        1,
+        "bench probe must reach the validated relay path"
+    );
 
     let mut group = c.benchmark_group("gossip_dispatch_throughput");
     group.throughput(Throughput::Elements(BATCH_SIZE as u64));
@@ -95,7 +120,15 @@ fn bench_handle_incoming(c: &mut Criterion) {
                 (0..BATCH_SIZE)
                     .map(|_| {
                         let seq = sequence.fetch_add(1, Ordering::Relaxed);
-                        build_eager_wire(&signing_key, topic_id, topic, seq)
+                        // Signing is fixture setup, outside the measured dispatch.
+                        let inner = rt
+                            .block_on(publisher.publish_and_get_envelope(
+                                topic.to_string(),
+                                Bytes::from(format!("bench-message-{seq}")),
+                            ))
+                            .expect("bench publish signs")
+                            .expect("network publish returns an envelope");
+                        build_eager_wire(&signing_key, topic_id, inner, seq)
                     })
                     .collect::<Vec<_>>()
             },

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Pub/sub requires a signing context (#1225; v0.47 train API follow-up).**
+  `PubSubManager::new`, `new_with_oracle`, `new_with_participation`, and
+  `GossipRuntime::new` now take `Arc<SigningContext>` instead of
+  `Option<Arc<SigningContext>>`. Pass the context directly instead of `Some(ctx)`;
+  callers that passed `None` must supply an agent signer. Network publishes
+  always carry signed inner V2 or V3 envelopes. `local:` topics remain local.
+  The unsigned encoder is test-only. This entry records the pending constructor
+  change; it does not change the version or amend a released v0.47 artifact.
+
 - **One token class for the join-request admin task (#1347).** `GET /groups/:id/requests`, `POST /groups/:id/requests/:request_id/approve` and `POST /groups/:id/requests/:request_id/reject` now take the same token class. It is the class of the other routes that change the roster (member add and remove, role change, ban and unban, invite): the Home fence `home_mutation_requires_durable`.
   - On an ordinary group a session token is accepted on all three routes. The list no longer needs the durable API token there. In v0.48.0 (#1334) it did, but approve and reject accepted a session token.
   - On a Home, or on a group with `OwnerCertified` admission, all three routes need the durable API token. A session token gets the same typed 403 on all three, and no request changes.
