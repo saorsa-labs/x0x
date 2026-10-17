@@ -2086,15 +2086,14 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.88 retains the reviewed git producer's outbound meter,
-    // wire_bytes_for_peer and key-cache accounting semantics (its pubsub
-    // sources are byte-identical to 0.5.87; 0.5.88 changes only membership).
-    // Group-roster eager selection can change attempt counts without
-    // changing the meter.
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.88";
+    // crates.io 0.5.89 retains the reviewed outbound meter, per-peer wire
+    // lengths and key-cache accounting. Compared with 0.5.88, pubsub changes
+    // only payload replay refusal state/handling and its tests. Refused
+    // replays can change attempt counts without changing the meter.
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.89";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097";
+        "f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2118,7 +2117,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
+        "version = '0.5.89'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2150,16 +2149,27 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("older registry fixture");
     assert!(!reviewed_pubsub_producer(&older_registry));
-    // The previously reviewed 0.5.87 registry package is superseded by
-    // 0.5.88 (#1321, D257), although its pubsub sources are identical.
+    // Previously reviewed registry packages stay superseded even when
+    // their outbound accounting matches the current package.
     let prior_registry: toml::Value = toml::from_str(
         "version = '0.5.87'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'd3d61f1e611205b38c896d61c7082d3c18f804a5417e02c28a6dcf3c954f3502'",
     )
     .expect("prior registry fixture");
     assert!(!reviewed_pubsub_producer(&prior_registry));
+    let previous_registry: toml::Value = toml::from_str(
+        "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
+    )
+    .expect("previous registry fixture");
+    assert!(!reviewed_pubsub_producer(&previous_registry));
     let mut wrong_registry = registry.clone();
     wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
     assert!(!reviewed_pubsub_producer(&wrong_registry));
+    let mut wrong_checksum = registry.clone();
+    wrong_checksum["checksum"] = toml::Value::String("0".repeat(64));
+    assert!(!reviewed_pubsub_producer(&wrong_checksum));
+    let mut wrong_version = registry;
+    wrong_version["version"] = toml::Value::String("0.5.88".into());
+    assert!(!reviewed_pubsub_producer(&wrong_version));
     // Exactly one component wrong versus the accepted git source: the
     // revision query parameter.
     let mut wrong_revision = git.clone();
@@ -2185,6 +2195,23 @@ fn controlled_load_producer_allowlist_is_exact() {
         .expect("table fixture")
         .remove("source");
     assert!(!reviewed_pubsub_producer(&missing_source));
+}
+
+#[test]
+fn controlled_load_build_lock_has_reviewed_producer() {
+    let lock: toml::Value =
+        toml::from_str(include_str!("../Cargo.lock")).expect("actual build lock");
+    let pinned: Vec<_> = lock["package"]
+        .as_array()
+        .expect("lock packages")
+        .iter()
+        .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
+        .collect();
+    assert_eq!(pinned.len(), 1, "exactly one pubsub producer in build lock");
+    assert!(
+        reviewed_pubsub_producer(pinned[0]),
+        "review the published meter source before updating the exact producer premise"
+    );
 }
 
 async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde_json::Value {
