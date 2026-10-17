@@ -133,23 +133,52 @@ CDEL()  { curl_body DELETE "$CT" "$CA$1"; }
 
 # Owner approve with the bounded ADR 0028 B8 retry. Approval answers 412 with
 # one of two exact bodies while the requester's signed JoinRequestCreated is
-# still on its way to the approver (tests/named_group_d4_apply.rs has the same
-# allowlist). Retry only those two, for at most 30 s; any other answer returns
-# at once with its body, so a missing obligation still fails the check.
+# still on its way to the approver. The allowlist is the one in
+# tests/named_group_d4_apply.rs (is_allowlisted_transient_412): status 412,
+# "ok": false and an exact "error" string. Retry only those, for at most 30 s.
+# Any other answer returns at once. APPROVE prints
+# {"http_status": N, "body": <body>} so approve_ok can require HTTP 200.
+D4_RETRY_NO_CLOCK="predecessor obligation has no durable first-observation time"
+D4_RETRY_NOT_RECEIVED="predecessor obligation not found — JoinRequestCreated not yet received"
+is_transient_approval_412() {
+  [ "$1" = "412" ] || return 1
+  python3 -c 'import sys,json
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+ok=isinstance(d,dict) and d.get("ok") is False and d.get("error") in (sys.argv[2],sys.argv[3])
+sys.exit(0 if ok else 1)' "$2" "$D4_RETRY_NO_CLOCK" "$D4_RETRY_NOT_RECEIVED"
+}
 APPROVE() {
   local path=$1 deadline=$((SECONDS + 30)) out status body
   while :; do
     out=$(curl -s -m 10 -w '\n%{http_code}' -X POST -H "Authorization: Bearer $AT" \
-      -H "Content-Type: application/json" -d '{}' "$AA$path" 2>/dev/null)
+      -H "Content-Type: application/json" -d '{}' "$AA$path" 2>/dev/null) || true
     status=${out##*$'\n'}; body=${out%$'\n'*}
-    if [ "$status" = "412" ] && [ "$SECONDS" -lt "$deadline" ] \
-      && grep -qE 'JoinRequestCreated not yet received|no durable first-observation time' <<<"$body"; then
+    if [ "$SECONDS" -lt "$deadline" ] && is_transient_approval_412 "$status" "$body"; then
       sleep 0.25
       continue
     fi
-    if [ -z "$body" ]; then echo '{"error":"curl_fail"}'; else echo "$body"; fi
+    python3 -c 'import sys,json
+try:
+    s=int(sys.argv[1])
+except ValueError:
+    s=0
+try:
+    b=json.loads(sys.argv[2])
+except Exception:
+    b=sys.argv[2]
+print(json.dumps({"http_status":s,"body":b}))' "$status" "$body"
     return
   done
+}
+# Success needs HTTP 200 and "ok": true in the body. Anything else fails.
+approve_ok() {
+  python3 -c 'import sys,json
+d=json.loads(sys.argv[1])
+b=d.get("body")
+sys.exit(0 if d.get("http_status")==200 and isinstance(b,dict) and b.get("ok") is True else 1)' "$1" 2>/dev/null
 }
 
 B_STATUS()  { curl_status "${1:-GET}" "$BT" "$BA${2}" "${3:-}"; }
@@ -381,7 +410,7 @@ STATUS=$(B_STATUS POST "/groups/$GID_PRS_REMOTE/requests" '{"message":"dup"}')
 
 # Alice approves.
 R=$(APPROVE /groups/$GID_PRS/requests/$BOB_REQ/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "pub-req: alice approves" || fail "pub-req: approve" "$R"
+approve_ok "$R" && ok "pub-req: alice approves" || fail "pub-req: approve" "$R"
 
 # Bob is an active member on alice's daemon.
 BOB_ACTIVE=no
@@ -516,7 +545,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 R=$(APPROVE /groups/$GID_D2/requests/$BOB_REQ/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2: alice approves bob" || fail "D.2: approve" "$R"
+approve_ok "$R" && ok "D.2: alice approves bob" || fail "D.2: approve" "$R"
 
 # Wait for bob to receive the secure-share envelope. We probe by trying an
 # encrypt on alice's side and attempting decrypt on bob's side up to 30s.
@@ -568,7 +597,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 R=$(APPROVE /groups/$GID_D2/requests/$CREQ_D2/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2: alice approves charlie" || fail "D.2: approve charlie" "$R"
+approve_ok "$R" && ok "D.2: alice approves charlie" || fail "D.2: approve charlie" "$R"
 
 # Wait for charlie to receive his shared-secret envelope and verify round-trip.
 info "D.2: waiting for charlie to receive shared secret..."
@@ -688,7 +717,7 @@ if [ -n "$EP" ]; then
     sleep 1
   done
   R=$(APPROVE /groups/$GID_ADV/requests/$BOB_REQ_ADV/approve)
-  [ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2-adv: alice approves bob" || fail "D.2-adv: approve" "$R"
+  approve_ok "$R" && ok "D.2-adv: alice approves bob" || fail "D.2-adv: approve" "$R"
 
   # ----------------------------------------------------------------------
   # Behavioral denial (non-cryptographic): eve's daemon has no shared secret
@@ -944,7 +973,7 @@ PATCH /groups/$GID_AZ/members/$BID/role '{"role":"admin"}' >/dev/null
 sleep 3
 
 R=$(APPROVE /groups/$GID_AZ/requests/$CREQ_A/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "authz: owner approves (sanity)" || fail "authz: owner approve" "$R"
+approve_ok "$R" && ok "authz: owner approves (sanity)" || fail "authz: owner approve" "$R"
 
 # P0-5: cancel own request path denied for non-requester.
 # Charlie cannot cancel Bob's (already approved) request — test with new pending one.
