@@ -17,6 +17,7 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
 - **saorsa-gossip `=0.5.90`** for all eleven `saorsa-gossip-*` crates (was
   `=0.5.89`). saorsa-gossip 0.5.90 changes only its ant-quic pin to
   `=0.27.61`; the crate sources are unchanged from 0.5.89.
+- **Accepted transient ADR for the ant-quic 0.27.61 receive-side changes (ADR 0087 rule 8).** `docs/adr/transient/T-ant-quic-0-27-61-transport-hardening.md` targets slot A05. David accepted it on 17 Oct 2026. This file is not folded.
 - The #501 controlled-load producer allowlist
   (`scripts/ci/derive-legacy-bus-attempts.py`,
   `src/legacy_bus_interop_tests.rs`) now accepts only the crates.io
