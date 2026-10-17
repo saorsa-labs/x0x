@@ -43,34 +43,46 @@ daemon REST schema, or the upgrade apply path.
 }
 ```
 
-`ok` is false when any check status is `fail`. Warnings alone leave `ok`
-true and the process exits zero. A failed check exits non-zero after the
-JSON is written.
+`evidence` is optional and omitted when absent. `ok` is false when any check
+status is `fail`. Warnings alone leave `ok` true and the process exits zero.
+A failed check exits non-zero after the JSON is written.
+
+When `--name <instance>` has no `api.port`, doctor still prints this object
+with all four checks as `fail` (daemon unreachable). It does not target the
+default daemon. The first `/health` probe uses a two-second timeout so a
+wedged accept path cannot hold the report for the client default of thirty
+seconds.
 
 Current sources (until sibling M1 routes replace them):
 
-| Check | Source | FAIL when |
-|---|---|---|
-| connectivity | `GET /health` | unreachable, or status not healthy/ok/connected/degraded |
-| key health | `GET /agent` | request fails, or `agent_id` / `machine_id` missing |
-| store integrity | `GET /stores` | request fails, or any store has `durability_degraded` |
-| upgrade | `GET /diagnostics/upgrade`, else `GET /upgrade` | request fails, or body `ok: false` |
+| Check | Source | FAIL when | WARN when |
+|---|---|---|---|
+| connectivity | `GET /health` (2 s timeout) | unreachable, or status not healthy/ok/connected/degraded | status `degraded` |
+| key health | `GET /agent` | request fails, or `agent_id` / `machine_id` missing | — |
+| store integrity | `GET /stores` | request fails, or any store has `durability_degraded` | — |
+| upgrade | `GET /diagnostics/upgrade`, else `GET /upgrade` | failed upgrade *attempt* (M2 / diagnostics apply health) | release *lookup* fails (`ok: false`, HTTP error, or timeout on `/upgrade`) |
 
-Degraded connectivity is `warn`, not `fail`. An available update is evidence
-under an `ok` upgrade check. Text mode uses the same checks and the same
-exit rule.
+Degraded connectivity is `warn`, not `fail`. Today's `GET /upgrade` reports
+release lookup only (`update_available`, versions). An available update is
+evidence under an `ok` upgrade check and does not fail doctor. A failed
+lookup (offline host, GitHub unreachable, monitor error) is `warn` so local
+key/store/connectivity health can still exit zero. Text mode uses the same
+checks and the same exit rule. The contacts probe from older doctor text is
+not part of this four-check summary.
 
 ## Consequences
 
 ### Positive
 
 - Agents parse one stable object and trust the exit code.
-- M2 exit tests can assert a failed upgrade attempt through this surface.
+- M2 exit tests can assert a failed upgrade attempt through this surface once
+  `/diagnostics/upgrade` exposes apply/rollback health as `fail`.
 
 ### Negative / Trade-offs
 
 - Doctor makes up to five GETs per run.
-- Until #1381 lands, upgrade evidence comes from `GET /upgrade`.
+- Until #1381 lands, upgrade evidence comes from `GET /upgrade` lookup only.
+  Offline hosts see upgrade `warn`, not `fail`.
 
 ### Neutral / Operational
 
@@ -78,10 +90,11 @@ exit rule.
 
 ## Validation
 
-A unit test serializes the report, parses the JSON, and asserts a non-zero
-exit (`Err`) when key health fails. A second case covers an unreachable
-daemon. `x0x doctor --json` on a healthy mock daemon exits zero with
-`ok: true`.
+Unit tests serialize the report, parse captured JSON stdout as one value, and
+assert a non-zero exit (`Err`) when a check fails and when named-instance
+discovery has no `api.port`. A hanging `/health` acceptor finishes within the
+two-second bound. A failed upgrade lookup is `warn` with exit zero.
+`x0x doctor --json` on a healthy mock daemon exits zero with `ok: true`.
 
 ## Notes for AI-assisted work
 

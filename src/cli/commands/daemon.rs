@@ -2,10 +2,14 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cli::{print_value, DaemonClient, OutputFormat};
+use crate::cli::{DaemonClient, OutputFormat};
+
+/// Bounded timeout for doctor's first `/health` probe (matches `ensure_running`).
+const DOCTOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `x0x start` — spawn x0xd as a background process.
 pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) -> Result<()> {
@@ -199,7 +203,10 @@ pub(crate) async fn collect_doctor_report(client: &DaemonClient) -> DoctorReport
 }
 
 async fn check_connectivity(client: &DaemonClient) -> DoctorCheck {
-    match client.get("/health").await {
+    match client
+        .get_with_timeout("/health", DOCTOR_HEALTH_TIMEOUT)
+        .await
+    {
         Ok(val) => {
             let status = val
                 .get("status")
@@ -274,11 +281,18 @@ async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
 
 async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     // Prefer `/diagnostics/upgrade` when #1381 ships; fall back to GET /upgrade.
+    // Until then `/upgrade` is a release *lookup*, not apply/rollback health:
+    // lookup failure and HTTP errors are `warn`; an available update stays `ok`.
     let (path, val) = match client.get("/diagnostics/upgrade").await {
         Ok(val) => ("/diagnostics/upgrade", val),
         Err(_) => match client.get("/upgrade").await {
             Ok(val) => ("/upgrade", val),
-            Err(e) => return DoctorCheck::fail(format!("/upgrade: {e:#}")),
+            Err(e) => {
+                return DoctorCheck::warn(
+                    format!("/upgrade lookup unavailable: {e:#}"),
+                    Some(serde_json::json!({ "source": "/upgrade", "lookup_error": true })),
+                );
+            }
         },
     };
 
@@ -287,7 +301,14 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("upgrade check failed");
-        return DoctorCheck::fail(format!("{path}: {err}"));
+        return DoctorCheck::warn(
+            format!("{path} lookup failed: {err}"),
+            Some(serde_json::json!({
+                "source": path,
+                "lookup_error": true,
+                "error": err,
+            })),
+        );
     }
 
     let update_available = val
@@ -322,8 +343,8 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     )
 }
 
-fn print_doctor_text(report: &DoctorReport) {
-    println!("Running diagnostics...\n");
+fn write_doctor_text(report: &DoctorReport, out: &mut dyn Write) -> Result<()> {
+    writeln!(out, "Running diagnostics...\n")?;
     for (name, check) in [
         ("Connectivity", &report.connectivity),
         ("Key health", &report.key_health),
@@ -335,30 +356,62 @@ fn print_doctor_text(report: &DoctorReport) {
             DoctorCheckStatus::Warn => "WARN",
             DoctorCheckStatus::Fail => "FAIL",
         };
-        println!("{name}: {label} — {}", check.detail);
+        writeln!(out, "{name}: {label} — {}", check.detail)?;
     }
-    println!();
+    writeln!(out)?;
     if report.ok {
-        println!("Diagnostics complete.");
+        writeln!(out, "Diagnostics complete.")?;
     } else {
-        println!("Diagnostics complete with failures.");
+        writeln!(out, "Diagnostics complete with failures.")?;
     }
+    Ok(())
+}
+
+/// Four-check failure summary when the daemon cannot be addressed at all
+/// (named instance with no `api.port`, or equivalent discovery failure).
+pub(crate) fn unreachable_doctor_report(detail: impl Into<String>) -> DoctorReport {
+    let detail = detail.into();
+    DoctorReport::from_checks(
+        DoctorCheck::fail(detail),
+        DoctorCheck::fail("skipped: daemon unreachable"),
+        DoctorCheck::fail("skipped: daemon unreachable"),
+        DoctorCheck::fail("skipped: daemon unreachable"),
+    )
 }
 
 /// Print the report and return `Err` when any check failed (#1382).
 pub(crate) fn finish_doctor(format: OutputFormat, report: &DoctorReport) -> Result<()> {
+    finish_doctor_write(format, report, &mut std::io::stdout())
+}
+
+/// Write the report to `out` and return `Err` when any check failed.
+///
+/// Tests capture `out` so they assert the exact JSON stdout contract.
+pub(crate) fn finish_doctor_write(
+    format: OutputFormat,
+    report: &DoctorReport,
+    out: &mut dyn Write,
+) -> Result<()> {
     match format {
         OutputFormat::Json => {
             let value = report.to_json_value()?;
-            print_value(OutputFormat::Json, &value);
+            let text = serde_json::to_string_pretty(&value).context("serialize doctor JSON")?;
+            writeln!(out, "{text}")?;
         }
-        OutputFormat::Text => print_doctor_text(report),
+        OutputFormat::Text => write_doctor_text(report, out)?,
     }
     if report.ok {
         Ok(())
     } else {
         anyhow::bail!("doctor detected failures")
     }
+}
+
+/// `x0x doctor` when named-instance discovery fails before any HTTP client
+/// exists. Still emits the JSON/text summary; does not fall back to default.
+pub fn doctor_unreachable(format: OutputFormat, err: &anyhow::Error) -> Result<()> {
+    let report = unreachable_doctor_report(format!("daemon not reachable: {err:#}"));
+    finish_doctor(format, &report)
 }
 
 /// `x0x doctor` — run diagnostics against the daemon.
@@ -1096,11 +1149,30 @@ mod tests {
         assert!(result.is_ok(), "doctor should succeed: {:?}", result);
     }
 
-    /// Done-when for #1382: parse the JSON summary and require a non-zero
-    /// exit (Err) when a check fails.
+    /// Parse exactly one JSON value from captured doctor stdout and assert
+    /// the exit Result matches `report.ok`.
+    fn assert_doctor_json_stdout(report: &DoctorReport, expect_ok: bool) -> serde_json::Value {
+        let mut stdout = Vec::new();
+        let result = finish_doctor_write(crate::cli::OutputFormat::Json, report, &mut stdout);
+        let text = String::from_utf8(stdout).expect("doctor stdout utf-8");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim())
+            .expect("doctor stdout must be exactly one JSON value");
+        assert_eq!(parsed["ok"], expect_ok, "summary ok mismatch: {parsed}");
+        if expect_ok {
+            assert!(result.is_ok(), "doctor must exit zero when ok: {result:?}");
+        } else {
+            assert!(
+                result.is_err(),
+                "doctor must exit non-zero when a check fails: {result:?}"
+            );
+        }
+        parsed
+    }
+
+    /// Done-when for #1382: captured JSON stdout + non-zero exit on FAIL.
+    /// Path-aware: /agent lacks identity so key_health fails by design.
     #[tokio::test]
     async fn doctor_json_nonzero_exit_on_failed_check() {
-        // Daemon answers, but /agent has no identity — key_health must FAIL.
         let mock_resp = serde_json::json!({
             "ok": true,
             "peers": 2,
@@ -1113,11 +1185,8 @@ mod tests {
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
 
         let report = collect_doctor_report(&client).await;
-        let json_text = serde_json::to_string(&report).expect("serialize doctor report");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_text).expect("doctor JSON must parse");
+        let parsed = assert_doctor_json_stdout(&report, false);
 
-        assert_eq!(parsed["ok"], false, "summary ok must be false on FAIL");
         assert_eq!(
             parsed["key_health"]["status"], "fail",
             "key_health must FAIL when agent_id/machine_id are missing: {parsed}"
@@ -1125,12 +1194,6 @@ mod tests {
         assert_eq!(parsed["connectivity"]["status"], "ok");
         assert_eq!(parsed["store_integrity"]["status"], "ok");
         assert_eq!(parsed["upgrade"]["status"], "ok");
-
-        let result = finish_doctor(crate::cli::OutputFormat::Json, &report);
-        assert!(
-            result.is_err(),
-            "doctor must exit non-zero when a check fails: {result:?}"
-        );
     }
 
     #[tokio::test]
@@ -1149,10 +1212,123 @@ mod tests {
         )
         .unwrap();
         let report = collect_doctor_report(&client).await;
-        let parsed = report.to_json_value().expect("serialize");
+        let parsed = assert_doctor_json_stdout(&report, false);
+        assert_eq!(parsed["connectivity"]["status"], "fail");
+    }
+
+    /// Named instance with no api.port: emit four-check JSON and exit non-zero.
+    #[test]
+    fn doctor_json_named_instance_missing_port_emits_report() {
+        let err = match DaemonClient::new(
+            Some("absent-instance-doctor-1382-xyz"),
+            None,
+            crate::cli::OutputFormat::Json,
+        ) {
+            Ok(_) => panic!("named instance without api.port must fail discovery"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absent-instance-doctor-1382-xyz"),
+            "discovery error should name the instance: {msg}"
+        );
+
+        let mut stdout = Vec::new();
+        let result = {
+            let report = unreachable_doctor_report(format!("daemon not reachable: {err:#}"));
+            finish_doctor_write(crate::cli::OutputFormat::Json, &report, &mut stdout)
+        };
+        let text = String::from_utf8(stdout).expect("utf-8");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("exactly one JSON value on stdout");
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["connectivity"]["status"], "fail");
-        assert!(finish_doctor(crate::cli::OutputFormat::Json, &report).is_err());
+        assert_eq!(parsed["key_health"]["status"], "fail");
+        assert_eq!(parsed["store_integrity"]["status"], "fail");
+        assert_eq!(parsed["upgrade"]["status"], "fail");
+        assert!(result.is_err(), "must exit non-zero: {result:?}");
+    }
+
+    /// First health probe must use the short (2 s) timeout, not the 30 s client default.
+    #[tokio::test]
+    async fn doctor_connectivity_uses_short_health_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Accept and hold without answering HTTP — wedged daemon shape.
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(socket);
+            }
+        });
+
+        let client = DaemonClient::new(
+            None,
+            Some(&format!("http://{addr}")),
+            crate::cli::OutputFormat::Json,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let report = collect_doctor_report(&client).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(report.connectivity.status, DoctorCheckStatus::Fail);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "health probe must not wait the 30s client timeout; took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "health probe should wait for the short timeout; took {elapsed:?}"
+        );
+        let parsed = assert_doctor_json_stdout(&report, false);
+        assert_eq!(parsed["connectivity"]["status"], "fail");
+    }
+
+    /// Failed upgrade *lookup* is warn (exit zero); update_available stays ok.
+    #[tokio::test]
+    async fn doctor_upgrade_lookup_failure_is_warn() {
+        let mock_resp = serde_json::json!({
+            "ok": false,
+            "error": "upgrade check unavailable",
+            "agent_id": "abc123",
+            "machine_id": "def456",
+            "peers": 1,
+            "status": "healthy",
+            "stores": []
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let report = collect_doctor_report(&client).await;
+        let parsed = assert_doctor_json_stdout(&report, true);
+        assert_eq!(parsed["upgrade"]["status"], "warn");
+        assert_eq!(parsed["connectivity"]["status"], "ok");
+        assert_eq!(parsed["key_health"]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn doctor_warn_only_exits_zero() {
+        let mock_resp = serde_json::json!({
+            "ok": true,
+            "agent_id": "abc123",
+            "machine_id": "def456",
+            "peers": 0,
+            "status": "degraded",
+            "degraded_reason": "no peers",
+            "stores": [],
+            "update_available": false,
+            "current_version": "0.1.0"
+        });
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let report = collect_doctor_report(&client).await;
+        let parsed = assert_doctor_json_stdout(&report, true);
+        assert_eq!(parsed["connectivity"]["status"], "warn");
     }
 
     #[tokio::test]

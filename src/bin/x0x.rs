@@ -2121,6 +2121,19 @@ async fn run(
             return commands::upgrade::run(*check, *force).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
+        Commands::Doctor => {
+            // Doctor must still emit its summary when a named instance has no
+            // api.port. Do not fall through to DaemonClient::new(?) — that
+            // leaves --json with empty stdout. Keep the named-instance
+            // boundary: never silently target the default daemon.
+            return match DaemonClient::new(name, api, format) {
+                Ok(client) => commands::daemon::doctor(&client.dump_requests(dump_request)).await,
+                Err(err) if name.is_some() && api.is_none() => {
+                    commands::daemon::doctor_unreachable(format, &err)
+                }
+                Err(err) => Err(err),
+            };
+        }
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
@@ -3148,7 +3161,9 @@ async fn run(
             Some(WsSub::Direct { backfill }) => commands::ws::direct(&client, backfill).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
-        Commands::Doctor => commands::daemon::doctor(&client).await,
+        Commands::Doctor => {
+            anyhow::bail!("command dispatched earlier — dispatch table out of sync")
+        }
         Commands::SendFile { agent_id, path } => {
             commands::files::send_file(&client, &agent_id, &path).await
         }

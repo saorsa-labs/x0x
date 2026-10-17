@@ -181,6 +181,29 @@ impl DaemonClient {
         self.handle_response(resp).await
     }
 
+    /// Send a GET with a per-request timeout (overrides the client default).
+    ///
+    /// Used by `doctor`'s first `/health` probe so a wedged daemon cannot
+    /// hold the report for the full 30 s client timeout.
+    pub async fn get_with_timeout(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        if self.dump {
+            return self.emit_dump("GET", path, None);
+        }
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
+            .timeout(timeout)
+            .send()
+            .await
+            .context("request failed — is x0xd running?")?;
+        self.handle_response(resp).await
+    }
+
     /// Send a GET request with query parameters.
     pub async fn get_query(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value> {
         if self.dump {
