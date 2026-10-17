@@ -29356,6 +29356,14 @@ pub(in crate::server) async fn approve_join_request(
         let groups = state.named_groups.read().await;
         match groups.get(&id) {
             Some(info) => {
+                // Authorize before the B8 precondition, as the TreeKEM path
+                // does. Otherwise a non-admin gets 412 (which tells it
+                // whether a predecessor obligation exists) instead of 403,
+                // after it has taken the persistence locks below. The gate
+                // runs again under the write lock before the mutation.
+                if let Err(resp) = group_access::admin_route_gate(info, &caller_hex) {
+                    return resp;
+                }
                 let request = info.join_requests.get(&request_id);
                 (
                     request.map(|req| req.requester_agent_id.clone()),

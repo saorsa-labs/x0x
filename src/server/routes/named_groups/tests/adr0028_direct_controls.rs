@@ -2138,6 +2138,50 @@ async fn b8_omission_rows_refuse_without_valid_predecessor() {
     }
 }
 
+/// A non-admin approver is refused with 403 before the B8 precondition runs.
+/// With no predecessor obligation, the old order answered 412, which told a
+/// plain member whether an obligation existed for the request.
+#[tokio::test]
+async fn b8_non_admin_approver_gets_403_before_precondition() {
+    let (state, _dir) = d_state().await;
+    let group_key = make_hex_id(0x0d01);
+    let requester_hex = hex::encode(fresh_kp().agent_id().as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let admin_kp = fresh_kp();
+    let admin_hex = hex::encode(admin_kp.agent_id().as_bytes());
+
+    let mut info = GroupInfo::with_policy(
+        "adr0028-non-admin".to_string(),
+        String::new(),
+        admin_kp.agent_id(),
+        group_key.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    info.add_member(
+        local_hex,
+        x0x::groups::GroupRole::Member,
+        Some(admin_hex),
+        None,
+    );
+    let request = x0x::groups::JoinRequest::new(group_key.clone(), requester_hex, None, unix_ms());
+    let request_id = request.request_id.clone();
+    info.join_requests.insert(request_id.clone(), request);
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_key.clone(), info);
+
+    let status = approve_status(&state, &group_key, &request_id).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a Member must get 403 from approve, not the B8 412"
+    );
+}
+
 // ===========================================================================
 // Helper: deterministic 64-char hex group id from a seed.
 // ===========================================================================
