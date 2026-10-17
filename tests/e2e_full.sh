@@ -258,13 +258,32 @@ R=$(A /groups); check_contains "list groups" "$R" "E2E Test Group"
     INVITE=$(echo "$R"|python3 -c "import sys,json;print(json.load(sys.stdin).get('invite_link',''))" 2>/dev/null||echo "")
     [ -n "$INVITE" ] && {
         R=$(Bp /groups/join "{\"invite\":\"$INVITE\"}"); check_not_error "bob joins via invite" "$R"
+        BNG=$(echo "$R"|python3 -c "import sys,json;print(json.load(sys.stdin).get('group_id',''))" 2>/dev/null||echo "")
     }
 
     # Display name — field is "name" not "display_name"
     R=$(Apu "/groups/$NG/display-name" '{"name":"Alice the Admin"}'); check_ok "set display name" "$R"
 
-    # Leave group
-    R=$(Ad "/groups/$NG"); check_not_error "leave group" "$R"
+    # Leave group. Alice is the only admin, so while bob is a member her leave
+    # is refused with 409 (ADR-0016 §3; a sole member's leave deletes the
+    # group). Bob leaves first; then alice's leave succeeds once her roster
+    # has applied bob's departure.
+    if [ -n "${BNG:-}" ]; then
+        for _ in $(seq 1 30); do
+            A "/groups/$NG/members" | grep -q "$BID" && break
+            sleep 1
+        done
+        R=$(Ad "/groups/$NG"); check_contains "sole admin cannot leave while bob is a member" "$R" "at least one admin"
+        R=$(request_json "DELETE" "$BT" "$BA/groups/$BNG"); check_not_error "bob leaves group" "$R"
+        for _ in $(seq 1 30); do
+            R=$(Ad "/groups/$NG")
+            echo "$R" | grep -q "at least one admin" || break
+            sleep 1
+        done
+    else
+        R=$(Ad "/groups/$NG")
+    fi
+    check_not_error "leave group" "$R"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

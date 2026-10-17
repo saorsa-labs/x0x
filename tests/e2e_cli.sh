@@ -369,6 +369,7 @@ print(json.dumps(d))
 
         # Bob joins via invite
         R=$(bob group join "$INVITE_LINK" --display-name "Bob"); check_not_error "bob joins via invite" "$R"
+        BOB_NG_ID=$(jq_field "$R" "group_id")
     else
         skip "invite link validation" "no invite_link returned"
         skip "bob joins via invite" "no invite_link returned"
@@ -424,8 +425,26 @@ print(d.get('agent_id',''))
     # Set display name
     R=$(alice group set-name "$NG_ID" "Alice the Admin"); check_not_error "set display name" "$R"
 
-    # Leave group
-    R=$(alice group leave "$NG_ID"); check_not_error "alice leaves group" "$R"
+    # Leave group. Alice is the only admin, so while bob is a member her leave
+    # is refused (ADR-0016 §3; a sole member's leave deletes the group). Bob
+    # leaves first; then alice's leave succeeds once her roster has applied
+    # bob's departure. The CLI wrapper hides the 409 body as cli_failed.
+    if [ -n "${BOB_NG_ID:-}" ]; then
+        for _ in $(seq 1 30); do
+            alice group members "$NG_ID" | grep -q "$BOB_AID" && break
+            sleep 1
+        done
+        R=$(alice group leave "$NG_ID"); check "sole admin cannot leave while bob is a member" "$(echo "$R" | grep -q cli_failed && echo true || echo false)"
+        R=$(bob group leave "$BOB_NG_ID"); check_not_error "bob leaves group" "$R"
+        for _ in $(seq 1 30); do
+            R=$(alice group leave "$NG_ID")
+            echo "$R" | grep -q cli_failed || break
+            sleep 1
+        done
+    else
+        R=$(alice group leave "$NG_ID")
+    fi
+    check_not_error "alice leaves group" "$R"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
