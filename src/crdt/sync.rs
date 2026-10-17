@@ -2484,7 +2484,10 @@ mod tests {
     /// `local_peer_id = peer(1)` and list id `list_id(1)`.
     async fn make_sync(topic: &str) -> TaskListSync {
         let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(
+            PubSubManager::new(node, crate::gossip::pubsub::test_support::signing_context())
+                .expect("pubsub"),
+        );
         let list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         TaskListSync::new(list, pubsub, topic.to_string(), peer(1)).expect("task list sync")
     }
@@ -2506,7 +2509,7 @@ mod tests {
         let signer = kp.agent_id();
         let signing = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
         (
-            Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub")),
+            Arc::new(PubSubManager::new(node, signing).expect("pubsub")),
             signer,
         )
     }
@@ -2879,7 +2882,7 @@ mod tests {
     /// `kp`'s agent as the gossip-verified sender.
     async fn pubsub_signed_by(kp: &crate::identity::AgentKeypair) -> Arc<PubSubManager> {
         let signing = Arc::new(crate::gossip::SigningContext::from_keypair(kp));
-        Arc::new(PubSubManager::new(make_node().await, Some(signing)).expect("pubsub"))
+        Arc::new(PubSubManager::new(make_node().await, signing).expect("pubsub"))
     }
 
     /// Lead requirement 3 (WHY): the exact bytes handed to the gossip publish

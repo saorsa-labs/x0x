@@ -1957,8 +1957,7 @@ mod tests {
             let signing = Arc::new(x0x::gossip::SigningContext::from_keypair(
                 state.agent.identity().agent_keypair(),
             ));
-            let pubsub =
-                Arc::new(x0x::gossip::PubSubManager::new(node, Some(signing)).expect("pubsub"));
+            let pubsub = Arc::new(x0x::gossip::PubSubManager::new(node, signing).expect("pubsub"));
             let peer = saorsa_gossip_types::PeerId::new([1; 32]);
             let list = x0x::crdt::TaskList::new(
                 x0x::crdt::TaskListId::new([9; 32]),

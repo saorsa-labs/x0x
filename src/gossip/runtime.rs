@@ -921,6 +921,7 @@ impl GossipRuntime {
     ///
     /// * `config` - The gossip configuration
     /// * `network` - The network node (implements GossipTransport)
+    /// * `signing` - Required author signing context for pub/sub messages
     ///
     /// # Returns
     ///
@@ -929,10 +930,20 @@ impl GossipRuntime {
     /// # Errors
     ///
     /// Returns an error if configuration validation fails.
+    ///
+    /// An absent signer is rejected before any runtime can start:
+    ///
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use x0x::{gossip::{GossipConfig, GossipRuntime}, network::NetworkNode};
+    /// # async fn without_signer(network: Arc<NetworkNode>) {
+    /// let _ = GossipRuntime::new(GossipConfig::default(), network, None).await;
+    /// # }
+    /// ```
     pub async fn new(
         mut config: GossipConfig,
         network: Arc<NetworkNode>,
-        signing: Option<Arc<SigningContext>>,
+        signing: Arc<SigningContext>,
     ) -> NetworkResult<Self> {
         if let Some(warning) = config.normalize_egress_budget() {
             tracing::warn!("{warning}");
@@ -1303,9 +1314,13 @@ mod tests {
         let network = NetworkNode::new(test_network_config(), None, None)
             .await
             .expect("Failed to create network");
-        let runtime = GossipRuntime::new(config, Arc::new(network), None)
-            .await
-            .expect("Failed to create runtime");
+        let runtime = GossipRuntime::new(
+            config,
+            Arc::new(network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("Failed to create runtime");
 
         assert_eq!(
             runtime.config().leaf_max_eager_degree,
@@ -1319,9 +1334,13 @@ mod tests {
         let network = NetworkNode::new(test_network_config(), None, None)
             .await
             .expect("Failed to create network");
-        let runtime = GossipRuntime::new(config, Arc::new(network), None)
-            .await
-            .expect("Failed to create runtime");
+        let runtime = GossipRuntime::new(
+            config,
+            Arc::new(network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("Failed to create runtime");
 
         assert!(runtime.start().await.is_ok());
         assert!(runtime.shutdown().await.is_ok());
@@ -1334,9 +1353,13 @@ mod tests {
             .await
             .expect("Failed to create network");
         let network_arc = Arc::new(network);
-        let runtime = GossipRuntime::new(config.clone(), network_arc.clone(), None)
-            .await
-            .expect("Failed to create runtime");
+        let runtime = GossipRuntime::new(
+            config.clone(),
+            network_arc.clone(),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("Failed to create runtime");
 
         assert_eq!(
             runtime.config().leaf_max_eager_degree,
@@ -1354,9 +1377,13 @@ mod tests {
         let network_arc = Arc::new(network);
         let expected_peer_id =
             saorsa_gossip_transport::GossipTransport::local_peer_id(network_arc.as_ref());
-        let runtime = GossipRuntime::new(config, network_arc, None)
-            .await
-            .expect("Failed to create runtime");
+        let runtime = GossipRuntime::new(
+            config,
+            network_arc,
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("Failed to create runtime");
 
         assert_eq!(runtime.peer_id(), expected_peer_id);
     }
@@ -1370,7 +1397,12 @@ mod tests {
         let network = NetworkNode::new(test_network_config(), None, None)
             .await
             .expect("Failed to create network");
-        let result = GossipRuntime::new(config, Arc::new(network), None).await;
+        let result = GossipRuntime::new(
+            config,
+            Arc::new(network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -1433,9 +1465,13 @@ mod tests {
         let network = NetworkNode::new(test_network_config(), None, None)
             .await
             .expect("Failed to create network");
-        let runtime = GossipRuntime::new(config, Arc::new(network), None)
-            .await
-            .expect("Failed to create runtime");
+        let runtime = GossipRuntime::new(
+            config,
+            Arc::new(network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("Failed to create runtime");
 
         assert_eq!(runtime.dispatch_stats().pubsub_workers, 2);
         assert_eq!(

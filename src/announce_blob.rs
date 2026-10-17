@@ -1824,7 +1824,7 @@ mod tests {
             );
             let kp = crate::identity::AgentKeypair::generate().expect("keypair");
             let signing = Arc::new(SigningContext::from_keypair(&kp));
-            Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub"))
+            Arc::new(PubSubManager::new(node, signing).expect("pubsub"))
         }
 
         /// Wait until `cache` holds `digest` (the fetch task fills it
