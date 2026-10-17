@@ -298,10 +298,14 @@ x0x --name <instance> identity rebuild-revocation-store --carrier v3 --from /pat
 
 Use `--carrier v1` for `revocations.bin` and `--carrier v2` for `revocations-v2.bin`. The command checks that the file decodes. It then writes that carrier. A readable live file is united with the file you pass, so a revocation already on disk stays. When the quarantine file can be read, the command unites those revocations too. Unreadable quarantine bytes do not block the command. The quarantine file stays. A zero-byte file is rejected.
 
-A node whose true revocation set is empty can reopen only with `x0x identity rebuild-revocation-store --empty --confirm-empty`. That path is deliberate. Pass `--carrier v1`, `--carrier v2`, or `--carrier v3` for the closed file. Stop x0xd first. A remote empty snapshot does not reopen the node.
+A node whose true revocation set is empty can reopen in two ways. Both are deliberate. Stop x0xd first. Pass `--carrier v1`, `--carrier v2`, or `--carrier v3` for the closed file. A remote empty snapshot does not reopen the node.
 
 ```bash
 x0x identity rebuild-revocation-store --carrier v3 --empty --confirm-empty
 ```
 
-`--confirm-empty` is required. A zero-byte file, a deleted quarantine file, or `--empty` without `--confirm-empty` is not recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.
+```bash
+x0x identity rebuild-revocation-store --carrier v3 --from /path/to/empty-revocations-v3.bin --confirm-empty
+```
+
+The `--from` file must be a valid empty store for that carrier. `--confirm-empty` is required for both commands. A zero-byte file, a deleted quarantine file, or an empty store without `--confirm-empty` is not recovery. Then start x0xd and read `GET /status`. `revocation_resync_required` is false when every closed carrier has a readable live file or a verified resync. An empty store does not restore subjects that were in the bad file.
