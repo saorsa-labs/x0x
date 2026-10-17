@@ -536,6 +536,52 @@ impl Drop for FailParentDirFsyncGuard {
     }
 }
 
+/// Fail a durable write before its rename. Arm a file path, or a directory
+/// to fail every durable publish under it. The temp file is removed and the
+/// destination stays unchanged.
+#[cfg(test)]
+static FAIL_DURABLE_BEFORE_RENAME_FOR_TESTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct FailDurableBeforeRenameGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_fail_durable_before_rename_for_testing(
+    path: &Path,
+) -> FailDurableBeforeRenameGuard {
+    FAIL_DURABLE_BEFORE_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+    FailDurableBeforeRenameGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+fn fails_durable_before_rename_for_testing(path: &Path) -> bool {
+    FAIL_DURABLE_BEFORE_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|armed| armed == path || path.starts_with(armed))
+}
+
+#[cfg(test)]
+impl Drop for FailDurableBeforeRenameGuard {
+    fn drop(&mut self) {
+        let mut armed = FAIL_DURABLE_BEFORE_RENAME_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|candidate| *candidate == self.path) {
+            armed.swap_remove(idx);
+        }
+    }
+}
+
 /// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
 /// temp file (0600) → `sync_all` the file → atomic rename into place →
 /// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
@@ -1058,6 +1104,14 @@ async fn write_private_bytes_durable_guarded(
         fs::set_permissions(&tmp_path, perms)
             .await
             .map_err(DurableWriteError::BeforeRename)?;
+    }
+
+    #[cfg(test)]
+    if fails_durable_before_rename_for_testing(path) {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(DurableWriteError::BeforeRename(std::io::Error::other(
+            "injected durable failure before rename (test seam)",
+        )));
     }
 
     if let Err(err) = fs::rename(&tmp_path, path).await {
@@ -1817,61 +1871,70 @@ impl Drop for FailRevocationArchiveGuard {
     }
 }
 
-/// Publish `bytes` at `dest` with a sibling temp file and rename.
+/// Move the live file onto its quarantine name.
 ///
-/// This is the temp-file half of the private-file writer, without the
-/// revocation-store guard. A crash during the write leaves `dest` unchanged.
-async fn publish_bytes_via_temp(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = dest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = dest.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid path: missing file name",
-        )
-    })?;
-    let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        unique
-    ));
-    if let Err(err) = fs::write(&tmp_path, bytes).await {
-        let _ = fs::remove_file(&tmp_path).await;
-        return Err(err);
+/// A test can force this rename to fail so the copy fallback runs while the
+/// live file is still present.
+async fn rename_onto_quarantine(path: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if fails_quarantine_rename_for_testing(path) {
+        return Err(std::io::Error::other("injected quarantine rename failure"));
     }
-    #[cfg(unix)]
-    {
-        let mut perms = match fs::metadata(&tmp_path).await {
-            Ok(metadata) => metadata.permissions(),
-            Err(err) => {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(err);
-            }
-        };
-        perms.set_mode(0o600);
-        if let Err(err) = fs::set_permissions(&tmp_path, perms).await {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(err);
+    fs::rename(path, dest).await
+}
+
+#[cfg(test)]
+static FAIL_QUARANTINE_RENAME_FOR_TESTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct FailQuarantineRenameGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+fn arm_fail_quarantine_rename_for_testing(path: &Path) -> FailQuarantineRenameGuard {
+    FAIL_QUARANTINE_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+    FailQuarantineRenameGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+fn fails_quarantine_rename_for_testing(path: &Path) -> bool {
+    FAIL_QUARANTINE_RENAME_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|armed| armed == path)
+}
+
+#[cfg(test)]
+impl Drop for FailQuarantineRenameGuard {
+    fn drop(&mut self) {
+        let mut armed = FAIL_QUARANTINE_RENAME_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = armed.iter().position(|candidate| *candidate == self.path) {
+            armed.swap_remove(idx);
         }
     }
-    if let Err(err) = fs::rename(&tmp_path, dest).await {
-        let _ = fs::remove_file(&tmp_path).await;
-        return Err(err);
-    }
-    Ok(())
 }
 
 /// Move corrupt revocation bytes to `<name>.quarantined-<unix-ms>`.
 ///
 /// Returns whether the live path no longer holds the payload. An existing
 /// quarantine file with the same bytes is kept and the live path is removed.
-/// When that rename fails, the bytes are published with the same temp file
-/// and rename as other private writes, then the live path is removed. A
-/// crash during the copy leaves the quarantine name unchanged. Startup
+/// When that rename fails, the bytes are published with the durable private
+/// write before the live path is removed. That write fsyncs the file and
+/// the parent directory. It does not take the revocation-store guard, so
+/// this archive does not call itself. The public durable writer and
+/// `write_private_file` do take that guard and would recurse. A failure
+/// before the publish leaves the quarantine name unchanged and the live
+/// file in place. Startup
 /// (`persist_attempt == false`) logs the operator message. A failed archive
 /// logs that the bytes are still on the live path.
 async fn archive_corrupt_revocation_bytes(
@@ -1941,14 +2004,16 @@ async fn archive_corrupt_revocation_bytes(
             seq = seq.saturating_add(1);
             dest = parent.join(format!("{prefix}{millis}-{seq}"));
         }
-        if let Err(rename_error) = tokio::fs::rename(path, &dest).await {
-            // A direct write can leave a short quarantine file after a crash.
-            // Publish the full bytes with a temp file and rename, then remove
-            // the live path.
-            if publish_bytes_via_temp(&dest, bytes).await.is_err() {
+        if let Err(rename_error) = rename_onto_quarantine(path, &dest).await {
+            // Publish the full bytes, and fsync them, before the live file
+            // is removed. A failure before that publish leaves `dest` absent.
+            if let Err(error) =
+                write_private_bytes_durable_guarded(&dest, bytes.to_vec(), None).await
+            {
                 tracing::error!(
                     path = %path.display(),
-                    error = %rename_error,
+                    rename_error = %rename_error,
+                    error = %error,
                     "{}",
                     crate::revocation::REVOCATION_ARCHIVE_FAILED
                 );
@@ -2187,6 +2252,46 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "quarantine copy is private");
+        }
+    }
+
+    /// An interrupted copy must not publish the quarantine name and must not
+    /// remove the live file. The failure is injected before the durable
+    /// rename, after the bytes have been written to the temp file.
+    #[tokio::test]
+    async fn fallback_quarantine_copy_keeps_live_file_when_publish_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let bytes = b"corrupt-bytes-must-stay-on-the-live-path";
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("seed live file");
+        let _rename = arm_fail_quarantine_rename_for_testing(&path);
+        let _publish = arm_fail_durable_before_rename_for_testing(dir.path());
+        let archived = archive_corrupt_revocation_bytes(&path, bytes, true).await;
+        assert!(
+            !archived,
+            "a copy that fails before publish must not count as archived"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("live file remains"),
+            bytes,
+            "the live file stays until the quarantine copy is durable"
+        );
+        assert!(
+            quarantine_files(dir.path(), REVOCATION_FILE)
+                .await
+                .is_empty(),
+            "the quarantine name is not published"
+        );
+        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read dir");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp"),
+                "no temp debris: {}",
+                name.to_string_lossy()
+            );
         }
     }
 
