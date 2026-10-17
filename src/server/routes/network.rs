@@ -644,6 +644,9 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "inner_envelope_verify": x0x::gossip::inner_verify_stats(),
+                // #1170 / Track E M1: per-MessageKind verify, bus, delivered,
+                // published counters with a rolling window and health verdict.
+                "per_kind": x0x::gossip::per_kind_gossip_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
                 "discovery_cache_entries": {
                     "agents": agents,
@@ -876,6 +879,14 @@ mod participation_diagnostics_tests {
                     "pubsub_stages.verify.{field}"
                 );
             }
+            // #1170 Track E M1: per-kind efficiency counters + health verdict.
+            assert!(body["per_kind"]["since_ts"].is_u64());
+            assert!(body["per_kind"]["window_secs"].is_u64());
+            assert!(body["per_kind"]["kinds"].is_object());
+            assert!(body["per_kind"]["health"]["cpu_share_threshold"].is_f64());
+            assert!(body["per_kind"]["health"]["bus_share_threshold"].is_f64());
+            assert!(body["per_kind"]["health"]["cpu_pressure_kinds"].is_array());
+            assert!(body["per_kind"]["health"]["bus_pressure_kinds"].is_array());
             for lane in ["pubsub", "membership", "bulk"] {
                 assert_eq!(
                     body["dispatcher"][lane]["over_100ms_count"].as_u64(),

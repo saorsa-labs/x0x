@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-kind gossip efficiency counters on `GET /diagnostics/gossip` (#1170).**
+  `per_kind` reports rolling-window `verify_ok` / `verify_err` (count and
+  `total_ns`), `bus_dispatched` / `bus_dropped`, `delivered`, and `published`
+  per PlumTree message kind, with `since_ts` and an M1 health verdict that
+  flags kinds over a 40% share of verify CPU or bus pressure.
+
 ## [v0.48.1] - 2026-10-17
 
 A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and
