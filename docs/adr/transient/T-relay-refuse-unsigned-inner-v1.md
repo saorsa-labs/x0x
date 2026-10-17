@@ -41,7 +41,8 @@ Do not remove this marker and permit repeated forwarding attempts.
 
 Expose `relay_fanout.unsigned_inner_v1_dropped` on `GET /diagnostics/gossip`.
 This process-local counter counts validator refusals after outer admission.
-Duplicate cache hits and frames rejected earlier do not increment it. It resets
+Message-ID and payload replay cache hits do not increment it. Frames rejected
+earlier do not increment it. It resets
 on restart. It adds a reason to the existing total validator-drop counter.
 
 ## Alternatives and consequences

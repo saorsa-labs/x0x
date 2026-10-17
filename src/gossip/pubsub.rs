@@ -9964,10 +9964,11 @@ mod tests {
                     signed_outer_frame_with_id(&outer_key, topic_id, unsigned, true, rewrapped_id),
                 )
                 .await;
-            assert_eq!(manager.stage_stats().validator.dropped, 2);
+            // Payload replays preserve refusal without rerunning the validator.
+            assert_eq!(manager.stage_stats().validator.dropped, 1);
             assert_eq!(
                 manager.relay_fanout_diagnostics()["unsigned_inner_v1_dropped"],
-                2
+                1
             );
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(kind_meter(&manager, "eager"), (0, 0));
@@ -10064,7 +10065,7 @@ mod tests {
             }
             assert_eq!(
                 manager.relay_fanout_diagnostics()["unsigned_inner_v1_dropped"],
-                2
+                1
             );
         }
     }
