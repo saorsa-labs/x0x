@@ -814,7 +814,7 @@ async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
                     "[cluster] FATAL: {} has zero peers after 30s — mesh is disconnected. \
                      Integration tests require a connected cluster. \
                      Check that x0xd bootstrap and mDNS are working. \
-                     #1283 transport evidence: [{snapshots}] \
+                     #1283 diagnostics evidence: [{snapshots}] \
                      Classification: {}. \
                      Daemon logs: {}/daemon.stdout.log and daemon.stderr.log \
                      (kept by the failure-only fixture diagnostics collector).",
@@ -846,11 +846,13 @@ struct MeshFailureEvidence {
     /// gossip-plane admission. `None` when the request failed or the field
     /// was absent — unknown, never folded into zero.
     registered_peers: Option<u64>,
-    /// Diagnostics `connections.active` — live transport connections
-    /// (ant-quic `EndpointStats::active_connections`, a live count kept
-    /// equal to direct+relayed across connect/disconnect churn). This is
-    /// the count that separates "no transport connection" from "connected
-    /// but not registered". `None` — unknown, like the other counts.
+    /// Diagnostics `connections.active` — ant-quic
+    /// `EndpointStats::active_connections`. Printed raw and NEVER used to
+    /// classify: in the pinned ant-quic the counter increments only after
+    /// the peer is registered, while `connected_peers` filters out
+    /// unroutable records, so a stale record can read `active=1,
+    /// registered=0`. Neither count separates "transport formed" from
+    /// "registration incomplete" (#1283 review). `None` — unknown.
     active_connections: Option<u64>,
 }
 
@@ -914,9 +916,10 @@ impl MeshFailureEvidence {
 /// that just failed to form (#1283). The failure-only fixture collector
 /// retains daemon logs, but fixtures run at `log_level = "warn"`, so the live
 /// snapshot is the evidence that classifies the failure: `local_addr` proves
-/// where the QUIC listener actually bound, `connections.active` counts live
-/// transport connections, and `connections.connected_peers` sizes the same
-/// registered-peer set `/peers` reads. Daemons that do not answer keep `None`
+/// where the QUIC listener actually bound, and `connections.connected_peers`
+/// sizes the same registered-peer set `/peers` reads. `connections.active` is
+/// recorded raw for the log but cannot classify anything (see
+/// [`MeshFailureEvidence::active_connections`]). Daemons that do not answer keep `None`
 /// counts — unknown, not zero.
 async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvidence> {
     let client = reqwest::Client::builder()
@@ -945,12 +948,14 @@ async fn mesh_failure_evidence(nodes: &[&AgentInstance]) -> Vec<MeshFailureEvide
 }
 
 /// Classify a mesh that never formed (#1283), claiming only what the
-/// collected evidence supports. `/peers` and `connections.connected_peers`
-/// read the same ant-quic registered-peer set, so registry counts cannot
-/// establish transport handshake or gossip-plane completion; the live
-/// `connections.active` count is what separates "never connected" from
-/// "connected but not registered". Daemons that did not answer are carried as
-/// unknown — a missing response must not be read as a zero count.
+/// collected evidence supports: the listener port and the registered-peer
+/// counts. `/peers` and `connections.connected_peers` read the same ant-quic
+/// registered-peer set, so these counts say who registers whom and nothing
+/// about transport handshakes or gossip-plane admission. `connections.active`
+/// is not consulted: in the pinned ant-quic it cannot separate a live
+/// transport from a stale record, so transport state stays UNKNOWN in every
+/// classification. Daemons that did not answer are carried as unknown — a
+/// missing response must not be read as a zero count.
 fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> String {
     /// Join names, or `none` when the list is empty.
     fn listed(names: &[&str]) -> String {
@@ -992,52 +997,31 @@ fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> Str
         .filter(|e| e.name != failing && e.registered_peers.is_some_and(|n| n > 0))
         .map(|e| e.name.as_str())
         .collect();
-    let peers_live: Vec<&str> = evidence
-        .iter()
-        .filter(|e| e.name != failing && e.active_connections.is_some_and(|n| n > 0))
-        .map(|e| e.name.as_str())
-        .collect();
     let registered = |n: u64| format!("registers {n} peer{}", if n == 1 { "" } else { "s" });
-    match (failing_ev.registered_peers, failing_ev.active_connections) {
+    match failing_ev.registered_peers {
         // The failing daemon is gone or wedged; its counts are unknown and
         // must not be read as zero connections.
-        (None, _) => format!(
+        None => format!(
             "the failing daemon did not answer the diagnostics API — dead or wedged \
              when the mesh was declared disconnected; peers that register peers: \
              {}.{note}",
             listed(&peers_registered),
         ),
-        (Some(0), Some(a)) if a > 0 => format!(
-            "the failing daemon holds {a} live transport connection{} but registers no \
-             peer — the transport formed and peer registration did not; peers: {}.{note}",
-            if a == 1 { "" } else { "s" },
-            listed(&peers_registered),
+        Some(0) if peers_registered.is_empty() => format!(
+            "no daemon registers a peer — peer registration never happened anywhere in \
+             the mesh; transport state is unknown (the ant-quic counters cannot show \
+             it).{note}"
         ),
-        (Some(0), Some(0)) => {
-            if peers_registered.is_empty() && peers_live.is_empty() {
-                format!(
-                    "no daemon reports a live transport connection or a registered peer \
-                     — the mesh never formed.{note}"
-                )
-            } else {
-                format!(
-                    "the failing daemon has no live transport connection and no registered \
-                     peer, while {} register peers and {} hold live connections — the \
-                     disconnect is one-sided.{note}",
-                    listed(&peers_registered),
-                    listed(&peers_live),
-                )
-            }
-        }
-        (Some(0), None) => format!(
-            "the failing daemon registers no peer and its live transport count is \
-             unknown; peers that register peers: {}.{note}",
+        Some(0) => format!(
+            "the failing daemon registers no peer while {} register peers — \
+             registration is one-sided; transport state is unknown (the ant-quic \
+             counters cannot show it).{note}",
             listed(&peers_registered),
         ),
         // Any remaining case has the failing daemon registering peers: /peers
         // reads that same registry, so its poll raced a mesh that completed
         // after the last read.
-        (Some(n), _) => format!(
+        Some(n) => format!(
             "the failing daemon {} — /peers reads that same registry, so its 30s poll \
              raced a mesh that completed after the last read.{note}",
             registered(n),
@@ -1318,7 +1302,8 @@ mod mesh_failure_evidence_tests {
         // The `/diagnostics/connectivity` shape the panic path parses
         // (#1283): `local_addr` plus the `connections` table, where
         // `connected_peers` sizes the registered-peer set `/peers` reads
-        // and `active` counts live transport connections.
+        // and `active` is ant-quic's raw `active_connections` counter
+        // (printed, never classified).
         json!({
             "ok": true,
             "local_addr": "[::]:40211",
@@ -1394,12 +1379,16 @@ mod mesh_failure_evidence_tests {
     }
 
     #[test]
-    fn dark_pair_classifies_as_never_formed() {
+    fn dark_pair_classifies_as_no_registration_with_transport_unknown() {
         let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(0));
         let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(0), Some(0));
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
         assert!(
-            classification.contains("never formed"),
+            classification.contains("registration never happened"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("transport state is unknown"),
             "got {classification}"
         );
         assert!(!classification.contains("raced"), "got {classification}");
@@ -1461,26 +1450,40 @@ mod mesh_failure_evidence_tests {
     }
 
     #[test]
-    fn live_transport_without_registration_is_distinguished() {
-        // Registry counts alone cannot show this; `active` can: the
-        // transport formed and registration did not.
-        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), Some(1));
+    fn active_count_never_drives_the_classification() {
+        // #1283 review: in the pinned ant-quic `active` increments after
+        // registration and `connected_peers` filters unroutable records, so a
+        // stale record reads `active=1, registered=0`. The classifier must
+        // give the same answer whatever `active` says, and must never claim
+        // a live transport or an incomplete registration from it.
         let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
-        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
-        assert!(
-            classification.contains("transport formed and peer registration did not"),
-            "got {classification}"
-        );
-    }
-
-    #[test]
-    fn unknown_transport_count_on_the_failing_daemon_is_preserved() {
-        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), None);
-        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
-        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
-        assert!(
-            classification.contains("live transport count is unknown"),
-            "got {classification}"
-        );
+        let mut answers = Vec::new();
+        for active in [None, Some(0), Some(1), Some(3)] {
+            let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(0), active);
+            let classification = classify_mesh_failure(
+                "pair-alice-7",
+                &[
+                    alice,
+                    evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1)),
+                ],
+            );
+            assert!(classification.contains("one-sided"), "got {classification}");
+            assert!(
+                classification.contains("transport state is unknown"),
+                "got {classification}"
+            );
+            assert!(
+                !classification.contains("transport formed"),
+                "got {classification}"
+            );
+            assert!(
+                !classification.contains("live transport connection"),
+                "got {classification}"
+            );
+            answers.push(classification);
+        }
+        assert!(answers.windows(2).all(|w| w[0] == w[1]), "got {answers:?}");
+        // The raw counter still reaches the log line.
+        assert!(bob.summary().contains("active=1"), "got {}", bob.summary());
     }
 }

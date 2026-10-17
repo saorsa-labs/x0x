@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Tests and tooling
+
+- **The `delegation_spaces` binary joined the `quic-localhost` nextest group
+  (#1283).** The groups job's issue #321 acceptance selector runs three
+  daemon-mesh tests from that binary in one nextest invocation; nextest runs
+  each test as its own process, so the in-process suite lock cannot serialise
+  them, and all three pairs formed at once in the one loopback-only network
+  namespace the isolated runtime grants the invocation. Run 37898362740 lost
+  two of the three meshes (`pair-alice` at zero peers after 30 s); a new
+  structural test, `scripts/ci/test_nextest_mesh_serialization.py`, checks
+  that every test in the binary is effectively in that group. The
+  ambient-load attribution stays unverified (#702).
+- **A mesh that never forms now says which kind it was (#1283).** When the
+  harness's zero-peers check fails, the panic carries a live
+  `/diagnostics/connectivity` snapshot of every daemon in the mesh: the
+  address the QUIC listener actually bound against the reserved port, the
+  registered-peer count (the same set `/peers` reads), and ant-quic's raw
+  `active` connection counter. The classification uses only the listener
+  port and the registered-peer counts — no peer registered anywhere, a
+  one-sided registration, a poll that raced a mesh completing late, or a
+  listener off its reserved port — and reports transport state as unknown.
+  The `active` counter is printed but never classified: in the pinned
+  ant-quic it increments after registration, and `connected_peers` filters
+  out unroutable records, so a stale record can read `active=1,
+  registered=0`. Fixtures log at `warn`, where dial and join activity is
+  not recorded. A daemon that does not answer keeps unknown counts; it is
+  never reported as zero connections.
+
 ## [v0.48.1] - 2026-10-17
 
 A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and
@@ -447,29 +475,6 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
   on `POST /groups/:id/quarantine/clear`, and the durable API token. The
   clear does not roll the sealed TreeKEM epoch back.
   `T-self-leave-fork-quarantine-clear` (Proposed, slot A14).
-
-### Tests and tooling
-
-- **The `delegation_spaces` binary joined the `quic-localhost` nextest group
-  (#1283).** The groups job's issue #321 acceptance selector runs three
-  daemon-mesh tests from that binary in one nextest invocation; nextest runs
-  each test as its own process, so the in-process suite lock cannot serialise
-  them, and all three pairs formed at once in the one loopback-only network
-  namespace the isolated runtime grants the invocation. Run 37898362740 lost
-  two of the three meshes (`pair-alice` at zero peers after 30 s); a new
-  structural test, `scripts/ci/test_nextest_mesh_serialization.py`, keeps the
-  override in place. The ambient-load attribution stays unverified (#702).
-- **A mesh that never forms now says which kind it was (#1283).** When the
-  harness's zero-peers check fails, the panic carries a live
-  `/diagnostics/connectivity` snapshot of every daemon in the mesh: the
-  address the QUIC listener actually bound against the reserved port, the
-  registered-peer count (the same set `/peers` reads), and the live
-  transport-connection count. That classifies the failure — no transport
-  connection at all, transport up but registration incomplete, a one-sided
-  disconnect, a poll that raced a mesh completing late, or a listener off
-  its reserved port — even though fixtures log at `warn`, where dial and
-  join activity is not recorded. A daemon that does not answer keeps
-  unknown counts; it is never reported as zero connections.
 
 ## [v0.48.0] - 2026-10-13
 
