@@ -1,9 +1,10 @@
 # T-relay-refuse-unsigned-inner-v1: Refuse unsigned messages at relay ingress
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Target slot:** A06
 - **Date:** 2026-10-17
 - **Decision owners:** David Irvine
+- **Acceptance:** David Irvine, relayed in Engineer's 2026-10-17 08:56 BST mailbox ruling
 - **Reviewers:** pending
 - **Supersedes:** none
 - **Related:** issues #1114, #1225 and #1226; charter I3 and I12
@@ -17,11 +18,11 @@ unsigned inner V1 message from reaching a local subscriber. A relay can still
 forward that message or advertise its identifier for later retrieval. This
 spends relay capacity on traffic that the destination must refuse.
 
-This proposal extends that refusal to relay ingress. It does not add a wire
+This decision extends that refusal to relay ingress. It does not add a wire
 version, change a signed message, or change an acknowledged delivery obligation.
 The separate #1225 change removes unsigned publication from the SDK.
 
-## Proposed decision
+## Decision
 
 The composite topic validator must return `Drop` when the inner payload decodes
 as unsigned V1. Apply this check before content validators and relay fan-out
@@ -65,7 +66,7 @@ same rejected bytes under a fresh ID must not restore service (saorsa-gossip
 #116). Signed
 V2 and V3 controls must still pass on subscribed and relay-only topics.
 
-David must decide this Proposed record before the relay policy and diagnostic
-API are treated as accepted. The upstream replay fix must reach the pinned
-dependency before this implementation is complete. Keep the consolidated pack at 15. Do not fold this
-record or change an Accepted ADR in this work.
+David accepted the relay policy and diagnostic API in this record. The upstream
+replay fix must reach the pinned dependency before this implementation is
+complete. Keep the consolidated pack at 15. Do not fold this record or change
+an Accepted ADR in this work.
