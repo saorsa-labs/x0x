@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A non-admin member who approves a join request on a GSS group gets 403
+  (#1439).** The admin check now runs before the ADR 0028 B8 predecessor
+  check, as on the TreeKEM path. Before, a member got 412, which showed
+  whether a predecessor obligation existed, and took the persistence locks
+  first.
+
 - **An installed SignedPublic group catches up one revision from a local admin who is not a Known contact (D272, #1105).** For a group this node already has installed, an active admin in the local roster who signed the single retained head counts as consent for that catch-up only. New installs keep the current gate: a Known contact, or a current `GroupInvite` grant on the authenticated machine. Blocked still wins, including before that catch-up branch. The sender is still refused when revoked. The one-revision apply checks are unchanged. The invite-only restart arm obtains N+1.
 
 - **The panic scanner reports a production panic after a closed test item
