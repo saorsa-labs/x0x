@@ -1,6 +1,6 @@
 # T-doctor-json-summary: `x0x doctor --json` health summary
 
-- **Status:** Proposed
+- **Status:** Accepted by David Irvine, 2026-10-17
 - **Target slot:** A14
 - **Date:** 2026-10-16
 - **Decision owners:** David Irvine
