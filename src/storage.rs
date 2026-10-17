@@ -412,7 +412,7 @@ pub(crate) struct FailParentDirFsyncGuard {
 /// Arm the parent-directory fsync failure seam for writes to `path`
 /// (issue #1101): until the returned guard is dropped, durable writes
 /// to exactly this path fail AFTER the atomic rename; writes to every
-/// other path are unaffected.
+/// other path are unaffected. A directory path arms every file under it.
 #[cfg(test)]
 pub(crate) fn arm_fail_parent_dir_fsync_for_testing(path: &Path) -> FailParentDirFsyncGuard {
     FAIL_PARENT_DIR_FSYNC_FOR_TESTING
@@ -431,7 +431,7 @@ fn fails_parent_dir_fsync_for_testing(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .any(|armed| armed == path)
+        .any(|armed| armed == path || path.starts_with(armed))
 }
 
 /// With the parent-directory fsync seam, replace the renamed bytes so the
@@ -1120,6 +1120,27 @@ async fn write_private_bytes_durable_guarded(
     }
 
     // Everything below runs with the NEW bytes already visible on disk.
+    sync_published_file(path).await
+}
+
+/// Fsync a file that is already visible, then fsync its parent directory.
+///
+/// The quarantine retry uses this before it removes the live file. A power
+/// loss after the rename, and before this returns, can still drop the name.
+/// [`DurableWriteError::AfterRename`] means the bytes are visible and the
+/// caller must not treat the name as durable.
+async fn sync_published_file(path: &Path) -> std::result::Result<(), DurableWriteError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file = fs::File::open(path)
+        .await
+        .map_err(DurableWriteError::AfterRename)?;
+    file.sync_all()
+        .await
+        .map_err(DurableWriteError::AfterRename)?;
+    drop(file);
 
     // Test seam (issue #1101): fail the parent-directory fsync here for
     // the armed path only, so PostRename callers can be exercised
@@ -1139,9 +1160,9 @@ async fn write_private_bytes_durable_guarded(
     let dir = fs::File::open(parent)
         .await
         .map_err(DurableWriteError::AfterRename)?;
-    if let Err(err) = dir.sync_all().await {
-        return Err(DurableWriteError::AfterRename(err));
-    }
+    dir.sync_all()
+        .await
+        .map_err(DurableWriteError::AfterRename)?;
     Ok(())
 }
 
@@ -1934,7 +1955,9 @@ impl Drop for FailQuarantineRenameGuard {
 /// this archive does not call itself. The public durable writer and
 /// `write_private_file` do take that guard and would recurse. A failure
 /// before the publish leaves the quarantine name unchanged and the live
-/// file in place. Startup
+/// file in place. A later attempt that finds the same bytes syncs that
+/// file and its directory again before it removes the live file. If that
+/// sync fails, the live file and the failure flag stay. Startup
 /// (`persist_attempt == false`) logs the operator message. A failed archive
 /// logs that the bytes are still on the live path.
 async fn archive_corrupt_revocation_bytes(
@@ -1980,6 +2003,20 @@ async fn archive_corrupt_revocation_bytes(
         }
     }
     let quarantine = if let Some(dest) = existing {
+        // The previous attempt may have published these bytes and then
+        // failed the directory sync. Prove the name is durable again
+        // before removing the live file.
+        if let Err(error) = sync_published_file(&dest).await {
+            tracing::error!(
+                path = %path.display(),
+                quarantine = %dest.display(),
+                error = %error,
+                "{}",
+                crate::revocation::REVOCATION_ARCHIVE_FAILED
+            );
+            note_archive_failed(path).await;
+            return false;
+        }
         if let Err(error) = tokio::fs::remove_file(path).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::error!(
@@ -2293,6 +2330,78 @@ mod tests {
                 name.to_string_lossy()
             );
         }
+    }
+
+    /// A directory sync that fails after the quarantine rename must keep the
+    /// live file. The next attempt, with that fault still armed, must sync
+    /// again and still keep the live file. After the fault clears, the retry
+    /// removes the live file.
+    #[tokio::test]
+    async fn fallback_quarantine_retry_resyncs_before_removing_the_live_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let bytes = b"corrupt-bytes-need-a-durable-directory-entry";
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("seed live file");
+        let _rename = arm_fail_quarantine_rename_for_testing(&path);
+        let sync_fault = arm_fail_parent_dir_fsync_for_testing(dir.path());
+
+        let first = archive_corrupt_revocation_bytes(&path, bytes, true).await;
+        assert!(!first, "a failed directory sync must not count as archived");
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("live file after first attempt"),
+            bytes,
+            "the first attempt keeps the live file"
+        );
+        let quarantine = quarantine_files(dir.path(), REVOCATION_FILE).await;
+        assert_eq!(quarantine.len(), 1, "the copy is visible");
+        assert_eq!(
+            std::fs::read(&quarantine[0]).expect("quarantine bytes"),
+            bytes
+        );
+        assert!(
+            archive_failed(&path).await,
+            "the first failure stays recorded"
+        );
+
+        let second = archive_corrupt_revocation_bytes(&path, bytes, true).await;
+        assert!(
+            !second,
+            "a retry with the directory sync still failing must not succeed"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("live file after retry"),
+            bytes,
+            "the retry must not remove the live file"
+        );
+        assert_eq!(
+            quarantine_files(dir.path(), REVOCATION_FILE).await.len(),
+            1,
+            "the retry does not add another quarantine file"
+        );
+        assert!(
+            archive_failed(&path).await,
+            "the failure flag stays set while the sync fault is active"
+        );
+
+        drop(sync_fault);
+        let third = archive_corrupt_revocation_bytes(&path, bytes, true).await;
+        assert!(third, "a retry after the fault clears archives");
+        assert!(
+            tokio::fs::read(&path).await.is_err(),
+            "the successful retry removes the live file"
+        );
+        assert_eq!(
+            std::fs::read(&quarantine[0]).expect("quarantine bytes remain"),
+            bytes
+        );
+        assert!(
+            !archive_failed(&path).await,
+            "the failure flag clears only after the durable retry"
+        );
     }
 
     /// #1116: the operator command validates, rejects an unconfirmed empty
