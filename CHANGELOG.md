@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.48.1] - 2026-10-17
+
+A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and
+collects the 38 pull requests merged since v0.48.0. Rust API note: the
+pub/sub constructors now take `Arc<SigningContext>` instead of
+`Option<Arc<SigningContext>>` (#1225, #1433; see Changed below).
+
+### Dependencies
+
+- **ant-quic `=0.27.61`** (was `=0.27.60`).
+- **saorsa-gossip `=0.5.90`** for all eleven `saorsa-gossip-*` crates (was
+  `=0.5.89`). saorsa-gossip 0.5.90 changes only its ant-quic pin to
+  `=0.27.61`; the crate sources are unchanged from 0.5.89.
+- **Accepted transient ADR for the ant-quic 0.27.61 receive-side changes (ADR 0087 rule 8).** `docs/adr/transient/T-ant-quic-0-27-61-transport-hardening.md` targets slot A05. David accepted it on 17 Oct 2026. This file is not folded.
+- The #501 controlled-load producer allowlist
+  (`scripts/ci/derive-legacy-bus-attempts.py`,
+  `src/legacy_bus_interop_tests.rs`) now accepts only the crates.io
+  saorsa-gossip-pubsub 0.5.90 package (checksum `ae450e28…`). Its pubsub
+  sources are byte-identical to 0.5.89; 0.5.89 is now refused as superseded.
+
+### Pull requests merged since v0.48.0
+
+- #1436 fix(pubsub): refuse unsigned inner V1 at relay validation
+- #1433 fix(pubsub): require an author signing context (#1225)
+- #1434 fix(revocation): fsync the quarantine copy before unlink
+- #1444 fix(deps): enable only the zip deflate feature
+- #1442 fix(groups): check the approver's role before the B8 precondition (#1439)
+- #1441 fix(x0xd): give runtime threads an 8 MiB stack (#1438)
+- #1437 fix(deps): bump zip to 9.0.4
+- #1432 fix(revocation): publish the quarantine fallback via a temp file
+- #1336 fix(revocation): quarantine a corrupt store and keep x0xd running
+- #1430 test(network): accept a one-ended winner repair
+- #1406 Seal a startup self-leave only after catch-up
+- #1425 fix(network): detect and re-dial a one-sided peer link
+- #1337 fix(named-groups): rekey TreeKEM after a member self-leaves
+- #1429 fix(daemon): register SIGTERM before the server accepts HTTP
+- #1416 fix(gui): display successful empty decrypt results (#1414)
+- #1421 fix(auth): restrict secure envelope opening to durable owner (#1228)
+- #1402 Consent installed catch-up from a local admin
+- #1400 fix(gui): send the JSON fields the routes read (#1399)
+- #1424 docs(adr): add proposed open-envelope actor record
+- #1311 fix(pubsub): carry validated MessageHeader.msg_id on live frames (#869)
+- #1413 fix(w3h): stop guessing per-request delivery transport (#1245)
+- #1418 fix(gui): recover after rejected owner tokens (#1417)
+- #1426 fix(groups): retain refusal diagnostics during warn cooldown
+- #1304 fix: close panic-scanner test regions at the item
+- #1428 docs(identity): correct supported revoke forms (#1108)
+- #1415 fix(groups): one token class for join-request list, approve and reject (#1347)
+- #1423 fix(server): apply named-group metadata per group, off the shared direct listener (#1238)
+- #1338 fix(groups): retire ended join attempts so remove + re-invite works without restart (#1191)
+- #1422 ci: raise the Signing path 100k job limit to 45 minutes
+- #1401 Accept installed catch-up admin consent (D272)
+- #1333 fix(groups): refuse unsigned GroupCards on discovery (#1224)
+- #1345 fix(groups): hide revoked and blocked authors on stored delivery (#1229)
+- #1411 docs: correct vision marks after the #1405 review
+- #1412 fix(groups): replace a cached group card only by its own authority
+- #1409 fix(network): count the plane legacy grace per connection generation (#1403)
+- #1344 fix(pubsub): read revocation stores at delivery (#1230)
+- #1408 fix: update Cargo.lock rustls to 0.23.46
+- #1405 docs: record the 13 Oct 2026 product vision
+
 ### Changed
 
 - **Pub/sub requires a signing context (#1225; v0.47 train API follow-up).**
