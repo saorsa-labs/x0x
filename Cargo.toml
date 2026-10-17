@@ -70,7 +70,7 @@ subtle = "2.6"
 flate2 = "1.0"
 fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"] }
 tar = "0.4"
-zip = "2.0"
+zip = "9.0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Issue #600: stdout log writes must not run synchronously on tokio workers.

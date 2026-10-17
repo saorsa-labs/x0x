@@ -717,6 +717,9 @@ fn extract_from_tar_gz(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Stage mode is always 0o755. The archive Unix mode is not
+            // applied, so setuid, setgid, and sticky bits in the entry
+            // cannot land on the staged binary.
             std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755)).map_err(
                 |e| UpgradeError::ExtractionError(format!("failed to set permissions: {e}")),
             )?;
@@ -754,10 +757,18 @@ fn extract_from_zip(
         if !entry.is_file() {
             continue;
         }
-        let file_name = Path::new(entry.name())
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        // zip 9 decodes the entry name on demand and returns a `Result`.
+        // Drop the borrowed name before the entry is read: `copy` needs
+        // `&mut entry`.
+        let file_name = {
+            let entry_name = entry
+                .name()
+                .map_err(|e| UpgradeError::ExtractionError(format!("bad zip entry name: {e}")))?;
+            Path::new(entry_name.as_ref())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
 
         if file_name != binary_name {
             continue;
@@ -782,6 +793,9 @@ fn extract_from_zip(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Stage mode is always 0o755. The archive Unix mode is not
+            // applied, so setuid, setgid, and sticky bits in the entry
+            // cannot land on the staged binary.
             std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755)).map_err(
                 |e| UpgradeError::ExtractionError(format!("failed to set permissions: {e}")),
             )?;
@@ -1245,6 +1259,150 @@ mod tests {
         let output = dir.path().join("extracted");
 
         extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    fn assert_staged_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(path).expect("staged path exists");
+        assert!(
+            meta.file_type().is_file(),
+            "staged output must be a regular file"
+        );
+        let mode = meta.permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "extraction sets mode 0o755");
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "extraction must not keep setuid, setgid, or sticky"
+        );
+    }
+
+    #[test]
+    fn test_extract_skips_zip_symlink_named_as_binary() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"real daemon");
+        // A symlink whose basename matches, next to the real regular file.
+        // The entry-type filter must skip it and extract the regular file.
+        // The symlink target must not be created on disk.
+        let archive_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let escaped = dir.path().join("escaped-target");
+        zip.add_symlink("x0xd", escaped.to_string_lossy(), options)
+            .unwrap();
+        zip.start_file("x0x-linux-x64-gnu/x0xd", options).unwrap();
+        zip.write_all(&content).unwrap();
+        zip.finish().unwrap();
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+        assert!(std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert!(!escaped.exists(), "symlink target must not be created");
+        #[cfg(unix)]
+        assert_staged_executable(&output);
+    }
+
+    #[test]
+    fn test_extract_refuses_zip_with_only_symlink() {
+        let dir = TempDir::new().unwrap();
+        let archive_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // Absolute target outside the archive. Extraction must refuse the
+        // entry and must not create a symlink at the output path.
+        zip.add_symlink("x0xd", "/tmp/x0x-zip-symlink-outside", options)
+            .unwrap();
+        zip.finish().unwrap();
+        let output = dir.path().join("extracted");
+
+        let result = extract_binary_from_archive(&archive_path, &output, "x0xd");
+        assert!(matches!(
+            &result,
+            Err(UpgradeError::ExtractionError(msg))
+                if msg == "binary 'x0xd' not found in zip archive"
+        ));
+        assert!(
+            std::fs::symlink_metadata(&output).is_err(),
+            "a skipped symlink must not be staged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_zip_forces_executable_mode() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"mode");
+        let archive_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        // Regular file, mode 0o644, plus setuid, setgid, and sticky in the
+        // high half of external_attributes. `unix_permissions` masks those
+        // bits away, so the raw attributes are set directly.
+        let crafted = 0o100644 | 0o7000;
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .system(zip::System::Unix)
+            .external_attributes(crafted << 16);
+        zip.start_file("x0xd", options).unwrap();
+        zip.write_all(&content).unwrap();
+        zip.finish().unwrap();
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+        assert_staged_executable(&output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_tar_gz_forces_executable_mode() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"mode");
+        let (mut builder, archive_path) = new_tar_gz(dir.path());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(content.len() as u64);
+        // setgid plus a non-executable mode. Extraction must stage 0o755.
+        header.set_mode(0o2644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "x0xd", content.as_slice())
+            .unwrap();
+        finish_tar_gz(builder);
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), content);
+        assert_staged_executable(&output);
+    }
+
+    #[test]
+    fn test_extract_from_deflated_zip() {
+        let dir = TempDir::new().unwrap();
+        let content = fake_binary(b"deflated daemon");
+        // Windows release zips are deflated (`Compress-Archive`). The default
+        // method is deflate when that feature is enabled.
+        let archive_path = dir.path().join("test.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("x0xd.exe", options).unwrap();
+        zip.write_all(&content).unwrap();
+        zip.finish().unwrap();
+        let output = dir.path().join("extracted");
+
+        extract_binary_from_archive(&archive_path, &output, "x0xd.exe").unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), content);
     }
 
