@@ -1019,13 +1019,28 @@ fn classify_mesh_failure(failing: &str, evidence: &[MeshFailureEvidence]) -> Str
             listed(&peers_registered),
         ),
         // Any remaining case has the failing daemon registering peers: /peers
-        // reads that same registry, so its poll raced a mesh that completed
-        // after the last read.
-        Some(n) => format!(
-            "the failing daemon {} — /peers reads that same registry, so its 30s poll \
-             raced a mesh that completed after the last read.{note}",
-            registered(n),
-        ),
+        // reads that same registry, so its own poll raced its own late
+        // registration. That is evidence about this daemon only — another
+        // daemon may still register nothing or not answer (#1283 review), so
+        // the classification never claims the mesh completed.
+        Some(n) => {
+            let disconnected: Vec<&str> = evidence
+                .iter()
+                .filter(|e| e.name != failing && e.registered_peers == Some(0))
+                .map(|e| e.name.as_str())
+                .collect();
+            let others = if disconnected.is_empty() {
+                String::new()
+            } else {
+                format!(" Still registering no peer: {}.", listed(&disconnected))
+            };
+            format!(
+                "the failing daemon now {} — /peers reads that same registry, so its 30s \
+                 poll raced its own registration after the last read. This shows only \
+                 that daemon's recovery, not a complete mesh.{others}{note}",
+                registered(n),
+            )
+        }
     }
 }
 
@@ -1438,11 +1453,20 @@ mod mesh_failure_evidence_tests {
     #[test]
     fn failing_daemon_now_registering_peers_is_a_poll_race() {
         // Same registry on both reads: the poll saw empty for 30s, the
-        // snapshot sees peers — the mesh completed after the last read.
+        // snapshot sees peers — the failing daemon registered after the last
+        // read. Nothing more is claimed about the mesh.
         let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(1), Some(1));
         let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
         let classification = classify_mesh_failure("pair-alice-7", &[alice, bob]);
         assert!(classification.contains("raced"), "got {classification}");
+        assert!(
+            !classification.contains("Still registering no peer"),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("mesh completed"),
+            "got {classification}"
+        );
         assert!(
             classification.contains("same registry"),
             "got {classification}"
@@ -1485,5 +1509,62 @@ mod mesh_failure_evidence_tests {
         assert!(answers.windows(2).all(|w| w[0] == w[1]), "got {answers:?}");
         // The raw counter still reaches the log line.
         assert!(bob.summary().contains("active=1"), "got {}", bob.summary());
+    }
+
+    #[test]
+    fn recovered_failing_daemon_with_a_disconnected_peer_is_not_a_complete_mesh() {
+        // #1283 review (3a0cd6b): counts [1, 1, 0]. The failing daemon now
+        // registers a peer, but carol registers none — the mesh is still
+        // partial. Report only the failing daemon's recovery, and name carol.
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(1), Some(1));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let carol = evidence("pair-carol-7", 6222, Some("[::]:6222"), Some(0), Some(0));
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
+        assert!(
+            classification.contains("only that daemon's recovery"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("Still registering no peer: pair-carol-7."),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("mesh completed"),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("mesh that completed"),
+            "got {classification}"
+        );
+    }
+
+    #[test]
+    fn recovered_failing_daemon_with_an_unanswered_peer_is_not_a_complete_mesh() {
+        // #1283 review (3a0cd6b): counts [1, 1, unknown]. carol did not
+        // answer, so the mesh is unverified — never "completed".
+        let alice = evidence("pair-alice-7", 40211, Some("[::]:40211"), Some(1), Some(1));
+        let bob = evidence("pair-bob-7", 5111, Some("[::]:5111"), Some(1), Some(1));
+        let carol = MeshFailureEvidence::unreachable("pair-carol-7", 6222);
+        let classification = classify_mesh_failure("pair-alice-7", &[alice, bob, carol]);
+        assert!(
+            classification.contains("only that daemon's recovery"),
+            "got {classification}"
+        );
+        assert!(
+            classification.contains("counts unknown): pair-carol-7."),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("Still registering no peer"),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("mesh completed"),
+            "got {classification}"
+        );
+        assert!(
+            !classification.contains("mesh that completed"),
+            "got {classification}"
+        );
     }
 }

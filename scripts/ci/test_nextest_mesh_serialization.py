@@ -13,9 +13,11 @@ be silently dropped.
 The guard validates the EFFECTIVE assignment of every TEST, not the file
 text and not the binary as a whole:
 
-* It parses only active (uncommented) keys of `[[profile.default.overrides]]`
-  blocks. The acceptance step runs the default profile (no `--profile`), so
-  no other profile's overrides are consulted.
+* It reads `profile.default.overrides` with a real TOML parser (tomllib), so
+  comments are ignored and every valid spelling of a header or key counts,
+  exactly as for nextest; invalid TOML fails closed. The acceptance step runs
+  the default profile (no `--profile`), so no other profile's overrides are
+  consulted.
 * It enumerates the test functions in `tests/delegation_spaces.rs` and
   evaluates each override filter against each test's real identity (package,
   binary, binary id, kind and test name). `test(...)` predicates are
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import tomllib
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,7 +67,6 @@ ACCEPTANCE_CASES = (
 )
 
 OVERRIDES_HEADER = "[[profile.default.overrides]]"
-GROUP_TABLE = "[test-groups.quic-localhost]"
 
 
 class ConfigError(Exception):
@@ -75,8 +77,6 @@ class ConfigError(Exception):
 class Override:
     filter: str
     test_group: str | None
-    filter_line: int
-    group_line: int | None
 
 
 @dataclass(frozen=True)
@@ -93,67 +93,50 @@ class CaseId:
         return f"{self.package}::{self.binary}"
 
 
-def _toml_string(raw: str) -> str:
-    raw = raw.strip()
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
-        return raw[1:-1]
-    raise ConfigError(f"expected a quoted TOML string, got {raw!r}")
+def load_config(text: str) -> dict:
+    """Parse the config with a real TOML parser, as nextest does.
+
+    Line matching misread valid TOML: a header with a trailing comment
+    (`[[profile.default.overrides]] # note`), extra spaces inside the
+    brackets, or a dotted-key or inline-array form all define overrides that
+    nextest applies, but a line matcher skips them (#1283 review). tomllib
+    reads every form, ignores comments exactly as nextest does, and rejects
+    the invalid TOML nextest would reject.
+    """
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise ConfigError(f"invalid TOML: {err}") from err
 
 
 def parse_overrides(text: str) -> list[Override]:
-    """Parse `[[profile.default.overrides]]` blocks from ACTIVE lines only.
+    """The `profile.default.overrides` array, in file order.
 
-    A commented-out key or header is not configuration — nextest never sees
-    it, so the guard must not either. Every block must carry an active
-    `filter` (nextest rejects an override without one); a `platform` key
-    makes the match host-dependent, which this guard does not model. Both
-    fail closed via ConfigError.
+    The acceptance step runs the default profile (no `--profile`), so no
+    other profile's overrides are consulted. Every override must carry a
+    `filter` string; a `platform` key makes the match host-dependent, which
+    this guard does not model. Both fail closed via ConfigError.
     """
-    lines = text.splitlines()
+    profile = load_config(text).get("profile", {}).get("default", {})
+    raw = profile.get("overrides", [])
+    if not isinstance(raw, list):
+        raise ConfigError("profile.default.overrides is not an array of tables")
     overrides: list[Override] = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() != OVERRIDES_HEADER:
-            i += 1
-            continue
-        i += 1
-        values: dict[str, tuple[str, int]] = {}
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if stripped.startswith("["):
-                break
-            if stripped and not stripped.startswith("#") and "=" in stripped:
-                key, _, raw = stripped.partition("=")
-                key = key.strip()
-                if key == "platform":
-                    raise ConfigError(
-                        f"override at line {i + 1} sets `platform`; the guard "
-                        "cannot evaluate host-dependent overrides"
-                    )
-                if key in ("filter", "test-group"):
-                    if key in values:
-                        # TOML rejects duplicate keys in one table; nextest
-                        # would never accept this file, so neither does the
-                        # guard. This also catches a commented-out block
-                        # header leaking its keys into the previous block.
-                        raise ConfigError(
-                            f"duplicate active key {key!r} in override block "
-                            f"around line {i + 1}"
-                        )
-                    values[key] = (_toml_string(raw), i)
-            i += 1
-        if "filter" not in values:
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"override #{index} is not a table")
+        if "platform" in entry:
             raise ConfigError(
-                f"override block ending at line {i} has no active filter key"
+                f"override #{index} sets `platform`; the guard cannot evaluate "
+                "host-dependent overrides"
             )
-        overrides.append(
-            Override(
-                filter=values["filter"][0],
-                test_group=values["test-group"][0] if "test-group" in values else None,
-                filter_line=values["filter"][1],
-                group_line=values["test-group"][1] if "test-group" in values else None,
-            )
-        )
+        filter_ = entry.get("filter")
+        if not isinstance(filter_, str):
+            raise ConfigError(f"override #{index} has no filter string")
+        group = entry.get("test-group")
+        if group is not None and not isinstance(group, str):
+            raise ConfigError(f"override #{index} has a non-string test-group")
+        overrides.append(Override(filter=filter_, test_group=group))
     return overrides
 
 
@@ -422,24 +405,49 @@ def assert_serialized_in_quic_localhost(
             )
 
 
-def active_key_in_section(text: str, section: str, key: str) -> str | None:
-    """Value of an active `key = ...` line inside `section`, else None."""
-    in_section = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_section = stripped == section
-            continue
-        if not in_section or stripped.startswith("#") or "=" not in stripped:
-            continue
-        k, _, raw = stripped.partition("=")
-        if k.strip() == key:
-            return raw.strip()
-    return None
+def group_max_threads(text: str, group: str) -> object:
+    """`max-threads` of `[test-groups.<group>]` as nextest reads it, else None."""
+    return load_config(text).get("test-groups", {}).get(group, {}).get("max-threads")
 
 
 def _config_text() -> str:
     return CONFIG.read_text(encoding="utf-8")
+
+
+def _line_parses_to(line: str, expected: dict) -> bool:
+    try:
+        return tomllib.loads(line) == expected
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+def _override_lines(text: str, override: Override) -> tuple[int, int, int | None]:
+    """(header, filter, test-group) line indices of `override` in `text`.
+
+    Used only to build text mutations for the controls below; the guard
+    itself never reads lines. The filter line is found by its parsed value,
+    so it must be unique in the file.
+    """
+    lines = text.splitlines()
+    hits = [
+        i for i, line in enumerate(lines) if _line_parses_to(line, {"filter": override.filter})
+    ]
+    if len(hits) != 1:
+        raise AssertionError(f"filter {override.filter!r} is not on exactly one line")
+    filter_line = hits[0]
+    header = filter_line
+    while not lines[header].lstrip().startswith("["):
+        header -= 1
+    group_line = None
+    for i in range(filter_line + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            break
+        if override.test_group is not None and _line_parses_to(
+            lines[i], {"test-group": override.test_group}
+        ):
+            group_line = i
+            break
+    return header, filter_line, group_line
 
 
 def _ds(name: str = "delegation_survives_restart_via_history") -> CaseId:
@@ -560,11 +568,13 @@ class EffectiveAssignment(unittest.TestCase):
                 assert_serialized_in_quic_localhost(text, binary)
 
     def test_quic_localhost_group_still_serialises(self) -> None:
-        # The group only serialises while `max-threads = 1` is an ACTIVE line;
-        # a commented `# max-threads = 1` must read as absent.
-        self.assertEqual(
-            active_key_in_section(_config_text(), GROUP_TABLE, "max-threads"), "1"
-        )
+        # The group only serialises while `max-threads = 1` is live TOML; a
+        # commented `# max-threads = 1` must read as absent.
+        self.assertEqual(group_max_threads(_config_text(), "quic-localhost"), 1)
+
+    def test_commented_max_threads_reads_as_absent(self) -> None:
+        text = "[test-groups.quic-localhost]\n# max-threads = 1\n"
+        self.assertIsNone(group_max_threads(text, "quic-localhost"))
 
     def test_override_without_an_active_filter_is_a_config_error(self) -> None:
         text = (
@@ -581,18 +591,19 @@ class NegativeControls(unittest.TestCase):
 
     def test_commented_out_group_assignment_is_rejected(self) -> None:
         text = _config_text()
-        override = _group_override(text, _ds())
-        assert override.group_line is not None
+        _, _, group_line = _override_lines(text, _group_override(text, _ds()))
+        assert group_line is not None
         lines = text.splitlines()
-        lines[override.group_line] = "# " + lines[override.group_line]
+        lines[group_line] = "# " + lines[group_line]
         with self.assertRaises(AssertionError):
             assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
 
     def test_negated_filter_is_rejected(self) -> None:
         text = _config_text()
         override = _group_override(text, _ds())
+        _, filter_line, _ = _override_lines(text, override)
         lines = text.splitlines()
-        lines[override.filter_line] = f'filter = "not ({override.filter})"'
+        lines[filter_line] = f'filter = "not ({override.filter})"'
         with self.assertRaises(AssertionError):
             assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
 
@@ -600,9 +611,9 @@ class NegativeControls(unittest.TestCase):
         # Codex review: `binary(delegation_spaces) & not test(delegation_)`
         # keeps the binary in the filter but removes two acceptance cases.
         text = _config_text()
-        override = _group_override(text, _ds())
+        _, filter_line, _ = _override_lines(text, _group_override(text, _ds()))
         lines = text.splitlines()
-        lines[override.filter_line] = (
+        lines[filter_line] = (
             'filter = "binary(delegation_spaces) & not test(delegation_)"'
         )
         with self.assertRaises(AssertionError):
@@ -610,9 +621,9 @@ class NegativeControls(unittest.TestCase):
 
     def test_difference_that_drops_one_acceptance_case_is_rejected(self) -> None:
         text = _config_text()
-        override = _group_override(text, _ds())
+        _, filter_line, _ = _override_lines(text, _group_override(text, _ds()))
         lines = text.splitlines()
-        lines[override.filter_line] = (
+        lines[filter_line] = (
             'filter = "binary(delegation_spaces) - '
             'test(=delegated_child_cold_wake_rehydrates_carrier_and_sends_as)"'
         )
@@ -621,10 +632,10 @@ class NegativeControls(unittest.TestCase):
 
     def test_retargeted_group_is_rejected(self) -> None:
         text = _config_text()
-        override = _group_override(text, _ds())
-        assert override.group_line is not None
+        _, _, group_line = _override_lines(text, _group_override(text, _ds()))
+        assert group_line is not None
         lines = text.splitlines()
-        lines[override.group_line] = 'test-group = "membership-cluster"'
+        lines[group_line] = 'test-group = "membership-cluster"'
         with self.assertRaises(AssertionError):
             assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
 
@@ -659,18 +670,66 @@ class NegativeControls(unittest.TestCase):
 
     def test_commented_out_override_header_is_not_config(self) -> None:
         text = _config_text()
-        override = _group_override(text, _ds())
+        header, _, _ = _override_lines(text, _group_override(text, _ds()))
         lines = text.splitlines()
-        # Walk back to the block's header line and comment it out: the
-        # override stops existing for nextest, and its keys leak into the
-        # previous block as duplicates — invalid TOML — so the guard must
-        # reject the file either way (AssertionError or ConfigError).
-        header = override.filter_line
-        while lines[header].strip() != OVERRIDES_HEADER:
-            header -= 1
+        # Comment out the block's header: the override stops existing for
+        # nextest, and its keys leak into the previous block as duplicates —
+        # invalid TOML — so the guard must reject the file either way
+        # (AssertionError or ConfigError).
         lines[header] = "# " + lines[header]
         with self.assertRaises((AssertionError, ConfigError)):
             assert_serialized_in_quic_localhost("\n".join(lines), "delegation_spaces")
+
+    def test_earlier_override_whose_header_has_a_trailing_comment_is_rejected(
+        self,
+    ) -> None:
+        # Codex review (3a0cd6b): `[[profile.default.overrides]] # note` is a
+        # valid header. nextest applies this earlier override first; the old
+        # line matcher skipped the block and stayed green.
+        text = _insert_before_first_override(
+            _config_text(),
+            [
+                f"{OVERRIDES_HEADER} # moved for a soak",
+                'filter = "binary(delegation_spaces)"',
+                'test-group = "membership-cluster"',
+            ],
+        )
+        self.assertEqual(
+            effective_test_group(text, _ds()),
+            "membership-cluster",
+        )
+        with self.assertRaises(AssertionError):
+            assert_serialized_in_quic_localhost(text, "delegation_spaces")
+
+    def test_earlier_override_in_other_valid_header_spellings_is_rejected(
+        self,
+    ) -> None:
+        # The same mutation in other spellings TOML accepts and a line
+        # matcher would miss: inner spaces, quoted keys, an inline comment
+        # after a key.
+        for header in (
+            "[[ profile.default.overrides ]]",
+            "[[profile . default . overrides]]",
+            '[["profile".default."overrides"]]',
+            "\t[[profile.default.overrides]]\t# tabbed",
+        ):
+            with self.subTest(header=header):
+                text = _insert_before_first_override(
+                    _config_text(),
+                    [
+                        header,
+                        'filter = "binary(delegation_spaces)"  # all of them',
+                        "test-group = 'membership-cluster'",
+                    ],
+                )
+                with self.assertRaises(AssertionError):
+                    assert_serialized_in_quic_localhost(text, "delegation_spaces")
+
+    def test_invalid_toml_fails_closed(self) -> None:
+        # A file nextest cannot parse must not read as a passing config.
+        text = _config_text() + "\n[test-groups.quic-localhost]\nmax-threads = 1\n"
+        with self.assertRaises(ConfigError):
+            assert_serialized_in_quic_localhost(text, "delegation_spaces")
 
 
 class PositiveControls(unittest.TestCase):

@@ -23,7 +23,9 @@ All notable changes to this project will be documented in this file.
   registered-peer count (the same set `/peers` reads), and ant-quic's raw
   `active` connection counter. The classification uses only the listener
   port and the registered-peer counts — no peer registered anywhere, a
-  one-sided registration, a poll that raced a mesh completing late, or a
+  one-sided registration, a poll that raced the failing daemon's own late
+  registration (never read as a complete mesh while another daemon registers
+  no peer or does not answer), or a
   listener off its reserved port — and reports transport state as unknown.
   The `active` counter is printed but never classified: in the pinned
   ant-quic it increments after registration, and `connected_peers` filters
