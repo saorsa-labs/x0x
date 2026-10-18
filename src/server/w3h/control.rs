@@ -27,7 +27,7 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 /// unreserved set), as the live fixture's `urllib.parse.quote(v, safe="")`
 /// does. A group store id is its topic, `x0x/group/<gid>/kv/<name>`, so
 /// its slashes must not split the `/stores/:id/:key` route.
-pub(super) fn path_segment(raw: &str) -> String {
+fn path_segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
