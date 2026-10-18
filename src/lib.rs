@@ -31833,29 +31833,20 @@ mod tests {
         let bob_network = bob.network().expect("bob network");
         let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let alice_peer = ant_quic::PeerId(alice.machine_id().0);
+        let mut bob_events = bob_network.subscribe();
+        let mut bob_lifecycle = bob_network
+            .subscribe_all_peer_events()
+            .await
+            .expect("bob lifecycle");
+        let bound = std::time::Duration::from_secs(5);
+
         let bob_id = bob.machine_id().0;
 
-        // Issue #316: this dial is the SETUP leg (the observation is the
-        // rejection of bob's later redial). Under full-suite ambient load a
-        // first setup attempt can fail fast at the socket or blow ant-quic's
-        // ~1–2.1 s adaptive direct budget — the original flake fast-failed
-        // here in 0.16 s. Retry the setup dial a bounded number of times so
-        // scheduler noise cannot fail the scenario; a persistent failure
-        // still panics loudly with the last error.
-        let mut last_dial_error = None;
-        let connected = loop {
-            match alice_network.connect_addr(bob_addr).await {
-                Ok(peer) => break peer,
-                Err(error) => {
-                    eprintln!("suppressed-redial setup dial failed, retrying: {error}");
-                    if last_dial_error.is_some() {
-                        panic!("alice could not dial bob for setup: {error}");
-                    }
-                    last_dial_error = Some(error);
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            }
-        };
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob for setup");
         assert_eq!(connected.0, bob.machine_id().0);
         let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < reg {
@@ -31869,16 +31860,36 @@ mod tests {
             "bob connected before rejection"
         );
 
-        // Quiesce the connection before the intentional rejection (issue
-        // #241 pattern): the initial dial can leave duplicate/zombie legs
-        // whose delayed setup/close events would race the rejection
-        // scenario below — the redial must be the sole inbound attempt.
-        await_quiesced_connection(
-            alice_network,
-            &bob_peer,
-            std::time::Duration::from_secs(1) * test_time_multiplier(),
-        )
-        .await;
+        // Finish the original inbound admission before rejecting it. Alice's
+        // dial returning does not mean Bob's accept loop has finished.
+        tokio::time::timeout(bound, async {
+            loop {
+                if matches!(bob_events.recv().await.expect("bob admission event"),
+                    network::NetworkEvent::PeerConnected { peer_id, .. } if peer_id == alice_peer.0)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("bob admitted the original connection");
+        let old_alice_generation = alice_network
+            .connection_health(bob_peer)
+            .await
+            .expect("alice health")
+            .generation
+            .expect("alice original generation");
+        let old_bob_generation = bob_network
+            .connection_health(alice_peer)
+            .await
+            .expect("bob health")
+            .generation
+            .expect("bob original generation");
+        assert_eq!(
+            bob_network.peer_admission(&alice_peer).await,
+            network::PeerAdmission::Admitted
+        );
+
         alice_network
             .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
             .await
@@ -31888,41 +31899,104 @@ mod tests {
             "PolicyRejection sets a permanent tombstone"
         );
 
-        // Alice's registry transition to disconnected is asynchronous: a
-        // one-shot !is_connected read here can race the in-flight close.
-        // Bounded-poll for the disconnected state (same pattern as the
-        // admin-revocation test) so bob's explicit connect_addr below is
-        // the SOLE intentional redial — not a racer against the original
-        // session's teardown.
-        {
-            let disc = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(5) * test_time_multiplier();
-            while tokio::time::Instant::now() < disc {
-                if !alice_network.is_connected(&bob_peer).await {
+        let set_at_before = alice_network
+            .reconnect_suppression_set_at(bob_id)
+            .expect("policy tombstone");
+        // The local disconnect is not a remote teardown barrier. Observe
+        // Closed for Bob's exact old generation before making a fresh dial.
+        tokio::time::timeout(bound, async {
+            loop {
+                let (peer, event) = bob_lifecycle.recv().await.expect("bob lifecycle event");
+                if peer == alice_peer
+                    && matches!(event, ant_quic::PeerLifecycleEvent::Closed { generation, .. }
+                        if generation == old_bob_generation)
+                {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            assert!(
-                !alice_network.is_connected(&bob_peer).await,
-                "bob disconnected after policy reject (bounded poll)"
-            );
-        }
+        })
+        .await
+        .expect("bob observed the original generation close");
+        assert!(!alice_network.is_connected(&bob_peer).await);
+        assert!(!bob_network.is_connected(&alice_peer).await);
+
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "bob disconnected after policy reject (bounded poll)"
+        );
 
         // Watch for any `PeerConnected` for bob: the gate must suppress it.
         let mut events = alice_network.subscribe();
 
-        // bob dials alice back — the deterministic stand-in for ant-quic's
-        // reverse-open (and for a revoked peer simply dialing back in). The
-        // handshake completes on bob's side (loopback is fast and alice's
-        // accept loop must be scheduled before her close lands); alice's
-        // accept loop must then close it immediately and never surface it.
-        // Asserting the dial reached alice keeps the test non-vacuous.
-        let dialed = bob_network
-            .connect_addr(alice_addr)
-            .await
-            .expect("bob redials alice after rejection");
+        // Hold Alice's real suppression-close after accept registered the
+        // fresh inbound. Otherwise that close may beat Bob's dial finalization
+        // and correctly produce "no live winner" before we can inspect the
+        // live suppressed connection.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        alice_network.observe_suppressed_inbound_for_test(network::SuppressedInboundProbe {
+            peer: bob_peer,
+            close: Some(network::SuppressedInboundClosePause {
+                reached: reached_tx,
+                resume: resume_rx,
+                closed: closed_tx,
+            }),
+            frame: bytes::Bytes::new(),
+            dropped: None,
+        });
+        let dialed = tokio::time::timeout(bound, async {
+            let (dialed, reached) = tokio::join!(bob_network.connect_addr(alice_addr), reached_rx);
+            reached.expect("alice reached the real suppressed-inbound close");
+            dialed.expect("bob redials alice after rejection")
+        })
+        .await
+        .expect("fresh redial reached suppression close");
+        assert_eq!(dialed, alice_peer);
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "fresh inbound is live at the interlock"
+        );
+        assert_ne!(
+            alice_network
+                .connection_health(bob_peer)
+                .await
+                .expect("alice health")
+                .generation,
+            Some(old_alice_generation),
+            "fresh inbound must not reuse the original session"
+        );
+        assert_ne!(
+            bob_network
+                .connection_health(alice_peer)
+                .await
+                .expect("bob health")
+                .generation,
+            Some(old_bob_generation),
+            "fresh dial must not reuse the original session"
+        );
+        assert_eq!(
+            alice_network.peer_admission(&bob_peer).await,
+            network::PeerAdmission::Suppressed,
+            "the live fresh inbound must remain suppressed before close"
+        );
+
         assert_eq!(dialed.0, alice.machine_id().0, "bob dialed alice");
+
+        resume_tx
+            .send(())
+            .expect("release the real suppression close");
+        assert!(
+            tokio::time::timeout(bound, closed_rx)
+                .await
+                .expect("suppression close completed")
+                .expect("suppression close result"),
+            "the real suppression close must succeed"
+        );
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "fresh inbound closed"
+        );
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
@@ -31943,6 +32017,11 @@ mod tests {
         assert!(
             alice_network.is_reconnect_suppressed(bob_id),
             "rejecting the inbound redial must not clear the tombstone"
+        );
+        assert_eq!(
+            alice_network.reconnect_suppression_set_at(bob_id),
+            Some(set_at_before),
+            "refusing the inbound redial must not refresh the tombstone"
         );
     }
 
@@ -32465,6 +32544,13 @@ mod tests {
         let bob_network = bob.network().expect("bob network");
         let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let alice_peer = ant_quic::PeerId(alice.machine_id().0);
+        let mut bob_events = bob_network.subscribe();
+        let mut bob_lifecycle = bob_network
+            .subscribe_all_peer_events()
+            .await
+            .expect("bob lifecycle");
+        let bound = std::time::Duration::from_secs(5);
 
         let carol = Agent::builder()
             .with_machine_key(dir.path().join("carol-machine.key"))
@@ -32505,6 +32591,36 @@ mod tests {
             "bob and carol connected before rejection"
         );
 
+        // Finish the original inbound admission before rejecting it. Alice's
+        // dial returning does not mean Bob's accept loop has finished.
+        tokio::time::timeout(bound, async {
+            loop {
+                if matches!(bob_events.recv().await.expect("bob admission event"),
+                    network::NetworkEvent::PeerConnected { peer_id, .. } if peer_id == alice_peer.0)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("bob admitted the original connection");
+        let old_alice_generation = alice_network
+            .connection_health(bob_peer)
+            .await
+            .expect("alice health")
+            .generation
+            .expect("alice original generation");
+        let old_bob_generation = bob_network
+            .connection_health(alice_peer)
+            .await
+            .expect("bob health")
+            .generation
+            .expect("bob original generation");
+        assert_eq!(
+            bob_network.peer_admission(&alice_peer).await,
+            network::PeerAdmission::Admitted
+        );
+
         // Baseline: both peers are gossip-plane carriers.
         let plane = alice_network.gossip_plane_peers().await;
         assert!(plane.contains(&bob_peer), "healthy bob is a gossip carrier");
@@ -32517,6 +32633,10 @@ mod tests {
             .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
             .await
             .expect("policy reject");
+
+        let set_at_before = alice_network
+            .reconnect_suppression_set_at(bob_peer.0)
+            .expect("policy tombstone");
 
         // Excluded immediately, carol untouched (over-suppression guard).
         let plane = alice_network.gossip_plane_peers().await;
@@ -32534,16 +32654,110 @@ mod tests {
             "carol must stay admitted — suppression is per-peer"
         );
 
-        // Drive the transient transport-connected window: bob redials, so
-        // ant-quic briefly holds a winner alice must not expose. Sample
-        // fast enough to catch the window when it opens; the exclusion
-        // assertions hold on every sample either way.
-        let _ = bob_network
-            .connect_addr(alice_addr)
-            .await
-            .expect("bob redials alice after rejection");
+        // The local disconnect is not a remote teardown barrier. Observe
+        // Closed for Bob's exact old generation before making a fresh dial.
+        tokio::time::timeout(bound, async {
+            loop {
+                let (peer, event) = bob_lifecycle.recv().await.expect("bob lifecycle event");
+                if peer == alice_peer
+                    && matches!(event, ant_quic::PeerLifecycleEvent::Closed { generation, .. }
+                        if generation == old_bob_generation)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("bob observed the original generation close");
+        assert!(!alice_network.is_connected(&bob_peer).await);
+        assert!(!bob_network.is_connected(&alice_peer).await);
+
+        // Hold Alice's real suppression-close after accept registered the
+        // fresh inbound. Otherwise that close may beat Bob's dial finalization
+        // and correctly produce "no live winner" before we can inspect the
+        // live suppressed connection.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        alice_network.observe_suppressed_inbound_for_test(network::SuppressedInboundProbe {
+            peer: bob_peer,
+            close: Some(network::SuppressedInboundClosePause {
+                reached: reached_tx,
+                resume: resume_rx,
+                closed: closed_tx,
+            }),
+            frame: bytes::Bytes::new(),
+            dropped: None,
+        });
+        let dialed = tokio::time::timeout(bound, async {
+            let (dialed, reached) = tokio::join!(bob_network.connect_addr(alice_addr), reached_rx);
+            reached.expect("alice reached the real suppressed-inbound close");
+            dialed.expect("bob redials alice after rejection")
+        })
+        .await
+        .expect("fresh redial reached suppression close");
+        assert_eq!(dialed, alice_peer);
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "fresh inbound is live at the interlock"
+        );
+        assert_ne!(
+            alice_network
+                .connection_health(bob_peer)
+                .await
+                .expect("alice health")
+                .generation,
+            Some(old_alice_generation),
+            "fresh inbound must not reuse the original session"
+        );
+        assert_ne!(
+            bob_network
+                .connection_health(alice_peer)
+                .await
+                .expect("bob health")
+                .generation,
+            Some(old_bob_generation),
+            "fresh dial must not reuse the original session"
+        );
+        assert_eq!(
+            alice_network.peer_admission(&bob_peer).await,
+            network::PeerAdmission::Suppressed,
+            "the live fresh inbound must remain suppressed before close"
+        );
+
+        let plane = alice_network.gossip_plane_peers().await;
+        assert!(
+            !plane.contains(&bob_peer),
+            "a transport-connected suppressed peer must never enter gossip_plane_peers"
+        );
+        assert!(
+            plane.contains(&carol_peer),
+            "carol must remain a gossip carrier throughout"
+        );
+        assert_eq!(
+            alice_network.peer_admission(&carol_peer).await,
+            network::PeerAdmission::Admitted,
+            "carol must stay admitted while bob's suppression close is held"
+        );
+
+        resume_tx
+            .send(())
+            .expect("release the real suppression close");
+        assert!(
+            tokio::time::timeout(bound, closed_rx)
+                .await
+                .expect("suppression close completed")
+                .expect("suppression close result"),
+            "the real suppression close must succeed"
+        );
+        assert!(
+            !alice_network.is_connected(&bob_peer).await,
+            "fresh inbound closed"
+        );
+
+        // Keep the original post-close sampling window and assertions.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
-        let mut transport_connected_samples = 0usize;
+        let mut transport_connected_samples = 1usize; // observed at the interlock
         while tokio::time::Instant::now() < deadline {
             if alice_network.is_connected(&bob_peer).await {
                 transport_connected_samples += 1;
@@ -32567,6 +32781,11 @@ mod tests {
         eprintln!(
             "raw is_connected observations during the redial window: \
              {transport_connected_samples}"
+        );
+        assert_eq!(
+            alice_network.reconnect_suppression_set_at(bob_peer.0),
+            Some(set_at_before),
+            "refusing the inbound redial must not refresh the tombstone"
         );
     }
 
