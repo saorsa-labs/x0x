@@ -275,8 +275,11 @@ async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
         }
     };
     let origin = tokio::time::Instant::now();
-    let wall_before = std::time::SystemTime::now();
+    // Install the pull callback before the baseline so both reads go through the
+    // virtual clock (real wall time would make wall_after look like it went
+    // backwards after a jump to the 2026-01-01 epoch).
     shim.install_virt_time(origin);
+    let wall_before = std::time::SystemTime::now();
     tokio::time::advance(Duration::from_secs(600)).await;
     let wall_after = std::time::SystemTime::now();
     shim.clear_virt_time();
