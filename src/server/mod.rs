@@ -1761,7 +1761,7 @@ pub async fn serve_with_options(
     // artifact patterns next to the binary, so it is a harmless no-op for an
     // embedder (which never creates such artifacts) — no host files can match.
     bg_tasks.push(tokio::spawn(async {
-        let removed = tokio::task::spawn_blocking(|| {
+        let removed = x0x::history::run_blocking(|| {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
             Some(x0x::upgrade::sweep_stale_upgrade_artifacts(

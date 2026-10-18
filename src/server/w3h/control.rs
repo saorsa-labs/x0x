@@ -218,6 +218,62 @@ async fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
     Ok(())
 }
 
+/// #1245: pull-based wall offset tracks a virtual-time jump immediately,
+/// without waiting for a 1 ms ticker task to be polled first.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
+    let origin = tokio::time::Instant::now();
+    *super::VIRT_ORIGIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(origin);
+    // SAFETY: same callback the shim invokes on every clock_gettime.
+    let before = unsafe { super::virt_offset_ns() };
+    ensure!(
+        before < 1_000_000,
+        "offset at origin should be ~0 ns, got {before}"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let after = unsafe { super::virt_offset_ns() };
+    *super::VIRT_ORIGIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let expected = Duration::from_secs(5).as_nanos() as u64;
+    ensure!(
+        after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
+        "pull offset after 5s jump should be ~{expected} ns, got {after} (stale ticker would lag)"
+    );
+    Ok(())
+}
+
+/// #1245: with the W3-H shim env set, history `run_blocking` runs inline so
+/// a completion cannot reorder other ready tasks via the blocking pool.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
+    let runtime_tid = std::thread::current().id();
+    // SAFETY: test-only env mutation; restored below.
+    std::env::set_var("W3H_SHIM_ACTIVE", "1");
+    let blocking_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&blocking_tid);
+    let value = crate::history::run_blocking(move || {
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
+        7u32
+    })
+    .await?;
+    std::env::remove_var("W3H_SHIM_ACTIVE");
+    ensure!(value == 7);
+    let got = blocking_tid
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ok_or_else(|| anyhow::anyhow!("run_blocking body did not run"))?;
+    ensure!(
+        got == runtime_tid,
+        "inline blocking must run on the runtime thread"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),

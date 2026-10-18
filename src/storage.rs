@@ -4,6 +4,8 @@
 //! MachineKeypair, AgentKeypair, UserKeypair, and AgentCertificate types,
 //! enabling persistence of identities across application restarts.
 
+#[cfg(test)]
+use self::w3h_fs as fs;
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
 use crate::revocation::{
@@ -14,7 +16,109 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(test))]
 use tokio::fs;
+
+/// Test-only FS layer for W3-H (#1245): when the entropy/wall-clock shim is
+/// active, read/write/exists/remove/metadata run on the current-thread
+/// runtime instead of `tokio::fs`'s blocking pool, so same-instant task
+/// order is not scrambled by remote wakeups. `read_dir` stays on tokio
+/// (rare on the join path; wrapping its stream type is not worth the
+/// surface). Production builds use `tokio::fs` unchanged.
+#[cfg(test)]
+mod w3h_fs {
+    use std::io;
+    use std::path::Path;
+
+    fn inline() -> bool {
+        std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    }
+
+    pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+        if inline() {
+            std::fs::read(path)
+        } else {
+            tokio::fs::read(path).await
+        }
+    }
+
+    pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+        if inline() {
+            std::fs::write(path, contents)
+        } else {
+            tokio::fs::write(path, contents).await
+        }
+    }
+
+    pub async fn try_exists(path: impl AsRef<Path>) -> io::Result<bool> {
+        if inline() {
+            Ok(path.as_ref().exists())
+        } else {
+            tokio::fs::try_exists(path).await
+        }
+    }
+
+    pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::remove_file(path)
+        } else {
+            tokio::fs::remove_file(path).await
+        }
+    }
+
+    pub async fn metadata(path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> {
+        if inline() {
+            std::fs::metadata(path)
+        } else {
+            tokio::fs::metadata(path).await
+        }
+    }
+
+    pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::create_dir(path)
+        } else {
+            tokio::fs::create_dir(path).await
+        }
+    }
+
+    pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::create_dir_all(path)
+        } else {
+            tokio::fs::create_dir_all(path).await
+        }
+    }
+
+    pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::remove_dir(path)
+        } else {
+            tokio::fs::remove_dir(path).await
+        }
+    }
+
+    pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::rename(from, to)
+        } else {
+            tokio::fs::rename(from, to).await
+        }
+    }
+
+    pub async fn set_permissions(
+        path: impl AsRef<Path>,
+        perms: std::fs::Permissions,
+    ) -> io::Result<()> {
+        if inline() {
+            std::fs::set_permissions(path, perms)
+        } else {
+            tokio::fs::set_permissions(path, perms).await
+        }
+    }
+
+    pub use tokio::fs::{read_dir, File};
+}
 
 /// Serialized keypair representation for storage (legacy v1 format).
 ///
@@ -1314,7 +1418,7 @@ pub async fn machine_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(MACHINE_KEY_FILE))
+    fs::try_exists(path.join(MACHINE_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -1364,7 +1468,7 @@ pub async fn save_machine_keypair_to<P: AsRef<Path> + Clone>(
 ///
 /// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_machine_keypair(&bytes)
 }
 
@@ -1378,7 +1482,7 @@ pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<Machin
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
 }
 
@@ -1421,7 +1525,7 @@ pub async fn agent_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(AGENT_KEY_FILE))
+    fs::try_exists(path.join(AGENT_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -1457,7 +1561,7 @@ pub async fn save_agent_keypair_to<P: AsRef<Path> + Clone>(
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair_from<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
 }
 
@@ -1518,7 +1622,7 @@ pub async fn user_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(USER_KEY_FILE))
+    fs::try_exists(path.join(USER_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -1534,7 +1638,7 @@ pub async fn save_user_keypair_to<P: AsRef<Path> + Clone>(kp: &UserKeypair, path
 
 /// Load a UserKeypair from the specified file path.
 pub async fn load_user_keypair_from<P: AsRef<Path>>(path: P) -> Result<UserKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_user_keypair(&bytes)
 }
 
@@ -1560,7 +1664,7 @@ pub async fn agent_certificate_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(AGENT_CERT_FILE))
+    fs::try_exists(path.join(AGENT_CERT_FILE))
         .await
         .unwrap_or(false)
 }
@@ -1576,7 +1680,7 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
 
 /// Load an AgentCertificate from the specified file path.
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     AgentCertificate::from_storage_bytes(&bytes)
 }
 
@@ -1835,7 +1939,7 @@ async fn quarantine_sibling_exists(path: &Path) -> bool {
         return false;
     };
     let prefix = format!("{name}.quarantined-");
-    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+    let Ok(mut entries) = fs::read_dir(parent).await else {
         return false;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1987,7 +2091,7 @@ async fn archive_corrupt_revocation_bytes(
     };
     let prefix = format!("{name}.quarantined-");
     let mut existing = None;
-    if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+    if let Ok(mut entries) = fs::read_dir(parent).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
             let Some(file_name) = file_name.to_str() else {
@@ -1996,7 +2100,7 @@ async fn archive_corrupt_revocation_bytes(
             if !file_name.starts_with(&prefix) {
                 continue;
             }
-            if tokio::fs::read(entry.path()).await.ok().as_deref() == Some(bytes) {
+            if fs::read(entry.path()).await.ok().as_deref() == Some(bytes) {
                 existing = Some(entry.path());
                 break;
             }
@@ -2017,7 +2121,7 @@ async fn archive_corrupt_revocation_bytes(
             note_archive_failed(path).await;
             return false;
         }
-        if let Err(error) = tokio::fs::remove_file(path).await {
+        if let Err(error) = fs::remove_file(path).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::error!(
                     path = %path.display(),
@@ -2037,7 +2141,7 @@ async fn archive_corrupt_revocation_bytes(
             .unwrap_or(0);
         let mut dest = parent.join(format!("{prefix}{millis}"));
         let mut seq = 0u32;
-        while tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        while fs::try_exists(&dest).await.unwrap_or(false) {
             seq = seq.saturating_add(1);
             dest = parent.join(format!("{prefix}{millis}-{seq}"));
         }
@@ -2057,7 +2161,7 @@ async fn archive_corrupt_revocation_bytes(
                 note_archive_failed(path).await;
                 return false;
             }
-            if let Err(error) = tokio::fs::remove_file(path).await {
+            if let Err(error) = fs::remove_file(path).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::error!(
                         path = %path.display(),
@@ -2230,7 +2334,7 @@ mod tests {
 
     async fn quarantine_files(dir: &Path, stem: &str) -> Vec<std::path::PathBuf> {
         let mut found = Vec::new();
-        let mut entries = tokio::fs::read_dir(dir).await.expect("read dir");
+        let mut entries = fs::read_dir(dir).await.expect("read dir");
         let prefix = format!("{stem}.quarantined-");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
             let name = entry.file_name();
@@ -2262,7 +2366,7 @@ mod tests {
             "a failed rename still archives when the copy completes"
         );
         assert!(
-            tokio::fs::read(&path).await.is_err(),
+            fs::read(&path).await.is_err(),
             "the live path does not hold the payload"
         );
         let quarantine = quarantine_files(dir.path(), REVOCATION_FILE).await;
@@ -2272,7 +2376,7 @@ mod tests {
             bytes,
             "the quarantine file holds the full payload"
         );
-        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read dir");
+        let mut entries = fs::read_dir(dir.path()).await.expect("read dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
             let name = entry.file_name();
             assert!(
@@ -2300,9 +2404,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let bytes = b"corrupt-bytes-must-stay-on-the-live-path";
-        tokio::fs::write(&path, bytes)
-            .await
-            .expect("seed live file");
+        fs::write(&path, bytes).await.expect("seed live file");
         let _rename = arm_fail_quarantine_rename_for_testing(&path);
         let _publish = arm_fail_durable_before_rename_for_testing(dir.path());
         let archived = archive_corrupt_revocation_bytes(&path, bytes, true).await;
@@ -2311,7 +2413,7 @@ mod tests {
             "a copy that fails before publish must not count as archived"
         );
         assert_eq!(
-            tokio::fs::read(&path).await.expect("live file remains"),
+            fs::read(&path).await.expect("live file remains"),
             bytes,
             "the live file stays until the quarantine copy is durable"
         );
@@ -2321,7 +2423,7 @@ mod tests {
                 .is_empty(),
             "the quarantine name is not published"
         );
-        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read dir");
+        let mut entries = fs::read_dir(dir.path()).await.expect("read dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
             let name = entry.file_name();
             assert!(
@@ -2341,16 +2443,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let bytes = b"corrupt-bytes-need-a-durable-directory-entry";
-        tokio::fs::write(&path, bytes)
-            .await
-            .expect("seed live file");
+        fs::write(&path, bytes).await.expect("seed live file");
         let _rename = arm_fail_quarantine_rename_for_testing(&path);
         let sync_fault = arm_fail_parent_dir_fsync_for_testing(dir.path());
 
         let first = archive_corrupt_revocation_bytes(&path, bytes, true).await;
         assert!(!first, "a failed directory sync must not count as archived");
         assert_eq!(
-            tokio::fs::read(&path)
+            fs::read(&path)
                 .await
                 .expect("live file after first attempt"),
             bytes,
@@ -2373,7 +2473,7 @@ mod tests {
             "a retry with the directory sync still failing must not succeed"
         );
         assert_eq!(
-            tokio::fs::read(&path).await.expect("live file after retry"),
+            fs::read(&path).await.expect("live file after retry"),
             bytes,
             "the retry must not remove the live file"
         );
@@ -2391,7 +2491,7 @@ mod tests {
         let third = archive_corrupt_revocation_bytes(&path, bytes, true).await;
         assert!(third, "a retry after the fault clears archives");
         assert!(
-            tokio::fs::read(&path).await.is_err(),
+            fs::read(&path).await.is_err(),
             "the successful retry removes the live file"
         );
         assert_eq!(
@@ -2410,7 +2510,7 @@ mod tests {
     async fn operator_rebuild_validates_and_reopens_with_confirm_1116() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("revocations-v3.bin");
-        tokio::fs::write(&path, b"corrupt-v3").await.unwrap();
+        fs::write(&path, b"corrupt-v3").await.unwrap();
         let loaded = read_revocation_store(&path, RevocationStore::V3, false)
             .await
             .unwrap()
@@ -2450,7 +2550,7 @@ mod tests {
             .unwrap();
         assert!(!opened.revocation_resync_required());
         assert_eq!(std::fs::read(&quarantine[0]).unwrap(), kept);
-        assert!(tokio::fs::read(&path).await.unwrap().len() > 1);
+        assert!(fs::read(&path).await.unwrap().len() > 1);
     }
 
     /// #1116 / ADR 0085 rule 4: a fail-closed load must not authorize
@@ -2460,9 +2560,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let garbage = b"unreadable v1 revocations\x00\xff";
-        tokio::fs::write(&path, garbage)
-            .await
-            .expect("seed garbage");
+        fs::write(&path, garbage).await.expect("seed garbage");
 
         let mut set = load_revocation_set(Some(dir.path())).await;
         assert!(set.is_empty(), "undecodable bytes contribute no records");
@@ -2487,7 +2585,7 @@ mod tests {
             "startup moves the bad v1 bytes to a quarantine file"
         );
         assert_ne!(
-            tokio::fs::read(&path).await.ok().as_deref(),
+            fs::read(&path).await.ok().as_deref(),
             Some(garbage.as_slice()),
             "the live path no longer holds the corrupt payload"
         );
@@ -2510,7 +2608,7 @@ mod tests {
         assert!(revocation_persistence_is_blocked(&refused));
         assert!(set.is_agent_revoked(&issuer.agent_id()));
         assert_ne!(
-            tokio::fs::read(&path).await.ok().as_deref(),
+            fs::read(&path).await.ok().as_deref(),
             Some(garbage.as_slice()),
             "persist must not put the corrupt payload back on the live path"
         );
@@ -2520,7 +2618,7 @@ mod tests {
             "the next start stays closed without reading the quarantined payload"
         );
         assert!(again.member_treated_as_revoked(&stranger.agent_id()));
-        tokio::fs::write(&path, RevocationSet::new().to_bytes().unwrap())
+        fs::write(&path, RevocationSet::new().to_bytes().unwrap())
             .await
             .expect("operator repair");
         save_revocation_set(&set, Some(dir.path()))
@@ -2545,15 +2643,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let garbage = b"corrupt payload must leave the live path";
-        tokio::fs::write(&path, garbage)
-            .await
-            .expect("seed garbage");
+        fs::write(&path, garbage).await.expect("seed garbage");
         let stranger = AgentKeypair::generate().expect("stranger");
         let first = load_revocation_set(Some(dir.path())).await;
         assert!(first.revocation_resync_required());
         assert!(first.member_treated_as_revoked(&stranger.agent_id()));
         assert_ne!(
-            tokio::fs::read(&path).await.ok().as_deref(),
+            fs::read(&path).await.ok().as_deref(),
             Some(garbage.as_slice()),
             "the original path is no longer the corrupt payload"
         );
@@ -2563,7 +2659,7 @@ mod tests {
         // A decodable replacement must not be loaded. The next start looks
         // at the quarantine name only.
         let readable = RevocationSet::new().to_bytes().expect("empty store");
-        tokio::fs::write(&quarantined[0], &readable)
+        fs::write(&quarantined[0], &readable)
             .await
             .expect("replace quarantined payload");
         let second = load_revocation_set(Some(dir.path())).await;
@@ -2573,7 +2669,7 @@ mod tests {
         );
         assert!(second.member_treated_as_revoked(&stranger.agent_id()));
         assert_ne!(
-            tokio::fs::read(&path).await.ok().as_deref(),
+            fs::read(&path).await.ok().as_deref(),
             Some(garbage.as_slice()),
             "the next start does not put the corrupt payload back"
         );
@@ -2650,7 +2746,7 @@ mod tests {
             "revocations-v3.bin",
         ];
         for name in names {
-            tokio::fs::write(dir.path().join(name), garbage)
+            fs::write(dir.path().join(name), garbage)
                 .await
                 .expect("seed garbage");
         }
@@ -2686,7 +2782,7 @@ mod tests {
                 "{name} is moved to a timestamped quarantine file"
             );
             assert_ne!(
-                tokio::fs::read(dir.path().join(name)).await.ok().as_deref(),
+                fs::read(dir.path().join(name)).await.ok().as_deref(),
                 Some(garbage.as_slice()),
                 "{name} live path no longer holds the corrupt payload"
             );
@@ -2700,25 +2796,25 @@ mod tests {
                 .expect_err("overwrite refused");
             assert!(revocation_persistence_is_blocked(&refused));
             assert_ne!(
-                tokio::fs::read(&path).await.ok().as_deref(),
+                fs::read(&path).await.ok().as_deref(),
                 Some(garbage.as_slice()),
                 "{name} stays off the live path after a refused write"
             );
         }
 
-        tokio::fs::write(
+        fs::write(
             dir.path().join("revocations.bin"),
             empty.to_bytes().unwrap(),
         )
         .await
         .unwrap();
-        tokio::fs::write(
+        fs::write(
             dir.path().join("revocations-v2.bin"),
             empty.to_bytes_v2().unwrap(),
         )
         .await
         .unwrap();
-        tokio::fs::write(
+        fs::write(
             dir.path().join("revocations-v3.bin"),
             empty.to_bytes_v3().unwrap(),
         )
@@ -2746,7 +2842,7 @@ mod tests {
         assert_open(&repaired, "repaired files");
 
         // One corrupt carrier is enough. A readable sibling does not clear it.
-        tokio::fs::write(dir.path().join("revocations-v2.bin"), garbage)
+        fs::write(dir.path().join("revocations-v2.bin"), garbage)
             .await
             .unwrap();
         let mut mixed = load_revocation_set(Some(dir.path())).await;
@@ -2794,7 +2890,7 @@ mod tests {
         for (name, bytes) in cases {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(name);
-            tokio::fs::write(&path, bytes).await.expect("seed");
+            fs::write(&path, bytes).await.expect("seed");
             let store = match name {
                 "revocations.bin" => RevocationStore::V1,
                 "revocations-v2.bin" => RevocationStore::V2,
@@ -2810,7 +2906,7 @@ mod tests {
             );
             assert!(loaded.is_empty(), "{name} contributes no records");
             assert_ne!(
-                tokio::fs::read(&path).await.ok().as_deref(),
+                fs::read(&path).await.ok().as_deref(),
                 Some(bytes),
                 "{name} no longer holds the bad payload"
             );
@@ -2830,7 +2926,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let garbage = b"cannot-archive";
-        tokio::fs::write(&path, garbage).await.expect("seed");
+        fs::write(&path, garbage).await.expect("seed");
         let _guard = arm_fail_revocation_archive_for_testing(&path);
         let loaded = read_revocation_store(&path, RevocationStore::V1, false)
             .await
@@ -2841,7 +2937,7 @@ mod tests {
             loaded.revocation_status_sentence(),
             crate::revocation::REVOCATION_ARCHIVE_FAILED
         );
-        assert_eq!(tokio::fs::read(&path).await.expect("live bytes"), garbage);
+        assert_eq!(fs::read(&path).await.expect("live bytes"), garbage);
         assert!(
             quarantine_files(dir.path(), REVOCATION_FILE)
                 .await
@@ -3230,7 +3326,7 @@ mod tests {
         // as a structured Storage error — never a panic, never a silent ok.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let blocker = tmp.path().join("blocker");
-        tokio::fs::write(&blocker, b"x")
+        fs::write(&blocker, b"x")
             .await
             .expect("create blocker file");
         let target = blocker.join("sub").join("secret.key");
@@ -3250,7 +3346,7 @@ mod tests {
         // being trusted on a later load.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let blocker = tmp.path().join("blocker");
-        tokio::fs::write(&blocker, b"x")
+        fs::write(&blocker, b"x")
             .await
             .expect("create blocker file");
         let target = blocker.join("sub").join("secret.key");
@@ -3522,19 +3618,19 @@ mod tests {
         super::write_private_bytes_durable(&path, vec![1, 2, 3, 4])
             .await
             .expect("durable write");
-        let bytes = tokio::fs::read(&path).await.expect("read back");
+        let bytes = fs::read(&path).await.expect("read back");
         assert_eq!(bytes, vec![1, 2, 3, 4]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = tokio::fs::metadata(&path)
+            let mode = fs::metadata(&path)
                 .await
                 .expect("metadata")
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "journal bytes are private");
         }
-        let mut entries = tokio::fs::read_dir(dir.path().join("sub"))
+        let mut entries = fs::read_dir(dir.path().join("sub"))
             .await
             .expect("read_dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
@@ -3549,7 +3645,7 @@ mod tests {
         super::write_private_bytes_durable(&path, vec![9])
             .await
             .expect("rewrite");
-        let bytes = tokio::fs::read(&path).await.expect("reread");
+        let bytes = fs::read(&path).await.expect("reread");
         assert_eq!(bytes, vec![9]);
     }
 
@@ -3572,9 +3668,9 @@ mod tests {
             matches!(err, super::DurableWriteError::AfterRename(_)),
             "typed AfterRename, got: {err:?}"
         );
-        let bytes = tokio::fs::read(&path).await.expect("read back");
+        let bytes = fs::read(&path).await.expect("read back");
         assert_eq!(bytes, vec![9, 9], "the NEW bytes are already in place");
-        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read_dir");
+        let mut entries = fs::read_dir(dir.path()).await.expect("read_dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
             assert!(
                 !entry.file_name().to_string_lossy().contains(".tmp"),
@@ -3596,7 +3692,7 @@ mod tests {
             ),
             other => panic!("untyped writer must keep IdentityError::Storage, got: {other:?}"),
         }
-        assert_eq!(tokio::fs::read(&path).await.expect("read back"), vec![7]);
+        assert_eq!(fs::read(&path).await.expect("read back"), vec![7]);
     }
 
     /// Issue #1101 seam scoping (round 2): threaded `cargo test` runs the
@@ -3618,7 +3714,7 @@ mod tests {
         assert!(a.is_err(), "the armed path fails after its rename");
         b.expect("a concurrent durable write to another path succeeds");
         assert_eq!(
-            tokio::fs::read(&path_b).await.expect("read b"),
+            fs::read(&path_b).await.expect("read b"),
             vec![2],
             "path B's bytes are in place and its directory was synced"
         );

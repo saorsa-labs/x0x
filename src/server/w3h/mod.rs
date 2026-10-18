@@ -13,8 +13,9 @@
 //! only inside [`Sim::within`] / [`Sim::until`] / [`Sim::api`], and every
 //! advance is attributed to a named barrier in the trace. When the
 //! entropy/wall-clock shim (`scripts/w3h/w3h_shim.c`) is preloaded, the
-//! wall clock is a fixed base plus virtual time, updated every virtual
-//! millisecond inside barriers, and all OS entropy is seeded.
+//! wall clock is a fixed base plus virtual time: each `clock_gettime`
+//! pulls the current virtual offset (no 1 ms ticker race; #1245), and
+//! all OS entropy is seeded.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
@@ -87,11 +88,34 @@ const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20
 #[derive(Clone, Copy)]
 struct Shim {
     set_wall_offset_ns: unsafe extern "C" fn(u64),
+    set_virt_time_ns_fn: unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
     thread_stats: unsafe extern "C" fn(*mut libc::c_char, usize) -> libc::c_int,
 }
 
 /// Why the shim is not controlling this process (recorded in the trace).
 const SHIM_NOT_LOADED: &str = "shim not preloaded";
+
+/// Virtual-time origin for the shim's pull-based CLOCK_REALTIME (#1245).
+/// Set when a scenario starts; cleared in [`Sim::finish`].
+static VIRT_ORIGIN: std::sync::Mutex<Option<tokio::time::Instant>> = std::sync::Mutex::new(None);
+
+/// C ABI callback: nanoseconds since [`VIRT_ORIGIN`] at the current paused
+/// instant. Used by `w3h_shim_set_virt_time_ns_fn` so every `clock_gettime`
+/// sees the same virtual now without a ticker task.
+unsafe extern "C" fn virt_offset_ns() -> u64 {
+    let Ok(guard) = VIRT_ORIGIN.lock() else {
+        return 0;
+    };
+    let Some(start) = *guard else {
+        return 0;
+    };
+    u64::try_from(
+        tokio::time::Instant::now()
+            .saturating_duration_since(start)
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
 
 impl Shim {
     /// The shim, if it is preloaded, active (it requires `W3H_SHIM_ACTIVE=1`
@@ -103,22 +127,32 @@ impl Shim {
         use rand::RngCore as _;
         // SAFETY: `dlsym` with RTLD_DEFAULT and NUL-terminated names has no
         // preconditions; null means "not found".
-        let (set_wall, active, calls, stats) = unsafe {
+        let (set_wall, set_virt, active, calls, stats) = unsafe {
             (
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_virt_time_ns_fn".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_active".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_entropy_calls".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_thread_stats".as_ptr()),
             )
         };
-        if set_wall.is_null() || active.is_null() || calls.is_null() || stats.is_null() {
+        if set_wall.is_null()
+            || set_virt.is_null()
+            || active.is_null()
+            || calls.is_null()
+            || stats.is_null()
+        {
             return Err(SHIM_NOT_LOADED.to_string());
         }
         // SAFETY: these are the shim's exported functions with exactly these
         // C ABI signatures (`scripts/w3h/w3h_shim.c`).
-        let (set_wall_offset_ns, active, calls) = unsafe {
+        let (set_wall_offset_ns, set_virt_time_ns_fn, active, calls) = unsafe {
             (
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u64)>(set_wall),
+                std::mem::transmute::<
+                    *mut libc::c_void,
+                    unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
+                >(set_virt),
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_int>(
                     active,
                 ),
@@ -153,6 +187,7 @@ impl Shim {
         };
         Ok(Self {
             set_wall_offset_ns,
+            set_virt_time_ns_fn,
             thread_stats,
         })
     }
@@ -183,6 +218,25 @@ impl Shim {
         let nanos = u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX);
         // SAFETY: the shim's setter only stores atomics.
         unsafe { (self.set_wall_offset_ns)(nanos) }
+    }
+
+    /// Pull-based wall clock: every `clock_gettime(CLOCK_REALTIME)` reads
+    /// the current paused instant relative to `origin` (#1245).
+    fn install_virt_time(self, origin: tokio::time::Instant) {
+        *VIRT_ORIGIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(origin);
+        // SAFETY: `virt_offset_ns` matches the shim's C ABI; it only locks
+        // `VIRT_ORIGIN` and reads tokio's paused clock.
+        unsafe { (self.set_virt_time_ns_fn)(Some(virt_offset_ns)) }
+    }
+
+    fn clear_virt_time(self) {
+        // SAFETY: clearing the pull fn is a plain atomic store in the shim.
+        unsafe { (self.set_virt_time_ns_fn)(None) }
+        *VIRT_ORIGIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -604,6 +658,9 @@ impl Sim {
         sim::register(&plane, &fabric);
         let (shim, entropy) = match Shim::detect() {
             Ok(shim) => {
+                // Pull-based wall clock from this fabric's virtual origin so
+                // every clock_gettime sees the exact paused now (#1245).
+                shim.install_virt_time(fabric.origin());
                 shim.set_wall(Duration::ZERO);
                 (Some(shim), "controlled".to_string())
             }
@@ -995,21 +1052,8 @@ impl Sim {
         let started = self.fabric.now();
         self.fabric.mark(format!("barrier '{name}' open"));
         gate.open().await;
-        let ticker = self.shim.map(|shim| {
-            let fabric = Arc::clone(&self.fabric);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_millis(1));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    shim.set_wall(fabric.now());
-                }
-            })
-        });
+        // Wall clock is pull-based (`install_virt_time`); no 1 ms ticker.
         let outcome = tokio::time::timeout(budget, fut).await;
-        if let Some(ticker) = ticker {
-            ticker.abort();
-        }
         *self
             .gate
             .lock()
@@ -1287,6 +1331,9 @@ impl Sim {
         }
         for line in stats.iter().flat_map(|stats| stats.lines()) {
             eprintln!("W3H-ENTROPY {} {line}", self.case);
+        }
+        if let Some(shim) = self.shim {
+            shim.clear_virt_time();
         }
         if !teardown_errors.is_empty() {
             bail!("teardown failed: {}", teardown_errors.join("; "));
