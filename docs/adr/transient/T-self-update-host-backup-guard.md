@@ -7,85 +7,86 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** x0x #1447. Stays clear of #1373 (versioned backups / ADR 0094 §3).
+- **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
+  Stays clear of #1373 (versioned backups).
 
 ## Context
 
-On a managed host, `x0xd` and `x0xd-443` share one on-disk binary. Each unit
-can run the self-update apply path. That path always copies the current
-target to `<target>.backup`, then replaces the target. When two units apply
-within about one second, the second copy can read the already-replaced
-target. The backup then holds the new bytes. The previous version is gone.
-The v0.48.1 rollout on saorsa-3 showed this race. Rollback then needs a
-fresh upload.
+On a managed host, `x0xd` and `x0xd-443` share one on-disk binary. Each can
+run the self-update apply path, which copies the current target to
+`<target>.backup` then replaces it. When two units apply within about one
+second, the second copy can read the already-replaced target, so the backup
+holds the new bytes. The v0.48.1 rollout on saorsa-3 showed this race.
 
 ## Decision Drivers
 
-- A host with more than one unit on one binary must keep one previous binary
-  after a successful apply.
-- The second unit must not destroy rollback bytes.
-- This record must not take the #1373 versioned-backup design.
-- The guard must work with today's single `<target>.backup` name.
+- Keep one previous binary after a successful multi-unit apply.
+- The second unit must not destroy rollback bytes, and must still restart
+  into already-installed bytes when it still runs the old image.
+- Do not take #1373; keep `<target>.backup`.
 
 ## Considered Options
 
 1. Leave the race. Operators upload a binary before rollback on a bad host.
-2. Skip the backup when the on-disk target already matches the incoming
-   bytes, with no host lock.
-3. Take a host-wide exclusive lock for the shared target. Under that lock,
-   skip the whole apply when the target already matches the incoming bytes;
-   otherwise copy the current target to `<target>.backup` and then replace.
-4. Ship #1373 versioned backups as the only answer to this race.
+2. Skip backup when the on-disk target already matches, with no lock.
+3. Take a host-wide exclusive lock. Under it, when the target already
+   matches, skip only backup and replace and keep the restart-owner path;
+   otherwise copy to `<target>.backup` then replace.
+4. Ship #1373 versioned backups only.
 
 ## Decision
 
-Choose option 3.
+Choose option 3. This Proposed record (#1447) owns the host-wide exclusive
+apply lock. Draft #1410 (#1106) must reuse it, not add a second lock.
+#1410 may lengthen that hold to Accepted ADR 0094 §2.
 
-1. Before backup or replace, the apply path takes an exclusive lock for the
-   shared target. The lock file lives beside the target (for example
-   `<target>.upgrade.lock`). Every unit that can replace that target uses
-   the same lock file.
-2. While the lock is held, compare the on-disk target bytes to the incoming
-   binary. If they match, skip backup and replace. Release the lock.
-3. If they differ, copy the current target to `<target>.backup`, then replace
-   the target. Release the lock after the replace step this process owns.
-4. Do not introduce versioned backup names here. #1373 keeps that scope.
+1. Before backup or replace, take an OS exclusive lock (`flock` / `fcntl`)
+   on a persistent lock file beside the target (for example
+   `<target>.upgrade.lock`). The OS releases it when the holder dies.
+   Reclaim must not unlink a lock file another process still holds. Every
+   unit that can replace that target uses that same lock file.
+2. While holding the lock, compare on-disk bytes to the incoming binary.
+   Distinguish an already-installed artifact (disk matches) from an
+   already-running version (this process still maps the old image). If disk
+   matches, skip backup and replace only; keep the carried restart-owner
+   path so that unit reloads the new bytes. Do not treat that as today's
+   `NoUpgrade` (restart stays on `Success` only). Release the lock.
+3. If they differ, copy to `<target>.backup`, then replace. For this legacy
+   guard only, release after that replace. That short hold does not weaken
+   Accepted ADR 0094 §2 (M2 holds through the HTTP response window,
+   old-process exit, and unresolved intent).
+4. No versioned backup names. #1373 keeps that scope.
 
-A content match without a lock is not enough. Two units can both see the old
-target, both decide to back up, and the later copy can still read the new
-target. The lock closes that window. The content match stops a second unit
-from rewriting a good backup after the first unit has finished.
+A content match without a lock is not enough: both can still decide to back
+up. The lock closes that window.
 
 ## Consequences
 
 ### Positive
 
-- Two units that share one binary leave `<target>.backup` as the previous
-  version after a concurrent apply.
-- A late unit that sees an already-updated target does no backup and no
-  replace.
+- Concurrent applies leave `<target>.backup` as the previous version.
+- A second old-running unit skips backup and replace, then still restarts.
 
 ### Negative / Trade-offs
 
-- Apply on one unit waits on the lock while another unit applies.
-- A stale lock file needs a clear reclaim rule (same-host flock semantics).
+- One unit waits while another holds the lock.
 
 ### Neutral / Operational
 
-- #1373 may later replace the single backup name. This guard still applies
-  until that design ships.
-- Implementation lives in `src/upgrade/`. Cursor workers stay off that path
-  until the Engineer lifts the upgrade-code fence for #1447.
+- Implementation lives in `src/upgrade/`. Cursor stays off until the
+  Engineer lifts the #1447 upgrade-code fence.
 
 ## Validation
 
-A test starts two apply attempts on one shared target. After both finish,
-`<target>.backup` still holds the original bytes, or the second attempt
-skips because the target already matches. A single-unit apply still backs
-up and replaces as today.
+A test starts two independent apply attempts on one shared target, forces
+both through a barrier, and covers a late second attempt after replacement
+plus the two-old-processes / one-shared-target case. After both finish,
+assert unconditionally that `<target>.backup` still holds the original
+bytes and the target holds the candidate bytes. Record a second-attempt
+skip separately; skip must not substitute for preserving the backup.
+Single-unit apply still backs up and replaces.
 
 ## Notes for AI-assisted work
 
-Do not mark this record Accepted. Do not fold it. Do not expand this into
-#1373 versioned backups. If the upgrade-code fence still blocks the apply
-path, stop and ask the Engineer.
+Do not mark this Accepted. Do not fold it. Do not expand into #1373. If the
+fence blocks apply, ask the Engineer.
