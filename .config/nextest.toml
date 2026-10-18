@@ -109,6 +109,20 @@ test-group = "quic-localhost"
 filter = "binary(named_group_join_metadata_event) | binary(named_group_integration)"
 test-group = "quic-localhost"
 
+# Issue #1283: the groups job's issue #321 acceptance selector runs three
+# daemon-mesh tests from this binary in one nextest invocation, and nextest
+# runs each test as its own process — the in-process suite_lock cannot
+# serialise them. All three pairs then form simultaneously inside the one
+# loopback-only network namespace the isolated runtime grants the invocation
+# (six daemons sharing one loopback interface and one ephemeral port range),
+# which is the sharing this group exists to prevent: both #1283 failures in
+# run 37898362740 were concurrent members of that selector. The ambient-load
+# attribution is unverified (#702). Not retries, not wider deadlines
+# (ADR 0025 — a flake is not an observation).
+[[profile.default.overrides]]
+filter = "binary(delegation_spaces)"
+test-group = "quic-localhost"
+
 [[profile.default.overrides]]
 filter = "binary(threading_integration)"
 test-group = "quic-localhost"
