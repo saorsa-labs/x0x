@@ -627,6 +627,11 @@ impl PeerEvidenceStore {
             .lock()
             .map_err(|_| EvidenceError::Invalid("poisoned store lock"))
     }
+    /// Hold the real store mutex for deadline regression tests.
+    #[cfg(test)]
+    pub(crate) fn hold_state_for_testing(&self) -> impl Sized + '_ {
+        self.state.lock()
+    }
     fn lock_mutation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.mutation
             .lock()

@@ -7,6 +7,14 @@ pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send +
 
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
 
+struct AbortLookupOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortLookupOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 type LookupResponder = dyn Fn(AgentId) -> futures::future::BoxFuture<'static, ()> + Send + Sync;
 
@@ -194,7 +202,51 @@ impl EvidenceRuntime {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
-        self.lookup_with_permit(agent, machine, permit).await;
+        self.lookup_with_permit(agent, machine, permit, None).await;
+    }
+
+    /// #1239: Lookup's store and responder-policy reads are synchronous.
+    /// Run them off the async executor, with the caller's absolute deadline.
+    /// Reserve the existing Lookup permit before spawning: even workers that
+    /// cannot leave a synchronous read yet stay within the 16-Lookup cap.
+    pub(crate) async fn lookup_before(
+        self: &Arc<Self>,
+        agent: AgentId,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), ()> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        let Some(permit) = self.lookup_permit() else {
+            return Ok(());
+        };
+        let runtime = Arc::clone(self);
+        let executor = tokio::runtime::Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
+            executor.block_on(async move {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                tokio::time::timeout_at(
+                    deadline,
+                    runtime.lookup_with_permit(agent, None, permit, Some(deadline)),
+                )
+                .await
+                .map_err(|_| ())?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                Ok(())
+            })
+        });
+        let _abort = AbortLookupOnDrop(worker.abort_handle());
+        // Dropping a queued worker aborts it. A running synchronous read cannot
+        // be aborted; its permit stays held until it exits, and the deadline
+        // checks below prevent a late read from starting a new exchange.
+        tokio::time::timeout_at(deadline, worker)
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?
     }
 
     /// x0x #1207: start a Lookup for `agent` in the background (the permit
@@ -210,7 +262,7 @@ impl EvidenceRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             if runtime.wait(0).await {
-                runtime.lookup_with_permit(agent, None, permit).await;
+                runtime.lookup_with_permit(agent, None, permit, None).await;
             }
         });
     }
@@ -230,7 +282,7 @@ impl EvidenceRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime
-                .lookup_with_permit(agent, Some(machine), permit)
+                .lookup_with_permit(agent, Some(machine), permit, None)
                 .await;
         });
     }
@@ -248,6 +300,7 @@ impl EvidenceRuntime {
         agent: AgentId,
         machine: Option<MachineId>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        deadline: Option<tokio::time::Instant>,
     ) {
         // Only the raw receive path supplies a transport-authenticated machine.
         // Its claimed agent is a routing hint, never evidence authority.
@@ -259,7 +312,7 @@ impl EvidenceRuntime {
             Some(machine) => self.usable(agent, machine, now),
             None => self.usable_agent(agent, now),
         };
-        if usable.is_some() {
+        if usable.is_some() || deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
             return;
         }
         #[cfg(test)]
@@ -268,7 +321,7 @@ impl EvidenceRuntime {
             return;
         }
         if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
-            context.lookup(agent, permit).await;
+            context.lookup(agent, permit, deadline).await;
         }
     }
     /// Start exactly one background re-verification; invalid files stay untouched.

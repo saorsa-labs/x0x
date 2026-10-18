@@ -371,8 +371,10 @@ impl Context {
         self: Arc<Self>,
         target: AgentId,
         permit: tokio::sync::OwnedSemaphorePermit,
+        send_deadline: Option<Instant>,
     ) {
         let deadline = Instant::now() + DEADLINE;
+        let deadline = send_deadline.map_or(deadline, |send| send.min(deadline));
         let _ = tokio::time::timeout_at(deadline, async {
             let Some(relations) = self.relations() else {
                 return;
@@ -400,6 +402,11 @@ impl Context {
             // A pre-seat send or a disconnected peer must not consume the
             // target cooldown: no Lookup has been sent yet (D30 30b).
             if responders.is_empty() || !self.runtime.wire_limits.claim_target(target) {
+                return;
+            }
+            // Responder selection and policy/cooldown reads may block. A send
+            // worker released after its deadline must not start an exchange.
+            if Instant::now() >= deadline {
                 return;
             }
             // No task queue: at most three exchanges, each also needing the

@@ -173,6 +173,7 @@ pub mod dm_capability_service;
 /// [`direct::DirectMessaging`].
 pub mod dm_inbox;
 
+mod dm_evidence;
 /// Sender-side gossip DM path — envelope construction, publish + retry,
 /// and `InFlightAcks` wait.
 pub mod dm_send;
@@ -7903,15 +7904,30 @@ impl Agent {
         agent: identity::AgentId,
         cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
+        self.connect_from_evidence_inner(agent, cold, None)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn connect_from_evidence_inner(
+        &self,
+        agent: identity::AgentId,
+        cold: ColdResolution,
+        bound: Option<&dm_evidence::SendEvidence<'_>>,
+    ) -> Result<Option<connectivity::ConnectOutcome>, dm::DmError> {
         let nonblocking = cold.opted_in();
         if nonblocking {
             if !self.peer_evidence().ready_now() {
-                return None;
+                return Ok(None);
             }
             self.peer_evidence().spawn_agent_lookup(agent);
+        } else if let Some(bound) = bound {
+            bound.wait(0).await?;
+            bound.lookup().await?;
         } else {
             if !self.peer_evidence().wait(0).await {
-                return None;
+                return Ok(None);
             }
             self.peer_evidence().lookup(agent, None).await;
         }
@@ -7921,21 +7937,28 @@ impl Agent {
                 .try_usable_agent(agent, now)
                 .ok()
                 .flatten()
+        } else if let Some(bound) = bound {
+            bound.usable_agent()?
         } else {
             self.peer_evidence().usable_agent(agent, now)
-        }?;
+        };
+        let Some(view) = view else {
+            return Ok(None);
+        };
         let machine = view.announcement.machine_id;
         if self
             .recipient_pairing_denied(&agent, &machine)
             .await
             .is_some()
         {
-            return None;
+            return Ok(None);
         }
-        let network = self.network.as_ref()?;
+        let Some(network) = self.network.as_ref() else {
+            return Ok(None);
+        };
         let peer = ant_quic::PeerId(machine.0);
         if network.is_connected(&peer).await {
-            return Some(connectivity::ConnectOutcome::AlreadyConnected);
+            return Ok(Some(connectivity::ConnectOutcome::AlreadyConnected));
         }
         let addrs = filter_discovery_announcement_addrs(
             view.announcement.addresses.clone(),
@@ -7947,20 +7970,25 @@ impl Agent {
         )
         .await;
         let now = dm_capability::now_unix_ms();
-        if nonblocking {
+        let still_usable = if nonblocking {
             self.peer_evidence()
                 .try_usable(agent, machine, now)
                 .ok()
-                .flatten()?;
+                .flatten()
+        } else if let Some(bound) = bound {
+            bound.usable(machine)?
         } else {
-            self.peer_evidence().usable(agent, machine, now)?;
+            self.peer_evidence().usable(agent, machine, now)
+        };
+        if still_usable.is_none() {
+            return Ok(None);
         }
-        Some(match result {
+        Ok(Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
                 connectivity::ConnectOutcome::Direct(addr)
             }
             _ => connectivity::ConnectOutcome::Unreachable,
-        })
+        }))
     }
 
     /// ADR 0115 §2: a dial result becomes routing state only
@@ -9682,6 +9710,7 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        let evidence = dm_evidence::SendEvidence::new(self, *to, config.timeout_per_attempt);
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
         // the raw agent key, so the gate must refuse HERE, before any
@@ -9704,12 +9733,9 @@ impl Agent {
         if let Some(machine_id) = {
             // #1239: this preflight read precedes the transport timeouts.
             // A held writer must not keep an ordinary or waiting send open.
-            let cache = tokio::time::timeout(
-                config.timeout_per_attempt,
-                self.identity_discovery_cache.read(),
-            )
-            .await
-            .map_err(|_| Self::pinned_bound_expired("discovery"))?;
+            let cache = evidence
+                .bounded("discovery", self.identity_discovery_cache.read())
+                .await?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
@@ -9755,23 +9781,13 @@ impl Agent {
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
-        let evidence_ready = if advert_binding.is_none() {
-            self.peer_evidence().wait(payload.len()).await
-        } else {
-            true
-        };
-        if advert_binding.is_none() && !evidence_ready {
-            return Err(dm::DmError::RecipientUndiscovered(
-                "peer evidence startup barrier unavailable".into(),
-            ));
-        }
         if advert_binding.is_none() {
-            self.peer_evidence().lookup(*to, None).await;
+            evidence.wait(payload.len()).await?;
+            evidence.lookup().await?;
             advert_binding = self.capability_store.lookup_binding(to);
         }
         let stored_cap = if advert_binding.is_none() {
-            self.peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
+            evidence.usable_agent()?
         } else {
             None
         };
@@ -9815,10 +9831,7 @@ impl Agent {
             (advert_cap, advert_machine, "advert_cache")
         } else if advert_cap.is_none() && stored_cap.is_some() {
             // Re-check after the refresh await; never retain authority across it.
-            match self
-                .peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
-            {
+            match evidence.usable_agent()? {
                 Some(view) => (
                     Some(view.advert.capabilities.clone()),
                     Some(view.announcement.machine_id),
@@ -10007,13 +10020,16 @@ impl Agent {
         }
 
         if cap_source == "peer_evidence" {
-            let _ = self
-                .connect_from_evidence_with(*to, ColdResolution::Off)
-                .await;
-            let still_usable = cap_machine.and_then(|m| {
-                self.peer_evidence()
-                    .usable(*to, m, dm_capability::now_unix_ms())
-            });
+            let _ = evidence
+                .bounded(
+                    "evidence connect",
+                    self.connect_from_evidence_inner(*to, ColdResolution::Off, Some(&evidence)),
+                )
+                .await??;
+            let still_usable = match cap_machine {
+                Some(machine) => evidence.usable(machine)?,
+                None => None,
+            };
             if still_usable.is_none() {
                 return Err(dm::DmError::RecipientUndiscovered(
                     "peer evidence no longer usable".into(),
