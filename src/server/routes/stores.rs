@@ -1219,6 +1219,14 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         let mut group = live.lock().await;
         let info = self.current_info().await?;
         if record.epoch != group.epoch() {
+            // #1427: a record from a later epoch means a missed commit.
+            if record.epoch > group.epoch() {
+                super::named_groups::spawn_treekem_epoch_ahead_catchup(
+                    &state,
+                    &self.group_key,
+                    record.epoch,
+                );
+            }
             return Err(x0x::kv::KvError::SecureRecord(
                 "TreeKEM record epoch is stale or ahead".to_string(),
             ));

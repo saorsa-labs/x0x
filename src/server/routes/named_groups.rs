@@ -11677,6 +11677,85 @@ async fn request_treekem_catchup_page(
     true
 }
 
+/// Most other active members one epoch-ahead observation asks (#1427).
+const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
+
+/// #1427: traffic at a later TreeKEM epoch than the local live group shows
+/// that this member missed a membership commit. The metadata topic stops
+/// redelivery after its schedule, and a member with no later membership
+/// event never reaches the gap catch-up. Ask a few other active members for
+/// a catch-up page on the existing request path. The response handler
+/// applies the served commits with all its usual checks. The shared
+/// per-peer throttle bounds repeats while the gap stays open.
+pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
+    state: &Arc<AppState>,
+    group_id: &str,
+    observed_epoch: u64,
+) {
+    let task_state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let _admitted = state.spawn_detached(async move {
+        request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch).await;
+    });
+}
+
+async fn request_treekem_catchup_for_epoch_ahead(
+    state: &Arc<AppState>,
+    group_id: &str,
+    observed_epoch: u64,
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (key, from_revision, from_epoch, peers) = {
+        let groups = state.named_groups.read().await;
+        let Some((key, info)) = groups.get_key_value(group_id).or_else(|| {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+        }) else {
+            return;
+        };
+        if info.withdrawn || !info.has_active_member(&local_agent_hex) {
+            return;
+        }
+        let mut peers: Vec<AgentId> = info
+            .active_members()
+            .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_agent_hex))
+            .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+            .collect();
+        peers.sort_by_key(|peer| peer.0);
+        peers.dedup();
+        peers.truncate(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS);
+        (key.clone(), info.state_revision, info.secret_epoch, peers)
+    };
+    let Some(local_epoch) = current_treekem_epoch(state, &key).await else {
+        return;
+    };
+    if observed_epoch <= local_epoch {
+        return;
+    }
+    tracing::info!(
+        group_id = %LogHexId::group(&key),
+        local_epoch,
+        observed_epoch,
+        "TreeKEM traffic is ahead of the local epoch; requesting catch-up"
+    );
+    for peer in peers {
+        let peer_hex = hex::encode(peer.as_bytes());
+        let throttle_key = format!("{key}:{peer_hex}:{from_revision}:{from_epoch}");
+        {
+            let mut throttle = state.treekem_catchup_throttle.write().await;
+            if throttle
+                .get(&throttle_key)
+                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+            {
+                continue;
+            }
+            throttle.insert(throttle_key, Instant::now());
+        }
+        let _sent = request_treekem_catchup_page(state, &key, &peer).await;
+    }
+}
+
 /// Issue #205: ask peers that witnessed a member's join for that member's
 /// cached, self-signed `MemberJoined` (carrying the TreeKEM KeyPackage) so a
 /// promoted admin missing the package can recover it. Candidates are the
@@ -31272,7 +31351,7 @@ async fn treekem_group_encrypt_for_actor(
 /// does not invalidate the already-recovered plaintext).
 #[cfg(test)]
 async fn treekem_group_decrypt(
-    state: &AppState,
+    state: &Arc<AppState>,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
@@ -31282,7 +31361,7 @@ async fn treekem_group_decrypt(
 }
 
 async fn treekem_group_decrypt_for_actor(
-    state: &AppState,
+    state: &Arc<AppState>,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
@@ -31344,6 +31423,12 @@ async fn treekem_group_decrypt_for_actor(
     let plaintext = match guard.decrypt_message(&ciphertext) {
         Ok(p) => p,
         Err(e) => {
+            // #1427: a ciphertext from a later epoch means a missed commit.
+            if let Some(observed) = x0x::mls::TreeKemMlsGroup::ciphertext_epoch(&ciphertext)
+                .filter(|observed| *observed > guard.epoch())
+            {
+                spawn_treekem_epoch_ahead_catchup(state, group_id_hex, observed);
+            }
             return bad_request(format!("treekem decrypt failed: {e}"));
         }
     };
@@ -31678,7 +31763,7 @@ pub(in crate::server) async fn secure_group_decrypt(
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
         return treekem_group_decrypt_for_actor(
-            state.as_ref(),
+            &state,
             &id,
             Some(&stable_group_id),
             &req.ciphertext_b64,

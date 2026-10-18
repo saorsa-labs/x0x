@@ -3652,3 +3652,177 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
     );
     Ok(())
 }
+
+/// #1427: a member that missed a removal commit, and sees no later
+/// membership event, asks for catch-up when it gets a later-epoch
+/// ciphertext. The page that a peer serves brings it to the new epoch.
+#[tokio::test]
+async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let admin = &cast.fixture.state;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let admin_id = admin.agent.agent_id();
+    let victim_id = victim.agent.agent_id();
+    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
+    admin
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let removed = remove_named_group_member(
+        State(Arc::clone(admin)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), member_hex)),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        removed.status(),
+        StatusCode::OK,
+        "the admin remove must seal"
+    );
+    let admin_epoch = live_epoch(admin, group_id).await;
+    assert!(
+        admin_epoch > cast.epoch_before,
+        "the removal advances the epoch"
+    );
+    // The victim was offline: it never got the removal.
+    assert_eq!(live_epoch(victim, group_id).await, cast.epoch_before);
+
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ahead = encrypt(admin, group_id, b"after-removal").await?;
+    let (status, _) = treekem_group_decrypt(
+        victim,
+        group_id,
+        None,
+        &base64::engine::general_purpose::STANDARD.encode(&ahead),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the old epoch cannot read");
+    let asked = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .any(|recorded| recorded == group_id.as_bytes())
+    };
+    wait_until(asked).await;
+    assert!(
+        asked(),
+        "a later-epoch ciphertext must start a TreeKEM catch-up request"
+    );
+
+    // The peer serves the request the victim sent; the victim applies it.
+    let request = {
+        let groups = victim.named_groups.read().await;
+        let info = groups.get(group_id).expect("group on the victim");
+        TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.clone(),
+            requester_agent_id: hex::encode(victim_id.as_bytes()),
+            from_revision: info.state_revision,
+            from_treekem_epoch: info.secret_epoch,
+            current_state_hash: info.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        }
+    };
+    handle_treekem_catchup_request(admin, &victim_id, true, request).await;
+    let served = admin
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("the peer serves a catch-up page");
+    let page: TreeKemCatchupResponse = serde_json::from_slice(&served)?;
+    assert!(
+        !page.events.is_empty(),
+        "the page carries the missed removal"
+    );
+    handle_treekem_catchup_response(victim, &admin_id, true, page).await;
+    assert_eq!(
+        live_epoch(victim, group_id).await,
+        admin_epoch,
+        "the returning member reaches the new epoch"
+    );
+    let next = encrypt(admin, group_id, b"caught-up").await?;
+    let (status, body) = treekem_group_decrypt(
+        victim,
+        group_id,
+        None,
+        &base64::engine::general_purpose::STANDARD.encode(&next),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "decrypt after catch-up: {body:?}");
+    Ok(())
+}
+
+/// #1427: a group-store record from a later epoch starts the same catch-up
+/// request. A record from an older epoch does not.
+#[tokio::test]
+async fn epoch_ahead_store_record_requests_catchup() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let info = victim
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .expect("group on the victim")
+        .clone();
+    let protector =
+        crate::server::routes::stores::treekem_task_list_protector(victim, group_id, &info)
+            .expect("shared TreeKEM protector");
+    let store_id = x0x::kv::KvStoreId::new([7; 32]);
+    let record = |epoch: u64| x0x::kv::TreeKemKvStoreRecordV1 {
+        version: 1,
+        group_id: info.stable_group_id().as_bytes().to_vec(),
+        store_id: *store_id.as_bytes(),
+        epoch,
+        reader_only: false,
+        ciphertext: Vec::new(),
+    };
+    let asked = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .len()
+    };
+
+    let stale = protector
+        .open_record(&store_id, &record(cast.epoch_before - 1))
+        .await;
+    assert!(stale.is_err(), "an older-epoch record must not open");
+    // The older-epoch arm spawns nothing, so this reads a settled count.
+    assert_eq!(
+        asked(),
+        0,
+        "an older-epoch record must not request catch-up"
+    );
+
+    let ahead = protector
+        .open_record(&store_id, &record(cast.epoch_before + 1))
+        .await;
+    assert!(ahead.is_err(), "a later-epoch record cannot open yet");
+    wait_until(|| asked() > 0).await;
+    assert!(
+        asked() > 0,
+        "a later-epoch store record must start a TreeKEM catch-up request"
+    );
+    Ok(())
+}

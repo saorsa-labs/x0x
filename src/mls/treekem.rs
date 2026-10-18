@@ -436,6 +436,16 @@ impl TreeKemMlsGroup {
             .map_err(|e| MlsError::DecryptionError(e.to_string()))
     }
 
+    /// The epoch an encoded application ciphertext claims, or `None` when
+    /// the bytes do not decode. The claim is not authenticated, so use it
+    /// only as a hint (#1427: a later epoch starts a catch-up request).
+    #[must_use]
+    pub(crate) fn ciphertext_epoch(ciphertext: &[u8]) -> Option<u64> {
+        decode::<ApplicationCiphertext>(ciphertext, "ciphertext")
+            .ok()
+            .map(|ct| ct.epoch)
+    }
+
     /// The group's current epoch.
     #[must_use]
     pub fn epoch(&self) -> u64 {
