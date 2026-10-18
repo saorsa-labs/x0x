@@ -4,7 +4,7 @@ use super::*;
 use std::task::Poll;
 use std::time::Duration;
 
-async fn agent_in(dir: &std::path::Path) -> Agent {
+async fn agent_in(dir: &std::path::Path) -> error::Result<Agent> {
     Agent::builder()
         .with_machine_key(dir.join("machine.key"))
         .with_agent_key_path(dir.join("agent.key"))
@@ -15,13 +15,13 @@ async fn agent_in(dir: &std::path::Path) -> Agent {
         .with_peer_cache_disabled()
         .build()
         .await
-        .unwrap()
 }
 
 #[tokio::test]
-async fn issue1239_discovery_lock_ends_ordinary_and_waiting_sends_at_the_bound() {
-    let dir = tempfile::tempdir().unwrap();
-    let agent = agent_in(dir.path()).await;
+async fn issue1239_discovery_lock_ends_ordinary_and_waiting_sends_at_the_bound(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let agent = agent_in(dir.path()).await?;
     assert!(agent.network.is_none());
     let recipient = identity::AgentId([0x39; 32]);
     let budget = Duration::from_secs(2);
@@ -63,12 +63,14 @@ async fn issue1239_discovery_lock_ends_ordinary_and_waiting_sends_at_the_bound()
         drop(held);
     }
     agent.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn issue1239_discovery_lock_released_before_bound_preserves_loopback() {
-    let dir = tempfile::tempdir().unwrap();
-    let agent = agent_in(dir.path()).await;
+async fn issue1239_discovery_lock_released_before_bound_preserves_loopback(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let agent = agent_in(dir.path()).await?;
     assert!(agent.network.is_none());
     let recipient = agent.agent_id();
     let held = agent.identity_discovery_cache.write().await;
@@ -80,7 +82,8 @@ async fn issue1239_discovery_lock_released_before_bound_preserves_loopback() {
     tokio::pin!(send);
     assert!(futures::poll!(&mut send).is_pending());
     drop(held);
-    let receipt = send.await.unwrap();
+    let receipt = send.await?;
     assert_eq!(receipt.path, dm::DmPath::Loopback);
     agent.shutdown().await;
+    Ok(())
 }
