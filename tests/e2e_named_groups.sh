@@ -39,7 +39,11 @@ ADIR="/tmp/x0x-ng-alice"
 BDIR="/tmp/x0x-ng-bob"
 CDIR="/tmp/x0x-ng-charlie"
 TS=$(date +%Y%m%d_%H%M%S)_$$
-USER_KEY_PATH="/tmp/x0x-ng-user.key"
+# `x0x user-id create` writes owner.json beside the key (ADR-0036), so the key
+# gets its own directory. A key straight in /tmp left /tmp/owner.json behind
+# and the next run's daemons refused to start ("install is owned by user ...").
+USER_KEY_DIR=$(mktemp -d -t x0x-ng-user.XXXXXX)
+USER_KEY_PATH="$USER_KEY_DIR/user.key"
 AP=""; BP=""; CP=""
 AT=""; BT=""; CT=""
 
@@ -58,7 +62,7 @@ cleanup() {
     return
   fi
   rm -rf "$ADIR" "$BDIR" "$CDIR"
-  rm -f "$USER_KEY_PATH"
+  rm -rf "$USER_KEY_DIR"
 }
 trap cleanup EXIT
 
@@ -126,6 +130,60 @@ BDEL()  { curl_body DELETE "$BT" "$BA$1"; }
 CGET()  { curl_body GET "$CT" "$CA$1"; }
 CPOST() { curl_body POST "$CT" "$CA$1" "${2:-{}}"; }
 CDEL()  { curl_body DELETE "$CT" "$CA$1"; }
+
+# Owner approve with the bounded ADR 0028 B8 retry. Approval answers 412 with
+# one of two exact bodies while the requester's signed JoinRequestCreated is
+# still on its way to the approver. The allowlist is the one in
+# tests/named_group_d4_apply.rs (is_allowlisted_transient_412): status 412,
+# "ok": false and an exact "error" string. Retry only those, for at most 30 s.
+# Any other answer returns at once. A non-zero curl exit (timeout, incomplete
+# transfer) is a transport failure: it is never retried and never passes.
+# APPROVE prints {"curl_exit": E, "http_status": N, "body": <body>} so
+# approve_ok can require curl exit 0 and HTTP 200.
+D4_RETRY_NO_CLOCK="predecessor obligation has no durable first-observation time"
+D4_RETRY_NOT_RECEIVED="predecessor obligation not found — JoinRequestCreated not yet received"
+is_transient_approval_412() {
+  [ "$1" = "412" ] || return 1
+  python3 -c 'import sys,json
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+ok=isinstance(d,dict) and d.get("ok") is False and d.get("error") in (sys.argv[2],sys.argv[3])
+sys.exit(0 if ok else 1)' "$2" "$D4_RETRY_NO_CLOCK" "$D4_RETRY_NOT_RECEIVED"
+}
+APPROVE() {
+  local path=$1 deadline=$((SECONDS + 30)) out rc status body
+  while :; do
+    rc=0
+    out=$(curl -s -m 10 -w '\n%{http_code}' -X POST -H "Authorization: Bearer $AT" \
+      -H "Content-Type: application/json" -d '{}' "$AA$path" 2>/dev/null) || rc=$?
+    status=${out##*$'\n'}; body=${out%$'\n'*}
+    if [ "$rc" -eq 0 ] && [ "$SECONDS" -lt "$deadline" ] && is_transient_approval_412 "$status" "$body"; then
+      sleep 0.25
+      continue
+    fi
+    python3 -c 'import sys,json
+try:
+    s=int(sys.argv[1])
+except ValueError:
+    s=0
+try:
+    b=json.loads(sys.argv[2])
+except Exception:
+    b=sys.argv[2]
+print(json.dumps({"curl_exit":int(sys.argv[3]),"http_status":s,"body":b}))' "$status" "$body" "$rc"
+    return
+  done
+}
+# Success needs curl exit 0, HTTP 200 and "ok": true in the body. Anything
+# else fails.
+approve_ok() {
+  python3 -c 'import sys,json
+d=json.loads(sys.argv[1])
+b=d.get("body")
+sys.exit(0 if d.get("curl_exit")==0 and d.get("http_status")==200 and isinstance(b,dict) and b.get("ok") is True else 1)' "$1" 2>/dev/null
+}
 
 B_STATUS()  { curl_status "${1:-GET}" "$BT" "$BA${2}" "${3:-}"; }
 C_STATUS()  { curl_status "${1:-GET}" "$CT" "$CA${2}" "${3:-}"; }
@@ -355,8 +413,8 @@ STATUS=$(B_STATUS POST "/groups/$GID_PRS_REMOTE/requests" '{"message":"dup"}')
 [ "$STATUS" = "409" ] && ok "P0-5 pub-req: duplicate pending request → 409" || fail "P0-5 duplicate request" "got $STATUS"
 
 # Alice approves.
-R=$(POST /groups/$GID_PRS/requests/$BOB_REQ/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "pub-req: alice approves" || fail "pub-req: approve" "$R"
+R=$(APPROVE /groups/$GID_PRS/requests/$BOB_REQ/approve)
+approve_ok "$R" && ok "pub-req: alice approves" || fail "pub-req: approve" "$R"
 
 # Bob is an active member on alice's daemon.
 BOB_ACTIVE=no
@@ -486,12 +544,12 @@ BOB_REQ=$(jf "$R" "request_id")
 # Wait for alice to see the request.
 for _ in $(seq 1 30); do
   R=$(GET /groups/$GID_D2/requests)
-  P=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$BID'))" 2>/dev/null || echo "0")
-  [ "$P" = "1" ] && break
+  PENDING_N=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$BID'))" 2>/dev/null || echo "0")
+  [ "$PENDING_N" = "1" ] && break
   sleep 1
 done
-R=$(POST /groups/$GID_D2/requests/$BOB_REQ/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2: alice approves bob" || fail "D.2: approve" "$R"
+R=$(APPROVE /groups/$GID_D2/requests/$BOB_REQ/approve)
+approve_ok "$R" && ok "D.2: alice approves bob" || fail "D.2: approve" "$R"
 
 # Wait for bob to receive the secure-share envelope. We probe by trying an
 # encrypt on alice's side and attempting decrypt on bob's side up to 30s.
@@ -538,12 +596,12 @@ done
 [ -n "$CREQ_D2" ] && ok "D.2: charlie submits request" || fail "D.2: charlie submits" "$R"
 for _ in $(seq 1 30); do
   R=$(GET /groups/$GID_D2/requests)
-  P=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$CID'))" 2>/dev/null || echo "0")
-  [ "$P" = "1" ] && break
+  PENDING_N=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$CID'))" 2>/dev/null || echo "0")
+  [ "$PENDING_N" = "1" ] && break
   sleep 1
 done
-R=$(POST /groups/$GID_D2/requests/$CREQ_D2/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2: alice approves charlie" || fail "D.2: approve charlie" "$R"
+R=$(APPROVE /groups/$GID_D2/requests/$CREQ_D2/approve)
+approve_ok "$R" && ok "D.2: alice approves charlie" || fail "D.2: approve charlie" "$R"
 
 # Wait for charlie to receive his shared-secret envelope and verify round-trip.
 info "D.2: waiting for charlie to receive shared secret..."
@@ -658,12 +716,12 @@ if [ -n "$EP" ]; then
   [ -n "$BOB_REQ_ADV" ] && ok "D.2-adv: bob submits" || fail "D.2-adv: bob submits" "$R"
   for _ in $(seq 1 30); do
     R=$(GET /groups/$GID_ADV/requests)
-    P=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$BID'))" 2>/dev/null || echo "0")
-    [ "$P" = "1" ] && break
+    PENDING_N=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('requests',[]) if r.get('status')=='pending' and r.get('requester_agent_id')=='$BID'))" 2>/dev/null || echo "0")
+    [ "$PENDING_N" = "1" ] && break
     sleep 1
   done
-  R=$(POST /groups/$GID_ADV/requests/$BOB_REQ_ADV/approve)
-  [ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "D.2-adv: alice approves bob" || fail "D.2-adv: approve" "$R"
+  R=$(APPROVE /groups/$GID_ADV/requests/$BOB_REQ_ADV/approve)
+  approve_ok "$R" && ok "D.2-adv: alice approves bob" || fail "D.2-adv: approve" "$R"
 
   # ----------------------------------------------------------------------
   # Behavioral denial (non-cryptographic): eve's daemon has no shared secret
@@ -918,8 +976,8 @@ STATUS=$(B_STATUS POST "/groups/$GID_AZ_REMOTE/requests/$CREQ_A/approve")
 PATCH /groups/$GID_AZ/members/$BID/role '{"role":"admin"}' >/dev/null
 sleep 3
 
-R=$(POST /groups/$GID_AZ/requests/$CREQ_A/approve)
-[ "$(jf "$R" "ok")" = "True" ] || [ "$(jf "$R" "ok")" = "true" ] && ok "authz: owner approves (sanity)" || fail "authz: owner approve" "$R"
+R=$(APPROVE /groups/$GID_AZ/requests/$CREQ_A/approve)
+approve_ok "$R" && ok "authz: owner approves (sanity)" || fail "authz: owner approve" "$R"
 
 # P0-5: cancel own request path denied for non-requester.
 # Charlie cannot cancel Bob's (already approved) request — test with new pending one.
