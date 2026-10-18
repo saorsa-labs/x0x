@@ -3826,3 +3826,57 @@ async fn epoch_ahead_store_record_requests_catchup() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1427: one epoch-ahead observation asks at most three peers. The next
+/// observation asks the peers not yet asked, so a reachable fourth peer
+/// (for example the removal's signer) is tried after three silent ones.
+#[test]
+fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
+    let peers: Vec<AgentId> = (1..=5u8).map(|byte| AgentId([byte; 32])).collect();
+    let mut asked: Vec<(AgentId, Instant)> = Vec::new();
+    let last = |asked: &[(AgentId, Instant)], peer: &AgentId| {
+        asked
+            .iter()
+            .find(|(seen, _)| seen == peer)
+            .map(|(_, at)| *at)
+    };
+
+    let first = epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer));
+    assert_eq!(
+        first,
+        peers[..3],
+        "the first observation keeps preference order"
+    );
+    let now = Instant::now();
+    asked.extend(first.iter().map(|peer| (*peer, now)));
+
+    let second = epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer));
+    assert_eq!(
+        second,
+        peers[3..],
+        "the next observation asks the peers outside the first three"
+    );
+    asked.extend(second.iter().map(|peer| (*peer, now)));
+    assert!(
+        epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer)).is_empty(),
+        "every peer is inside the throttle window"
+    );
+
+    // After the window, the least recently asked go first.
+    let older = now
+        .checked_sub(TREEKEM_CATCHUP_THROTTLE * 3)
+        .expect("monotonic clock past three windows");
+    let old = now
+        .checked_sub(TREEKEM_CATCHUP_THROTTLE * 2)
+        .expect("monotonic clock past two windows");
+    let asked: Vec<(AgentId, Instant)> = peers
+        .iter()
+        .enumerate()
+        .map(|(index, peer)| (*peer, if index < 2 { old } else { older }))
+        .collect();
+    assert_eq!(
+        epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer)),
+        peers[2..],
+        "the least recently asked peers are asked first"
+    );
+}

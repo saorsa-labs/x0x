@@ -11686,7 +11686,9 @@ const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
 /// event never reaches the gap catch-up. Ask a few other active members for
 /// a catch-up page on the existing request path. The response handler
 /// applies the served commits with all its usual checks. The shared
-/// per-peer throttle bounds repeats while the gap stays open.
+/// per-peer throttle bounds repeats while the gap stays open, and each
+/// later observation asks the members asked least recently, so every
+/// active member is tried in turn (see [`epoch_ahead_catchup_peers`]).
 pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11717,14 +11719,23 @@ async fn request_treekem_catchup_for_epoch_ahead(
         if info.withdrawn || !info.has_active_member(&local_agent_hex) {
             return;
         }
-        let mut peers: Vec<AgentId> = info
+        // Owner and admins first: they sign membership commits, and only
+        // the signer can deliver a removal whose binding is the legacy
+        // `treekem:epoch=<n>` form (`catchup_may_apply_removed_as_author`).
+        let mut candidates: Vec<(bool, AgentId)> = info
             .active_members()
             .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_agent_hex))
-            .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+            .filter_map(|member| {
+                parse_agent_id_hex(&member.agent_id)
+                    .ok()
+                    .map(|peer| (!member.role.at_least(x0x::groups::GroupRole::Admin), peer))
+            })
             .collect();
-        peers.sort_by_key(|peer| peer.0);
-        peers.dedup();
-        peers.truncate(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS);
+        // `false` sorts first, so admins lead.
+        candidates.sort_by_key(|(not_admin, peer)| (*not_admin, peer.0));
+        let mut seen = HashSet::new();
+        candidates.retain(|(_, peer)| seen.insert(*peer));
+        let peers: Vec<AgentId> = candidates.into_iter().map(|(_, peer)| peer).collect();
         (key.clone(), info.state_revision, info.secret_epoch, peers)
     };
     let Some(local_epoch) = current_treekem_epoch(state, &key).await else {
@@ -11739,21 +11750,43 @@ async fn request_treekem_catchup_for_epoch_ahead(
         observed_epoch,
         "TreeKEM traffic is ahead of the local epoch; requesting catch-up"
     );
-    for peer in peers {
-        let peer_hex = hex::encode(peer.as_bytes());
-        let throttle_key = format!("{key}:{peer_hex}:{from_revision}:{from_epoch}");
-        {
-            let mut throttle = state.treekem_catchup_throttle.write().await;
-            if throttle
-                .get(&throttle_key)
-                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
-            {
-                continue;
-            }
-            throttle.insert(throttle_key, Instant::now());
+    let throttle_key =
+        |peer: &AgentId| format!("{key}:{}:{from_revision}:{from_epoch}", hex::encode(peer.0));
+    let chosen = {
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        let chosen =
+            epoch_ahead_catchup_peers(peers, |peer| throttle.get(&throttle_key(peer)).copied());
+        let now = Instant::now();
+        for peer in &chosen {
+            throttle.insert(throttle_key(peer), now);
         }
+        chosen
+    };
+    for peer in chosen {
         let _sent = request_treekem_catchup_page(state, &key, &peer).await;
     }
+}
+
+/// #1427: the peers one epoch-ahead observation asks. `candidates` is in
+/// preference order. A peer asked inside the throttle window is skipped.
+/// The rest are taken least recently asked first (never asked before
+/// asked), so a later observation moves past offline or stale peers to the
+/// next members instead of asking the same few again.
+fn epoch_ahead_catchup_peers(
+    candidates: Vec<AgentId>,
+    last_asked: impl Fn(&AgentId) -> Option<Instant>,
+) -> Vec<AgentId> {
+    let mut open: Vec<(Option<Instant>, AgentId)> = candidates
+        .into_iter()
+        .map(|peer| (last_asked(&peer), peer))
+        .filter(|(last, _)| last.is_none_or(|last| last.elapsed() >= TREEKEM_CATCHUP_THROTTLE))
+        .collect();
+    // Stable: ties keep the preference order.
+    open.sort_by_key(|(last, _)| *last);
+    open.into_iter()
+        .take(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS)
+        .map(|(_, peer)| peer)
+        .collect()
 }
 
 /// Issue #205: ask peers that witnessed a member's join for that member's
