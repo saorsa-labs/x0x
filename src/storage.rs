@@ -117,7 +117,64 @@ mod w3h_fs {
         }
     }
 
-    pub use tokio::fs::{read_dir, File};
+    pub use tokio::fs::read_dir;
+
+    /// File handle that uses `std::fs` inline under the W3-H shim so durable
+    /// create/write/sync/open do not schedule on the blocking pool (#1245).
+    pub struct File {
+        inner: FileInner,
+    }
+
+    enum FileInner {
+        Std(std::fs::File),
+        Tokio(tokio::fs::File),
+    }
+
+    impl File {
+        pub async fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+            if inline() {
+                Ok(Self {
+                    inner: FileInner::Std(std::fs::File::create(path)?),
+                })
+            } else {
+                Ok(Self {
+                    inner: FileInner::Tokio(tokio::fs::File::create(path).await?),
+                })
+            }
+        }
+
+        pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+            if inline() {
+                Ok(Self {
+                    inner: FileInner::Std(std::fs::File::open(path)?),
+                })
+            } else {
+                Ok(Self {
+                    inner: FileInner::Tokio(tokio::fs::File::open(path).await?),
+                })
+            }
+        }
+
+        pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            match &mut self.inner {
+                FileInner::Std(file) => {
+                    use std::io::Write;
+                    file.write_all(buf)
+                }
+                FileInner::Tokio(file) => {
+                    use tokio::io::AsyncWriteExt;
+                    file.write_all(buf).await
+                }
+            }
+        }
+
+        pub async fn sync_all(&self) -> io::Result<()> {
+            match &self.inner {
+                FileInner::Std(file) => file.sync_all(),
+                FileInner::Tokio(file) => file.sync_all().await,
+            }
+        }
+    }
 }
 
 /// Serialized keypair representation for storage (legacy v1 format).
@@ -1159,6 +1216,9 @@ async fn write_private_bytes_durable_guarded(
     bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
 ) -> std::result::Result<(), DurableWriteError> {
+    // Production uses tokio::fs::File + AsyncWriteExt; test builds use
+    // w3h_fs::File's inherent write_all (inline under the shim).
+    #[cfg(not(test))]
     use tokio::io::AsyncWriteExt;
 
     let parent = path
@@ -3607,6 +3667,59 @@ mod tests {
             result.is_err(),
             "#456 guard must panic when a test would touch the real ~/.x0x"
         );
+    }
+
+    /// #1245: with the W3-H shim env set, durable create/write/sync must
+    /// run inline on the current-thread runtime so an occupied blocking
+    /// pool worker cannot stall the write (same-instant wakeup cause).
+    /// Uses a real-time timeout: a held blocking worker also inhibits
+    /// paused auto-advance, so a virtual sleep cannot detect the stall.
+    #[test]
+    fn write_private_bytes_durable_is_inline_when_shim_env_set() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            // SAFETY: test-only env mutation; restored below.
+            std::env::set_var("W3H_SHIM_ACTIVE", "1");
+            let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = lock_tx.send(());
+                let _ = release_rx.recv();
+            });
+            lock_rx.recv().expect("blocking worker occupied");
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("journal.bin");
+            let timed = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                super::write_private_bytes_durable(&path, vec![1, 2, 3, 4]),
+            )
+            .await;
+            let _ = release_tx.send(());
+            let _ = blocker.await;
+            std::env::remove_var("W3H_SHIM_ACTIVE");
+            let result = timed.expect(
+                "durable write stalled behind the occupied pool worker; \
+                 File::create/write/sync must be inline under W3H_SHIM_ACTIVE=1",
+            );
+            result.expect("inline durable write");
+            let bytes = fs::read(&path).await.expect("read back");
+            assert_eq!(bytes, vec![1, 2, 3, 4]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path)
+                    .await
+                    .expect("metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "journal bytes are private");
+            }
+        });
     }
 
     /// Review r3 (PR #465 item 1): the durable journal write is

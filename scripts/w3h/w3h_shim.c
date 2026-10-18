@@ -26,7 +26,7 @@
  *  2. Wall clock. clock_gettime(CLOCK_REALTIME*) returns 2026-01-01T00:00:00Z
  *     plus the harness's virtual time. Prefer w3h_shim_set_virt_time_ns_fn():
  *     each clock_gettime pulls the current virtual offset, so a time jump is
- *     visible to every task without a 1 ms ticker race (#1245). 
+ *     visible to every task without a 1 ms ticker race (#1245).
  *     w3h_shim_set_wall_offset_ns() remains as a push fallback when no pull
  *     fn is registered. CLOCK_MONOTONIC is NOT changed: kernel waits with
  *     absolute monotonic deadlines (futex, condvars) keep real time.

@@ -95,26 +95,55 @@ struct Shim {
 /// Why the shim is not controlling this process (recorded in the trace).
 const SHIM_NOT_LOADED: &str = "shim not preloaded";
 
-/// Virtual-time origin for the shim's pull-based CLOCK_REALTIME (#1245).
-/// Set when a scenario starts; cleared in [`Sim::finish`].
-static VIRT_ORIGIN: std::sync::Mutex<Option<tokio::time::Instant>> = std::sync::Mutex::new(None);
+/// Owning scenario clock for the shim's pull-based CLOCK_REALTIME (#1245).
+/// Holds the fabric origin and the runtime [`Handle`] that owns the paused
+/// clock. Set when a scenario starts; cleared in [`Sim::finish`].
+struct VirtClock {
+    origin: tokio::time::Instant,
+    handle: tokio::runtime::Handle,
+}
 
-/// C ABI callback: nanoseconds since [`VIRT_ORIGIN`] at the current paused
-/// instant. Used by `w3h_shim_set_virt_time_ns_fn` so every `clock_gettime`
-/// sees the same virtual now without a ticker task.
+static VIRT_CLOCK: std::sync::Mutex<Option<VirtClock>> = std::sync::Mutex::new(None);
+
+/// C ABI callback: nanoseconds since the scenario origin at the current
+/// paused instant. Enters the owning runtime so a plain OS thread (no
+/// tokio context) still reads virtual time, not real monotonic time.
 unsafe extern "C" fn virt_offset_ns() -> u64 {
-    let Ok(guard) = VIRT_ORIGIN.lock() else {
+    let Ok(guard) = VIRT_CLOCK.lock() else {
         return 0;
     };
-    let Some(start) = *guard else {
+    let Some(clock) = guard.as_ref() else {
         return 0;
     };
+    let origin = clock.origin;
+    let handle = clock.handle.clone();
+    drop(guard);
+    let _enter = handle.enter();
     u64::try_from(
         tokio::time::Instant::now()
-            .saturating_duration_since(start)
+            .saturating_duration_since(origin)
             .as_nanos(),
     )
     .unwrap_or(u64::MAX)
+}
+
+/// Test helper: install the pull origin on the current runtime.
+#[cfg(test)]
+pub(super) fn install_virt_clock_for_test(origin: tokio::time::Instant) {
+    *VIRT_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(VirtClock {
+        origin,
+        handle: tokio::runtime::Handle::current(),
+    });
+}
+
+/// Test helper: clear the pull origin.
+#[cfg(test)]
+pub(super) fn clear_virt_clock_for_test() {
+    *VIRT_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 impl Shim {
@@ -223,18 +252,21 @@ impl Shim {
     /// Pull-based wall clock: every `clock_gettime(CLOCK_REALTIME)` reads
     /// the current paused instant relative to `origin` (#1245).
     fn install_virt_time(self, origin: tokio::time::Instant) {
-        *VIRT_ORIGIN
+        *VIRT_CLOCK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(origin);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(VirtClock {
+            origin,
+            handle: tokio::runtime::Handle::current(),
+        });
         // SAFETY: `virt_offset_ns` matches the shim's C ABI; it only locks
-        // `VIRT_ORIGIN` and reads tokio's paused clock.
+        // `VIRT_CLOCK`, enters the owning handle, and reads the paused clock.
         unsafe { (self.set_virt_time_ns_fn)(Some(virt_offset_ns)) }
     }
 
     fn clear_virt_time(self) {
         // SAFETY: clearing the pull fn is a plain atomic store in the shim.
         unsafe { (self.set_virt_time_ns_fn)(None) }
-        *VIRT_ORIGIN
+        *VIRT_CLOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }

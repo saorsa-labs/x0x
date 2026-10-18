@@ -17,7 +17,7 @@
 #![cfg(test)]
 
 use super::*;
-use anyhow::ensure;
+use anyhow::{bail, ensure};
 use base64::Engine as _;
 use serde_json::json;
 
@@ -223,9 +223,7 @@ async fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
     let origin = tokio::time::Instant::now();
-    *super::VIRT_ORIGIN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(origin);
+    super::install_virt_clock_for_test(origin);
     // SAFETY: same callback the shim invokes on every clock_gettime.
     let before = unsafe { super::virt_offset_ns() };
     ensure!(
@@ -233,14 +231,62 @@ async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
         "offset at origin should be ~0 ns, got {before}"
     );
     tokio::time::advance(Duration::from_secs(5)).await;
-    let after = unsafe { super::virt_offset_ns() };
-    *super::VIRT_ORIGIN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let after_runtime = unsafe { super::virt_offset_ns() };
+    // Plain OS thread: must enter the owning runtime Handle, not read real time.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: same C ABI callback the shim calls from any thread.
+        let _ = tx.send(unsafe { super::virt_offset_ns() });
+    });
+    let after_os = rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("OS-thread callback did not return"))?;
+    super::clear_virt_clock_for_test();
     let expected = Duration::from_secs(5).as_nanos() as u64;
+    for (label, after) in [("runtime", after_runtime), ("os-thread", after_os)] {
+        ensure!(
+            after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
+            "pull offset after 5s jump on {label} should be ~{expected} ns, got {after}"
+        );
+    }
+    Ok(())
+}
+
+/// #1245: on Linux with the shim preloaded, `SystemTime::now()` must follow
+/// the pull callback after a virtual jump (no separate wall-offset push).
+/// When the shim env is set but detection fails, this fails so registration
+/// or interposition bugs cannot hide. Without the shim env (coverage), skip.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H wall-clock shim is Linux LD_PRELOAD only"
+)]
+async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
+    let shim_env =
+        std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let shim = match super::Shim::detect() {
+        Ok(shim) => shim,
+        Err(reason) if !shim_env => {
+            eprintln!("W3H-SKIP system_time_via_shim: {reason}");
+            return Ok(());
+        }
+        Err(reason) => {
+            bail!("W3H_SHIM_ACTIVE=1 but shim detect failed: {reason}");
+        }
+    };
+    let origin = tokio::time::Instant::now();
+    let wall_before = std::time::SystemTime::now();
+    shim.install_virt_time(origin);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    let wall_after = std::time::SystemTime::now();
+    shim.clear_virt_time();
+    let elapsed = wall_after
+        .duration_since(wall_before)
+        .map_err(|e| anyhow::anyhow!("SystemTime went backwards: {e}"))?;
     ensure!(
-        after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
-        "pull offset after 5s jump should be ~{expected} ns, got {after} (stale ticker would lag)"
+        elapsed >= Duration::from_secs(599) && elapsed <= Duration::from_secs(601),
+        "SystemTime::now() after 600s virtual jump should advance ~600s, got {elapsed:?} \
+         (registration/interposition failure would leave real wall time)"
     );
     Ok(())
 }
