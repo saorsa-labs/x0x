@@ -1,0 +1,80 @@
+name: GPP deterministic proof
+on:
+  push:
+    branches: [codex/gpp-suppressed-deterministic]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, barriers-delayed, fixed, fixed-delayed]
+    env:
+      GPP_MODE: ${{ matrix.mode }}
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set evidence paths
+        run: |
+          evidence="$HOME/x0x-codex/evidence/gpp-${{ github.run_id }}-${{ matrix.mode }}"
+          mkdir -p "$evidence/scratch"
+          echo "GPP_EVIDENCE=$evidence" >> "$GITHUB_ENV"
+          echo "RUNNER_TEMP=$evidence/scratch" >> "$GITHUB_ENV"
+          echo "TMPDIR=$evidence/scratch" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: llvm-tools-preview,clippy,rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144,cargo-llvm-cov
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: gpp-registry-${{ hashFiles('Cargo.lock') }}
+      - name: Instrument diagnostics
+        run: python3 .planning-gpp-proof.py
+      - name: Stress under coverage and isolation
+        run: |
+          cargo llvm-cov show-env --sh > "$GPP_EVIDENCE/coverage-env.sh"
+          source "$GPP_EVIDENCE/coverage-env.sh"
+          count=100
+          if [[ "$GPP_MODE" == *delayed ]]; then count=20; fi
+          set +e
+          bash scripts/ci/nextest-isolated.sh --locked --all-features --lib -- --no-fail-fast --retries 0 --stress-count "$count" --test-threads 1 -E 'test(=tests::gossip_plane_peers_excludes_suppressed_transport_connected_peer) | test(=tests::suppressed_peer_inbound_redial_is_rejected)' --success-output final > "$GPP_EVIDENCE/stress.log" 2>&1
+          result=$?
+          echo "$result" > "$GPP_EVIDENCE/stress-exit.txt"
+          tail -60 "$GPP_EVIDENCE/stress.log"
+          if [[ "$GPP_MODE" == fixed* ]]; then exit "$result"; fi
+      - name: Full crate nextest without exclusions
+        if: always() && matrix.mode == 'fixed'
+        run: |
+          git restore src/lib.rs
+          source "$GPP_EVIDENCE/coverage-env.sh"
+          set +e
+          bash scripts/ci/nextest-isolated.sh --locked --all-features --workspace -- --no-fail-fast --retries 0 > "$GPP_EVIDENCE/full-nextest.log" 2>&1
+          result=$?
+          echo "$result" > "$GPP_EVIDENCE/full-exit.txt"
+          tail -80 "$GPP_EVIDENCE/full-nextest.log"
+          exit "$result"
+      - name: Format and clippy
+        if: always() && matrix.mode == 'fixed'
+        run: |
+          git restore src/lib.rs
+          cargo fmt --all -- --check > "$GPP_EVIDENCE/fmt.log" 2>&1
+          cargo clippy --locked --workspace --all-features --all-targets -- -D warnings > "$GPP_EVIDENCE/clippy.log" 2>&1
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: gpp-${{ matrix.mode }}
+          path: ~/x0x-codex/evidence/
+          retention-days: 30
