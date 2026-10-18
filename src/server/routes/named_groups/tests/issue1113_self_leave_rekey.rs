@@ -3652,3 +3652,642 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
     );
     Ok(())
 }
+
+/// #1427: a member that missed a removal commit, and sees no later
+/// membership event, asks for catch-up when it gets a later-epoch
+/// ciphertext. The page that a peer serves brings it to the new epoch.
+#[tokio::test]
+async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let admin = &cast.fixture.state;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let admin_id = admin.agent.agent_id();
+    let victim_id = victim.agent.agent_id();
+    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
+    admin
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let removed = remove_named_group_member(
+        State(Arc::clone(admin)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), member_hex)),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        removed.status(),
+        StatusCode::OK,
+        "the admin remove must seal"
+    );
+    let admin_epoch = live_epoch(admin, group_id).await;
+    assert!(
+        admin_epoch > cast.epoch_before,
+        "the removal advances the epoch"
+    );
+    // The victim was offline: it never got the removal.
+    assert_eq!(live_epoch(victim, group_id).await, cast.epoch_before);
+
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ahead = encrypt(admin, group_id, b"after-removal").await?;
+    let (status, _) = treekem_group_decrypt(
+        victim,
+        group_id,
+        None,
+        &base64::engine::general_purpose::STANDARD.encode(&ahead),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the old epoch cannot read");
+    let asked = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .any(|recorded| recorded == group_id.as_bytes())
+    };
+    wait_until(asked).await;
+    assert!(
+        asked(),
+        "a later-epoch ciphertext must start a TreeKEM catch-up request"
+    );
+
+    // The peer serves the request the victim sent; the victim applies it.
+    let request = {
+        let groups = victim.named_groups.read().await;
+        let info = groups.get(group_id).expect("group on the victim");
+        TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.clone(),
+            requester_agent_id: hex::encode(victim_id.as_bytes()),
+            from_revision: info.state_revision,
+            from_treekem_epoch: info.secret_epoch,
+            current_state_hash: info.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        }
+    };
+    handle_treekem_catchup_request(admin, &victim_id, true, request).await;
+    let served = admin
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("the peer serves a catch-up page");
+    let page: TreeKemCatchupResponse = serde_json::from_slice(&served)?;
+    assert!(
+        !page.events.is_empty(),
+        "the page carries the missed removal"
+    );
+    handle_treekem_catchup_response(victim, &admin_id, true, page).await;
+    assert_eq!(
+        live_epoch(victim, group_id).await,
+        admin_epoch,
+        "the returning member reaches the new epoch"
+    );
+    let next = encrypt(admin, group_id, b"caught-up").await?;
+    let (status, body) = treekem_group_decrypt(
+        victim,
+        group_id,
+        None,
+        &base64::engine::general_purpose::STANDARD.encode(&next),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "decrypt after catch-up: {body:?}");
+    Ok(())
+}
+
+/// #1427: a group-store record from a later epoch starts the same catch-up
+/// request. A record from an older epoch does not.
+#[tokio::test]
+async fn epoch_ahead_store_record_requests_catchup() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let info = victim
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .expect("group on the victim")
+        .clone();
+    let protector =
+        crate::server::routes::stores::treekem_task_list_protector(victim, group_id, &info)
+            .expect("shared TreeKEM protector");
+    let store_id = x0x::kv::KvStoreId::new([7; 32]);
+    let record = |epoch: u64| x0x::kv::TreeKemKvStoreRecordV1 {
+        version: 1,
+        group_id: info.stable_group_id().as_bytes().to_vec(),
+        store_id: *store_id.as_bytes(),
+        epoch,
+        reader_only: false,
+        ciphertext: Vec::new(),
+    };
+    let asked = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .len()
+    };
+
+    let stale = protector
+        .open_record(&store_id, &record(cast.epoch_before - 1))
+        .await;
+    assert!(stale.is_err(), "an older-epoch record must not open");
+    // The older-epoch arm spawns nothing, so this reads a settled count.
+    assert_eq!(
+        asked(),
+        0,
+        "an older-epoch record must not request catch-up"
+    );
+
+    let ahead = protector
+        .open_record(&store_id, &record(cast.epoch_before + 1))
+        .await;
+    assert!(ahead.is_err(), "a later-epoch record cannot open yet");
+    wait_until(|| asked() > 0).await;
+    assert!(
+        asked() > 0,
+        "a later-epoch store record must start a TreeKEM catch-up request"
+    );
+    Ok(())
+}
+
+/// #1427: one epoch-ahead observation asks at most three peers. The next
+/// observation asks the peers not yet asked, so a reachable fourth peer
+/// (for example the removal's signer) is tried after three silent ones.
+#[test]
+fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
+    let peers: Vec<AgentId> = (1..=5u8).map(|byte| AgentId([byte; 32])).collect();
+    let mut asked: Vec<(AgentId, Instant)> = Vec::new();
+    let last = |asked: &[(AgentId, Instant)], peer: &AgentId| {
+        asked
+            .iter()
+            .find(|(seen, _)| seen == peer)
+            .map(|(_, at)| *at)
+    };
+
+    let first = epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer));
+    assert_eq!(
+        first,
+        peers[..3],
+        "the first observation keeps preference order"
+    );
+    let now = Instant::now();
+    asked.extend(first.iter().map(|peer| (*peer, now)));
+
+    let second = epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer));
+    assert_eq!(
+        second,
+        peers[3..],
+        "the next observation asks the peers outside the first three"
+    );
+    asked.extend(second.iter().map(|peer| (*peer, now)));
+    assert!(
+        epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer)).is_empty(),
+        "every peer is inside the throttle window"
+    );
+
+    // After the window, the least recently asked go first.
+    let older = now
+        .checked_sub(TREEKEM_CATCHUP_THROTTLE * 3)
+        .expect("monotonic clock past three windows");
+    let old = now
+        .checked_sub(TREEKEM_CATCHUP_THROTTLE * 2)
+        .expect("monotonic clock past two windows");
+    let asked: Vec<(AgentId, Instant)> = peers
+        .iter()
+        .enumerate()
+        .map(|(index, peer)| (*peer, if index < 2 { old } else { older }))
+        .collect();
+    assert_eq!(
+        epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer)),
+        peers[2..],
+        "the least recently asked peers are asked first"
+    );
+}
+
+/// #1427 (Codex RC2): one later-epoch record, then silence. The three
+/// members asked first never answer and the signer ranks fourth. The
+/// single observation must still go on to the signer, with no further
+/// traffic to start a new request.
+#[tokio::test]
+async fn single_epoch_ahead_observation_reaches_the_fourth_ranked_signer() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let signer_hex = hex::encode(signer.as_bytes());
+    // Admins rank first by agent id, so these three rank before the signer.
+    let silent: Vec<AgentId> = (1..=3u8)
+        .map(|last| {
+            let mut id = [0u8; 32];
+            id[31] = last;
+            AgentId(id)
+        })
+        .collect();
+    {
+        let mut groups = victim.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on the victim");
+        for peer in &silent {
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(signer_hex.clone()),
+                None,
+            );
+        }
+    }
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, cast.epoch_before + 1);
+
+    let asked = |peer: &AgentId| {
+        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+        let throttle = victim.treekem_catchup_throttle.try_read();
+        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix)))
+    };
+    wait_until(|| asked(&signer)).await;
+    for peer in &silent {
+        assert!(asked(peer), "the first round asks the three silent admins");
+    }
+    assert!(
+        asked(&signer),
+        "one observation must go on to the fourth-ranked signer"
+    );
+    assert!(
+        asked(&cast.fixture.member_id) && asked(&cast.member_b),
+        "the later round asks the remaining members too"
+    );
+    Ok(())
+}
+
+/// #1427 (Codex RC3): a recovery for epoch e+1 asks every member. An
+/// e+2 record then arrives, with every member inside the throttle
+/// window. A delayed, terminal page that serves only e+1 then arrives.
+/// The e+2 observation must not be lost: the recovery must ask again from
+/// e+1.
+#[tokio::test]
+async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let admin = &cast.fixture.state;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let admin_id = admin.agent.agent_id();
+    let victim_id = victim.agent.agent_id();
+    admin
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let remove = |member: AgentId| {
+        remove_named_group_member(
+            State(Arc::clone(admin)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((group_id.clone(), hex::encode(member.as_bytes()))),
+        )
+    };
+    let removed = remove(cast.fixture.member_id).await.into_response();
+    assert_eq!(removed.status(), StatusCode::OK, "the first remove seals");
+    let first_epoch = live_epoch(admin, group_id).await;
+
+    // The page a peer at the first epoch serves; it arrives late.
+    let request = {
+        let groups = victim.named_groups.read().await;
+        let info = groups.get(group_id).expect("group on the victim");
+        TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.clone(),
+            requester_agent_id: hex::encode(victim_id.as_bytes()),
+            from_revision: info.state_revision,
+            from_treekem_epoch: info.secret_epoch,
+            current_state_hash: info.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        }
+    };
+    handle_treekem_catchup_request(admin, &victim_id, true, request).await;
+    let served = admin
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("the peer serves a catch-up page");
+    let late_page: TreeKemCatchupResponse = serde_json::from_slice(&served)?;
+
+    let removed = remove(cast.member_b).await.into_response();
+    assert_eq!(removed.status(), StatusCode::OK, "the second remove seals");
+    let second_epoch = live_epoch(admin, group_id).await;
+    assert!(second_epoch > first_epoch && first_epoch > cast.epoch_before);
+
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let sent = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|recorded| *recorded == group_id.as_bytes())
+            .count()
+    };
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, first_epoch);
+    wait_until(|| sent() >= 3).await;
+    assert_eq!(sent(), 3, "the first round asks all three members");
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, second_epoch);
+    let target = || {
+        victim
+            .treekem_epoch_ahead_targets
+            .try_lock()
+            .ok()
+            .and_then(|targets| targets.get(group_id).map(|target| target.epoch))
+    };
+    wait_until(|| target() == Some(second_epoch)).await;
+    assert_eq!(
+        target(),
+        Some(second_epoch),
+        "the running recovery takes the newer epoch"
+    );
+
+    handle_treekem_catchup_response(victim, &admin_id, true, late_page).await;
+    assert_eq!(
+        live_epoch(victim, group_id).await,
+        first_epoch,
+        "the late page brings only the older epoch"
+    );
+    let before = sent();
+    tokio::time::pause();
+    wait_until(|| sent() > before).await;
+    assert!(
+        sent() > before,
+        "the recovery must go on asking for the newer epoch"
+    );
+    Ok(())
+}
+
+/// #1427 (Codex RC4): the last round of a recovery asks the signer, which
+/// is offline. The signer then comes back and sends one record at the
+/// same missed epoch, after that attempt and before the round ends. The
+/// observation changes no target epoch, but it must not be lost: the
+/// recovery must ask the signer again, with no further traffic.
+#[tokio::test]
+async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let missed = cast.epoch_before + 1;
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let sent = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|recorded| *recorded == group_id.as_bytes())
+            .count()
+    };
+    // The throttle uses the wall clock, which paused time does not move.
+    // Removing a peer's entry stands for its throttle window passing.
+    let expire = |throttle: &mut HashMap<String, Instant>, peer: &AgentId| {
+        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+        throttle.retain(|key, _| !key.starts_with(&prefix));
+    };
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, missed);
+    wait_until(|| sent() >= 3).await;
+    assert_eq!(sent(), 3, "the first round asks all three members");
+
+    // Halfway between the rounds before the last one and the last one.
+    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 2) + TREEKEM_CATCHUP_THROTTLE / 2)
+        .await;
+    assert_eq!(sent(), 3, "the middle rounds find every member throttled");
+    // Hold the throttle so the last round stops after it reads its target.
+    let mut throttle = victim.treekem_catchup_throttle.write().await;
+    expire(&mut throttle, &signer);
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+    // Hold the targets so the last round stops before it ends.
+    let mut targets = victim.treekem_epoch_ahead_targets.lock().await;
+    drop(throttle);
+    wait_until(|| sent() >= 4).await;
+    assert_eq!(sent(), 4, "the last round asks the offline signer");
+
+    // The signer is back and sends one record at the same epoch.
+    assert!(
+        !note_epoch_ahead_observation(&mut targets, group_id, missed),
+        "the running recovery takes the observation"
+    );
+    expire(&mut *victim.treekem_catchup_throttle.write().await, &signer);
+    drop(targets);
+
+    wait_until(|| sent() > 4).await;
+    assert!(
+        sent() > 4,
+        "a same-epoch observation in the last round must start a new request"
+    );
+    let asked_signer = {
+        let prefix = format!("{group_id}:{}:", hex::encode(signer.as_bytes()));
+        victim
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .keys()
+            .any(|key| key.starts_with(&prefix))
+    };
+    assert!(asked_signer, "the new request asks the signer");
+    Ok(())
+}
+
+/// #1427 (Codex RC5): six candidates, three per round. The penultimate
+/// round asks the signer, which is offline. The signer then comes back
+/// and sends one record at the same missed epoch. The last round asks
+/// only other members. The observation must not be lost: the recovery
+/// must ask the signer again, with no further traffic.
+#[tokio::test]
+async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let signer_hex = hex::encode(signer.as_bytes());
+    let missed = cast.epoch_before + 1;
+    // Admins rank first by agent id, so these three rank before the signer.
+    let silent: Vec<AgentId> = (1..=3u8)
+        .map(|last| {
+            let mut id = [0u8; 32];
+            id[31] = last;
+            AgentId(id)
+        })
+        .collect();
+    {
+        let mut groups = victim.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on the victim");
+        for peer in &silent {
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(signer_hex.clone()),
+                None,
+            );
+        }
+    }
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let sent = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|recorded| *recorded == group_id.as_bytes())
+            .count()
+    };
+    let prefix = |peer: &AgentId| format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+    // The throttle uses the wall clock, which paused time does not move.
+    // Removing a peer's entry stands for its throttle window passing.
+    let expire = |peers: &[AgentId]| {
+        let mut throttle = victim
+            .treekem_catchup_throttle
+            .try_write()
+            .expect("no round holds the throttle");
+        throttle.retain(|key, _| !peers.iter().any(|peer| key.starts_with(&prefix(peer))));
+    };
+    let asked = |peer: &AgentId| {
+        let throttle = victim.treekem_catchup_throttle.try_read();
+        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix(peer))))
+    };
+    let others: Vec<AgentId> = silent
+        .iter()
+        .copied()
+        .chain([cast.fixture.member_id, cast.member_b])
+        .collect();
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, missed);
+    wait_until(|| sent() >= 6).await;
+    assert_eq!(sent(), 6, "the first two rounds ask all six members");
+    assert!(asked(&signer), "the second round asks the signer");
+
+    // Between the third and fourth rounds after the first ask.
+    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 4) + TREEKEM_CATCHUP_THROTTLE / 2)
+        .await;
+    assert_eq!(sent(), 6, "the middle rounds find every member throttled");
+    expire(&[signer]);
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+    assert_eq!(sent(), 7, "the penultimate round asks the offline signer");
+
+    // The signer is back and sends one record at the same epoch.
+    assert!(
+        !note_epoch_ahead_observation(
+            &mut *victim.treekem_epoch_ahead_targets.lock().await,
+            group_id,
+            missed,
+        ),
+        "the running recovery takes the observation"
+    );
+    // The last round finds the signer still inside its window.
+    expire(&others);
+    wait_until(|| sent() >= 10).await;
+    assert_eq!(sent(), 10, "the last round asks three other members");
+
+    expire(&[signer]);
+    wait_until(|| asked(&signer)).await;
+    assert!(
+        asked(&signer),
+        "the recovery must ask the signer again after its observation"
+    );
+    Ok(())
+}
+
+/// #1427 (Codex RC3): the signer ranks after twenty silent admins, so
+/// past six rounds of three. One observation must still reach it.
+#[tokio::test]
+async fn single_epoch_ahead_observation_asks_every_candidate() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let signer_hex = hex::encode(signer.as_bytes());
+    let silent: Vec<AgentId> = (1..=20u8)
+        .map(|last| {
+            let mut id = [0u8; 32];
+            id[31] = last;
+            AgentId(id)
+        })
+        .collect();
+    {
+        let mut groups = victim.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on the victim");
+        for peer in &silent {
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(signer_hex.clone()),
+                None,
+            );
+        }
+    }
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, cast.epoch_before + 1);
+
+    let asked = |peer: &AgentId| {
+        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+        let throttle = victim.treekem_catchup_throttle.try_read();
+        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix)))
+    };
+    let everyone: Vec<AgentId> = silent
+        .iter()
+        .copied()
+        .chain([signer, cast.fixture.member_id, cast.member_b])
+        .collect();
+    wait_until(|| everyone.iter().all(&asked)).await;
+    assert!(
+        asked(&signer),
+        "one observation must go on to the signer ranked 21st"
+    );
+    for peer in &everyone {
+        assert!(asked(peer), "every candidate is asked");
+    }
+    Ok(())
+}
