@@ -1,7 +1,7 @@
 name: GPP deterministic proof
 on:
   push:
-    branches: [codex/gpp-suppressed-deterministic]
+    branches: [codex/gpp-proof-custody]
 permissions:
   contents: read
 jobs:
@@ -45,6 +45,7 @@ jobs:
         run: python3 .planning-gpp-proof.py
       - name: Stress under coverage and isolation
         run: |
+          export RUNNER_TEMP="$GPP_EVIDENCE/scratch"
           cargo llvm-cov show-env --sh > "$GPP_EVIDENCE/coverage-env.sh"
           source "$GPP_EVIDENCE/coverage-env.sh"
           count=100
@@ -58,6 +59,7 @@ jobs:
       - name: Full crate nextest without exclusions
         if: always() && matrix.mode == 'fixed'
         run: |
+          export RUNNER_TEMP="$GPP_EVIDENCE/scratch"
           git restore src/lib.rs
           source "$GPP_EVIDENCE/coverage-env.sh"
           set +e
