@@ -25,6 +25,13 @@
 //!   first catch-up round reaches nobody. The single write gives one
 //!   observation, so that observation must move on to the signer.
 //!
+//! From V's restart until the preconditions are witnessed, every
+//! application frame toward V is held (dropped). Only transport links form.
+//! While held, the case reads the epoch V loaded from disk, waits for V to
+//! connect to the signer, takes the decoys off the fabric, and reads V's
+//! epoch again. Both reads must be e. Then the hold ends and the signer
+//! writes. The case records the first poll at which V is past e.
+//!
 //! GREEN: V's live TreeKEM epoch reaches the signer's, then V reads a
 //! value the signer writes and the signer reads a value V writes. RED (the
 //! issue on `main`): V stays at epoch e for the whole bound and the signer
@@ -93,6 +100,47 @@ fn on_topic(write: &Write, topic: &str) -> bool {
     write.lane.class == LaneClass::PubSub
         && !contains(&write.bytes, DM_TOPIC_MARKER)
         && contains(&write.bytes, topic.as_bytes())
+}
+
+/// Drops application frames (direct, relayed DM, pubsub, bulk, stream)
+/// toward `target` while held, and counts them. Transport links still form.
+struct InboundHold {
+    held: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl InboundHold {
+    fn install(sim: &Sim, target: &str) -> Result<Self> {
+        let machine = sim.peer(target)?.0;
+        let held = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            let application = matches!(
+                write.lane.class,
+                LaneClass::Direct
+                    | LaneClass::RelayedDm
+                    | LaneClass::PubSub
+                    | LaneClass::Bulk
+                    | LaneClass::Stream(_)
+            );
+            if rule_held.load(Ordering::SeqCst) && write.lane.dst == machine && application {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        Ok(Self { held, dropped })
+    }
+
+    fn set(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
 }
 
 /// Drops metadata-topic frames toward `target` while held, and counts them.
@@ -309,6 +357,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .at_instant("read metadata topic", metadata_topic(sim, "O", &group))
         .await??;
     let metadata = TopicBlock::install(sim, "V", &topic)?;
+    let hold = InboundHold::install(sim, "V")?;
     sim.stop("V", RestartMode::Crash).await?;
     metadata.set(true);
     let (status, removed) = sim
@@ -334,7 +383,15 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         async { tokio::time::sleep(OFFLINE).await },
     )
     .await?;
+    // Hold V's application traffic until the preconditions are witnessed,
+    // so nothing can move V past e before the deliberate write.
+    hold.set(true);
     sim.start_again("V").await?;
+    let loaded = epoch(sim, "V", &group).await?;
+    ensure!(
+        loaded == e,
+        "INFRA: V loaded epoch {loaded} from disk, not the persisted epoch {e}"
+    );
     mesh(sim, labels).await?;
     sim.until("V is connected to the signer", SETUP, async |s: &Sim| {
         connected_to(s, "V", signer).await
@@ -345,21 +402,41 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     for decoy in &decoys {
         sim.set_online(decoy, false)?;
     }
+    for decoy in &decoys {
+        let peer = sim.peer(decoy)?;
+        ensure!(
+            sim.fabric().is_online(&peer) == Some(false),
+            "INFRA: decoy {decoy} is still on the fabric"
+        );
+        ensure!(
+            sees_admin(sim, "V", &group, decoy).await?,
+            "INFRA: V does not list decoy {decoy} as an admin candidate"
+        );
+    }
     let restarted = epoch(sim, "V", &group).await?;
     ensure!(
         restarted == e,
-        "INFRA: V restarted at epoch {restarted}, not the persisted epoch {e}"
+        "INFRA: V left epoch {e} for {restarted} while its traffic was held"
     );
     let reopened = open_store(sim, "V", &group).await?;
     ensure!(reopened == store, "V reopened {reopened}, expected {store}");
+    let held_frames = hold.dropped();
+    hold.set(false);
+    ensure!(
+        connected_to(sim, "V", signer).await,
+        "INFRA: V lost its link to the signer during the hold"
+    );
     let back = sim
         .fabric()
         .mark_indexed("case: V is back at epoch e; the signer is at e+1");
     receipt.setup_done(at(sim));
     receipt.evidence(
         "returning_member_missed_the_removal",
-        restarted == e && ahead > e,
-        format!("V={restarted} {signer}={ahead} e={e}"),
+        loaded == e && restarted == e && ahead > e,
+        format!(
+            "V loaded={loaded} V before release={restarted} {signer}={ahead} e={e} \
+             frames held toward V={held_frames}"
+        ),
         at(sim),
     );
     if arm == Arm::SignerAfterThreeOfflineAdmins {
@@ -376,13 +453,28 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // One later-epoch write, then silence: no further traffic restarts a
     // catch-up request.
     let ticks = 1_u32;
+    let written_at = at(sim);
     put_value(sim, signer, &store, "w3h-1427-ahead", "e+1").await?;
     let mut seen = Observations::default();
+    // The first poll at which V is past e: when, and which admins had
+    // served a page by then.
+    let mut first_move: Option<String> = None;
     let waited = sim
         .until("V reaches the signer's epoch", CATCHUP, async |s: &Sim| {
             let Some(v) = seen.observe(epoch_now(s, "V", &group)).await else {
                 return true;
             };
+            if v > e && first_move.is_none() {
+                let pages: Vec<(&str, usize)> = admins
+                    .iter()
+                    .map(|(_, label)| (*label, served_pages(s, label).unwrap_or(0)))
+                    .collect();
+                first_move = Some(format!(
+                    "first move of V past e={e}: to {v} at {} us, after the write \
+                     at {written_at} us; pages served so far by admin {pages:?}",
+                    s.fabric().now().as_micros()
+                ));
+            }
             let Some(now) = seen.observe(epoch_now(s, signer, &group)).await else {
                 return true;
             };
@@ -399,6 +491,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let signer_epoch = epoch(sim, signer, &group).await?;
     let served = served_pages(sim, signer)?.saturating_sub(served_before);
     let caught_up = v_epoch == signer_epoch;
+    receipt.note(first_move.unwrap_or_else(|| format!("V never moved past e={e}")));
 
     let mut data_ok = false;
     if caught_up {
